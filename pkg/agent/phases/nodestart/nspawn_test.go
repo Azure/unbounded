@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/isolation/nspawn"
 )
 
 // silentLogger returns a logger that drops all output. Tests use it so the
@@ -267,7 +268,7 @@ func TestIsAlreadyExistsErr(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			require.Equal(t, tc.want, isAlreadyExistsErr(tc.err))
+			require.Equal(t, tc.want, nspawn.IsAlreadyExists(tc.err))
 		})
 	}
 }

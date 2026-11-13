@@ -6,6 +6,11 @@ license = "Apache-2.0"
 publish = false
 description = "Runtime-independent membership, placement, and routing algorithms"
 
+[features]
+default = []
+# Exposes test_util::FullMeshMax, a per-thread full mesh limit for tests and simulations.
+test-util = []
+
 [dependencies]
 sha2 = "0.10"
 

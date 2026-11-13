@@ -2,7 +2,12 @@
 GOCMD=go
 GOFMT=gofumpt
 GOBUILD=$(GOCMD) build
-GOTEST=$(GOCMD) test
+GOTEST=$(GOCMD) test -v
+# gotestsum runs `go test -json`, prints the same output as `go test -v`, and
+# ends with a summary of every skipped and failed test with its output. The
+# JSON report feeds the CI job summary (hack/cmd/test-summary).
+GO_TEST_REPORT ?= $(CURDIR)/tmp/go-test.json
+GOTESTSUM=$(GOCMD) tool gotestsum --format standard-verbose --jsonfile $(GO_TEST_REPORT)
 GOMOD=$(GOCMD) mod
 GOLINT=golangci-lint run -c .golangci.yaml
 ENVTEST_K8S_VERSION ?= 1.37.0
@@ -88,6 +93,14 @@ TOKEN_REFRESHER_IMAGE ?= $(CONTAINER_REGISTRY)/token-refresher:$(VERSION_TAG)
 MACHINE_OPS_CONTROLLER_BIN=bin/machine-ops-controller
 MACHINE_OPS_CONTROLLER_CMD=./cmd/machine-ops-controller
 MACHINE_OPS_CONTROLLER_IMAGE ?= $(CONTAINER_REGISTRY)/machine-ops-controller:$(VERSION_TAG)
+
+# The Unbounded Karpenter plugin is a nested Go module (plugins/karpenter),
+# because upstream Karpenter pins older Kubernetes libraries than this module.
+# Its targets delegate to plugins/karpenter/Makefile.
+KARPENTER_IMAGE ?= $(CONTAINER_REGISTRY)/unbounded-karpenter:$(VERSION_TAG)
+KARPENTER_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
+KARPENTER_MAKE = $(MAKE) -C plugins/karpenter VERSION=$(VERSION) IMAGE=$(KARPENTER_IMAGE) \
+	NAMESPACE=$(KARPENTER_NAMESPACE) CONTAINER_ENGINE=$(CONTAINER_ENGINE)
 MACHINE_OPS_CONTROLLER_NAME ?= machine-ops-controller
 MACHINE_OPS_PROVIDER ?=
 MACHINE_OPS_SITE ?=
@@ -100,6 +113,7 @@ PROJECT_SIGNAL_ADAPTER_CMD=./cmd/project-signal-adapter
 SIGNAL_ADAPTER_IMAGE ?= example.invalid/project-signal-adapter@sha256:0000000000000000000000000000000000000000000000000000000000000000
 SIGNAL_ADAPTER_BUILD_IMAGE ?= example.invalid/project-signal-adapter:replace-me
 SIGNAL_CERTIFICATION_RUNNER_IMAGE ?= example.invalid/project-signal-runner@sha256:0000000000000000000000000000000000000000000000000000000000000000
+SIGNAL_CERTIFICATION_RUNNER_BUILD_IMAGE ?= project-signal-certification-runner:$(VERSION_TAG)
 SIGNAL_PROMETHEUS_IMAGE ?= quay.io/prometheus/prometheus@sha256:49214755b6153f90a597adcbff0252cc61069f8ab69ce8411285cd4a560e8038
 SIGNAL_RESOLVER_IMAGES ?=
 PROJECT_SIGNAL_MODEL_CACHE_BIN=bin/project-signal-model-cache
@@ -213,6 +227,7 @@ GANTRY_CHART_APP_VERSION ?= $(VERSION_TAG)
 GANTRY_CHART_PACKAGE_DIR := build/charts
 GANTRY_CHART_STAGE_DIR := tmp/gantry-chart-package
 GANTRY_CHART_IMAGE_REPOSITORY ?= $(CONTAINER_REGISTRY)/gantry
+GANTRY_NODE_CONFIG_IMAGE ?= $(CONTAINER_REGISTRY)/gantry-node-config:$(VERSION_TAG)
 
 # Version is derived from the latest git tag. Override with: make VERSION=v1.0.0
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
@@ -292,8 +307,9 @@ NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
 # Frontend build toggle (dev builds produce unminified output with sourcemaps).
 REACT_DEV ?= false
 
-.PHONY: all help fmt lint lint-actions test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc install-helm generate kubectl-unbounded forge relctl relctl-build agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests project-signal-controller project-signal-controller-build project-signal-verify-clean-source project-signal-adapter project-signal-adapter-build project-signal-model-cache project-signal-model-cache-build signal-manifests signal-vllm-cache-handoff image-project-signal-controller-local image-project-signal-adapter-local image-project-signal-vllm-canary-local image-project-signal-vllm-model-cache-local metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-gantry e2e-playpen e2e-racer gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build license-check notice notice-check gantry gantry-build gantry-manifests inventory-manifests
+.PHONY: all help fmt lint lint-actions test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc install-helm install-kind generate kubectl-unbounded forge relctl relctl-build agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests project-signal-controller project-signal-controller-build project-signal-verify-clean-source project-signal-adapter project-signal-adapter-build project-signal-model-cache project-signal-model-cache-build signal-manifests signal-vllm-cache-handoff image-project-signal-controller-local image-project-signal-adapter-local image-project-signal-certification-runner-local image-project-signal-vllm-canary-local image-project-signal-vllm-model-cache-local metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-gantry e2e-playpen e2e-racer gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build license-check notice notice-check gantry gantry-build gantry-manifests inventory-manifests
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests gantry-chart-lint gantry-chart-package release-bom release-manifests unbounded-operator-release-manifest
+.PHONY: karpenter karpenter-fmt karpenter-lint karpenter-test karpenter-test-ci karpenter-build karpenter-manifests image-karpenter-local
 .PHONY: image-machina-local image-token-refresher-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-unbounded-operator-push image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
 
@@ -311,12 +327,17 @@ help: ## Show this help
 	@echo "  install-tools                    Install gofumpt, golangci-lint, protoc-gen-go, protoc-gen-go-grpc, controller-gen, actionlint"
 	@echo "  install-protoc                   Download pinned protoc into bin/protoc/"
 	@echo "  install-helm                     Download pinned Helm into bin/"
+	@echo "  install-kind                     Install pinned kind into bin/"
 	@echo ""
 	@echo "Development:"
 	@echo "  fmt                              Format Go source (gofumpt + wsl_v5)"
 	@echo "  lint                             Run golangci-lint and actionlint"
 	@echo "  lint-actions                     Run actionlint over .github/workflows"
 	@echo "  test                             Run all tests"
+	@echo "  karpenter                        Lint, test and build the Karpenter plugin (nested module)"
+	@echo "  karpenter-fmt|lint|test|build    Individual Karpenter plugin steps"
+	@echo "  karpenter-manifests              Render the Karpenter plugin manifests"
+	@echo "  image-karpenter-local            Build the unbounded-karpenter image locally"
 	@echo "  build                            Compile all Go packages"
 	@echo "  generate                         Run go generate (deepcopy, CRDs, protobuf)"
 	@echo "  vulncheck                        Run govulncheck; fails only on vulnerabilities with final fixes"
@@ -379,6 +400,7 @@ help: ## Show this help
 	@echo "  image-machine-ops-controller-local Build machine-ops-controller image"
 	@echo "  image-project-signal-controller-local Build Project Signal controller image"
 	@echo "  image-project-signal-adapter-local Build Project Signal adapter image"
+	@echo "  image-project-signal-certification-runner-local Build Project Signal certification runner image"
 	@echo "  image-metalman-local             Build metalman image"
 	@echo "  image-unbounded-operator-local   Build unbounded-operator image"
 	@echo "  image-unbounded-operator-push    Build and push unbounded-operator image"
@@ -432,8 +454,13 @@ help: ## Show this help
 	@echo ""
 	@echo "Racer:"
 	@echo "  racer-test                       Test the Rust Racer workspace and Go Racer API and wire contracts"
+	@echo "  racer-fmt                        Format the Rust Racer workspace"
+	@echo "  racer-lint                       Check Rust formatting, workspace Clippy, and Racer purity"
+	@echo "  racer-purity-graph               Fail when a pure Racer crate depends on an IO crate"
 	@echo "  racer-gpu-test                   Build the CUDA shim with kernels and run GPU hardware tests"
-	@echo "  racer-sim                        Run the Racer simulator (ARGS='--scenario smoke --nodes 16')"
+	@echo "  racer-fuzz                       Run each Racer libFuzzer target briefly (FUZZ_SECONDS, default 30)"
+	@echo "  racer-dst                        Run the Racer DST seed set twice each (DST_SEEDS, DST_STEPS, DST_FILTER)"
+	@echo "  racer-dst-report                 Write one Model scenario's JSON report (ARGS='--scenario full-failover --nodes 200')"
 	@echo "  racer-envtest                    Run Racer API-server tests with KUBEBUILDER_ASSETS"
 	@echo "  racer-envtest-ci                 Provision pinned assets and run Racer API-server tests"
 	@echo "  racer-generate                   Generate Racer deepcopy and CRD artifacts"
@@ -460,8 +487,8 @@ help: ## Show this help
 # When CI is set (GitHub Actions sets CI=true automatically), targets run
 # without their usual dependency chains so each CI job stays independent.
 
-GOFUMPT_VERSION ?= v0.11.0
-GOLANGCI_LINT_VERSION ?= v2.13.1
+GOFUMPT_VERSION ?= v0.12.0
+GOLANGCI_LINT_VERSION ?= v2.15.0
 PROTOC_GEN_GO_VERSION ?= v1.36.11
 PROTOC_GEN_GO_GRPC_VERSION ?= v1.6.1
 CONTROLLER_GEN_VERSION ?= v0.21.0
@@ -469,6 +496,10 @@ ACTIONLINT_VERSION ?= v1.7.12
 HELM_VERSION ?= 3.21.3
 HELM ?= $(CURDIR)/bin/helm
 HELM_STAMP := $(CURDIR)/bin/.helm-v$(HELM_VERSION)
+KIND_VERSION ?= v0.30.0
+KIND ?= $(CURDIR)/bin/kind
+KIND_STAMP := $(CURDIR)/bin/.kind-$(KIND_VERSION)
+GANTRY_E2E_RUN ?= .
 
 HELM_UNAME_S := $(shell uname -s)
 HELM_UNAME_M := $(shell uname -m)
@@ -533,6 +564,17 @@ install-tools: ## Install development tools (gofumpt, golangci-lint, protoc-gen-
 install-protoc: $(PROTOC) ## Download pinned protoc into bin/protoc/
 
 install-helm: $(HELM) ## Download pinned Helm into bin/
+
+install-kind: $(KIND) ## Install pinned kind into bin/
+
+$(KIND_STAMP):
+	@mkdir -p $(dir $(KIND))
+	GOBIN=$(CURDIR)/bin $(GOCMD) install sigs.k8s.io/kind@$(KIND_VERSION)
+	@$(KIND) version
+	@touch $(KIND_STAMP)
+
+$(KIND): $(KIND_STAMP)
+	@test -x $(KIND) || { rm -f $(KIND_STAMP); $(MAKE) $(KIND_STAMP); }
 
 $(HELM_STAMP):
 	@test -n "$(HELM_SHA256)" || { echo "unsupported Helm platform $(HELM_OS)-$(HELM_ARCH)" >&2; exit 1; }
@@ -613,19 +655,28 @@ ifdef CI
 # In CI each job is independent; skip chained prerequisites.
 
 test: machina-manifests token-refresher-manifests machine-ops-manifests signal-manifests playpen-manifests net-manifests unbounded-operator-manifests gantry-manifests ## Run all tests with race detector
-	$(GOTEST) -race ./...
+	@mkdir -p $(dir $(GO_TEST_REPORT))
+	$(GOTESTSUM) -- -race ./...
 
 else
 # Locally, chain test -> lint for convenience.
 
 test: lint machina-manifests token-refresher-manifests machine-ops-manifests signal-manifests playpen-manifests net-manifests unbounded-operator-manifests gantry-manifests ## Run all tests (implies lint)
-	$(GOTEST) ./...
+	@mkdir -p $(dir $(GO_TEST_REPORT))
+	$(GOTESTSUM) -- ./...
 
 endif
 
-e2e-gantry: $(HELM) ## Run the kind-based Gantry e2e suite
-	CONTAINER_ENGINE="$(CONTAINER_ENGINE)" KIND_EXPERIMENTAL_PROVIDER="$(CONTAINER_ENGINE)" PATH="$(CURDIR)/bin:$$PATH" \
-		$(GOTEST) -tags=e2e -count=1 -timeout=120m -v ./e2e/gantry
+e2e-gantry: $(HELM) $(KIND) ## Run the kind-based Gantry e2e suite
+	@set -eu; \
+	if [ "$(CONTAINER_ENGINE)" = "podman" ] && [ "$$($(CONTAINER_ENGINE) info --format '{{.Host.Security.Rootless}}')" = "true" ]; then \
+		command -v systemd-run >/dev/null 2>&1 || { echo "rootless Podman requires systemd-run" >&2; exit 1; }; \
+		exec systemd-run --user --scope --quiet -p Delegate=yes \
+			env CONTAINER_ENGINE="$(CONTAINER_ENGINE)" KIND_EXPERIMENTAL_PROVIDER="$(CONTAINER_ENGINE)" PATH="$(CURDIR)/bin:$$PATH" \
+			$(GOTEST) -tags=e2e -count=1 -timeout=120m -run '$(GANTRY_E2E_RUN)' -v ./e2e/gantry; \
+	fi; \
+	exec env CONTAINER_ENGINE="$(CONTAINER_ENGINE)" KIND_EXPERIMENTAL_PROVIDER="$(CONTAINER_ENGINE)" PATH="$(CURDIR)/bin:$$PATH" \
+		$(GOTEST) -tags=e2e -count=1 -timeout=120m -run '$(GANTRY_E2E_RUN)' -v ./e2e/gantry
 
 e2e-racer: ## Run the kind-based Racer e2e suite (object caching and the Gantry Racer backend)
 	timeout --signal=TERM --kill-after=30s 7200s $(GOTEST) -tags=e2e -count=1 -timeout=110m -v ./e2e/racer
@@ -642,6 +693,29 @@ racer-rust-test: ## Test the Rust Racer workspace, including the embedded cluste
 	timeout --signal=TERM --kill-after=10s 1500s cargo test --locked --manifest-path cmd/racer/Cargo.toml --workspace
 
 racer-test: racer-go-test racer-rust-test ## Check Racer
+
+RACER_RUST_TOOLCHAIN ?= 1.96.0
+
+.PHONY: racer-fmt racer-lint racer-purity-graph
+racer-fmt: ## Format the Rust Racer workspace
+	timeout --signal=TERM --kill-after=10s 300s cargo +$(RACER_RUST_TOOLCHAIN) fmt --manifest-path cmd/racer/Cargo.toml --all
+
+racer-purity-graph: ## Fail when a pure Racer crate depends on an IO crate
+	timeout --signal=TERM --kill-after=10s 300s python3 hack/scripts/racer-purity-graph.py --manifest-path cmd/racer/Cargo.toml --strict
+
+racer-lint: racer-purity-graph ## Check Rust formatting, workspace Clippy, and Racer purity
+	timeout --signal=TERM --kill-after=10s 300s cargo +$(RACER_RUST_TOOLCHAIN) fmt --manifest-path cmd/racer/Cargo.toml --all --check
+	timeout --signal=TERM --kill-after=10s 1200s cargo +$(RACER_RUST_TOOLCHAIN) clippy --locked --manifest-path cmd/racer/Cargo.toml --workspace --all-targets -- -D warnings
+	timeout --signal=TERM --kill-after=10s 600s cargo +$(RACER_RUST_TOOLCHAIN) test --locked --manifest-path cmd/racer/Cargo.toml -p racer-core --test purity
+
+FUZZ_SECONDS ?= 30
+RACER_FUZZ_TARGETS ?= http_head small_body peer_envelope control_documents store_record checkpoint
+
+.PHONY: racer-fuzz
+racer-fuzz: ## Run each Racer libFuzzer target for FUZZ_SECONDS (default 30)
+	cd cmd/racer/fuzz && for target in $(RACER_FUZZ_TARGETS); do \
+		timeout --signal=TERM --kill-after=10s 1500s env RUSTC_BOOTSTRAP=1 cargo +$(RACER_RUST_TOOLCHAIN) fuzz run "$$target" "corpus/$$target" -- -max_total_time=$(FUZZ_SECONDS) || exit 1; \
+	done
 
 RACER_GPU_NATIVE ?= $(CURDIR)/bin/racer-gpu-native
 # 1 skips when no GPU is found; require fails instead (dedicated GPU runners).
@@ -677,11 +751,20 @@ racer-python-dist: ## Build sdists and wheels for racer-client and racer-vllm in
 	timeout --signal=TERM --kill-after=10s 300s "$(RACER_PY_VENV)/bin/python" -m build -o tmp/racer-python-dist clients/python/racer
 	timeout --signal=TERM --kill-after=10s 300s "$(RACER_PY_VENV)/bin/python" -m build -o tmp/racer-python-dist clients/python/racer-vllm
 
-RACER_SIM_TIMEOUT ?= 7200s
+RACER_DST_TIMEOUT ?= 1200s
 
-.PHONY: racer-sim
-racer-sim: ## Run the Racer discrete-event simulator; pass options with ARGS='--nodes 50000 --seed 1'
-	timeout --signal=TERM --kill-after=10s $(RACER_SIM_TIMEOUT) cargo run --release --locked --manifest-path cmd/racer/Cargo.toml -p racer-sim -- $(ARGS)
+# DST_SEEDS: seed file or count N (seeds 1..=N per scenario); default dst/seeds/{ci,regressions}.txt.
+# DST_STEPS: step budget per run. DST_FILTER: scenario name substring. Each entry runs twice.
+.PHONY: racer-dst
+racer-dst: ## Run the Racer deterministic simulation tests; every seed runs twice and must match
+	DST_SEEDS="$(DST_SEEDS)" DST_STEPS="$(DST_STEPS)" DST_FILTER="$(DST_FILTER)" timeout --signal=TERM --kill-after=10s $(RACER_DST_TIMEOUT) cargo +$(RACER_RUST_TOOLCHAIN) run --locked --profile test --manifest-path cmd/racer/Cargo.toml -p racer-dst --bin racer-dst
+
+RACER_DST_REPORT_TIMEOUT ?= 7200s
+
+# One Model scenario's JSON report: --scenario, --nodes, --seed, --duration, --config, --out.
+.PHONY: racer-dst-report
+racer-dst-report: ## Write one Racer Model scenario's JSON report; pass options with ARGS='--scenario full-failover --nodes 200'
+	timeout --signal=TERM --kill-after=10s $(RACER_DST_REPORT_TIMEOUT) cargo +$(RACER_RUST_TOOLCHAIN) run --release --locked --manifest-path cmd/racer/Cargo.toml -p racer-dst --bin racer-dst -- $(ARGS)
 
 $(SETUP_ENVTEST):
 	@mkdir -p bin tmp/envtest-tools
@@ -977,6 +1060,33 @@ unroute-build: ## Build the unroute utility binary (no lint/test)
 
 unroute: test unroute-build ## Build the unroute utility (implies test)
 
+##@ Karpenter plugin (nested Go module in plugins/karpenter)
+
+karpenter-fmt: ## Format the Karpenter plugin module
+	$(KARPENTER_MAKE) fmt
+
+karpenter-lint: ## Lint the Karpenter plugin module
+	$(KARPENTER_MAKE) lint
+
+karpenter-test: ## Test the Karpenter plugin module
+	$(KARPENTER_MAKE) test
+
+karpenter-test-ci: $(SETUP_ENVTEST) ## Provision pinned API-server assets and test the Karpenter plugin module
+	@mkdir -p tmp/karpenter-envtest
+	@assets=$$(TMPDIR="$(CURDIR)/tmp/karpenter-envtest" timeout --signal=TERM --kill-after=10s 300s "$(SETUP_ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(CURDIR)/bin/envtest" -p path) && \
+		$(MAKE) karpenter-test KUBEBUILDER_ASSETS="$$assets"
+
+karpenter-build: ## Build the unbounded-karpenter binary (no lint/test)
+	$(KARPENTER_MAKE) build
+
+karpenter: karpenter-lint karpenter-test karpenter-build ## Build the Karpenter plugin (implies lint and test)
+
+karpenter-manifests: ## Render the Karpenter plugin manifests into deploy/karpenter/rendered
+	$(KARPENTER_MAKE) manifests
+
+image-karpenter-local: ## Build the unbounded-karpenter container image locally (single-arch)
+	$(KARPENTER_MAKE) image
+
 ##@ Gantry (peer-to-peer OCI distribution)
 
 gantry-build: ## Build the gantry binary (no lint/test)
@@ -1232,6 +1342,14 @@ image-project-signal-adapter-local: ## Build Project Signal adapter image locall
 		-f ./images/project-signal-adapter/Containerfile .
 	$(call trivy-maybe,$(SIGNAL_ADAPTER_BUILD_IMAGE))
 
+image-project-signal-certification-runner-local: ## Build Project Signal certification runner image locally
+	python3 ./images/project-signal-certification-runner/build.py check
+	$(CONTAINER_ENGINE) build \
+		--platform linux/amd64 \
+		-t $(SIGNAL_CERTIFICATION_RUNNER_BUILD_IMAGE) \
+		-f ./images/project-signal-certification-runner/Containerfile .
+	$(call trivy-maybe,$(SIGNAL_CERTIFICATION_RUNNER_BUILD_IMAGE))
+
 image-project-signal-vllm-canary-local: ## Build Project Signal vLLM canary image locally
 	$(CONTAINER_ENGINE) build \
 		-t $(SIGNAL_VLLM_CANARY_BUILD_IMAGE) \
@@ -1246,10 +1364,12 @@ image-project-signal-vllm-model-cache-local: ## Build Project Signal vLLM model 
 
 MACHINA_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
 MACHINA_API_SERVER_ENDPOINT ?=
+MACHINA_EXPERIMENTAL_CONTAINER_ISOLATION ?= false
 MACHINA_MANIFEST_TEMPLATES_DIR := deploy/machina
 MACHINA_MANIFEST_RENDERED_DIR  := deploy/machina/rendered
 MACHINE_OPS_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
 MACHINE_OPS_API_SERVER_ENDPOINT ?=
+MACHINE_OPS_EXPERIMENTAL_CONTAINER_ISOLATION ?= false
 MACHINE_OPS_MANIFEST_TEMPLATES_DIR := deploy/machine-ops
 MACHINE_OPS_MANIFEST_RENDERED_DIR  := deploy/machine-ops/rendered
 PLAYPEN_NAMESPACE ?= playpen
@@ -1274,7 +1394,8 @@ machina-manifests: ## Render machina deployment manifests into deploy/machina/re
 		--output-dir $(MACHINA_MANIFEST_RENDERED_DIR) \
 		--set Namespace=$(MACHINA_NAMESPACE) \
 		--set ControllerImage=$(MACHINA_IMAGE) \
-		--set APIServerEndpoint=$(MACHINA_API_SERVER_ENDPOINT)
+		--set APIServerEndpoint=$(MACHINA_API_SERVER_ENDPOINT) \
+		--set ExperimentalContainerIsolation=$(MACHINA_EXPERIMENTAL_CONTAINER_ISOLATION)
 	@cp $(MACHINA_MANIFEST_TEMPLATES_DIR)/crd/*.yaml $(MACHINA_MANIFEST_RENDERED_DIR)/crd/
 	@echo "Rendered machina manifests into $(MACHINA_MANIFEST_RENDERED_DIR) (image: $(MACHINA_IMAGE))"
 
@@ -1313,7 +1434,8 @@ machine-ops-manifests: ## Render machine-ops-controller manifests into deploy/ma
 		--set ControllerImage=$(MACHINE_OPS_CONTROLLER_IMAGE) \
 		--set Provider=$(MACHINE_OPS_PROVIDER) \
 		--set Site=$(MACHINE_OPS_SITE) \
-		--set APIServerEndpoint=$(MACHINE_OPS_API_SERVER_ENDPOINT)
+		--set APIServerEndpoint=$(MACHINE_OPS_API_SERVER_ENDPOINT) \
+		--set ExperimentalContainerIsolation=$(MACHINE_OPS_EXPERIMENTAL_CONTAINER_ISOLATION)
 	@echo "Rendered machine-ops manifests into $(MACHINE_OPS_MANIFEST_RENDERED_DIR) (image: $(MACHINE_OPS_CONTROLLER_IMAGE))"
 
 signal-manifests: ## Render Project Signal manifests into deploy/signal/rendered
@@ -1595,6 +1717,16 @@ image-gantry-local: ## Build the gantry container image locally (single-arch)
 image-gantry-push: image-gantry-local ## Build and push the gantry container image
 	$(CONTAINER_ENGINE) push $(GANTRY_IMAGE)
 
+.PHONY: image-gantry-node-config-local image-gantry-node-config-push
+image-gantry-node-config-local: ## Build the Gantry OverlayBD node configurator image locally
+	$(CONTAINER_ENGINE) build \
+		-t gantry-node-config:$(VERSION_TAG) -t $(GANTRY_NODE_CONFIG_IMAGE) \
+		-f ./images/gantry-node-config/Containerfile .
+	$(call trivy-maybe,$(GANTRY_NODE_CONFIG_IMAGE))
+
+image-gantry-node-config-push: image-gantry-node-config-local ## Build and push the Gantry OverlayBD node configurator image
+	$(CONTAINER_ENGINE) push $(GANTRY_NODE_CONFIG_IMAGE)
+
 ##@ Orca
 
 .PHONY: orca orca-build orca-manifests orca-oci orca-oci-push \
@@ -1724,7 +1856,7 @@ images-net-all: image-net-controller-local image-net-node-local ## Build all unb
 
 images-net-all-push: image-net-controller-push image-net-node-push ## Build and push all unbounded-net container images
 
-images-local: image-machina-local image-token-refresher-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-net-controller-local image-net-node-local image-gantry-local ## Build all container images locally
+images-local: image-machina-local image-token-refresher-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-node-config-local ## Build all container images locally
 
 ##@ Net Frontend
 

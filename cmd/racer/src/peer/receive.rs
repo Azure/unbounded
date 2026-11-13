@@ -11,7 +11,6 @@ use flow_control::{Charge, Quotas};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use uring_runtime::environment::now;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
@@ -102,7 +101,7 @@ impl Gate {
         if self.config.active == 0 {
             return Ok(None);
         }
-        let deadline = scope.deadline.0.min(now() + self.config.wait);
+        let deadline = scope.deadline.0.min(scope.clock().now() + self.config.wait);
         let mut state = self.state.lock().map_err(|_| Error::Unavailable)?;
         if state.queued() >= self.config.queued {
             self.metrics.record(Event::PeerReceiveFull, 1);
@@ -120,7 +119,7 @@ impl Gate {
             id,
             deadline,
             charge: Some(charge),
-            started: now(),
+            started: scope.clock().now(),
             terminal: false,
         }))
     }
@@ -151,7 +150,7 @@ impl Gate {
         let wakes = {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             state.poll_deadlines(budget, |scope, deadline| {
-                now() >= deadline || scope.check().is_err()
+                scope.clock().now() >= deadline || scope.check().is_err()
             })
         };
         for wake in wakes {
@@ -173,7 +172,7 @@ impl Ticket {
         cx: &mut Context<'_>,
     ) -> Poll<Result<Arc<Permit>>> {
         if let Err(error) = scope.check().and_then(|()| {
-            if now() >= self.deadline {
+            if scope.clock().now() >= self.deadline {
                 Err(Error::DeadlineExceeded)
             } else {
                 Ok(())
@@ -181,8 +180,8 @@ impl Ticket {
         }) {
             self.terminal = true;
             self.gate.metrics.record(
-                if error == Error::Cancelled {
-                    Event::PeerReceiveCancelled
+                if error == Error::Canceled {
+                    Event::PeerReceiveCanceled
                 } else {
                     Event::PeerReceiveTimeout
                 },
@@ -203,7 +202,9 @@ impl Ticket {
             self.gate.metrics.record(Event::PeerReceiveAdmitted, 1);
             self.gate.metrics.record(
                 Event::PeerReceiveWaitNs,
-                now()
+                scope
+                    .clock()
+                    .now()
                     .saturating_duration_since(self.started)
                     .as_nanos()
                     .min(u64::MAX as u128) as u64,
@@ -240,7 +241,7 @@ impl Drop for Ticket {
             wake
         };
         if !self.terminal {
-            self.gate.metrics.record(Event::PeerReceiveCancelled, 1);
+            self.gate.metrics.record(Event::PeerReceiveCanceled, 1);
         }
         if let Some(wake) = wake {
             wake.wake();
@@ -266,8 +267,14 @@ impl Drop for Permit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn now(env: &racer_io::Env) -> Instant {
+        env.ctx.clock.clone().now()
+    }
+
     #[test]
     fn worker_handles_share_fifo_but_not_counter_shards() {
+        let env = racer_io::Env::host();
         let metrics = Metrics::for_workers(2).unwrap();
         let first = Gate::with_metrics(
             Config {
@@ -282,9 +289,9 @@ mod tests {
         let admission = Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         ));
-        let scope = RequestScope::new(
+        let scope = RequestScope::host(
             crate::model::RequestId([1; 16]),
-            now() + Duration::from_secs(10),
+            now(&env) + Duration::from_secs(10),
         )
         .unwrap();
         let permit = futures::executor::block_on(second.acquire(&admission, &scope))
@@ -298,7 +305,7 @@ mod tests {
         drop(ticket);
         assert_eq!(metrics[0].writer_count(Event::PeerReceiveFull), 1);
         assert_eq!(metrics[1].writer_count(Event::PeerReceiveFull), 0);
-        for event in [Event::PeerReceiveAdmitted, Event::PeerReceiveCancelled] {
+        for event in [Event::PeerReceiveAdmitted, Event::PeerReceiveCanceled] {
             assert_eq!(metrics[0].writer_count(event), 0);
             assert_eq!(metrics[1].writer_count(event), 1);
         }
@@ -317,8 +324,10 @@ mod tests {
     #[test]
     fn receive_alarm_wakes_without_completion_and_preserves_scope() {
         use std::future::Future;
-        let clock = uring_runtime::environment::SimulationClock::new(909);
-        let _env = clock.environment(0).enter();
+        let clock = racer_io::SimClock::new(909);
+        let sim_env = clock.ctx(0);
+        let env = racer_io::Env::new(racer_io::Driver::Uring, sim_env.clone());
+        let sim_ctx = sim_env.clone();
         let admission = Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         ));
@@ -333,8 +342,12 @@ mod tests {
                 metrics.clone(),
             )
             .unwrap();
-            let parent =
-                RequestScope::new(RequestId([4; 16]), now() + Duration::from_secs(10)).unwrap();
+            let parent = RequestScope::on(
+                &sim_ctx.clock,
+                RequestId([4; 16]),
+                now(&env) + Duration::from_secs(10),
+            )
+            .unwrap();
             let original = parent.deadline;
             let wake = Arc::new(Wake(AtomicUsize::new(0)));
             let waker = Waker::from(wake.clone());
@@ -344,13 +357,14 @@ mod tests {
                 panic!("grant");
             };
             drop(held);
-            let scope = RequestScope::new(parent.request, parent.deadline.0).unwrap();
+            let scope =
+                RequestScope::on(&sim_ctx.clock, parent.request, parent.deadline.0).unwrap();
             if cause == "idle" {
                 scope.set_candidate_idle(Duration::from_millis(10)).unwrap();
             }
             if cause == "total" {
                 scope
-                    .set_candidate_total(now() + Duration::from_millis(10))
+                    .set_candidate_total(now(&env) + Duration::from_millis(10))
                     .unwrap();
             }
             let mut pending = Box::pin(gate.acquire(&admission, &scope));
@@ -372,7 +386,7 @@ mod tests {
                 "{cause}: no unrelated CQE required"
             );
             let expected = if cause == "cancel" {
-                Error::Cancelled
+                Error::Canceled
             } else {
                 Error::DeadlineExceeded
             };
@@ -385,7 +399,7 @@ mod tests {
             assert_eq!(metrics.gauge(Gauge::PeerReceiveActive), 1);
             assert_eq!(
                 metrics.count(if cause == "cancel" {
-                    Event::PeerReceiveCancelled
+                    Event::PeerReceiveCanceled
                 } else {
                     Event::PeerReceiveTimeout
                 }),
@@ -400,6 +414,7 @@ mod tests {
     #[test]
     fn receive_permit_is_not_retained_by_idle_http_state() {
         use http1::connection::State as _;
+        let env = racer_io::Env::host();
         let admission = Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         ));
@@ -408,7 +423,8 @@ mod tests {
             ..Config::default()
         })
         .unwrap();
-        let scope = RequestScope::new(RequestId([5; 16]), now() + Duration::from_secs(5)).unwrap();
+        let scope =
+            RequestScope::host(RequestId([5; 16]), now(&env) + Duration::from_secs(5)).unwrap();
         let mut ticket = gate.enter(&admission, &scope).unwrap().unwrap();
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         let Poll::Ready(Ok(permit)) = ticket.poll(&scope, &mut cx) else {
@@ -428,6 +444,7 @@ mod tests {
     }
     #[test]
     fn receive_fifo_is_shared_bounded_and_completion_owned() {
+        let env = racer_io::Env::host();
         assert_eq!(std::mem::align_of::<Gate>(), 64);
         let admission = Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
@@ -438,7 +455,8 @@ mod tests {
             ..Config::default()
         })
         .unwrap();
-        let scope = RequestScope::new(RequestId([1; 16]), now() + Duration::from_secs(5)).unwrap();
+        let scope =
+            RequestScope::host(RequestId([1; 16]), now(&env) + Duration::from_secs(5)).unwrap();
         let wake = Arc::new(Wake(AtomicUsize::new(0)));
         let waker = Waker::from(wake.clone());
         let mut cx = Context::from_waker(&waker);
@@ -471,10 +489,12 @@ mod tests {
     }
     #[test]
     fn receive_disabled_cancel_and_expired_ticket_do_not_grant() {
+        let env = racer_io::Env::host();
         let admission = Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         ));
-        let scope = RequestScope::new(RequestId([2; 16]), now() + Duration::from_secs(5)).unwrap();
+        let scope =
+            RequestScope::host(RequestId([2; 16]), now(&env) + Duration::from_secs(5)).unwrap();
         assert!(
             Gate::new(Config::default())
                 .unwrap()
@@ -490,7 +510,7 @@ mod tests {
         .unwrap();
         let mut ticket = gate.enter(&admission, &scope).unwrap().unwrap();
         assert!(ticket.deadline() <= scope.deadline.0);
-        ticket.deadline = now();
+        ticket.deadline = now(&env);
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         assert!(matches!(
             ticket.poll(&scope, &mut cx),
@@ -501,7 +521,7 @@ mod tests {
         scope.cancel().unwrap();
         assert!(matches!(
             ticket.poll(&scope, &mut cx),
-            Poll::Ready(Err(Error::Cancelled))
+            Poll::Ready(Err(Error::Canceled))
         ));
         drop(ticket);
         assert_eq!(admission.used(ResourceClass::RequestContext), 0);
@@ -509,6 +529,7 @@ mod tests {
 
     #[test]
     fn receive_queue_pressure_and_middle_removal_preserve_fifo() {
+        let env = racer_io::Env::host();
         let admission = Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         ));
@@ -518,7 +539,8 @@ mod tests {
             ..Config::default()
         })
         .unwrap();
-        let scope = RequestScope::new(RequestId([3; 16]), now() + Duration::from_secs(5)).unwrap();
+        let scope =
+            RequestScope::host(RequestId([3; 16]), now(&env) + Duration::from_secs(5)).unwrap();
         let held = admission
             .reserve(
                 None,

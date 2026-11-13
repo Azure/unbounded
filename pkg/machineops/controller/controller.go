@@ -31,10 +31,16 @@ type Options struct {
 	APIServerEndpoint           string
 	CredentialSecretNamespace   string
 	ClusterInfo                 *ClusterInfo
+	// ExperimentalContainerIsolation enables the experimental container
+	// isolation mode for HostReplace. See
+	// internal/machineops.MachineOperationReconciler.
+	ExperimentalContainerIsolation bool
 }
 
 // AddToManager validates provider registrations and adds one MachineOperation
-// reconciler to mgr.
+// reconciler to mgr. When a selected registration declares capacity, the
+// reconciler also runs that registration's HostAllocate and HostRelease
+// operations for the MachineAllocation controller.
 func AddToManager(mgr ctrl.Manager, providers []*machineops.Provider, options Options) error {
 	if mgr == nil {
 		return fmt.Errorf("controller-runtime manager is required")
@@ -71,13 +77,39 @@ func AddToManager(mgr ctrl.Manager, providers []*machineops.Provider, options Op
 		KubeClient:                  kubeClient,
 		APIServerEndpoint:           options.APIServerEndpoint,
 		CredentialSecretNamespace:   options.CredentialSecretNamespace,
+
+		ExperimentalContainerIsolation: options.ExperimentalContainerIsolation,
 	}
 
 	if err := reconciler.SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup MachineOperation controller: %w", err)
 	}
 
+	if !allocationPathEnabled(providers, options.ProviderName) {
+		return nil
+	}
+
+	if err := reconciler.SetupAllocationWithManager(mgr); err != nil {
+		return fmt.Errorf("setup MachineOperation allocation controller: %w", err)
+	}
+
 	return nil
+}
+
+// allocationPathEnabled reports whether a selected registration declares
+// capacity. With scopedProvider set, only that registration is selected.
+func allocationPathEnabled(providers []*machineops.Provider, scopedProvider string) bool {
+	for _, provider := range providers {
+		if scopedProvider != "" && provider.Name() != scopedProvider {
+			continue
+		}
+
+		if _, ok := provider.Capacity(); ok {
+			return true
+		}
+	}
+
+	return false
 }
 
 func validateProviders(providers []*machineops.Provider, scopedProvider string) error {

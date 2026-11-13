@@ -59,6 +59,13 @@ type MachineOperationReconciler struct {
 	KubeClient                  kubernetes.Interface
 	APIServerEndpoint           string
 	CredentialSecretNamespace   string
+
+	// ExperimentalContainerIsolation enables the experimental container
+	// isolation mode for HostReplace: the replacement's agent configuration
+	// opts in (Experimental.ContainerIsolation). When it is not set, a
+	// HostReplace of a Machine that declares container fails before the
+	// provider runs.
+	ExperimentalContainerIsolation bool
 }
 
 // +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machineoperations,verbs=get;list;watch;delete
@@ -78,6 +85,14 @@ func (r *MachineOperationReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	var op unboundedv1alpha3.MachineOperation
 	if err := r.Get(ctx, opKey, &op); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	// HostAllocate and HostRelease act on a MachineAllocation, not on an
+	// existing host. This controller never executes, fails or deletes them,
+	// even when a provider registers the kind.
+	if op.Spec.OperationKind.IsAllocationOperation() {
+		logger.V(1).Info("ignoring allocation operation", "operation", op.Name, "operationKind", op.Spec.OperationKind)
+		return ctrl.Result{}, nil
 	}
 
 	if op.Status.IsTerminal() {
@@ -132,6 +147,10 @@ func (r *MachineOperationReconciler) Reconcile(ctx context.Context, req ctrl.Req
 			"machine", machine.Name)
 
 		return ctrl.Result{}, nil
+	}
+
+	if reason, message := allocationMachineRejection(op.Spec.OperationKind, &machine); reason != "" {
+		return r.failOperation(ctx, &op, reason, message)
 	}
 
 	if err := validateProviderReference(&machine, providerMatch.provider); err != nil {
@@ -383,8 +402,10 @@ func shouldExecuteOperation(op *unboundedv1alpha3.MachineOperation, operation *p
 // execute operation. HostSoftReboot is executed by the in-host agent, so a
 // provider that does not register it must ignore rather than fail it. Host
 // operations do not wait for a HostSoftReboot; the agent waits for them.
+// HostAllocate and HostRelease act on a MachineAllocation, not on an existing
+// host, so they are not host operations here.
 func isHostOperation(operation unboundedv1alpha3.OperationKind) bool {
-	if operation == unboundedv1alpha3.OperationHostSoftReboot {
+	if operation == unboundedv1alpha3.OperationHostSoftReboot || operation.IsAllocationOperation() {
 		return false
 	}
 
@@ -427,6 +448,10 @@ func (r *MachineOperationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 }
 
 func shouldReconcileOperation(op *unboundedv1alpha3.MachineOperation) bool {
+	if op.Spec.OperationKind.IsAllocationOperation() {
+		return false
+	}
+
 	if !op.Status.IsTerminal() {
 		return true
 	}
@@ -505,7 +530,7 @@ func (r *MachineOperationReconciler) reconcileTerminal(ctx context.Context, op *
 }
 
 func (r *MachineOperationReconciler) markInProgress(ctx context.Context, op *unboundedv1alpha3.MachineOperation, message string) error {
-	message = truncateUTF8Bytes(message, maxConditionMessageBytes)
+	message = TruncateUTF8Bytes(message, MaxConditionMessageBytes)
 
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var latest unboundedv1alpha3.MachineOperation
@@ -569,7 +594,7 @@ func (r *MachineOperationReconciler) finishOperation(
 	observedMachineGeneration int64,
 ) (ctrl.Result, error) {
 	reason = normalizeConditionReason(reason)
-	message = truncateUTF8Bytes(message, maxConditionMessageBytes)
+	message = TruncateUTF8Bytes(message, MaxConditionMessageBytes)
 
 	var updated unboundedv1alpha3.MachineOperation
 

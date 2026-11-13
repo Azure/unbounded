@@ -21,6 +21,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -397,6 +398,11 @@ func TestValidateStageEvidenceSummaryBoundaries(t *testing.T) {
 				ContentDigest: "sha256:" + strings.Repeat("a", 64),
 				Trust:         signalv1.CertificationTestTrustApproved,
 			},
+			Metrics: []signalv1.TestMetricDefinition{{
+				Name: "throughput",
+				Type: signalv1.MetricValueTypeThroughput,
+				Unit: "TFLOP/s",
+			}},
 		},
 		Schedule: signalv1.StageSchedule{
 			Mode:              signalv1.CheckExecutionModePeriodic,
@@ -410,6 +416,7 @@ func TestValidateStageEvidenceSummaryBoundaries(t *testing.T) {
 	}
 	started := metav1.NewTime(time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC))
 	finished := metav1.NewTime(started.Add(time.Hour))
+	throughput := "800"
 	summary := signalv1.StageEvidenceSummary{
 		PhaseOrder:               0,
 		StageOrder:               0,
@@ -428,6 +435,14 @@ func TestValidateStageEvidenceSummaryBoundaries(t *testing.T) {
 		FirstInvocationAt:        &started,
 		LastInvocationAt:         &finished,
 		MaxStartGap:              testDurationPointer(10 * time.Minute),
+		Measurements: []signalv1.MetricMeasurement{{
+			Name: "throughput",
+			Value: signalv1.TypedValue{
+				Type:         signalv1.TypedValueTypeDecimal,
+				DecimalValue: &throughput,
+			},
+			Unit: "TFLOP/s",
+		}},
 		Participants: []signalv1.ParticipantEvidenceIdentity{{
 			Index:   0,
 			Role:    signalv1.ParticipantRoleRequester,
@@ -478,6 +493,13 @@ func TestValidateStageEvidenceSummaryBoundaries(t *testing.T) {
 			name: "excessive gap",
 			mutate: func(value *signalv1.StageEvidenceSummary) {
 				value.MaxStartGap = testDurationPointer(12 * time.Minute)
+			},
+		},
+		{
+			name: "measurement schema mismatch",
+			mutate: func(value *signalv1.StageEvidenceSummary) {
+				value.Measurements = append([]signalv1.MetricMeasurement(nil), value.Measurements...)
+				value.Measurements[0].Unit = "GB/s"
 			},
 		},
 	}
@@ -979,6 +1001,157 @@ func TestResolvedRunCleanupReleasesAndDeletesWithoutScriptBundle(t *testing.T) {
 	}
 }
 
+func TestTerminalRunRecoversDurableEvidenceBeforeCleanup(t *testing.T) {
+	t.Parallel()
+
+	scheme := resolvedCleanupScheme(t)
+	finishedAt := time.Date(2026, 11, 13, 0, 9, 53, 0, time.UTC)
+	run := &signalv1.CertificationRun{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "terminal-run",
+			Namespace:  "signal-system",
+			UID:        "terminal-run-uid",
+			Finalizers: []string{RunFinalizer},
+		},
+		Status: signalv1.CertificationRunStatus{
+			Phase: signalv1.RunPhaseCancelled,
+		},
+	}
+	evidence := []byte(fmt.Sprintf(
+		`{"runID":%q,"runName":%q,"phase":"Canceled","verdict":"Inconclusive","reason":"Canceled","finishedAt":%q,"checkStatus":[]}`,
+		run.UID,
+		run.Name,
+		finishedAt.Format(time.RFC3339Nano),
+	))
+	store := staticEvidenceStore{
+		data:   evidence,
+		uri:    "kubernetes://signal-system/terminal-run-evidence/evidence.json.gz",
+		digest: "sha256:" + strings.Repeat("a", 64),
+	}
+	kube := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&signalv1.CertificationRun{}).
+		WithObjects(run).
+		Build()
+	reconciler := &RunReconciler{Client: kube, APIReader: kube, Evidence: store}
+
+	if _, err := reconciler.Reconcile(
+		context.Background(),
+		ctrl.Request{NamespacedName: client.ObjectKey{
+			Namespace: run.Namespace,
+			Name:      run.Name,
+		}},
+	); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+
+	var current signalv1.CertificationRun
+	if err := kube.Get(
+		context.Background(),
+		client.ObjectKey{Namespace: run.Namespace, Name: run.Name},
+		&current,
+	); err != nil {
+		t.Fatalf("get recovered Run: %v", err)
+	}
+
+	if current.Status.Evidence.URI != store.uri ||
+		current.Status.Evidence.Digest != store.digest {
+		t.Fatalf("recovered evidence = %#v", current.Status.Evidence)
+	}
+	if !slices.Contains(current.Finalizers, RunFinalizer) {
+		t.Fatalf("Run finalizers = %#v, want cleanup deferred", current.Finalizers)
+	}
+}
+
+func TestTerminalRunWithExistingIdentityCleansUpFromImmutableEvidence(t *testing.T) {
+	t.Parallel()
+
+	scheme := resolvedCleanupScheme(t)
+	finishedAt := time.Date(2026, 11, 13, 0, 9, 53, 0, time.UTC)
+	node := qualificationNode("node", "node-uid", "boot-a")
+	run := &signalv1.CertificationRun{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "partially-recovered-run",
+			Namespace:  "signal-system",
+			UID:        "partially-recovered-run-uid",
+			Finalizers: []string{RunFinalizer},
+		},
+		Spec: signalv1.CertificationRunSpec{
+			Release: true,
+			Participants: []signalv1.Participant{{
+				NodeName: node.Name,
+				NodeUID:  node.UID,
+			}},
+		},
+		Status: signalv1.CertificationRunStatus{
+			Phase: signalv1.RunPhaseCancelled,
+			Evidence: signalv1.EvidenceStatus{
+				Identity: &signalv1.QualificationEvidenceIdentity{
+					PlanDigest: "sha256:" + strings.Repeat("b", 64),
+					Participants: []signalv1.ParticipantEvidenceIdentity{{
+						Index:   0,
+						Role:    signalv1.ParticipantRoleRequester,
+						Verdict: signalv1.QualificationVerdictInconclusive,
+					}},
+					Stages: []signalv1.StageEvidenceSummary{{
+						Name:       "partial-stage",
+						PhaseOrder: 0,
+						StageOrder: 0,
+						Role:       signalv1.CheckStageRoleValidation,
+						Mode:       signalv1.CheckExecutionModeRunOnce,
+						Verdict:    signalv1.StageVerdictPassed,
+					}},
+				},
+			},
+		},
+	}
+	evidence := []byte(fmt.Sprintf(
+		`{"runID":%q,"runName":%q,"finishedAt":%q}`,
+		run.UID,
+		run.Name,
+		finishedAt.Format(time.RFC3339Nano),
+	))
+	store := staticEvidenceStore{
+		data:   evidence,
+		uri:    "kubernetes://signal-system/partially-recovered-run-evidence/evidence.json.gz",
+		digest: "sha256:" + strings.Repeat("a", 64),
+	}
+	kube := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&signalv1.CertificationRun{}).
+		WithObjects(node, run).
+		Build()
+	reconciler := &RunReconciler{Client: kube, APIReader: kube, Evidence: store}
+
+	if _, err := reconciler.Reconcile(
+		context.Background(),
+		ctrl.Request{NamespacedName: client.ObjectKey{
+			Namespace: run.Namespace,
+			Name:      run.Name,
+		}},
+	); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+
+	var current signalv1.CertificationRun
+	if err := kube.Get(
+		context.Background(),
+		client.ObjectKey{Namespace: run.Namespace, Name: run.Name},
+		&current,
+	); err != nil {
+		t.Fatalf("get cleaned Run: %v", err)
+	}
+
+	if slices.Contains(current.Finalizers, RunFinalizer) {
+		t.Fatalf("Run finalizers = %#v", current.Finalizers)
+	}
+	if current.Status.Evidence.URI != "" ||
+		current.Status.Evidence.Digest != "" ||
+		current.Status.Evidence.Identity == nil {
+		t.Fatalf("partial evidence status was rewritten: %#v", current.Status.Evidence)
+	}
+}
+
 func TestResolvedCleanupWaitsForAndFencesChildWorkflowsAndPods(t *testing.T) {
 	t.Parallel()
 
@@ -1101,6 +1274,7 @@ func TestResolvePhasePlanEnforcesCertificationTestTrust(t *testing.T) {
 			}
 
 			contentDigest := "sha256:" + strings.Repeat("a", 64)
+
 			test := &signalv1.CertificationTest{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:       "generic-test",
@@ -1183,6 +1357,7 @@ func TestResolvePhasePlanEnforcesCertificationTestTrust(t *testing.T) {
 					}},
 				},
 			}
+
 			if tt.largeInputs {
 				for _, name := range []string{"first", "second"} {
 					value := strings.Repeat("x", 60*1024)
@@ -1329,6 +1504,112 @@ func resolvedWorkflowTestRun() *signalv1.CertificationRun {
 
 func testDurationPointer(value time.Duration) *metav1.Duration {
 	return &metav1.Duration{Duration: value}
+}
+
+func TestCompletedStageSummariesReadsImmutableResultBeforeWorkflowTermination(t *testing.T) {
+	t.Parallel()
+
+	node := qualificationNode("node", "node-uid", "boot-a")
+	run, summary, runnerImage := resolvedTerminalTestRun(
+		t,
+		node,
+		signalv1.StageVerdictPassed,
+		false,
+	)
+	run.Namespace = "signal-system"
+
+	throughput := "30.0"
+	summary.Measurements = []signalv1.MetricMeasurement{{
+		Name: "throughput",
+		Value: signalv1.TypedValue{
+			Type:         signalv1.TypedValueTypeDecimal,
+			DecimalValue: &throughput,
+		},
+	}}
+
+	content, err := json.Marshal(summary)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	immutable := true
+	controller := true
+	workflow := &unstructured.Unstructured{}
+	workflow.SetGroupVersionKind(workflowGVK)
+	workflow.SetName("active-workflow")
+	workflow.SetNamespace(run.Namespace)
+	workflow.SetUID("workflow-uid")
+
+	result := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      stageResultName(run.Name, 0, 0),
+			Namespace: run.Namespace,
+			Labels: map[string]string{
+				SnapshotRunLabel: run.Name,
+			},
+			Annotations: map[string]string{
+				stageResultRunUID:       string(run.UID),
+				stageResultPlanDigest:   run.Spec.PlanDigest,
+				stageResultPhaseOrder:   "0",
+				stageResultStageOrder:   "0",
+				stageResultDigest:       digestBytes(content),
+				stageResultRunnerImages: `["` + runnerImage + `"]`,
+			},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: workflow.GetAPIVersion(),
+				Kind:       workflow.GetKind(),
+				Name:       workflow.GetName(),
+				UID:        workflow.GetUID(),
+				Controller: &controller,
+			}},
+		},
+		Immutable:  &immutable,
+		BinaryData: map[string][]byte{checkResultDataKey: content},
+	}
+
+	stage := run.Spec.ResolvedPlan.Phases[0].Stages[0]
+	test := &signalv1.CertificationTest{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       stage.Test.Identity.Name,
+			UID:        stage.Test.Identity.UID,
+			Generation: stage.Test.Identity.Generation,
+		},
+		Spec: signalv1.CertificationTestSpec{
+			Metrics:  stage.Test.Metrics,
+			Topology: stage.Test.Topology,
+			Driver:   stage.Test.Driver,
+		},
+		Status: signalv1.CertificationTestStatus{
+			ObservedGeneration: stage.Test.Identity.Generation,
+			Trust: &signalv1.CertificationTestTrustStatus{
+				State:         stage.Test.Identity.Trust,
+				ContentDigest: stage.Test.Identity.ContentDigest,
+			},
+		},
+	}
+
+	scheme := qualificationScheme(t)
+	kube := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node, result, test).
+		Build()
+	reconciler := &RunReconciler{Client: kube, APIReader: kube}
+
+	stages, images, err := reconciler.completedStageSummaries(
+		t.Context(),
+		workflow,
+		run,
+	)
+	if err != nil {
+		t.Fatalf("completedStageSummaries() error = %v", err)
+	}
+
+	if len(stages) != 1 ||
+		len(stages[0].Measurements) != 1 ||
+		stages[0].Measurements[0].Name != "throughput" ||
+		!slices.Equal(images, []string{runnerImage}) {
+		t.Fatalf("stages = %#v, images = %#v", stages, images)
+	}
 }
 
 func resolvedTerminalTestRun(

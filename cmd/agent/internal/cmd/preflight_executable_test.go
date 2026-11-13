@@ -33,26 +33,39 @@ func TestPreflightExecutableJSONFailure(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(device, "vendor"), []byte("0x10de\n"), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(device, "class"), []byte("0x030200\n"), 0o644))
 
-	// Redirect only hardware discovery paths in the test build. Keep the actual
-	// executable entry point, NVIDIA query, report writer, and error handler.
-	sourcePath := filepath.Join(root, "pkg/agent/phases/host/preflight_nvidia.go")
-	source, err := os.ReadFile(sourcePath)
-	require.NoError(t, err)
+	// Redirect only hardware discovery paths and the install-state store in
+	// the test build. Keep the actual executable entry point, NVIDIA query,
+	// report writer, and error handler.
+	replace := map[string]string{}
 
-	sourceText := string(source)
-	for original, replacement := range map[string]string{
-		`pciDevicesDir: "/sys/bus/pci/devices"`: "pciDevicesDir: " + fmt.Sprintf("%q", pciDir),
-		`devDir:        "/dev"`:                 "devDir: " + fmt.Sprintf("%q", deviceDir),
+	for file, replacements := range map[string]map[string]string{
+		"pkg/agent/phases/host/preflight_nvidia.go": {
+			`pciDevicesDir: "/sys/bus/pci/devices"`: "pciDevicesDir: " + fmt.Sprintf("%q", pciDir),
+			`devDir:        "/dev"`:                 "devDir: " + fmt.Sprintf("%q", deviceDir),
+		},
+		// Admission must not read the host's installation record.
+		"cmd/agent/internal/installstate/store.go": {
+			`DefaultDirectory = "/var/lib/unbounded/agent"`: "DefaultDirectory = " + fmt.Sprintf("%q", filepath.Join(dir, "install-state")),
+		},
 	} {
-		require.Contains(t, sourceText, original)
-		sourceText = strings.Replace(sourceText, original, replacement, 1)
+		sourcePath := filepath.Join(root, file)
+		source, err := os.ReadFile(sourcePath)
+		require.NoError(t, err)
+
+		sourceText := string(source)
+		for original, replacement := range replacements {
+			require.Contains(t, sourceText, original)
+			sourceText = strings.Replace(sourceText, original, replacement, 1)
+		}
+
+		overlaySource := filepath.Join(dir, filepath.Base(file))
+		require.NoError(t, os.WriteFile(overlaySource, []byte(sourceText), 0o644))
+		replace[sourcePath] = overlaySource
 	}
 
-	overlaySource := filepath.Join(dir, "preflight_nvidia.go")
-	require.NoError(t, os.WriteFile(overlaySource, []byte(sourceText), 0o644))
 	overlay, err := json.Marshal(struct {
 		Replace map[string]string
-	}{Replace: map[string]string{sourcePath: overlaySource}})
+	}{Replace: replace})
 	require.NoError(t, err)
 
 	overlayPath := filepath.Join(dir, "overlay.json")

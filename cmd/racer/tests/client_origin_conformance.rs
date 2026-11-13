@@ -33,7 +33,8 @@ use racer::read::ReadPayload;
 use racer::read::ReadResponse;
 use racer::runtime::Reactor;
 use racer::runtime::RequestScope;
-use racer_control_wire::CacheId;
+use racer_io::ring::IoBuffer;
+use racer_wire::control::CacheId;
 use std::future::Future;
 use std::io::Read;
 use std::io::Write;
@@ -46,7 +47,6 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::UNIX_EPOCH;
-use uring_runtime::reactor::IoBuffer;
 
 const LIMIT: usize = 32768;
 const P: u64 = 16777216;
@@ -72,6 +72,8 @@ impl Rig {
             queue_entries: n,
             connections_per_neighbor: n,
             client_connections: n,
+            peer_connections: n,
+            outbound_connections: n,
             pipes: n,
             range_window_pages: n,
             header_bytes: NonZeroUsize::new(LIMIT).unwrap(),
@@ -83,7 +85,7 @@ impl Rig {
             metadata_entries: n,
             relay_transfers: n,
         })));
-        let reactor = Rc::new(Reactor::new(admission.clone()));
+        let reactor = Rc::new(Reactor::new(admission.clone(), &racer_io::Env::host()));
         let io = Rc::new(racer::http::new_io(
             reactor.clone(),
             Codec::new(LIMIT),
@@ -120,7 +122,12 @@ impl Rig {
     }
 }
 fn scope() -> RequestScope {
-    RequestScope::new(RequestId([7; 16]), Instant::now() + Duration::from_secs(8)).unwrap()
+    RequestScope::with_clock(
+        RequestId([7; 16]),
+        Instant::now() + Duration::from_secs(8),
+        racer_io::Clock::host(),
+    )
+    .unwrap()
 }
 fn object() -> ObjectId {
     ObjectId {
@@ -524,7 +531,12 @@ fn raw_uds_origin_expiry_rejects_noncanonical_whitespace() {
 #[test]
 fn raw_uds_origin_bootstrap_and_aligned_final_page() {
     let empty = raw_response(head_response("Content-Length: 0\r\nContent-Type: application/octet-stream\r\nETag: \"v\"\r\nRacer-Expires-At: 0\r\n"), "GET").unwrap();
-    assert_eq!(validate_bootstrap(&empty, &object()).unwrap().1, 0);
+    assert_eq!(
+        validate_bootstrap(&empty, &object(), racer::model::PageSize::DEFAULT)
+            .unwrap()
+            .1,
+        0
+    );
     let page = PageId {
         version: ObjectVersion {
             object: object(),
@@ -541,10 +553,13 @@ fn raw_uds_origin_bootstrap_and_aligned_final_page() {
     ] {
         let raw = format!("HTTP/1.1 {status} Result\r\nContent-Length: {length}\r\nContent-Type: application/octet-stream\r\nContent-Range: {range}\r\nETag: {tag}\r\nRacer-Expires-At: 0\r\n\r\n").into_bytes();
         let head = raw_response(raw, "GET").unwrap();
-        assert_eq!(validate_page(&head, &page, length).is_ok(), valid);
+        assert_eq!(
+            validate_page(&head, &page, racer::model::PageSize::DEFAULT, length).is_ok(),
+            valid
+        );
         if valid {
             assert_eq!(
-                validate_page(&head, &page, length - 1),
+                validate_page(&head, &page, racer::model::PageSize::DEFAULT, length - 1),
                 Err(Error::BadGateway)
             );
         }
@@ -1383,7 +1398,9 @@ mod sdk {
                 assert_eq!(validate_metadata(&head, &object()).unwrap().length, 3);
             } else if !fields.contains("If-Match") {
                 assert_eq!(
-                    validate_bootstrap(&head, &object()).unwrap().1,
+                    validate_bootstrap(&head, &object(), racer::model::PageSize::DEFAULT)
+                        .unwrap()
+                        .1,
                     if key == 1 { 0 } else { 3 }
                 );
             } else {
@@ -1394,7 +1411,12 @@ mod sdk {
                     },
                     number: PageNumber(0),
                 };
-                assert_eq!(validate_page(&head, &page, 3).unwrap().length, 3);
+                assert_eq!(
+                    validate_page(&head, &page, racer::model::PageSize::DEFAULT, 3)
+                        .unwrap()
+                        .length,
+                    3
+                );
             }
         }
         child.0.stdin.take().unwrap().write_all(b"x").unwrap();
@@ -1435,7 +1457,10 @@ fn raw_uds_fixed_body_is_not_scanned_for_heads_and_short_eof_is_failure() {
                 .unwrap();
             let sent = rig.io.send_head(rig.lease(local), head, &scope).await?;
             let received = rig.io.receive_head(sent.connection, &scope).await?;
-            assert_eq!(validate_bootstrap(&received.value, &object())?.1, 9);
+            assert_eq!(
+                validate_bootstrap(&received.value, &object(), racer::model::PageSize::DEFAULT)?.1,
+                9
+            );
             let mut connection = received.connection;
             let mut body = Vec::new();
             while body.len() < 9 {
@@ -1517,7 +1542,7 @@ fn raw_uds_sequential_requests_do_not_inherit_opaque_context() {
 
 #[test]
 fn cache_names_validate_dns_labels_and_complete_socket_path() {
-    use racer_control_wire::canonical_socket_paths;
+    use racer_wire::control::canonical_socket_paths;
     for name in ["a", "a-b.c9", "0"] {
         assert!(canonical_socket_paths(name).is_ok());
     }

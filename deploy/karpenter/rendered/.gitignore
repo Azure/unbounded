@@ -1,0 +1,4 @@
+# `make karpenter-manifests` writes the rendered Karpenter plugin manifests
+# here; none of that output is tracked.
+*
+!.gitignore

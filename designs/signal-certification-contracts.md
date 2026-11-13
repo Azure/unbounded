@@ -28,8 +28,6 @@ enabled.
 name; its spec provides an operator display name, owner, version, typed
 parameters, typed metrics, participant topology, a driver, and explicit
 security requirements.
-Root execution is opt-in through `security.allowRoot`; privileged execution
-does not implicitly change the runner image's configured user.
 
 Participant roles are optional. Omitting `topology.roles` and explicitly
 supplying an empty role list are equivalent role-free topologies; per-role
@@ -53,25 +51,6 @@ The trust status is administrator-controlled:
 
 Approval applies to the canonical test content digest, not only the object
 name. A later test generation requires a new approval decision.
-
-## Source plans and generated tests
-
-`CertificationTest` objects are deployment artifacts, not the preferred
-authoring surface for repository-owned scripts. Authors define a versioned
-`CertificationPlan` file, place script or Python sources under its declared
-`spec.sourceRoot`, and select one digest-pinned image from the plan's named
-runtime catalog for each Script or Container driver.
-
-`kubectl unbounded signal render -f <plan>` resolves source paths relative to
-the plan, rejects files outside the declared source root, computes each
-artifact SHA-256, and emits deterministic `CertificationTest` YAML with the
-content embedded. WorkflowTemplate drivers may also attach one source artifact
-while pinning the separately managed template by name and canonical digest.
-
-Generated YAML may be committed for GitOps and direct cluster application, but
-it is never edited by hand. The plan, source files, and digest-pinned runtime
-catalog are authoritative. CI should render the plan and reject stale generated
-output.
 
 ## Suites and scheduling
 

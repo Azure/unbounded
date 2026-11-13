@@ -36,7 +36,10 @@ type config struct {
 }
 
 func main() {
-	var cfg config
+	var (
+		cfg         config
+		metricProxy signaladapter.MetricProxyConfig
+	)
 
 	command := &cobra.Command{
 		Use:     adapterName,
@@ -66,6 +69,32 @@ func main() {
 		"Required ServiceAccount for approved child WorkflowTemplate execution",
 	)
 	flags.StringVar(&cfg.ResultConfigMap, "result-configmap", "", "Immutable check result ConfigMap name")
+
+	metricProxyCommand := &cobra.Command{
+		Use:    "metric-proxy",
+		Short:  "Validate and export bounded stage metric telemetry",
+		Hidden: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			metricProxy.Identity = signaladapter.MetricProxyIdentity{
+				Namespace:       os.Getenv("PROJECT_SIGNAL_NAMESPACE"),
+				Run:             os.Getenv("PROJECT_SIGNAL_RUN_NAME"),
+				RunUID:          os.Getenv("PROJECT_SIGNAL_RUN_UID"),
+				Stage:           os.Getenv("PROJECT_SIGNAL_STAGE_ID"),
+				Invocation:      os.Getenv("PROJECT_SIGNAL_INVOCATION_ID"),
+				ParticipantRole: os.Getenv("PROJECT_SIGNAL_PARTICIPANT_ROLE"),
+				Node:            os.Getenv("PROJECT_SIGNAL_NODE_NAME"),
+			}
+
+			return signaladapter.RunMetricProxy(cmd.Context(), metricProxy)
+		},
+	}
+	metricProxyFlags := metricProxyCommand.Flags()
+	metricProxyFlags.StringVar(&metricProxy.ContractJSON, "contract-json", "", "Resolved metric declaration JSON")
+	metricProxyFlags.StringVar(&metricProxy.RecordsPath, "records", "", "Workload metric record stream")
+	metricProxyFlags.StringVar(&metricProxy.DonePath, "done", "", "Workload completion marker")
+	metricProxyFlags.IntVar(&metricProxy.Port, "port", 9464, "Prometheus metrics port")
+	metricProxyFlags.DurationVar(&metricProxy.FinalGrace, "final-grace", 10*time.Second, "Final scrape grace period")
+	command.AddCommand(metricProxyCommand)
 
 	command.CompletionOptions.DisableDefaultCmd = true
 
@@ -125,6 +154,7 @@ func run(ctx context.Context, cfg config) error {
 			Runner:                 runner,
 			Namespace:              cfg.Namespace,
 			WorkflowName:           cfg.WorkflowName,
+			RunName:                cfg.RunName,
 			ExecutionName:          cfg.ExecutionName,
 			WorkflowServiceAccount: cfg.WorkflowServiceAccount,
 		}

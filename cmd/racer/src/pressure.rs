@@ -343,6 +343,9 @@ pub(crate) struct PressureActions {
     pub(crate) clear_idle_connections: bool,
     /// Memory-cache reclaim quanta to run per tick.
     pub(crate) reclaim_cache_quanta: usize,
+    /// Release memory-cache entries idle for `racer_core::cache::IDLE_TTL`.
+    /// Off at Normal so cached data stays until its space is reclaimed.
+    pub(crate) expire_idle_cache: bool,
     pub(crate) trim_allocator: bool,
 }
 
@@ -353,6 +356,7 @@ pub(crate) fn pressure_actions(level: PressureLevel) -> PressureActions {
         reclaim_idle_buffers: true,
         clear_idle_connections: true,
         reclaim_cache_quanta: 0,
+        expire_idle_cache: true,
         trim_allocator: true,
     };
     match level {
@@ -689,6 +693,10 @@ mod tests {
         assert!(elevated.constrain_pools && elevated.reclaim_idle_buffers);
         assert!(elevated.clear_idle_connections && elevated.trim_allocator);
         assert_eq!(elevated.reclaim_cache_quanta, 0);
+        // Idle cache entries persist at Normal and expire under pressure.
+        assert!(!pressure_actions(Normal).expire_idle_cache);
+        assert!(elevated.expire_idle_cache);
+        assert!(pressure_actions(Critical).expire_idle_cache);
         assert_eq!(
             pressure_actions(Critical),
             PressureActions {

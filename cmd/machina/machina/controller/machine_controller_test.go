@@ -753,6 +753,50 @@ func TestMachineReconciler_Provisioning_RetryFromFailed(t *testing.T) {
 	require.Equal(t, RequeueAfterJoining, result.RequeueAfter)
 }
 
+// A Machine that declares the experimental container mode is not provisioned
+// unless machina enables it, and an enabled machina opts the agent in.
+func TestMachineReconciler_Provisioning_ExperimentalContainerIsolation(t *testing.T) {
+	t.Parallel()
+
+	for _, enabled := range []bool{false, true} {
+		s := newTestScheme(t)
+
+		machine := newTestMachine("test-machine", "10.0.0.1:22", "testuser", defaultKubernetes())
+		machine.Spec.Isolation = unboundedv1alpha3.IsolationContainer
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(s).
+			WithObjects(machine, newSSHKeySecret(t, "ssh-key-secret"), newBootstrapTokenSecret("bootstrap-token-abc123")).
+			WithStatusSubresource(machine).
+			Build()
+
+		provisioner := &mockProvisioner{}
+		reconciler := &MachineReconciler{
+			Client:                         fakeClient,
+			Scheme:                         s,
+			ReachabilityChecker:            &mockReachabilityChecker{},
+			Provisioner:                    provisioner,
+			ClusterInfo:                    &ClusterInfo{},
+			ExperimentalContainerIsolation: enabled,
+		}
+
+		req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-machine"}}
+
+		_, err := reconciler.Reconcile(context.Background(), req)
+		require.NoError(t, err)
+		require.Equal(t, enabled, provisioner.called, "enabled=%v", enabled)
+
+		if enabled {
+			continue
+		}
+
+		var got unboundedv1alpha3.Machine
+		require.NoError(t, fakeClient.Get(context.Background(), req.NamespacedName, &got))
+		require.Equal(t, unboundedv1alpha3.MachinePhaseFailed, got.Status.Phase)
+		require.Contains(t, got.Status.Message, "experimentalContainerIsolation")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Helper function tests
 // ---------------------------------------------------------------------------

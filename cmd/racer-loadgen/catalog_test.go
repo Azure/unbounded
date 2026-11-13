@@ -138,6 +138,22 @@ func TestCatalogTraversalCompletePasses(t *testing.T) {
 	}
 }
 
+func TestCatalogSweepSharesOnePassAcrossWorkers(t *testing.T) {
+	p := &puller{opts: pullOptions{Profile: profileSweep}}
+	p.batches = make([]blobBatch, 5)
+	workers := []catalogTraversal{p.newTraversal(), p.newTraversal(), p.newTraversal()}
+
+	var got []int
+
+	for i := range 10 {
+		got = append(got, workers[i%len(workers)].nextIndex(5))
+	}
+
+	require.Equal(t, []int{0, 1, 2, 3, 4, 0, 1, 2, 3, 4}, got)
+	require.NoError(t, validateProfile(profileSweep, defaultZipfExponent))
+	require.Error(t, validateProfile("sequential", defaultZipfExponent))
+}
+
 func TestCatalogWorkerTraversalAndVerifiedBytes(t *testing.T) {
 	for _, fail := range []bool{false, true} {
 		t.Run(fmt.Sprintf("failure=%t", fail), func(t *testing.T) {

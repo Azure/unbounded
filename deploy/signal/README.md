@@ -48,8 +48,10 @@ fleet scheduling are intentionally deferred.
 - `project-signal-prometheus` scrapes controller metrics every 15 seconds and
   retains up to 24 hours or 1 GiB in namespace-local ephemeral storage.
 
-Argo Workflows is required. The Kubeflow MPI Operator is required only for
-legacy Suites that still contain an `MPIJob` check.
+Argo Workflows is required. The Kubeflow MPI Operator is required when a
+Suite's bound WorkflowTemplates create `MPIJob` resources, including the
+private R03 and R05 certification stages; the public native stage model does
+not otherwise require it.
 
 ## First deployment
 
@@ -69,6 +71,12 @@ digest in the controller arguments. Supplying
 `SIGNAL_WORKFLOW_TEMPLATE_DIGEST=sha256:<digest>` turns that value into an
 expected digest and makes rendering fail if the rendered template differs.
 Controller, adapter, and runner images must all be immutable digest references.
+The certification runner is built from
+`images/project-signal-certification-runner/` and published through the
+repository `images.yaml` workflow as `project-signal-certification-runner`.
+Run `python3 images/project-signal-certification-runner/build.py check` before
+publication; private packages separately bind their exact script revision and
+per-script hashes and do not place scripts in the runner image.
 Set `SIGNAL_RESOLVER_IMAGES` to a comma-separated list of digest-pinned
 resolver images when external input resolution is part of the accepted plan.
 Those images are recorded in immutable plan and evidence provenance.
@@ -759,9 +767,54 @@ and evidence digests, and credits only evidence that satisfies the Policy.
 
 The static package deploys a namespace-local Prometheus scraper. Its in-cluster
 query API is available from the `project-signal-prometheus` Service on port
-`9090`. The scraper has no Kubernetes API token and no external ingress.
-Restarting its Pod discards the local time series; certification evidence
-remains durable in immutable evidence ConfigMaps independently of Prometheus.
+`9090`. Its ServiceAccount can only get, list, and watch Pods in the Signal
+namespace for annotated workload discovery; it has no mutation privileges or
+external ingress. Restarting its Pod discards the local time series;
+certification evidence remains durable in immutable evidence ConfigMaps
+independently of Prometheus.
+
+After each stage completes, the controller validates the immutable stage result
+and publishes its bounded typed measurement projection in Run status while the
+parent Workflow continues. It exports numeric completed measurements as
+`project_signal_fleet_certification_measurement`; compatibility projections such
+as the completed R07 minimum derive from the same state. Script metrics may
+declare a bounded telemetry contract with a live
+gauge mode, allowed dimensions, series and sample limits, and an optional final
+evidence aggregation. Workloads append generic JSON measurement records; the
+credential-free adapter sidecar validates them, injects Run/stage/participant
+identity, and exports `project_signal_certification_metric` plus optional
+`project_signal_certification_metric_sample` series. The namespace-local
+Prometheus discovers only those annotated Pods and scrapes every five seconds.
+The sidecar remains available for a final scrape, then exits with the attempt so
+its live series become stale. Invalid or over-limit records fail closed. Live
+series are operational telemetry only; qualification uses validated final
+measurements in the immutable stage result and digest-covered evidence. The
+final evidence URI and digest remain unset until terminal evidence publication.
+
+A declared metric and workload record use this shape:
+
+```yaml
+- name: gpu0MinTflops
+  displayName: BF16 GPU 0 minimum throughput
+  type: Throughput
+  unit: TFLOP/s
+  required: true
+  telemetry:
+    live: GaugeAndSamples
+    dimensions: [dtype, gpu, workload]
+    seriesLimit: 1
+    sampleLimit: 2
+    evidence: Minimum
+```
+
+```json
+{"metric":"gpu0MinTflops","value":123.5,"dimensions":{"dtype":"bf16","gpu":"gpu-index-0","workload":"torch-mm"}}
+```
+
+The runtime rejects undeclared metrics or dimensions, non-finite values,
+incomplete records, and series or sample overflow. Dashboard queries select
+`project_signal_certification_metric` by `metric_id` and the declared
+dimensions; trusted identity labels are added separately.
 
 Inspect Runs and lifecycle conditions:
 

@@ -18,6 +18,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
+	agentdaemon "github.com/Azure/unbounded/pkg/agent/daemon"
 )
 
 func outOfBandOperation(name, machineRef string, kind v1alpha3.OperationKind) *v1alpha3.MachineOperation {
@@ -228,7 +230,8 @@ func TestReconcileHostSoftReboot_ReadsMachineFromAPIReader(t *testing.T) {
 	c := fakeStatusClient(cached, hostSoftRebootOperation("op-soft"))
 	apiReader := fakeStatusClient(fresh, outOfBand)
 	reconciler := newTestMachinaMachineOperationReconcilerWithLockPath(
-		t, c, op, filepath.Join(t.TempDir(), "agent-upgrade.lock"), apiReader)
+		t, c, op, filepath.Join(t.TempDir(), "agent-upgrade.lock"), apiReader,
+	)
 
 	result, err := reconciler.ReconcileMachineOperation(context.Background(), "op-soft")
 	require.NoError(t, err)
@@ -272,10 +275,70 @@ func TestIsOutOfBandHostOperation(t *testing.T) {
 		v1alpha3.OperationNodeReboot:     false,
 		v1alpha3.OperationAgentUpgrade:   false,
 		v1alpha3.OperationAgentReset:     false,
+		v1alpha3.OperationHostAllocate:   false,
+		v1alpha3.OperationHostRelease:    false,
 	}
 
 	for kind, want := range tests {
 		assert.Equal(t, want, isOutOfBandHostOperation(kind), kind)
+	}
+}
+
+func TestReconcileHostSoftReboot_IgnoresAllocationOperations(t *testing.T) {
+	for _, kind := range []v1alpha3.OperationKind{v1alpha3.OperationHostAllocate, v1alpha3.OperationHostRelease} {
+		for _, phase := range []v1alpha3.OperationPhase{"", v1alpha3.OperationPhaseInProgress} {
+			name := string(phase)
+			if name == "" {
+				name = "NoPhase"
+			}
+
+			t.Run(string(kind)+"/"+name, func(t *testing.T) {
+				machine := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "test-machine", Generation: 4}}
+				allocation := outOfBandOperation("op-allocation", "test-machine", kind)
+				allocation.Spec.AllocationRef = &v1alpha3.UIDReference{Name: "alloc-1", UID: "alloc-1-uid"}
+				allocation.Status.Phase = phase
+				op := &fakeNodeOperator{bootID: "boot-1"}
+				c := fakeStatusClient(machine, allocation, hostSoftRebootOperation("op-soft"))
+				reconciler := newTestMachinaMachineOperationReconciler(t, c, op)
+
+				before := getMachineOperation(t, c, "op-allocation")
+
+				result, err := reconciler.ReconcileMachineOperation(context.Background(), "op-soft")
+				require.NoError(t, err)
+				assert.Zero(t, result.RequeueAfter)
+				assert.Equal(t, 1, op.rebootCalls, "an allocation operation must not hold off a HostSoftReboot")
+
+				started := getMachineOperation(t, c, "op-soft")
+				assert.Equal(t, v1alpha3.OperationPhaseInProgress, started.Status.Phase)
+				assert.NotContains(t, started.Status.Message, "waiting for out-of-band host operation")
+
+				after := getMachineOperation(t, c, "op-allocation")
+				assert.Equal(t, before.Status, after.Status)
+			})
+		}
+	}
+}
+
+func TestUnfinishedOutOfBandHostOperation_IgnoresAllocationOperations(t *testing.T) {
+	machine := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "test-machine"}}
+
+	for _, kind := range []v1alpha3.OperationKind{v1alpha3.OperationHostAllocate, v1alpha3.OperationHostRelease} {
+		t.Run(string(kind), func(t *testing.T) {
+			allocation := outOfBandOperation("op-allocation", "test-machine", kind)
+			allocation.Spec.AllocationRef = &v1alpha3.UIDReference{Name: "alloc-1", UID: "alloc-1-uid"}
+			allocation.CreationTimestamp = metav1.NewTime(time.Unix(100, 0))
+
+			blocker, err := unfinishedOutOfBandHostOperation(context.Background(), fakeStatusClient(allocation), machine)
+			require.NoError(t, err)
+			assert.Empty(t, blocker)
+
+			powerOff := outOfBandOperation("op-power-off", "test-machine", v1alpha3.OperationHostPowerOff)
+			powerOff.CreationTimestamp = metav1.NewTime(time.Unix(200, 0))
+
+			blocker, err = unfinishedOutOfBandHostOperation(context.Background(), fakeStatusClient(allocation, powerOff), machine)
+			require.NoError(t, err)
+			assert.Equal(t, "op-power-off", blocker)
+		})
 	}
 }
 
@@ -421,4 +484,46 @@ func TestMarkHostSoftRebootWaiting_IgnoresDeletedOperation(t *testing.T) {
 	c := fakeStatusClient()
 
 	require.NoError(t, markHostSoftRebootWaiting(context.Background(), c, "op-soft", "waiting"))
+}
+
+// A reprovision handoff defers every MachineOperation before its handler runs,
+// so a HostSoftReboot that an out-of-band host operation would also hold is
+// left as it was: Pending, with no waiting message, and no requeue, for the
+// daemon the handoff installs to pick up.
+func TestReconcileHostSoftReboot_AHandoffDefersItBeforeTheOutOfBandCheck(t *testing.T) {
+	machine := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "test-machine", Generation: 4}}
+	outOfBand := outOfBandOperation("op-oob", "test-machine", v1alpha3.OperationHostPowerOff)
+	outOfBand.Status.Phase = v1alpha3.OperationPhaseInProgress
+	op := &fakeNodeOperator{bootID: "boot-1"}
+	c := fakeStatusClient(machine, outOfBand, hostSoftRebootOperation("op-soft"))
+
+	handoff := &handoffState{}
+	handoff.set()
+
+	target := &machineOperationTarget{
+		installation: installstate.NewStore(filepath.Join(t.TempDir(), "state"), filepath.Join(t.TempDir(), "install.lock")),
+		Client:       c,
+		log:          discardLogger(),
+		machineName:  "test-machine",
+		nodeOperator: op,
+		handoff:      handoff,
+	}
+
+	result, err := target.handlers()[v1alpha3.OperationHostSoftReboot](context.Background(), nil, agentdaemon.MachineOperation{Name: "op-soft", Kind: v1alpha3.OperationHostSoftReboot})
+	require.NoError(t, err)
+	assert.Zero(t, result.RequeueAfter)
+	assert.Zero(t, op.rebootCalls)
+
+	soft := getMachineOperation(t, c, "op-soft")
+	assert.Empty(t, soft.Status.Phase)
+	assert.Empty(t, soft.Status.Message, "the out-of-band check does not run during a handoff")
+
+	// Without the handoff, the out-of-band operation holds it.
+	target.handoff = &handoffState{}
+
+	result, err = target.handlers()[v1alpha3.OperationHostSoftReboot](context.Background(), nil, agentdaemon.MachineOperation{Name: "op-soft", Kind: v1alpha3.OperationHostSoftReboot})
+	require.NoError(t, err)
+	assert.Equal(t, hostSoftRebootWaitInterval, result.RequeueAfter)
+	assert.Zero(t, op.rebootCalls)
+	assert.Equal(t, "waiting for out-of-band host operation op-oob", getMachineOperation(t, c, "op-soft").Status.Message)
 }

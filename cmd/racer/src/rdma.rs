@@ -10,30 +10,33 @@ use crate::model::PageId;
 use crate::model::TransferId;
 use crate::peer::protocol::VerifiedHead;
 use crate::runtime::RequestScope;
-use crate::security::PageCryptoEngine;
 use crate::topology::FAILURE_LINKS;
 use crate::topology::Route;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 #[cfg(test)]
-use racer_control_wire::MembershipVersion;
-use racer_control_wire::NodeId;
-use racer_control_wire::RailId;
-use racer_control_wire::RailMapping;
+use racer_wire::control::MembershipVersion;
+use racer_wire::control::NodeId;
+use racer_wire::control::RailId;
+use racer_wire::control::RailMapping;
+#[cfg(test)]
 use rdma_verbs::PortInfo;
-use rdma_verbs::discovery::Binding;
 use sha2::Digest;
 use sha2::Sha256;
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::future::poll_fn;
+#[cfg(test)]
 use std::path::Path;
 use std::rc::Rc;
 use std::task::Poll;
 
+pub(crate) mod breaker;
+mod discovery;
 pub(crate) mod link_setup;
 pub(crate) mod links;
 mod retry;
+mod setup;
 pub use links::AuthenticatedGrant;
 pub use links::BUFFER_LEN;
 pub use links::GRANT_HEADER;
@@ -44,18 +47,16 @@ pub use links::PendingReceive;
 pub use links::SETUP_DEADLINE;
 pub use links::SetupAdmission;
 pub use links::SetupAttempt;
+pub use links::SetupOutcome;
 pub use links::buffer_count;
 pub use links::grants_per_link;
 pub use links::link_key;
 use retry::NativeRetry;
 
-/// Host the node's link owner beside page crypto on its paired thread.
-pub type WithOwner = rdma_verbs::WithNative<PageCryptoEngine, rdma_verbs::Owner>;
-
 // Match discovered ports to trusted local fabric associations and publication.
 // Fabric strings are opaque labels: a GID or enumeration order is never a label.
 // Public contracts always compile; native FFI is gated by `rdma`. The node owner
-// runs on one crypto thread (`WithOwner`); I/O workers use `Links`.
+// runs on its own thread (`rdma_verbs::OwnerRole`); I/O workers use `Links`.
 
 /// Signed setup extension of an `RdmaLink` request and response.
 pub const SETUP_HEADER: &str = "racer-rdma-setup";
@@ -106,145 +107,16 @@ fn validate_native_page_size(page_size: libc::c_long) -> Result<()> {
         Err(Error::Unavailable)
     }
 }
-/// Match authenticated physical bindings against live eligible verbs ports.
-pub fn match_publication(
-    publication: &[RailMapping],
-    discovered: &[PortInfo],
-) -> Result<Vec<(RailMapping, usize)>> {
-    Ok(rdma_verbs::discovery::match_ports(
-        &publication.iter().map(binding).collect::<Vec<_>>(),
-        discovered,
-    )?
-    .into_iter()
-    .map(|(port, index)| (mapping(port), index))
-    .collect())
-}
-
-// Pre-enrollment inventory and deterministic per-worker physical NIC selection.
-
-/// Shared durable-journal bound for admission, restoration, and enrollment I/O.
-pub use rdma_verbs::discovery::MAX_JOURNAL_BYTES;
-
-/// One process-wide inventory, shared by enrollment and every worker. Withdrawn
-/// ports keep their rail reservation: neither outages nor GID changes renumber
-/// surviving ports. Enrollment persists reservations across process restarts.
-#[derive(Default)]
-pub struct Inventory(rdma_verbs::discovery::Inventory);
-
-/// Local discovery snapshot translated into Racer publication types.
-#[derive(Clone, Default)]
-pub struct Snapshot {
-    pub generation: u64,
-
-    pub nics: Vec<RailMapping>,
-}
-
-impl Inventory {
-    pub fn generation(&self) -> u64 {
-        self.0.generation()
-    }
-    /// Read the shared physical inventory using Racer's publication types.
-    pub fn snapshot(&self) -> Result<Snapshot> {
-        Ok(snapshot(self.0.snapshot()?))
-    }
-
-    /// Optional transport discovery failures withdraw RDMA, not HTTP service.
-    pub fn refresh(&self) -> Result<Snapshot> {
-        self.update(inventory())
-    }
-
-    /// Publish discovered ports while preserving their durable physical labels.
-    pub fn update(&self, nics: Vec<RailMapping>) -> Result<Snapshot> {
-        Ok(snapshot(self.0.update(nics.iter().map(binding).collect())?))
-    }
-
-    /// Keep the existing enrollment journal representation unchanged.
-    pub fn reservations(&self) -> Result<Vec<u8>> {
-        self.0.reservations().map_err(Into::into)
-    }
-
-    /// Restore before issuance, never discard a corrupt journal and renumber.
-    pub fn restore(&self, bytes: &[u8]) -> Result<()> {
-        self.0.restore(bytes).map_err(|error| match error {
-            rdma_verbs::Error::InvalidRequest => Error::CorruptRecord,
-            other => other.into(),
-        })
-    }
-}
-
-/// Erase application rail identity before passing physical bindings to verbs.
-fn binding(nic: &RailMapping) -> Binding {
-    Binding {
-        rail: nic.rail.0,
-        device: nic.device.clone(),
-        port: nic.port,
-        gid: nic.gid,
-        numa_node: nic.numa_node,
-    }
-}
-
-/// Restore application identity after physical discovery, without authorizing it.
-fn mapping(nic: Binding) -> RailMapping {
-    RailMapping {
-        rail: RailId(nic.rail),
-        device: nic.device,
-        port: nic.port,
-        gid: nic.gid,
-        numa_node: nic.numa_node,
-    }
-}
-
-/// Convert the physical snapshot at the application boundary.
-fn snapshot(snapshot: rdma_verbs::discovery::Snapshot) -> Snapshot {
-    Snapshot {
-        generation: snapshot.generation,
-        nics: snapshot.nics.into_iter().map(mapping).collect(),
-    }
-}
-
-/// Discovery failures are optional-transport failures, never HTTP startup failures.
-pub fn inventory() -> Vec<RailMapping> {
-    inventory_at(
-        rdma_verbs::inventory().unwrap_or_default(),
-        Path::new("/sys/class/infiniband"),
-    )
-}
-
-fn inventory_at(ports: Vec<PortInfo>, root: &Path) -> Vec<RailMapping> {
-    rdma_verbs::discovery::inventory_at(ports, root)
-        .into_iter()
-        .take(64)
-        .enumerate()
-        .map(|(i, p)| RailMapping {
-            device: p.device,
-            port: p.port,
-            rail: RailId(i as u16),
-            gid: Some(p.gid),
-            numa_node: p.numa_node,
-        })
-        .collect()
-}
-
-/// Select at most one device per rail. Explicit NUMA overrides detected locality;
-/// prefer local, then unknown, then remote, spreading equal candidates by worker.
-pub fn select_worker(
-    published: &[RailMapping],
-    discovered: &[RailMapping],
-    worker: usize,
-    numa: Option<usize>,
-    capacity: usize,
-) -> Vec<RailMapping> {
-    rdma_verbs::discovery::select_worker(
-        &published.iter().map(binding).collect::<Vec<_>>(),
-        &discovered.iter().map(binding).collect::<Vec<_>>(),
-        worker,
-        numa,
-        capacity,
-    )
-    .into_iter()
-    .map(mapping)
-    .collect()
-}
+// Pre-enrollment inventory, the durable rail journal, and per-worker NUMA
+// selection live in `discovery`; `rdma_verbs` only enumerates ports.
+#[cfg(test)]
+use discovery::inventory_at;
+pub use discovery::{
+    DEV_CHAR, Inventory, MAX_JOURNAL_BYTES, RailPresence, SYSFS_INFINIBAND, SYSFS_INFINIBAND_VERBS,
+    Snapshot, char_devices_present, device_active, device_discoverable, discoverable_devices,
+    inventory, match_publication, rail_devices, rail_presence, refresh_char_devices, select_worker,
+    verbs_char_devices,
+};
 
 // RDMA requires compatible authenticated mappings; discovery can only veto.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -265,8 +137,8 @@ pub fn select(route: &Route, page: &PageId) -> Result<TransportPlan> {
 pub fn select_hop(
     route: &Route,
     page: &PageId,
-    local: &racer_control_wire::NodeId,
-    peer: &racer_control_wire::NodeId,
+    local: &racer_wire::control::NodeId,
+    peer: &racer_wire::control::NodeId,
 ) -> Result<TransportPlan> {
     validate_route(route)?;
     if !route.nodes.windows(2).any(|pair| {
@@ -296,8 +168,8 @@ pub fn select_hop(
 pub fn is_overflow(
     membership: &crate::topology::Membership,
     page: &PageId,
-    local: &racer_control_wire::NodeId,
-    peer: &racer_control_wire::NodeId,
+    local: &racer_wire::control::NodeId,
+    peer: &racer_wire::control::NodeId,
 ) -> bool {
     let (Ok(a), Ok(b)) = (membership.member(local), membership.member(peer)) else {
         return false;
@@ -305,6 +177,62 @@ pub fn is_overflow(
     membership.is_neighbor(local, peer)
         && rail_plan(membership, &[a, b], page).is_some()
         && !is_rdma_edge(membership, local, peer)
+}
+
+/// Why a peer page exchange was planned over HTTP although this node
+/// publishes RDMA rails.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HttpPlanReason {
+    /// Both ends share a nonempty Site and publish rails, but not the page's
+    /// hashed rail.
+    NoRail,
+    /// The ends differ in Site, have no Site, or the peer publishes no rails.
+    Ineligible,
+    /// The hop qualifies by Site and rail but is not an RDMA edge.
+    Overflow,
+    /// The exchange was sent directly over HTTP by request.
+    DirectHttp,
+}
+
+impl HttpPlanReason {
+    /// The metric event for this reason.
+    pub fn event(self) -> crate::telemetry::Event {
+        use crate::telemetry::Event;
+        match self {
+            Self::NoRail => Event::RdmaPlanHttpNoRail,
+            Self::Ineligible => Event::RdmaPlanHttpIneligible,
+            Self::Overflow => Event::RdmaPlanHttpOverflow,
+            Self::DirectHttp => Event::RdmaPlanHttpDirect,
+        }
+    }
+}
+
+/// Classify an HTTP plan for `page` from `local` to `peer`. `None` when this
+/// node publishes no rails (RDMA is off here, so HTTP is expected) or when
+/// either node is not a member.
+pub fn http_plan_reason(
+    membership: &crate::topology::Membership,
+    page: &PageId,
+    local: &racer_wire::control::NodeId,
+    peer: &racer_wire::control::NodeId,
+    direct_http: bool,
+) -> Option<HttpPlanReason> {
+    let (Ok(a), Ok(b)) = (membership.member(local), membership.member(peer)) else {
+        return None;
+    };
+    if a.rails.is_empty() {
+        return None;
+    }
+    if direct_http {
+        return Some(HttpPlanReason::DirectHttp);
+    }
+    if a.site.is_empty() || a.site != b.site || b.rails.is_empty() {
+        return Some(HttpPlanReason::Ineligible);
+    }
+    if rail_plan(membership, &[a, b], page).is_none() {
+        return Some(HttpPlanReason::NoRail);
+    }
+    Some(HttpPlanReason::Overflow)
 }
 
 /// The symmetric RDMA eligibility of an edge: both ends are in the same
@@ -372,8 +300,8 @@ impl RdmaEdges {
 /// [`crate::topology::RDMA_PEERS`] best ranked eligible edges.
 pub fn is_rdma_edge(
     membership: &crate::topology::Membership,
-    a: &racer_control_wire::NodeId,
-    b: &racer_control_wire::NodeId,
+    a: &racer_wire::control::NodeId,
+    b: &racer_wire::control::NodeId,
 ) -> bool {
     let (Ok(pa), Ok(pb)) = (membership.position(a), membership.position(b)) else {
         return false;
@@ -392,6 +320,26 @@ pub fn is_rdma_edge(
             .peers(membership, pb)
             .binary_search(&pa)
             .is_ok()
+}
+
+/// Every peer whose edge to `local` uses RDMA (see [`is_rdma_edge`]).
+/// Empty when `local` is not a member.
+pub fn rdma_edge_peers(
+    membership: &crate::topology::Membership,
+    local: &racer_wire::control::NodeId,
+) -> Vec<racer_wire::control::NodeId> {
+    let Ok(position) = membership.position(local) else {
+        return Vec::new();
+    };
+    let members = membership.members();
+    membership
+        .rdma_edges
+        .peers(membership, position)
+        .iter()
+        .map(|&peer| &members[peer].node)
+        .filter(|peer| is_rdma_edge(membership, local, peer))
+        .cloned()
+        .collect()
 }
 
 fn validate_route(route: &Route) -> Result<()> {
@@ -451,6 +399,54 @@ fn rail_plan(
     Some(rail)
 }
 
+/// Whether a hop planned as `plan` may carry its page on `chosen`, the rail
+/// the receiver named in its signed `Accept`: the plan is RDMA and both ends
+/// publish `chosen` in the membership's rail domain. The receiver picks the
+/// rail (see [`receiver_rail`]), so `chosen` need not be the page's hashed
+/// rail.
+pub fn admits_rail(
+    plan: TransportPlan,
+    membership: &crate::topology::Membership,
+    local: &racer_wire::control::NodeId,
+    peer: &racer_wire::control::NodeId,
+    chosen: RailId,
+) -> bool {
+    let (Ok(a), Ok(b)) = (membership.member(local), membership.member(peer)) else {
+        return false;
+    };
+    matches!(plan, TransportPlan::Rdma { .. })
+        && membership.rail_domain().contains(&chosen)
+        && [a, b]
+            .iter()
+            .all(|m| m.rails.iter().any(|r| r.rail == chosen))
+}
+
+/// The rail a receiver grants `page` on, given the page's hashed rail
+/// `planned` and the ready rails whose NIC shares the receiving worker's
+/// NUMA node (`local`), so the NIC writes and the worker copies memory on
+/// one node.
+///
+/// Keeps `planned` when it is local or no rail is. Otherwise picks one of
+/// `local` by an independent hash of the page, so pages whose hashed rail is
+/// remote spread evenly over the local rails. With rails split evenly across
+/// nodes and workers spread evenly across them, every rail stays evenly used.
+pub fn receiver_rail(page: Option<&PageId>, planned: RailId, local: &[RailId]) -> RailId {
+    if local.is_empty() || local.contains(&planned) {
+        return planned;
+    }
+    let Some(page) = page else {
+        return planned;
+    };
+    let mut local = local.to_vec();
+    local.sort_unstable();
+    local.dedup();
+    let mut digest = crate::topology::hash_domain(b"racer/rail-numa/v1\0");
+    crate::topology::hash_object(&mut digest, &page.version.object, page.number);
+    let digest = crate::topology::hash_finish(digest);
+    let sample = u64::from_be_bytes(digest[..8].try_into().unwrap());
+    local[(sample % local.len() as u64) as usize]
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -467,27 +463,34 @@ pub(crate) mod tests {
             use http1::Header;
             use http1::MessageHead;
             use http1::StartLine;
-            use racer_control_wire::BundleGeneration;
-            use racer_control_wire::ClusterId;
-            use racer_control_wire::KeyringBundle;
-            use racer_control_wire::SCHEMA_VERSION;
             use racer_crypto::identity::Certificates;
             use racer_crypto::identity::KeyEpochs;
             use racer_crypto::identity::Keyring;
+            use racer_wire::control::BundleGeneration;
+            use racer_wire::control::ClusterId;
+            use racer_wire::control::KeyringBundle;
             use std::sync::Arc;
             let (pending, chain, roots) = issued();
             let cluster = ClusterId(CLUSTER.into());
             let node = NodeId(NODE.into());
             let identity = pending
-                .accept(cluster.clone(), node.clone(), chain, &roots)
+                .accept(
+                    cluster.clone(),
+                    node.clone(),
+                    chain,
+                    &roots,
+                    &crate::enrollment::wall_clock(&racer_io::Clock::host()),
+                )
                 .unwrap();
             let keys = Rc::new(Keyring::new(
                 cluster.clone(),
                 node.clone(),
-                Arc::new(KeyEpochs::default()),
+                Arc::new(KeyEpochs::with_clock(crate::enrollment::wall_clock(
+                    &racer_io::Clock::host(),
+                ))),
             ));
             keys.install(KeyringBundle {
-                schema_version: SCHEMA_VERSION,
+                schema_version: racer_wire::control::KEYRING_SCHEMA_VERSION,
                 cluster: cluster.clone(),
                 generation: BundleGeneration(1),
                 peer_trust_roots: roots,
@@ -496,8 +499,8 @@ pub(crate) mod tests {
             .unwrap();
             keys.install_signing_identity(Arc::new(identity)).unwrap();
             let certificates = Rc::new(Certificates::new(cluster, keys.clone()));
-            let signatures = Signatures::new(keys, certificates);
-            let setup = link_setup::Setup::new(RailId(9), [1; 32], 8, 2)
+            let signatures = Signatures::new(keys, certificates, racer_io::WorkerCtx::host());
+            let setup = link_setup::Setup::new(RailId(9), [1; 32], 8, 2, &racer_io::Rng::os())
                 .unwrap()
                 .encode();
             let value = STANDARD.encode(&setup).into_bytes();
@@ -546,6 +549,7 @@ pub(crate) mod tests {
             let replay = SignedHead {
                 head: verified.signed.head,
                 signature: verified.signed.signature,
+                chain: verified.signed.chain,
             };
             signatures.verify_proof(replay).unwrap();
             let mut tampered = signatures.sign(head()).unwrap();
@@ -631,26 +635,49 @@ pub(crate) mod tests {
                     gid: Some([1; 16]),
                     numa_node: None,
                 };
-                let mut accepted = 0;
+                // Replacement batches reuse withdrawn rails instead of growing.
                 for batch in 0..20 {
                     let snapshot = inventory
                         .update((batch * 64..(batch + 1) * 64).map(nic).collect())
                         .unwrap();
-                    accepted += snapshot.nics.len();
+                    assert_eq!(snapshot.nics.len(), 64);
+                    assert_eq!(snapshot.nics.last().unwrap().rail, RailId(63));
                     assert!(inventory.reservations().unwrap().len() <= MAX_JOURNAL_BYTES);
                 }
-                assert!(
-                    accepted > 0 && accepted < 1024,
-                    "byte bound must precede identity cap"
-                );
-                let journal = inventory.reservations().unwrap();
-                assert!(inventory.update(vec![nic(2000)]).unwrap().nics.is_empty());
-                assert_eq!(inventory.reservations().unwrap(), journal);
+                // A journal restored at saturation admits only known ports.
+                let mut bytes = 0;
+                let mut rails: Vec<_> = (0..1024)
+                    .map(|i| (format!("{i:04}{}", "x".repeat(59)), 255u8, i as u16))
+                    .take_while(|e| {
+                        bytes += serde_json::to_vec(e).unwrap().len() + 1;
+                        bytes + 40 < MAX_JOURNAL_BYTES
+                    })
+                    .collect();
+                // Top up with a shorter name so a longer replacement cannot fit.
+                let encoded =
+                    |rails: &Vec<(String, u8, u16)>| serde_json::to_vec(rails).unwrap().len() + 22;
+                for len in (1..=63).rev() {
+                    let mut topped = rails.clone();
+                    topped.push(("y".repeat(len), 255u8, rails.len() as u16));
+                    if encoded(&topped) <= MAX_JOURNAL_BYTES {
+                        rails = topped;
+                        break;
+                    }
+                }
+                let journal = format!(
+                    r#"{{"version":2,"rails":{}}}"#,
+                    serde_json::to_string(&rails).unwrap()
+                )
+                .into_bytes();
                 let restarted = Inventory::default();
                 restarted.restore(&journal).unwrap();
+                // An escaped name encodes longer than the rail it would reuse.
+                let mut longer = nic(2000);
+                longer.device = format!("2000{}", "\"".repeat(59));
                 let mut old = nic(0);
+                old.device = format!("0000{}", "x".repeat(59));
                 old.gid = Some([2; 16]);
-                let snapshot = restarted.update(vec![nic(2000), old]).unwrap();
+                let snapshot = restarted.update(vec![longer, old]).unwrap();
                 assert_eq!(snapshot.nics.len(), 1);
                 assert_eq!(snapshot.nics[0].rail, RailId(0));
                 assert_eq!(snapshot.nics[0].gid, Some([2; 16]));
@@ -727,10 +754,14 @@ pub(crate) mod tests {
             let journal = inventory.reservations().unwrap();
             let restarted = Inventory::default();
             restarted.restore(&journal).unwrap();
+            // The new port "c" reuses absent "a"'s rail rather than growing.
             let next = restarted.update(vec![nic("b", 3), nic("c", 4)]).unwrap();
             assert_eq!(
-                next.nics.iter().map(|n| n.rail).collect::<Vec<_>>(),
-                vec![RailId(1), RailId(2)]
+                next.nics
+                    .iter()
+                    .map(|n| (n.device.as_str(), n.rail))
+                    .collect::<Vec<_>>(),
+                vec![("c", RailId(0)), ("b", RailId(1))]
             );
             assert_eq!(
                 restarted.update(vec![nic("a", 5)]).unwrap().nics[0].rail,
@@ -939,6 +970,85 @@ pub(crate) mod tests {
             }
         }
         #[test]
+        fn admits_rail_accepts_any_rail_both_ends_publish() {
+            let both = route(|_| {});
+            let (a, b) = (&both.nodes[0], &both.nodes[1]);
+            let rdma = TransportPlan::Rdma { rail: RailId(7) };
+            for rail in [RailId(7), RailId(2)] {
+                assert!(admits_rail(rdma, &both.membership, a, b, rail));
+                assert!(admits_rail(rdma, &both.membership, b, a, rail));
+            }
+            // Not a published rail, an HTTP plan, or an unknown peer.
+            assert!(!admits_rail(rdma, &both.membership, a, b, RailId(3)));
+            assert!(!admits_rail(
+                TransportPlan::Http,
+                &both.membership,
+                a,
+                b,
+                RailId(7)
+            ));
+            let unknown = NodeId("unknown".into());
+            assert!(!admits_rail(rdma, &both.membership, a, &unknown, RailId(7)));
+            // A rail only one end publishes.
+            let one = route(|m| m[1].rails.retain(|r| r.rail == RailId(7)));
+            let (a, b) = (&one.nodes[0], &one.nodes[1]);
+            assert!(admits_rail(rdma, &one.membership, a, b, RailId(7)));
+            assert!(!admits_rail(rdma, &one.membership, a, b, RailId(2)));
+            assert!(!admits_rail(rdma, &one.membership, b, a, RailId(2)));
+        }
+
+        #[test]
+        fn receiver_rail_keeps_local_or_unplaceable_pages_on_the_hashed_rail() {
+            let local = [RailId(0), RailId(1)];
+            assert_eq!(receiver_rail(Some(&page(0)), RailId(1), &local), RailId(1));
+            assert_eq!(receiver_rail(Some(&page(0)), RailId(5), &[]), RailId(5));
+            assert_eq!(receiver_rail(None, RailId(5), &local), RailId(5));
+            // Order and duplicates of the local set do not change the choice.
+            for number in 0..64 {
+                let p = page(number);
+                assert_eq!(
+                    receiver_rail(Some(&p), RailId(5), &[RailId(1), RailId(0), RailId(1)]),
+                    receiver_rail(Some(&p), RailId(5), &local),
+                );
+                assert!(local.contains(&receiver_rail(Some(&p), RailId(5), &local)));
+            }
+        }
+
+        /// Eight rails, four per NUMA node, as on the benchmark nodes. Pages
+        /// owned by workers on either node land only on that node's rails,
+        /// and every rail carries an even share overall.
+        #[test]
+        fn receiver_rail_is_numa_local_and_even() {
+            let domain: Vec<_> = (0..8).map(RailId).collect();
+            let node_rails = |numa: u16| -> Vec<RailId> {
+                domain.iter().copied().filter(|r| r.0 / 4 == numa).collect()
+            };
+            let pages = 16_000u64;
+            let mut counts = [0u64; 8];
+            for number in 0..pages {
+                let p = page(number);
+                let mut digest = crate::topology::hash_domain(b"racer/rail/v1\0");
+                crate::topology::hash_object(&mut digest, &p.version.object, p.number);
+                let digest = crate::topology::hash_finish(digest);
+                let sample = u64::from_be_bytes(digest[..8].try_into().unwrap());
+                let planned = domain[(sample % 8) as usize];
+                // Owner workers alternate between the two nodes.
+                let numa = (number % 2) as u16;
+                let local = node_rails(numa);
+                let rail = receiver_rail(Some(&p), planned, &local);
+                assert!(local.contains(&rail), "page {number} left node {numa}");
+                counts[usize::from(rail.0)] += 1;
+            }
+            let expected = pages / 8;
+            for (rail, &count) in counts.iter().enumerate() {
+                assert!(
+                    count.abs_diff(expected) < expected / 10,
+                    "rail {rail} carried {count}, expected about {expected}"
+                );
+            }
+        }
+
+        #[test]
         fn mixed_site_hops_preserve_global_rail_mapping_and_hardware_vetoes() {
             let mixed = route(|m| m[2].site = "site2".into());
             let a = &mixed.nodes[0];
@@ -1027,6 +1137,27 @@ pub(crate) mod tests {
             }
         }
         #[test]
+        fn rdma_edge_peers_lists_exactly_the_rdma_edges() {
+            let membership = mesh_with_budget(40, 16);
+            let nodes: Vec<_> = membership
+                .members()
+                .iter()
+                .map(|m| m.node.clone())
+                .collect();
+            for a in &nodes {
+                let mut peers = rdma_edge_peers(&membership, a);
+                peers.sort();
+                let mut expected: Vec<_> = nodes
+                    .iter()
+                    .filter(|b| is_rdma_edge(&membership, a, b))
+                    .cloned()
+                    .collect();
+                expected.sort();
+                assert_eq!(peers, expected);
+            }
+            assert!(rdma_edge_peers(&membership, &NodeId("absent".into())).is_empty());
+        }
+        #[test]
         fn rdma_edges_need_both_ends_within_the_peer_budget() {
             // A full mesh of 40 with a budget of 16: 39 neighbors each.
             let budget = 16;
@@ -1059,6 +1190,10 @@ pub(crate) mod tests {
                     } else {
                         assert_eq!(plan, TransportPlan::Http);
                         assert!(is_overflow(&membership, &page(0), a, b));
+                        assert_eq!(
+                            http_plan_reason(&membership, &page(0), a, b, false),
+                            Some(HttpPlanReason::Overflow)
+                        );
                     }
                     // The cached peer set agrees with the topology crate.
                     let took = membership
@@ -1122,6 +1257,66 @@ pub(crate) mod tests {
                 &nodes[0],
                 &NodeId("unknown".into())
             ));
+        }
+        #[test]
+        fn http_plans_are_classified_by_reason() {
+            let membership = {
+                let members = (0..4)
+                    .map(|i| {
+                        let mut member = member(i, 4);
+                        member.site = if i == 2 { "site2" } else { "site1" }.into();
+                        member.rails = match i {
+                            // Only rail 2; page 0 hashes to rail 7.
+                            0 => mappings()[1..].to_vec(),
+                            1 => vec![],
+                            _ => mappings(),
+                        };
+                        member
+                    })
+                    .collect();
+                Arc::new(Membership::validate(MembershipVersion(1), members).unwrap())
+            };
+            let by_rails = |rails: usize, site: &str| {
+                membership
+                    .members()
+                    .iter()
+                    .find(|m| m.rails.len() == rails && m.site == site)
+                    .unwrap()
+                    .node
+                    .clone()
+            };
+            let local = by_rails(2, "site1");
+            let partial = by_rails(1, "site1");
+            let bare = by_rails(0, "site1");
+            let remote = by_rails(2, "site2");
+            let reason = |a: &NodeId, b: &NodeId, direct| {
+                http_plan_reason(&membership, &page(0), a, b, direct)
+            };
+            assert_eq!(hop(&membership, &local, &partial), TransportPlan::Http);
+            assert_eq!(
+                reason(&local, &partial, false),
+                Some(HttpPlanReason::NoRail)
+            );
+            assert_eq!(
+                reason(&local, &bare, false),
+                Some(HttpPlanReason::Ineligible)
+            );
+            assert_eq!(
+                reason(&local, &remote, false),
+                Some(HttpPlanReason::Ineligible)
+            );
+            assert_eq!(
+                reason(&local, &partial, true),
+                Some(HttpPlanReason::DirectHttp)
+            );
+            // A node without rails expects HTTP and counts nothing.
+            assert_eq!(reason(&bare, &local, false), None);
+            assert_eq!(reason(&bare, &local, true), None);
+            assert_eq!(reason(&local, &NodeId("unknown".into()), false), None);
+            assert_eq!(
+                HttpPlanReason::NoRail.event(),
+                crate::telemetry::Event::RdmaPlanHttpNoRail
+            );
         }
         #[test]
         fn golden_page_to_rail_vectors() {

@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
@@ -18,17 +17,27 @@ type reconcileNVIDIA struct {
 	goalState *goalstates.NodeStart
 	run       func(context.Context, *slog.Logger, string, ...string) (string, error)
 	execute   func(context.Context, *slog.Logger, phases.Task) error
+	// imageDir is where the staged image archives are listed; see
+	// ImportContainerImagesFrom.
+	imageDir string
 }
 
 // ReconcileNVIDIA returns the reusable post-start flow for an nspawn GPU node.
 // It stops consumers of the ephemeral driver root, rebuilds NVIDIA state, then
 // restores containerd and kubelet. Non-GPU discovery is a no-op.
 func ReconcileNVIDIA(log *slog.Logger, goalState *goalstates.NodeStart) phases.Task {
+	return ReconcileNVIDIAFrom(log, goalState, "")
+}
+
+// ReconcileNVIDIAFrom is ReconcileNVIDIA listing the staged container image
+// archives it reimports in imageDir; see ImportContainerImagesFrom.
+func ReconcileNVIDIAFrom(log *slog.Logger, goalState *goalstates.NodeStart, imageDir string) phases.Task {
 	return &reconcileNVIDIA{
 		log:       log,
 		goalState: goalState,
-		run:       executil.MachineRun,
+		run:       nodeExec(goalState),
 		execute:   phases.ExecuteTask,
+		imageDir:  imageDir,
 	}
 }
 
@@ -52,7 +61,7 @@ func (r *reconcileNVIDIA) Do(ctx context.Context) error {
 	for _, task := range []phases.Task{
 		SetupNVIDIA(r.log, r.goalState),
 		StartContainerd(r.log, r.goalState),
-		ImportContainerImages(r.log, r.goalState),
+		ImportContainerImagesFrom(r.log, r.goalState, r.imageDir),
 		StartKubelet(r.log, r.goalState),
 	} {
 		if err := r.execute(ctx, r.log, task); err != nil {

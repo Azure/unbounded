@@ -165,6 +165,7 @@ type ResolvedInputIdentity struct {
 	IncompleteReason string `json:"incompleteReason,omitempty"`
 }
 
+// +kubebuilder:validation:XValidation:rule="!has(self.allowRoot) || !self.allowRoot || (has(self.privileged) && self.privileged)",message="allowRoot requires privileged execution"
 type ResolvedSecurityRequirements struct {
 	Privileged  bool `json:"privileged,omitempty"`
 	AllowRoot   bool `json:"allowRoot,omitempty"`

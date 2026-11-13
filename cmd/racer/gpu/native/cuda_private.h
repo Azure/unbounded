@@ -32,9 +32,11 @@ typedef struct CUctx_st *CUcontext;
 typedef struct CUstream_st *CUstream;
 typedef struct CUmod_st *CUmodule;
 typedef struct CUfunc_st *CUfunction;
+typedef struct CUevent_st *CUevent;
 typedef struct { char bytes[16]; } CUuuid;
 
 #define CUDA_SUCCESS 0
+#define CUDA_ERROR_NOT_READY 600
 #define CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED 704
 
 /* CUdevice_attribute */
@@ -42,7 +44,30 @@ typedef struct { char bytes[16]; } CUuuid;
 #define CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED 102
 #define CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR_SUPPORTED 103
 #define CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_SUPPORTED 116
+#define CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_FLUSH_WRITES_OPTIONS 117
+#define CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WRITES_ORDERING 118
 #define CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED 124
+
+/* CUflushGPUDirectRDMAWritesOptions, CUGPUDirectRDMAWritesOrdering,
+ * CUflushGPUDirectRDMAWritesScope and CUflushGPUDirectRDMAWritesTarget */
+#define CU_FLUSH_GPU_DIRECT_RDMA_WRITES_OPTION_HOST 0x1
+#define CU_GPU_DIRECT_RDMA_WRITES_ORDERING_NONE 0
+#define CU_GPU_DIRECT_RDMA_WRITES_ORDERING_OWNER 100
+#define CU_GPU_DIRECT_RDMA_WRITES_ORDERING_ALL_DEVICES 200
+#define CU_FLUSH_GPU_DIRECT_RDMA_WRITES_TO_OWNER 100
+#define CU_FLUSH_GPU_DIRECT_RDMA_WRITES_TO_ALL_DEVICES 200
+#define CU_FLUSH_GPU_DIRECT_RDMA_WRITES_TARGET_CURRENT_CTX 0
+/* cuFlushGPUDirectRDMAWrites (CUDA 11.3+); resolved optionally. */
+typedef CUresult (*cuFlushGPUDirectRDMAWrites_fn)(int target, int scope);
+/* cuLaunchHostFunc (CUDA 10.0+); resolved optionally. */
+typedef void (*CUhostFn)(void *user_data);
+typedef CUresult (*cuLaunchHostFunc_fn)(CUstream stream, CUhostFn fn, void *user_data);
+
+/* CUevent_flags */
+#define CU_EVENT_DISABLE_TIMING 0x2
+/* cuMemHostAlloc and cuMemHostRegister flags */
+#define CU_MEMHOSTALLOC_PORTABLE 0x01
+#define CU_MEMHOSTREGISTER_PORTABLE 0x01
 
 /* CUstream_flags */
 #define CU_STREAM_NON_BLOCKING 0x1
@@ -137,6 +162,17 @@ _Static_assert(sizeof(CUmemAccessDesc) == 12, "CUmemAccessDesc layout");
     X(cuStreamCreate, "cuStreamCreate", CUresult, (CUstream *stream, unsigned int flags)) \
     X(cuStreamSynchronize, "cuStreamSynchronize", CUresult, (CUstream stream)) \
     X(cuStreamDestroy, "cuStreamDestroy_v2", CUresult, (CUstream stream)) \
+    X(cuStreamWaitEvent, "cuStreamWaitEvent", CUresult, \
+      (CUstream stream, CUevent event, unsigned int flags)) \
+    X(cuEventCreate, "cuEventCreate", CUresult, (CUevent *event, unsigned int flags)) \
+    X(cuEventRecord, "cuEventRecord", CUresult, (CUevent event, CUstream stream)) \
+    X(cuEventQuery, "cuEventQuery", CUresult, (CUevent event)) \
+    X(cuEventSynchronize, "cuEventSynchronize", CUresult, (CUevent event)) \
+    X(cuEventDestroy, "cuEventDestroy_v2", CUresult, (CUevent event)) \
+    X(cuMemHostAlloc, "cuMemHostAlloc", CUresult, (void **ptr, size_t size, unsigned int flags)) \
+    X(cuMemHostRegister, "cuMemHostRegister_v2", CUresult, \
+      (void *ptr, size_t size, unsigned int flags)) \
+    X(cuMemHostUnregister, "cuMemHostUnregister", CUresult, (void *ptr)) \
     X(cuModuleLoadData, "cuModuleLoadData", CUresult, (CUmodule *module, const void *image)) \
     X(cuModuleUnload, "cuModuleUnload", CUresult, (CUmodule module)) \
     X(cuModuleGetFunction, "cuModuleGetFunction", CUresult, \

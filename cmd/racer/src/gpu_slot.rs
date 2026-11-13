@@ -58,6 +58,26 @@ impl Inner {
     }
 }
 
+/// Owned by the start thread; publishes "off" on drop unless finished.
+struct Resolve(Option<Arc<Inner>>);
+
+impl Resolve {
+    fn finish(mut self, helper: Option<Arc<GpuHelper>>) {
+        if let Some(inner) = self.0.take() {
+            inner.finish(helper);
+        }
+    }
+}
+
+impl Drop for Resolve {
+    fn drop(&mut self) {
+        if let Some(inner) = self.0.take() {
+            eprintln!("racer: stage=gpu state=disabled reason=start-panicked");
+            inner.finish(None);
+        }
+    }
+}
+
 /// The process-wide GPU helper, started now or on first use.
 pub struct GpuSlot {
     inner: Arc<Inner>,
@@ -144,6 +164,9 @@ impl GpuSlot {
         let spawned = std::thread::Builder::new()
             .name("racer-gpu-start".into())
             .spawn(move || {
+                // Resolves the slot as off if `start` or `on_start` unwinds,
+                // so waiters never wait on a start that will not finish.
+                let resolve = Resolve(Some(inner));
                 let helper = start().unwrap_or_else(|error| {
                     eprintln!("racer: stage=gpu state=disabled reason={error}");
                     None
@@ -151,7 +174,7 @@ impl GpuSlot {
                 if let (Some(helper), Some(on_start)) = (&helper, on_start) {
                     on_start(helper);
                 }
-                inner.finish(helper);
+                resolve.finish(helper);
             });
         if spawned.is_err() {
             eprintln!("racer: stage=gpu state=disabled reason=spawn-failed");
@@ -301,6 +324,44 @@ mod tests {
         let got = futures::executor::block_on(live).unwrap();
         assert!(Arc::ptr_eq(&got, &helper));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    /// A start or start hook that panics resolves the slot as off and wakes
+    /// every waiter instead of leaving it starting forever.
+    fn panicking_start_resolves_slot_and_wakes_waiters() {
+        type Case = (Starter, OnStart);
+        let cases: Vec<fn() -> Case> = vec![
+            || {
+                (
+                    Box::new(|| panic!("simulated start panic")),
+                    Box::new(|_| {}),
+                )
+            },
+            || {
+                (
+                    Box::new(|| Ok(Some(crate::gpu::testing::helper(&[None])))),
+                    Box::new(|_| panic!("simulated on_start panic")),
+                )
+            },
+        ];
+        for case in cases {
+            let (start, on_start) = case();
+            let slot = Arc::new(GpuSlot::lazy(start, on_start));
+            let waiters: Vec<_> = (0..4)
+                .map(|_| {
+                    let slot = slot.clone();
+                    std::thread::spawn(move || futures::executor::block_on(slot.get_or_start()))
+                })
+                .collect();
+            for waiter in waiters {
+                assert!(waiter.join().unwrap().is_none());
+            }
+            assert!(!slot.standby());
+            assert!(slot.get().is_none());
+            assert!(matches!(&*slot.inner.lock(), Pending::Done));
+            assert!(futures::executor::block_on(slot.get_or_start()).is_none());
+        }
     }
 
     #[test]

@@ -48,6 +48,7 @@ func ValidateTestArtifacts(spec CertificationTestSpec) error {
 		}
 
 		sum := sha256.Sum256([]byte(artifact.Content))
+
 		actual := "sha256:" + hex.EncodeToString(sum[:])
 		if artifact.Digest != actual {
 			return fmt.Errorf("test artifact %q digest does not match content", artifact.Name)

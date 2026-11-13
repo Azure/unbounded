@@ -219,7 +219,13 @@ fn deterministic_under_permutation() {
 /// Mean degree matches the spec table within 25%.
 #[test]
 fn degree_matches_spec_table() {
-    for (k, expected) in [(64usize, 63.0f64), (256, 45.0), (1024, 93.0), (4096, 189.0)] {
+    for (k, expected) in [
+        (64usize, 63.0f64),
+        (256, 255.0),
+        (257, 45.0),
+        (1024, 93.0),
+        (4096, 189.0),
+    ] {
         let members = Membership::new(nodes(k, Sites::One)).unwrap();
         let total: usize = (0..k).map(|p| members.degree(p)).sum();
         let mean = total as f64 / k as f64;
@@ -233,10 +239,11 @@ fn degree_matches_spec_table() {
     }
 }
 
-/// Pools of up to 64 members are full meshes, whatever their Sites.
+/// Pools of up to 256 members are full meshes, whatever their Sites.
 #[test]
-fn full_mesh_up_to_sixty_four() {
-    for k in [2, 17, FULL_MESH_MAX] {
+fn full_mesh_up_to_two_hundred_fifty_six() {
+    assert_eq!(FULL_MESH_MAX, 256);
+    for k in [2, 17, 65, 150, FULL_MESH_MAX] {
         for sites in [Sites::ManyTiny, Sites::TwoLarge] {
             let members = Membership::new(nodes(k, sites)).unwrap();
             assert_eq!(members.pools()[0].columns(), 1);

@@ -30,6 +30,7 @@ name: unbounded release
 #                           racer-object, racer-vllm,
 #                           host-ubuntu2404,
 #                           host-azurelinux3, host-azurelinux3-nvidia,
+#                           host-azurelinux3-mshv,
 #                           inventory-aggregator, inventory-inspector,
 #                           inventory-viewer)
 #     -> gantry-chart      (OCI chart + signed downloadable archive)
@@ -289,7 +290,7 @@ jobs:
           go-version-file: go.mod
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
 
       - name: Install syft (for SBOM generation)
         uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
@@ -387,10 +388,10 @@ jobs:
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
 
       - name: Log in to ghcr.io
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -606,10 +607,10 @@ jobs:
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
 
       - name: Log in to ghcr.io
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -705,7 +706,7 @@ jobs:
   component-images:
     needs: version
     strategy:
-      # One bad component must not cancel the other ten. Runner minutes are the
+      # One bad component must not cancel the other eleven. Runner minutes are the
       # wrong thing to optimize on a release: knowing the full blast radius in
       # one pass beats discovering it one re-run at a time, and it keeps the
       # re-run down to the job that actually failed. When v0.5.0's
@@ -748,6 +749,10 @@ jobs:
             file: images/racer-object/Containerfile
             platforms: linux/amd64,linux/arm64
             trivy: true
+          - name: gantry-node-config
+            file: images/gantry-node-config/Containerfile
+            platforms: linux/amd64,linux/arm64
+            trivy: true
           # vLLM with racer-client and racer-vllm. The upstream vLLM base is
           # not ours to patch, so it is not gated on Trivy. The base image
           # alone is larger than a hosted runner's free disk.
@@ -768,6 +773,11 @@ jobs:
           - name: host-azurelinux3-nvidia
             file: images/host-azurelinux3-nvidia/Containerfile
             platforms: linux/amd64,linux/arm64
+            trivy: false
+          # The Microsoft Hypervisor packages are x86_64 only.
+          - name: host-azurelinux3-mshv
+            file: images/host-azurelinux3-mshv/Containerfile
+            platforms: linux/amd64
             trivy: false
           - name: inventory-aggregator
             file: images/inventory/aggregator/Containerfile
@@ -815,9 +825,9 @@ jobs:
         run: echo "REGISTRY=${REGISTRY,,}" >> "$GITHUB_ENV"
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
 
-      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -906,7 +916,7 @@ jobs:
           go-version-file: go.mod
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
 
       - name: Build release manifests
         run: |
@@ -1006,7 +1016,7 @@ jobs:
           go-version-file: go.mod
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
 
       - name: Download goreleaser dist
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.0

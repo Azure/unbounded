@@ -1,0 +1,48 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+# Metalman machine image for Azure Linux 3.0 that boots Linux as the root
+# partition of the Microsoft Hypervisor (MSHV). Virtual machine monitors such
+# as Cloud Hypervisor use /dev/mshv on these machines instead of /dev/kvm.
+# The hypervisor runs on amd64 only.
+#
+# The hypervisor loader needs shim 15.8, because Azure Linux's shim 16
+# conflicts with mshv-bootloader-lx. With UEFI Secure Boot on, shim 15.8 halts
+# with "Bootloader has not verified loaded image" when another shim, such as
+# the one in Metalman's PXE chain, chainloads it. Secure Boot works when the
+# firmware starts the disk's boot entry directly, but the first boot after a
+# Metalman repave goes through the PXE chain, so Secure Boot must be off for
+# the repave to finish.
+
+FROM mcr.microsoft.com/azurelinux/base/core:3.0 AS rootfs
+ARG KERNEL_PACKAGE=kernel-mshv
+ARG NVIDIA=0
+ARG MSHV=1
+COPY images/host-azurelinux3/assets/rootfs.sh /usr/local/bin/build-rootfs
+RUN KERNEL_PACKAGE="${KERNEL_PACKAGE}" NVIDIA="${NVIDIA}" MSHV="${MSHV}" sh /usr/local/bin/build-rootfs install
+RUN KERNEL_PACKAGE="${KERNEL_PACKAGE}" NVIDIA="${NVIDIA}" MSHV="${MSHV}" sh /usr/local/bin/build-rootfs finish
+
+FROM --platform=$BUILDPLATFORM docker.io/library/ubuntu:24.04 AS build
+ARG TARGETARCH
+ARG MSHV=1
+RUN apt-get update && \
+    ok=false && \
+    for attempt in 1 2 3 4 5; do \
+      if apt-get install -y --no-install-recommends \
+           dosfstools e2fsprogs fdisk mtools pigz; then \
+        ok=true; break; \
+      fi; \
+      echo "apt-get install failed (attempt $attempt/5), retrying in 30s..."; \
+      sleep 30; \
+      apt-get update; \
+    done && $ok && \
+    rm -rf /var/lib/apt/lists/*
+COPY --from=rootfs /rootfs.tar /rootfs.kver /
+COPY images/host-azurelinux3/assets/disk.sh /usr/local/bin/build-disk
+RUN TARGETARCH="${TARGETARCH}" MSHV="${MSHV}" sh /usr/local/bin/build-disk && rm /rootfs.tar
+
+FROM scratch
+LABEL org.opencontainers.image.source="https://github.com/Azure/unbounded" \
+      org.opencontainers.image.description="Metalman machine image for Azure Linux 3.0 with the Microsoft Hypervisor"
+COPY --from=build /disk /disk
+COPY LICENSE NOTICE /unbounded/licenses/

@@ -40,6 +40,7 @@ func main() {
 	}
 
 	selected := 0
+
 	for _, value := range []string{dataKey, field, artifact} {
 		if value != "" {
 			selected++

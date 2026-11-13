@@ -19,6 +19,10 @@ type Config struct {
 	EnableLeaderElection    bool          `yaml:"enableLeaderElection"`
 	MaxConcurrentReconciles int           `yaml:"maxConcurrentReconciles"`
 	ProvisioningTimeout     time.Duration `yaml:"provisioningTimeout"`
+	// ExperimentalContainerIsolation enables the experimental container
+	// isolation mode (spec.isolation: container). Off by default: machina
+	// then refuses to provision a Machine that declares it.
+	ExperimentalContainerIsolation bool `yaml:"experimentalContainerIsolation"`
 }
 
 // DefaultConfig returns a config with default values.

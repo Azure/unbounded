@@ -20,13 +20,12 @@ use crate::telemetry::Metrics;
 use crate::telemetry::Observer;
 use crate::telemetry::Stage;
 use crate::topology::Paths;
-use racer_control_wire::MembershipVersion;
-use racer_control_wire::NodeId;
+use racer_wire::control::MembershipVersion;
+use racer_wire::control::NodeId;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
-use uring_runtime::environment::now;
 
 pub mod forwarding;
 pub mod protocol;
@@ -45,15 +44,17 @@ const STAGES: [(Event, Event); 4] = [
 /// Publish all HTTP Page stages only after verification; censor other outcomes.
 pub(crate) struct PageTiming<'a> {
     metrics: &'a Metrics,
+    clock: racer_io::Clock,
     active: bool,
     start: Option<Instant>,
     durations: [u64; 4],
     completed: u8,
 }
 impl<'a> PageTiming<'a> {
-    fn new(metrics: &'a Metrics) -> Self {
+    fn new(metrics: &'a Metrics, clock: racer_io::Clock) -> Self {
         Self {
             metrics,
+            clock,
             active: false,
             start: None,
             durations: [0; 4],
@@ -69,12 +70,14 @@ impl<'a> PageTiming<'a> {
     }
     fn begin(&mut self) {
         if self.active {
-            self.start = Some(now());
+            self.start = Some(self.clock.now());
         }
     }
     fn end(&mut self, stage: usize) {
         if let Some(start) = self.start.take() {
-            self.durations[stage] = now()
+            self.durations[stage] = self
+                .clock
+                .now()
                 .saturating_duration_since(start)
                 .as_nanos()
                 .min(u64::MAX as u128) as u64;
@@ -107,15 +110,16 @@ impl Drop for PageTiming<'_> {
 pub struct Config {
     pub total: usize,
     pub per_peer: usize,
-    /// Least time between one-slot recoveries of a reduced limit after
-    /// verified successes.
+    /// Longest time between one-slot recoveries of a reduced per-peer limit
+    /// after verified successes. A limit also recovers one slot per `limit`
+    /// verified completions, about one per round trip.
     pub recovery: Duration,
 }
 impl Default for Config {
     fn default() -> Self {
         Self {
-            total: 256,
-            per_peer: 32,
+            total: 4096,
+            per_peer: 512,
             recovery: RECOVERY,
         }
     }
@@ -161,7 +165,6 @@ impl flow_control::AdaptiveObserver for AdmissionObserver {
                 AdmissionEvent::CircuitRejected => Event::PeerCircuitRejected,
                 AdmissionEvent::Accepted => Event::PeerAdmissionAccepted,
                 AdmissionEvent::Probe => Event::PeerProbe,
-                AdmissionEvent::LocalPressure => Event::PeerLocalPressure,
                 AdmissionEvent::Verified => Event::PeerVerified,
                 AdmissionEvent::LinkFailure => Event::PeerLinkFailure,
             },
@@ -171,26 +174,27 @@ impl flow_control::AdaptiveObserver for AdmissionObserver {
     fn active(&self, active: usize) {
         self.0.set_gauge(Gauge::PeerExchanges, active as u64);
     }
-    fn limit(&self, limit: usize) {
-        self.0.set_gauge(Gauge::PeerAdmissionLimit, limit as u64);
-    }
 }
 impl AdaptivePeers {
     pub(crate) fn hedge_available(&self, node: &NodeId) -> bool {
         self.inner.hedge_available(node)
     }
-    pub(crate) fn new(config: Config, metrics: Metrics) -> Result<Arc<Self>> {
-        Self::with_clock(config, metrics, now)
+    pub(crate) fn new(
+        config: Config,
+        metrics: Metrics,
+        clock: racer_io::Clock,
+    ) -> Result<Arc<Self>> {
+        Self::with_clock(config, metrics, move || clock.now())
     }
-    /// As `new`, reading time from `clock` instead of the runtime clock. A
-    /// simulator passes its virtual clock; `new` passes the runtime clock, so
-    /// production pays nothing for the parameter.
+    /// As `new`, reading time from an arbitrary monotonic source.
     pub(crate) fn with_clock(
         config: Config,
         metrics: Metrics,
-        clock: fn() -> std::time::Instant,
+        clock: impl Fn() -> std::time::Instant + Send + Sync + 'static,
     ) -> Result<Arc<Self>> {
         config.validate()?;
+        // The total is a fixed cap, published once for dashboards.
+        metrics.set_gauge(Gauge::PeerAdmissionLimit, config.total as u64);
         Ok(Arc::new(Self {
             shard: metrics.writer_shard(),
             inner: flow_control::Adaptive::new(
@@ -225,18 +229,24 @@ impl AdaptivePeers {
 /// Outbound operations route directly from their retained membership lease.
 pub struct PeerNetwork {
     pub local: NodeId,
-    published: Arc<controlplane::Published<crate::control::Snapshot>>,
+    published: Arc<crate::control::cell::PublicationCell<crate::control::Snapshot>>,
+    clock: racer_io::Clock,
 }
 
 impl PeerNetwork {
     pub fn new(
         local: NodeId,
-        published: Arc<controlplane::Published<crate::control::Snapshot>>,
+        published: Arc<crate::control::cell::PublicationCell<crate::control::Snapshot>>,
+        clock: racer_io::Clock,
     ) -> Result<Self> {
         if local.0.is_empty() {
             return Err(Error::InvalidConfiguration);
         }
-        Ok(Self { local, published })
+        Ok(Self {
+            local,
+            published,
+            clock,
+        })
     }
 
     pub fn membership(
@@ -244,7 +254,7 @@ impl PeerNetwork {
         version: MembershipVersion,
     ) -> Result<std::sync::Arc<crate::topology::Membership>> {
         self.published
-            .resolve(version.0, uring_runtime::environment::now())?
+            .resolve(version.0, self.clock.now())?
             .ok_or(Error::IncompatibleMembership)
     }
 
@@ -451,28 +461,22 @@ impl Relay {
             let outbound = self
                 .forwarding
                 .append_request(request, next, outbound_budget)?;
-            let response = if relay.is_some() {
-                self.transport
-                    .exchange_inner(outbound, membership, Some(reservation), &scope)
-                    .await?
-            } else {
-                transport::RelayResponse::Complete(
-                    self.transport
-                        .exchange(outbound, membership, &scope)
-                        .await?,
+            let response = self
+                .transport
+                .exchange_inner(
+                    outbound,
+                    membership,
+                    relay.is_some().then(|| reservation.clone()),
+                    &scope,
                 )
-            };
+                .await?;
             scope.check()?;
+            // The exchange verified every proof against `binding`; only append.
             match response {
-                transport::RelayResponse::Complete(response) => {
-                    let response = self
-                        .forwarding
-                        .verify_response_async(response, &binding, &scope)
-                        .await?;
-                    self.forwarding
-                        .append_response(response, &previous)
-                        .map(transport::RelayResponse::Complete)
-                }
+                transport::RelayResponse::Complete(response) => self
+                    .forwarding
+                    .append_response(response, &previous)
+                    .map(transport::RelayResponse::Complete),
                 // A relay never asks for landing.
                 transport::RelayResponse::Landed(_) => Err(Error::Internal),
                 transport::RelayResponse::Http {
@@ -481,10 +485,11 @@ impl Relay {
                     length,
                     overflow,
                 } => {
-                    let authentication = self
-                        .forwarding
-                        .forward_opaque_async(authentication, length, &binding, &previous, &scope)
-                        .await?;
+                    let authentication = self.forwarding.forward_opaque_verified(
+                        authentication,
+                        &binding,
+                        &previous,
+                    )?;
                     Ok(transport::RelayResponse::Http {
                         authentication,
                         connection,
@@ -510,6 +515,13 @@ pub(crate) enum Delivered {
 /// Concrete candidate requester. Scripted outcomes exist only in unit tests and
 /// the subscription interoperability fixture, so cancellation and an adversarial
 /// late-success completion fence remain distinct.
+#[cfg_attr(
+    any(test, feature = "subscription-interop"),
+    allow(
+        clippy::large_enum_variant,
+        reason = "Only the test-only Scripted variant is small; production has one variant"
+    )
+)]
 pub enum Requester {
     Network {
         #[cfg(test)]
@@ -531,7 +543,7 @@ pub enum Requester {
         available: Box<
             dyn Fn(
                 &std::sync::Arc<crate::topology::Membership>,
-                &racer_control_wire::NodeId,
+                &racer_wire::control::NodeId,
             ) -> bool,
         >,
         #[expect(
@@ -561,11 +573,12 @@ pub(crate) type ScriptedLanding = Box<dyn Fn(&PeerRequest) -> Option<transport::
 impl Requester {
     #[cfg(any(test, feature = "subscription-interop"))]
     pub(crate) fn scripted<T: 'static>(
+        clock: racer_io::Clock,
         state: Rc<T>,
         available: fn(
             &T,
             &std::sync::Arc<crate::topology::Membership>,
-            &racer_control_wire::NodeId,
+            &racer_wire::control::NodeId,
         ) -> bool,
         request: for<'a> fn(
             &'a T,
@@ -582,7 +595,10 @@ impl Requester {
     ) -> Rc<Self> {
         let capability = state.clone();
         Rc::new(Self::Scripted {
-            health: Rc::new(crate::topology::LinkHealth::default()),
+            health: Rc::new(crate::topology::LinkHealth::new(
+                crate::topology::LINK_HEALTH_CAPACITY,
+                clock,
+            )),
             available: Box::new(move |m, n| available(&capability, m, n)),
             request: Box::new(move |r, m, scope, is_direct| {
                 let state = state.clone();
@@ -662,7 +678,7 @@ impl Requester {
     pub fn direct_hedge_available(
         &self,
         membership: &std::sync::Arc<crate::topology::Membership>,
-        destination: &racer_control_wire::NodeId,
+        destination: &racer_wire::control::NodeId,
     ) -> bool {
         match self {
             Self::Network {
@@ -734,7 +750,7 @@ impl Requester {
 ///     let reply = relay.forward(admitted, membership.clone(), scope).await?;
 ///     let _retained_chain = reply.authentication;
 ///     // Both network boundaries preserve envelopes in each direction.
-///     let _exchange: SignedResponse = transport.exchange(outbound, membership, scope).await?;
+///     let _exchange: VerifiedResponse = transport.exchange(outbound, membership, scope).await?;
 ///     let _dispatch: SignedResponse = server.dispatch(inbound, scope).await?;
 ///     Ok(())
 /// }
@@ -766,8 +782,8 @@ impl Requester {
             if !self.direct_hedge_available(&membership, &next) {
                 return Err(Error::Overloaded);
             }
-            let (signed, binding) = forwarding.sign_request_to(request, &next)?;
-            let mut timing = PageTiming::new(metrics);
+            let (signed, _binding) = forwarding.sign_request_to(request, &next)?;
+            let mut timing = PageTiming::new(metrics, scope.clock().clone());
             let response = self
                 .exchange_inner_mode(
                     signed,
@@ -783,9 +799,7 @@ impl Requester {
                 return Err(Error::Internal);
             };
             scope.check()?;
-            let response = forwarding
-                .verify_response_async(response, &binding, &scope)
-                .await?;
+            // Verified once by `exchange_inner_mode` against the binding from signing.
             timing.success(&response);
             Ok(response)
         })
@@ -906,8 +920,8 @@ impl Requester {
                     .await,
             )?;
             let next = route.nodes.get(1).ok_or(Error::Unavailable)?;
-            let (signed, binding) = forwarding.sign_request_to(request, next)?;
-            let mut timing = PageTiming::new(metrics);
+            let (signed, _binding) = forwarding.sign_request_to(request, next)?;
+            let mut timing = PageTiming::new(metrics, scope.clock().clone());
             let response = self
                 .exchange_inner_mode(
                     signed,
@@ -919,9 +933,9 @@ impl Requester {
                     landing,
                 )
                 .await?;
+            // Verified once by `exchange_inner_mode` against `binding`.
             let response = match response {
                 transport::RelayResponse::Complete(response) => response,
-                // Verified by exchange_inner_mode against `binding`.
                 transport::RelayResponse::Landed(landed) => {
                     scope.check()?;
                     return Ok(Delivered::Landed(landed));
@@ -929,13 +943,6 @@ impl Requester {
                 transport::RelayResponse::Http { .. } => return Err(Error::Internal),
             };
             scope.check()?;
-            let response = observer.result(
-                Stage::PeerVerify,
-                &scope,
-                forwarding
-                    .verify_response_async(response, &binding, &scope)
-                    .await,
-            )?;
             timing.success(&response);
             Ok(Delivered::Response(response))
         })
@@ -958,7 +965,7 @@ impl Requester {
         request: SignedRequest,
         membership: std::sync::Arc<crate::topology::Membership>,
         scope: &'a RequestScope,
-    ) -> Operation<'a, SignedResponse> {
+    ) -> Operation<'a, VerifiedResponse> {
         Box::pin(async move {
             match self
                 .exchange_inner(request, membership, None, scope)
@@ -985,7 +992,7 @@ impl Requester {
         membership: std::sync::Arc<crate::topology::Membership>,
         relay: Option<Rc<flow_control::Charge<AdmissionPolicy>>>,
         scope: &'a RequestScope,
-    ) -> Operation<'a, transport::RelayResponse> {
+    ) -> Operation<'a, transport::VerifiedExchange> {
         self.exchange_inner_mode(request, membership, relay, scope, false, None, None)
     }
     #[allow(clippy::too_many_arguments)] // Keep transport, routing, and landing inputs explicit.
@@ -998,7 +1005,7 @@ impl Requester {
         direct_http: bool,
         timing: Option<&'a mut PageTiming<'_>>,
         landing: Option<i32>,
-    ) -> Operation<'a, transport::RelayResponse> {
+    ) -> Operation<'a, transport::VerifiedExchange> {
         let (network, paths, health, forwarding, transfers) = match self {
             Self::Network {
                 network,
@@ -1040,7 +1047,7 @@ impl Requester {
                     return Err(Error::InvalidRequest);
                 }
                 crate::rdma::TransportPlan::Http
-            } else if let Some(page) = rail_hint {
+            } else if let Some(page) = &rail_hint {
                 let search = search_budget(budget, &network.local)?;
                 let route = paths
                     .shortest_async(membership.clone(), &network.local, &search, &scope)
@@ -1048,10 +1055,23 @@ impl Requester {
                 if route.nodes.get(1) != Some(&next) {
                     return Err(Error::Unavailable);
                 }
-                rdma::select_hop(&route, &page, &network.local, &next)?
+                rdma::select_hop(&route, page, &network.local, &next)?
             } else {
                 crate::rdma::TransportPlan::Http
             };
+            if plan == crate::rdma::TransportPlan::Http
+                && let Some(page) = &rail_hint
+                && let Some(reason) = crate::rdma::http_plan_reason(
+                    &membership,
+                    page,
+                    &network.local,
+                    &next,
+                    direct_http,
+                )
+                && let Self::Network { metrics, .. } = self
+            {
+                metrics.record(reason.event(), 1);
+            }
             // The last link: this sender learns whether the destination
             // answers.
             let last_page = match &request.request.operation {
@@ -1061,13 +1081,17 @@ impl Requester {
                 _ => None,
             };
             let receive_permit = transfers.admit_receive(&request.request, &scope).await?;
-            let _probe = health.acquire(&next)?;
-            let sent = uring_runtime::environment::now();
-            let permit = paths
-                .peer_admission
-                .as_ref()
-                .map(|a| a.acquire(&next))
-                .transpose()?;
+            let probe = health.acquire(&next)?;
+            let sent = scope.clock().now();
+            let permit = match paths.peer_admission.as_ref().map(|a| a.acquire(&next)) {
+                Some(Err(error)) => {
+                    // No traffic is sent, so the circuit stays eligible.
+                    probe.cancel();
+                    return Err(error);
+                }
+                permit => permit.transpose()?,
+            };
+            let _probe = probe;
             let binding = forwarding.outbound_binding(&request)?;
             let socket_failure = Rc::new(std::cell::Cell::new(false));
             let response = transfers
@@ -1088,13 +1112,22 @@ impl Requester {
             // Receiving a signed envelope is not proof. Recover only after the
             // complete reverse chain and original request binding are verified.
             let response = match response {
-                Ok(response) => self.verify_exchange(response, &binding, &scope).await,
+                Ok(response) => {
+                    let verified = self.verify_exchange(response, &binding, &scope).await;
+                    match self {
+                        Self::Network { observer, .. } => {
+                            observer.result(Stage::PeerVerify, &scope, verified)
+                        }
+                        #[cfg(any(test, feature = "subscription-interop"))]
+                        Self::Scripted { .. } => verified,
+                    }
+                }
                 Err(error) => Err(error),
             };
             use racer_core::route;
             let exchange = match &response {
                 Ok(transport::RelayResponse::Complete(response)) => route::Exchange::Complete {
-                    overloaded: matches!(response.response, protocol::PeerResponse::Overloaded),
+                    overloaded: matches!(response.response(), protocol::PeerResponse::Overloaded),
                 },
                 // A landed page was verified by the transport, like a complete response.
                 Ok(transport::RelayResponse::Landed(_)) => {
@@ -1142,7 +1175,7 @@ impl Requester {
         response: transport::RelayResponse,
         binding: &crate::peer::forwarding::RequestBinding,
         scope: &RequestScope,
-    ) -> Result<transport::RelayResponse> {
+    ) -> Result<transport::VerifiedExchange> {
         let forwarding = match self {
             Self::Network { forwarding, .. } => forwarding,
             #[cfg(any(test, feature = "subscription-interop"))]
@@ -1154,7 +1187,7 @@ impl Requester {
             transport::RelayResponse::Complete(response) => forwarding
                 .verify_response_async(response, binding, scope)
                 .await
-                .map(|verified| transport::RelayResponse::Complete(verified.into_signed())),
+                .map(transport::RelayResponse::Complete),
             transport::RelayResponse::Landed(landed) => {
                 forwarding.verify_landed(
                     &landed.authentication,
@@ -1176,8 +1209,10 @@ impl Requester {
                 // All Racer outcomes use HTTP 200. Inspect the authenticated
                 // outcome, exactly as the materialized path does, not HTTP status.
                 connection.state_mut().exchange.verified_response(
-                    crate::peer::protocol::field(&authentication.original.head, "racer-outcome")?
-                        != "overloaded",
+                    crate::peer::protocol::field(
+                        &authentication.authentication().original.head,
+                        "racer-outcome",
+                    )? != "overloaded",
                 );
                 Ok(transport::RelayResponse::Http {
                     authentication,

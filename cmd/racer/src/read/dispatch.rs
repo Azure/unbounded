@@ -22,11 +22,11 @@ use crate::peer::forwarding::VerifiedRequest;
 use crate::peer::protocol::PeerResponse;
 use crate::peer::server::LocalPageService;
 use crate::runtime::Cancellation;
-use crate::runtime::HashMap;
 use crate::runtime::RequestScope;
 use crate::security::OriginContext;
 use crate::security::PeerOriginContext;
 use crate::store::holds::{HoldEpoch, HoldPages};
+use racer_io::xthread::command as mailbox;
 use std::cell::RefCell;
 #[cfg(test)]
 use std::future::Future;
@@ -42,7 +42,6 @@ use std::task::Context;
 use std::task::Poll;
 #[cfg(test)]
 use std::task::Waker;
-use uring_runtime::mailbox;
 
 #[cfg(test)]
 type Completion = mailbox::Completion<Result<Value>, AcquisitionBudget>;
@@ -51,31 +50,33 @@ type Command = mailbox::Command<Work, Result<Value>, AcquisitionBudget, RequestS
 type Receipt = mailbox::Receipt<Work, Result<Value>, AcquisitionBudget, RequestScope>;
 type Handoff = mailbox::Mailbox<Work, Result<Value>, AcquisitionBudget, RequestScope>;
 
-thread_local! {
-    // Installed only on the owning I/O thread. No Rc enters the shared directory.
-    static LOCALS: RefCell<HashMap<usize, (WorkerId, Weak<Coordinator>)>> = RefCell::new(HashMap::default());
-}
-
 struct Mailbox {
     worker: WorkerId,
     inner: Arc<Handoff>,
     /// Failed GPU verdicts the mailbox could not carry. The owning endpoint
     /// applies them on its next poll so a corrupt copy is never left eligible.
     failed_verdicts: std::sync::Mutex<Vec<super::sealed::SealedReport>>,
+    /// Failed verdicts lost because `failed_verdicts` was full; the owner
+    /// counts them so a corrupt copy left eligible is visible.
+    dropped_verdicts: std::sync::atomic::AtomicU64,
 }
 
 /// Bound on retained failed verdicts per worker. Each entry is one failed GPU
-/// verification; beyond this the owner is far behind and the oldest are kept.
+/// verification; beyond this the owner is far behind: the oldest are kept and
+/// the rest are counted in `racer_failed_verdicts_dropped_total`.
 const FAILED_VERDICT_LIMIT: usize = 4096;
 
 impl Mailbox {
-    /// Retain a failed verdict for the owner. Returns false only when full.
+    /// Retain a failed verdict for the owner. Returns false only when full,
+    /// after counting the drop.
     fn retain_failed_verdict(&self, report: super::sealed::SealedReport) -> bool {
         let mut pending = self
             .failed_verdicts
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         if pending.len() >= FAILED_VERDICT_LIMIT {
+            self.dropped_verdicts
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return false;
         }
         pending.push(report);
@@ -98,14 +99,34 @@ impl std::ops::Deref for Mailbox {
     }
 }
 
+/// One worker's view of the [`NodeDirectory`]: the shared map and mailboxes
+/// plus this worker's own coordinator, bound by [`WorkerDirectory::install`].
+/// Each worker thread builds its own view from the node graph, so no Rc
+/// enters the shared directory and no thread-local lookup is needed. Tests that
+/// model several workers on one thread may share one view and select the
+/// current worker with `simulation_scope`.
+pub struct WorkerDirectory {
+    shared: Arc<NodeDirectory>,
+    local: RefCell<Option<(WorkerId, Weak<Coordinator>)>>,
+}
+
+impl std::ops::Deref for WorkerDirectory {
+    type Target = NodeDirectory;
+    fn deref(&self) -> &NodeDirectory {
+        &self.shared
+    }
+}
+
 /// The map is immutable for the lifetime of this directory. Construct a replacement
 /// only after all endpoints and completion receipts have drained.
-pub struct WorkerDirectory {
+pub struct NodeDirectory {
     /// Node-wide prefetch tickets, scheduler, and owner budget.
     pub prefetch: Arc<crate::prefetch::service::Prefetch>,
     spill: std::sync::Mutex<super::spill::Config>,
     pub(crate) subscriptions: Arc<super::range_stream::Scheduler>,
     map: Arc<WorkerMap>,
+    /// Node-wide time and entropy.
+    ctx: racer_io::WorkerCtx,
     mailboxes: Vec<Arc<Mailbox>>,
     sequence: AtomicU64,
 }
@@ -213,7 +234,7 @@ impl mailbox::executor::ExecutionScope for RequestScope {
 /// Worker-owned command driver. Poll it even after ingress requests disconnect.
 /// Active futures are retained until completion; cancel is never a completion fence.
 pub struct WorkerEndpoint {
-    directory: Arc<WorkerDirectory>,
+    directory: std::rc::Rc<WorkerDirectory>,
 
     mailbox: Arc<Mailbox>,
 
@@ -238,13 +259,18 @@ impl WorkerDirectory {
     /// Scheduler fanout bypasses Fill flights. Count each consuming subscription
     /// on the stable page owner, retaining its original verified ciphertext.
     /// A full mailbox only loses an optional retention hint, never a page read.
-    pub(crate) fn observe_verified(&self, page: PageResult, scope: &RequestScope) {
+    pub(crate) fn observe_verified(
+        &self,
+        drivers: &std::rc::Rc<crate::drivers::DriverQueue>,
+        page: PageResult,
+        scope: &RequestScope,
+    ) {
         let Ok(owner) = self.page_owner(page.plaintext.page()) else {
             return;
         };
         // Reserve bounded worker-owned progress BEFORE retaining a mailbox
         // receipt. Dropping or delaying this optional task cannot hold delivery.
-        let Ok(permit) = uring_runtime::drivers::reserve() else {
+        let Ok(permit) = drivers.reserve() else {
             return;
         };
         if self.is_local(owner) {
@@ -289,7 +315,7 @@ impl WorkerDirectory {
         context: &OriginContext,
         scope: &RequestScope,
         budget: AcquisitionBudget,
-    ) -> Result<Operation<'static, (Result<PageResult>, AcquisitionBudget)>> {
+    ) -> Result<Operation<'static, PageResult>> {
         // Always use the owned worker driver, even for local ingress. Detaching the
         // stream must not free the provider contract before accepted I/O fences.
         let owner = self.metadata_owner(&version.object)?;
@@ -300,13 +326,10 @@ impl WorkerDirectory {
             Some(budget),
         )?;
         Ok(Box::pin(async move {
-            let completion = receipt.await?;
-            let budget = completion.budget.ok_or(Error::StaleFlight)?;
-            let result = completion.value.and_then(|value| match value {
+            match receipt.await?.value? {
                 Value::Page(result) => Ok(result),
                 _ => Err(Error::StaleFlight),
-            });
-            Ok((result, budget))
+            }
         }))
     }
     pub(crate) async fn accept_selected(
@@ -335,7 +358,7 @@ impl WorkerDirectory {
     /// A simulated process loss discards queued messages and their producer permits.
     /// Remaining receipts observe producer loss, not successful completion fences.
     /// Do not execute commands or mark kernel/NIC operations complete here.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "dst"))]
     pub(crate) fn simulation_crash(&self) {
         for mailbox in &self.mailboxes {
             mailbox.stop_admission();
@@ -344,55 +367,36 @@ impl WorkerDirectory {
     }
     /// Select a logical worker on the single-threaded simulation scheduler.
     /// Production gets this isolation from its owning OS thread.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "dst"))]
     pub(crate) fn simulation_scope(
-        &self,
+        self: &Rc<Self>,
         local: Option<(WorkerId, Rc<Coordinator>)>,
     ) -> SimulationLocal {
-        let key = self as *const Self as usize;
-        let previous = LOCALS.with(|locals| {
-            let mut locals = locals.borrow_mut();
-            let previous = locals.remove(&key);
-            if let Some((worker, local)) = local {
-                locals.insert(key, (worker, Rc::downgrade(&local)));
-            }
-            previous
-        });
-        SimulationLocal { key, previous }
-    }
-    pub fn new(map: Arc<WorkerMap>, workers: Vec<WorkerId>, capacity: usize) -> Result<Self> {
-        if workers.is_empty()
-            || capacity == 0
-            || workers
-                .iter()
-                .enumerate()
-                .any(|(i, w)| workers[..i].contains(w))
-        {
-            return Err(Error::InvalidConfiguration);
+        let previous = self
+            .local
+            .replace(local.map(|(worker, local)| (worker, Rc::downgrade(&local))));
+        SimulationLocal {
+            directory: self.clone(),
+            previous,
         }
-        Ok(Self {
-            prefetch: Arc::new(crate::prefetch::service::Prefetch::new()),
-            spill: std::sync::Mutex::new(super::spill::Config::default()),
-            subscriptions: super::range_stream::Scheduler::new(
-                capacity.saturating_mul(workers.len()),
-            ),
-            map,
-            mailboxes: workers
-                .into_iter()
-                .map(|worker| {
-                    Arc::new(Mailbox {
-                        worker,
-                        inner: Arc::new(Handoff::new(capacity).expect("validated capacity")),
-                        failed_verdicts: std::sync::Mutex::new(Vec::new()),
-                    })
-                })
-                .collect(),
-            sequence: AtomicU64::new(1),
-        })
+    }
+    /// A directory with a fresh node-wide state and one unbound view of it.
+    pub fn new(
+        map: Arc<WorkerMap>,
+        workers: Vec<WorkerId>,
+        capacity: usize,
+        ctx: racer_io::WorkerCtx,
+    ) -> Result<Self> {
+        Ok(Arc::new(NodeDirectory::new(map, workers, capacity, ctx)?).view())
+    }
+
+    /// The node-wide state shared by every worker's view.
+    pub fn node(&self) -> &Arc<NodeDirectory> {
+        &self.shared
     }
 
     pub fn install(
-        self: &Arc<Self>,
+        self: &Rc<Self>,
         worker: WorkerId,
         local: Rc<Coordinator>,
     ) -> Result<WorkerEndpoint> {
@@ -403,20 +407,18 @@ impl WorkerDirectory {
             .index()
             .set_hold_capacity_percent(self.spill_config().retained_percent)?;
         let mailbox = self.mailbox(worker)?.clone();
-        let key = Arc::as_ptr(self) as usize;
-        LOCALS.with(|locals| {
-            let mut locals = locals.borrow_mut();
-            if locals
-                .get(&key)
+        {
+            let mut bound = self.local.borrow_mut();
+            if bound
+                .as_ref()
                 .and_then(|(_, local)| local.upgrade())
                 .is_some()
             {
                 return Err(Error::InvalidConfiguration);
             }
             mailbox.install()?;
-            locals.insert(key, (worker, Rc::downgrade(&local)));
-            Ok(())
-        })?;
+            *bound = Some((worker, Rc::downgrade(&local)));
+        }
         Ok(WorkerEndpoint {
             directory: self.clone(),
             mailbox,
@@ -425,33 +427,22 @@ impl WorkerDirectory {
         })
     }
 
-    fn mailbox(&self, worker: WorkerId) -> Result<&Arc<Mailbox>> {
-        self.mailboxes
-            .iter()
-            .find(|m| m.worker == worker)
-            .ok_or(Error::InvalidConfiguration)
-    }
     /// This worker's read coordinator.
     pub(crate) fn local_coordinator(&self) -> Result<Rc<Coordinator>> {
         self.local()
     }
     pub(super) fn local(&self) -> Result<Rc<Coordinator>> {
-        LOCALS
-            .with(|locals| {
-                locals
-                    .borrow()
-                    .get(&(self as *const Self as usize))
-                    .and_then(|(_, local)| local.upgrade())
-            })
+        self.local
+            .borrow()
+            .as_ref()
+            .and_then(|(_, local)| local.upgrade())
             .ok_or(Error::Unavailable)
     }
     fn is_local(&self, owner: WorkerId) -> bool {
-        LOCALS.with(|locals| {
-            locals
-                .borrow()
-                .get(&(self as *const Self as usize))
-                .is_some_and(|(worker, _)| *worker == owner)
-        })
+        self.local
+            .borrow()
+            .as_ref()
+            .is_some_and(|(worker, _)| *worker == owner)
     }
     fn seal(&self, context: &OriginContext, scope: &RequestScope) -> Result<PeerOriginContext> {
         let sequence = self
@@ -463,23 +454,6 @@ impl WorkerDirectory {
         self.local()?
             .credentials
             .seal(context, AttemptId(attempt), scope)
-    }
-    pub fn metadata_owner(&self, object: &ObjectId) -> Result<WorkerId> {
-        self.map.metadata_owner(object)
-    }
-    pub fn page_owner(&self, page: &PageId) -> Result<WorkerId> {
-        self.map.owner(page)
-    }
-
-    /// Apply read spill settings. Call before installing workers.
-    pub fn configure_spill(&self, config: super::spill::Config) -> Result<()> {
-        config.validate()?;
-        *self.spill.lock().unwrap() = config;
-        Ok(())
-    }
-
-    pub fn spill_config(&self) -> super::spill::Config {
-        *self.spill.lock().unwrap()
     }
 
     /// Add one holder to `page` on its owning worker only, until `until`.
@@ -513,6 +487,7 @@ impl WorkerDirectory {
     /// returns its holds; hold expiry is the backstop if this cannot submit.
     pub(super) fn release_read_pages(
         &self,
+        drivers: &std::rc::Rc<crate::drivers::DriverQueue>,
         version: &ObjectVersion,
         pages: impl IntoIterator<Item = (PageNumber, HoldEpoch)>,
         request: crate::model::RequestId,
@@ -540,12 +515,14 @@ impl WorkerDirectory {
                 }
                 continue;
             }
-            let Ok(permit) = uring_runtime::drivers::reserve() else {
+            let Ok(permit) = drivers.reserve() else {
                 continue;
             };
-            let Ok(scope) = RequestScope::new(
+            let clock = self.ctx.clock.clone();
+            let Ok(scope) = RequestScope::with_clock(
                 request,
-                uring_runtime::environment::now() + std::time::Duration::from_secs(30),
+                clock.now() + std::time::Duration::from_secs(30),
+                clock,
             ) else {
                 continue;
             };
@@ -661,22 +638,6 @@ impl WorkerDirectory {
         }
     }
 
-    fn submit(
-        &self,
-        worker: WorkerId,
-        work: Work,
-        scope: &RequestScope,
-        budget: Option<AcquisitionBudget>,
-    ) -> Result<Receipt> {
-        scope.check()?;
-        let mailbox = self.mailbox(worker)?;
-        let generation = self
-            .sequence
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-            .map_err(|_| Error::Unavailable)?;
-        mailbox.inner.submit(generation, work, scope, budget)
-    }
-
     async fn budgeted(
         &self,
         owner: WorkerId,
@@ -778,7 +739,7 @@ impl WorkerDirectory {
         context: &OriginContext,
         scope: &RequestScope,
         budget: AcquisitionBudget,
-    ) -> Result<Operation<'static, (Result<PageResult>, AcquisitionBudget)>> {
+    ) -> Result<Operation<'static, PageResult>> {
         if page.version.object != context.object {
             return Err(Error::InvalidRequest);
         }
@@ -790,13 +751,10 @@ impl WorkerDirectory {
             Some(budget),
         )?;
         Ok(Box::pin(async move {
-            let completion = receipt.await?;
-            let budget = completion.budget.ok_or(Error::StaleFlight)?;
-            let value = completion.value.and_then(|value| match value {
+            match receipt.await?.value? {
                 Value::Page(value) => Ok(value),
                 _ => Err(Error::StaleFlight),
-            });
-            Ok((value, budget))
+            }
         }))
     }
     /// Like [`Self::start_page`], but ciphertext the GPU behind `target`
@@ -809,7 +767,7 @@ impl WorkerDirectory {
         scope: &RequestScope,
         budget: AcquisitionBudget,
         target: super::sealed::SealedTarget,
-    ) -> Result<Operation<'static, (Result<super::sealed::Fetched>, AcquisitionBudget)>> {
+    ) -> Result<Operation<'static, super::sealed::Fetched>> {
         if page.version.object != context.object {
             return Err(Error::InvalidRequest);
         }
@@ -821,19 +779,17 @@ impl WorkerDirectory {
             Some(budget),
         )?;
         Ok(Box::pin(async move {
-            let completion = receipt.await?;
-            let budget = completion.budget.ok_or(Error::StaleFlight)?;
-            let value = completion.value.and_then(|value| match value {
+            match receipt.await?.value? {
                 Value::Fetched(value) => Ok(value),
                 _ => Err(Error::StaleFlight),
-            });
-            Ok((value, budget))
+            }
         }))
     }
 
     /// Tell a sealed page's owner what the GPU decided, in the background.
     pub(crate) fn report_sealed(
         &self,
+        drivers: &std::rc::Rc<crate::drivers::DriverQueue>,
         report: super::sealed::SealedReport,
         passed: bool,
         scope: &RequestScope,
@@ -858,13 +814,13 @@ impl WorkerDirectory {
                 mailbox.retain_failed_verdict(report);
             }
         };
-        let Ok(permit) = uring_runtime::drivers::reserve() else {
+        let Ok(permit) = drivers.reserve() else {
             retain(report);
             return;
         };
         // The request may already be ending; the verdict must still arrive.
-        let deadline = uring_runtime::environment::now() + std::time::Duration::from_secs(5);
-        let Ok(detached) = RequestScope::new(scope.request, deadline) else {
+        let deadline = scope.clock().now() + std::time::Duration::from_secs(5);
+        let Ok(detached) = scope.child(scope.request, deadline) else {
             retain(report);
             return;
         };
@@ -907,11 +863,10 @@ impl WorkerDirectory {
     /// work is queued on the mailbox as another worker's request would be.
     #[cfg(test)]
     pub(crate) fn as_remote<T>(&self, f: impl FnOnce() -> T) -> T {
-        let key = self as *const Self as usize;
-        let entry = LOCALS.with(|locals| locals.borrow_mut().remove(&key));
+        let entry = self.local.borrow_mut().take();
         let output = f();
         if let Some(entry) = entry {
-            LOCALS.with(|locals| locals.borrow_mut().insert(key, entry));
+            self.local.replace(Some(entry));
         }
         output
     }
@@ -998,35 +953,44 @@ impl WorkerDirectory {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "dst"))]
 pub(crate) struct SimulationLocal {
-    key: usize,
+    directory: std::rc::Rc<WorkerDirectory>,
     previous: Option<(WorkerId, std::rc::Weak<Coordinator>)>,
 }
-#[cfg(test)]
+#[cfg(any(test, feature = "dst"))]
 impl Drop for SimulationLocal {
     fn drop(&mut self) {
-        LOCALS.with(|locals| {
-            let mut locals = locals.borrow_mut();
-            locals.remove(&self.key);
-            if let Some(previous) = self.previous.take() {
-                locals.insert(self.key, previous);
-            }
-        });
+        self.directory.local.replace(self.previous.take());
     }
 }
 
 impl WorkerEndpoint {
+    /// The local worker's detached driver queue.
+    #[cfg(test)]
+    pub(crate) fn drivers(&self) -> &std::rc::Rc<crate::drivers::DriverQueue> {
+        self.local.drivers()
+    }
+
     /// Simulated process loss occurs after the OS crash cut. Drop accepted tasks
     /// without polling them; the simulated reactor still fences owned buffers.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "dst"))]
     pub(crate) fn simulation_crash(&mut self) {
-        assert!(uring_runtime::reactor::simulation::Simulation::current().is_some());
         self.directory.simulation_crash();
         self.active.simulation_crash();
     }
     /// Apply failed GPU verdicts other workers could not send through the mailbox.
     fn apply_failed_verdicts(&self) {
+        let dropped = self
+            .mailbox
+            .dropped_verdicts
+            .swap(0, std::sync::atomic::Ordering::Relaxed);
+        if dropped != 0 {
+            self.local
+                .fill
+                .metrics
+                .record(crate::telemetry::Event::FailedVerdictDropped, dropped);
+        }
         for report in self.mailbox.take_failed_verdicts() {
             self.local.fill.sealed_verdict(report, false);
         }
@@ -1059,10 +1023,14 @@ impl WorkerEndpoint {
         let waker = futures::task::noop_waker();
         self.poll(&mut Context::from_waker(&waker), work_budget)
     }
-    /// Earliest caller deadline. The I/O loop currently uses its bounded 1 ms tick
-    /// to check deadlines rather than scheduling this value directly.
+    /// Earliest instant [`Self::poll`] has timed work: a caller deadline or a
+    /// node-wide prefetch expiry. The owning lane parks no later than this.
     pub fn next_deadline(&self) -> Option<std::time::Instant> {
-        self.active.next_deadline(&self.mailbox)
+        self.active
+            .next_deadline(&self.mailbox)
+            .into_iter()
+            .chain(self.directory.prefetch.next_wake())
+            .min()
     }
     pub fn uninstall(&mut self) -> Result<()> {
         self.stop_admission();
@@ -1070,22 +1038,14 @@ impl WorkerEndpoint {
             return Err(Error::Unavailable);
         }
         self.mailbox.uninstall()?;
-        LOCALS.with(|locals| {
-            locals
-                .borrow_mut()
-                .remove(&(Arc::as_ptr(&self.directory) as usize))
-        });
+        self.directory.local.borrow_mut().take();
         Ok(())
     }
 }
 impl Drop for WorkerEndpoint {
     fn drop(&mut self) {
         self.stop_admission();
-        LOCALS.with(|locals| {
-            locals
-                .borrow_mut()
-                .remove(&(Arc::as_ptr(&self.directory) as usize));
-        });
+        self.directory.local.borrow_mut().take();
         // Queued work has not started and can be fenced as non-submission. Drop
         // outside the mailbox lock because its permit releases against that lock.
         Executor::reject_queued(&self.mailbox, Error::Unavailable);
@@ -1338,8 +1298,98 @@ async fn execute(
     }
 }
 
-// PeerServer owns local services through Rc; retain the node-wide directory Arc.
-impl LocalPageService for Arc<WorkerDirectory> {
+impl NodeDirectory {
+    pub fn new(
+        map: Arc<WorkerMap>,
+        workers: Vec<WorkerId>,
+        capacity: usize,
+        ctx: racer_io::WorkerCtx,
+    ) -> Result<Self> {
+        if workers.is_empty()
+            || capacity == 0
+            || workers
+                .iter()
+                .enumerate()
+                .any(|(i, w)| workers[..i].contains(w))
+        {
+            return Err(Error::InvalidConfiguration);
+        }
+        Ok(Self {
+            prefetch: Arc::new(crate::prefetch::service::Prefetch::new(ctx.clone())),
+            spill: std::sync::Mutex::new(super::spill::Config::default()),
+            subscriptions: super::range_stream::Scheduler::new(
+                capacity.saturating_mul(workers.len()),
+                ctx.clone(),
+            ),
+            map,
+            ctx,
+            mailboxes: workers
+                .into_iter()
+                .map(|worker| {
+                    Arc::new(Mailbox {
+                        worker,
+                        inner: Arc::new(Handoff::new(capacity).expect("validated capacity")),
+                        failed_verdicts: std::sync::Mutex::new(Vec::new()),
+                        dropped_verdicts: std::sync::atomic::AtomicU64::new(0),
+                    })
+                })
+                .collect(),
+            sequence: AtomicU64::new(1),
+        })
+    }
+
+    pub fn metadata_owner(&self, object: &ObjectId) -> Result<WorkerId> {
+        self.map.metadata_owner(object)
+    }
+    pub fn page_owner(&self, page: &PageId) -> Result<WorkerId> {
+        self.map.owner(page)
+    }
+
+    /// Apply read spill settings. Call before installing workers.
+    pub fn configure_spill(&self, config: super::spill::Config) -> Result<()> {
+        config.validate()?;
+        *self.spill.lock().unwrap() = config;
+        Ok(())
+    }
+
+    pub fn spill_config(&self) -> super::spill::Config {
+        *self.spill.lock().unwrap()
+    }
+
+    fn mailbox(&self, worker: WorkerId) -> Result<&Arc<Mailbox>> {
+        self.mailboxes
+            .iter()
+            .find(|m| m.worker == worker)
+            .ok_or(Error::InvalidConfiguration)
+    }
+
+    fn submit(
+        &self,
+        worker: WorkerId,
+        work: Work,
+        scope: &RequestScope,
+        budget: Option<AcquisitionBudget>,
+    ) -> Result<Receipt> {
+        scope.check()?;
+        let mailbox = self.mailbox(worker)?;
+        let generation = self
+            .sequence
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .map_err(|_| Error::Unavailable)?;
+        mailbox.inner.submit(generation, work, scope, budget)
+    }
+
+    /// A new view for one worker, unbound until [`WorkerDirectory::install`].
+    pub fn view(self: &Arc<Self>) -> WorkerDirectory {
+        WorkerDirectory {
+            shared: self.clone(),
+            local: RefCell::new(None),
+        }
+    }
+}
+
+// PeerServer owns local services through Rc; retain this worker's directory view.
+impl LocalPageService for std::rc::Rc<WorkerDirectory> {
     fn serve_peer<'a>(
         &'a self,
         request: VerifiedRequest,
@@ -1383,7 +1433,7 @@ mod tests {
     use crate::model::CacheKey;
     use crate::model::RequestId;
     use crate::model::StrongEtag;
-    use racer_control_wire::CacheId;
+    use racer_wire::control::CacheId;
     use std::time::Duration;
     use std::time::Instant;
     /// A page owned by `worker` in the two-worker test map.
@@ -1415,8 +1465,8 @@ mod tests {
         }
     }
     /// Deliver retained verdicts through the owner's endpoint and count them.
-    fn applied_by_owner(directory: &Arc<WorkerDirectory>) -> u64 {
-        let (owner, _fixture) = crate::read::tests::admission_coordinator();
+    fn applied_by_owner(env: &racer_io::Env, directory: &std::rc::Rc<WorkerDirectory>) -> u64 {
+        let (owner, _fixture) = crate::read::tests::admission_coordinator(env);
         let before = owner
             .fill
             .metrics
@@ -1433,79 +1483,81 @@ mod tests {
     }
     #[test]
     fn failed_sealed_verdict_survives_full_driver_queue() {
-        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1));
-        let _queue = queue.enter();
+        let env = racer_io::Env::host();
+        let queue = Rc::new(crate::drivers::DriverQueue::new(1));
         let workers = vec![WorkerId(0), WorkerId(1)];
-        let directory = Arc::new(
+        let directory = std::rc::Rc::new(
             WorkerDirectory::new(
                 Arc::new(WorkerMap::new(workers.clone()).unwrap()),
                 workers,
                 4,
+                racer_io::WorkerCtx::host(),
             )
             .unwrap(),
         );
         let page = page_owned_by(&directory, WorkerId(1));
-        let full = uring_runtime::drivers::reserve().unwrap();
+        let full = queue.reserve().unwrap();
         {
-            let (local, _fixture) = crate::read::tests::admission_coordinator();
+            let (local, _fixture) = crate::read::tests::admission_coordinator(&env);
             let _local = directory.simulation_scope(Some((WorkerId(0), local)));
-            directory.report_sealed(failed_report(page.clone()), false, &scope());
+            directory.report_sealed(&queue, failed_report(page.clone()), false, &scope());
             // A passing verdict is only a persistence hint and is not retained.
-            directory.report_sealed(failed_report(page), true, &scope());
+            directory.report_sealed(&queue, failed_report(page), true, &scope());
         }
         drop(full);
-        assert_eq!(applied_by_owner(&directory), 1);
+        assert_eq!(applied_by_owner(&env, &directory), 1);
         assert!(directory.mailboxes[1].take_failed_verdicts().is_empty());
     }
     #[test]
     fn failed_sealed_verdict_survives_full_mailbox() {
-        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(64));
-        let _queue = queue.enter();
+        let env = racer_io::Env::host();
+        let queue = Rc::new(crate::drivers::DriverQueue::new(64));
         let workers = vec![WorkerId(0), WorkerId(1)];
-        let directory = Arc::new(
+        let directory = std::rc::Rc::new(
             WorkerDirectory::new(
                 Arc::new(WorkerMap::new(workers.clone()).unwrap()),
                 workers,
                 1,
+                racer_io::WorkerCtx::host(),
             )
             .unwrap(),
         );
         directory.mailboxes[1].install().unwrap();
         let page = page_owned_by(&directory, WorkerId(1));
         {
-            let (local, _fixture) = crate::read::tests::admission_coordinator();
+            let (local, _fixture) = crate::read::tests::admission_coordinator(&env);
             let _local = directory.simulation_scope(Some((WorkerId(0), local)));
             // The first verdict takes the only mailbox slot; the second is retained.
-            directory.report_sealed(failed_report(page.clone()), false, &scope());
+            directory.report_sealed(&queue, failed_report(page.clone()), false, &scope());
             assert_eq!(directory.mailboxes[1].outstanding(), 1);
-            directory.report_sealed(failed_report(page), false, &scope());
+            directory.report_sealed(&queue, failed_report(page), false, &scope());
         }
         assert_eq!(directory.mailboxes[1].take_failed_verdicts().len(), 1);
     }
     /// Run `report_sealed` for a landed page owned by worker 1 from worker 0,
     /// and return worker 0's new CorruptMiss count and worker 1's mailbox.
-    fn landed_verdict(passed: bool) -> (u64, usize) {
-        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(64));
-        let _queue = queue.enter();
+    fn landed_verdict(env: &racer_io::Env, passed: bool) -> (u64, usize) {
+        let queue = Rc::new(crate::drivers::DriverQueue::new(64));
         let workers = vec![WorkerId(0), WorkerId(1)];
-        let directory = Arc::new(
+        let directory = std::rc::Rc::new(
             WorkerDirectory::new(
                 Arc::new(WorkerMap::new(workers.clone()).unwrap()),
                 workers,
                 4,
+                racer_io::WorkerCtx::host(),
             )
             .unwrap(),
         );
         directory.mailboxes[1].install().unwrap();
         let page = page_owned_by(&directory, WorkerId(1));
-        let (local, _fixture) = crate::read::tests::admission_coordinator();
+        let (local, _fixture) = crate::read::tests::admission_coordinator(env);
         let before = local
             .fill
             .metrics
             .count(crate::telemetry::Event::CorruptMiss);
         {
             let _local = directory.simulation_scope(Some((WorkerId(0), local.clone())));
-            directory.report_sealed(landed_report(page), passed, &scope());
+            directory.report_sealed(&queue, landed_report(page), passed, &scope());
         }
         let local_misses = local
             .fill
@@ -1520,12 +1572,14 @@ mod tests {
     /// The owner may share a landed copy with other sealed fetches, so a
     /// failed verdict goes to it rather than settling on the reporter.
     fn failed_landed_verdict_goes_to_the_owner() {
-        assert_eq!(landed_verdict(false), (0, 1));
+        let env = racer_io::Env::host();
+        assert_eq!(landed_verdict(&env, false), (0, 1));
     }
     #[test]
     /// A passed landed page leaves the owner nothing to do.
     fn passed_landed_verdict_settles_locally() {
-        assert_eq!(landed_verdict(true), (0, 0));
+        let env = racer_io::Env::host();
+        assert_eq!(landed_verdict(&env, true), (0, 0));
     }
     #[test]
     fn failed_sealed_verdicts_are_bounded() {
@@ -1534,10 +1588,38 @@ mod tests {
         for _ in 0..FAILED_VERDICT_LIMIT {
             assert!(directory.mailboxes[1].retain_failed_verdict(failed_report(page.clone())));
         }
+        assert!(!directory.mailboxes[1].retain_failed_verdict(failed_report(page.clone())));
         assert!(!directory.mailboxes[1].retain_failed_verdict(failed_report(page)));
         assert_eq!(
             directory.mailboxes[1].take_failed_verdicts().len(),
             FAILED_VERDICT_LIMIT
+        );
+        // The owner counts the drops once on its next poll.
+        let env = racer_io::Env::host();
+        let workers = vec![WorkerId(0), WorkerId(1)];
+        let directory = std::rc::Rc::new(
+            WorkerDirectory::new(
+                Arc::new(WorkerMap::new(workers.clone()).unwrap()),
+                workers,
+                1,
+                racer_io::WorkerCtx::host(),
+            )
+            .unwrap(),
+        );
+        let page = page_owned_by(&directory, WorkerId(1));
+        for _ in 0..FAILED_VERDICT_LIMIT + 2 {
+            directory.mailboxes[1].retain_failed_verdict(failed_report(page.clone()));
+        }
+        let (owner, _fixture) = crate::read::tests::admission_coordinator(&env);
+        let mut endpoint = directory.install(WorkerId(1), owner.clone()).unwrap();
+        endpoint.poll_budgeted(0).unwrap();
+        endpoint.poll_budgeted(0).unwrap();
+        assert_eq!(
+            owner
+                .fill
+                .metrics
+                .count(crate::telemetry::Event::FailedVerdictDropped),
+            2
         );
     }
     #[test]
@@ -1604,7 +1686,7 @@ mod tests {
         use crate::model::ObjectVersion;
         use crate::model::PageNumber;
         use crate::model::StrongEtag;
-        use racer_control_wire::CacheId;
+        use racer_wire::control::CacheId;
         let map = WorkerMap::new(vec![WorkerId(9), WorkerId(3), WorkerId(1)]).unwrap();
         let ordered = WorkerMap::new(vec![WorkerId(1), WorkerId(3), WorkerId(9)]).unwrap();
         let object = ObjectId {
@@ -1636,6 +1718,7 @@ mod tests {
             Arc::new(WorkerMap::new(workers.clone()).unwrap()),
             workers,
             capacity,
+            racer_io::WorkerCtx::host(),
         )
         .unwrap();
         for mailbox in &directory.mailboxes {
@@ -1644,7 +1727,7 @@ mod tests {
         directory
     }
     fn scope() -> RequestScope {
-        RequestScope::new(RequestId([1; 16]), Instant::now() + Duration::from_secs(60)).unwrap()
+        RequestScope::host(RequestId([1; 16]), Instant::now() + Duration::from_secs(60)).unwrap()
     }
     fn version() -> ObjectVersion {
         ObjectVersion {
@@ -1689,14 +1772,14 @@ mod tests {
             .complete(
                 command.generation,
                 Completion {
-                    value: Err(Error::Cancelled),
+                    value: Err(Error::Canceled),
                     budget: None,
                 },
             )
             .unwrap();
         assert!(matches!(
             selected.as_mut().poll(&mut cx),
-            Poll::Ready(Err(Error::Cancelled))
+            Poll::Ready(Err(Error::Canceled))
         ));
         drop((selected, command));
         assert_eq!(directory.mailbox(owner).unwrap().outstanding(), 0);
@@ -1705,8 +1788,9 @@ mod tests {
     #[test]
     fn expired_drain_completes_queued_selected_waiters_and_reclaims_ciphertext() {
         use crate::admission::ResourceClass;
+        let env = racer_io::Env::host();
         for cancel_caller in [false, true] {
-            let directory = Arc::new(directory(1));
+            let directory = Rc::new(directory(1));
             let caller = scope();
             let admission = Rc::new(flow_control::Quotas::new(
                 crate::admission::AdmissionPolicy::new(
@@ -1726,7 +1810,7 @@ mod tests {
             let mut endpoint = WorkerEndpoint {
                 mailbox: mailbox.clone(),
                 directory: directory.clone(),
-                local: crate::test_support::wake_test_coordinator(),
+                local: crate::test_support::wake_test_coordinator(&env),
                 active: Executor::default(),
             };
             // Model ingress on the other worker so the real selected handoff is used.
@@ -1740,12 +1824,15 @@ mod tests {
             assert!(selected.as_mut().poll(&mut cx).is_pending());
             assert!(mailbox.has_queued());
             assert_eq!(mailbox.outstanding(), 1);
-            assert_eq!(admission.used(ResourceClass::Ciphertext), 19);
+            assert_eq!(
+                admission.used(ResourceClass::Ciphertext),
+                page_alloc::buf::GRANULE
+            );
             if cancel_caller {
                 caller.cancel().unwrap();
                 assert!(selected.as_mut().poll(&mut cx).is_pending());
             }
-            let shutdown = RequestScope::new(RequestId([2; 16]), Instant::now()).unwrap();
+            let shutdown = RequestScope::host(RequestId([2; 16]), Instant::now()).unwrap();
             assert_eq!(shutdown.check(), Err(Error::DeadlineExceeded));
             let mut drain = endpoint.drain(&shutdown);
             let before = count.count();
@@ -1759,7 +1846,7 @@ mod tests {
             assert_eq!(mailbox.outstanding(), 1, "unread receipt retains its slot");
             assert!(matches!(
                 selected.as_mut().poll(&mut cx),
-                Poll::Ready(Err(Error::Cancelled))
+                Poll::Ready(Err(Error::Canceled))
             ));
             assert_eq!(mailbox.outstanding(), 0);
             assert_eq!(drain.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
@@ -1774,12 +1861,13 @@ mod tests {
 
     #[test]
     fn expired_drain_returns_queued_budget_and_reclaims_detached_receipts() {
+        let env = racer_io::Env::host();
         for detach in [false, true] {
-            let directory = Arc::new(directory(1));
+            let directory = Rc::new(directory(1));
             let mut endpoint = WorkerEndpoint {
                 mailbox: directory.mailboxes[0].clone(),
                 directory: directory.clone(),
-                local: crate::test_support::wake_test_coordinator(),
+                local: crate::test_support::wake_test_coordinator(&env),
                 active: Executor::default(),
             };
             let caller = scope();
@@ -1798,7 +1886,7 @@ mod tests {
                 .unwrap();
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             assert!(Pin::new(&mut receipt).poll(&mut cx).is_pending());
-            let shutdown = RequestScope::new(RequestId([2; 16]), Instant::now()).unwrap();
+            let shutdown = RequestScope::host(RequestId([2; 16]), Instant::now()).unwrap();
             let mut drain = endpoint.drain(&shutdown);
             if detach {
                 drop(receipt);
@@ -1809,7 +1897,7 @@ mod tests {
                 let Poll::Ready(Ok(completion)) = Pin::new(&mut receipt).poll(&mut cx) else {
                     panic!("queued non-submission must return a normal completion");
                 };
-                assert!(matches!(completion.value, Err(Error::Cancelled)));
+                assert!(matches!(completion.value, Err(Error::Canceled)));
                 let budget = completion.budget.unwrap();
                 assert_eq!(budget.remaining_attempts(), 3);
                 assert_eq!(budget.remaining_links(), 5);
@@ -1827,7 +1915,7 @@ mod tests {
 
     #[test]
     fn cached_page_handoff_is_lookup_only_and_propagates_misses_and_errors() {
-        for error in [None, Some(Error::Cancelled), Some(Error::CorruptRecord)] {
+        for error in [None, Some(Error::Canceled), Some(Error::CorruptRecord)] {
             let directory = directory(1);
             let scope = scope();
             let page = PageId {
@@ -1922,13 +2010,14 @@ mod tests {
 
     #[test]
     fn mailbox_and_reply_notifications_cover_both_registration_orders() {
+        let env = racer_io::Env::host();
         for submit_before_poll in [false, true] {
             for complete_before_poll in [false, true] {
-                let directory = Arc::new(directory(4));
+                let directory = Rc::new(directory(4));
                 let mut endpoint = WorkerEndpoint {
                     mailbox: directory.mailboxes[0].clone(),
                     directory: directory.clone(),
-                    local: crate::test_support::wake_test_coordinator(),
+                    local: crate::test_support::wake_test_coordinator(&env),
                     active: Executor::default(),
                 };
                 let count = Arc::new(crate::test_support::WakeCounter::default());
@@ -1937,7 +2026,7 @@ mod tests {
                 if !submit_before_poll {
                     endpoint.poll(&mut cx, 0).unwrap();
                 }
-                let sender = directory.clone();
+                let sender = directory.node().clone();
                 let mut receipt = std::thread::spawn(move || {
                     sender
                         .submit(
@@ -1974,10 +2063,9 @@ mod tests {
     /// A parked real acquisition cannot prevent an unrelated mailbox completion.
     #[test]
     fn bounded_admission_mailbox_keeps_other_work_progressing() {
-        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
-        let _owner = queue.enter();
-        let directory = Arc::new(directory(4));
-        let (local, _fixture) = crate::read::tests::admission_coordinator();
+        let env = racer_io::Env::host();
+        let directory = Rc::new(directory(4));
+        let (local, _fixture) = crate::read::tests::admission_coordinator(&env);
         let mut endpoint = WorkerEndpoint {
             mailbox: directory.mailboxes[0].clone(),
             directory: directory.clone(),
@@ -1998,7 +2086,7 @@ mod tests {
             number: crate::model::PageNumber(0),
         };
         page.version.object.cache =
-            racer_control_wire::CacheId(crate::test_support::security::CACHE.into());
+            racer_wire::control::CacheId(crate::test_support::security::CACHE.into());
         let context = OriginContext {
             object: page.version.object.clone(),
             metadata: None,
@@ -2009,8 +2097,11 @@ mod tests {
             .seal(&context, AttemptId([3; 16]), &caller)
             .unwrap();
         let membership = Arc::new(
-            crate::topology::Membership::validate(racer_control_wire::MembershipVersion(1), vec![])
-                .unwrap(),
+            crate::topology::Membership::validate(
+                racer_wire::control::MembershipVersion(1),
+                vec![],
+            )
+            .unwrap(),
         );
         let mut waiting = directory
             .submit(
@@ -2194,7 +2285,8 @@ mod tests {
         fn sync<T: Sync>() {}
         send::<Command>();
         send::<Completion>();
-        send::<WorkerDirectory>();
-        sync::<WorkerDirectory>();
+        // Only the node-wide state crosses threads; each worker owns its view.
+        send::<Arc<NodeDirectory>>();
+        sync::<NodeDirectory>();
     }
 }

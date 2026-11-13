@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
-FROM docker.io/library/golang:1.27.0-trixie AS builder
+FROM docker.io/library/golang:1.27.4-trixie@sha256:b54b2639de8c1bfe538ec5ffc45f29b1932235ac5f6d63c059853646677112d9 AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates git make \
     && rm -rf /var/lib/apt/lists/*

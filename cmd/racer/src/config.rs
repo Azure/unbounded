@@ -1,38 +1,52 @@
-//! Environment and deployment configuration, validated before startup.
+//! Environment and deployment configuration, validated once before startup.
+//!
+//! Every accepted variable is one entry in [`table::TABLE`]. Parsing,
+//! defaults, single-variable bounds, the unknown-variable check, and the
+//! generated reference documentation come from that table; cross-variable
+//! rules live in [`Config::validate`] and name every variable they involve.
+//!
+//! Only `main` reads the process environment ([`Config::from_env`]). Tests and
+//! simulations build a [`Config`] from an explicit map ([`Config::from_map`])
+//! or lookup ([`Config::from_lookup`]), so many nodes in one process never see
+//! each other's settings.
 //!
 //! Default to all eligible physical cores, subject to CPU and resource budgets.
 //! Shares and physical NIC bindings come from accepted controller membership.
 
+pub mod spec;
+pub mod table;
+
 use crate::error::Error;
 use crate::error::Result;
 use crate::model::PAGE_BYTES;
-use crate::store::MAX_HEADER_BYTES;
-use racer_control_wire::ClusterId;
-use racer_control_wire::DEFAULT_SHARES;
-use racer_control_wire::NodeId;
+use racer_wire::control::ClusterId;
+use racer_wire::control::NodeId;
+pub use spec::ConfigError;
+use spec::Values;
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
+use table::MAX_BYTES;
+use table::MAX_ENTRIES;
+use table::RECORD_BYTES;
+use table::TABLE;
 
 pub const DEFAULT_MAX_THREADS: usize = usize::MAX;
-/// Default per-cache, per-worker origin connection cap. Remote object stores
-/// deliver roughly 30 MB/s per connection, so filling a fast NIC needs a few
-/// hundred page fetches in flight across all workers.
-pub const DEFAULT_ORIGIN_CONNECTIONS_PER_CACHE: usize = 32;
 /// Not a Node UID. Only verified enrollment/local identity recovery may replace it.
 pub const UNRESOLVED_NODE_ID: &str = "";
 /// Not a cluster UID. Managed startup replaces it from the elected control bootstrap.
 pub const UNRESOLVED_CLUSTER_ID: &str = "";
 /// Projected control-audience token used by managed deployments.
 pub const MANAGED_SERVICE_ACCOUNT_TOKEN: &str = "/var/run/racer-token/token";
+/// Control-audience token default for a standalone controller.
+pub const STANDALONE_SERVICE_ACCOUNT_TOKEN: &str = "/var/run/secrets/racer-control/token";
 /// Smallest explicit thread cap in managed mode: I/O, crypto, and cluster control.
 pub const MANAGED_MIN_THREADS: usize = 3;
 const MIB: u64 = 1024 * 1024;
-const MAX_BYTES: u64 = 64 * 1024 * MIB;
-const MAX_ENTRIES: usize = 1_048_576;
 
 /// Disk retention policy only; never changes request admission or authorization.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -43,17 +57,13 @@ pub enum AdmissionMode {
 
 pub use racer_core::admission::Limits;
 
-/// Which limit dimensions were left unset in the environment.
+/// Which shared limit dimensions hold per-worker amounts.
 ///
-/// Unset dimensions carry per-worker defaults. Worker sizing divides every
-/// node-wide dimension by the I/O worker count, so a fixed node-wide default
-/// shrinks each lane's budget as cores are added and eventually falls under a
-/// per-worker floor. Sizing then sheds workers until the partition fits, which
-/// turns a larger host into a smaller dataplane. Scaling the defaults by the
-/// planned worker count keeps each lane's budget constant instead.
-///
-/// A dimension set explicitly in the environment is node-wide by definition and
-/// is never scaled.
+/// Worker sizing divides every shared dimension by the I/O worker count. A
+/// `*_PER_WORKER` variable (or its default) is stated per worker, so it is
+/// multiplied by the planned worker count first and each lane's budget stays
+/// constant as cores are added. The plain-named variable is a node-wide total
+/// and is never scaled.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ScaledLimits {
     pub plaintext_bytes: bool,
@@ -64,18 +74,50 @@ pub struct ScaledLimits {
     pub flights: bool,
     pub queue_entries: bool,
     pub client_connections: bool,
+    pub peer_connections: bool,
+    pub outbound_connections: bool,
     pub pipes: bool,
     pub placement_cache_bytes: bool,
     pub cached_paths: bool,
     pub path_cache_bytes: bool,
     pub metadata_entries: bool,
     pub relay_transfers: bool,
+    /// Neither registered-memory variable was set, so the scaled default is
+    /// capped at [`DEFAULT_REGISTERED_BYTES_CAP`].
+    pub registered_bytes_default_cap: bool,
+}
+
+/// Node-wide ceiling on the default RDMA registered pool. The per-worker
+/// default scales the pool with node size, so small nodes pin little memory,
+/// while large nodes stop at a pool that still holds 56 buffers per rail on
+/// eight rails. An explicit setting is never capped.
+pub const DEFAULT_REGISTERED_BYTES_CAP: u64 = 8 * 1024 * MIB;
+
+/// Origin transport and Azure credential settings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OriginSettings {
+    /// CA bundle for HTTPS origins and the Entra authority.
+    pub trust_bundle: PathBuf,
+    /// Entra authority base URL ending in `/`.
+    pub azure_authority_host: String,
+    /// Workload identity federated token file.
+    pub azure_federated_token_file: Option<PathBuf>,
+}
+
+impl Default for OriginSettings {
+    fn default() -> Self {
+        Self {
+            trust_bundle: http1::tls::DEFAULT_TRUST_BUNDLE.into(),
+            azure_authority_host: crate::origin::azure_auth::DEFAULT_AUTHORITY_HOST.into(),
+            azure_federated_token_file: None,
+        }
+    }
 }
 
 pub struct Config {
     pub spill: crate::read::spill::Config,
     pub prefetch: crate::prefetch::Config,
-    pub send_crc_pair: Option<crate::telemetry::Pair>,
+    pub send_tag_pair: Option<crate::telemetry::Pair>,
     pub page_hedge: crate::read::candidates::HedgeConfig,
     /// Order in which a non-owner requester visits a page's ranked owners.
     pub replica_selection: crate::read::candidates::ReplicaSelection,
@@ -103,6 +145,8 @@ pub struct Config {
     /// Opt into logical-CPU sizing instead of one eligible CPU per physical core.
     pub allow_smt: bool,
     pub enable_rdma: bool,
+    /// RDMA-to-HTTP circuit breaker and per-page RDMA timeout.
+    pub rdma_breaker: crate::rdma::breaker::BreakerConfig,
     /// `gpu-read` support. Resolved against hardware at startup, on the GPU
     /// helper thread, because GPU handles cannot move between threads.
     pub enable_gpu: GpuMode,
@@ -166,318 +210,357 @@ pub struct Config {
     pub peer_attempt_timeout: Duration,
     pub reader_stall_timeout: Duration,
     pub shutdown_timeout: Duration,
+    /// Origin transport and Azure credential settings.
+    pub origin: OriginSettings,
+    /// Embedded cluster control settings, present when `RACER_NAMESPACE`
+    /// selects managed mode. `main` takes them to start control.
+    pub authority: Option<racer_authority::Config>,
+}
+
+/// Smallest ciphertext budget for a range window of `window` pages: one page
+/// of acquisition progress beyond the window plus one maximum record header.
+pub(crate) fn min_ciphertext_bytes(window: u64) -> u64 {
+    window * (PAGE_BYTES + 16) + RECORD_BYTES
 }
 
 impl Config {
-    /// Parse and validate startup configuration from the process environment.
-    pub fn from_env() -> Result<Self> {
-        Self::from_lookup(env_value)
+    /// Read the process environment and parse it. Only `main` calls this.
+    pub fn from_env() -> std::result::Result<Self, ConfigError> {
+        Self::from_map(&environment()?)
     }
 
-    /// Read only exact supported names, without enumerating unrelated environment values.
-    pub fn from_lookup(mut lookup: impl FnMut(&str) -> Result<Option<String>>) -> Result<Self> {
-        let mut values = Vec::new();
-        for name in ENV_NAMES {
-            if let Some(value) = lookup(&format!("RACER_{name}"))? {
-                if *name != "SEND_CRC_PAIR" {
-                    validate_text(&value, 4096)?;
-                }
-                values.push(((*name).to_owned(), value));
-            }
-        }
-        let raw: RawConfig = envy::from_iter(values).map_err(|_| Error::InvalidConfiguration)?;
+    /// Parse an explicit environment. Any `RACER_*` name the table does not
+    /// list is rejected.
+    pub fn from_map(map: &BTreeMap<String, String>) -> std::result::Result<Self, ConfigError> {
+        spec::reject_unknown(TABLE, map.keys().map(String::as_str))?;
+        Self::parse(|name| Ok(map.get(name).cloned()))
+    }
+
+    /// Parse the table's names through `lookup`. Unlike [`Config::from_map`]
+    /// this cannot see names outside the table, so it never rejects unknown
+    /// variables; it suits tests that set a few values.
+    pub fn from_lookup(
+        mut lookup: impl FnMut(&str) -> Result<Option<String>>,
+    ) -> std::result::Result<Self, ConfigError> {
+        Self::parse(|name| {
+            lookup(name).map_err(|error| ConfigError::new(name, format!("unreadable: {error}")))
+        })
+    }
+
+    fn parse(
+        lookup: impl FnMut(&str) -> std::result::Result<Option<String>, ConfigError>,
+    ) -> std::result::Result<Self, ConfigError> {
+        let v = Values::load(TABLE, lookup, &empty_is_unset)?;
+        let u = |name: &str| v.unsigned(name).expect("defaulted");
+        let size = |name: &str| to_usize(u(name)).map_err(|_| too_large(&v, name));
+        let nonzero = |name: &str| {
+            size(name).and_then(|n| {
+                NonZeroUsize::new(n)
+                    .ok_or_else(|| ConfigError::value(name, "0", "must be positive"))
+            })
+        };
+        let flag = |name: &str| v.boolean(name).expect("defaulted");
+        let word = |name: &str| v.text(name).expect("defaulted");
+        let path = |name: &str| -> std::result::Result<PathBuf, ConfigError> {
+            let text = word(name);
+            validate_path(Path::new(text)).map_err(|_| {
+                ConfigError::value(name, text, "must be an absolute, canonical path")
+            })?;
+            Ok(text.into())
+        };
+        let millis = |name: &str| Duration::from_millis(u(name));
+        let secs = |name: &str| Duration::from_secs(u(name));
+
         // Auto reserves native resources only with usable startup hardware.
         // Explicit true reserves them even when absent, enabling hotplug recovery.
-        let enable_rdma = match raw.enable_rdma.as_deref().unwrap_or("auto") {
+        let enable_rdma = match word("RACER_ENABLE_RDMA") {
             "auto" => {
                 cfg!(feature = "rdma")
                     && rdma_verbs::inventory().is_ok_and(|ports| !ports.is_empty())
             }
-            "true" => true,
-            "false" => false,
-            _ => return Err(Error::InvalidConfiguration),
+            value => value == "true",
         };
-        let enable_gpu = match raw.enable_gpu.as_deref().unwrap_or("auto") {
+        let enable_gpu = match word("RACER_ENABLE_GPU") {
             "auto" => GpuMode::Auto,
             "true" => GpuMode::Required,
-            "false" => GpuMode::Disabled,
-            _ => return Err(Error::InvalidConfiguration),
+            _ => GpuMode::Disabled,
         };
-        let gpu_staging_bytes = raw.gpu_staging_bytes.unwrap_or(DEFAULT_GPU_STAGING_BYTES);
-        if gpu_staging_bytes < GPU_STAGING_UNIT
-            || !gpu_staging_bytes.is_multiple_of(GPU_STAGING_UNIT)
-        {
-            return Err(Error::InvalidConfiguration);
+        let cluster_id = v.text("RACER_CLUSTER_ID").map(str::to_owned);
+        let control_endpoint = v.text("RACER_CONTROL_ENDPOINT").map(str::to_owned);
+        // Standalone mode needs both static values; managed mode must set neither.
+        if cluster_id.is_some() != control_endpoint.is_some() {
+            return Err(ConfigError::new(
+                "RACER_CLUSTER_ID, RACER_CONTROL_ENDPOINT",
+                "set both for standalone control, or neither for managed control",
+            ));
         }
-        let gpu_landing_bytes = raw.gpu_landing_bytes.unwrap_or(DEFAULT_GPU_LANDING_BYTES);
-        if !gpu_landing_bytes.is_multiple_of(GPU_STAGING_UNIT) {
-            return Err(Error::InvalidConfiguration);
-        }
-        // Per-worker limit defaults live with the admission rules in racer-core.
-        let defaults = Limits::default();
-        let gpu_peer = match raw.gpu_peer.as_deref().unwrap_or("auto") {
-            "auto" => true,
-            "off" => false,
-            _ => return Err(Error::InvalidConfiguration),
+        let service_account_token = match v.text("RACER_CONTROL_TOKEN") {
+            Some(_) => path("RACER_CONTROL_TOKEN")?,
+            None if control_endpoint.is_some() => STANDALONE_SERVICE_ACCOUNT_TOKEN.into(),
+            None => MANAGED_SERVICE_ACCOUNT_TOKEN.into(),
         };
+        let listener = |name: &str| {
+            parse_listener_address(word(name)).map_err(|_| {
+                ConfigError::value(name, word(name), "must be a numeric ip:port socket address")
+            })
+        };
+
+        // Each shared budget comes from its node-wide name or, by default,
+        // from its per-worker name, which is scaled later.
+        let mut scaled = [false; 16];
+        let mut shared = [NonZeroUsize::MIN; 16];
+        for (index, (node, worker)) in table::SHARED_BUDGETS.iter().enumerate() {
+            match (v.is_set(node), v.is_set(worker)) {
+                (true, true) => {
+                    return Err(ConfigError::new(
+                        format!("{node}, {worker}"),
+                        "set either the node-wide total or the per-worker amount, not both",
+                    ));
+                }
+                (true, false) => shared[index] = nonzero(node)?,
+                (false, _) => {
+                    shared[index] = nonzero(worker)?;
+                    scaled[index] = true;
+                }
+            }
+        }
+        let [
+            plaintext_bytes,
+            ciphertext_bytes,
+            dirty_bytes,
+            registered_bytes,
+            request_context_bytes,
+            flights,
+            queue_entries,
+            client_connections,
+            peer_connections,
+            outbound_connections,
+            pipes,
+            placement_cache_bytes,
+            cached_paths,
+            path_cache_bytes,
+            metadata_entries,
+            relay_transfers,
+        ] = shared;
+        let limits = Limits {
+            plaintext_bytes,
+            ciphertext_bytes,
+            dirty_bytes,
+            registered_bytes,
+            request_context_bytes,
+            flights,
+            waiters_per_flight: nonzero("RACER_WAITERS_PER_FLIGHT")?,
+            queue_entries,
+            connections_per_neighbor: nonzero("RACER_NEIGHBOR_CONNECTIONS_PER_WORKER")?,
+            client_connections,
+            peer_connections,
+            outbound_connections,
+            pipes,
+            range_window_pages: nonzero("RACER_RANGE_WINDOW_PAGES")?,
+            header_bytes: nonzero("RACER_HEADER_BYTES")?,
+            placement_cache_bytes,
+            cached_paths,
+            path_cache_bytes,
+            active_path_searches: nonzero("RACER_ACTIVE_PATH_SEARCHES_PER_WORKER")?,
+            retained_snapshots: nonzero("RACER_RETAINED_SNAPSHOTS")?,
+            metadata_entries,
+            relay_transfers,
+        };
+        let [
+            plaintext_bytes,
+            ciphertext_bytes,
+            dirty_bytes,
+            registered_bytes,
+            request_context_bytes,
+            flights,
+            queue_entries,
+            client_connections,
+            peer_connections,
+            outbound_connections,
+            pipes,
+            placement_cache_bytes,
+            cached_paths,
+            path_cache_bytes,
+            metadata_entries,
+            relay_transfers,
+        ] = scaled;
+        let registered_bytes_default_cap =
+            !v.is_set("RACER_REGISTERED_BYTES") && !v.is_set("RACER_REGISTERED_BYTES_PER_WORKER");
+        let scaled_limits = ScaledLimits {
+            registered_bytes_default_cap,
+            plaintext_bytes,
+            ciphertext_bytes,
+            dirty_bytes,
+            registered_bytes,
+            request_context_bytes,
+            flights,
+            queue_entries,
+            client_connections,
+            peer_connections,
+            outbound_connections,
+            pipes,
+            placement_cache_bytes,
+            cached_paths,
+            path_cache_bytes,
+            metadata_entries,
+            relay_transfers,
+        };
+        let mut origin_connections_per_cache =
+            nonzero("RACER_CACHE_ORIGIN_CONNECTIONS_PER_WORKER")?;
+        if !v.is_set("RACER_CACHE_ORIGIN_CONNECTIONS_PER_WORKER") {
+            // The default must not reject a smaller explicit client budget.
+            origin_connections_per_cache =
+                origin_connections_per_cache.min(limits.client_connections);
+        }
+        let peer_listen = listener("RACER_PEER_LISTEN")?;
         let mut config = Self {
             spill: crate::read::spill::Config {
-                retained_percent: to_usize(raw.retained_segment_percent.unwrap_or(50))?,
-                range_spill_pages: to_usize(raw.range_spill_pages.unwrap_or(0))?,
+                retained_percent: size("RACER_RETAINED_SEGMENT_PERCENT")?,
+                range_spill_pages: size("RACER_RANGE_SPILL_PAGES")?,
             },
-            prefetch: {
-                let d = crate::prefetch::Config::default();
-                crate::prefetch::Config {
-                    max_body_bytes: raw.prefetch_max_body_bytes.unwrap_or(d.max_body_bytes),
-                    max_refs: raw.prefetch_max_refs.unwrap_or(d.max_refs),
-                    max_tickets: raw.prefetch_max_tickets.unwrap_or(d.max_tickets),
-                    max_ttl_secs: raw.prefetch_max_ttl_secs.unwrap_or(d.max_ttl_secs),
-                    ticket_retention_secs: raw
-                        .prefetch_ticket_retention_secs
-                        .unwrap_or(d.ticket_retention_secs),
-                    max_wait_secs: raw.prefetch_max_wait_secs.unwrap_or(d.max_wait_secs),
-                    default_pending_bytes: raw
-                        .prefetch_default_pending_bytes
-                        .unwrap_or(d.default_pending_bytes),
-                    max_pending_bytes: raw
-                        .prefetch_max_pending_bytes
-                        .unwrap_or(d.max_pending_bytes),
-                    node_pending_bytes: raw
-                        .prefetch_node_pending_bytes
-                        .unwrap_or(d.node_pending_bytes),
-                    concurrent_fills: raw.prefetch_concurrent_fills.unwrap_or(d.concurrent_fills),
-                    origin_bytes_per_sec: raw
-                        .prefetch_origin_bytes_per_sec
-                        .unwrap_or(d.origin_bytes_per_sec),
-                    max_attempts: raw.prefetch_max_attempts.unwrap_or(d.max_attempts),
-                }
+            prefetch: crate::prefetch::Config {
+                max_body_bytes: u("RACER_PREFETCH_MAX_BODY_BYTES"),
+                max_refs: u("RACER_PREFETCH_MAX_REFS"),
+                max_tickets: u("RACER_PREFETCH_MAX_TICKETS"),
+                max_ttl_secs: u("RACER_PREFETCH_MAX_TTL_SECS"),
+                ticket_retention_secs: u("RACER_PREFETCH_TICKET_RETENTION_SECS"),
+                max_wait_secs: u("RACER_PREFETCH_MAX_WAIT_SECS"),
+                default_pending_bytes: u("RACER_PREFETCH_DEFAULT_PENDING_BYTES"),
+                max_pending_bytes: u("RACER_PREFETCH_MAX_PENDING_BYTES"),
+                node_pending_bytes: u("RACER_PREFETCH_NODE_PENDING_BYTES"),
+                concurrent_fills: u("RACER_PREFETCH_CONCURRENT_FILLS"),
+                origin_bytes_per_sec: u("RACER_PREFETCH_ORIGIN_BYTES_PER_SEC"),
+                max_attempts: u("RACER_PREFETCH_MAX_ATTEMPTS"),
             },
-            send_crc_pair: raw
-                .send_crc_pair
-                .map(|value| crate::telemetry::Pair::parse(&value))
+            send_tag_pair: v
+                .text("RACER_SEND_TAG_PAIR")
+                .map(|value| {
+                    crate::telemetry::Pair::parse(value).map_err(|_| {
+                        ConfigError::value(
+                            "RACER_SEND_TAG_PAIR",
+                            value,
+                            "must be two different canonical node UUIDs, sender,receiver",
+                        )
+                    })
+                })
                 .transpose()?,
             page_hedge: crate::read::candidates::HedgeConfig {
-                delay: Duration::from_millis(raw.page_hedge_delay_ms.unwrap_or(100)),
-                slots: to_usize(raw.page_hedge_slots.unwrap_or(0))?,
-                bytes: to_usize(
-                    raw.page_hedge_bytes
-                        .unwrap_or(crate::read::candidates::DUPLICATE_BYTES as u64),
-                )?,
+                delay: millis("RACER_PAGE_HEDGE_DELAY_MS"),
+                slots: size("RACER_PAGE_HEDGE_SLOTS")?,
+                bytes: size("RACER_PAGE_HEDGE_BYTES")?,
             },
-            replica_selection: match raw.replica_selection.as_deref().unwrap_or("spread") {
+            replica_selection: match word("RACER_REPLICA_SELECTION") {
                 "primary" => crate::read::candidates::ReplicaSelection::Primary,
-                "spread" => crate::read::candidates::ReplicaSelection::Spread,
-                _ => return Err(Error::InvalidConfiguration),
+                _ => crate::read::candidates::ReplicaSelection::Spread,
             },
             peer_admission: crate::peer::Config {
-                total: to_usize(raw.peer_inflight_max.unwrap_or(256))?,
-                per_peer: to_usize(raw.peer_per_neighbor_max.unwrap_or(32))?,
-                recovery: Duration::from_millis(raw.peer_admission_recovery_ms.unwrap_or(1000)),
+                total: size("RACER_PEER_INFLIGHT_MAX")?,
+                per_peer: size("RACER_PEER_PER_NEIGHBOR_MAX")?,
+                recovery: millis("RACER_PEER_ADMISSION_RECOVERY_MS"),
             },
             peer_receive: crate::peer::receive::Config {
-                active: to_usize(raw.peer_receive_max.unwrap_or(0))?,
-                queued: to_usize(raw.peer_receive_queue_max.unwrap_or(256))?,
-                wait: Duration::from_millis(raw.peer_receive_wait_ms.unwrap_or(1000)),
+                active: size("RACER_PEER_RECEIVE_MAX")?,
+                queued: size("RACER_PEER_RECEIVE_QUEUE_MAX")?,
+                wait: millis("RACER_PEER_RECEIVE_WAIT_MS"),
             },
-            shares: nonzero_u32(raw.shares.unwrap_or(u64::from(DEFAULT_SHARES)))?,
-            disk_page_entries: nonzero_usize(raw.disk_page_entries.unwrap_or(65536))?,
-            admission_mode: match raw.admission_mode.as_deref().unwrap_or("second-sight") {
+            shares: std::num::NonZeroU32::new(
+                u32::try_from(u("RACER_SHARES")).map_err(|_| too_large(&v, "RACER_SHARES"))?,
+            )
+            .ok_or_else(|| ConfigError::value("RACER_SHARES", "0", "must be positive"))?,
+            disk_page_entries: nonzero("RACER_DISK_PAGE_ENTRIES")?,
+            admission_mode: match word("RACER_ADMISSION_MODE") {
                 "disabled" => AdmissionMode::Disabled,
-                "second-sight" => AdmissionMode::SecondSight,
-                _ => return Err(Error::InvalidConfiguration),
+                _ => AdmissionMode::SecondSight,
             },
-            admission_history_bytes: nonzero_usize(raw.admission_history_bytes.unwrap_or(4 * MIB))?,
-            admission_period: Duration::from_secs(raw.admission_period_secs.unwrap_or(60)),
-            checkpoint_bytes: nonzero_usize(raw.checkpoint_bytes.unwrap_or(64 * MIB))?,
+            admission_history_bytes: nonzero("RACER_ADMISSION_HISTORY_BYTES")?,
+            admission_period: secs("RACER_ADMISSION_PERIOD_SECS"),
+            checkpoint_bytes: nonzero("RACER_CHECKPOINT_BYTES")?,
             cluster: ClusterId(
-                raw.cluster_id
+                cluster_id
                     .clone()
                     .unwrap_or_else(|| UNRESOLVED_CLUSTER_ID.into()),
             ),
             node: NodeId(UNRESOLVED_NODE_ID.into()),
-            max_threads: to_usize(raw.max_threads.unwrap_or(DEFAULT_MAX_THREADS as u64))?,
-            io_workers: raw.io_workers.map(to_usize).transpose()?,
-            crypto_helpers: raw.crypto_helpers.map(to_usize).transpose()?,
-            allow_smt: raw.allow_smt.unwrap_or(false),
+            max_threads: match v.unsigned("RACER_MAX_THREADS") {
+                Some(_) => size("RACER_MAX_THREADS")?,
+                None => DEFAULT_MAX_THREADS,
+            },
+            io_workers: v
+                .unsigned("RACER_IO_WORKERS")
+                .map(|_| size("RACER_IO_WORKERS"))
+                .transpose()?,
+            crypto_helpers: v
+                .unsigned("RACER_CRYPTO_HELPERS")
+                .map(|_| size("RACER_CRYPTO_HELPERS"))
+                .transpose()?,
+            allow_smt: flag("RACER_ALLOW_SMT"),
             enable_rdma,
+            rdma_breaker: crate::rdma::breaker::BreakerConfig {
+                enabled: flag("RACER_RDMA_BREAKER"),
+                base: millis("RACER_RDMA_BREAKER_COOLDOWN_MS"),
+                max: millis("RACER_RDMA_BREAKER_MAX_COOLDOWN_MS"),
+                page_timeout: millis("RACER_RDMA_PAGE_TIMEOUT_MS"),
+            },
             enable_gpu,
-            gpu_staging_bytes,
-            gpu_landing_bytes,
-            gpu_pci_p2pdma: raw.gpu_pci_p2pdma.unwrap_or(false),
-            gpu_peer,
-            opaque_relay: raw.opaque_relay.unwrap_or(false),
-            peer_tcp_nodelay: raw.peer_tcp_nodelay.unwrap_or(true),
-            memory_pressure: raw.memory_pressure.unwrap_or(true),
-            pprof_enabled: raw.pprof_enabled.unwrap_or(false),
-            control_endpoint: raw.control_endpoint.clone(),
+            gpu_staging_bytes: u("RACER_GPU_STAGING_BYTES"),
+            gpu_landing_bytes: u("RACER_GPU_LANDING_BYTES"),
+            gpu_pci_p2pdma: flag("RACER_GPU_PCI_P2PDMA"),
+            gpu_peer: word("RACER_GPU_PEER") == "auto",
+            opaque_relay: flag("RACER_OPAQUE_RELAY"),
+            peer_tcp_nodelay: flag("RACER_PEER_TCP_NODELAY"),
+            memory_pressure: flag("RACER_MEMORY_PRESSURE"),
+            pprof_enabled: flag("RACER_PPROF_ENABLED"),
+            control_endpoint,
             managed_control: None,
             enrollment_directory: None,
-            peer_listen: parse_listener_address(
-                raw.peer_listen.as_deref().unwrap_or("0.0.0.0:7443"),
-            )?,
-            diagnostics_listen: parse_listener_address(
-                raw.diagnostics_listen
-                    .as_deref()
-                    .unwrap_or("127.0.0.1:9090"),
-            )?,
-            trust_bundle: raw
-                .trust_bundle
-                .unwrap_or_else(|| "/etc/racer/trust/ca.crt".into())
-                .into(),
-            service_account_token: raw
-                .service_account_token
-                .unwrap_or_else(|| {
-                    if raw.control_endpoint.is_some() {
-                        "/var/run/secrets/racer-control/token".into()
-                    } else {
-                        MANAGED_SERVICE_ACCOUNT_TOKEN.into()
+            peer_listen,
+            diagnostics_listen: listener("RACER_DIAGNOSTICS_LISTEN")?,
+            trust_bundle: path("RACER_CONTROL_TRUST_BUNDLE")?,
+            service_account_token,
+            identity_directory: path("RACER_IDENTITY_DIRECTORY")?,
+            slab_directory: path("RACER_SLAB_DIRECTORY")?,
+            device_directory: path("RACER_DEVICE_DIRECTORY")?,
+            device_busy_wait: secs("RACER_DEVICE_BUSY_WAIT_SECS"),
+            slab_bytes: u("RACER_SLAB_BYTES_PER_WORKER"),
+            segment_bytes: u("RACER_SEGMENT_BYTES"),
+            free_segment_reserve: size("RACER_FREE_SEGMENT_RESERVE_PER_WORKER")?,
+            limits,
+            scaled_limits,
+            origin_connections_per_cache,
+            request_timeout: millis("RACER_REQUEST_TIMEOUT_MS"),
+            peer_attempt_timeout: millis("RACER_PEER_ATTEMPT_TIMEOUT_MS"),
+            reader_stall_timeout: millis("RACER_READER_STALL_TIMEOUT_MS"),
+            shutdown_timeout: millis("RACER_SHUTDOWN_TIMEOUT_MS"),
+            origin: OriginSettings {
+                trust_bundle: path("RACER_ORIGIN_TRUST_BUNDLE")?,
+                azure_authority_host: {
+                    let host = word("RACER_AZURE_AUTHORITY_HOST");
+                    if !host.starts_with("https://") && !host.starts_with("http://") {
+                        return Err(ConfigError::value(
+                            "RACER_AZURE_AUTHORITY_HOST",
+                            host,
+                            "must be an https:// URL",
+                        ));
                     }
-                })
-                .into(),
-            identity_directory: raw
-                .identity_directory
-                .unwrap_or_else(|| "/var/lib/racer/identity".into())
-                .into(),
-            slab_directory: raw
-                .slab_directory
-                .unwrap_or_else(|| "/var/lib/racer/slabs".into())
-                .into(),
-            device_directory: raw
-                .device_directory
-                .unwrap_or_else(|| "/host/dev".into())
-                .into(),
-            device_busy_wait: Duration::from_secs(raw.device_busy_wait_secs.unwrap_or(120)),
-            slab_bytes: raw.slab_bytes.unwrap_or(16 * 1024 * MIB),
-            segment_bytes: raw.segment_bytes.unwrap_or(1024 * MIB),
-            free_segment_reserve: to_usize(raw.free_segment_reserve.unwrap_or(2))?,
-            limits: Limits {
-                // Byte and count dimensions below are divided by the I/O worker
-                // count during sizing, so their defaults are stated per worker
-                // and multiplied back out by `scale_limits` once the planner
-                // resolves that count. A page is 16 MiB.
-                plaintext_bytes: nonzero_usize(
-                    raw.plaintext_bytes
-                        .unwrap_or(defaults.plaintext_bytes.get() as u64),
-                )?,
-                ciphertext_bytes: nonzero_usize(
-                    raw.ciphertext_bytes
-                        .unwrap_or(defaults.ciphertext_bytes.get() as u64),
-                )?,
-                dirty_bytes: nonzero_usize(
-                    raw.dirty_bytes.unwrap_or(defaults.dirty_bytes.get() as u64),
-                )?,
-                registered_bytes: nonzero_usize(
-                    raw.registered_bytes
-                        .unwrap_or(defaults.registered_bytes.get() as u64),
-                )?,
-                request_context_bytes: nonzero_usize(
-                    raw.request_context_bytes
-                        .unwrap_or(defaults.request_context_bytes.get() as u64),
-                )?,
-                flights: nonzero_usize(raw.flights.unwrap_or(defaults.flights.get() as u64))?,
-                waiters_per_flight: nonzero_usize(
-                    raw.waiters_per_flight
-                        .unwrap_or(defaults.waiters_per_flight.get() as u64),
-                )?,
-                queue_entries: nonzero_usize(
-                    raw.queue_entries
-                        .unwrap_or(defaults.queue_entries.get() as u64),
-                )?,
-                connections_per_neighbor: nonzero_usize(
-                    raw.connections_per_neighbor
-                        .unwrap_or(defaults.connections_per_neighbor.get() as u64),
-                )?,
-                client_connections: nonzero_usize(
-                    raw.client_connections
-                        .unwrap_or(defaults.client_connections.get() as u64),
-                )?,
-                pipes: nonzero_usize(raw.pipes.unwrap_or(defaults.pipes.get() as u64))?,
-                range_window_pages: nonzero_usize(
-                    raw.range_window_pages
-                        .unwrap_or(defaults.range_window_pages.get() as u64),
-                )?,
-                header_bytes: nonzero_usize(
-                    raw.header_bytes
-                        .unwrap_or(defaults.header_bytes.get() as u64),
-                )?,
-                placement_cache_bytes: nonzero_usize(
-                    raw.placement_cache_bytes
-                        .unwrap_or(defaults.placement_cache_bytes.get() as u64),
-                )?,
-                cached_paths: nonzero_usize(
-                    raw.cached_paths
-                        .unwrap_or(defaults.cached_paths.get() as u64),
-                )?,
-                path_cache_bytes: nonzero_usize(
-                    raw.path_cache_bytes
-                        .unwrap_or(defaults.path_cache_bytes.get() as u64),
-                )?,
-                active_path_searches: nonzero_usize(
-                    raw.active_path_searches
-                        .unwrap_or(defaults.active_path_searches.get() as u64),
-                )?,
-                retained_snapshots: nonzero_usize(
-                    raw.retained_snapshots
-                        .unwrap_or(defaults.retained_snapshots.get() as u64),
-                )?,
-                metadata_entries: nonzero_usize(
-                    raw.metadata_entries
-                        .unwrap_or(defaults.metadata_entries.get() as u64),
-                )?,
-                relay_transfers: nonzero_usize(
-                    raw.relay_transfers
-                        .unwrap_or(defaults.relay_transfers.get() as u64),
-                )?,
+                    host.to_owned()
+                },
+                azure_federated_token_file: v
+                    .text("RACER_AZURE_FEDERATED_TOKEN_FILE")
+                    .map(|_| path("RACER_AZURE_FEDERATED_TOKEN_FILE"))
+                    .transpose()?,
             },
-            scaled_limits: ScaledLimits {
-                plaintext_bytes: raw.plaintext_bytes.is_none(),
-                ciphertext_bytes: raw.ciphertext_bytes.is_none(),
-                dirty_bytes: raw.dirty_bytes.is_none(),
-                registered_bytes: raw.registered_bytes.is_none(),
-                request_context_bytes: raw.request_context_bytes.is_none(),
-                flights: raw.flights.is_none(),
-                queue_entries: raw.queue_entries.is_none(),
-                client_connections: raw.client_connections.is_none(),
-                pipes: raw.pipes.is_none(),
-                placement_cache_bytes: raw.placement_cache_bytes.is_none(),
-                cached_paths: raw.cached_paths.is_none(),
-                path_cache_bytes: raw.path_cache_bytes.is_none(),
-                metadata_entries: raw.metadata_entries.is_none(),
-                relay_transfers: raw.relay_transfers.is_none(),
-            },
-            origin_connections_per_cache: nonzero_usize(
-                raw.origin_connections_per_cache
-                    .unwrap_or(DEFAULT_ORIGIN_CONNECTIONS_PER_CACHE as u64),
-            )?,
-            request_timeout: Duration::from_millis(raw.request_timeout_ms.unwrap_or(30_000)),
-            peer_attempt_timeout: Duration::from_millis(
-                raw.peer_attempt_timeout_ms.unwrap_or(30_000),
-            ),
-            reader_stall_timeout: Duration::from_millis(
-                raw.reader_stall_timeout_ms.unwrap_or(10_000),
-            ),
-            shutdown_timeout: Duration::from_millis(raw.shutdown_timeout_ms.unwrap_or(30_000)),
+            authority: None,
         };
-        // Standalone mode needs both static values; managed mode must set neither.
-        if raw.cluster_id.is_some() != raw.control_endpoint.is_some() {
-            return Err(Error::InvalidConfiguration);
-        }
-        if raw.origin_connections_per_cache.is_none() {
-            // The default must not reject a smaller explicit client budget.
-            config.origin_connections_per_cache = config
-                .origin_connections_per_cache
-                .min(config.limits.client_connections);
-        }
+        config.authority = authority(&v, &config)?;
         config.validate()?;
         Ok(config)
     }
 
-    /// Multiply every defaulted limit dimension by the planned I/O worker count.
+    /// Multiply every per-worker shared limit by the planned I/O worker count.
     ///
-    /// Worker sizing partitions node-wide limits across lanes, so a default
-    /// stated per worker has to be scaled back up before that division or each
-    /// lane receives only a fraction of its intended budget. Explicitly
-    /// configured dimensions are node-wide by definition and are left alone.
+    /// Worker sizing partitions shared limits across lanes, so a per-worker
+    /// amount has to be scaled up before that division or each lane receives
+    /// only a fraction of its intended budget. Node-wide totals are left alone.
     ///
     /// A second call is a no-op: the scaling record is consumed, but only once
     /// every dimension has scaled successfully. Scaling is computed against a
@@ -507,6 +590,11 @@ impl Config {
         scale(&mut limits.flights, scaled.flights)?;
         scale(&mut limits.queue_entries, scaled.queue_entries)?;
         scale(&mut limits.client_connections, scaled.client_connections)?;
+        scale(&mut limits.peer_connections, scaled.peer_connections)?;
+        scale(
+            &mut limits.outbound_connections,
+            scaled.outbound_connections,
+        )?;
         scale(&mut limits.pipes, scaled.pipes)?;
         scale(
             &mut limits.placement_cache_bytes,
@@ -516,106 +604,186 @@ impl Config {
         scale(&mut limits.path_cache_bytes, scaled.path_cache_bytes)?;
         scale(&mut limits.metadata_entries, scaled.metadata_entries)?;
         scale(&mut limits.relay_transfers, scaled.relay_transfers)?;
+        if scaled.registered_bytes_default_cap {
+            let cap = usize::try_from(DEFAULT_REGISTERED_BYTES_CAP).unwrap_or(usize::MAX);
+            if limits.registered_bytes.get() > cap {
+                limits.registered_bytes =
+                    NonZeroUsize::new(cap).ok_or(Error::InvalidConfiguration)?;
+            }
+        }
         self.limits = scratch;
         self.scaled_limits = ScaledLimits::default();
         Ok(())
     }
 
-    /// Check arithmetic and progress reserves; filesystem alignment is additionally
-    /// discovered and checked when opening the slabs, not guessed from this config.
-    pub fn validate(&self) -> Result<()> {
+    /// Cross-variable rules. Single-variable bounds are already enforced by
+    /// the table. Filesystem alignment is additionally discovered and checked
+    /// when opening the slabs, not guessed from this config.
+    ///
+    /// Parsing runs this once; nothing else needs to.
+    pub(crate) fn validate(&self) -> std::result::Result<(), ConfigError> {
+        let rule = |names: &str, reason: &str| Err(ConfigError::new(names, reason));
         match (self.io_workers, self.crypto_helpers) {
             (None, None) => {}
-            (Some(io), Some(helpers))
-                if io > 0
-                    && io <= usize::from(u16::MAX) + 1
-                    && helpers > 0
-                    && helpers <= io
-                    && io
-                        .checked_add(helpers)
-                        .is_some_and(|n| n <= self.max_threads) => {}
-            _ => return Err(Error::InvalidConfiguration),
+            (Some(_), None) | (None, Some(_)) => {
+                return rule(
+                    "RACER_IO_WORKERS, RACER_CRYPTO_HELPERS",
+                    "set both exact counts, or neither for automatic sizing",
+                );
+            }
+            (Some(io), Some(helpers)) => {
+                if helpers > io {
+                    return rule(
+                        "RACER_IO_WORKERS, RACER_CRYPTO_HELPERS",
+                        "crypto helpers must not outnumber I/O workers",
+                    );
+                }
+                // With RDMA on, one thread of the cap runs the RDMA owner.
+                if io
+                    .checked_add(helpers)
+                    .and_then(|n| n.checked_add(usize::from(self.enable_rdma)))
+                    .is_none_or(|n| n > self.max_threads)
+                {
+                    return rule(
+                        "RACER_IO_WORKERS, RACER_CRYPTO_HELPERS, RACER_ENABLE_RDMA, RACER_MAX_THREADS",
+                        "I/O workers plus crypto helpers, plus the RDMA owner thread when RDMA is enabled, must fit the thread cap",
+                    );
+                }
+            }
         }
-        self.spill.validate()?;
-        self.prefetch.validate()?;
-        if let Some(pair) = &self.send_crc_pair {
-            pair.validate()?;
-        }
-        self.page_hedge.validate()?;
-        self.peer_receive.validate()?;
-        self.peer_admission.validate()?;
-        if self.disk_page_entries.get() > MAX_ENTRIES
-            || self.checkpoint_bytes.get() > 512 * MIB as usize
-            || !(32..=512 * MIB as usize).contains(&self.admission_history_bytes.get())
-            || self.admission_period < Duration::from_secs(1)
-            || self.admission_period > Duration::from_secs(86_400)
-            || self.device_busy_wait > Duration::from_secs(3_600)
+        // Managed mode withholds one thread for control; the rest must still
+        // hold an I/O worker, a crypto helper, and the RDMA owner when enabled.
+        if self.managed()
+            && self.max_threads != DEFAULT_MAX_THREADS
+            && self.max_threads < MANAGED_MIN_THREADS + usize::from(self.enable_rdma)
         {
-            return Err(Error::InvalidConfiguration);
+            return rule(
+                "RACER_MAX_THREADS",
+                "managed deployments need at least 3 threads, or 4 with RDMA enabled",
+            );
         }
-        let cluster_resolved = valid_uuid(&self.cluster.0);
-        // Only managed mode may run with the unresolved placeholder.
-        if (!cluster_resolved
-            && (self.control_endpoint.is_some() || self.cluster.0 != UNRESOLVED_CLUSTER_ID))
-            || (self.node.0 != UNRESOLVED_NODE_ID && !valid_uuid(&self.node.0))
-            || self.max_threads < 2
+        if self.prefetch.default_pending_bytes > self.prefetch.max_pending_bytes {
+            return rule(
+                "RACER_PREFETCH_DEFAULT_PENDING_BYTES, RACER_PREFETCH_MAX_PENDING_BYTES",
+                "the default per-ticket bound must not exceed the maximum",
+            );
+        }
+        if self.page_hedge.slots > 0
+            && self.page_hedge.bytes < crate::read::candidates::DUPLICATE_BYTES
         {
-            return Err(Error::InvalidConfiguration);
+            return rule(
+                "RACER_PAGE_HEDGE_SLOTS, RACER_PAGE_HEDGE_BYTES",
+                "hedging needs memory for at least one duplicate (two pages plus 16 bytes)",
+            );
+        }
+        if self.peer_admission.per_peer > self.peer_admission.total {
+            return rule(
+                "RACER_PEER_PER_NEIGHBOR_MAX, RACER_PEER_INFLIGHT_MAX",
+                "the per-neighbor cap must not exceed the in-flight cap",
+            );
+        }
+        // Backstops: the table bounds make these unreachable, but the owning
+        // modules keep their own invariants.
+        let backstop = |result: Result<()>, names: &str| {
+            result.map_err(|_| ConfigError::new(names, "rejected by its subsystem"))
+        };
+        backstop(
+            self.spill.validate(),
+            "RACER_RETAINED_SEGMENT_PERCENT, RACER_RANGE_SPILL_PAGES",
+        )?;
+        backstop(self.prefetch.validate(), "RACER_PREFETCH_*")?;
+        backstop(self.page_hedge.validate(), "RACER_PAGE_HEDGE_*")?;
+        backstop(self.peer_receive.validate(), "RACER_PEER_RECEIVE_*")?;
+        backstop(
+            self.peer_admission.validate(),
+            "RACER_PEER_INFLIGHT_MAX, RACER_PEER_PER_NEIGHBOR_MAX, RACER_PEER_ADMISSION_RECOVERY_MS",
+        )?;
+        if self.node.0 != UNRESOLVED_NODE_ID && !valid_uuid(&self.node.0) {
+            return Err(ConfigError::value(
+                "node identity",
+                &self.node.0,
+                "must be a canonical, non-nil UUID",
+            ));
+        }
+        if (self.control_endpoint.is_some() || !self.cluster.0.is_empty())
+            && !valid_uuid(&self.cluster.0)
+        {
+            return Err(ConfigError::value(
+                "RACER_CLUSTER_ID",
+                &self.cluster.0,
+                "must be a canonical, non-nil UUID",
+            ));
         }
         if let Some(endpoint) = &self.control_endpoint {
-            validate_endpoint(endpoint)?;
+            validate_endpoint(endpoint).map_err(|_| {
+                ConfigError::value(
+                    "RACER_CONTROL_ENDPOINT",
+                    endpoint,
+                    "must be https://host[:port] with no path, query, or user info",
+                )
+            })?;
         }
-        for address in [self.peer_listen, self.diagnostics_listen] {
-            validate_socket(address)?;
+        for (name, address) in [
+            ("RACER_PEER_LISTEN", self.peer_listen),
+            ("RACER_DIAGNOSTICS_LISTEN", self.diagnostics_listen),
+        ] {
+            validate_socket(address).map_err(|_| {
+                ConfigError::value(
+                    name,
+                    &address.to_string(),
+                    "needs a nonzero port and a unicast address without scope, flow label, or IPv4 mapping",
+                )
+            })?;
         }
         if self.peer_listen.port() == self.diagnostics_listen.port()
             && (self.peer_listen.ip() == self.diagnostics_listen.ip()
                 || self.peer_listen.ip().is_unspecified()
                 || self.diagnostics_listen.ip().is_unspecified())
         {
-            return Err(Error::InvalidConfiguration);
+            return rule(
+                "RACER_PEER_LISTEN, RACER_DIAGNOSTICS_LISTEN",
+                "the listeners overlap",
+            );
         }
         let paths = [
-            &self.trust_bundle,
-            &self.service_account_token,
-            &self.identity_directory,
-            &self.slab_directory,
-            &self.device_directory,
+            ("RACER_CONTROL_TRUST_BUNDLE", &self.trust_bundle),
+            ("RACER_CONTROL_TOKEN", &self.service_account_token),
+            ("RACER_IDENTITY_DIRECTORY", &self.identity_directory),
+            ("RACER_SLAB_DIRECTORY", &self.slab_directory),
+            ("RACER_DEVICE_DIRECTORY", &self.device_directory),
         ];
-        for path in paths {
-            validate_path(path)?;
-        }
         // Writable state must not contain or live inside projected credentials.
         // Lexical checks cannot prove mounts/symlinks are distinct; open-time checks
         // remain mandatory and must allow Kubernetes projection symlinks.
-        for (index, left) in paths.iter().enumerate() {
-            for right in &paths[index + 1..] {
+        for (index, (left_name, left)) in paths.iter().enumerate() {
+            for (right_name, right) in &paths[index + 1..] {
                 if left.starts_with(right) || right.starts_with(left) {
-                    return Err(Error::InvalidConfiguration);
+                    return rule(
+                        &format!("{left_name}, {right_name}"),
+                        "paths must not contain each other",
+                    );
                 }
             }
         }
-        let record_bytes = PAGE_BYTES
-            .checked_add(16)
-            .and_then(|n| n.checked_add(MAX_HEADER_BYTES as u64))
-            .ok_or(Error::InvalidConfiguration)?;
-        if self.segment_bytes < record_bytes
-            || self.slab_bytes > i64::MAX as u64
-            || self.slab_bytes == 0
-            || !self.slab_bytes.is_multiple_of(self.segment_bytes)
-            || self.free_segment_reserve == 0
-        {
-            return Err(Error::InvalidConfiguration);
+        if !self.slab_bytes.is_multiple_of(self.segment_bytes) {
+            return rule(
+                "RACER_SLAB_BYTES_PER_WORKER, RACER_SEGMENT_BYTES",
+                "the slab must be a whole number of segments",
+            );
         }
-        let segments = to_usize(self.slab_bytes / self.segment_bytes)?;
-        if segments > MAX_ENTRIES || self.free_segment_reserve >= segments {
-            return Err(Error::InvalidConfiguration);
+        let segments = self.slab_bytes / self.segment_bytes;
+        if segments > MAX_ENTRIES || self.free_segment_reserve as u64 >= segments {
+            return rule(
+                "RACER_SLAB_BYTES_PER_WORKER, RACER_SEGMENT_BYTES, RACER_FREE_SEGMENT_RESERVE_PER_WORKER",
+                "a slab needs more segments than the free reserve, and at most 1,048,576",
+            );
         }
         let limits = &self.limits;
-        if self.origin_connections_per_cache.get() > 1024
-            || self.origin_connections_per_cache > limits.client_connections
-        {
-            return Err(Error::InvalidConfiguration);
+        if self.origin_connections_per_cache > limits.client_connections {
+            return rule(
+                "RACER_CACHE_ORIGIN_CONNECTIONS_PER_WORKER, RACER_CLIENT_CONNECTIONS",
+                "origin connections per cache must not exceed client connections",
+            );
         }
         let mut bytes = 0u64;
         for limit in [
@@ -625,79 +793,71 @@ impl Config {
             limits.registered_bytes,
             limits.request_context_bytes,
         ] {
-            let value = limit.get() as u64;
-            if value > MAX_BYTES || limit.get() > isize::MAX as usize {
-                return Err(Error::InvalidConfiguration);
-            }
-            bytes = bytes
-                .checked_add(value)
-                .ok_or(Error::InvalidConfiguration)?;
+            bytes = bytes.saturating_add(limit.get() as u64);
         }
         // Node-wide budgets are partitioned after affinity discovery. Integration
         // must recheck progress floors per I/O shard and reduce workers if necessary.
-        if bytes > 256 * 1024 * MIB || bytes > isize::MAX as u64 {
-            return Err(Error::InvalidConfiguration);
+        if bytes > 256 * 1024 * MIB || bytes > isize::MAX as u64 || bytes / 5 > MAX_BYTES {
+            return rule(
+                "RACER_PLAINTEXT_BYTES, RACER_CIPHERTEXT_BYTES, RACER_DIRTY_BYTES, RACER_REGISTERED_BYTES, RACER_REQUEST_CONTEXT_BYTES",
+                "byte budgets must total at most 256 GiB",
+            );
         }
-        for (limit, maximum) in [
-            (limits.flights, 65_536),
-            (limits.waiters_per_flight, 4096),
-            (limits.queue_entries, 65_536),
-            (limits.connections_per_neighbor, 1024),
-            (limits.client_connections, 65_536),
-            (limits.pipes, 65_536),
-            (limits.range_window_pages, 64),
-            (limits.header_bytes, 32 * 1024),
-            (limits.placement_cache_bytes, 512 * MIB as usize),
-            (limits.cached_paths, MAX_ENTRIES),
-            (limits.path_cache_bytes, 512 * MIB as usize),
-            (limits.active_path_searches, 64),
-            (limits.retained_snapshots, 64),
-            (limits.metadata_entries, MAX_ENTRIES),
-            (limits.relay_transfers, 65_536),
-        ] {
-            if limit.get() > maximum {
-                return Err(Error::InvalidConfiguration);
-            }
-        }
+        // Sized for the largest page: the cluster page size is published after
+        // startup, so local limits must fit any page size it may choose.
         // Keep one page of acquisition progress beyond a full range window. The
         // ciphertext margin also fits one maximum unpadded storage record.
         // Plaintext covers only in-flight decrypts and pages held by range
         // streams; the memory cache retains ciphertext alone.
         let window = limits.range_window_pages.get() as u64;
-        let plaintext = (window + 1)
-            .checked_mul(PAGE_BYTES)
-            .ok_or(Error::InvalidConfiguration)?;
-        let ciphertext = window
-            .checked_mul(PAGE_BYTES + 16)
-            .and_then(|n| n.checked_add(record_bytes))
-            .ok_or(Error::InvalidConfiguration)?;
-        if (limits.plaintext_bytes.get() as u64) < plaintext
-            || (limits.ciphertext_bytes.get() as u64) < ciphertext
-            || (limits.dirty_bytes.get() as u64) < PAGE_BYTES + 16
-            || (self.enable_rdma && (limits.registered_bytes.get() as u64) < PAGE_BYTES + 16)
-            || limits.header_bytes.get() < 1024
-            || limits.request_context_bytes.get() < 128 * 1024
-            || limits.queue_entries.get() < 2
-            || limits.retained_snapshots.get() < 2
-            || limits.placement_cache_bytes.get() < crate::topology::RANKING_BYTES
-            || limits.connections_per_neighbor > limits.client_connections
-            || limits
-                .flights
-                .get()
-                .checked_mul(limits.waiters_per_flight.get())
-                .is_none_or(|n| n > MAX_ENTRIES)
-        {
-            return Err(Error::InvalidConfiguration);
+        let plaintext = (window + 1) * PAGE_BYTES;
+        let ciphertext = min_ciphertext_bytes(window);
+        if (limits.plaintext_bytes.get() as u64) < plaintext {
+            return rule(
+                "RACER_PLAINTEXT_BYTES, RACER_RANGE_WINDOW_PAGES",
+                "plaintext must fit one page more than the range window",
+            );
         }
-        for (timeout, maximum) in [
-            (self.request_timeout, Duration::from_secs(86_400)),
-            (self.peer_attempt_timeout, Duration::from_secs(86_400)),
-            (self.reader_stall_timeout, self.request_timeout),
-            (self.shutdown_timeout, Duration::from_secs(3600)),
-        ] {
-            if timeout < Duration::from_millis(1) || timeout > maximum {
-                return Err(Error::InvalidConfiguration);
-            }
+        if (limits.ciphertext_bytes.get() as u64) < ciphertext {
+            return rule(
+                "RACER_CIPHERTEXT_BYTES, RACER_RANGE_WINDOW_PAGES",
+                "ciphertext must fit the range window plus one stored record",
+            );
+        }
+        if self.enable_rdma && (limits.registered_bytes.get() as u64) < PAGE_BYTES + 16 {
+            return rule(
+                "RACER_REGISTERED_BYTES, RACER_ENABLE_RDMA",
+                "RDMA needs registered memory for at least one page plus 16 bytes",
+            );
+        }
+        if limits.connections_per_neighbor > limits.outbound_connections {
+            return rule(
+                "RACER_NEIGHBOR_CONNECTIONS_PER_WORKER, RACER_OUTBOUND_CONNECTIONS",
+                "neighbor connections must not exceed outbound connections",
+            );
+        }
+        if limits
+            .flights
+            .get()
+            .checked_mul(limits.waiters_per_flight.get())
+            .is_none_or(|n| n as u64 > MAX_ENTRIES)
+        {
+            return rule(
+                "RACER_FLIGHTS, RACER_WAITERS_PER_FLIGHT",
+                "flights times waiters must be at most 1,048,576",
+            );
+        }
+        if self.rdma_breaker.base > self.rdma_breaker.max {
+            return rule(
+                "RACER_RDMA_BREAKER_COOLDOWN_MS, RACER_RDMA_BREAKER_MAX_COOLDOWN_MS",
+                "the breaker cooldown must not exceed its maximum",
+            );
+        }
+        if self.reader_stall_timeout > self.request_timeout {
+            return rule(
+                "RACER_READER_STALL_TIMEOUT_MS, RACER_REQUEST_TIMEOUT_MS",
+                "the reader stall timeout must not exceed the request timeout",
+            );
         }
         Ok(())
     }
@@ -707,12 +867,13 @@ impl Config {
         self.control_endpoint.is_none()
     }
 
-    /// Withhold one thread from an explicit cap for the cluster-control thread.
+    /// Withhold one thread from an explicit cap for the authority thread.
     ///
     /// The control thread is unpinned and mostly blocked on network I/O. With
     /// no explicit cap, worker sizing is already bounded by eligible CPUs, so
     /// nothing is withheld. An explicit cap must leave at least one I/O and one
-    /// crypto thread, so managed mode requires a cap of at least three.
+    /// crypto thread, plus the RDMA owner when RDMA is enabled, so managed mode
+    /// requires a cap of at least three, or four with RDMA.
     pub fn reserve_control_thread(&mut self) -> Result<()> {
         if !self.managed() {
             return Err(Error::InvalidConfiguration);
@@ -720,13 +881,16 @@ impl Config {
         if self.max_threads == DEFAULT_MAX_THREADS {
             return Ok(());
         }
-        if self.max_threads < MANAGED_MIN_THREADS {
+        if self.max_threads < MANAGED_MIN_THREADS + usize::from(self.enable_rdma) {
             return Err(Error::InvalidConfiguration);
         }
         let reserved = self.max_threads - 1;
         // An exact worker pair must still fit beside the control thread.
         if let (Some(io), Some(helpers)) = (self.io_workers, self.crypto_helpers)
-            && io.checked_add(helpers).is_none_or(|n| n > reserved)
+            && io
+                .checked_add(helpers)
+                .and_then(|n| n.checked_add(usize::from(self.enable_rdma)))
+                .is_none_or(|n| n > reserved)
         {
             return Err(Error::InvalidConfiguration);
         }
@@ -780,280 +944,222 @@ pub const DEFAULT_GPU_LANDING_BYTES: u64 = 256 * 1024 * 1024;
 /// whole number of them.
 pub const GPU_STAGING_UNIT: u64 = 2 * 1024 * 1024;
 
-/// Environment names are exact and case sensitive, even though envy folds keys.
-const ENV_NAMES: &[&str] = &[
-    "CLUSTER_ID",
-    "CONTROL_ENDPOINT",
-    "ENABLE_RDMA",
-    "ENABLE_GPU",
-    "GPU_STAGING_BYTES",
-    "GPU_LANDING_BYTES",
-    "GPU_PCI_P2PDMA",
-    "GPU_PEER",
-    "ALLOW_SMT",
-    "OPAQUE_RELAY",
-    "PEER_TCP_NODELAY",
-    "MEMORY_PRESSURE",
-    "PPROF_ENABLED",
-    "PEER_LISTEN",
-    "DIAGNOSTICS_LISTEN",
-    "TRUST_BUNDLE",
-    "SERVICE_ACCOUNT_TOKEN",
-    "IDENTITY_DIRECTORY",
-    "SLAB_DIRECTORY",
-    "DEVICE_DIRECTORY",
-    "DEVICE_BUSY_WAIT_SECS",
-    "ADMISSION_MODE",
-    "MAX_THREADS",
-    "IO_WORKERS",
-    "CRYPTO_HELPERS",
-    "RETAINED_SEGMENT_PERCENT",
-    "PREFETCH_MAX_BODY_BYTES",
-    "PREFETCH_MAX_REFS",
-    "PREFETCH_MAX_TICKETS",
-    "PREFETCH_MAX_TTL_SECS",
-    "PREFETCH_TICKET_RETENTION_SECS",
-    "PREFETCH_MAX_WAIT_SECS",
-    "PREFETCH_DEFAULT_PENDING_BYTES",
-    "PREFETCH_MAX_PENDING_BYTES",
-    "PREFETCH_NODE_PENDING_BYTES",
-    "PREFETCH_CONCURRENT_FILLS",
-    "PREFETCH_ORIGIN_BYTES_PER_SEC",
-    "PREFETCH_MAX_ATTEMPTS",
-    "PAGE_HEDGE_DELAY_MS",
-    "PAGE_HEDGE_SLOTS",
-    "PAGE_HEDGE_BYTES",
-    "REPLICA_SELECTION",
-    "PEER_INFLIGHT_MAX",
-    "PEER_PER_NEIGHBOR_MAX",
-    "PEER_ADMISSION_RECOVERY_MS",
-    "SHARES",
-    "PEER_RECEIVE_MAX",
-    "PEER_RECEIVE_QUEUE_MAX",
-    "PEER_RECEIVE_WAIT_MS",
-    "SLAB_BYTES",
-    "SEGMENT_BYTES",
-    "FREE_SEGMENT_RESERVE",
-    "REQUEST_TIMEOUT_MS",
-    "PEER_ATTEMPT_TIMEOUT_MS",
-    "READER_STALL_TIMEOUT_MS",
-    "SHUTDOWN_TIMEOUT_MS",
-    "ADMISSION_PERIOD_SECS",
-    "PLAINTEXT_BYTES",
-    "CIPHERTEXT_BYTES",
-    "DIRTY_BYTES",
-    "REGISTERED_BYTES",
-    "REQUEST_CONTEXT_BYTES",
-    "FLIGHTS",
-    "WAITERS_PER_FLIGHT",
-    "QUEUE_ENTRIES",
-    "CONNECTIONS_PER_NEIGHBOR",
-    "CLIENT_CONNECTIONS",
-    "PIPES",
-    "RANGE_WINDOW_PAGES",
-    "RANGE_SPILL_PAGES",
-    "HEADER_BYTES",
-    "PLACEMENT_CACHE_BYTES",
-    "CACHED_PATHS",
-    "PATH_CACHE_BYTES",
-    "ACTIVE_PATH_SEARCHES",
-    "RETAINED_SNAPSHOTS",
-    "METADATA_ENTRIES",
-    "RELAY_TRANSFERS",
-    "ORIGIN_CONNECTIONS_PER_CACHE",
-    "DISK_PAGE_ENTRIES",
-    "ADMISSION_HISTORY_BYTES",
-    "CHECKPOINT_BYTES",
-    "SEND_CRC_PAIR",
-];
-
-/// Parsed values before application defaults, conversions, and cross-field policy.
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawConfig {
-    cluster_id: Option<String>,
-    control_endpoint: Option<String>,
-    enable_rdma: Option<String>,
-    enable_gpu: Option<String>,
-    #[serde(default, deserialize_with = "decimal")]
-    gpu_staging_bytes: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    gpu_landing_bytes: Option<u64>,
-    gpu_pci_p2pdma: Option<bool>,
-    gpu_peer: Option<String>,
-    allow_smt: Option<bool>,
-    opaque_relay: Option<bool>,
-    peer_tcp_nodelay: Option<bool>,
-    memory_pressure: Option<bool>,
-    pprof_enabled: Option<bool>,
-    peer_listen: Option<String>,
-    diagnostics_listen: Option<String>,
-    trust_bundle: Option<String>,
-    service_account_token: Option<String>,
-    identity_directory: Option<String>,
-    slab_directory: Option<String>,
-    device_directory: Option<String>,
-    admission_mode: Option<String>,
-    send_crc_pair: Option<String>,
-    #[serde(default, deserialize_with = "decimal")]
-    max_threads: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    io_workers: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    crypto_helpers: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    prefetch_max_body_bytes: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    prefetch_max_refs: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    prefetch_max_tickets: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    prefetch_max_ttl_secs: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    prefetch_ticket_retention_secs: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    prefetch_max_wait_secs: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    prefetch_default_pending_bytes: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    prefetch_max_pending_bytes: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    prefetch_node_pending_bytes: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    prefetch_concurrent_fills: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    prefetch_origin_bytes_per_sec: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    prefetch_max_attempts: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    retained_segment_percent: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    page_hedge_delay_ms: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    page_hedge_slots: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    page_hedge_bytes: Option<u64>,
-    replica_selection: Option<String>,
-    #[serde(default, deserialize_with = "decimal")]
-    peer_inflight_max: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    peer_per_neighbor_max: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    peer_admission_recovery_ms: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    shares: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    peer_receive_max: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    peer_receive_queue_max: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    peer_receive_wait_ms: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    slab_bytes: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    segment_bytes: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    free_segment_reserve: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    request_timeout_ms: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    peer_attempt_timeout_ms: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    reader_stall_timeout_ms: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    shutdown_timeout_ms: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    admission_period_secs: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    device_busy_wait_secs: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    plaintext_bytes: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    ciphertext_bytes: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    dirty_bytes: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    registered_bytes: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    request_context_bytes: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    flights: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    waiters_per_flight: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    queue_entries: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    connections_per_neighbor: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    client_connections: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    pipes: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    range_window_pages: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    range_spill_pages: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    header_bytes: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    placement_cache_bytes: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    cached_paths: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    path_cache_bytes: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    active_path_searches: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    retained_snapshots: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    metadata_entries: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    relay_transfers: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    origin_connections_per_cache: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    disk_page_entries: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    admission_history_bytes: Option<u64>,
-    #[serde(default, deserialize_with = "decimal")]
-    checkpoint_bytes: Option<u64>,
-}
-
-/// Keep decimal syntax stricter than Rust's unsigned FromStr, which accepts '+'.
-fn decimal<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> std::result::Result<Option<u64>, D::Error> {
-    let value = <String as serde::Deserialize>::deserialize(deserializer)?;
-    unsigned(&value).map(Some).map_err(serde::de::Error::custom)
-}
-
-/// Read one Unicode variable, preserving the distinction between missing and invalid.
-fn env_value(name: &str) -> Result<Option<String>> {
-    lookup_result(std::env::var(name))
-}
-
-/// Missing values may use defaults; non-Unicode values must fail.
-fn lookup_result(value: std::result::Result<String, std::env::VarError>) -> Result<Option<String>> {
-    match value {
-        Ok(value) => Ok(Some(value)),
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(std::env::VarError::NotUnicode(_)) => Err(Error::InvalidConfiguration),
+/// Read every `RACER_*` variable and every other table name from the process
+/// environment. Non-Unicode names are skipped, since no table name can match
+/// one; a non-Unicode value of a candidate name is an error naming it.
+pub fn environment() -> std::result::Result<BTreeMap<String, String>, ConfigError> {
+    let mut map = BTreeMap::new();
+    for (name, value) in std::env::vars_os() {
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with(spec::PREFIX) && !TABLE.iter().any(|var| var.name == name) {
+            continue;
+        }
+        let value = value
+            .into_string()
+            .map_err(|_| ConfigError::new(name, "value is not valid UTF-8"))?;
+        map.insert(name.to_owned(), value);
     }
+    Ok(map)
 }
 
-/// Reject empty, oversized, or control-bearing text without trimming it.
-fn validate_text(value: &str, maximum: usize) -> Result<()> {
-    if value.is_empty() || value.len() > maximum || value.chars().any(char::is_control) {
-        return Err(Error::InvalidConfiguration);
-    }
-    Ok(())
+/// Whether an empty value means unset. Kubernetes expands absent field
+/// references and optional values to "", so Pod-derived and optional origin
+/// settings treat "" as unset; every other variable rejects it.
+pub fn empty_is_unset(name: &str) -> bool {
+    TABLE.iter().any(|var| {
+        var.name == name
+            && (var.owner == spec::Owner::Authority
+                || matches!(
+                    name,
+                    "RACER_ORIGIN_TRUST_BUNDLE"
+                        | "RACER_AZURE_AUTHORITY_HOST"
+                        | "RACER_AZURE_FEDERATED_TOKEN_FILE"
+                ))
+    })
 }
 
-/// Accept only ASCII decimal digits within the full u64 range.
-fn unsigned(value: &str) -> Result<u64> {
-    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(Error::InvalidConfiguration);
+fn too_large(v: &Values, name: &str) -> ConfigError {
+    ConfigError::value(
+        name,
+        &v.shown(name).unwrap_or_default(),
+        "does not fit this platform",
+    )
+}
+
+/// Build embedded cluster control's configuration when `RACER_NAMESPACE`
+/// selects managed mode.
+fn authority(
+    v: &Values,
+    config: &Config,
+) -> std::result::Result<Option<racer_authority::Config>, ConfigError> {
+    use racer_authority::SeatPolicy;
+    let Some(namespace) = v.text("RACER_NAMESPACE") else {
+        return Ok(None);
+    };
+    let need = |name: &str| {
+        v.text(name).map(str::to_owned).ok_or_else(|| {
+            ConfigError::new(
+                name,
+                "required when RACER_NAMESPACE selects managed control",
+            )
+        })
+    };
+    let label = |name: &str, value: &str| {
+        let ok = !value.is_empty()
+            && value.len() <= 253
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.');
+        if ok {
+            Ok(value.to_owned())
+        } else {
+            Err(ConfigError::value(
+                name,
+                value,
+                "must be a lowercase DNS name of at most 253 characters",
+            ))
+        }
+    };
+    let ip = |name: &str, value: &str| {
+        value
+            .parse::<IpAddr>()
+            .map_err(|_| ConfigError::value(name, value, "must be an IP address"))
+    };
+    let namespace = label("RACER_NAMESPACE", namespace)?;
+    let pod_name = label("RACER_POD_NAME", &need("RACER_POD_NAME")?)?;
+    let pod_uid = need("RACER_POD_UID")?;
+    if !racer_wire::control::valid_uuid(&pod_uid) {
+        return Err(ConfigError::value(
+            "RACER_POD_UID",
+            &pod_uid,
+            "must be a canonical UUID",
+        ));
     }
-    value.parse().map_err(|_| Error::InvalidConfiguration)
+    let node_name = need("RACER_NODE_NAME")?;
+    let pod_ip = ip("RACER_POD_IP", &need("RACER_POD_IP")?)?;
+    let mut pod_ips = Vec::new();
+    let listed = v.text("RACER_POD_IPS").unwrap_or_default();
+    for value in listed.split(',').filter(|v| !v.is_empty()) {
+        pod_ips.push(ip("RACER_POD_IPS", value)?);
+    }
+    // Kubernetes reports at most one Pod IP per family, primary first.
+    if !pod_ips.is_empty()
+        && (pod_ips[0] != pod_ip
+            || pod_ips.len() > 2
+            || (pod_ips.len() == 2 && pod_ips[0].is_ipv6() == pod_ips[1].is_ipv6()))
+    {
+        return Err(ConfigError::value(
+            "RACER_POD_IPS",
+            listed,
+            "must start with RACER_POD_IP and hold at most one address per family",
+        ));
+    }
+    let seats = match v.text("RACER_CONTROL_SEATS").unwrap_or("auto") {
+        "auto" => SeatPolicy::Auto,
+        value => match spec::unsigned(value) {
+            Some(n)
+                if (1..=racer_authority::annotations::MAX_SEATS as u64).contains(&n)
+                    && value == n.to_string() =>
+            {
+                SeatPolicy::Fixed(n as usize)
+            }
+            _ => {
+                return Err(ConfigError::value(
+                    "RACER_CONTROL_SEATS",
+                    value,
+                    "must be auto or a decimal from 1 to 16 without leading zeros",
+                ));
+            }
+        },
+    };
+    let address = |name: &str| -> std::result::Result<SocketAddr, ConfigError> {
+        let raw = v.text(name).expect("defaulted");
+        control_address(raw)
+            .ok_or_else(|| ConfigError::value(name, raw, "must be ip:port, [ip]:port, or :port"))
+    };
+    let control_listen = address("RACER_CONTROL_LISTEN")?;
+    let webhook_listen = address("RACER_WEBHOOK_LISTEN")?;
+    if control_listen.port() != 0 && control_listen.port() == webhook_listen.port() {
+        return Err(ConfigError::new(
+            "RACER_CONTROL_LISTEN, RACER_WEBHOOK_LISTEN",
+            "the listeners must use different ports",
+        ));
+    }
+    let webhook_alternate = (webhook_listen.ip() == pod_ip)
+        .then(|| {
+            pod_ips
+                .iter()
+                .copied()
+                .find(|ip| ip.is_ipv6() != pod_ip.is_ipv6())
+        })
+        .flatten();
+    let host = need("KUBERNETES_SERVICE_HOST")?;
+    let port = v.unsigned("KUBERNETES_SERVICE_PORT").expect("defaulted");
+    let api_server = if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    let control = racer_authority::Config {
+        namespace,
+        pod_name,
+        pod_uid,
+        node_name,
+        pod_ip,
+        seats,
+        control_listen,
+        webhook_listen,
+        webhook_alternate,
+        object_image: v.text("RACER_OBJECT_IMAGE").map(str::to_owned),
+        api_server,
+        api_ca: v.text("RACER_KUBE_API_CA").expect("defaulted").into(),
+        api_token: v.text("RACER_KUBE_API_TOKEN").expect("defaulted").into(),
+        control_token: config.service_account_token.clone(),
+        daemonset: label(
+            "RACER_DAEMONSET",
+            v.text("RACER_DAEMONSET").expect("defaulted"),
+        )?,
+        service_account: label(
+            "RACER_SERVICE_ACCOUNT",
+            v.text("RACER_SERVICE_ACCOUNT").expect("defaulted"),
+        )?,
+        // Members reach this node's peer listener; publish its port.
+        peer_port: config.peer_listen.port(),
+        rotation: racer_authority::Rotation {
+            retained_page_keys: v.unsigned("RACER_RETAINED_PAGE_KEYS").expect("defaulted") as usize,
+            ..Default::default()
+        },
+        page_size: racer_wire::object::PageSize::new(
+            v.unsigned("RACER_PAGE_BYTES").expect("defaulted"),
+        )
+        .map_err(|_| ConfigError::new("RACER_PAGE_BYTES", "must be a power of two"))?,
+    };
+    control.validate().map_err(|error| {
+        ConfigError::new(
+            "RACER_NAMESPACE",
+            format!("cluster control rejected the Pod identity: {error}"),
+        )
+    })?;
+    Ok(Some(control))
+}
+
+/// Control and webhook listeners also accept `:port` for every IPv4 address.
+fn control_address(value: &str) -> Option<SocketAddr> {
+    let value = if value.starts_with(':') {
+        format!("0.0.0.0{value}")
+    } else {
+        value.to_owned()
+    };
+    if let Ok(address) = value.parse() {
+        return Some(address);
+    }
+    let (host, port) = value.strip_prefix('[')?.split_once("]:")?;
+    if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(SocketAddr::new(host.parse().ok()?, port.parse().ok()?))
 }
 
 /// Convert a size without truncating it on smaller platforms.
@@ -1061,19 +1167,8 @@ fn to_usize(value: u64) -> Result<usize> {
     usize::try_from(value).map_err(|_| Error::InvalidConfiguration)
 }
 
-/// Convert a positive size without truncation.
-fn nonzero_usize(value: u64) -> Result<NonZeroUsize> {
-    NonZeroUsize::new(to_usize(value)?).ok_or(Error::InvalidConfiguration)
-}
-
-/// Convert a positive share count without truncation.
-fn nonzero_u32(value: u64) -> Result<std::num::NonZeroU32> {
-    std::num::NonZeroU32::new(u32::try_from(value).map_err(|_| Error::InvalidConfiguration)?)
-        .ok_or(Error::InvalidConfiguration)
-}
-
 fn valid_uuid(value: &str) -> bool {
-    racer_control_wire::valid_uuid(value) && value != "00000000-0000-0000-0000-000000000000"
+    racer_wire::control::valid_uuid(value) && value != "00000000-0000-0000-0000-000000000000"
 }
 
 // Kubernetes expands a single bracketed Pod IP template for both IP families.
@@ -1187,40 +1282,241 @@ fn absolute_path(path: &Path, maximum: usize, component_maximum: usize) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::MAX_HEADER_BYTES;
+    use racer_wire::control::DEFAULT_SHARES;
     use std::io::Read;
 
+    /// `RACER_CACHE_ORIGIN_CONNECTIONS_PER_WORKER` default.
+    const DEFAULT_ORIGIN_CONNECTIONS_PER_CACHE: usize = 32;
+
     #[test]
-    fn every_allowlisted_name_is_a_raw_config_field() {
-        let values: Vec<_> = ENV_NAMES
-            .iter()
-            .map(|name| {
-                let value = match *name {
-                    "ALLOW_SMT" | "OPAQUE_RELAY" | "PEER_TCP_NODELAY" | "MEMORY_PRESSURE"
-                    | "PPROF_ENABLED" | "GPU_PCI_P2PDMA" => "true",
-                    _ => "1",
-                };
-                ((*name).to_owned(), value.to_owned())
-            })
-            .collect();
-        // Values need only satisfy raw types; application policy is checked separately.
-        assert!(envy::from_iter::<_, RawConfig>(values.clone()).is_ok());
-        let mut typo = values;
-        typo.push(("MAX_THREAD".into(), "1".into()));
-        assert!(envy::from_iter::<_, RawConfig>(typo).is_err());
+    fn every_table_default_parses_and_names_are_unique() {
+        let mut names = std::collections::BTreeSet::new();
+        for var in TABLE {
+            assert!(names.insert(var.name), "{} listed twice", var.name);
+            assert!(
+                var.name.starts_with(spec::PREFIX) || var.name.starts_with("KUBERNETES_"),
+                "{}",
+                var.name
+            );
+            if let spec::Default::Value(text) = var.default {
+                spec::parse(var, text).unwrap_or_else(|e| panic!("default of {}: {e}", var.name));
+            }
+            if let spec::Kind::Unsigned { min, max, step, .. } = var.kind {
+                assert!(min <= max && step > 0, "{}", var.name);
+            }
+            assert!(
+                !var.doc.is_empty() && !var.doc.contains('\u{2014}'),
+                "{}",
+                var.name
+            );
+        }
+        // The bare defaults parse to a working standalone configuration.
+        parse(&[]).unwrap();
     }
 
     #[test]
-    fn lookup_distinguishes_absence_empty_and_nonunicode() {
-        assert_eq!(lookup_result(Ok(String::new())), Ok(Some(String::new())));
-        assert_eq!(lookup_result(Ok("value".into())), Ok(Some("value".into())));
-        assert_eq!(lookup_result(Err(std::env::VarError::NotPresent)), Ok(None));
-        #[cfg(unix)]
-        {
-            use std::os::unix::ffi::OsStringExt;
-            let value = std::ffi::OsString::from_vec(vec![0xff]);
-            assert_eq!(
-                lookup_result(Err(std::env::VarError::NotUnicode(value))),
-                Err(Error::InvalidConfiguration)
+    fn defaults_match_the_owning_modules() {
+        let config = parse(&[]).unwrap();
+        let limits = Limits::default();
+        assert_eq!(config.limits, limits);
+        assert_eq!(config.prefetch, crate::prefetch::Config::default());
+        assert_eq!(config.gpu_staging_bytes, DEFAULT_GPU_STAGING_BYTES);
+        assert_eq!(config.gpu_landing_bytes, DEFAULT_GPU_LANDING_BYTES);
+        assert_eq!(
+            config.page_hedge.bytes,
+            crate::read::candidates::DUPLICATE_BYTES
+        );
+        assert_eq!(
+            config.shares.get(),
+            racer_wire::control::DEFAULT_SHARES,
+            "RACER_SHARES default"
+        );
+        assert_eq!(config.origin, OriginSettings::default());
+    }
+
+    #[test]
+    fn unknown_racer_variables_are_rejected_by_name() {
+        let error = parse(&[("RACER_MAX_THREAD", "4")]).err().unwrap();
+        assert_eq!(error.name, "RACER_MAX_THREAD");
+        assert!(error.reason.contains("unknown"), "{error}");
+        // Retired and renamed names are unknown too.
+        for name in [
+            "RACER_WARM_MAX_TTL_SECS",
+            "RACER_SLAB_BYTES",
+            "RACER_TRUST_BUNDLE",
+            "RACER_SERVICE_ACCOUNT_TOKEN",
+            "RACER_PEER_PORT",
+            "RACER_DST_SEEDS",
+        ] {
+            assert_eq!(parse(&[(name, "1")]).err().unwrap().name, name);
+        }
+        // Names without the prefix belong to someone else.
+        parse(&[
+            ("PATH", "/bin"),
+            ("racer_max_threads", "x"),
+            ("DST_SEEDS", "1"),
+        ])
+        .unwrap();
+        // The operator's key reaches the Pod through envFrom and is accepted.
+        parse(&[("RACER_NVIDIA", "cdi")]).unwrap();
+    }
+
+    #[test]
+    fn bound_violations_name_the_variable_value_and_reason() {
+        for var in TABLE {
+            let spec::Kind::Unsigned { min, max, step, .. } = var.kind else {
+                continue;
+            };
+            if max < u64::MAX {
+                let value = (max + 1).to_string();
+                let error = spec::parse(var, &value).err().unwrap();
+                assert_eq!(error.name, var.name);
+                assert_eq!(error.value.as_deref(), Some(value.as_str()));
+                assert!(error.reason.contains("from"), "{error}");
+            }
+            if min > 0 {
+                let value = (min - 1).to_string();
+                assert_eq!(spec::parse(var, &value).err().unwrap().name, var.name);
+            }
+            if step > 1 {
+                assert!(spec::parse(var, &(min + 1).to_string()).is_err());
+            }
+            assert!(spec::parse(var, "+1").is_err());
+        }
+        let error = parse(&[("RACER_RANGE_WINDOW_PAGES", "65")]).err().unwrap();
+        assert_eq!(
+            error.to_string(),
+            "RACER_RANGE_WINDOW_PAGES=\"65\": must be from 1 to 64"
+        );
+        let error = parse(&[("RACER_ENABLE_GPU", "yes")]).err().unwrap();
+        assert_eq!(error.name, "RACER_ENABLE_GPU");
+        assert!(error.reason.contains("auto, true, false"), "{error}");
+        // Cross-variable rules name every variable involved.
+        let error = parse(&[("RACER_IO_WORKERS", "2")]).err().unwrap();
+        assert_eq!(error.name, "RACER_IO_WORKERS, RACER_CRYPTO_HELPERS");
+        // Long values are truncated in messages.
+        let long = "a".repeat(4000);
+        let error = parse(&[("RACER_SLAB_DIRECTORY", &long)]).err().unwrap();
+        assert!(error.to_string().len() < 400, "{error}");
+    }
+
+    #[test]
+    fn shared_budgets_are_per_worker_by_default_and_node_wide_when_named() {
+        let defaults = parse(&[]).unwrap();
+        assert_eq!(
+            defaults.scaled_limits,
+            ScaledLimits {
+                plaintext_bytes: true,
+                ciphertext_bytes: true,
+                dirty_bytes: true,
+                registered_bytes: true,
+                request_context_bytes: true,
+                flights: true,
+                queue_entries: true,
+                client_connections: true,
+                peer_connections: true,
+                outbound_connections: true,
+                pipes: true,
+                placement_cache_bytes: true,
+                cached_paths: true,
+                path_cache_bytes: true,
+                metadata_entries: true,
+                relay_transfers: true,
+                registered_bytes_default_cap: true,
+            }
+        );
+        // An explicit per-worker amount is still scaled.
+        let mut worker = parse(&[("RACER_FLIGHTS_PER_WORKER", "10")]).unwrap();
+        assert!(worker.scaled_limits.flights);
+        worker.scale_limits(3).unwrap();
+        assert_eq!(worker.limits.flights.get(), 30);
+        // A node-wide total is never scaled.
+        let mut node = parse(&[("RACER_FLIGHTS", "10")]).unwrap();
+        assert!(!node.scaled_limits.flights);
+        node.scale_limits(3).unwrap();
+        assert_eq!(node.limits.flights.get(), 10);
+        // The default registered pool scales with workers up to its cap.
+        let per_worker = 384 * MIB as usize;
+        let mut small = parse(&[]).unwrap();
+        small.scale_limits(2).unwrap();
+        assert_eq!(small.limits.registered_bytes.get(), 2 * per_worker);
+        let mut large = parse(&[]).unwrap();
+        large.scale_limits(86).unwrap();
+        assert_eq!(
+            large.limits.registered_bytes.get() as u64,
+            DEFAULT_REGISTERED_BYTES_CAP
+        );
+        // An explicit per-worker amount or node-wide total is never capped.
+        let mut explicit = parse(&[("RACER_REGISTERED_BYTES_PER_WORKER", "402653184")]).unwrap();
+        assert!(!explicit.scaled_limits.registered_bytes_default_cap);
+        explicit.scale_limits(86).unwrap();
+        assert_eq!(explicit.limits.registered_bytes.get(), 86 * per_worker);
+        let total = 16 * 1024 * MIB;
+        let mut node = parse(&[("RACER_REGISTERED_BYTES", &total.to_string())]).unwrap();
+        node.scale_limits(86).unwrap();
+        assert_eq!(node.limits.registered_bytes.get() as u64, total);
+        // Each pair is a node-wide name and its per-worker name.
+        for (node_name, worker_name) in table::SHARED_BUDGETS {
+            assert_eq!(format!("{node_name}_PER_WORKER"), worker_name);
+            let node_var = TABLE.iter().find(|v| v.name == node_name).unwrap();
+            let worker_var = TABLE.iter().find(|v| v.name == worker_name).unwrap();
+            assert_eq!(node_var.scope, spec::Scope::Node);
+            assert_eq!(worker_var.scope, spec::Scope::PerWorker);
+            assert!(matches!(node_var.default, spec::Default::Unset(_)));
+            assert!(matches!(worker_var.default, spec::Default::Value(_)));
+            let spec::Default::Value(value) = worker_var.default else {
+                unreachable!()
+            };
+            let error = parse(&[(node_name, value), (worker_name, value)])
+                .err()
+                .unwrap();
+            assert_eq!(error.name, format!("{node_name}, {worker_name}"));
+        }
+        // Per-worker variables carry the suffix; node-wide ones do not.
+        for var in TABLE {
+            if var.scope == spec::Scope::PerWorker && var.name != "RACER_RETAINED_SEGMENT_PERCENT" {
+                assert!(var.name.ends_with("_PER_WORKER"), "{}", var.name);
+            }
+            if var.name.ends_with("_PER_WORKER") {
+                assert_eq!(var.scope, spec::Scope::PerWorker, "{}", var.name);
+            }
+        }
+    }
+
+    #[test]
+    fn generated_reference_is_current() {
+        // Regenerate with `BLESS=1 cargo test -p racer config::tests::generated_reference_is_current`.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let bless = std::env::var_os("BLESS").is_some();
+        let doc = root.join("docs/content/reference/racer.md");
+        let begin = "<!-- BEGIN GENERATED: racer configuration table -->\n";
+        let end = "<!-- END GENERATED: racer configuration table -->";
+        let text = std::fs::read_to_string(&doc).unwrap();
+        let start = text.find(begin).expect("begin marker") + begin.len();
+        let stop = text.find(end).expect("end marker");
+        let expected = format!("\n{}", spec::markdown(TABLE));
+        if bless {
+            std::fs::write(
+                &doc,
+                format!("{}{expected}{}", &text[..start], &text[stop..]),
+            )
+            .unwrap();
+        } else {
+            assert!(
+                text[start..stop] == expected,
+                "docs/content/reference/racer.md is stale; rerun with BLESS=1"
+            );
+        }
+        let json = root.join("internal/operator/components/racer/dataplane-settings.json");
+        let expected = spec::json(TABLE, &empty_is_unset);
+        if bless {
+            std::fs::write(&json, &expected).unwrap();
+        } else {
+            assert!(
+                std::fs::read_to_string(&json).unwrap() == expected,
+                "{} is stale; rerun with BLESS=1",
+                json.display()
             );
         }
     }
@@ -1244,10 +1540,25 @@ mod tests {
                 parse(&[
                     ("RACER_IO_WORKERS", io),
                     ("RACER_CRYPTO_HELPERS", helpers),
-                    ("RACER_MAX_THREADS", cap)
+                    ("RACER_MAX_THREADS", cap),
+                    ("RACER_ENABLE_RDMA", "false"),
                 ])
                 .is_ok(),
                 valid
+            );
+        }
+        // With RDMA on, the owner thread takes one thread of the cap.
+        for (cap, valid) in [("30", false), ("31", true)] {
+            assert_eq!(
+                parse(&[
+                    ("RACER_IO_WORKERS", "20"),
+                    ("RACER_CRYPTO_HELPERS", "10"),
+                    ("RACER_MAX_THREADS", cap),
+                    ("RACER_ENABLE_RDMA", "true"),
+                ])
+                .is_ok(),
+                valid,
+                "{cap}"
             );
         }
         assert!(parse(&[("RACER_IO_WORKERS", "20")]).is_err());
@@ -1256,22 +1567,31 @@ mod tests {
 
     #[test]
     fn text_defaults_and_strict_values() {
-        assert!(validate_text("ok", 2).is_ok());
-        assert!(validate_text("é", 2).is_ok());
-        assert!(validate_text("é", 1).is_err());
         // An empty environment selects managed mode with an unresolved cluster.
         assert!(Config::from_lookup(|_| Ok(None)).unwrap().managed());
         assert_eq!(parse(&[]).unwrap().max_threads, DEFAULT_MAX_THREADS);
-        for value in ["", "a\n", "\0", "\u{85}", "abc"] {
-            assert!(validate_text(value, 2).is_err());
+        let var = TABLE
+            .iter()
+            .find(|v| v.name == "RACER_SLAB_DIRECTORY")
+            .unwrap();
+        assert!(spec::parse(var, "/é").is_ok());
+        assert!(spec::parse(var, &format!("/{}", "a".repeat(4095))).is_ok());
+        for value in [
+            "",
+            "/a\n",
+            "/\0",
+            "/\u{85}",
+            &format!("/{}", "a".repeat(4096)),
+        ] {
+            assert!(spec::parse(var, value).is_err());
         }
         assert!(parse(&[("RACER_ALLOW_SMT", "true")]).unwrap().allow_smt);
         assert!(!parse(&[("RACER_ALLOW_SMT", "false")]).unwrap().allow_smt);
         for value in ["", "TRUE", "1", " false", "false\n"] {
             assert!(parse(&[("RACER_ALLOW_SMT", value)]).is_err());
         }
-        assert_eq!(unsigned("000"), Ok(0));
-        assert_eq!(unsigned("18446744073709551615"), Ok(u64::MAX));
+        assert_eq!(spec::unsigned("000"), Some(0));
+        assert_eq!(spec::unsigned("18446744073709551615"), Some(u64::MAX));
         for value in [
             "",
             "+1",
@@ -1282,13 +1602,17 @@ mod tests {
             "１",
             "18446744073709551616",
         ] {
-            assert!(unsigned(value).is_err());
+            assert!(spec::unsigned(value).is_none());
         }
-        assert!(nonzero_u32(0).is_err());
-        assert!(nonzero_u32(u32::MAX as u64 + 1).is_err());
-        assert_eq!(nonzero_u32(u32::MAX as u64).unwrap().get(), u32::MAX);
-        assert!(nonzero_usize(0).is_err());
-        assert_eq!(nonzero_usize(usize::MAX as u64).unwrap().get(), usize::MAX);
+        assert!(parse(&[("RACER_SHARES", "0")]).is_err());
+        assert!(parse(&[("RACER_SHARES", &(u32::MAX as u64 + 1).to_string())]).is_err());
+        assert_eq!(
+            parse(&[("RACER_SHARES", &u32::MAX.to_string())])
+                .unwrap()
+                .shares
+                .get(),
+            u32::MAX
+        );
     }
 
     #[test]
@@ -1345,14 +1669,13 @@ mod tests {
     }
 
     #[test]
-    fn envy_preserves_full_decimal_range_and_text_bytes() {
-        let raw: RawConfig = envy::from_iter([
-            ("CLUSTER_ID".into(), "unused".into()),
-            ("CONTROL_ENDPOINT".into(), "unused".into()),
-            ("MAX_THREADS".into(), u64::MAX.to_string()),
-        ])
-        .unwrap();
-        assert_eq!(raw.max_threads, Some(u64::MAX));
+    fn decimal_range_and_text_bytes_are_preserved() {
+        assert_eq!(
+            parse(&[("RACER_MAX_THREADS", &u64::MAX.to_string())])
+                .unwrap()
+                .max_threads as u64,
+            u64::MAX
+        );
         assert_eq!(
             parse(&[("RACER_MAX_THREADS", "0004")]).unwrap().max_threads,
             4
@@ -1376,7 +1699,7 @@ mod tests {
     #[test]
     fn process_environment_uses_only_exact_supported_unicode_names() {
         use std::os::unix::ffi::OsStringExt;
-        const CHILD: &str = "RACER_CONFIG_TEST_CHILD";
+        const CHILD: &str = "CONFIG_TEST_CHILD";
         if let Ok(expected) = std::env::var(CHILD) {
             let result = Config::from_env();
             if expected == "valid" {
@@ -1384,7 +1707,7 @@ mod tests {
                 assert_eq!(config.max_threads, 7);
                 assert!(!config.allow_smt);
             } else {
-                assert!(matches!(result, Err(Error::InvalidConfiguration)));
+                assert_eq!(result.err().unwrap().name, expected);
             }
             return;
         }
@@ -1403,15 +1726,16 @@ mod tests {
             (
                 "RACER_ALLOW_SMT",
                 std::ffi::OsString::from_vec(vec![0xff]),
-                "invalid",
+                "RACER_ALLOW_SMT",
             ),
             (
                 "RACER_SHARES",
                 std::ffi::OsString::from_vec(vec![0xff]),
-                "invalid",
+                "RACER_SHARES",
             ),
-            ("RACER_SHARES", "".into(), "invalid"),
-            ("RACER_ALLOW_SMT", "".into(), "invalid"),
+            ("RACER_SHARES", "".into(), "RACER_SHARES"),
+            ("RACER_ALLOW_SMT", "".into(), "RACER_ALLOW_SMT"),
+            ("RACER_UNKNOWN", "1".into(), "RACER_UNKNOWN"),
         ] {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .arg("--exact")
@@ -1436,8 +1760,8 @@ mod tests {
     #[test]
     fn configured_ports_do_not_override_membership_or_discovered_hardware() {
         use crate::rdma::match_publication;
-        use racer_control_wire::RailId;
-        use racer_control_wire::RailMapping;
+        use racer_wire::control::RailId;
+        use racer_wire::control::RailMapping;
         let nic = RailMapping {
             device: "a".into(),
             port: 1,
@@ -1482,17 +1806,15 @@ mod tests {
 
     // RDMA NIC configuration arrives only through authenticated enrollment wire NICs.
     fn nic_request(nics: &str) -> Vec<u8> {
-        String::from_utf8(
-            include_bytes!("../control-wire/testdata/bootstrap-request.json").to_vec(),
-        )
-        .unwrap()
-        .replace("\"rdma_nics\":[]", &format!("\"rdma_nics\":{nics}"))
-        .into_bytes()
+        String::from_utf8(include_bytes!("../wire/testdata/bootstrap-request.json").to_vec())
+            .unwrap()
+            .replace("\"rdma_nics\":[]", &format!("\"rdma_nics\":{nics}"))
+            .into_bytes()
     }
     #[test]
     fn enrollment_nics_reject_malformed_ambiguous_or_unsafe_entries() {
         assert!(
-            racer_control_wire::decode_enrollment_request(&nic_request(
+            racer_wire::control::decode_enrollment_request(&nic_request(
                 r#"[{"device":"a","port":1,"rail":0}]"#
             ))
             .is_ok()
@@ -1509,7 +1831,7 @@ mod tests {
             r#"[{"device":"a","port":1,"rail":0},{"device":"a","port":1,"rail":1}]"#,
         ] {
             assert!(
-                racer_control_wire::decode_enrollment_request(&nic_request(nics)).is_err(),
+                racer_wire::control::decode_enrollment_request(&nic_request(nics)).is_err(),
                 "{nics}"
             );
         }
@@ -1520,23 +1842,23 @@ mod tests {
             .map(|i| format!(r#"{{"device":"d{i}","port":1,"rail":0}}"#))
             .collect();
         assert!(
-            racer_control_wire::decode_enrollment_request(&nic_request(&format!(
+            racer_wire::control::decode_enrollment_request(&nic_request(&format!(
                 "[{}]",
                 entries[..64].join(",")
             )))
             .is_ok()
         );
         assert!(
-            racer_control_wire::decode_enrollment_request(&nic_request(&format!(
+            racer_wire::control::decode_enrollment_request(&nic_request(&format!(
                 "[{}]",
                 entries.join(",")
             )))
             .is_err()
         );
         assert!(
-            racer_control_wire::decode_enrollment_request(&vec![
+            racer_wire::control::decode_enrollment_request(&vec![
                 b' ';
-                racer_control_wire::MAX_ENROLLMENT_BYTES
+                racer_wire::control::MAX_ENROLLMENT_BYTES
                     + 1
             ])
             .is_err()
@@ -1547,7 +1869,7 @@ mod tests {
         let sim = rdma_verbs::simulation::Simulation::new()
             .with_devices(vec![])
             .unwrap();
-        let _environment = sim.enter();
+        let _devices = sim.enter();
         assert!(
             !parse(&[("RACER_REGISTERED_BYTES", "1")])
                 .unwrap()
@@ -1670,13 +1992,17 @@ mod tests {
         }
     }
 
-    fn parse_managed(overrides: &[(&str, &str)]) -> Result<Config> {
-        Config::from_lookup(|name| {
-            Ok(overrides
-                .iter()
-                .find(|(key, _)| *key == name)
-                .map(|(_, value)| (*value).to_owned()))
-        })
+    type Parsed = std::result::Result<Config, ConfigError>;
+
+    fn map(overrides: &[(&str, &str)]) -> BTreeMap<String, String> {
+        overrides
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect()
+    }
+
+    fn parse_managed(overrides: &[(&str, &str)]) -> Parsed {
+        Config::from_map(&map(overrides))
     }
 
     #[test]
@@ -1732,16 +2058,15 @@ mod tests {
     }
 
     #[test]
-    fn managed_mode_reserves_one_thread_for_cluster_control() {
+    fn managed_mode_reserves_one_thread_for_authority() {
         let mut unlimited = parse_managed(&[]).unwrap();
         unlimited.reserve_control_thread().unwrap();
         assert_eq!(unlimited.max_threads, DEFAULT_MAX_THREADS);
         let mut capped = parse_managed(&[("RACER_MAX_THREADS", "3")]).unwrap();
         capped.reserve_control_thread().unwrap();
         assert_eq!(capped.max_threads, 2);
-        let mut minimal = parse_managed(&[("RACER_MAX_THREADS", "2")]).unwrap();
-        assert!(minimal.reserve_control_thread().is_err());
-        assert_eq!(minimal.max_threads, 2);
+        // Too small a managed cap is a configuration error before startup.
+        assert!(parse_managed(&[("RACER_MAX_THREADS", "2")]).is_err());
         // An exact pair that no longer fits after reservation is rejected unchanged.
         let mut exact = parse_managed(&[
             ("RACER_MAX_THREADS", "4"),
@@ -1751,21 +2076,53 @@ mod tests {
         .unwrap();
         assert!(exact.reserve_control_thread().is_err());
         assert_eq!(exact.max_threads, 4);
+        // The RDMA owner also needs its thread beside the control thread.
+        let mut rdma = parse_managed(&[
+            ("RACER_MAX_THREADS", "5"),
+            ("RACER_IO_WORKERS", "2"),
+            ("RACER_CRYPTO_HELPERS", "2"),
+            ("RACER_ENABLE_RDMA", "true"),
+        ])
+        .unwrap();
+        assert!(rdma.reserve_control_thread().is_err());
+        let mut rdma = parse_managed(&[
+            ("RACER_MAX_THREADS", "6"),
+            ("RACER_IO_WORKERS", "2"),
+            ("RACER_CRYPTO_HELPERS", "2"),
+            ("RACER_ENABLE_RDMA", "true"),
+        ])
+        .unwrap();
+        rdma.reserve_control_thread().unwrap();
+        assert_eq!(rdma.max_threads, 5);
         assert!(parse(&[]).unwrap().reserve_control_thread().is_err());
     }
 
-    fn parse(overrides: &[(&str, &str)]) -> Result<Config> {
-        Config::from_lookup(|name| {
-            Ok(overrides
-                .iter()
-                .find(|(key, _)| *key == name)
-                .map(|(_, value)| (*value).to_owned())
-                .or_else(|| match name {
-                    "RACER_CLUSTER_ID" => Some("00000000-0000-4000-8000-000000000001".into()),
-                    "RACER_CONTROL_ENDPOINT" => Some("https://control.example:7443".into()),
-                    _ => None,
-                }))
-        })
+    /// The RDMA owner needs a thread beside I/O, crypto, and managed control.
+    #[test]
+    fn managed_rdma_needs_four_threads() {
+        let Err(error) =
+            parse_managed(&[("RACER_MAX_THREADS", "3"), ("RACER_ENABLE_RDMA", "true")])
+        else {
+            panic!("managed RDMA with three threads must be rejected");
+        };
+        assert_eq!(error.name, "RACER_MAX_THREADS");
+        let mut rdma =
+            parse_managed(&[("RACER_MAX_THREADS", "4"), ("RACER_ENABLE_RDMA", "true")]).unwrap();
+        rdma.reserve_control_thread().unwrap();
+        assert_eq!(rdma.max_threads, 3);
+        let mut plain =
+            parse_managed(&[("RACER_MAX_THREADS", "3"), ("RACER_ENABLE_RDMA", "false")]).unwrap();
+        plain.reserve_control_thread().unwrap();
+        assert_eq!(plain.max_threads, 2);
+    }
+
+    fn parse(overrides: &[(&str, &str)]) -> Parsed {
+        let mut values = map(&[
+            ("RACER_CLUSTER_ID", "00000000-0000-4000-8000-000000000001"),
+            ("RACER_CONTROL_ENDPOINT", "https://control.example:7443"),
+        ]);
+        values.extend(map(overrides));
+        Config::from_map(&values)
     }
     #[test]
     fn spill_defaults_and_environment_limits_are_bounded() {
@@ -1868,25 +2225,13 @@ mod tests {
     }
 
     #[test]
-    fn removed_warm_keys_are_not_known() {
-        for key in [
-            "WARM_MAX_TTL_SECS",
-            "WARM_FILL_TIMEOUT_SECS",
-            "WARM_MAX_JOBS",
-            "WARM_WINDOW_PAGES",
-        ] {
-            assert!(!ENV_NAMES.contains(&key), "{key}");
-        }
-    }
-
-    #[test]
-    fn send_crc_pair_is_opt_in_and_validated() {
-        assert!(parse(&[]).unwrap().send_crc_pair.is_none());
+    fn send_tag_pair_is_opt_in_and_validated() {
+        assert!(parse(&[]).unwrap().send_tag_pair.is_none());
         let valid = "8816d91d-e896-49bf-ba8a-da97ede93818,11111111-1111-4111-8111-111111111111";
         assert!(
-            parse(&[("RACER_SEND_CRC_PAIR", valid)])
+            parse(&[("RACER_SEND_TAG_PAIR", valid)])
                 .unwrap()
-                .send_crc_pair
+                .send_tag_pair
                 .is_some()
         );
         for invalid in [
@@ -1895,7 +2240,7 @@ mod tests {
             "a,b,c",
             "8816d91d-e896-49bf-ba8a-da97ede93818,8816d91d-e896-49bf-ba8a-da97ede93818",
         ] {
-            assert!(parse(&[("RACER_SEND_CRC_PAIR", invalid)]).is_err());
+            assert!(parse(&[("RACER_SEND_TAG_PAIR", invalid)]).is_err());
         }
     }
 
@@ -1992,12 +2337,8 @@ mod tests {
                 );
             }
         }
-        let mut config = parse(&[]).unwrap();
-        config.admission_period = Duration::ZERO;
-        assert_eq!(config.validate(), Err(Error::InvalidConfiguration));
-        config.admission_period = Duration::from_secs(60);
-        config.admission_history_bytes = NonZeroUsize::new(31).unwrap();
-        assert_eq!(config.validate(), Err(Error::InvalidConfiguration));
+        assert!(parse(&[("RACER_ADMISSION_PERIOD_SECS", "0")]).is_err());
+        assert!(parse(&[("RACER_ADMISSION_HISTORY_BYTES", "31")]).is_err());
     }
 
     #[test]
@@ -2010,9 +2351,13 @@ mod tests {
         assert_eq!(config.admission_history_per_worker(8), Ok(512 * 1024));
         for workers in [1, 2, 3, 8, 64] {
             let share = config.admission_history_per_worker(workers).unwrap();
-            let policy =
-                crate::retention::Retention::configured(share, 1, config.admission_period, true)
-                    .unwrap();
+            let policy = crate::retention::Retention::configured(
+                share,
+                config.admission_period,
+                true,
+                racer_io::Clock::host(),
+            )
+            .unwrap();
             let allocated = policy.snapshot().filter_bits / 8;
             assert_eq!(allocated, share / 32 * 32);
             assert!(allocated * workers <= config.admission_history_bytes.get());
@@ -2072,15 +2417,15 @@ mod tests {
             config.origin_connections_per_cache.get(),
             DEFAULT_ORIGIN_CONNECTIONS_PER_CACHE
         );
-        assert_eq!(config.limits.connections_per_neighbor.get(), 2);
-        assert_eq!(config.validate(), Ok(()));
+        assert_eq!(config.limits.connections_per_neighbor.get(), 8);
+        config.validate().unwrap();
         crate::app::Application::assemble(config).unwrap();
         assert!(parse(&[("RACER_ENABLE_RDMA", "true"), ("RACER_MAX_THREADS", "7")]).is_ok());
     }
 
     type LimitField = (&'static str, fn(&Limits) -> NonZeroUsize);
 
-    const SCALED_FIELDS: [LimitField; 14] = [
+    const SCALED_FIELDS: [LimitField; 16] = [
         ("RACER_PLAINTEXT_BYTES", |l| l.plaintext_bytes),
         ("RACER_CIPHERTEXT_BYTES", |l| l.ciphertext_bytes),
         ("RACER_DIRTY_BYTES", |l| l.dirty_bytes),
@@ -2089,6 +2434,8 @@ mod tests {
         ("RACER_FLIGHTS", |l| l.flights),
         ("RACER_QUEUE_ENTRIES", |l| l.queue_entries),
         ("RACER_CLIENT_CONNECTIONS", |l| l.client_connections),
+        ("RACER_PEER_CONNECTIONS", |l| l.peer_connections),
+        ("RACER_OUTBOUND_CONNECTIONS", |l| l.outbound_connections),
         ("RACER_PIPES", |l| l.pipes),
         ("RACER_PLACEMENT_CACHE_BYTES", |l| l.placement_cache_bytes),
         ("RACER_CACHED_PATHS", |l| l.cached_paths),
@@ -2104,11 +2451,11 @@ mod tests {
             let before = config.limits.clone();
             config.scale_limits(workers).unwrap();
             for (name, field) in SCALED_FIELDS {
-                assert_eq!(
-                    field(&config.limits).get(),
-                    field(&before).get() * workers,
-                    "{name}"
-                );
+                let mut expected = field(&before).get() * workers;
+                if name == "RACER_REGISTERED_BYTES" {
+                    expected = expected.min(DEFAULT_REGISTERED_BYTES_CAP as usize);
+                }
+                assert_eq!(field(&config.limits).get(), expected, "{name}");
             }
             for field in [
                 (|l: &Limits| l.waiters_per_flight) as fn(&Limits) -> NonZeroUsize,
@@ -2169,6 +2516,10 @@ mod tests {
                 "RACER_FLIGHTS" => config.scaled_limits.flights = true,
                 "RACER_QUEUE_ENTRIES" => config.scaled_limits.queue_entries = true,
                 "RACER_CLIENT_CONNECTIONS" => config.scaled_limits.client_connections = true,
+                "RACER_PEER_CONNECTIONS" => config.scaled_limits.peer_connections = true,
+                "RACER_OUTBOUND_CONNECTIONS" => {
+                    config.scaled_limits.outbound_connections = true;
+                }
                 "RACER_PIPES" => config.scaled_limits.pipes = true,
                 "RACER_PLACEMENT_CACHE_BYTES" => config.scaled_limits.placement_cache_bytes = true,
                 "RACER_CACHED_PATHS" => config.scaled_limits.cached_paths = true,
@@ -2205,7 +2556,7 @@ mod tests {
             vec![("RACER_PEER_INFLIGHT_MAX", "0")],
             vec![("RACER_PEER_INFLIGHT_MAX", "65537")],
             vec![("RACER_PEER_PER_NEIGHBOR_MAX", "0")],
-            vec![("RACER_PEER_PER_NEIGHBOR_MAX", "257")],
+            vec![("RACER_PEER_PER_NEIGHBOR_MAX", "4097")],
             vec![("RACER_PEER_ADMISSION_RECOVERY_MS", "0")],
             vec![("RACER_PEER_ADMISSION_RECOVERY_MS", "60001")],
         ] {
@@ -2267,10 +2618,7 @@ mod tests {
         for value in [
             "", "1", "0", "TRUE", "False", "auto", " true", "true ", "true\n",
         ] {
-            assert!(matches!(
-                parse(&[(name, value)]),
-                Err(Error::InvalidConfiguration)
-            ));
+            assert_eq!(parse(&[(name, value)]).err().unwrap().name, name);
         }
         assert!(
             Config::from_lookup(|key| {
@@ -2321,7 +2669,7 @@ mod tests {
             ("RACER_PLACEMENT_CACHE_BYTES", "1025"),
             ("RACER_CACHED_PATHS", "1"),
             ("RACER_PATH_CACHE_BYTES", "7"),
-            ("RACER_ACTIVE_PATH_SEARCHES", "2"),
+            ("RACER_ACTIVE_PATH_SEARCHES_PER_WORKER", "2"),
         ])
         .unwrap();
         assert_eq!(config.limits.placement_cache_bytes.get(), 1025);
@@ -2333,24 +2681,21 @@ mod tests {
             ("RACER_PLACEMENT_CACHE_BYTES", "536870913"),
             ("RACER_PATH_CACHE_BYTES", "0"),
             ("RACER_PATH_CACHE_BYTES", "536870913"),
-            ("RACER_ACTIVE_PATH_SEARCHES", "0"),
-            ("RACER_ACTIVE_PATH_SEARCHES", "65"),
+            ("RACER_ACTIVE_PATH_SEARCHES_PER_WORKER", "0"),
+            ("RACER_ACTIVE_PATH_SEARCHES_PER_WORKER", "65"),
             ("RACER_CACHED_PATHS", "0"),
             ("RACER_CACHED_PATHS", "1048577"),
         ] {
             assert!(parse(&[(name, value)]).is_err(), "{name}={value}");
         }
-        let mut config = defaults;
-        config.limits.placement_cache_bytes = NonZeroUsize::new(1023).unwrap();
-        assert_eq!(config.validate(), Err(Error::InvalidConfiguration));
-        config.limits.placement_cache_bytes = NonZeroUsize::new(1024).unwrap();
-        config.limits.path_cache_bytes = NonZeroUsize::new(512 * MIB as usize + 1).unwrap();
-        assert_eq!(config.validate(), Err(Error::InvalidConfiguration));
-        config.limits.path_cache_bytes = NonZeroUsize::new(1).unwrap();
-        config.limits.active_path_searches = NonZeroUsize::new(65).unwrap();
-        assert_eq!(config.validate(), Err(Error::InvalidConfiguration));
-        config.limits.active_path_searches = NonZeroUsize::new(64).unwrap();
-        assert_eq!(config.validate(), Ok(()));
+        assert!(parse(&[("RACER_PLACEMENT_CACHE_BYTES", "1023")]).is_err());
+        parse(&[("RACER_PLACEMENT_CACHE_BYTES", "1024")]).unwrap();
+        parse(&[
+            ("RACER_PATH_CACHE_BYTES", "1"),
+            ("RACER_ACTIVE_PATH_SEARCHES_PER_WORKER", "64"),
+        ])
+        .unwrap();
+        drop(defaults);
     }
 
     #[test]
@@ -2361,21 +2706,21 @@ mod tests {
     #[test]
     fn origin_connection_cap_is_independent_and_validated() {
         let config = parse(&[
-            ("RACER_ORIGIN_CONNECTIONS_PER_CACHE", "16"),
-            ("RACER_CONNECTIONS_PER_NEIGHBOR", "1"),
+            ("RACER_CACHE_ORIGIN_CONNECTIONS_PER_WORKER", "16"),
+            ("RACER_NEIGHBOR_CONNECTIONS_PER_WORKER", "1"),
         ])
         .unwrap();
         assert_eq!(config.origin_connections_per_cache.get(), 16);
         assert_eq!(config.limits.connections_per_neighbor.get(), 1);
         for value in ["", "0", "1025", "129", "-1", "1 ", "many"] {
             assert!(
-                parse(&[("RACER_ORIGIN_CONNECTIONS_PER_CACHE", value)]).is_err(),
+                parse(&[("RACER_CACHE_ORIGIN_CONNECTIONS_PER_WORKER", value)]).is_err(),
                 "{value}"
             );
         }
         assert!(
             parse(&[
-                ("RACER_ORIGIN_CONNECTIONS_PER_CACHE", "1024"),
+                ("RACER_CACHE_ORIGIN_CONNECTIONS_PER_WORKER", "1024"),
                 ("RACER_CLIENT_CONNECTIONS", "1024")
             ])
             .is_ok()
@@ -2384,7 +2729,7 @@ mod tests {
         assert_eq!(small.origin_connections_per_cache.get(), 12);
         assert!(
             parse(&[
-                ("RACER_ORIGIN_CONNECTIONS_PER_CACHE", "13"),
+                ("RACER_CACHE_ORIGIN_CONNECTIONS_PER_WORKER", "13"),
                 ("RACER_CLIENT_CONNECTIONS", "12")
             ])
             .is_err()
@@ -2411,7 +2756,7 @@ mod tests {
         assert!(cap <= outbound, "{cap} > {outbound}");
         assert!(cap - 1 < outbound);
         // An explicit cap above outbound admission is bounded the same way.
-        let explicit = parse(&[("RACER_ORIGIN_CONNECTIONS_PER_CACHE", "64")]).unwrap();
+        let explicit = parse(&[("RACER_CACHE_ORIGIN_CONNECTIONS_PER_WORKER", "64")]).unwrap();
         assert_eq!(effective(&explicit), (outbound, outbound));
         // Large budgets keep the full default.
         let large = parse(&[("RACER_CLIENT_CONNECTIONS", "16384")]).unwrap();
@@ -2562,10 +2907,13 @@ mod tests {
             Config::from_lookup(|_| Ok(None)).unwrap().cluster.0,
             UNRESOLVED_CLUSTER_ID
         );
-        assert!(matches!(
-            Config::from_lookup(|_| Err(Error::InvalidConfiguration)),
-            Err(Error::InvalidConfiguration)
-        ));
+        assert_eq!(
+            Config::from_lookup(|_| Err(Error::InvalidConfiguration))
+                .err()
+                .unwrap()
+                .name,
+            "RACER_CLUSTER_ID"
+        );
         for value in [
             "",
             "node-name",
@@ -2577,9 +2925,9 @@ mod tests {
         assert!(parse(&[("RACER_SHARES", "")]).is_err());
         let mut config = parse(&[]).unwrap();
         config.node = NodeId("node-name".into());
-        assert_eq!(config.validate(), Err(Error::InvalidConfiguration));
+        assert!(config.validate().is_err());
         config.node = NodeId("00000000-0000-4000-8000-000000000002".into());
-        assert_eq!(config.validate(), Ok(()));
+        config.validate().unwrap();
     }
 
     #[test]
@@ -2683,8 +3031,8 @@ mod tests {
     #[test]
     fn paths_are_absolute_canonical_and_separate_without_filesystem_access() {
         for name in [
-            "RACER_TRUST_BUNDLE",
-            "RACER_SERVICE_ACCOUNT_TOKEN",
+            "RACER_CONTROL_TRUST_BUNDLE",
+            "RACER_CONTROL_TOKEN",
             "RACER_IDENTITY_DIRECTORY",
             "RACER_SLAB_DIRECTORY",
         ] {
@@ -2721,28 +3069,41 @@ mod tests {
             ])
             .is_ok()
         );
-        assert!(parse(&[("RACER_TRUST_BUNDLE", &format!("/{}", "a".repeat(256)))]).is_err());
+        assert!(
+            parse(&[(
+                "RACER_CONTROL_TRUST_BUNDLE",
+                &format!("/{}", "a".repeat(256))
+            )])
+            .is_err()
+        );
     }
 
     #[test]
     fn geometry_includes_aead_and_envelope_and_preserves_a_writable_segment() {
-        let mut config = parse(&[]).unwrap();
         let minimum = PAGE_BYTES + 16 + MAX_HEADER_BYTES as u64;
-        config.segment_bytes = minimum;
-        config.slab_bytes = minimum * 3;
-        assert_eq!(config.validate(), Ok(()));
-        config.segment_bytes -= 1;
-        config.slab_bytes = config.segment_bytes * 3;
-        assert_eq!(config.validate(), Err(Error::InvalidConfiguration));
+        let geometry = |segment: u64| {
+            parse(&[
+                ("RACER_SEGMENT_BYTES", &segment.to_string()),
+                ("RACER_SLAB_BYTES_PER_WORKER", &(segment * 3).to_string()),
+            ])
+        };
+        geometry(minimum).unwrap();
+        assert_eq!(
+            geometry(minimum - 1).err().unwrap().name,
+            "RACER_SEGMENT_BYTES"
+        );
         for (name, value) in [
             ("RACER_SEGMENT_BYTES", "0"),
-            ("RACER_SLAB_BYTES", "0"),
+            ("RACER_SLAB_BYTES_PER_WORKER", "0"),
             ("RACER_SEGMENT_BYTES", "16777216"),
-            ("RACER_SLAB_BYTES", "1073741825"),
-            ("RACER_FREE_SEGMENT_RESERVE", "0"),
-            ("RACER_FREE_SEGMENT_RESERVE", "16"),
-            ("RACER_SLAB_BYTES", "18446744073709551615"),
-            ("RACER_FREE_SEGMENT_RESERVE", "18446744073709551615"),
+            ("RACER_SLAB_BYTES_PER_WORKER", "1073741825"),
+            ("RACER_FREE_SEGMENT_RESERVE_PER_WORKER", "0"),
+            ("RACER_FREE_SEGMENT_RESERVE_PER_WORKER", "16"),
+            ("RACER_SLAB_BYTES_PER_WORKER", "18446744073709551615"),
+            (
+                "RACER_FREE_SEGMENT_RESERVE_PER_WORKER",
+                "18446744073709551615",
+            ),
         ] {
             assert!(parse(&[(name, value)]).is_err(), "{name}={value}");
         }
@@ -2763,10 +3124,31 @@ mod tests {
             ("RACER_PIPES", "65537"),
             ("RACER_RANGE_WINDOW_PAGES", "16"),
             ("RACER_PLAINTEXT_BYTES", "18446744073709551615"),
-            ("RACER_CONNECTIONS_PER_NEIGHBOR", "129"),
+            ("RACER_NEIGHBOR_CONNECTIONS_PER_WORKER", "129"),
+            ("RACER_NEIGHBOR_CONNECTIONS_PER_WORKER", "65"),
+            ("RACER_PEER_CONNECTIONS_PER_WORKER", "0"),
+            ("RACER_PEER_CONNECTIONS", "65537"),
+            ("RACER_OUTBOUND_CONNECTIONS_PER_WORKER", "0"),
         ] {
             assert!(parse(&[(name, value)]).is_err(), "{name}={value}");
         }
+        // Neighbor connections are bounded by outbound connections, not client connections.
+        assert!(parse(&[("RACER_NEIGHBOR_CONNECTIONS_PER_WORKER", "64")]).is_ok());
+        let wide = parse(&[
+            ("RACER_NEIGHBOR_CONNECTIONS_PER_WORKER", "65"),
+            ("RACER_OUTBOUND_CONNECTIONS_PER_WORKER", "128"),
+            ("RACER_CLIENT_CONNECTIONS_PER_WORKER", "8"),
+        ])
+        .unwrap();
+        assert_eq!(wide.limits.outbound_connections.get(), 128);
+        assert_eq!(wide.limits.peer_connections.get(), 2048);
+        assert!(
+            parse(&[
+                ("RACER_NEIGHBOR_CONNECTIONS_PER_WORKER", "9"),
+                ("RACER_OUTBOUND_CONNECTIONS_PER_WORKER", "8"),
+            ])
+            .is_err()
+        );
         assert!(
             parse(&[
                 ("RACER_FLIGHTS", "65536"),
@@ -2798,10 +3180,10 @@ mod tests {
         config.limits.ciphertext_bytes =
             NonZeroUsize::new((window + 1) * (PAGE_BYTES as usize + 16) + MAX_HEADER_BYTES)
                 .unwrap();
-        assert_eq!(config.validate(), Ok(()));
+        config.validate().unwrap();
         config.limits.ciphertext_bytes =
             NonZeroUsize::new(config.limits.ciphertext_bytes.get() - 1).unwrap();
-        assert_eq!(config.validate(), Err(Error::InvalidConfiguration));
+        assert!(config.validate().is_err());
     }
 
     #[test]
@@ -2831,6 +3213,42 @@ mod tests {
     }
 
     #[test]
+    fn rdma_breaker_defaults_off_and_cooldowns_are_ordered() {
+        let config = parse(&[]).unwrap();
+        assert_eq!(
+            config.rdma_breaker,
+            crate::rdma::breaker::BreakerConfig {
+                enabled: false,
+                ..crate::rdma::breaker::BreakerConfig::default()
+            }
+        );
+        let tuned = parse(&[
+            ("RACER_RDMA_BREAKER", "true"),
+            ("RACER_RDMA_BREAKER_COOLDOWN_MS", "500"),
+            ("RACER_RDMA_BREAKER_MAX_COOLDOWN_MS", "500"),
+            ("RACER_RDMA_PAGE_TIMEOUT_MS", "750"),
+        ])
+        .unwrap();
+        assert!(tuned.rdma_breaker.enabled);
+        assert_eq!(tuned.rdma_breaker.base, Duration::from_millis(500));
+        assert_eq!(tuned.rdma_breaker.max, Duration::from_millis(500));
+        assert_eq!(tuned.rdma_breaker.page_timeout, Duration::from_millis(750));
+        for port in ["1", "18515", "65535"] {
+            assert!(parse(&[("RACER_RDMA_CM_PORT", port)]).is_ok(), "{port}");
+        }
+        for (name, value) in [
+            ("RACER_RDMA_PAGE_TIMEOUT_MS", "0"),
+            ("RACER_RDMA_PAGE_TIMEOUT_MS", "60001"),
+            ("RACER_RDMA_BREAKER_COOLDOWN_MS", "0"),
+            ("RACER_RDMA_BREAKER_COOLDOWN_MS", "30001"),
+            ("RACER_RDMA_CM_PORT", "0"),
+            ("RACER_RDMA_CM_PORT", "65536"),
+        ] {
+            assert!(parse(&[(name, value)]).is_err(), "{name}={value}");
+        }
+    }
+
+    #[test]
     fn peer_attempt_timeout_is_independent_and_validates_programmatic_config() {
         let mut config = parse(&[
             ("RACER_REQUEST_TIMEOUT_MS", "10"),
@@ -2839,10 +3257,297 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(config.peer_attempt_timeout, Duration::from_secs(6));
-        assert_eq!(config.validate(), Ok(()));
-        config.peer_attempt_timeout = Duration::ZERO;
-        assert_eq!(config.validate(), Err(Error::InvalidConfiguration));
-        config.peer_attempt_timeout = Duration::from_millis(86_400_001);
-        assert_eq!(config.validate(), Err(Error::InvalidConfiguration));
+        config.validate().unwrap();
+        for value in ["0", "86400001"] {
+            assert_eq!(
+                parse(&[("RACER_PEER_ATTEMPT_TIMEOUT_MS", value)])
+                    .err()
+                    .unwrap()
+                    .name,
+                "RACER_PEER_ATTEMPT_TIMEOUT_MS"
+            );
+        }
+        config.reader_stall_timeout = Duration::from_millis(11);
+        assert!(config.validate().is_err());
+    }
+
+    // Embedded cluster control settings (ported from the authority crate's own
+    // environment parser, which this table replaced).
+
+    fn managed_env(extra: &[(&str, &str)]) -> Parsed {
+        let mut values = map(&[
+            ("RACER_NAMESPACE", "racer-system"),
+            ("RACER_POD_NAME", "racer-abc"),
+            ("RACER_POD_UID", "11111111-1111-4111-8111-111111111111"),
+            ("RACER_NODE_NAME", "node-a"),
+            ("RACER_POD_IP", "10.0.0.5"),
+            ("KUBERNETES_SERVICE_HOST", "10.96.0.1"),
+        ]);
+        for (key, value) in extra {
+            values.insert((*key).into(), (*value).into());
+        }
+        Config::from_map(&values)
+    }
+
+    fn control(extra: &[(&str, &str)]) -> racer_authority::Config {
+        managed_env(extra).unwrap().authority.unwrap()
+    }
+
+    #[test]
+    fn authority_is_absent_without_a_namespace() {
+        assert!(parse_managed(&[]).unwrap().authority.is_none());
+        assert!(parse(&[]).unwrap().authority.is_none());
+    }
+
+    #[test]
+    fn authority_defaults() {
+        let config = managed_env(&[]).unwrap();
+        let c = config.authority.as_ref().unwrap();
+        assert_eq!(c.seats, racer_authority::SeatPolicy::Auto);
+        assert_eq!(c.control_listen.port(), 8443);
+        assert_eq!(c.webhook_listen.port(), 9443);
+        assert_eq!(c.api_server, "10.96.0.1:443");
+        assert!(c.object_image.is_none());
+        assert_eq!(c.daemonset, "racer");
+        // One control token serves the dataplane and control seats.
+        assert_eq!(c.control_token, config.service_account_token);
+        assert_eq!(
+            c.control_token,
+            PathBuf::from(MANAGED_SERVICE_ACCOUNT_TOKEN)
+        );
+        // The published peer port is the peer listener's port.
+        assert_eq!(c.peer_port, config.peer_listen.port());
+        let c = control(&[("RACER_PEER_LISTEN", "[10.0.0.5]:8082")]);
+        assert_eq!(c.peer_port, 8082);
+        // Kubernetes may expand absent fields to empty strings.
+        let c = control(&[("RACER_OBJECT_IMAGE", ""), ("RACER_POD_IPS", "")]);
+        assert!(c.object_image.is_none());
+        assert!(c.webhook_alternate.is_none());
+    }
+
+    #[test]
+    fn authority_retained_page_keys() {
+        let c = control(&[]);
+        assert_eq!(
+            c.rotation.retained_page_keys,
+            racer_authority::rules::keyring::DEFAULT_RETAINED_PAGE_KEYS
+        );
+        assert_eq!(c.rotation, racer_authority::Rotation::default());
+        for (value, want) in [("1", 1), ("16", 16)] {
+            let c = control(&[("RACER_RETAINED_PAGE_KEYS", value)]);
+            assert_eq!(c.rotation.retained_page_keys, want);
+        }
+        for bad in ["0", "17", "x"] {
+            assert_eq!(
+                managed_env(&[("RACER_RETAINED_PAGE_KEYS", bad)])
+                    .err()
+                    .unwrap()
+                    .name,
+                "RACER_RETAINED_PAGE_KEYS"
+            );
+        }
+    }
+
+    #[test]
+    fn authority_page_bytes() {
+        assert_eq!(
+            control(&[]).page_size,
+            racer_wire::object::PageSize::DEFAULT
+        );
+        let c = control(&[("RACER_PAGE_BYTES", "16777216")]);
+        assert_eq!(c.page_size.get(), 16 * 1024 * 1024);
+        // The SDKs and disk index assume 16 MiB pages; other sizes are refused.
+        for bad in ["4096", "65536", "1048576", "98304", "33554432", "x"] {
+            assert_eq!(
+                managed_env(&[("RACER_PAGE_BYTES", bad)])
+                    .err()
+                    .unwrap()
+                    .name,
+                "RACER_PAGE_BYTES"
+            );
+        }
+    }
+
+    #[test]
+    fn authority_seats_and_ipv6_api() {
+        let c = control(&[
+            ("RACER_CONTROL_SEATS", "5"),
+            ("KUBERNETES_SERVICE_HOST", "fd00::1"),
+        ]);
+        assert_eq!(c.seats, racer_authority::SeatPolicy::Fixed(5));
+        assert_eq!(c.api_server, "[fd00::1]:443");
+        for bad in ["0", "17", "05", "x"] {
+            assert_eq!(
+                managed_env(&[("RACER_CONTROL_SEATS", bad)])
+                    .err()
+                    .unwrap()
+                    .name,
+                "RACER_CONTROL_SEATS"
+            );
+        }
+    }
+
+    #[test]
+    fn authority_listeners_accept_both_pod_ip_families() {
+        for ip in ["10.244.2.3", "fd00:10:244::3"] {
+            let control_listen = format!("[{ip}]:8443");
+            let webhook = format!("[{ip}]:9443");
+            let c = control(&[
+                ("RACER_POD_IP", ip),
+                ("RACER_CONTROL_LISTEN", &control_listen),
+                ("RACER_WEBHOOK_LISTEN", &webhook),
+            ]);
+            let ip: IpAddr = ip.parse().unwrap();
+            assert_eq!(c.control_listen, SocketAddr::new(ip, 8443));
+            assert_eq!(c.webhook_listen, SocketAddr::new(ip, 9443));
+        }
+    }
+
+    #[test]
+    fn authority_webhook_also_serves_the_other_pod_ip_family() {
+        let webhook = "[10.0.0.5]:9443";
+        let c = |ips: &str, listen: &str| {
+            managed_env(&[("RACER_POD_IPS", ips), ("RACER_WEBHOOK_LISTEN", listen)])
+        };
+        let alt = |ips, listen| c(ips, listen).unwrap().authority.unwrap().webhook_alternate;
+        assert_eq!(
+            alt("10.0.0.5,fd00::5", webhook),
+            Some("fd00::5".parse().unwrap())
+        );
+        // Single stack, absent, or not listening on the Pod IP: none.
+        assert_eq!(alt("10.0.0.5", webhook), None);
+        assert_eq!(alt("10.0.0.5,fd00::5", "127.0.0.1:9443"), None);
+        // Malformed, not led by status.podIP, duplicate, or same family: rejected.
+        for bad in [
+            "10.0.0.5,nope",
+            "10.0.0.6,fd00::5",
+            "fd00::5,10.0.0.5",
+            "10.0.0.5,10.0.0.5",
+            "10.0.0.5,10.0.0.6",
+            "10.0.0.5,fd00::5,fd00::6",
+        ] {
+            assert_eq!(
+                c(bad, webhook).err().unwrap().name,
+                "RACER_POD_IPS",
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn authority_listener_address_validation() {
+        for address in ["127.0.0.1:0", "[127.0.0.1]:0", "[::1]:0", ":0"] {
+            let c = control(&[("RACER_CONTROL_LISTEN", address)]);
+            assert_eq!(c.control_listen.port(), 0);
+        }
+        for bad in [
+            "[10.244.2.3:8443",
+            "10.244.2.3]:8443",
+            "[10.244.2.3]:+8443",
+            "[10.244.2.3]:8443extra",
+            "[10.244.2.3]:65536",
+            "[10.244.2.3]:",
+            "[not-an-ip]:8443",
+            "[]:8443",
+            "fd00:10:244::3:8443",
+        ] {
+            for name in ["RACER_CONTROL_LISTEN", "RACER_WEBHOOK_LISTEN"] {
+                assert_eq!(
+                    managed_env(&[(name, bad)]).err().unwrap().name,
+                    name,
+                    "{name}={bad}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn authority_missing_identity_fails_by_name() {
+        let mut values = map(&[
+            ("RACER_NAMESPACE", "racer-system"),
+            ("RACER_POD_NAME", "racer-abc"),
+            ("RACER_NODE_NAME", "node-a"),
+            ("RACER_POD_IP", "10.0.0.5"),
+            ("KUBERNETES_SERVICE_HOST", "10.96.0.1"),
+        ]);
+        assert_eq!(
+            Config::from_map(&values).err().unwrap().name,
+            "RACER_POD_UID"
+        );
+        values.insert("RACER_POD_UID".into(), "not-a-uid".into());
+        assert_eq!(
+            Config::from_map(&values).err().unwrap().name,
+            "RACER_POD_UID"
+        );
+        assert_eq!(
+            managed_env(&[("RACER_POD_IP", "nope")]).err().unwrap().name,
+            "RACER_POD_IP"
+        );
+        assert_eq!(
+            managed_env(&[("RACER_NAMESPACE", "Upper")])
+                .err()
+                .unwrap()
+                .name,
+            "RACER_NAMESPACE"
+        );
+        assert_eq!(
+            managed_env(&[("KUBERNETES_SERVICE_PORT", "x")])
+                .err()
+                .unwrap()
+                .name,
+            "KUBERNETES_SERVICE_PORT"
+        );
+    }
+
+    #[test]
+    fn origin_settings_come_from_the_table() {
+        let config = parse(&[
+            ("RACER_ORIGIN_TRUST_BUNDLE", "/etc/origin.pem"),
+            ("RACER_AZURE_AUTHORITY_HOST", "https://login.example/"),
+            ("RACER_AZURE_FEDERATED_TOKEN_FILE", "/var/run/azure/token"),
+        ])
+        .unwrap();
+        assert_eq!(
+            config.origin,
+            OriginSettings {
+                trust_bundle: "/etc/origin.pem".into(),
+                azure_authority_host: "https://login.example/".into(),
+                azure_federated_token_file: Some("/var/run/azure/token".into()),
+            }
+        );
+        // Empty selects the default, as Kubernetes may expand absent values.
+        let config = parse(&[
+            ("RACER_ORIGIN_TRUST_BUNDLE", ""),
+            ("RACER_AZURE_AUTHORITY_HOST", ""),
+            ("RACER_AZURE_FEDERATED_TOKEN_FILE", ""),
+        ])
+        .unwrap();
+        assert_eq!(config.origin, OriginSettings::default());
+        for (name, value) in [
+            ("RACER_ORIGIN_TRUST_BUNDLE", "relative.pem"),
+            ("RACER_AZURE_AUTHORITY_HOST", "login.example/"),
+            ("RACER_AZURE_FEDERATED_TOKEN_FILE", "token"),
+        ] {
+            assert_eq!(parse(&[(name, value)]).err().unwrap().name, name);
+        }
+    }
+
+    #[test]
+    fn markdown_and_json_cover_every_variable() {
+        let markdown = spec::markdown(TABLE);
+        let json = spec::json(TABLE, &empty_is_unset);
+        for var in TABLE {
+            assert!(
+                markdown.contains(&format!("| `{}` |", var.name)),
+                "{}",
+                var.name
+            );
+            assert!(
+                json.contains(&format!("\"name\": \"{}\"", var.name)),
+                "{}",
+                var.name
+            );
+        }
+        assert!(!markdown.contains('\u{2014}'));
     }
 }

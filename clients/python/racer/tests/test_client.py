@@ -119,6 +119,18 @@ def test_host_read_passes_memfd(server):
     assert pages == [(0, 4096), (4096, 4096), (8192, 4096), (12288, 512)]
 
 
+def test_host_buffer_is_sealed_against_shrinking():
+    import fcntl
+
+    with racer.HostBuffer(4096) as buf:
+        seals = fcntl.fcntl(buf.fileno(), getattr(fcntl, "F_GET_SEALS", 1034))
+        assert seals & getattr(fcntl, "F_SEAL_SHRINK", 0x0002)
+        with pytest.raises(OSError):
+            os.ftruncate(buf.fileno(), 1)
+        os.pwrite(buf.fileno(), b"x", 0)
+        assert bytes(buf.view[:1]) == b"x"
+
+
 def test_host_read_range(server):
     req = add(server)
     with racer.HostBuffer(5000) as buf:

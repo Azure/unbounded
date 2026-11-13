@@ -467,6 +467,7 @@ func TestFifteenScriptBaselineMapsToIndependentTests(t *testing.T) {
 				},
 			},
 		}
+
 		stages[index] = CertificationStage{
 			Name: name,
 			Test: CertificationTestReference{

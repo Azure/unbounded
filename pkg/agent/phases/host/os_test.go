@@ -9,12 +9,14 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/Azure/unbounded/pkg/agent/isolation"
 )
 
 func TestDetectHostPackageManagerUsesAPT(t *testing.T) {
 	t.Parallel()
 
-	pm, err := detectHostPackageManagerFor(existingPathLookup("apt-get", "tdnf"), false)
+	pm, err := detectHostPackageManager(existingPathLookup("apt-get", "tdnf"), false, isolation.DefaultMode)
 	require.NoError(t, err)
 
 	require.Equal(t, "apt-get", pm.name)
@@ -27,7 +29,7 @@ func TestDetectHostPackageManagerUsesAPT(t *testing.T) {
 func TestDetectHostPackageManagerUsesTdnf(t *testing.T) {
 	t.Parallel()
 
-	pm, err := detectHostPackageManagerFor(existingPathLookup("tdnf"), false)
+	pm, err := detectHostPackageManager(existingPathLookup("tdnf"), false, isolation.DefaultMode)
 	require.NoError(t, err)
 
 	require.Equal(t, "tdnf", pm.name)
@@ -40,7 +42,7 @@ func TestDetectHostPackageManagerUsesTdnf(t *testing.T) {
 func TestDetectHostPackageManagerUsesDnf(t *testing.T) {
 	t.Parallel()
 
-	pm, err := detectHostPackageManagerFor(existingPathLookup("dnf"), false)
+	pm, err := detectHostPackageManager(existingPathLookup("dnf"), false, isolation.DefaultMode)
 	require.NoError(t, err)
 
 	require.Equal(t, "dnf", pm.name)
@@ -53,7 +55,7 @@ func TestDetectHostPackageManagerUsesDnf(t *testing.T) {
 func TestDetectHostPackageManagerRejectsUnsupportedHost(t *testing.T) {
 	t.Parallel()
 
-	_, err := detectHostPackageManagerFor(missingPathLookup, false)
+	_, err := detectHostPackageManager(missingPathLookup, false, isolation.DefaultMode)
 	require.ErrorContains(t, err, "no supported package manager")
 	require.ErrorContains(t, err, "systemd-container (provides systemd-nspawn)")
 }
@@ -85,7 +87,7 @@ func TestDetectHostPackageManagerAcceptsCapabilityOnlyHost(t *testing.T) {
 
 	lookup := existingPathLookup("systemd-nspawn", "curl", "nft", "mountpoint")
 
-	pm, err := detectHostPackageManagerFor(lookup, false)
+	pm, err := detectHostPackageManager(lookup, false, isolation.DefaultMode)
 	require.NoError(t, err)
 	require.Equal(t, "none", pm.name)
 	require.Nil(t, pm.command, "a capability-only host has nothing to install with")
@@ -102,7 +104,7 @@ func TestDetectHostPackageManagerAcceptsCapabilityOnlyHost(t *testing.T) {
 func TestInstallPackagesRefusesCapabilityOnlyHostWithoutTools(t *testing.T) {
 	t.Parallel()
 
-	pm := capabilityManager(missingPathLookup)
+	pm := capabilityManager(missingPathLookup, rpmRequiredPackages)
 	require.Nil(t, pm.command)
 
 	var missing []string
@@ -126,13 +128,13 @@ func TestImageManagedHostValidatesRatherThanInstalls(t *testing.T) {
 	// tdnf present, as on Azure Container Linux, alongside every required tool.
 	lookup := existingPathLookup("tdnf", "systemd-nspawn", "curl", "nft", "mountpoint")
 
-	pm, err := detectHostPackageManagerFor(lookup, true)
+	pm, err := detectHostPackageManager(lookup, true, isolation.DefaultMode)
 	require.NoError(t, err)
 	require.Equal(t, "none", pm.name, "tdnf must not be selected on an image-managed host")
 	require.Nil(t, pm.command)
 
 	// The same lookup on a mutable host selects tdnf and can install.
-	mutable, err := detectHostPackageManagerFor(lookup, false)
+	mutable, err := detectHostPackageManager(lookup, false, isolation.DefaultMode)
 	require.NoError(t, err)
 	require.Equal(t, "tdnf", mutable.name)
 	require.NotNil(t, mutable.command)
@@ -147,7 +149,7 @@ func TestImageManagedHostReportsMissingToolAsPrerequisite(t *testing.T) {
 	// systemd-nspawn absent, everything else present.
 	lookup := existingPathLookup("tdnf", "curl", "nft", "mountpoint")
 
-	_, err := detectHostPackageManagerFor(lookup, true)
+	_, err := detectHostPackageManager(lookup, true, isolation.DefaultMode)
 	require.ErrorContains(t, err, "image-managed")
 	require.ErrorContains(t, err, "systemd-container (provides systemd-nspawn)")
 	require.ErrorContains(t, err, "system extension")

@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -36,7 +37,17 @@ func (c *configureLocalDNS) Do(_ context.Context) error {
 		return nil
 	}
 
-	root := filepath.Join(c.goalState.MachineDir, "etc/unbounded/localdns")
+	root := c.goalState.Root().Path("etc/unbounded/localdns")
+
+	if c.goalState.HostNative() {
+		// CoreDNS runs as a systemd DynamicUser on the host, so it must be able
+		// to traverse to its configuration. The default directory mode of the
+		// file writer (0750, root only) would lock it out.
+		if err := ensureTraversableDirs(c.goalState.Root().Path("etc/unbounded"), root); err != nil {
+			return fmt.Errorf("create LocalDNS config directory: %w", err)
+		}
+	}
+
 	if err := utilio.WriteFile(filepath.Join(root, "Corefile"), c.goalState.LocalDNS.Corefile, 0o644); err != nil {
 		return fmt.Errorf("write LocalDNS Corefile: %w", err)
 	}
@@ -63,7 +74,7 @@ func (c *configureLocalDNS) Do(_ context.Context) error {
 		return fmt.Errorf("render LocalDNS slice: %w", err)
 	}
 
-	if err := utilio.WriteFile(filepath.Join(c.goalState.MachineDir, "etc/systemd/system", goalstates.LocalDNSSliceUnit), slice.Bytes(), 0o644); err != nil {
+	if err := utilio.WriteFile(c.goalState.Root().Path(filepath.Join("etc/systemd/system", goalstates.LocalDNSSliceUnit)), slice.Bytes(), 0o644); err != nil {
 		return fmt.Errorf("write LocalDNS slice: %w", err)
 	}
 
@@ -83,10 +94,18 @@ func (c *configureLocalDNS) Do(_ context.Context) error {
 	resolverLines = append(resolverLines, "nameserver "+c.goalState.LocalDNS.NodeListenerIP.String())
 
 	resolverContent := []byte(strings.Join(resolverLines, "\n") + "\n")
-	for _, resolvPath := range []string{
-		filepath.Join(c.goalState.MachineDir, "etc/resolv.conf"),
-		filepath.Join(c.goalState.MachineDir, strings.TrimPrefix(goalstates.LocalDNSResolvConfPath, "/")),
-	} {
+
+	resolvPaths := []string{
+		c.goalState.Root().Path("etc/resolv.conf"),
+		c.goalState.Root().Path(strings.TrimPrefix(goalstates.LocalDNSResolvConfPath, "/")),
+	}
+	if c.goalState.HostNative() {
+		// The host keeps its own resolver configuration; only kubelet's
+		// dedicated resolver file carries the LocalDNS listener.
+		resolvPaths = resolvPaths[1:]
+	}
+
+	for _, resolvPath := range resolvPaths {
 		if err := utilio.WriteFile(resolvPath, resolverContent, 0o644); err != nil {
 			return fmt.Errorf("write machine resolver %s: %w", resolvPath, err)
 		}
@@ -98,6 +117,10 @@ func (c *configureLocalDNS) Do(_ context.Context) error {
 type setupLocalDNSNetwork struct {
 	log       *slog.Logger
 	goalState *goalstates.NodeStart
+
+	// write and systemctl are the host steps; nil is the real host.
+	write     func(*goalstates.NodeStart) (bool, error)
+	systemctl func(ctx context.Context, args ...string) error
 }
 
 // SetupLocalDNSNetwork reconciles the shared dummy interface and NOTRACK rules.
@@ -112,15 +135,38 @@ func (s *setupLocalDNSNetwork) Do(ctx context.Context) error {
 		return nil
 	}
 
-	if err := WriteLocalDNSNetworkFiles(s.goalState); err != nil {
+	write, systemctl := s.write, s.systemctl
+	if write == nil {
+		write = writeLocalDNSNetworkFiles
+	}
+
+	if systemctl == nil {
+		systemctl = func(ctx context.Context, args ...string) error {
+			return executil.RunCmd(ctx, s.log, executil.Systemctl(), args...)
+		}
+	}
+
+	changed, err := write(s.goalState)
+	if err != nil {
 		return err
 	}
 
-	if err := executil.RunCmd(ctx, s.log, executil.Systemctl(), "daemon-reload"); err != nil {
+	// Restarting the unit restarts every unit that requires it, which is the
+	// node stack: the container's supervising unit, the nspawn machine (through
+	// its drop-in) and the host-native units. Files that did not change need no
+	// restart: the unit runs again whenever a node unit that requires it
+	// starts, which is how a stopped or new node gets the network set up.
+	if !changed {
+		s.log.Debug("LocalDNS network files unchanged; not restarting the network unit")
+
+		return nil
+	}
+
+	if err := systemctl(ctx, "daemon-reload"); err != nil {
 		return fmt.Errorf("reload systemd for LocalDNS: %w", err)
 	}
 
-	if err := executil.RunCmd(ctx, s.log, executil.Systemctl(), "restart", goalstates.LocalDNSNetworkUnit); err != nil {
+	if err := systemctl(ctx, "restart", goalstates.LocalDNSNetworkUnit); err != nil {
 		return fmt.Errorf("start LocalDNS network unit: %w", err)
 	}
 
@@ -132,9 +178,19 @@ func (s *setupLocalDNSNetwork) Do(ctx context.Context) error {
 // reloading systemd or running the unit, which is what moving a host to the
 // host root needs. It does nothing when LocalDNS is disabled.
 func WriteLocalDNSNetworkFiles(goalState *goalstates.NodeStart) error {
+	_, err := writeLocalDNSNetworkFiles(goalState)
+
+	return err
+}
+
+// writeLocalDNSNetworkFiles is WriteLocalDNSNetworkFiles, reporting whether
+// any file differed from what was on disk.
+func writeLocalDNSNetworkFiles(goalState *goalstates.NodeStart) (bool, error) {
 	if !goalState.LocalDNS.Enabled {
-		return nil
+		return false, nil
 	}
+
+	var files changeTracker
 
 	// The unit names the helper, so both are written from one resolution.
 	helper := goalstates.ResolveHostPaths().LocalDNSNetworkHelper
@@ -148,31 +204,37 @@ func WriteLocalDNSNetworkFiles(goalState *goalstates.NodeStart) error {
 
 	var script bytes.Buffer
 	if err := assetsTemplate.ExecuteTemplate(&script, "unbounded-localdns-network.sh", data); err != nil {
-		return fmt.Errorf("render LocalDNS network script: %w", err)
+		return false, fmt.Errorf("render LocalDNS network script: %w", err)
 	}
 
-	if err := utilio.WriteFile(helper, script.Bytes(), 0o755); err != nil {
-		return fmt.Errorf("write LocalDNS network script: %w", err)
+	if err := files.write(helper, script.Bytes(), 0o755); err != nil {
+		return false, fmt.Errorf("write LocalDNS network script: %w", err)
 	}
 
 	var unit bytes.Buffer
 	if err := assetsTemplate.ExecuteTemplate(&unit, "unbounded-localdns-network.service", data); err != nil {
-		return fmt.Errorf("render LocalDNS network unit: %w", err)
+		return false, fmt.Errorf("render LocalDNS network unit: %w", err)
 	}
 
 	unitPath := filepath.Join(goalstates.SystemdSystemDir, goalstates.LocalDNSNetworkUnit)
-	if err := utilio.WriteFile(unitPath, unit.Bytes(), 0o644); err != nil {
-		return fmt.Errorf("write LocalDNS network unit: %w", err)
+	if err := files.write(unitPath, unit.Bytes(), 0o644); err != nil {
+		return false, fmt.Errorf("write LocalDNS network unit: %w", err)
+	}
+
+	if !goalState.NSpawnMachine() {
+		// No nspawn machine to order against; the host-native units and the
+		// container supervising unit order themselves after the network unit.
+		return files.Changed(), nil
 	}
 
 	dropIn := []byte("[Unit]\nRequires=" + goalstates.LocalDNSNetworkUnit + "\nAfter=" + goalstates.LocalDNSNetworkUnit + "\n")
 
 	dropInPath := filepath.Join(goalstates.SystemdSystemDir, "systemd-nspawn@"+goalState.MachineName+".service.d", "10-localdns.conf")
-	if err := utilio.WriteFile(dropInPath, dropIn, 0o644); err != nil {
-		return fmt.Errorf("write LocalDNS nspawn ordering: %w", err)
+	if err := files.write(dropInPath, dropIn, 0o644); err != nil {
+		return false, fmt.Errorf("write LocalDNS nspawn ordering: %w", err)
 	}
 
-	return nil
+	return files.Changed(), nil
 }
 
 type waitLocalDNS struct {
@@ -246,6 +308,23 @@ func localDNSReady(ctx context.Context, client *http.Client, addresses []string)
 
 		if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 			return fmt.Errorf("readiness endpoint for %s returned %s", address, response.Status)
+		}
+	}
+
+	return nil
+}
+
+// ensureTraversableDirs creates each directory, in order, and makes it 0755 so
+// an unprivileged service can traverse it. Only the mode of the named
+// directories changes; their contents keep theirs.
+func ensureTraversableDirs(dirs ...string) error {
+	for _, dir := range dirs {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+
+		if err := os.Chmod(dir, 0o755); err != nil { //nolint:gosec // traversable by the CoreDNS service user, by design
+			return err
 		}
 	}
 

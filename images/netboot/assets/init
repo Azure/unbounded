@@ -152,6 +152,481 @@ partition_number() {
     cat "/sys/class/block/$part/partition" 2>/dev/null || true
 }
 
+# BEGIN local media functions
+# Local media mode: the VirtualMedia ISO boots this installer with
+# unbounded.install_url and a media.cpio that describes the host network.
+# The functions below only read the paths in UB_NET, UB_MEDIA, UB_WORK, and
+# UB_PROC_BOND and run "$UB_IP", so tests can point them at fixtures.
+
+valid_install_url() {
+    case "$1" in
+        *[!a-zA-Z0-9_.:/-]*) return 1 ;;
+        http://?*/bootmedia/*) ;;
+        *) return 1 ;;
+    esac
+    vi_id=${1##*/bootmedia/}
+    vi_host=${1#http://}
+    vi_host=${vi_host%%/*}
+    [ -n "$vi_host" ] || return 1
+    [ "$1" = "http://$vi_host/bootmedia/$vi_id" ] || return 1
+    [ "${#vi_id}" -eq 32 ] || return 1
+    case "$vi_id" in *[!0-9a-f]*) return 1 ;; esac
+    return 0
+}
+
+net_token_ok() {
+    case "$1" in
+        ''|*[!a-zA-Z0-9_.:/,+-]*) return 1 ;;
+    esac
+    return 0
+}
+
+net_uint_ok() {
+    case "$1" in ''|*[!0-9]*) return 1 ;; esac
+    [ "${#1}" -le 9 ]
+}
+
+net_mtu_ok() {
+    [ "$1" = - ] && return 0
+    net_uint_ok "$1" && [ "$1" -ge 68 ] && [ "$1" -le 65535 ]
+}
+
+net_ifname_ok() {
+    case "$1" in
+        ''|.|..|*/*|*:*|*,*) return 1 ;;
+    esac
+    [ "${#1}" -le 15 ]
+}
+
+net_mac_ok() {
+    case "$1" in
+        [0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]) return 0 ;;
+    esac
+    return 1
+}
+
+net_ipv4_ok() {
+    case "$1" in *[!0-9.]*|.*|*.|*..*) return 1 ;; esac
+    ni_ifs=$IFS
+    IFS=.
+    # shellcheck disable=SC2086
+    set -- $1
+    IFS=$ni_ifs
+    [ "$#" -eq 4 ] || return 1
+    for ni_octet in "$@"; do
+        net_uint_ok "$ni_octet" && [ "$ni_octet" -le 255 ] || return 1
+    done
+    return 0
+}
+
+net_cidr_ok() {
+    case "$1" in */*) ;; *) return 1 ;; esac
+    net_ipv4_ok "${1%/*}" || return 1
+    nc_prefix=${1#*/}
+    net_uint_ok "$nc_prefix" && [ "$nc_prefix" -le 32 ]
+}
+
+net_declared() {
+    grep -Fqx -- "$1" "$UB_WORK/names" 2>/dev/null
+}
+
+net_declare() {
+    net_ifname_ok "$1" || { log "invalid interface name $1"; return 1; }
+    if net_declared "$1"; then
+        log "duplicate interface name $1"
+        return 1
+    fi
+    echo "$1" >> "$UB_WORK/names"
+}
+
+# parse_network_file validates the runtime description and splits it into one
+# file per directive under UB_WORK, so the apply step can run in dependency
+# order no matter how the description is ordered.
+parse_network_file() {
+    pn_file=$1
+    [ -f "$pn_file" ] || { log "missing $pn_file"; return 1; }
+    rm -rf "$UB_WORK"
+    mkdir -p "$UB_WORK" || return 1
+    for pn_kind in names ethernet bond vlan address route dns source; do
+        : > "$UB_WORK/$pn_kind" || return 1
+    done
+    pn_lineno=0
+    while IFS= read -r pn_line || [ -n "$pn_line" ]; do
+        pn_lineno=$((pn_lineno + 1))
+        pn_line=${pn_line%%#*}
+        set -f
+        # shellcheck disable=SC2086
+        set -- $pn_line
+        set +f
+        [ "$#" -gt 0 ] || continue
+        for pn_tok in "$@"; do
+            net_token_ok "$pn_tok" || { log "network line $pn_lineno: invalid token"; return 1; }
+        done
+        pn_dir=$1
+        shift
+        case "$pn_dir" in
+            ethernet)
+                [ "$#" -eq 3 ] || { log "network line $pn_lineno: ethernet needs 3 arguments"; return 1; }
+                net_declare "$1" || return 1
+                net_mac_ok "$2" || { log "network line $pn_lineno: invalid MAC $2"; return 1; }
+                if cut -d' ' -f2 "$UB_WORK/ethernet" | grep -Fqx -- "$2"; then
+                    log "network line $pn_lineno: duplicate MAC $2"
+                    return 1
+                fi
+                net_mtu_ok "$3" || { log "network line $pn_lineno: invalid MTU $3"; return 1; }
+                ;;
+            bond)
+                [ "$#" -eq 7 ] || { log "network line $pn_lineno: bond needs 7 arguments"; return 1; }
+                net_declare "$1" || return 1
+                case "$2" in 802.3ad|active-backup|balance-xor) ;; *) log "network line $pn_lineno: unsupported bond mode $2"; return 1 ;; esac
+                net_uint_ok "$3" || { log "network line $pn_lineno: invalid miimon $3"; return 1; }
+                case "$4" in -|layer2|layer2+3|layer3+4|encap2+3|encap3+4) ;; *) log "network line $pn_lineno: invalid hash policy $4"; return 1 ;; esac
+                case "$5" in -|slow|fast) ;; *) log "network line $pn_lineno: invalid LACP rate $5"; return 1 ;; esac
+                net_mtu_ok "$6" || { log "network line $pn_lineno: invalid MTU $6"; return 1; }
+                case "$7" in ,*|*,|*,,*) log "network line $pn_lineno: invalid member list"; return 1 ;; esac
+                ;;
+            vlan)
+                [ "$#" -eq 4 ] || { log "network line $pn_lineno: vlan needs 4 arguments"; return 1; }
+                net_declare "$1" || return 1
+                net_ifname_ok "$2" || { log "network line $pn_lineno: invalid link $2"; return 1; }
+                if ! net_uint_ok "$3" || [ "$3" -lt 1 ] || [ "$3" -gt 4094 ]; then
+                    log "network line $pn_lineno: invalid VLAN ID $3"
+                    return 1
+                fi
+                net_mtu_ok "$4" || { log "network line $pn_lineno: invalid MTU $4"; return 1; }
+                ;;
+            address)
+                [ "$#" -eq 2 ] || { log "network line $pn_lineno: address needs 2 arguments"; return 1; }
+                net_cidr_ok "$2" || { log "network line $pn_lineno: invalid address $2"; return 1; }
+                ;;
+            route)
+                [ "$#" -eq 3 ] || { log "network line $pn_lineno: route needs 3 arguments"; return 1; }
+                [ "$2" = default ] || net_cidr_ok "$2" || { log "network line $pn_lineno: invalid route $2"; return 1; }
+                net_ipv4_ok "$3" || { log "network line $pn_lineno: invalid next hop $3"; return 1; }
+                ;;
+            dns)
+                [ "$#" -eq 1 ] || { log "network line $pn_lineno: dns needs 1 argument"; return 1; }
+                net_ipv4_ok "$1" || { log "network line $pn_lineno: invalid DNS server $1"; return 1; }
+                ;;
+            source)
+                [ "$#" -eq 2 ] || { log "network line $pn_lineno: source needs 2 arguments"; return 1; }
+                [ ! -s "$UB_WORK/source" ] || { log "network line $pn_lineno: duplicate source"; return 1; }
+                net_ipv4_ok "$2" || { log "network line $pn_lineno: invalid source address $2"; return 1; }
+                ;;
+            *)
+                log "network line $pn_lineno: unknown directive"
+                return 1
+                ;;
+        esac
+        echo "$*" >> "$UB_WORK/$pn_dir" || return 1
+    done < "$pn_file"
+    net_check_references
+}
+
+net_check_references() {
+    while read -r cr_name _ _ _ _ _ cr_members; do
+        cr_ifs=$IFS
+        IFS=,
+        for cr_member in $cr_members; do
+            IFS=$cr_ifs
+            if ! cut -d' ' -f1 "$UB_WORK/ethernet" | grep -Fqx -- "$cr_member"; then
+                log "bond $cr_name member $cr_member is not a declared ethernet"
+                return 1
+            fi
+            IFS=,
+        done
+        IFS=$cr_ifs
+    done < "$UB_WORK/bond"
+    cr_dup=$(awk '{ print $7 }' "$UB_WORK/bond" | tr ',' '\n' | sort | uniq -d | head -n 1)
+    if [ -n "$cr_dup" ]; then
+        log "ethernet $cr_dup belongs to more than one bond"
+        return 1
+    fi
+    while read -r cr_name cr_link _; do
+        if ! cut -d' ' -f1 "$UB_WORK/ethernet" "$UB_WORK/bond" | grep -Fqx -- "$cr_link"; then
+            log "vlan $cr_name link $cr_link is not a declared ethernet or bond"
+            return 1
+        fi
+    done < "$UB_WORK/vlan"
+    while read -r cr_name _; do
+        net_declared "$cr_name" || { log "unknown interface $cr_name"; return 1; }
+    done < "$UB_WORK/address"
+    while read -r cr_name _; do
+        net_declared "$cr_name" || { log "unknown interface $cr_name"; return 1; }
+    done < "$UB_WORK/route"
+    [ -s "$UB_WORK/ethernet" ] || { log "network declares no ethernets"; return 1; }
+    [ -s "$UB_WORK/source" ] || { log "network declares no source"; return 1; }
+    read -r cr_name cr_ip < "$UB_WORK/source"
+    if ! cut -d/ -f1 "$UB_WORK/address" | grep -Fqx -- "$cr_name $cr_ip"; then
+        log "source address $cr_ip is not declared on $cr_name"
+        return 1
+    fi
+    return 0
+}
+
+# net_find_mac prints the kernel device whose current MAC is $1. Bonding
+# rewrites member MACs, so every ethernet is resolved before any bond exists.
+net_find_mac() {
+    fm_found=""
+    fm_phys=""
+    for fm_dev in "$UB_NET"/*; do
+        [ -e "$fm_dev/address" ] || continue
+        fm_name=${fm_dev##*/}
+        [ "$fm_name" = lo ] && continue
+        [ -e "$fm_dev/bonding" ] && continue
+        [ -e "$fm_dev/master" ] && continue
+        fm_mac=$(tr '[:upper:]' '[:lower:]' < "$fm_dev/address" 2>/dev/null || true)
+        [ "$fm_mac" = "$1" ] || continue
+        if [ -e "$fm_dev/device" ]; then
+            # Virtual devices can copy a MAC; two physical ones cannot be
+            # told apart.
+            if [ -n "$fm_phys" ]; then
+                log "MAC $1 matches devices $fm_phys and $fm_name" >&2
+                return 2
+            fi
+            fm_phys=$fm_name
+        elif [ -z "$fm_found" ]; then
+            fm_found=$fm_name
+        fi
+    done
+    fm_found=${fm_phys:-$fm_found}
+    [ -n "$fm_found" ] || return 1
+    echo "$fm_found"
+}
+
+net_map_ethernets() {
+    : > "$UB_WORK/map" || return 1
+    while read -r me_name me_mac _; do
+        me_tries=0
+        while :; do
+            me_dev=$(net_find_mac "$me_mac") && break
+            me_rc=$?
+            [ "$me_rc" -eq 2 ] && return 1
+            me_tries=$((me_tries + 1))
+            if [ "$me_tries" -ge "${UB_MAP_TRIES:-30}" ]; then
+                log "no network device has MAC $me_mac for $me_name"
+                return 1
+            fi
+            sleep 1
+        done
+        log "ethernet $me_name is $me_dev ($me_mac)"
+        echo "$me_name $me_dev" >> "$UB_WORK/map" || return 1
+    done < "$UB_WORK/ethernet"
+}
+
+# net_dev prints the kernel device for a declared interface name.
+net_dev() {
+    nd_dev=$(awk -v n="$1" '$1 == n { print $2; exit }' "$UB_WORK/map")
+    echo "${nd_dev:-$1}"
+}
+
+net_mtu() {
+    [ "$2" = - ] && return 0
+    "$UB_IP" link set dev "$1" mtu "$2"
+}
+
+apply_network() {
+    net_map_ethernets || return 1
+    while read -r an_name _ an_mtu; do
+        an_dev=$(net_dev "$an_name")
+        net_mtu "$an_dev" "$an_mtu" || { log "failed to set MTU on $an_dev"; return 1; }
+    done < "$UB_WORK/ethernet"
+    while read -r an_name an_mode an_miimon an_hash an_rate an_mtu an_members; do
+        if [ -e "$UB_NET/$an_name" ]; then
+            log "interface $an_name already exists"
+            return 1
+        fi
+        set -- mode "$an_mode" miimon "$an_miimon"
+        [ "$an_hash" = - ] || set -- "$@" xmit_hash_policy "$an_hash"
+        [ "$an_rate" = - ] || set -- "$@" lacp_rate "$an_rate"
+        log "creating bond $an_name ($an_mode) with $an_members"
+        "$UB_IP" link add name "$an_name" type bond "$@" || { log "failed to create bond $an_name"; return 1; }
+        an_ifs=$IFS
+        IFS=,
+        for an_member in $an_members; do
+            IFS=$an_ifs
+            an_dev=$(net_dev "$an_member")
+            "$UB_IP" link set dev "$an_dev" down || return 1
+            "$UB_IP" link set dev "$an_dev" master "$an_name" || { log "failed to add $an_dev to $an_name"; return 1; }
+            IFS=,
+        done
+        IFS=$an_ifs
+        net_mtu "$an_name" "$an_mtu" || { log "failed to set MTU on $an_name"; return 1; }
+    done < "$UB_WORK/bond"
+    while read -r an_name an_link an_id an_mtu; do
+        if [ -e "$UB_NET/$an_name" ]; then
+            log "interface $an_name already exists"
+            return 1
+        fi
+        an_dev=$(net_dev "$an_link")
+        log "creating VLAN $an_name (ID $an_id on $an_dev)"
+        "$UB_IP" link add link "$an_dev" name "$an_name" type vlan id "$an_id" \
+            || { log "failed to create VLAN $an_name"; return 1; }
+        net_mtu "$an_name" "$an_mtu" || { log "failed to set MTU on $an_name"; return 1; }
+    done < "$UB_WORK/vlan"
+    for an_kind in ethernet bond vlan; do
+        while read -r an_name _; do
+            "$UB_IP" link set dev "$(net_dev "$an_name")" up || { log "failed to bring up $an_name"; return 1; }
+        done < "$UB_WORK/$an_kind"
+    done
+    while read -r an_name an_cidr; do
+        "$UB_IP" addr replace "$an_cidr" dev "$(net_dev "$an_name")" \
+            || { log "failed to add $an_cidr to $an_name"; return 1; }
+    done < "$UB_WORK/address"
+    while read -r an_name an_to an_via; do
+        "$UB_IP" route replace "$an_to" via "$an_via" dev "$(net_dev "$an_name")" \
+            || { log "failed to add route $an_to via $an_via"; return 1; }
+    done < "$UB_WORK/route"
+    if [ -s "$UB_WORK/dns" ]; then
+        sed 's/^/nameserver /' "$UB_WORK/dns" > "$UB_RESOLV" || return 1
+    fi
+    return 0
+}
+
+# net_source_bond prints the bond under the source interface, if any.
+net_source_bond() {
+    sb_name=$1
+    sb_link=$(awk -v n="$sb_name" '$1 == n { print $2; exit }' "$UB_WORK/vlan")
+    [ -z "$sb_link" ] || sb_name=$sb_link
+    awk -v n="$sb_name" '$1 == n { print $1; exit }' "$UB_WORK/bond"
+}
+
+wait_source_link() {
+    read -r ws_name _ < "$UB_WORK/source"
+    ws_dev=$(net_dev "$ws_name")
+    ws_bond=$(net_source_bond "$ws_name")
+    ws_i=0
+    ws_max=${UB_LINK_WAIT:-120}
+    while [ "$ws_i" -lt "$ws_max" ]; do
+        ws_carrier=$(cat "$UB_NET/$ws_dev/carrier" 2>/dev/null || true)
+        ws_state=$(cat "$UB_NET/$ws_dev/operstate" 2>/dev/null || true)
+        if [ "$ws_carrier" = 1 ] && [ "$ws_state" = up ]; then
+            log "source interface $ws_name ($ws_dev) is up"
+            return 0
+        fi
+        if [ $((ws_i % 10)) -eq 0 ]; then
+            log "waiting for $ws_name ($ws_dev) carrier=${ws_carrier:-unknown} state=${ws_state:-unknown}"
+            if [ -n "$ws_bond" ] && [ -r "$UB_PROC_BOND/$ws_bond" ]; then
+                grep -E 'Interface|MII Status|Aggregator ID|Partner Mac|port state|LACP|Number of ports' \
+                    "$UB_PROC_BOND/$ws_bond" 2>/dev/null | while IFS= read -r ws_line; do
+                    log "  $ws_bond: $ws_line"
+                done
+            fi
+        fi
+        ws_i=$((ws_i + 1))
+        sleep 1
+    done
+    log "WARNING: $ws_name ($ws_dev) is not up after ${ws_max}s, trying anyway"
+    return 0
+}
+
+# parse_install reads KEY=VALUE instructions without evaluating them. Unknown
+# keys are ignored; a known key with an invalid value rejects the response.
+parse_install() {
+    INSTALL_IMAGE_URL=""
+    INSTALL_SERVE_URL=""
+    INSTALL_DS_URL=""
+    INSTALL_NODE_NAME=""
+    INSTALL_NODE_NAMESPACE=""
+    INSTALL_APISERVER_URL=""
+    INSTALL_MEDIA_CALLBACK=""
+    INSTALL_DISK=""
+    while IFS= read -r pi_line || [ -n "$pi_line" ]; do
+        [ -n "$pi_line" ] || continue
+        case "$pi_line" in
+            *=*) ;;
+            *) log "install instructions: malformed line"; return 1 ;;
+        esac
+        pi_key=${pi_line%%=*}
+        pi_value=${pi_line#*=}
+        case "$pi_key" in
+            IMAGE_URL|SERVE_URL|DS_URL|NODE_NAME|NODE_NAMESPACE|APISERVER_URL|MEDIA_CALLBACK|DISK) ;;
+            *) continue ;;
+        esac
+        case "$pi_value" in
+            *[!a-zA-Z0-9_.:/@+-]*) log "install instructions: invalid $pi_key"; return 1 ;;
+        esac
+        case "$pi_key" in
+            IMAGE_URL) INSTALL_IMAGE_URL=$pi_value ;;
+            SERVE_URL) INSTALL_SERVE_URL=$pi_value ;;
+            DS_URL) INSTALL_DS_URL=$pi_value ;;
+            NODE_NAME) INSTALL_NODE_NAME=$pi_value ;;
+            NODE_NAMESPACE) INSTALL_NODE_NAMESPACE=$pi_value ;;
+            APISERVER_URL) INSTALL_APISERVER_URL=$pi_value ;;
+            MEDIA_CALLBACK) INSTALL_MEDIA_CALLBACK=$pi_value ;;
+            DISK) INSTALL_DISK=$pi_value ;;
+        esac
+    done < "$1"
+    [ -n "$INSTALL_IMAGE_URL" ] || { log "install instructions: IMAGE_URL missing"; return 1; }
+    if [ "$INSTALL_MEDIA_CALLBACK" != "$2" ]; then
+        log "install instructions: MEDIA_CALLBACK does not match install URL"
+        return 1
+    fi
+    return 0
+}
+
+# fetch_install retries until metalman answers. It returns 0 with the
+# instructions in $2, 3 when metalman refuses the boot (409), and 1 on a
+# permanent failure. Other statuses, including 503 for transient metalman
+# lookup errors, are retried.
+fetch_install() {
+    fi_url="$1/install"
+    fi_out=$2
+    fi_deadline=${UB_FETCH_ATTEMPTS:-60}
+    fi_delay=2
+    fi_i=0
+    while [ "$fi_i" -lt "$fi_deadline" ]; do
+        fi_i=$((fi_i + 1))
+        rm -f "$fi_out"
+        fi_status=$(curl --connect-timeout 5 --max-time 30 --retry 0 --silent \
+            --output "$fi_out" --write-out '%{http_code}' "$fi_url") || fi_status=000
+        case "$fi_status" in
+            200) return 0 ;;
+            409) log "metalman refused this boot (409)"; return 3 ;;
+            400|401|403|404) log "install instructions request failed with $fi_status"; return 1 ;;
+        esac
+        log "install instructions request returned $fi_status (attempt $fi_i/$fi_deadline), retrying in ${fi_delay}s"
+        sleep "$fi_delay"
+        fi_delay=$((fi_delay * 2))
+        [ "$fi_delay" -le 15 ] || fi_delay=15
+    done
+    log "install instructions unavailable after $fi_deadline attempts"
+    return 1
+}
+
+# persist_host_network installs the rendered host network into the mounted
+# root at $1, choosing networkd or netplan like the single-NIC path.
+persist_host_network() {
+    ph_root=$1
+    if [ ! -d "$ph_root/etc/netplan" ] && [ -d "$ph_root/etc/systemd/network" ]; then
+        log "persisting host network configuration for systemd-networkd"
+        rm -f "$ph_root/etc/systemd/network/90-unbounded-dhcp.network" \
+            "$ph_root/etc/systemd/network/10-unbounded-metal.network"
+        ph_found=""
+        for ph_file in "$UB_MEDIA"/networkd/*; do
+            [ -f "$ph_file" ] || continue
+            ph_base=${ph_file##*/}
+            case "$ph_base" in
+                *[!a-zA-Z0-9_.-]*|.*) log "invalid networkd file name $ph_base"; return 1 ;;
+                *.link|*.netdev|*.network) ;;
+                *) log "unexpected networkd file $ph_base"; return 1 ;;
+            esac
+            cp "$ph_file" "$ph_root/etc/systemd/network/$ph_base" || return 1
+            chmod 644 "$ph_root/etc/systemd/network/$ph_base" || return 1
+            ph_found=1
+        done
+        [ -n "$ph_found" ] || { log "media has no networkd files"; return 1; }
+    else
+        log "persisting host network configuration"
+        mkdir -p "$ph_root/etc/netplan" || return 1
+        rm -f "$ph_root/etc/netplan/50-cloud-init.yaml"
+        cp "$UB_MEDIA/netplan.yaml" "$ph_root/etc/netplan/99-unbounded-metal.yaml" || return 1
+        chmod 600 "$ph_root/etc/netplan/99-unbounded-metal.yaml" || return 1
+    fi
+    return 0
+}
+# END local media functions
+
 KVER=$(uname -r)
 for mod in virtio_pci virtio_blk ahci sd_mod nvme xfs ext4; do
     modprobe "$mod" 2>/dev/null || true
@@ -170,140 +645,196 @@ for mod in nls_cp437 nls_ascii nls_utf8 fat vfat efivarfs; do
     modprobe "$mod" 2>/dev/null || true
 done
 
-IMAGE_URL=$(get_param unbounded.image_url) || fatal "unbounded.image_url not set"
-SERVE_URL=$(get_param unbounded.serve_url || true)
-TARGET_DISK=$(get_param unbounded.disk || true)
-BOOT_MAC=$(get_param unbounded.boot_mac || true)
-BOOTIF=$(get_param BOOTIF || true)
-DS_URL=$(get_param unbounded.ds_url || true)
-NODE_NAME=$(get_param unbounded.node_name || true)
-NODE_NAMESPACE=$(get_param unbounded.node_namespace || true)
-APISERVER_URL=$(get_param unbounded.apiserver_url || true)
-DNS_SERVERS=$(get_param unbounded.dns || true)
-VIRTUAL_MEDIA=$(get_param unbounded.virtual_media || true)
-MEDIA_CALLBACK=$(get_param unbounded.media_callback || true)
-if [ "$VIRTUAL_MEDIA" = 1 ]; then
-    case "$MEDIA_CALLBACK" in
-        http://*/bootmedia/*) ;;
-        *) fatal "invalid virtual media callback URL" ;;
+UB_NET=/sys/class/net
+UB_MEDIA=/unbounded/media
+UB_WORK=/tmp/unbounded-net
+UB_PROC_BOND=/proc/net/bonding
+UB_RESOLV=/etc/resolv.conf
+UB_IP=ip
+[ ! -x /unbounded/bin/ip ] || UB_IP=/unbounded/bin/ip
+
+local_media_power_off() {
+    log "powering off"
+    sync
+    poweroff -f 2>/dev/null || halt -f 2>/dev/null || echo o > /proc/sysrq-trigger
+    sleep 30
+    fatal "failed to power off"
+}
+
+local_media_setup() {
+    valid_install_url "$INSTALL_URL" || fatal "invalid unbounded.install_url"
+    log "local media install from $INSTALL_URL"
+    modprobe bonding max_bonds=0 2>/dev/null || true
+    modprobe 8021q 2>/dev/null || true
+    log_interfaces
+    parse_network_file "$UB_MEDIA/network" || fatal "invalid host network description"
+    [ -f "$UB_MEDIA/netplan.yaml" ] || fatal "media has no netplan.yaml"
+    apply_network || fatal "failed to configure host network"
+    log_interfaces
+    wait_source_link || true
+    install_status=0
+    fetch_install "$INSTALL_URL" /tmp/unbounded-install || install_status=$?
+    case "$install_status" in
+        0) ;;
+        3) local_media_power_off ;;
+        *) fatal "failed to fetch install instructions" ;;
     esac
-fi
-BOOT_MAC=$(normalize_mac "$BOOT_MAC")
-if [ -z "$BOOT_MAC" ] && [ -n "$BOOTIF" ]; then
-    BOOT_MAC=$(bootif_to_mac "$BOOTIF")
-fi
+    parse_install /tmp/unbounded-install "$INSTALL_URL" || fatal "invalid install instructions"
+    rm -f /tmp/unbounded-install
+    IMAGE_URL=$INSTALL_IMAGE_URL
+    SERVE_URL=$INSTALL_SERVE_URL
+    TARGET_DISK=$INSTALL_DISK
+    DS_URL=$INSTALL_DS_URL
+    NODE_NAME=$INSTALL_NODE_NAME
+    NODE_NAMESPACE=$INSTALL_NODE_NAMESPACE
+    APISERVER_URL=$INSTALL_APISERVER_URL
+    MEDIA_CALLBACK=$INSTALL_MEDIA_CALLBACK
+    VIRTUAL_MEDIA=1
+    HOST_NETPLAN=$UB_MEDIA/netplan.yaml
+    IP_PARAM=""
+}
 
-log_interfaces
+INSTALL_URL=$(get_param unbounded.install_url || true)
+HOST_NETPLAN=""
+if [ -n "$INSTALL_URL" ]; then
+    local_media_setup
+else
+    IMAGE_URL=$(get_param unbounded.image_url) || fatal "unbounded.image_url not set"
+    SERVE_URL=$(get_param unbounded.serve_url || true)
+    TARGET_DISK=$(get_param unbounded.disk || true)
+    BOOT_MAC=$(get_param unbounded.boot_mac || true)
+    BOOTIF=$(get_param BOOTIF || true)
+    DS_URL=$(get_param unbounded.ds_url || true)
+    NODE_NAME=$(get_param unbounded.node_name || true)
+    NODE_NAMESPACE=$(get_param unbounded.node_namespace || true)
+    APISERVER_URL=$(get_param unbounded.apiserver_url || true)
+    DNS_SERVERS=$(get_param unbounded.dns || true)
+    VIRTUAL_MEDIA=$(get_param unbounded.virtual_media || true)
+    MEDIA_CALLBACK=$(get_param unbounded.media_callback || true)
+    DHCP_HOLD=$(get_param unbounded.dhcp_hold || true)
+    if [ "$VIRTUAL_MEDIA" = 1 ]; then
+        case "$MEDIA_CALLBACK" in
+            http://*/bootmedia/*) ;;
+            *) fatal "invalid virtual media callback URL" ;;
+        esac
+    fi
+    BOOT_MAC=$(normalize_mac "$BOOT_MAC")
+    if [ -z "$BOOT_MAC" ] && [ -n "$BOOTIF" ]; then
+        BOOT_MAC=$(bootif_to_mac "$BOOTIF")
+    fi
 
-log "waiting for network interface"
-IFACE=""
-find_iface_by_mac() {
-    [ -n "$BOOT_MAC" ] || return 1
-    for dev in /sys/class/net/*; do
-        [ -e "$dev" ] || continue
-        name=$(basename "$dev")
-        [ "$name" = "lo" ] && continue
-        mac=$(normalize_mac "$(cat "$dev/address" 2>/dev/null || true)")
-        if [ "$mac" = "$BOOT_MAC" ]; then
+    log_interfaces
+
+    log "waiting for network interface"
+    IFACE=""
+    find_iface_by_mac() {
+        [ -n "$BOOT_MAC" ] || return 1
+        for dev in /sys/class/net/*; do
+            [ -e "$dev" ] || continue
+            name=$(basename "$dev")
+            [ "$name" = "lo" ] && continue
+            mac=$(normalize_mac "$(cat "$dev/address" 2>/dev/null || true)")
+            if [ "$mac" = "$BOOT_MAC" ]; then
+                IFACE="$name"
+                return 0
+            fi
+        done
+        return 1
+    }
+
+    find_first_iface() {
+        for dev in /sys/class/net/*; do
+            [ -e "$dev" ] || continue
+            name=$(basename "$dev")
+            [ "$name" = "lo" ] && continue
             IFACE="$name"
             return 0
-        fi
-    done
-    return 1
-}
-
-find_first_iface() {
-    for dev in /sys/class/net/*; do
-        [ -e "$dev" ] || continue
-        name=$(basename "$dev")
-        [ "$name" = "lo" ] && continue
-        IFACE="$name"
-        return 0
-    done
-    return 1
-}
-
-if [ -n "$BOOT_MAC" ]; then
-    retry 30 1 "find network interface with MAC $BOOT_MAC" find_iface_by_mac \
-        || fatal "no network interface found with MAC $BOOT_MAC"
-fi
-
-if [ -z "$IFACE" ]; then
-    retry 30 1 "find network interface" find_first_iface || fatal "no network interface found"
-    log "WARNING: using first non-loopback network interface $IFACE"
-else
-    log "selected network interface $IFACE for MAC $BOOT_MAC"
-fi
-
-mask2cidr() {
-    local cidr=0 octets=0 suffix=0
-    for octet in $(echo "$1" | tr '.' ' '); do
-        octets=$((octets + 1))
-        [ "$octets" -le 4 ] || return 1
-        if [ "$suffix" -eq 1 ]; then
-            [ "$octet" = 0 ] || return 1
-            continue
-        fi
-        case "$octet" in
-            255) cidr=$((cidr + 8)) ;;
-            254) cidr=$((cidr + 7)); suffix=1 ;;
-            252) cidr=$((cidr + 6)); suffix=1 ;;
-            248) cidr=$((cidr + 5)); suffix=1 ;;
-            240) cidr=$((cidr + 4)); suffix=1 ;;
-            224) cidr=$((cidr + 3)); suffix=1 ;;
-            192) cidr=$((cidr + 2)); suffix=1 ;;
-            128) cidr=$((cidr + 1)); suffix=1 ;;
-            0) suffix=1 ;;
-            *) return 1 ;;
-        esac
-    done
-    [ "$octets" -eq 4 ] || return 1
-    echo "$cidr"
-}
-
-IP_PARAM=$(get_param ip || true)
-if [ -n "$IP_PARAM" ]; then
-    CLIENT_IP=$(echo "$IP_PARAM" | cut -d: -f1)
-    GW=$(echo "$IP_PARAM" | cut -d: -f3)
-    MASK=$(echo "$IP_PARAM" | cut -d: -f4)
-    IFACE_PARAM=$(echo "$IP_PARAM" | cut -d: -f6)
-
-    case "$MASK" in
-        *.*.*.*) PREFIX=$(mask2cidr "$MASK") || fatal "invalid or non-contiguous subnet mask $MASK" ;;
-        *) PREFIX="$MASK" ;;
-    esac
-    case "$PREFIX" in
-        ''|*[!0-9]*) fatal "invalid IPv4 prefix $PREFIX" ;;
-    esac
-    [ "$PREFIX" -le 32 ] || fatal "invalid IPv4 prefix $PREFIX"
-    [ -n "$CLIENT_IP" ] || fatal "static client IP is empty"
-    [ -n "$BOOT_MAC" ] || fatal "unbounded.boot_mac is required for persistent static networking"
-
-    if [ -n "$IFACE_PARAM" ] && [ -e "/sys/class/net/$IFACE_PARAM" ]; then
-        IFACE="$IFACE_PARAM"
-    fi
-
-    log "configuring $IFACE with $CLIENT_IP/$PREFIX"
-    retry 5 2 "link up $IFACE" ip link set "$IFACE" up || fatal "failed to bring up $IFACE"
-    retry 3 1 "set address" ip addr replace "$CLIENT_IP/$PREFIX" dev "$IFACE" \
-        || fatal "failed to configure $CLIENT_IP/$PREFIX on $IFACE"
-    if [ -n "$GW" ]; then
-        retry 3 1 "set default route" ip route replace default via "$GW" dev "$IFACE" \
-            || fatal "failed to configure default route through $GW"
-    fi
-
-    if [ -n "$DNS_SERVERS" ]; then
-        : > /etc/resolv.conf
-        old_ifs=$IFS
-        IFS=,
-        for dns in $DNS_SERVERS; do
-            IFS=$old_ifs
-            [ -n "$dns" ] || fatal "empty DNS server in unbounded.dns"
-            case "$dns" in *[!0-9a-fA-F:.]*) fatal "invalid DNS server $dns" ;; esac
-            echo "nameserver $dns" >> /etc/resolv.conf
-            IFS=,
         done
-        IFS=$old_ifs
+        return 1
+    }
+
+    if [ -n "$BOOT_MAC" ]; then
+        retry 30 1 "find network interface with MAC $BOOT_MAC" find_iface_by_mac \
+            || fatal "no network interface found with MAC $BOOT_MAC"
+    fi
+
+    if [ -z "$IFACE" ]; then
+        retry 30 1 "find network interface" find_first_iface || fatal "no network interface found"
+        log "WARNING: using first non-loopback network interface $IFACE"
+    else
+        log "selected network interface $IFACE for MAC $BOOT_MAC"
+    fi
+
+    mask2cidr() {
+        local cidr=0 octets=0 suffix=0
+        for octet in $(echo "$1" | tr '.' ' '); do
+            octets=$((octets + 1))
+            [ "$octets" -le 4 ] || return 1
+            if [ "$suffix" -eq 1 ]; then
+                [ "$octet" = 0 ] || return 1
+                continue
+            fi
+            case "$octet" in
+                255) cidr=$((cidr + 8)) ;;
+                254) cidr=$((cidr + 7)); suffix=1 ;;
+                252) cidr=$((cidr + 6)); suffix=1 ;;
+                248) cidr=$((cidr + 5)); suffix=1 ;;
+                240) cidr=$((cidr + 4)); suffix=1 ;;
+                224) cidr=$((cidr + 3)); suffix=1 ;;
+                192) cidr=$((cidr + 2)); suffix=1 ;;
+                128) cidr=$((cidr + 1)); suffix=1 ;;
+                0) suffix=1 ;;
+                *) return 1 ;;
+            esac
+        done
+        [ "$octets" -eq 4 ] || return 1
+        echo "$cidr"
+    }
+
+    IP_PARAM=$(get_param ip || true)
+    if [ -n "$IP_PARAM" ]; then
+        CLIENT_IP=$(echo "$IP_PARAM" | cut -d: -f1)
+        GW=$(echo "$IP_PARAM" | cut -d: -f3)
+        MASK=$(echo "$IP_PARAM" | cut -d: -f4)
+        IFACE_PARAM=$(echo "$IP_PARAM" | cut -d: -f6)
+
+        case "$MASK" in
+            *.*.*.*) PREFIX=$(mask2cidr "$MASK") || fatal "invalid or non-contiguous subnet mask $MASK" ;;
+            *) PREFIX="$MASK" ;;
+        esac
+        case "$PREFIX" in
+            ''|*[!0-9]*) fatal "invalid IPv4 prefix $PREFIX" ;;
+        esac
+        [ "$PREFIX" -le 32 ] || fatal "invalid IPv4 prefix $PREFIX"
+        [ -n "$CLIENT_IP" ] || fatal "static client IP is empty"
+        [ -n "$BOOT_MAC" ] || fatal "unbounded.boot_mac is required for persistent static networking"
+
+        if [ -n "$IFACE_PARAM" ] && [ -e "/sys/class/net/$IFACE_PARAM" ]; then
+            IFACE="$IFACE_PARAM"
+        fi
+
+        log "configuring $IFACE with $CLIENT_IP/$PREFIX"
+        retry 5 2 "link up $IFACE" ip link set "$IFACE" up || fatal "failed to bring up $IFACE"
+        retry 3 1 "set address" ip addr replace "$CLIENT_IP/$PREFIX" dev "$IFACE" \
+            || fatal "failed to configure $CLIENT_IP/$PREFIX on $IFACE"
+        if [ -n "$GW" ]; then
+            retry 3 1 "set default route" ip route replace default via "$GW" dev "$IFACE" \
+                || fatal "failed to configure default route through $GW"
+        fi
+
+        if [ -n "$DNS_SERVERS" ]; then
+            : > /etc/resolv.conf
+            old_ifs=$IFS
+            IFS=,
+            for dns in $DNS_SERVERS; do
+                IFS=$old_ifs
+                [ -n "$dns" ] || fatal "empty DNS server in unbounded.dns"
+                case "$dns" in *[!0-9a-fA-F:.]*) fatal "invalid DNS server $dns" ;; esac
+                echo "nameserver $dns" >> /etc/resolv.conf
+                IFS=,
+            done
+            IFS=$old_ifs
+        fi
     fi
 fi
 
@@ -373,15 +904,20 @@ find_root_part() {
     return 1
 }
 
-if [ -n "$DS_URL" ] || [ -n "$IP_PARAM" ]; then
+if [ -n "$DS_URL" ] || [ -n "$IP_PARAM" ] || [ -n "$HOST_NETPLAN" ]; then
     retry 20 2 "find root partition" find_root_part || fatal "no root partition found on $TARGET_DISK"
     retry 5 2 "mount $ROOT_PART" mount "$ROOT_PART" /mnt || fatal "failed to mount $ROOT_PART"
 
-    if [ -n "$IP_PARAM" ] && [ ! -d /mnt/etc/netplan ] && [ -d /mnt/etc/systemd/network ]; then
+    if [ -n "$HOST_NETPLAN" ]; then
+        persist_host_network /mnt || fatal "failed to persist host network configuration"
+    elif [ -n "$IP_PARAM" ] && [ ! -d /mnt/etc/netplan ] && [ -d /mnt/etc/systemd/network ]; then
         # Images without netplan (for example Azure Linux) use
         # systemd-networkd directly. The lower file name sorts before the
         # image's default DHCP file, which is removed so that other NICs do
-        # not add competing default routes.
+        # not add competing default routes. When unbounded.dhcp_hold=1, DHCP
+        # also runs on the provisioning NIC only to hold the site lease for
+        # the static address; routes, DNS, NTP, hostname, and domains from
+        # the lease are ignored.
         log "persisting static network configuration for systemd-networkd"
         rm -f /mnt/etc/systemd/network/90-unbounded-dhcp.network
         {
@@ -389,7 +925,11 @@ if [ -n "$DS_URL" ] || [ -n "$IP_PARAM" ]; then
             echo "MACAddress=${BOOT_MAC}"
             echo ""
             echo "[Network]"
-            echo "DHCP=no"
+            if [ "$DHCP_HOLD" = "1" ]; then
+                echo "DHCP=ipv4"
+            else
+                echo "DHCP=no"
+            fi
             echo "IPv6AcceptRA=no"
             echo "Address=${CLIENT_IP}/${PREFIX}"
             [ -z "$GW" ] || echo "Gateway=${GW}"
@@ -399,9 +939,37 @@ if [ -n "$DS_URL" ] || [ -n "$IP_PARAM" ]; then
                 echo "DNS=${dns}"
             done
             IFS=$old_ifs
+            if [ "$DHCP_HOLD" = "1" ]; then
+                echo ""
+                echo "[DHCPv4]"
+                echo "ClientIdentifier=mac"
+                echo "UseRoutes=no"
+                echo "UseGateway=no"
+                echo "UseDNS=no"
+                echo "UseNTP=no"
+                echo "UseHostname=no"
+                echo "UseDomains=no"
+            fi
         } > /mnt/etc/systemd/network/10-unbounded-metal.network
         chmod 644 /mnt/etc/systemd/network/10-unbounded-metal.network
     elif [ -n "$IP_PARAM" ]; then
+        # When unbounded.dhcp_hold=1, DHCP runs alongside the static address
+        # only to hold the site lease for it, so the DHCP server does not
+        # hand the address to another host. Routes, DNS, NTP, hostname, and
+        # domains from the lease are ignored. The client identifies with the
+        # NIC MAC so site reservations keyed by MAC match.
+        if [ "$DHCP_HOLD" = "1" ]; then
+            DHCP4_CONFIG='      dhcp4: true
+      dhcp-identifier: mac
+      dhcp4-overrides:
+        use-routes: false
+        use-dns: false
+        use-ntp: false
+        use-hostname: false
+        use-domains: false'
+        else
+            DHCP4_CONFIG='      dhcp4: false'
+        fi
         log "persisting static network configuration"
         mkdir -p /mnt/etc/netplan
         rm -f /mnt/etc/netplan/50-cloud-init.yaml
@@ -412,7 +980,7 @@ network:
     provisioning:
       match:
         macaddress: "${BOOT_MAC}"
-      dhcp4: false
+${DHCP4_CONFIG}
       dhcp6: false
       addresses:
         - "${CLIENT_IP}/${PREFIX}"

@@ -1,10 +1,27 @@
-{{- if .BootLease }}
+{{- if .HostNetplan }}
+{{ .HostNetplan }}
+{{- else if .BootLease }}
 version: 2
 ethernets:
   provisioning:
     match:
       macaddress: {{ yamlQuote .BootLease.MAC }}
+{{- if .DHCPHoldLease }}
+    # DHCP runs alongside the static address only to hold the lease for
+    # it, so the site DHCP server does not hand the address to another
+    # host. Routes, DNS, and hostname still come from the static config. The client identifies with the NIC MAC so
+    # site reservations keyed by MAC match.
+    dhcp4: true
+    dhcp-identifier: mac
+    dhcp4-overrides:
+      use-routes: false
+      use-dns: false
+      use-ntp: false
+      use-hostname: false
+      use-domains: false
+{{- else }}
     dhcp4: false
+{{- end }}
     dhcp6: false
     addresses:
       - {{ yamlQuote (printf "%s/%d" .BootLease.IPv4 (subnetPrefix .BootLease.SubnetMask)) }}

@@ -311,6 +311,7 @@ func resolvedStageDependencyGraph(
 	}
 
 	nodes := make(map[string]resolvedStageDependencyNode)
+
 	for phaseIndex := range phases {
 		if len(phases[phaseIndex].Stages) == 0 {
 			return nil, fmt.Errorf("phase %d must contain at least one stage", phaseIndex)
@@ -391,6 +392,7 @@ func resolvedStageDependencyGraph(
 	states := make(map[string]int, len(nodes))
 
 	var visit func(string) error
+
 	visit = func(stage string) error {
 		switch states[stage] {
 		case visiting:
@@ -468,18 +470,21 @@ func DeriveResolvedPlanDeadline(phases []ResolvedPhasePlan) (time.Duration, erro
 	deadlines := make(map[string]time.Duration, len(nodes))
 
 	var derive func(string) (time.Duration, error)
+
 	derive = func(name string) (time.Duration, error) {
 		if deadline, exists := deadlines[name]; exists {
 			return deadline, nil
 		}
 
 		node := nodes[name]
+
 		ownDeadline, err := resolvedStageDeadline(node.stage)
 		if err != nil {
 			return 0, fmt.Errorf("stage %s schedule is invalid: %w", name, err)
 		}
 
 		var dependencyDeadline time.Duration
+
 		for _, dependency := range node.dependencies {
 			candidate, err := derive(dependency)
 			if err != nil {
@@ -501,6 +506,7 @@ func DeriveResolvedPlanDeadline(phases []ResolvedPhasePlan) (time.Duration, erro
 	}
 
 	var required time.Duration
+
 	for name := range nodes {
 		deadline, err := derive(name)
 		if err != nil {

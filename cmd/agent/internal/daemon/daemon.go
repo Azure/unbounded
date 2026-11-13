@@ -84,8 +84,13 @@ type runOptions struct {
 	// NewClient constructs controller-runtime clients. Defaults to client.NewWithWatch.
 	NewClient kubeClientFunc
 
-	// NodeOperator performs host-local nspawn operations. Defaults to nspawnNodeOperator.
+	// NodeOperator performs host-local node operations. Run sets it to the
+	// dispatcher over the mode operators it is given; it is required.
 	NodeOperator nodeOperator
+
+	// Migration is where isolation mode changes live on the host. Nil is the
+	// real host.
+	Migration *migrationEnv
 }
 
 func (o *runOptions) validate() error {
@@ -98,11 +103,15 @@ func (o *runOptions) validate() error {
 	}
 
 	if o.NodeOperator == nil {
-		o.NodeOperator = nspawnNodeOperator{}
+		return errors.New("run options need a node operator")
 	}
 
 	if o.installation == nil {
 		o.installation = installstate.DefaultStore()
+	}
+
+	if o.Migration == nil {
+		o.Migration = &migrationEnv{}
 	}
 
 	if o.DaemonCredentialDir == "" {
@@ -112,17 +121,19 @@ func (o *runOptions) validate() error {
 	return nil
 }
 
-// Run is the main daemon entry point. It discovers the active nspawn
-// machine, builds a Kubernetes client, registers the Machine CR if needed,
-// and blocks until the context is canceled.
-func Run(ctx context.Context, log *slog.Logger) error {
+// Run is the main daemon entry point. It discovers the active node, builds a
+// Kubernetes client, registers the Machine CR if needed, and blocks until the
+// context is canceled. modes is the operator, and backends the backend, of
+// every isolation mode this agent can operate, from the agent's mode
+// composition table.
+func Run(ctx context.Context, log *slog.Logger, modes ModeOperators, backends ModeBackends) error {
 	// After an AgentUpgrade from a release that predates the host root, this is
 	// the first time the new agent runs on the host.
 	if err := MigrateHostRoot(log); err != nil {
 		return err
 	}
 
-	return run(ctx, log, runOptions{})
+	return run(ctx, log, runOptions{NodeOperator: newDispatchOperator(newHostOperator(backends), modes)})
 }
 
 // run is the inner loop. Tests can override external dependencies through opts.
@@ -134,7 +145,7 @@ func run(ctx context.Context, log *slog.Logger, opts runOptions) error {
 
 	// Discovery and migration share ownership. Read once after the launcher
 	// releases its lock rather than mutating a previously discovered snapshot.
-	active, err := discoverAndMigrate(ctx, log, runOpts.installation, runOpts.NodeOperator)
+	active, settled, err := discoverAndMigrate(ctx, log, runOpts.installation, runOpts.NodeOperator, runOpts.Migration)
 	if err != nil {
 		return fmt.Errorf("find active machine: %w", err)
 	}
@@ -169,6 +180,13 @@ func run(ctx context.Context, log *slog.Logger, opts runOptions) error {
 		return fmt.Errorf("register machine: %w", err)
 	}
 
+	// The mode changes discovery resolved are reported now that there is a
+	// client, and their journals cleared once reported.
+	handoff := &handoffState{}
+	if reportStartupIsolationChanges(ctx, log, kubeClient, runOpts, active.Config.MachineName, settled).handedOff {
+		handoff.set()
+	}
+
 	if err := publishAndClearAgentUpgradeSignals(ctx, log, kubeClient); err != nil {
 		log.Warn("failed to publish and clear AgentUpgrade daemon signals", "error", err)
 	}
@@ -185,10 +203,23 @@ func run(ctx context.Context, log *slog.Logger, opts runOptions) error {
 		return ErrRestartRequested
 	}
 
-	return runController(ctx, log, controllerCfg, active.Config.MachineName, active.Config.NodeName, runOpts.NodeOperator, runOpts.installation)
+	return runController(ctx, log, controllerCfg, active.Config.MachineName, active.Config.NodeName, runOpts.NodeOperator, runOpts.installation, handoff)
 }
 
-func discoverAndMigrate(ctx context.Context, log *slog.Logger, store *installstate.Store, operator nodeOperator) (*ActiveMachine, error) {
+// discoverAndMigrate finds the active node under installation ownership and
+// brings its lifecycle files up to date. A mode change a previous daemon left
+// unfinished is resolved first, on the host alone: an interrupted in-place
+// change is resumed or rolled back before anything reads which slot is active,
+// and before the daemon needs credentials or the API server, so a node is
+// never left half changed because the cluster cannot be reached. What it
+// resolved is returned for reporting once the daemon has a client.
+func discoverAndMigrate(
+	ctx context.Context,
+	log *slog.Logger,
+	store *installstate.Store,
+	operator nodeOperator,
+	migration *migrationEnv,
+) (*ActiveMachine, []settledJournal, error) {
 	waitCtx, cancel := context.WithTimeout(ctx, installationLockWaitTimeout)
 	defer cancel()
 
@@ -197,16 +228,18 @@ func discoverAndMigrate(ctx context.Context, log *slog.Logger, store *installsta
 		if err == nil {
 			defer releaseInstallationLock(log, lock)
 
+			settled := migration.resolveJournals(ctx, log)
+
 			active, err := operator.FindActiveMachine(log)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 
 			if err := operator.EnsureLifecycleMigration(ctx, log, active); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 
-			return active, nil
+			return active, settled, nil
 		}
 
 		// An installation owns this host and has not finished. Nothing here can
@@ -215,11 +248,11 @@ func discoverAndMigrate(ctx context.Context, log *slog.Logger, store *installsta
 		if errors.Is(err, installstate.ErrInstallationInProgress) {
 			log.Warn("installation has not finished; daemon is standing down until bootstrap completes", "error", err)
 
-			return nil, ErrDeferred
+			return nil, nil, ErrDeferred
 		}
 
 		if !errors.Is(err, installstate.ErrLockHeld) {
-			return nil, err
+			return nil, nil, err
 		}
 
 		select {
@@ -232,7 +265,7 @@ func discoverAndMigrate(ctx context.Context, log *slog.Logger, store *installsta
 				"waited", installationLockWaitTimeout,
 			)
 
-			return nil, ErrDeferred
+			return nil, nil, ErrDeferred
 		case <-time.After(250 * time.Millisecond):
 		}
 	}
@@ -328,11 +361,25 @@ func registerMachine(ctx context.Context, log *slog.Logger, c client.Client, cfg
 			slog.String("machineID", string(machine.UID)),
 		)
 
-		return reportProvisioningFormat(ctx, c, cfg)
+		return reportMachineObservations(ctx, log, c, cfg)
 	} else if apimeta.IsNoMatchError(err) {
 		return fmt.Errorf("machine CRD is not installed (machina not deployed?): %w", err)
 	} else if !apierrors.IsNotFound(err) {
 		return fmt.Errorf("get Machine CR %q: %w", machineName, err)
+	}
+
+	// An allocation host's Machine is created for its allocation by the
+	// cluster. A Machine the agent created would carry no allocationRef and
+	// could never authorize this host, so the agent leaves it absent and every
+	// node start refuses.
+	if uid, backed := AllocationUID(cfg); backed {
+		log.Warn(
+			"Machine CR not found; an allocation host does not register its Machine",
+			slog.String("machine", machineName),
+			slog.String("allocation_uid", uid),
+		)
+
+		return nil
 	}
 
 	// Machine CR does not exist; create a minimal one.
@@ -341,7 +388,7 @@ func registerMachine(ctx context.Context, log *slog.Logger, c client.Client, cfg
 	machine = buildMachineCR(cfg)
 	if err := c.Create(ctx, &machine); apierrors.IsAlreadyExists(err) {
 		log.Info("Machine CR was created by another client", slog.String("machine", machineName))
-		return reportProvisioningFormat(ctx, c, cfg)
+		return reportMachineObservations(ctx, log, c, cfg)
 	} else if err != nil {
 		return fmt.Errorf("create Machine CR %q: %w", machineName, err)
 	}
@@ -352,7 +399,7 @@ func registerMachine(ctx context.Context, log *slog.Logger, c client.Client, cfg
 		slog.String("machineID", string(machine.UID)),
 	)
 
-	return reportProvisioningFormat(ctx, c, cfg)
+	return reportMachineObservations(ctx, log, c, cfg)
 }
 
 // Report only explicit installation observations, using existing status
@@ -408,6 +455,11 @@ func buildMachineCR(cfg *provision.AgentConfig) v1alpha3.Machine {
 				NodeLabels:         cfg.Kubelet.Labels,
 				RegisterWithTaints: cfg.Kubelet.RegisterWithTaints,
 			},
+			// The agent registers a Machine nobody created. Its spec says the
+			// mode the agent runs, or IsolationDrift would be True from the
+			// first reconcile. This create is the only time the agent writes
+			// spec.isolation; it never writes the spec of an existing Machine.
+			Isolation: v1alpha3.IsolationMode(cfg.Isolation),
 		},
 	}
 

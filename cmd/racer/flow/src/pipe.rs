@@ -5,6 +5,7 @@
 //! recycled while a reader owns the lease. Writes copy into kernel
 //! pipe pages before splice: socket acceptance is not a userspace page reuse fence.
 use crate::{Charge, Error, Policy, Quotas, Result};
+use racer_io::{ring::Descriptor, sim::SimOs};
 use std::{
     cell::RefCell,
     collections::VecDeque,
@@ -14,7 +15,6 @@ use std::{
     rc::{Rc, Weak},
     task::{Poll, Waker},
 };
-use uring_runtime::reactor::descriptor::Descriptor;
 
 /// Maximum kernel buffer capacity per admitted reader. Pipe admission is in pipe
 /// units, so total pipe capacity is bounded by the pipe quota * MAX_PIPE_BYTES.
@@ -34,6 +34,9 @@ pub struct PipePool<P: Policy> {
     waiting: Waiters,
 
     idle: Rc<RefCell<Vec<PipeResources<P>>>>,
+
+    /// Simulated world whose pipes this pool creates, or `None` for host pipes.
+    sim: Option<SimOs>,
 }
 
 /// Shared local queue whose head alone attempts scheduled admission.
@@ -146,7 +149,14 @@ impl<P: Policy> PipePool<P> {
             waiter_limit,
             waiting: Rc::default(),
             idle: Rc::default(),
+            sim: None,
         }
+    }
+
+    /// Test support: create pipes in simulated world `os` instead of the host.
+    pub fn simulated(mut self, os: SimOs) -> Self {
+        self.sim = Some(os);
+        self
     }
 
     /// Borrow the worker-local authority used by pipe and waiter admission.
@@ -256,7 +266,7 @@ impl<P: Policy> PipePool<P> {
         }
         let reservation = self.quotas.reserve(None, self.pipe_class, 1)?;
         reservation.validate(self.pipe_class, 1)?;
-        Ok(self.lease(PipeResources::new(reservation)?))
+        Ok(self.lease(PipeResources::new(reservation, self.sim.as_ref())?))
     }
 
     /// Attach local recycling and notification to uniquely owned resources.
@@ -272,9 +282,8 @@ impl<P: Policy> PipePool<P> {
 
 impl<P: Policy> PipeResources<P> {
     /// Create bounded descriptors, closing them before admission on any failure.
-    fn new(reservation: Charge<P>) -> Result<Self> {
-        #[cfg(feature = "simulation")]
-        if let Some(sim) = uring_runtime::reactor::simulation::Simulation::current() {
+    fn new(reservation: Charge<P>, sim: Option<&SimOs>) -> Result<Self> {
+        if let Some(sim) = sim {
             let (read, write) = sim.pipe(MAX_PIPE_BYTES);
             return Ok(Self {
                 read,
@@ -326,7 +335,6 @@ impl<P: Policy> PipeLease<P> {
     /// pipe size has shrunk. Failure to grow is harmless: use the actual capacity.
     pub fn prepare_transit(&mut self) {
         let pipe = self.resources.as_mut().unwrap();
-        #[cfg(feature = "simulation")]
         if pipe.write.as_sim().is_some() {
             return;
         }
@@ -350,7 +358,6 @@ impl<P: Policy> PipeLease<P> {
     /// The descriptor is validated as a nonblocking stream socket. Callers must
     /// not concurrently clear O_NONBLOCK through a duplicate descriptor.
     pub fn try_splice_from(&mut self, socket: &Descriptor, count: usize) -> io::Result<usize> {
-        #[cfg(feature = "simulation")]
         if socket.as_sim().is_some() || self.resources.as_ref().unwrap().write.as_sim().is_some() {
             return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
         }
@@ -387,7 +394,6 @@ impl<P: Policy> PipeLease<P> {
     /// to the caller; this method never waits or retains a borrowed buffer.
     pub fn try_write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let pipe = self.resources.as_mut().unwrap();
-        #[cfg(feature = "simulation")]
         if let Some(handle) = pipe.write.as_sim() {
             let written = handle.pipe_write(bytes)?;
             pipe.buffered += written;
@@ -410,7 +416,6 @@ impl<P: Policy> PipeLease<P> {
     /// Read currently buffered bytes, or return WouldBlock for an empty pipe.
     pub fn try_read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         let pipe = self.resources.as_mut().unwrap();
-        #[cfg(feature = "simulation")]
         if let Some(handle) = pipe.read.as_sim() {
             let read = handle.pipe_read(bytes)?;
             pipe.buffered -= read;
@@ -435,12 +440,11 @@ impl<P: Policy> PipeLease<P> {
         socket: &Descriptor,
         count: usize,
     ) -> io::Result<usize> {
-        #[cfg(feature = "simulation")]
         {
             let pipe = self.resources.as_mut().unwrap();
             match (pipe.read.as_sim(), socket.as_sim()) {
                 (Some(read), Some(socket)) => {
-                    let sent = read.splice(socket, count.min(pipe.buffered))?;
+                    let sent = read.splice(&socket, count.min(pipe.buffered))?;
                     pipe.buffered -= sent;
                     return Ok(sent);
                 }
@@ -1242,13 +1246,11 @@ mod tests {
     }
 
     /// Simulated descriptors preserve byte counts, pooling, and partial close.
-    #[cfg(feature = "simulation")]
     #[test]
     fn simulation_uses_runtime_descriptors_and_preserves_accounting() {
-        let sim = uring_runtime::reactor::simulation::Simulation::new();
-        let _environment = sim.enter();
+        let sim = SimOs::new();
         let quotas = admission(1);
-        let pool = new_pool(quotas.clone());
+        let pool = new_pool(quotas.clone()).simulated(sim.clone());
         let mut pipe = pool.acquire().unwrap();
         assert!(pipe.resources.as_ref().unwrap().read.as_sim().is_some());
         assert_eq!(pipe.capacity(), MAX_PIPE_BYTES);
@@ -1277,19 +1279,19 @@ mod tests {
     }
 
     /// Mixed descriptor backends reject splice without consuming buffered bytes.
-    #[cfg(feature = "simulation")]
     #[test]
     fn mixed_splice_backends_preserve_buffered_suffix() {
         use std::os::unix::net::UnixStream;
 
-        let pool = new_pool(admission(2));
+        let quotas = admission(2);
+        let pool = new_pool(quotas.clone());
         let mut real_pipe = pool.acquire().unwrap();
         let (real_socket, _peer) = UnixStream::pair().unwrap();
         real_socket.set_nonblocking(true).unwrap();
         let real_socket = Descriptor::from(std::os::fd::OwnedFd::from(real_socket));
-        let sim = uring_runtime::reactor::simulation::Simulation::new();
-        let _environment = sim.enter();
-        let mut simulated_pipe = pool.acquire().unwrap();
+        let sim = SimOs::new();
+        let simulated_pool = new_pool(quotas).simulated(sim.clone());
+        let mut simulated_pipe = simulated_pool.acquire().unwrap();
         let (simulated_socket, _peer) = sim.socket_pair();
 
         for (pipe, socket) in [

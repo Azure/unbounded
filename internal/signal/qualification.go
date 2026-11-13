@@ -678,7 +678,7 @@ func (r *QualificationReconciler) buildQualificationRunIndex(
 		run := &runs.Items[runIndex]
 		liveRunUIDs[run.UID] = struct{}{}
 
-		if !run.Status.Phase.Terminal() || run.Status.Evidence.Identity == nil ||
+		if !run.Status.Phase.Terminal() ||
 			run.Spec.PlanDigest == "" || run.Spec.PlanProvenance == nil {
 			continue
 		}
@@ -691,8 +691,74 @@ func (r *QualificationReconciler) buildQualificationRunIndex(
 			run.Spec.ResolvedPlan,
 			*run.Spec.PlanProvenance,
 		)
-		if err != nil || canonical != run.Spec.PlanDigest ||
-			run.Status.Evidence.Identity.PlanDigest != run.Spec.PlanDigest ||
+		if err != nil || canonical != run.Spec.PlanDigest {
+			continue
+		}
+
+		if run.Status.Evidence.Identity == nil {
+			if run.Status.Phase == signalv1.RunPhaseSucceeded {
+				continue
+			}
+
+			verdict := signalv1.QualificationVerdictInconclusive
+			if run.Status.Phase == signalv1.RunPhaseFailed {
+				verdict = signalv1.QualificationVerdictFail
+			}
+
+			identity := signalv1.QualificationEvidenceIdentity{
+				PlanDigest:   run.Spec.PlanDigest,
+				Participants: make([]signalv1.ParticipantEvidenceIdentity, len(run.Spec.Participants)),
+			}
+
+			starts, startErr := decodeStartFingerprints(run)
+			if startErr != nil {
+				starts = nil
+			}
+
+			for participantIndex := range run.Spec.Participants {
+				start := signalv1.NodeFingerprint{
+					NodeUID: run.Spec.Participants[participantIndex].NodeUID,
+				}
+				if participantIndex < len(starts) {
+					start = starts[participantIndex]
+				}
+
+				identity.Participants[participantIndex] = signalv1.ParticipantEvidenceIdentity{
+					Index:   int32(participantIndex),
+					Role:    resolvedParticipantRole(int32(participantIndex)),
+					Verdict: verdict,
+					Start:   start,
+					End:     start,
+				}
+			}
+
+			record := qualificationRecord{
+				Reference: signalv1.ContributingRunReference{
+					Name:           run.Name,
+					UID:            run.UID,
+					PlanDigest:     run.Spec.PlanDigest,
+					EvidenceURI:    run.Status.Evidence.URI,
+					EvidenceDigest: run.Status.Evidence.Digest,
+				},
+				Profile:        run.Spec.Profile,
+				Suite:          run.Spec.Suite,
+				Identity:       identity,
+				CreditEligible: false,
+				Phase:          run.Status.Phase,
+				StartedAt:      run.CreationTimestamp.Time,
+				FinishedAt:     run.CreationTimestamp.Time,
+			}
+			for participantIndex := range run.Spec.Participants {
+				nodeUID := run.Spec.Participants[participantIndex].NodeUID
+				if nodeUID != "" {
+					index[nodeUID] = append(index[nodeUID], record)
+				}
+			}
+
+			continue
+		}
+
+		if run.Status.Evidence.Identity.PlanDigest != run.Spec.PlanDigest ||
 			!qualificationIdentityProvenanceValid(run.Status.Evidence.Identity) {
 			continue
 		}

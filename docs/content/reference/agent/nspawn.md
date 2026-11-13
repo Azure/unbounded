@@ -124,6 +124,9 @@ automatically bind-mounts them into the container and grants cgroup device
 permissions so that workloads inside the container can run virtual machines:
 
 - `/dev/kvm` for hardware virtualization (for example QEMU/KVM).
+- `/dev/mshv` for the Microsoft Hypervisor when the host boots Linux as its
+  root partition (for example the `host-azurelinux3-mshv` Metalman image).
+  Cloud Hypervisor uses it in place of `/dev/kvm`.
 - `/dev/net/tun` for TAP interfaces used by VM networking.
 - `/dev/vhost-net` for accelerated VirtIO networking.
 
@@ -306,6 +309,7 @@ image imports or every containerd client path.
 | `SYSTEMD_NSPAWN_API_VFS_WRITABLE=network` | Service override | Makes `/proc/sys/net` writable for CNI and kube-proxy. |
 | `DeviceAllow=char-ipvtap rwm` / `DeviceAllow=char-macvtap rwm` | Service override | Allows network tooling inside the node to create and use ipvtap and macvtap devices. |
 | `Bind=/dev/kvm` | nspawn config | KVM device bind-mount (auto-generated when `/dev/kvm` is present). |
+| `Bind=/dev/mshv` / `DeviceAllow=/dev/mshv rwm` | Both | Microsoft Hypervisor device bind-mount (auto-generated when `/dev/mshv` is present). |
 | `Bind=/dev/net/tun` / `DeviceAllow=/dev/net/tun rwm` | Both | Exposes the generic TUN/TAP device when it is present on the host. |
 | `Bind=<block device>` | nspawn config | Storage block device bind-mount (auto-generated for non-virtual `/sys/class/block` entries, including partitions, `dm-*`, and `md*`). |
 | `Bind=/dev/infiniband:/dev/infiniband` | nspawn config | InfiniBand directory bind-mount (auto-generated when `/dev/infiniband` exists). |

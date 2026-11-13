@@ -253,6 +253,28 @@ func TestCertificationTestContract(t *testing.T) {
 		t.Fatalf("metric maxItems = %v, want %d", metrics.MaxItems, MaxTestMetrics)
 	}
 
+	metric := metrics.Items.Schema
+	telemetry := metric.Properties["telemetry"]
+
+	dimensions := telemetry.Properties["dimensions"]
+	if dimensions.MaxItems == nil || *dimensions.MaxItems != MaxMetricDimensions {
+		t.Fatalf("metric dimension maxItems = %v, want %d", dimensions.MaxItems, MaxMetricDimensions)
+	}
+
+	if maximum := telemetry.Properties["seriesLimit"].Maximum; maximum == nil ||
+		*maximum != MaxMetricSeries {
+		t.Fatalf("metric series maximum = %v, want %d", maximum, MaxMetricSeries)
+	}
+
+	if maximum := telemetry.Properties["sampleLimit"].Maximum; maximum == nil ||
+		*maximum != MaxMetricSamples {
+		t.Fatalf("metric sample maximum = %v, want %d", maximum, MaxMetricSamples)
+	}
+
+	if rule := "!has(self.telemetry) || self.type in ['Gauge', 'Ratio', 'Throughput', 'IOPS', 'Bandwidth', 'Latency']"; !hasValidationRule(metric, rule) {
+		t.Fatalf("generated metric definition has no %q validation", rule)
+	}
+
 	roles := spec.Properties["topology"].Properties["roles"]
 	if roles.MaxItems == nil || *roles.MaxItems != MaxTestRoles {
 		t.Fatalf("role maxItems = %v, want %d", roles.MaxItems, MaxTestRoles)
@@ -939,6 +961,21 @@ func TestCertificationRunPlanAndEvidenceContract(t *testing.T) {
 		if _, found := stage.Properties[property]; !found {
 			t.Fatalf("generated stage evidence has no %s", property)
 		}
+	}
+
+	stageParticipants := stage.Properties["participants"]
+	if stageParticipants.MaxItems == nil || *stageParticipants.MaxItems != 16 {
+		t.Fatalf("stage evidence participants maxItems = %v, want 16", stageParticipants.MaxItems)
+	}
+
+	stageAssertions := stage.Properties["assertions"]
+	if stageAssertions.MaxItems == nil || *stageAssertions.MaxItems != 8 {
+		t.Fatalf("stage evidence assertions maxItems = %v, want 8", stageAssertions.MaxItems)
+	}
+
+	invocationEvidence := stage.Properties["invocationEvidence"]
+	if invocationEvidence.MaxItems == nil || *invocationEvidence.MaxItems != 8 {
+		t.Fatalf("stage invocation evidence maxItems = %v, want 8", invocationEvidence.MaxItems)
 	}
 
 	if !hasValidationRule(

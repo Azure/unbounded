@@ -16,6 +16,19 @@ if [ -z "${last_good}" ] || [ ! -x "${last_good}" ]; then
     exit 1
 fi
 
+# A node in an isolation mode other than nspawn records its applied config under
+# that mode's own name. Refuse a last-known-good binary that cannot operate the
+# mode: an agent that predates it would not find the node, or would operate it
+# as an nspawn machine. A binary without the check subcommand fails it.
+for entry in {{ .IsolationModeConfigs }}; do
+    mode="${entry%%=*}"
+    config="${entry#*=}"
+    if [ -e "${config}" ] && ! "${last_good}" {{ .SupportsIsolationCommand }} "${mode}" >/dev/null 2>&1; then
+        echo "last-known-good agent ${last_good} cannot operate isolation mode ${mode}; refusing to roll back to it" >&2
+        exit 1
+    fi
+done
+
 if [ -f "${upgrade_signal}" ]; then
     message="AgentUpgrade daemon failed after switching binary; rolled back to ${last_good}"
     if ! "${last_good}" record-agent-upgrade-failure-signal --message "${message}"; then

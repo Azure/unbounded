@@ -26,7 +26,7 @@ use serde::Serialize;
 
 /// Working-memory budget for one discovery.
 ///
-/// The encoded response is capped at `MAX_BODY_BYTES` (about 64 KiB). The
+/// The encoded response is capped at `HARDWARE_BODY_BYTES` (about 64 KiB). The
 /// in-memory report is charged with per-entry overhead (string and vector
 /// headers, struct sizes) that pretty JSON does not carry, while JSON adds keys
 /// and indentation the structs do not, so the two are of similar magnitude. Four
@@ -34,7 +34,7 @@ use serde::Serialize;
 /// which is dropped before encoding, while still aborting long before a host
 /// whose report could never fit in one response exhausts memory. Defined here so
 /// the diagnostic memory reservation can charge it.
-pub const WORKING_BYTES: usize = 4 * ::telemetry::server::MAX_BODY_BYTES;
+pub const WORKING_BYTES: usize = 4 * crate::telemetry::HARDWARE_BODY_BYTES;
 
 /// Largest sysfs attribute read. Longer files are treated as malformed (`null`).
 pub const MAX_ATTRIBUTE_BYTES: usize = 4096;
@@ -50,13 +50,13 @@ const MIN_GROWTH: usize = 4;
 pub enum Abort {
     /// The working-memory budget was exhausted.
     TooLarge,
-    /// The request was cancelled or timed out.
-    Cancelled,
+    /// The request was canceled or timed out.
+    Canceled,
 }
 
 /// Cancellation flag and remaining working-memory budget for one discovery.
 pub struct Walk {
-    cancelled: Arc<AtomicBool>,
+    canceled: Arc<AtomicBool>,
     remaining: Cell<usize>,
     reads: Cell<usize>,
     #[cfg(test)]
@@ -64,10 +64,10 @@ pub struct Walk {
 }
 
 impl Walk {
-    /// A walk that may retain at most `budget` bytes and stops once `cancelled` is set.
-    pub fn new(cancelled: Arc<AtomicBool>, budget: usize) -> Self {
+    /// A walk that may retain at most `budget` bytes and stops once `canceled` is set.
+    pub fn new(canceled: Arc<AtomicBool>, budget: usize) -> Self {
         Self {
-            cancelled,
+            canceled,
             remaining: Cell::new(budget),
             reads: Cell::new(0),
             #[cfg(test)]
@@ -75,10 +75,10 @@ impl Walk {
         }
     }
 
-    /// Fail if the request has been cancelled.
+    /// Fail if the request has been canceled.
     pub fn check(&self) -> Result<(), Abort> {
-        if self.cancelled.load(Ordering::Acquire) {
-            Err(Abort::Cancelled)
+        if self.canceled.load(Ordering::Acquire) {
+            Err(Abort::Canceled)
         } else {
             Ok(())
         }
@@ -151,7 +151,7 @@ impl Walk {
         self.reads.set(reads);
         #[cfg(test)]
         if self.cancel_after_reads == Some(reads) {
-            self.cancelled.store(true, Ordering::Release);
+            self.canceled.store(true, Ordering::Release);
         }
         Ok(())
     }
@@ -1171,8 +1171,8 @@ mod tests {
         gid[1] = 0x80;
         gid[15] = 0x02;
         inventory
-            .update(vec![racer_control_wire::RailMapping {
-                rail: racer_control_wire::RailId(0),
+            .update(vec![racer_wire::control::RailMapping {
+                rail: racer_wire::control::RailId(0),
                 device: "mlx5_0".into(),
                 port: 1,
                 gid: Some(gid),
@@ -1352,21 +1352,21 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_before_walk_reads_nothing() {
+    fn canceled_before_walk_reads_nothing() {
         let f = Fixture::new();
         block_tree(&f);
         let walk = walk();
-        walk.cancelled.store(true, Ordering::Release);
+        walk.canceled.store(true, Ordering::Release);
         assert_eq!(
             discover(&walk, &f.sys(), &f.dev()).unwrap_err(),
-            Abort::Cancelled
+            Abort::Canceled
         );
         assert_eq!(walk.reads.get(), 0);
         assert_eq!(walk.remaining(), WORKING_BYTES);
     }
 
     #[test]
-    fn cancelled_during_walk_stops_at_the_next_read() {
+    fn canceled_during_walk_stops_at_the_next_read() {
         let f = Fixture::new();
         block_tree(&f);
         rdma_tree(&f);
@@ -1374,7 +1374,7 @@ mod tests {
         walk.cancel_after_reads = Some(5);
         assert_eq!(
             discover(&walk, &f.sys(), &f.dev()).unwrap_err(),
-            Abort::Cancelled
+            Abort::Canceled
         );
         assert_eq!(walk.reads.get(), 5, "no read after cancellation");
     }

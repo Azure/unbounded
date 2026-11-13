@@ -255,17 +255,6 @@ func TestProcessNetworkNamespacePaths(t *testing.T) {
 	})
 }
 
-// TestLinkManager_Integration tests link manager integration.
-func TestLinkManager_Integration(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
-
-	// This would test actual interface creation/deletion
-	// Skip unless running as root
-	t.Skip("integration test requires root privileges")
-}
-
 // TestWireGuardManager_prefixToIPNet tests wire guard manager prefix to ipnet.
 func TestWireGuardManager_prefixToIPNet(t *testing.T) {
 	tests := []struct {

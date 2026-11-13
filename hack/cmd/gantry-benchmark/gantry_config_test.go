@@ -110,8 +110,20 @@ func TestValidateDirectGantryRegistry(t *testing.T) {
     endpoint: https://gantry.azurecr.io
 `)
 
-	if err := validateDirectGantryRegistry(raw, "gantry.azurecr.io"); err != nil {
+	if err := validateDirectGantryRegistry(raw, "gantry.azurecr.io", "https://gantry.azurecr.io"); err != nil {
 		t.Fatalf("validateDirectGantryRegistry: %v", err)
+	}
+
+	streaming := []byte(`upstream_registries:
+  - name: gantry.azurecr.io
+    endpoint: http://127.0.0.1:8578?ns=gantry.azurecr.io
+`)
+	if err := validateDirectGantryRegistry(
+		streaming,
+		"gantry.azurecr.io",
+		"http://127.0.0.1:8578?ns=gantry.azurecr.io",
+	); err != nil {
+		t.Fatalf("validate streaming registry: %v", err)
 	}
 }
 
@@ -121,7 +133,7 @@ func TestValidateDirectGantryRegistryRejectsBaselineEndpoint(t *testing.T) {
     endpoint: https://baseline.azurecr.io
 `)
 
-	if err := validateDirectGantryRegistry(raw, "gantry.azurecr.io"); err == nil || !strings.Contains(err.Error(), "want") {
+	if err := validateDirectGantryRegistry(raw, "gantry.azurecr.io", "https://gantry.azurecr.io"); err == nil || !strings.Contains(err.Error(), "want") {
 		t.Fatalf("error = %v, want endpoint mismatch", err)
 	}
 }

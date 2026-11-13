@@ -1711,6 +1711,7 @@ func validateSourcePhases(phases []signalv1.CertificationPhase) error {
 	}
 
 	dependencies := make(map[string][]string, stageCount)
+
 	for phaseIndex := range phases {
 		for stageIndex := range phases[phaseIndex].Stages {
 			stage := &phases[phaseIndex].Stages[stageIndex]
@@ -1774,6 +1775,7 @@ func validateStageDependencyGraph(
 	states := make(map[string]int, len(stageLocations))
 
 	var visit func(string) error
+
 	visit = func(stage string) error {
 		switch states[stage] {
 		case visiting:
@@ -2449,6 +2451,13 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 			return ctrl.Result{}, nil
 		}
 
+		if run.Status.Evidence.URI == "" && run.Status.Evidence.Identity == nil {
+			result, recovered, err := r.resumeGroupedEvidence(ctx, &run)
+			if err != nil || recovered {
+				return result, err
+			}
+		}
+
 		return r.cleanup(ctx, &run)
 	}
 
@@ -3030,6 +3039,7 @@ func buildResolvedWorkflow(run *signalv1.CertificationRun) (*unstructured.Unstru
 				dependencies := make([]string, len(stage.DependsOn))
 				for index := range stage.DependsOn {
 					dependency := stage.DependsOn[index]
+
 					dependencyTask, exists := taskNames[dependency.Stage]
 					if !exists {
 						return nil, fmt.Errorf(
@@ -3460,6 +3470,55 @@ func (r *RunReconciler) terminalStageSummaries(
 	return stages, runnerImages, verdict, reason
 }
 
+func (r *RunReconciler) completedStageSummaries(
+	ctx context.Context,
+	workflow *unstructured.Unstructured,
+	run *signalv1.CertificationRun,
+) ([]signalv1.StageEvidenceSummary, []string, error) {
+	stages := make([]signalv1.StageEvidenceSummary, 0, resolvedStageCount(*run.Spec.ResolvedPlan))
+	runnerImages := make([]string, 0)
+	seenRunnerImages := map[string]struct{}{}
+
+	for phaseIndex := range run.Spec.ResolvedPlan.Phases {
+		phase := &run.Spec.ResolvedPlan.Phases[phaseIndex]
+		for stageIndex := range phase.Stages {
+			stage := &phase.Stages[stageIndex]
+
+			summary, stageRunnerImages, err := r.readStageResult(
+				ctx,
+				workflow,
+				run,
+				int32(phaseIndex),
+				int32(stageIndex),
+				phase.Role,
+				stage,
+			)
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+
+			if err != nil {
+				return nil, nil, err
+			}
+
+			stages = append(stages, *summary)
+
+			for _, image := range stageRunnerImages {
+				if _, exists := seenRunnerImages[image]; exists {
+					continue
+				}
+
+				seenRunnerImages[image] = struct{}{}
+				runnerImages = append(runnerImages, image)
+			}
+		}
+	}
+
+	sort.Strings(runnerImages)
+
+	return stages, runnerImages, nil
+}
+
 func (r *RunReconciler) readStageResult(
 	ctx context.Context,
 	workflow *unstructured.Unstructured,
@@ -3651,6 +3710,29 @@ func validateStageEvidenceSummary(
 		summary.InconclusiveInvocations+
 		summary.CanceledInvocations {
 		return errors.New("stage invocation outcome counts are inconsistent")
+	}
+
+	if len(summary.Measurements) > signalv1.MaxTestMetrics {
+		return errors.New("stage evidence contains too many typed measurements")
+	}
+
+	metricDefinitions := make(map[string]signalv1.TestMetricDefinition, len(stage.Test.Metrics))
+	for _, definition := range stage.Test.Metrics {
+		metricDefinitions[definition.Name] = definition
+	}
+
+	seenMeasurements := make(map[string]struct{}, len(summary.Measurements))
+	for _, measurement := range summary.Measurements {
+		definition, exists := metricDefinitions[measurement.Name]
+		if !exists || measurement.Unit != definition.Unit {
+			return fmt.Errorf("stage measurement %q does not match the immutable metric schema", measurement.Name)
+		}
+
+		if _, duplicate := seenMeasurements[measurement.Name]; duplicate {
+			return fmt.Errorf("stage measurement %q is repeated", measurement.Name)
+		}
+
+		seenMeasurements[measurement.Name] = struct{}{}
 	}
 
 	seenParticipants := make(map[int32]struct{}, len(summary.Participants))
@@ -3947,7 +4029,8 @@ func (r *RunReconciler) persistedEvidenceFinishedAt(
 		return time.Time{}, errors.New("terminal Run is missing durable evidence")
 	}
 
-	if uri != run.Status.Evidence.URI || digest != run.Status.Evidence.Digest {
+	if (run.Status.Evidence.URI != "" || run.Status.Evidence.Digest != "") &&
+		(uri != run.Status.Evidence.URI || digest != run.Status.Evidence.Digest) {
 		return time.Time{}, errors.New("durable evidence identity does not match Run status")
 	}
 
@@ -4911,12 +4994,20 @@ func (r *RunReconciler) resolvedQualificationEvidenceIdentity(
 			return nil, "Inconclusive", "ParticipantIdentityChanged: node UID changed during execution", nil
 		}
 
+		end := nodeBaseFingerprint(&node)
+		if !sameBaseFingerprint(starts[index], end) {
+			return nil,
+				"Inconclusive",
+				fmt.Sprintf("ParticipantIdentityChanged: participant %d rebooted or changed during execution", index),
+				nil
+		}
+
 		participants[index] = signalv1.ParticipantEvidenceIdentity{
 			Index:   int32(index),
 			Role:    resolvedParticipantRole(int32(index)),
 			Verdict: "",
 			Start:   starts[index],
-			End:     nodeBaseFingerprint(&node),
+			End:     end,
 		}
 	}
 

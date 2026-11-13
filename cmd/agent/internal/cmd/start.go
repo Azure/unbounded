@@ -4,7 +4,10 @@
 package cmd
 
 import (
+	"context"
 	"encoding/base64"
+	"errors"
+	"log/slog"
 	"os"
 	"os/signal"
 	"strings"
@@ -20,6 +23,8 @@ import (
 )
 
 func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
+	var overrides *configOverrides
+
 	cmd := &cobra.Command{
 		Use:   "start",
 		Short: "Bootstrap the host, rootfs, and start the node",
@@ -39,42 +44,48 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 				return err
 			}
 
-			cfg, err := loadConfig(cmdCtx.Logger)
+			cfg, err := loadConfigWith(cmdCtx.Logger, *overrides)
 			if err != nil {
 				return err
 			}
 
-			log := cmdCtx.Logger
-
-			if err := cfg.Validate(); err != nil {
-				return err
-			}
-
-			id, err := bootstrapIdentity(cfg)
-			if err != nil {
-				return err
-			}
-
-			stages := &agentStages{log: log, cfg: cfg}
-
-			outcome, err := bootstrap.New(log, installstate.DefaultStore(), stages, stages).Run(ctx, id)
-			if err != nil {
-				return err
-			}
-
-			if outcome.AlreadyComplete {
-				log.Info("installation already complete")
-			}
-
-			// Safe when bootstrap never reached credential setup: the reporter
-			// reports through a nil-receiver check.
-			stages.reporter.Succeeded(ctx)
-
-			return nil
+			return runStart(ctx, cmdCtx.Logger, cfg)
 		},
 	}
 
+	overrides = addIsolationFlag(cmd)
+
 	return cmd
+}
+
+// runStart bootstraps the host from cfg: the start command, and the bootstrap
+// a reprovision handoff runs after its reset.
+func runStart(ctx context.Context, log *slog.Logger, cfg *provision.UnboundedAgentConfig) error {
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+
+	id, err := bootstrapIdentity(cfg)
+	if err != nil {
+		return err
+	}
+
+	stages := &agentStages{log: log, cfg: cfg}
+
+	outcome, err := bootstrap.New(log, installstate.DefaultStore(), stages, stages).Run(ctx, id)
+	if err != nil {
+		return err
+	}
+
+	if outcome.AlreadyComplete {
+		log.Info("installation already complete")
+	}
+
+	// Safe when bootstrap never reached credential setup: the reporter
+	// reports through a nil-receiver check.
+	stages.reporter.Succeeded(ctx)
+
+	return nil
 }
 
 func syncAttestedKubeletConfig(cfg *provision.AgentConfig, nodeStart *goalstates.NodeStart) {
@@ -95,9 +106,14 @@ func syncAttestedKubeletConfig(cfg *provision.AgentConfig, nodeStart *goalstates
 // a failure there is the most common real one: a rejected or expired token, an
 // unreachable API server, a CA mismatch. Reporting it as a generic failure
 // would tell an operator nothing.
+//
+// A refused allocation launch is matched first, by error rather than by text,
+// so a message that happens to name a task cannot hide it.
 func classifyNodeStartFailure(err error) string {
 	message := err.Error()
 	switch {
+	case errors.Is(err, daemon.ErrAllocationLaunchRefused):
+		return daemon.AllocationLaunchRefusedReason
 	case strings.Contains(message, "start-kubelet"),
 		strings.Contains(message, "wait-for-kubelet-bootstrap"):
 		return "KubeletBootstrapFailed"

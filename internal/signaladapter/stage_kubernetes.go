@@ -11,6 +11,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -22,9 +24,11 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	utilptr "k8s.io/utils/ptr"
+	"sigs.k8s.io/yaml"
 
 	signalv1 "github.com/Azure/unbounded/api/signal/v1alpha1"
 )
@@ -39,6 +43,14 @@ const (
 	stageSharedMemoryVolumeName       = "shared-memory"
 	stageSharedMemoryMountPath        = "/dev/shm"
 	stageSharedMemorySize             = "1Gi"
+	liveTelemetryVolumeName           = "live-telemetry"
+	liveTelemetryMountPath            = "/live-telemetry"
+	liveTelemetryRecordsPath          = liveTelemetryMountPath + "/records.jsonl"
+	liveTelemetryDonePath             = liveTelemetryMountPath + "/done"
+	liveTelemetryPort                 = 9464
+	liveTelemetryVolumeBytes          = 256 * 1024
+	liveTelemetryFinalScrapeGrace     = 10 * time.Second
+	workloadPodSpecPatch              = `{"securityContext":{"fsGroup":65532,"runAsGroup":65532,"runAsNonRoot":true,"runAsUser":65532}}`
 )
 
 type workflowRestartSourceCounts struct {
@@ -50,6 +62,7 @@ type KubernetesStageExecutor struct {
 	Runner                 *Runner
 	Namespace              string
 	WorkflowName           string
+	RunName                string
 	ExecutionName          string
 	WorkflowServiceAccount string
 }
@@ -246,6 +259,20 @@ func (e *KubernetesStageExecutor) executePods(
 
 		participantResults = append(participantResults, participantEnvelope.Participants[0])
 		for _, measurement := range participantEnvelope.Measurements {
+			if existing, found := measurements[measurement.Name]; found &&
+				(existing.Unit != measurement.Unit ||
+					!reflect.DeepEqual(existing.Value, measurement.Value)) {
+				return signalv1.InvocationResultEnvelope{}, errors.Join(
+					fmt.Errorf(
+						"participant measurements conflict for metric %q",
+						measurement.Name,
+					),
+					podCleanupErr,
+					e.cleanupStagePods(ctx, createdPods),
+					errInvocationEvidenceIntegrity,
+				)
+			}
+
 			measurements[measurement.Name] = measurement
 		}
 
@@ -416,6 +443,30 @@ func (e *KubernetesStageExecutor) stagePod(
 		Resources: driverResources(driver),
 	}
 
+	telemetryContract, liveTelemetry, err := metricTelemetryContract(invocation.Stage.Test.Metrics)
+	if err != nil {
+		return nil, err
+	}
+
+	if liveTelemetry {
+		if invocation.Stage.Test.Driver.Type != signalv1.TestDriverTypeScript {
+			return nil, errors.New("live metric telemetry currently requires a Script driver")
+		}
+
+		if !runnerImagePattern.MatchString(invocation.AdapterImage) {
+			return nil, errors.New("live metric telemetry requires the immutable adapter image")
+		}
+
+		container.Env = append(container.Env,
+			corev1.EnvVar{Name: "PROJECT_SIGNAL_METRICS_FILE", Value: liveTelemetryRecordsPath},
+			corev1.EnvVar{Name: "PROJECT_SIGNAL_LIVE_METRICS_DONE", Value: liveTelemetryDonePath},
+			corev1.EnvVar{
+				Name:  "PROJECT_SIGNAL_LIVE_METRICS_PORT",
+				Value: strconv.Itoa(liveTelemetryPort),
+			},
+		)
+	}
+
 	switch driver.Type {
 	case signalv1.TestDriverTypeScript:
 		if driver.Script == nil {
@@ -429,6 +480,7 @@ func (e *KubernetesStageExecutor) stagePod(
 
 		container.Command = []string{"/bin/sh", "-ceu"}
 		container.Args = []string{scriptInvocationWrapper(driver.Script.Language, artifact.Name, artifact.Digest)}
+
 		container.VolumeMounts = []corev1.VolumeMount{{
 			Name:      "script",
 			MountPath: "/scripts",
@@ -437,6 +489,12 @@ func (e *KubernetesStageExecutor) stagePod(
 			Name:      "results",
 			MountPath: "/results",
 		}}
+		if liveTelemetry {
+			container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{
+				Name:      liveTelemetryVolumeName,
+				MountPath: liveTelemetryMountPath,
+			})
+		}
 	case signalv1.TestDriverTypeContainer:
 		if driver.Container == nil {
 			return nil, errors.New("container driver configuration is absent")
@@ -456,6 +514,7 @@ func (e *KubernetesStageExecutor) stagePod(
 			MountPath: stageSharedMemoryMountPath,
 		})
 	}
+
 	applyStageSecurity(&container, invocation.Stage.Test.Security)
 
 	pod := &corev1.Pod{
@@ -480,10 +539,38 @@ func (e *KubernetesStageExecutor) stagePod(
 			NodeName:                     participant.NodeName,
 			HostNetwork:                  invocation.Stage.Test.Security.HostNetwork,
 			AutomountServiceAccountToken: utilptr.To(false),
+			SecurityContext:              workloadPodSecurityContext(),
 			Containers:                   []corev1.Container{container},
 			Volumes:                      stageHostPathVolumes(invocation.Stage.Test.Security.HostPaths),
 		},
 	}
+	if liveTelemetry {
+		pod.Annotations = map[string]string{
+			"prometheus.io/path":   "/metrics",
+			"prometheus.io/port":   strconv.Itoa(liveTelemetryPort),
+			"prometheus.io/scrape": "true",
+		}
+		pod.Spec.Containers = append(
+			pod.Spec.Containers,
+			liveTelemetrySidecar(
+				invocation.AdapterImage,
+				telemetryContract,
+				e.Namespace,
+				e.RunName,
+				invocation,
+				role,
+			),
+		)
+		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
+			Name: liveTelemetryVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{
+					SizeLimit: resource.NewQuantity(liveTelemetryVolumeBytes, resource.BinarySI),
+				},
+			},
+		})
+	}
+
 	if invocation.Stage.Test.Security.IPCLock {
 		sizeLimit := resource.MustParse(stageSharedMemorySize)
 		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
@@ -523,6 +610,74 @@ func (e *KubernetesStageExecutor) stagePod(
 	return pod, nil
 }
 
+func liveTelemetrySidecar(
+	image string,
+	contractJSON string,
+	namespace string,
+	runName string,
+	invocation StageInvocation,
+	role string,
+) corev1.Container {
+	return corev1.Container{
+		Name:    "live-telemetry",
+		Image:   image,
+		Command: []string{"/project-signal-adapter"},
+		Args: []string{
+			"metric-proxy",
+			"--contract-json=" + contractJSON,
+			"--records=" + liveTelemetryRecordsPath,
+			"--done=" + liveTelemetryDonePath,
+			"--port=" + strconv.Itoa(liveTelemetryPort),
+			"--final-grace=" + liveTelemetryFinalScrapeGrace.String(),
+		},
+		Env: []corev1.EnvVar{
+			{Name: "PROJECT_SIGNAL_NAMESPACE", Value: namespace},
+			{Name: "PROJECT_SIGNAL_RUN_NAME", Value: runName},
+			{Name: "PROJECT_SIGNAL_RUN_UID", Value: string(invocation.RunUID)},
+			{Name: "PROJECT_SIGNAL_STAGE_ID", Value: invocation.Stage.Name},
+			{Name: "PROJECT_SIGNAL_INVOCATION_ID", Value: invocation.ID},
+			{Name: "PROJECT_SIGNAL_PARTICIPANT_ROLE", Value: role},
+			{
+				Name: "PROJECT_SIGNAL_NODE_NAME",
+				ValueFrom: &corev1.EnvVarSource{
+					FieldRef: &corev1.ObjectFieldSelector{FieldPath: "spec.nodeName"},
+				},
+			},
+		},
+		Ports: []corev1.ContainerPort{{
+			Name:          "live-metrics",
+			ContainerPort: liveTelemetryPort,
+			Protocol:      corev1.ProtocolTCP,
+		}},
+		Resources: corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("10m"),
+				corev1.ResourceMemory: resource.MustParse("32Mi"),
+			},
+			Limits: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("100m"),
+				corev1.ResourceMemory: resource.MustParse("64Mi"),
+			},
+		},
+		SecurityContext: &corev1.SecurityContext{
+			AllowPrivilegeEscalation: utilptr.To(false),
+			ReadOnlyRootFilesystem:   utilptr.To(true),
+			Privileged:               utilptr.To(false),
+			RunAsUser:                utilptr.To(workloadIdentityID),
+			RunAsGroup:               utilptr.To(workloadIdentityID),
+			RunAsNonRoot:             utilptr.To(true),
+			Capabilities: &corev1.Capabilities{
+				Drop: []corev1.Capability{"ALL"},
+			},
+		},
+		VolumeMounts: []corev1.VolumeMount{{
+			Name:      liveTelemetryVolumeName,
+			MountPath: liveTelemetryMountPath,
+			ReadOnly:  true,
+		}},
+	}
+}
+
 func invocationArtifact(
 	invocation StageInvocation,
 	name string,
@@ -537,7 +692,7 @@ func invocationArtifact(
 }
 
 func artifactMaterializer(image string, artifact signalv1.TestArtifact) corev1.Container {
-	return corev1.Container{
+	container := corev1.Container{
 		Name:    "materialize-script",
 		Image:   image,
 		Command: []string{"/bin/sh", "-ceu"},
@@ -557,6 +712,9 @@ chmod 0555 "/scripts/$PROJECT_SIGNAL_ARTIFACT_NAME"`},
 			MountPath: "/scripts",
 		}},
 	}
+	applyWorkloadIdentity(&container)
+
+	return container
 }
 
 func stageHostPathVolumes(paths []signalv1.WorkloadHostPath) []corev1.Volume {
@@ -647,6 +805,7 @@ func (e *KubernetesStageExecutor) executeWorkflowTemplate(
 	}
 
 	var workflowArtifact *signalv1.TestArtifact
+
 	if driver.Artifact != "" {
 		artifact, err := invocationArtifact(invocation, driver.Artifact)
 		if err != nil {
@@ -690,6 +849,34 @@ func (e *KubernetesStageExecutor) executeWorkflowTemplate(
 	if err := validateWorkflowServiceAccount(templateSpec, e.WorkflowServiceAccount); err != nil {
 		return signalv1.InvocationResultEnvelope{}, err
 	}
+
+	tolerations, err := e.participantTolerations(ctx, invocation.Participants)
+	if err != nil {
+		return signalv1.InvocationResultEnvelope{}, err
+	}
+
+	if err := applyWorkflowRuntimeIdentity(templateSpec, workflowRuntimeIdentityOptions{
+		AllowRoot:   invocation.Stage.Test.Security.AllowRoot,
+		Tolerations: tolerations,
+	}); err != nil {
+		return signalv1.InvocationResultEnvelope{}, err
+	}
+
+	podSpecPatch := []byte(workloadPodSpecPatch)
+	if len(tolerations) > 0 {
+		podSpecPatch, err = json.Marshal(struct {
+			SecurityContext *corev1.PodSecurityContext `json:"securityContext"`
+			Tolerations     []corev1.Toleration        `json:"tolerations"`
+		}{
+			SecurityContext: workloadPodSecurityContext(),
+			Tolerations:     tolerations,
+		})
+		if err != nil {
+			return signalv1.InvocationResultEnvelope{}, fmt.Errorf("encode WorkflowTemplate Pod spec patch: %w", err)
+		}
+	}
+
+	templateSpec["podSpecPatch"] = string(podSpecPatch)
 
 	claims := workflowPersistentVolumeClaims(templateSpec)
 
@@ -739,6 +926,7 @@ func (e *KubernetesStageExecutor) executeWorkflowTemplate(
 	}
 
 	templateSpec["activeDeadlineSeconds"] = int64(invocation.Stage.Schedule.InvocationTimeout.Seconds())
+
 	adapterParameters := []any{
 		map[string]any{"name": "invocation-id", "value": invocation.ID},
 		map[string]any{"name": "run-uid", "value": string(invocation.RunUID)},
@@ -1292,7 +1480,20 @@ func collectPersistentVolumeClaims(value any, claims map[string]struct{}) {
 			}
 		}
 
-		for _, child := range typed {
+		for key, child := range typed {
+			if key == "resource" {
+				if resourceTemplate, ok := child.(map[string]any); ok {
+					if manifest, ok := resourceTemplate["manifest"].(string); ok {
+						resource := map[string]any{}
+						if yaml.Unmarshal([]byte(manifest), &resource) == nil {
+							collectPersistentVolumeClaims(resource, claims)
+						}
+					}
+				}
+
+				continue
+			}
+
 			collectPersistentVolumeClaims(child, claims)
 		}
 	case []any:
@@ -1429,6 +1630,25 @@ func validateWorkflowServiceAccountFields(value any, allowed string) error {
 				}
 			case "templateRef", "workflowTemplateRef":
 				return fmt.Errorf("approved WorkflowTemplate cannot use external reference %q", key)
+			case "resource":
+				resourceTemplate, ok := child.(map[string]any)
+				if !ok {
+					return errors.New("WorkflowTemplate resource must be an object")
+				}
+
+				manifest, ok := resourceTemplate["manifest"].(string)
+				if !ok {
+					return errors.New("WorkflowTemplate resource manifest must be a string")
+				}
+
+				resource := map[string]any{}
+				if err := yaml.Unmarshal([]byte(manifest), &resource); err != nil {
+					return fmt.Errorf("decode WorkflowTemplate resource manifest: %w", err)
+				}
+
+				if err := validateWorkflowServiceAccountFields(resource, allowed); err != nil {
+					return err
+				}
 			case "metadata":
 				metadata, ok := child.(map[string]any)
 				if !ok {
@@ -1458,6 +1678,324 @@ func validateWorkflowServiceAccountFields(value any, allowed string) error {
 	}
 
 	return nil
+}
+
+type workflowRuntimeIdentityOptions struct {
+	AllowRoot   bool
+	Tolerations []corev1.Toleration
+}
+
+func applyWorkflowRuntimeIdentity(value any, runtimeOptions ...workflowRuntimeIdentityOptions) error {
+	options := workflowRuntimeIdentityOptions{}
+	if len(runtimeOptions) > 0 {
+		options = runtimeOptions[0]
+	}
+
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, child := range typed {
+			switch key {
+			case "container", "script":
+				container, ok := child.(map[string]any)
+				if !ok {
+					return fmt.Errorf("WorkflowTemplate %s must be an object", key)
+				}
+
+				if err := applyUnstructuredContainerIdentity(container, options.AllowRoot); err != nil {
+					return err
+				}
+			case "containers", "initContainers", "sidecars", "ephemeralContainers":
+				containers, ok := child.([]any)
+				if !ok {
+					return fmt.Errorf("WorkflowTemplate %s must be a list", key)
+				}
+
+				for index, item := range containers {
+					container, ok := item.(map[string]any)
+					if !ok {
+						return fmt.Errorf("WorkflowTemplate %s[%d] must be an object", key, index)
+					}
+
+					if err := applyUnstructuredContainerIdentity(container, options.AllowRoot); err != nil {
+						return err
+					}
+				}
+			case "resource":
+				resourceTemplate, ok := child.(map[string]any)
+				if !ok {
+					return errors.New("WorkflowTemplate resource must be an object")
+				}
+
+				if err := applyWorkflowResourceRuntimeIdentity(resourceTemplate, options); err != nil {
+					return err
+				}
+			}
+
+			if err := applyWorkflowRuntimeIdentity(child, options); err != nil {
+				return err
+			}
+		}
+	case []any:
+		for _, child := range typed {
+			if err := applyWorkflowRuntimeIdentity(child, options); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func applyWorkflowResourceRuntimeIdentity(
+	resourceTemplate map[string]any,
+	options workflowRuntimeIdentityOptions,
+) error {
+	manifest, ok := resourceTemplate["manifest"].(string)
+	if !ok {
+		return errors.New("WorkflowTemplate resource manifest must be a string")
+	}
+
+	resource := map[string]any{}
+	if err := yaml.Unmarshal([]byte(manifest), &resource); err != nil {
+		return fmt.Errorf("decode WorkflowTemplate resource manifest: %w", err)
+	}
+
+	kind, ok := resource["kind"].(string)
+	if !ok || kind == "" {
+		return errors.New("WorkflowTemplate resource kind must be a non-empty string")
+	}
+
+	switch kind {
+	case "Pod":
+		if err := applyNestedPodSpecIdentity(resource, options, "spec"); err != nil {
+			return err
+		}
+	case "Job", "Deployment", "DaemonSet", "StatefulSet", "ReplicaSet":
+		if err := applyNestedPodSpecIdentity(resource, options, "spec", "template", "spec"); err != nil {
+			return err
+		}
+	case "CronJob":
+		if err := applyNestedPodSpecIdentity(
+			resource,
+			options,
+			"spec",
+			"jobTemplate",
+			"spec",
+			"template",
+			"spec",
+		); err != nil {
+			return err
+		}
+	case "MPIJob":
+		replicas, found, err := unstructured.NestedMap(resource, "spec", "mpiReplicaSpecs")
+		if err != nil || !found {
+			return errors.New("WorkflowTemplate MPIJob resource has no replica specifications")
+		}
+
+		for role, replica := range replicas {
+			replicaSpec, ok := replica.(map[string]any)
+			if !ok {
+				return fmt.Errorf("WorkflowTemplate MPIJob replica %q must be an object", role)
+			}
+
+			if err := applyNestedPodSpecIdentity(replicaSpec, options, "template", "spec"); err != nil {
+				return fmt.Errorf("apply WorkflowTemplate MPIJob replica %q identity: %w", role, err)
+			}
+		}
+
+		if err := unstructured.SetNestedMap(resource, replicas, "spec", "mpiReplicaSpecs"); err != nil {
+			return fmt.Errorf("write WorkflowTemplate MPIJob replica identities: %w", err)
+		}
+	case "ConfigMap", "Secret", "Service", "PersistentVolumeClaim":
+	default:
+		return fmt.Errorf(
+			"WorkflowTemplate resource kind %q is not approved for fixed runtime identity enforcement",
+			kind,
+		)
+	}
+
+	content, err := json.Marshal(resource)
+	if err != nil {
+		return fmt.Errorf("encode WorkflowTemplate resource manifest: %w", err)
+	}
+
+	resourceTemplate["manifest"] = string(content)
+
+	return nil
+}
+
+func applyNestedPodSpecIdentity(
+	resource map[string]any,
+	options workflowRuntimeIdentityOptions,
+	fields ...string,
+) error {
+	spec, found, err := unstructured.NestedMap(resource, fields...)
+	if err != nil || !found {
+		return fmt.Errorf("WorkflowTemplate resource has no Pod spec at %q", strings.Join(fields, "."))
+	}
+
+	if err := applyUnstructuredPodSpecIdentity(spec, options); err != nil {
+		return err
+	}
+
+	if err := unstructured.SetNestedMap(resource, spec, fields...); err != nil {
+		return fmt.Errorf("write WorkflowTemplate resource Pod spec: %w", err)
+	}
+
+	return nil
+}
+
+func applyUnstructuredPodSpecIdentity(
+	spec map[string]any,
+	options workflowRuntimeIdentityOptions,
+) error {
+	securityContext := map[string]any{}
+
+	if value, found := spec["securityContext"]; found {
+		typed, ok := value.(map[string]any)
+		if !ok {
+			return errors.New("WorkflowTemplate Pod securityContext must be an object")
+		}
+
+		securityContext = typed
+	}
+
+	if securityContext == nil {
+		securityContext = map[string]any{}
+	}
+
+	securityContext["runAsUser"] = workloadIdentityID
+	securityContext["runAsGroup"] = workloadIdentityID
+	securityContext["runAsNonRoot"] = true
+	securityContext["fsGroup"] = workloadIdentityID
+	spec["securityContext"] = securityContext
+
+	if len(options.Tolerations) > 0 {
+		converted := make([]any, 0, len(options.Tolerations))
+		for index := range options.Tolerations {
+			value, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&options.Tolerations[index])
+			if err != nil {
+				return fmt.Errorf("convert participant toleration: %w", err)
+			}
+
+			converted = append(converted, value)
+		}
+
+		spec["tolerations"] = converted
+	}
+
+	for _, field := range []string{"initContainers", "containers", "ephemeralContainers"} {
+		value, found := spec[field]
+		if !found {
+			continue
+		}
+
+		containers, ok := value.([]any)
+		if !ok {
+			return fmt.Errorf("WorkflowTemplate Pod %s must be a list", field)
+		}
+
+		for _, item := range containers {
+			container, ok := item.(map[string]any)
+			if !ok {
+				return fmt.Errorf("WorkflowTemplate Pod %s entry must be an object", field)
+			}
+
+			if err := applyUnstructuredContainerIdentity(container, options.AllowRoot); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func applyUnstructuredContainerIdentity(container map[string]any, allowRoot ...bool) error {
+	securityContext := map[string]any{}
+
+	if value, found := container["securityContext"]; found {
+		typed, ok := value.(map[string]any)
+		if !ok {
+			return errors.New("WorkflowTemplate container securityContext must be an object")
+		}
+
+		securityContext = typed
+	}
+
+	if securityContext == nil {
+		securityContext = map[string]any{}
+	}
+
+	if len(allowRoot) > 0 && allowRoot[0] && securityContext["runAsUser"] == int64(0) {
+		if securityContext["runAsGroup"] != int64(0) ||
+			securityContext["runAsNonRoot"] != false {
+			return errors.New("WorkflowTemplate root container must set runAsGroup 0 and runAsNonRoot false")
+		}
+
+		container["securityContext"] = securityContext
+
+		return nil
+	}
+
+	securityContext["runAsUser"] = workloadIdentityID
+	securityContext["runAsGroup"] = workloadIdentityID
+	securityContext["runAsNonRoot"] = true
+	container["securityContext"] = securityContext
+
+	return nil
+}
+
+func (e *KubernetesStageExecutor) participantTolerations(
+	ctx context.Context,
+	participants []signalv1.Participant,
+) ([]corev1.Toleration, error) {
+	byIdentity := map[string]corev1.Toleration{}
+
+	for _, participant := range participants {
+		node, err := e.Runner.Kubernetes.CoreV1().Nodes().
+			Get(ctx, participant.NodeName, metav1.GetOptions{})
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+
+			return nil, fmt.Errorf("get participant node %s tolerations: %w", participant.NodeName, err)
+		}
+
+		if node.UID != participant.NodeUID {
+			return nil, fmt.Errorf("participant node %s identity changed", participant.NodeName)
+		}
+
+		for _, taint := range node.Spec.Taints {
+			if taint.Effect != corev1.TaintEffectNoSchedule &&
+				taint.Effect != corev1.TaintEffectNoExecute {
+				continue
+			}
+
+			toleration := corev1.Toleration{
+				Key:      taint.Key,
+				Operator: corev1.TolerationOpEqual,
+				Value:    taint.Value,
+				Effect:   taint.Effect,
+			}
+			identity := toleration.Key + "\x00" + toleration.Value + "\x00" + string(toleration.Effect)
+			byIdentity[identity] = toleration
+		}
+	}
+
+	identities := make([]string, 0, len(byIdentity))
+	for identity := range byIdentity {
+		identities = append(identities, identity)
+	}
+
+	sort.Strings(identities)
+
+	tolerations := make([]corev1.Toleration, 0, len(identities))
+	for _, identity := range identities {
+		tolerations = append(tolerations, byIdentity[identity])
+	}
+
+	return tolerations, nil
 }
 
 func validateWorkflowTemplateIdentity(
@@ -1637,7 +2175,7 @@ func convertLegacyInvocationResult(
 		return signalv1.InvocationResultEnvelope{}, errors.New("legacy result conversion supports one participant")
 	}
 
-	measurements, err := legacyMeasurements(legacy.Measurements)
+	measurements, err := legacyMeasurements(legacy.Measurements, invocation.Stage.Test.Metrics)
 	if err != nil {
 		return signalv1.InvocationResultEnvelope{}, err
 	}
@@ -1717,10 +2255,18 @@ func convertLegacyInvocationResult(
 	}, nil
 }
 
-func legacyMeasurements(content string) ([]signalv1.MetricMeasurement, error) {
+func legacyMeasurements(
+	content string,
+	definitions []signalv1.TestMetricDefinition,
+) ([]signalv1.MetricMeasurement, error) {
 	var values map[string]any
 	if err := json.Unmarshal([]byte(content), &values); err != nil {
 		return nil, fmt.Errorf("decode legacy measurements: %w", err)
+	}
+
+	declared := make(map[string]signalv1.TestMetricDefinition, len(definitions))
+	for _, definition := range definitions {
+		declared[definition.Name] = definition
 	}
 
 	result := make([]signalv1.MetricMeasurement, 0, len(values))
@@ -1732,17 +2278,88 @@ func legacyMeasurements(content string) ([]signalv1.MetricMeasurement, error) {
 			continue
 		}
 
+		definition, exists := declared[name]
 		typed, ok := legacyTypedValue(value)
+		unit := ""
+
+		if exists {
+			typed, ok = legacyTypedMetricValue(value, definition.Type)
+			unit = definition.Unit
+		}
+
 		if !ok {
 			continue
 		}
 
-		result = append(result, signalv1.MetricMeasurement{Name: name, Value: typed})
+		result = append(result, signalv1.MetricMeasurement{
+			Name:  name,
+			Value: typed,
+			Unit:  unit,
+		})
 	}
 
 	sortMeasurements(result)
 
 	return result, nil
+}
+
+func legacyTypedMetricValue(
+	value any,
+	metricType signalv1.MetricValueType,
+) (signalv1.TypedValue, bool) {
+	switch metricType {
+	case signalv1.MetricValueTypeBoolean:
+		typed, ok := value.(bool)
+		if !ok {
+			return signalv1.TypedValue{}, false
+		}
+
+		return signalv1.TypedValue{
+			Type:         signalv1.TypedValueTypeBoolean,
+			BooleanValue: &typed,
+		}, true
+	case signalv1.MetricValueTypeStatus:
+		typed, ok := value.(string)
+		if !ok {
+			return signalv1.TypedValue{}, false
+		}
+
+		return signalv1.TypedValue{
+			Type:        signalv1.TypedValueTypeString,
+			StringValue: &typed,
+		}, true
+	case signalv1.MetricValueTypeCount:
+		number, ok := value.(float64)
+		if !ok || number != float64(int64(number)) {
+			return signalv1.TypedValue{}, false
+		}
+
+		integer := int64(number)
+
+		return signalv1.TypedValue{
+			Type:         signalv1.TypedValueTypeInteger,
+			IntegerValue: &integer,
+		}, true
+	case signalv1.MetricValueTypeGauge,
+		signalv1.MetricValueTypeRatio,
+		signalv1.MetricValueTypeThroughput,
+		signalv1.MetricValueTypeIOPS,
+		signalv1.MetricValueTypeBandwidth,
+		signalv1.MetricValueTypeLatency:
+		number, ok := value.(float64)
+		if !ok || math.IsNaN(number) || math.IsInf(number, 0) {
+			return signalv1.TypedValue{}, false
+		}
+
+		decimal := strconv.FormatFloat(number, 'f', -1, 64)
+
+		return signalv1.TypedValue{
+			Type:         signalv1.TypedValueTypeDecimal,
+			DecimalValue: &decimal,
+		}, true
+	default:
+		return legacyTypedValue(value)
+	}
 }
 
 func legacyTypedValue(value any) (signalv1.TypedValue, bool) {
@@ -1837,6 +2454,9 @@ set +e
 results_dir="${PROJECT_SIGNAL_RESULTS_DIR:-/results}"
 mkdir -p "$results_dir"
 rm -f "$results_dir/verdict" "$results_dir/reason" "$results_dir/measurements.json"
+if [ -n "${PROJECT_SIGNAL_LIVE_METRICS_DONE:-}" ]; then
+  trap ': > "$PROJECT_SIGNAL_LIVE_METRICS_DONE" || true' EXIT
+fi
 script=/scripts/%s
 want=%s
 got=$(sha256sum "$script" | awk '{print $1}')
@@ -1847,6 +2467,56 @@ if [ "sha256:$got" != "$want" ]; then
 else
   %s "$script"
   status=$?
+fi
+
+if [ -n "${PROJECT_SIGNAL_LIVE_METRICS_DONE:-}" ]; then
+  : > "$PROJECT_SIGNAL_LIVE_METRICS_DONE"
+  if ! python3 - "$results_dir/measurements.json" <<'PY_METRICS'
+import json
+import os
+import pathlib
+import sys
+import time
+import urllib.error
+import urllib.request
+
+measurements_path = pathlib.Path(sys.argv[1])
+measurements = {}
+if measurements_path.exists():
+    measurements = json.loads(measurements_path.read_text(encoding="utf-8"))
+    if not isinstance(measurements, dict):
+        raise SystemExit("measurements must be an object")
+final = None
+for _ in range(30):
+    try:
+        port = os.environ["PROJECT_SIGNAL_LIVE_METRICS_PORT"]
+        with urllib.request.urlopen("http://127.0.0.1:" + port + "/final", timeout=2) as response:
+            final = json.load(response)
+            break
+    except urllib.error.HTTPError as error:
+        if error.code == 202:
+            time.sleep(1)
+            continue
+        raise SystemExit("metric contract violation") from error
+    except OSError:
+        time.sleep(1)
+if final is None:
+    raise SystemExit("metric telemetry timeout")
+if not isinstance(final, dict):
+    raise SystemExit("final metric telemetry must be an object")
+if set(measurements) & set(final):
+    raise SystemExit("trusted metric telemetry collides with workload measurements")
+measurements.update(final)
+measurements_path.write_text(
+    json.dumps(measurements, sort_keys=True, separators=(",", ":")),
+    encoding="utf-8",
+)
+PY_METRICS
+  then
+    printf 'Inconclusive' > "$results_dir/verdict"
+    printf 'MetricContractViolation' > "$results_dir/reason"
+    status=2
+  fi
 fi
 
 if [ -f "$results_dir/verdict" ] || [ -f "$results_dir/reason" ] || [ -f "$results_dir/measurements.json" ]; then

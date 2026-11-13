@@ -10,6 +10,12 @@
 # Scenario definitions are shared with CI in e2e.py. E2E_SUITE selects a focused
 # suite; the default runs lifecycle followed by configuration scenarios.
 #
+# ISOLATION_MODE (nspawn, none or container) selects where the node stack runs
+# and is passed to the bootstrap as --isolation, together with
+# --experimental-container-isolation. Unset keeps the default nspawn behavior.
+# Use E2E_SUITE=isolation-operations with any mode, and
+# E2E_SUITE=isolation-matrix with it unset. See README.md.
+#
 # Prerequisites (Fedora):
 #   sudo dnf install -y qemu-system-x86 qemu-img genisoimage iptables docker-ce docker-ce-cli containerd.io
 #   sudo systemctl enable --now docker
@@ -60,6 +66,15 @@ export VM_IP="${VM_IP:-${VM_SUBNET}.10}"
 export AGENT_MACHINE_NAME="${AGENT_MACHINE_NAME:-agent-e2e}"
 export AGENT_DEBUG="${AGENT_DEBUG:-}"
 export KIND_EXPERIMENTAL_PROVIDER="${KIND_EXPERIMENTAL_PROVIDER:-docker}"
+
+# Every kubectl, kind and e2e.py call uses the Kind cluster's own kubeconfig,
+# never the user's default one: its current-context can change under a running
+# suite (another shell, another session) and send the suite's bootstrap tokens
+# and Machines to a real cluster. kind writes the cluster's context here, and
+# e2e.py rewrites the same file from `kind get kubeconfig` and checks it.
+KIND_CONTEXT="kind-${KIND_CLUSTER_NAME}"
+export KUBECONFIG="${E2E_KUBECONFIG:-${REPO_ROOT}/tmp/e2e-kind/${KIND_CLUSTER_NAME}.kubeconfig}"
+mkdir -p "$(dirname "${KUBECONFIG}")"
 
 python3 -m unittest discover -s "${REPO_ROOT}/hack/agent/e2e-kind" -p 'test_*.py'
 
@@ -143,7 +158,7 @@ cleanup() {
     info "Running cleanup..."
     cleanup_forwarding "${BRIDGE}"
     python3 "$E2E" "${E2E_ARGS[@]}" cleanup 2>/dev/null || true
-    kind delete cluster --name "${KIND_CLUSTER_NAME}" 2>/dev/null || true
+    kind delete cluster --name "${KIND_CLUSTER_NAME}" --kubeconfig "${KUBECONFIG}" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -181,14 +196,28 @@ info "All preflight checks passed"
 # ---------------------------------------------------------------------------
 if kind get clusters 2>/dev/null | grep -qx "${KIND_CLUSTER_NAME}"; then
     info "Kind cluster '${KIND_CLUSTER_NAME}' already exists, reusing"
+    if [[ -z "${E2E_KUBECONFIG:-}" ]]; then
+        kind get kubeconfig --name "${KIND_CLUSTER_NAME}" > "${KUBECONFIG}.tmp"
+        chmod 0600 "${KUBECONFIG}.tmp"
+        mv "${KUBECONFIG}.tmp" "${KUBECONFIG}"
+    fi
 else
     info "Creating Kind cluster '${KIND_CLUSTER_NAME}'..."
     # Wait for the node to be Ready, as CI's kind-action does. The bridge is
     # attached and kindnet patched next; doing that before kindnet has written
     # its CNI config can leave the node without one, and setup then times out
     # waiting for controllers that cannot be scheduled.
-    kind create cluster --name "${KIND_CLUSTER_NAME}" --wait 2m
+    kind create cluster --name "${KIND_CLUSTER_NAME}" --kubeconfig "${KUBECONFIG}" --wait 2m
 fi
+
+# Refuse to touch a cluster that is not this Kind cluster.
+contexts="$(kubectl config get-contexts -o name 2>/dev/null || true)"
+current="$(kubectl config current-context 2>/dev/null || true)"
+if [[ "${contexts}" != "${KIND_CONTEXT}" || "${current}" != "${KIND_CONTEXT}" ]]; then
+    error "kubeconfig ${KUBECONFIG} must hold only context ${KIND_CONTEXT} and use it; it holds [${contexts//$'\n'/ }], current '${current}'"
+    exit 1
+fi
+info "Using kubeconfig ${KUBECONFIG} (context ${KIND_CONTEXT})"
 
 # ---------------------------------------------------------------------------
 # Kind networking for VM
@@ -210,8 +239,8 @@ setup_forwarding "${BRIDGE}"
 # of the hostname (which is unresolvable from the VM).
 info "Patching kindnet DaemonSet..."
 PATCH="{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"kindnet-cni\",\"env\":[{\"name\":\"CONTROL_PLANE_ENDPOINT\",\"value\":\"${KIND_IP}:6443\"}]}]}}}}"
-kubectl -n kube-system patch daemonset kindnet --type=strategic -p "${PATCH}"
-kubectl -n kube-system rollout status daemonset/kindnet --timeout=60s
+kubectl --context "${KIND_CONTEXT}" -n kube-system patch daemonset kindnet --type=strategic -p "${PATCH}"
+kubectl --context "${KIND_CONTEXT}" -n kube-system rollout status daemonset/kindnet --timeout=60s
 
 # ---------------------------------------------------------------------------
 # QEMU VM

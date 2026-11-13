@@ -80,6 +80,7 @@ func TestValidateTestArtifacts(t *testing.T) {
 		oversized := spec
 		oversized.Driver = *spec.Driver.DeepCopy()
 		oversized.Artifacts = nil
+
 		for index := 0; index < 4; index++ {
 			content := strings.Repeat(string(rune('a'+index)), MaxTestArtifactBytes)
 			sum := sha256.Sum256([]byte(content))
@@ -89,6 +90,7 @@ func TestValidateTestArtifacts(t *testing.T) {
 				Digest:  "sha256:" + hex.EncodeToString(sum[:]),
 			})
 		}
+
 		oversized.Driver.Script.Artifact = oversized.Artifacts[0].Name
 
 		if err := ValidateTestArtifacts(oversized); err == nil {

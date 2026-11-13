@@ -24,10 +24,11 @@ def main():
 
     def seal(plaintext):
         length = len(plaintext)
-        aad = (b"racer/page/aead/v1\0" + struct.pack(">I", 1)
+        aad = (b"racer/page/aead/v2\0" + struct.pack(">I", 1)
                + struct.pack(">I", len(cache)) + cache
                + bytes([3]) * 32 + struct.pack(">I", 4) + b'"v1"'
-               + struct.pack(">Q", 7) + bytes([1]) * 16 + nonce
+               + struct.pack(">Q", 7) + struct.pack(">I", 16 << 20)
+               + bytes([1]) * 16 + nonce
                + struct.pack(">II", length, length + 16))
         output = ctypes.create_string_buffer(length + 16)
         output_length = ctypes.c_ulonglong()

@@ -31,6 +31,10 @@ const (
 // +kubebuilder:printcolumn:name="Phase",type="string",JSONPath=".status.phase"
 // +kubebuilder:printcolumn:name="K8s Version",type="string",JSONPath=".spec.kubernetes.version"
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
+// The allocationRef and fenced transition rules sit on the root, not on spec,
+// because a rule on the spec node is skipped when an update drops the whole spec.
+// +kubebuilder:validation:XValidation:rule="(has(self.spec) && has(self.spec.allocationRef)) == (has(oldSelf.spec) && has(oldSelf.spec.allocationRef)) && (!has(self.spec) || !has(self.spec.allocationRef) || self.spec.allocationRef == oldSelf.spec.allocationRef)",message="allocationRef is immutable",fieldPath=".spec.allocationRef"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.spec) || !has(oldSelf.spec.fenced) || !oldSelf.spec.fenced || (has(self.spec) && has(self.spec.fenced) && self.spec.fenced)",message="fenced cannot be unset",fieldPath=".spec.fenced"
 
 // Machine represents a machine that can be managed by machina.
 type Machine struct {
@@ -90,6 +94,13 @@ const (
 	// configuration is assigned.
 	MachineConditionConfigurationPending = "ConfigurationPending"
 
+	// MachineConditionIsolationDrift is True when spec.isolation differs
+	// from the mode the agent reports as applied (status.isolation).
+	// Nothing moves on drift: the node changes mode at its next repave.
+	// False when they match or when spec.isolation is empty (no
+	// declaration), absent when the applied mode has not been reported.
+	MachineConditionIsolationDrift = "IsolationDrift"
+
 	// MachineConditionRepavePending indicates that the Machine's desired
 	// configuration version has not yet been applied to the running Node.
 	// For OnDelete updates this remains True until the operator deletes
@@ -107,11 +118,24 @@ const (
 	// object to record which MachineConfigurationVersion was used to
 	// bootstrap the machine.
 	AnnotationConfigurationVersion = "unbounded-cloud.io/machine-configuration-version"
+
+	// AnnotationAllowReprovision on a Machine, set to "true", allows the
+	// agent to change the isolation mode by resetting the host and
+	// bootstrapping it again (IsolationChangeReprovision). It is separate
+	// from spec.isolation so that declaring a mode never wipes a host by
+	// itself. Without it, a change that needs a reprovision is refused and
+	// reported in status.isolationChange with reason
+	// IsolationChangeReasonReprovisionNotAllowed; the repave goes ahead in
+	// the mode the node already runs.
+	AnnotationAllowReprovision = "unbounded-cloud.io/allow-reprovision"
 )
 
 // MachineSpec defines the desired state of a Machine.
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.provider) || (has(self.provider) && self.provider == oldSelf.provider)",message="provider is immutable once set"
 // +kubebuilder:validation:XValidation:rule="!has(self.host) || (!has(self.host.netboot) && !has(self.host.azure) && !has(self.host.external)) || (!has(self.pxe) && !has(self.provider) && !has(self.providerID))",message="host ownership cannot be combined with legacy pxe, provider, or providerID fields"
+// +kubebuilder:validation:XValidation:rule="!has(self.fenced) || !self.fenced || has(self.allocationRef)",message="fenced requires allocationRef"
+// +kubebuilder:validation:XValidation:rule="!has(self.pxe) || !has(self.pxe.network) || !has(self.pxe.network.bonds) || self.pxe.network.bonds.all(b, b.interfaces.all(i, self.pxe.network.ethernets.exists(e, e.name == i)))",message="bond interfaces must reference declared ethernets",fieldPath=".pxe.network.bonds"
+// +kubebuilder:validation:XValidation:rule="!has(self.pxe) || !has(self.pxe.network) || !has(self.pxe.network.vlans) || self.pxe.network.vlans.all(v, self.pxe.network.ethernets.exists(e, e.name == v.link) || (has(self.pxe.network.bonds) && self.pxe.network.bonds.exists(b, b.name == v.link)))",message="vlan link must reference a declared ethernet or bond",fieldPath=".pxe.network.vlans"
 type MachineSpec struct {
 	// SSH contains the SSH connection and credential details for the
 	// machine.
@@ -130,6 +154,18 @@ type MachineSpec struct {
 	// Agent contains settings for the unbounded node agent.
 	// +optional
 	Agent *AgentSpec `json:"agent,omitempty"`
+
+	// Isolation declares where the node stack (containerd, kubelet, CNI and
+	// CoreDNS) runs on the host. Empty means no declaration: a new host is
+	// provisioned in nspawn, and a repave leaves a running node in the mode it
+	// already uses. Setting it does not move a running node: the node changes
+	// to this mode at its next repave, which the agent performs when the Node
+	// is deleted. The enum lists only the modes this release can run.
+	// container is experimental: machina provisions it, and the agent runs
+	// it, only when explicitly enabled (see the isolation reference docs).
+	// +kubebuilder:validation:Enum="";nspawn;none;container
+	// +optional
+	Isolation IsolationMode `json:"isolation,omitempty"`
 
 	// Provider identifies the legacy external control provider for this machine.
 	// New callers should use Host.External.Provider or Host.Azure.
@@ -160,6 +196,16 @@ type MachineSpec struct {
 	// controller.
 	// +optional
 	ConfigurationRef *MachineConfigurationRef `json:"configurationRef,omitempty"`
+
+	// AllocationRef identifies the MachineAllocation this Machine was
+	// created for. It can be set only when the Machine is created.
+	// +optional
+	AllocationRef *UIDReference `json:"allocationRef,omitempty"`
+
+	// Fenced forbids the agent from starting this Machine's node again. It
+	// can only change from false to true, and requires AllocationRef.
+	// +optional
+	Fenced bool `json:"fenced,omitempty"`
 }
 
 // ProviderMachineReference identifies a cluster-scoped provider-owned Machine
@@ -187,6 +233,8 @@ type ProviderMachineReference struct {
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.netboot) || has(self.netboot)",message="netboot host ownership is immutable once set"
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.azure) || has(self.azure)",message="azure host ownership is immutable once set"
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.external) || has(self.external)",message="external host ownership is immutable once set"
+// +kubebuilder:validation:XValidation:rule="!has(self.netboot) || !has(self.netboot.network) || !has(self.netboot.network.bonds) || self.netboot.network.bonds.all(b, b.interfaces.all(i, self.netboot.network.ethernets.exists(e, e.name == i)))",message="bond interfaces must reference declared ethernets",fieldPath=".netboot.network.bonds"
+// +kubebuilder:validation:XValidation:rule="!has(self.netboot) || !has(self.netboot.network) || !has(self.netboot.network.vlans) || self.netboot.network.vlans.all(v, self.netboot.network.ethernets.exists(e, e.name == v.link) || (has(self.netboot.network.bonds) && self.netboot.network.bonds.exists(b, b.name == v.link)))",message="vlan link must reference a declared ethernet or bond",fieldPath=".netboot.network.vlans"
 type HostSpec struct {
 	// Image is an opaque provider-interpreted image identifier. If omitted,
 	// HostReplace preserves the host's current image.
@@ -368,6 +416,16 @@ type DHCPLease struct {
 	// DNS is a list of DNS server addresses.
 	// +optional
 	DNS []string `json:"dns,omitempty"`
+
+	// HoldLease, when true, makes the installed host also run a DHCPv4
+	// client on this lease's NIC so the site DHCP server keeps the lease
+	// for IPv4 and does not reassign it to another host. The static
+	// address, gateway, and DNS remain authoritative; routes, DNS, NTP,
+	// hostname, and domains from DHCP are ignored. The site DHCP server
+	// should reserve IPv4 for MAC. Leave unset where there is no DHCP
+	// server.
+	// +optional
+	HoldLease bool `json:"holdLease,omitempty"`
 }
 
 // RedfishSpec defines Redfish BMC connection details.
@@ -394,6 +452,9 @@ type RedfishSpec struct {
 
 // PXESpec defines PXE boot configuration for a Machine.
 // +kubebuilder:validation:XValidation:rule="!has(self.bootProtocol) || self.bootProtocol != 'VirtualMedia' || has(self.redfish)",message="VirtualMedia requires redfish"
+// +kubebuilder:validation:XValidation:rule="!has(self.network) || (has(self.bootProtocol) && self.bootProtocol == 'VirtualMedia')",message="network requires bootProtocol VirtualMedia"
+// +kubebuilder:validation:XValidation:rule="!has(self.network) || (has(self.dhcpLeases) && size(self.dhcpLeases) > 0)",message="network requires a dhcpLeases entry for the provisioning address"
+// +kubebuilder:validation:XValidation:rule="!has(self.network) || !has(self.dhcpLeases) || size(self.dhcpLeases) == 0 || !has(self.dhcpLeases[0].holdLease) || !self.dhcpLeases[0].holdLease",message="network does not support dhcpLeases[0].holdLease",fieldPath=".dhcpLeases"
 type PXESpec struct {
 	// Image is an OCI image reference containing the machine disk image.
 	// The image must contain /disk/disk.img.gz.
@@ -461,6 +522,185 @@ type PXESpec struct {
 	// machines.
 	// +optional
 	CloudInit *CloudInitSpec `json:"cloudInit,omitempty"`
+
+	// Network declares the host's static network topology: physical
+	// ethernets identified by MAC address, bonds, and VLANs. The installer
+	// brings it up before fetching install instructions and persists it as
+	// netplan or systemd-networkd configuration on the installed host.
+	// It requires the VirtualMedia boot protocol: metalman then boots the
+	// installer from the bootstrap ISO without network access, so links that
+	// only pass traffic once LACP negotiates (no switch fallback) still work.
+	// The first DHCPLeases entry remains the provisioning identity: its IPv4
+	// address and gateway must be configured on exactly one declared
+	// interface, and its MAC must be one of the declared ethernets.
+	// When omitted, metalman keeps the single-NIC behavior driven by
+	// DHCPLeases.
+	// +optional
+	Network *HostNetworkSpec `json:"network,omitempty"`
+}
+
+// HostNetworkSpec declares a static host network topology.
+//
+// The cross-reference rules (bond members and VLAN links) are declared on
+// MachineSpec and HostSpec rather than here: PXESpec is also embedded in the
+// unbounded MachineOperation status.targets list, where these nested list
+// rules would exceed the API server's CEL cost budget.
+type HostNetworkSpec struct {
+	// Ethernets declares the physical network interfaces, matched by their
+	// permanent MAC addresses.
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=16
+	Ethernets []EthernetSpec `json:"ethernets"`
+
+	// Bonds declares link aggregation interfaces built from ethernets.
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:MaxItems=8
+	// +optional
+	Bonds []BondSpec `json:"bonds,omitempty"`
+
+	// VLANs declares 802.1Q VLAN interfaces on top of ethernets or bonds.
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:MaxItems=32
+	// +optional
+	VLANs []VLANSpec `json:"vlans,omitempty"`
+
+	// DNS is the list of IPv4 nameserver addresses for the host.
+	// +kubebuilder:validation:MaxItems=3
+	// +kubebuilder:validation:items:MaxLength=15
+	// +optional
+	DNS []string `json:"dns,omitempty"`
+}
+
+// InterfaceAddressing holds the static IPv4 configuration of an interface.
+type InterfaceAddressing struct {
+	// MTU is the interface MTU in bytes. When omitted, the kernel default is
+	// used.
+	// +kubebuilder:validation:Minimum=576
+	// +kubebuilder:validation:Maximum=9216
+	// +optional
+	MTU *int32 `json:"mtu,omitempty"`
+
+	// Addresses lists static IPv4 addresses in CIDR notation, for example
+	// 192.0.2.10/24.
+	// +kubebuilder:validation:MaxItems=8
+	// +kubebuilder:validation:items:MaxLength=18
+	// +optional
+	Addresses []string `json:"addresses,omitempty"`
+
+	// Gateway is the IPv4 default gateway reachable through this interface.
+	// At most one interface in the host network may set it.
+	// +kubebuilder:validation:MaxLength=15
+	// +optional
+	Gateway string `json:"gateway,omitempty"`
+
+	// Routes lists static IPv4 routes through this interface.
+	// +kubebuilder:validation:MaxItems=32
+	// +optional
+	Routes []RouteSpec `json:"routes,omitempty"`
+}
+
+// RouteSpec declares a static IPv4 route.
+type RouteSpec struct {
+	// To is the destination prefix in CIDR notation, for example
+	// 198.51.100.0/24.
+	// +kubebuilder:validation:MaxLength=18
+	To string `json:"to"`
+
+	// Via is the IPv4 next-hop address.
+	// +kubebuilder:validation:MaxLength=15
+	Via string `json:"via"`
+}
+
+// EthernetSpec declares a physical network interface.
+type EthernetSpec struct {
+	// Name is the interface name persisted on the installed host, for example
+	// enp1s0f0. Metalman matches the device by MACAddress and does not rely
+	// on the kernel's naming during installation.
+	// +kubebuilder:validation:MaxLength=15
+	// +kubebuilder:validation:Pattern=`^[a-zA-Z][a-zA-Z0-9_-]{0,14}$`
+	Name string `json:"name"`
+
+	// MACAddress is the permanent MAC address of the physical interface, as
+	// lowercase colon-separated hex (aa:bb:cc:dd:ee:ff).
+	// +kubebuilder:validation:Pattern=`^([0-9a-f]{2}:){5}[0-9a-f]{2}$`
+	MACAddress string `json:"macAddress"`
+
+	InterfaceAddressing `json:",inline"`
+}
+
+const (
+	// BondMode8023AD is IEEE 802.3ad dynamic link aggregation (LACP).
+	BondMode8023AD = "802.3ad"
+	// BondModeActiveBackup keeps one member active at a time.
+	BondModeActiveBackup = "active-backup"
+	// BondModeBalanceXOR balances traffic by the transmit hash policy.
+	BondModeBalanceXOR = "balance-xor"
+)
+
+// BondSpec declares a link aggregation interface.
+// +kubebuilder:validation:XValidation:rule="!has(self.lacpRate) || self.mode == '802.3ad'",message="lacpRate requires mode 802.3ad"
+type BondSpec struct {
+	// Name is the bond interface name, for example bond0.
+	// +kubebuilder:validation:MaxLength=15
+	// +kubebuilder:validation:Pattern=`^[a-zA-Z][a-zA-Z0-9_-]{0,14}$`
+	Name string `json:"name"`
+
+	// Interfaces lists the names of the ethernets aggregated by this bond.
+	// +listType=set
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=8
+	// +kubebuilder:validation:items:MaxLength=15
+	Interfaces []string `json:"interfaces"`
+
+	// Mode is the bonding mode.
+	// +kubebuilder:validation:Enum="802.3ad";active-backup;balance-xor
+	// +kubebuilder:default="802.3ad"
+	// +optional
+	Mode string `json:"mode,omitempty"`
+
+	// MIIMonitorInterval is the link monitoring interval in milliseconds.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=10000
+	// +kubebuilder:default=100
+	// +optional
+	MIIMonitorInterval *int32 `json:"miiMonitorInterval,omitempty"`
+
+	// TransmitHashPolicy selects the member used to transmit each flow in
+	// 802.3ad and balance-xor modes.
+	// +kubebuilder:validation:Enum=layer2;layer2+3;layer3+4;encap2+3;encap3+4
+	// +optional
+	TransmitHashPolicy string `json:"transmitHashPolicy,omitempty"`
+
+	// LACPRate is the LACPDU transmit rate requested from the link partner in
+	// 802.3ad mode.
+	// +kubebuilder:validation:Enum=slow;fast
+	// +optional
+	LACPRate string `json:"lacpRate,omitempty"`
+
+	InterfaceAddressing `json:",inline"`
+}
+
+// VLANSpec declares an 802.1Q VLAN interface.
+type VLANSpec struct {
+	// Name is the VLAN interface name, for example bond0.64.
+	// +kubebuilder:validation:MaxLength=15
+	// +kubebuilder:validation:Pattern=`^[a-zA-Z][a-zA-Z0-9_.-]{0,14}$`
+	Name string `json:"name"`
+
+	// ID is the 802.1Q VLAN identifier.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=4094
+	ID int32 `json:"id"`
+
+	// Link is the name of the ethernet or bond carrying the VLAN.
+	// +kubebuilder:validation:MaxLength=15
+	Link string `json:"link"`
+
+	InterfaceAddressing `json:",inline"`
 }
 
 const (
@@ -552,6 +792,103 @@ type KubernetesSpec struct {
 	// "token-id" and "token-secret".
 	// +optional
 	BootstrapTokenRef *LocalObjectReference `json:"bootstrapTokenRef,omitempty"`
+}
+
+// IsolationMode names where the node stack runs on a host.
+type IsolationMode string
+
+const (
+	// IsolationNSpawn runs the node stack in a systemd-nspawn machine. It is
+	// the default.
+	IsolationNSpawn IsolationMode = "nspawn"
+	// IsolationNone runs the node stack directly on the host.
+	IsolationNone IsolationMode = "none"
+	// IsolationContainer runs the node stack in a privileged OCI container.
+	// It is experimental and must be enabled explicitly.
+	IsolationContainer IsolationMode = "container"
+)
+
+// IsolationChangePhase is how far a mode change got.
+// +kubebuilder:validation:Enum=InProgress;Succeeded;Failed
+type IsolationChangePhase string
+
+const (
+	// IsolationChangeInProgress means the agent started the change.
+	IsolationChangeInProgress IsolationChangePhase = "InProgress"
+	// IsolationChangeSucceeded means the node now runs in the target mode.
+	IsolationChangeSucceeded IsolationChangePhase = "Succeeded"
+	// IsolationChangeFailed means the change did not complete or was
+	// refused. The message says why and whether the node was rolled back.
+	// The agent does not retry on its own; the next repave tries again.
+	IsolationChangeFailed IsolationChangePhase = "Failed"
+)
+
+// IsolationChangeStrategy is how a mode change is carried out.
+// +kubebuilder:validation:Enum=InPlace;Reprovision
+type IsolationChangeStrategy string
+
+const (
+	// IsolationChangeInPlace builds the target beside the running node and
+	// switches over, rolling back on failure.
+	IsolationChangeInPlace IsolationChangeStrategy = "InPlace"
+	// IsolationChangeReprovision resets the host and bootstraps it again in
+	// the target mode. It needs the AnnotationAllowReprovision opt-in.
+	IsolationChangeReprovision IsolationChangeStrategy = "Reprovision"
+)
+
+// Machine-readable reasons the agent gives for a refused mode change in
+// IsolationChangeStatus.Reason.
+const (
+	// IsolationChangeReasonUnsupportedMode means the agent on the host cannot
+	// run the target mode, for example because it predates it, or cannot
+	// change a running node to it.
+	IsolationChangeReasonUnsupportedMode = "UnsupportedMode"
+	// IsolationChangeReasonReprovisionNotAllowed means the change needs a
+	// reprovision and the Machine does not carry AnnotationAllowReprovision.
+	IsolationChangeReasonReprovisionNotAllowed = "ReprovisionNotAllowed"
+	// IsolationChangeReasonExperimentalNotEnabled means the target mode is
+	// experimental and the agent's configuration does not opt in to it.
+	IsolationChangeReasonExperimentalNotEnabled = "ExperimentalNotEnabled"
+)
+
+// IsolationChangeMessageMaxLength is the longest IsolationChangeStatus.Message
+// the API accepts, in bytes. Writers truncate to it. It must match the
+// MaxLength marker on the field.
+const IsolationChangeMessageMaxLength = 4096
+
+// IsolationChangeStatus reports a mode change made at a repave.
+type IsolationChangeStatus struct {
+	// TargetMode is the mode the change was moving the node to. It is not
+	// limited to the modes this release can run: an agent reports a change it
+	// refused to a mode it does not know.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	TargetMode IsolationMode `json:"targetMode"`
+
+	// Phase is how far the change got.
+	Phase IsolationChangePhase `json:"phase"`
+
+	// Strategy is how the change was carried out.
+	// +optional
+	Strategy IsolationChangeStrategy `json:"strategy,omitempty"`
+
+	// Reason is a machine-readable CamelCase reason for a refused change,
+	// such as UnsupportedMode or ReprovisionNotAllowed. Empty for a change
+	// that was attempted.
+	// +kubebuilder:validation:MaxLength=64
+	// +kubebuilder:validation:Pattern=`^([A-Za-z][A-Za-z0-9]*)?$`
+	// +optional
+	Reason string `json:"reason,omitempty"`
+
+	// Message explains the phase, including why a failed change failed and
+	// whether the node was rolled back.
+	// +kubebuilder:validation:MaxLength=4096
+	// +optional
+	Message string `json:"message,omitempty"`
+
+	// LastTransitionTime is when Phase last changed.
+	// +optional
+	LastTransitionTime metav1.Time `json:"lastTransitionTime,omitempty"`
 }
 
 // AgentSpec defines settings for the unbounded node agent.
@@ -740,6 +1077,18 @@ type MachineStatus struct {
 	// It does not override desired replacement image settings.
 	// +optional
 	ObservedProvisioningFormat ProvisioningFormat `json:"observedProvisioningFormat,omitempty"`
+
+	// Isolation is the isolation mode the agent reports as applied on the
+	// host. Empty means the agent has not reported one. It is compared with
+	// spec.isolation to report drift. Only the agent writes it.
+	// +kubebuilder:validation:Enum="";nspawn;none;container
+	// +optional
+	Isolation IsolationMode `json:"isolation,omitempty"`
+
+	// IsolationChange reports the agent's latest attempt to move the node to
+	// the mode in spec.isolation during a repave. Only the agent writes it.
+	// +optional
+	IsolationChange *IsolationChangeStatus `json:"isolationChange,omitempty"`
 	// Phase is the current phase of the machine. Intended for human
 	// consumption; follows the state machine rather than driving it.
 	Phase MachinePhase `json:"phase,omitempty"`

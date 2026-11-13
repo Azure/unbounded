@@ -58,6 +58,7 @@ type StageInvocation struct {
 	ID              string
 	RunUID          types.UID
 	PlanDigest      string
+	AdapterImage    string
 	PhaseOrder      int32
 	StageOrder      int32
 	Ordinal         int32
@@ -78,6 +79,7 @@ var errInvocationEvidenceIntegrity = errors.New("invocation evidence integrity f
 type StageExecutionRequest struct {
 	RunUID                         types.UID
 	PlanDigest                     string
+	AdapterImage                   string
 	PhaseOrder                     int32
 	StageOrder                     int32
 	PhaseRole                      signalv1.CheckStageRole
@@ -225,6 +227,7 @@ func (r StageRunner) executeWithRetry(
 			ID:              stageInvocationID(request, ordinal, attempt),
 			RunUID:          request.RunUID,
 			PlanDigest:      request.PlanDigest,
+			AdapterImage:    request.AdapterImage,
 			PhaseOrder:      request.PhaseOrder,
 			StageOrder:      request.StageOrder,
 			Ordinal:         ordinal,
@@ -477,6 +480,7 @@ func summarizeStageExecution(
 	}
 
 	evidenceStartedAt := startedAt.UTC().Truncate(time.Second)
+
 	evidenceFinishedAt := finishedAt.UTC().Truncate(time.Second)
 	if !evidenceFinishedAt.Equal(finishedAt) {
 		evidenceFinishedAt = evidenceFinishedAt.Add(time.Second)
@@ -559,6 +563,10 @@ func summarizeStageExecution(
 	}
 
 	summary.Assertions = assertions
+	summary.Measurements = stageMeasurements(
+		request.Stage.Test.Metrics,
+		envelopes[len(envelopes)-1].Measurements,
+	)
 
 	invocationEvidence, err := boundedInvocationReferences(envelopes)
 	if err != nil {
@@ -569,6 +577,32 @@ func summarizeStageExecution(
 	summary.Verdict = stageVerdict(request, summary, assertionsPass)
 
 	return summary, nil
+}
+
+func stageMeasurements(
+	definitions []signalv1.TestMetricDefinition,
+	measurements []signalv1.MetricMeasurement,
+) []signalv1.MetricMeasurement {
+	allowed := make(map[string]signalv1.TestMetricDefinition, len(definitions))
+	for _, definition := range definitions {
+		allowed[definition.Name] = definition
+	}
+
+	result := make([]signalv1.MetricMeasurement, 0, min(len(measurements), len(allowed)))
+	for _, measurement := range measurements {
+		definition, exists := allowed[measurement.Name]
+		if !exists || measurement.Unit != definition.Unit {
+			continue
+		}
+
+		result = append(result, *measurement.DeepCopy())
+	}
+
+	sort.Slice(result, func(left, right int) bool {
+		return result[left].Name < result[right].Name
+	})
+
+	return result
 }
 
 func summarizeStageParticipants(
@@ -766,49 +800,61 @@ func evaluateStageAssertions(
 	stage signalv1.ResolvedStagePlan,
 	envelopes []signalv1.InvocationResultEnvelope,
 ) ([]signalv1.AssertionResult, bool, error) {
-	measurements := make(map[string]signalv1.TypedValue)
-
-	for _, envelope := range envelopes {
-		for _, measurement := range envelope.Measurements {
-			measurements[measurement.Name] = measurement.Value
-		}
-	}
-
 	results := make([]signalv1.AssertionResult, 0, len(stage.Assertions))
 	allPassed := true
 
 	for _, assertion := range stage.Assertions {
-		actual, exists := measurements[assertion.Metric]
-		if !exists {
-			results = append(results, signalv1.AssertionResult{
-				Name:    assertion.Name,
-				Passed:  false,
-				Message: missingAssertionMetricMessage(assertion),
-			})
-			allPassed = false
-
-			continue
+		result := signalv1.AssertionResult{Name: assertion.Name, Passed: true}
+		if len(envelopes) == 0 {
+			result.Passed = false
+			result.Message = missingAssertionMetricMessage(assertion)
 		}
 
-		passed, err := evaluateAssertion(assertion, actual, measurements)
-		if err != nil {
-			results = append(results, signalv1.AssertionResult{
-				Name:    assertion.Name,
-				Passed:  false,
-				Actual:  actual.DeepCopy(),
-				Message: boundedAssertionMessage("assertion evaluation failed: " + err.Error()),
-			})
-			allPassed = false
+		for _, envelope := range envelopes {
+			measurements := make(map[string]signalv1.TypedValue, len(envelope.Measurements))
+			for _, measurement := range envelope.Measurements {
+				measurements[measurement.Name] = measurement.Value
+			}
 
-			continue
+			actual, exists := measurements[assertion.Metric]
+			if !exists {
+				result.Passed = false
+				result.Actual = nil
+				result.Message = boundedAssertionMessage(
+					fmt.Sprintf(
+						"invocation %s: %s",
+						envelope.InvocationID,
+						missingAssertionMetricMessage(assertion),
+					),
+				)
+
+				break
+			}
+
+			result.Actual = actual.DeepCopy()
+
+			passed, err := evaluateAssertion(assertion, actual, measurements)
+			if err != nil {
+				result.Passed = false
+				result.Message = boundedAssertionMessage(
+					fmt.Sprintf("invocation %s: assertion evaluation failed: %v", envelope.InvocationID, err),
+				)
+
+				break
+			}
+
+			if !passed {
+				result.Passed = false
+				result.Message = boundedAssertionMessage(
+					fmt.Sprintf("invocation %s did not satisfy the assertion", envelope.InvocationID),
+				)
+
+				break
+			}
 		}
 
-		results = append(results, signalv1.AssertionResult{
-			Name:   assertion.Name,
-			Passed: passed,
-			Actual: actual.DeepCopy(),
-		})
-		allPassed = allPassed && passed
+		results = append(results, result)
+		allPassed = allPassed && result.Passed
 	}
 
 	return results, allPassed, nil

@@ -3,7 +3,6 @@
 
 use super::Priority;
 use std::fmt::Write;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// Monotonic per-priority counters.
@@ -70,6 +69,7 @@ impl Outcome {
             Self::Succeeded => "succeeded",
             Self::Partial => "partial",
             Self::Failed => "failed",
+            // Published label value; keeps the British spelling.
             Self::Canceled => "cancelled",
         }
     }
@@ -82,90 +82,171 @@ pub const SAMPLE_LINES: usize =
 /// Upper bounds of `racer_prefetch_demand_wait_seconds`, in milliseconds.
 const WAIT_BUCKETS_MS: [u64; 10] = [1, 5, 10, 50, 100, 500, 1000, 5000, 10000, 60000];
 
-#[derive(Default)]
-struct Histogram {
-    buckets: [AtomicU64; WAIT_BUCKETS_MS.len()],
-    count: AtomicU64,
-    sum_micros: AtomicU64,
+const COUNTER_SLOTS: usize = COUNTERS.len() * 3;
+const THROTTLE_SLOT: usize = COUNTER_SLOTS;
+const FINISHED_SLOT: usize = THROTTLE_SLOT + 3;
+const HISTOGRAM_SLOT: usize = FINISHED_SLOT + 3 * Outcome::ALL.len();
+/// Per priority: every bucket, then count, then the sum in microseconds.
+const HISTOGRAM_STRIDE: usize = WAIT_BUCKETS_MS.len() + 2;
+const SLOTS: usize = HISTOGRAM_SLOT + 3 * HISTOGRAM_STRIDE;
+
+/// One counter cell in the prefetch registry: a fixed (family, labels) pair.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Slot(u8);
+
+const _: () = assert!(SLOTS <= u8::MAX as usize);
+
+impl crate::telemetry::primitives::Metric for Slot {
+    const ALL: &'static [Self] = &{
+        let mut all = [Slot(0); SLOTS];
+        let mut index = 0;
+        while index < SLOTS {
+            all[index] = Slot(index as u8);
+            index += 1;
+        }
+        all
+    };
+
+    fn index(self) -> usize {
+        usize::from(self.0)
+    }
+
+    fn name(self) -> &'static str {
+        let index = self.index();
+        if index < COUNTER_SLOTS {
+            COUNTERS[index / 3].1
+        } else if index < FINISHED_SLOT {
+            "racer_prefetch_throttle_seconds_total"
+        } else if index < HISTOGRAM_SLOT {
+            "racer_prefetch_tickets_finished_total"
+        } else {
+            "racer_prefetch_demand_wait_seconds"
+        }
+    }
 }
 
-/// Node-wide prefetch metrics, shared by every worker's `Metrics` handle.
-#[derive(Default)]
-pub struct PrefetchMetrics {
-    counters: [[AtomicU64; 3]; COUNTERS.len()],
-    throttle_micros: [AtomicU64; 3],
-    queued_bytes: [AtomicU64; 3],
-    tickets: [AtomicU64; 3],
-    finished: [[AtomicU64; 4]; 3],
-    demand_wait: [Histogram; 3],
+/// One gauge cell: queued bytes, then tickets, per priority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GaugeSlot(u8);
+
+impl crate::telemetry::primitives::Metric for GaugeSlot {
+    const ALL: &'static [Self] = &[
+        GaugeSlot(0),
+        GaugeSlot(1),
+        GaugeSlot(2),
+        GaugeSlot(3),
+        GaugeSlot(4),
+        GaugeSlot(5),
+    ];
+
+    fn index(self) -> usize {
+        usize::from(self.0)
+    }
+
+    fn name(self) -> &'static str {
+        if self.0 < 3 {
+            "racer_prefetch_queued_bytes"
+        } else {
+            "racer_prefetch_tickets"
+        }
+    }
+}
+
+fn slot(index: usize) -> Slot {
+    Slot(index as u8)
+}
+
+fn counter_slot(counter: Counter, priority: Priority) -> Slot {
+    slot(counter as usize * 3 + priority.index())
+}
+
+fn finished_slot(priority: Priority, outcome: Outcome) -> Slot {
+    slot(FINISHED_SLOT + priority.index() * Outcome::ALL.len() + outcome as usize)
+}
+
+fn histogram_slot(priority: Priority, offset: usize) -> Slot {
+    slot(HISTOGRAM_SLOT + priority.index() * HISTOGRAM_STRIDE + offset)
+}
+
+/// Prefetch metrics on the per-worker sharded registry. Each worker's
+/// `Metrics` handle holds its own shard; the node-wide prefetch service
+/// records through the first attached worker's handle from any worker
+/// thread, so updates stay atomic `fetch_add`. Counters wrap.
+#[derive(Clone)]
+pub struct PrefetchMetrics(crate::telemetry::primitives::Metrics<Slot, GaugeSlot>);
+
+impl Default for PrefetchMetrics {
+    fn default() -> Self {
+        Self::shards(1).pop().expect("one prefetch metrics shard")
+    }
 }
 
 impl PrefetchMetrics {
+    /// One handle per worker over a shared registry.
+    pub fn shards(n: usize) -> Vec<Self> {
+        crate::telemetry::primitives::Metrics::shards(n)
+            .into_iter()
+            .map(Self)
+            .collect()
+    }
+
     pub fn add(&self, counter: Counter, priority: Priority, value: u64) {
-        let index = COUNTERS
-            .iter()
-            .position(|(c, _)| *c == counter)
-            .expect("listed counter");
-        saturating_add(&self.counters[index][priority.index()], value);
+        self.0.add(counter_slot(counter, priority), value);
     }
 
     pub fn get(&self, counter: Counter, priority: Priority) -> u64 {
-        let index = COUNTERS
-            .iter()
-            .position(|(c, _)| *c == counter)
-            .expect("listed counter");
-        self.counters[index][priority.index()].load(Ordering::Relaxed)
+        self.0.count(counter_slot(counter, priority))
     }
 
     pub fn throttled(&self, priority: Priority, wait: Duration) {
-        saturating_add(
-            &self.throttle_micros[priority.index()],
+        self.0.add(
+            slot(THROTTLE_SLOT + priority.index()),
             wait.as_micros().min(u128::from(u64::MAX)) as u64,
         );
     }
 
     pub fn finished(&self, priority: Priority, outcome: Outcome) {
-        let index = Outcome::ALL
-            .iter()
-            .position(|o| *o == outcome)
-            .expect("listed outcome");
-        saturating_add(&self.finished[priority.index()][index], 1);
+        self.0.add(finished_slot(priority, outcome), 1);
     }
 
     pub fn finished_count(&self, priority: Priority, outcome: Outcome) -> u64 {
-        let index = Outcome::ALL
-            .iter()
-            .position(|o| *o == outcome)
-            .expect("listed outcome");
-        self.finished[priority.index()][index].load(Ordering::Relaxed)
+        self.0.count(finished_slot(priority, outcome))
     }
 
     /// Replace the node-wide gauges.
     pub fn set_gauges(&self, queued_bytes: [u64; 3], tickets: [u64; 3]) {
         for i in 0..3 {
-            self.queued_bytes[i].store(queued_bytes[i], Ordering::Relaxed);
-            self.tickets[i].store(tickets[i], Ordering::Relaxed);
+            self.0.set(GaugeSlot(i as u8), queued_bytes[i]);
+            self.0.set(GaugeSlot(3 + i as u8), tickets[i]);
         }
     }
 
     pub fn tickets(&self, priority: Priority) -> u64 {
-        self.tickets[priority.index()].load(Ordering::Relaxed)
+        self.0.gauge(GaugeSlot(3 + priority.index() as u8))
+    }
+
+    fn queued_bytes(&self, priority: Priority) -> u64 {
+        self.0.gauge(GaugeSlot(priority.index() as u8))
     }
 
     pub fn demand_wait(&self, priority: Priority, wait: Duration) {
-        let histogram = &self.demand_wait[priority.index()];
         // Compare the exact duration so fractional milliseconds are not
         // truncated into a lower bucket than the recorded sum implies.
-        for (bucket, bound) in histogram.buckets.iter().zip(WAIT_BUCKETS_MS) {
+        for (offset, bound) in WAIT_BUCKETS_MS.into_iter().enumerate() {
             if wait <= Duration::from_millis(bound) {
-                saturating_add(bucket, 1);
+                self.0.add(histogram_slot(priority, offset), 1);
             }
         }
-        saturating_add(&histogram.count, 1);
-        saturating_add(
-            &histogram.sum_micros,
+        self.0
+            .add(histogram_slot(priority, WAIT_BUCKETS_MS.len()), 1);
+        self.0.add(
+            histogram_slot(priority, WAIT_BUCKETS_MS.len() + 1),
             wait.as_micros().min(u128::from(u64::MAX)) as u64,
         );
+    }
+
+    fn bucket(&self, priority: Priority, offset: usize) -> u64 {
+        self.0.count(histogram_slot(priority, offset))
     }
 
     /// Prometheus text exposition.
@@ -177,14 +258,14 @@ impl PrefetchMetrics {
                     out,
                     "{name}{{priority=\"{}\"}} {}",
                     priority.as_str(),
-                    self.counters[index][priority.index()].load(Ordering::Relaxed)
+                    self.0.count(slot(index * 3 + priority.index()))
                 )?;
             }
         }
         let name = "racer_prefetch_throttle_seconds_total";
         writeln!(out, "# TYPE {name} counter")?;
         for priority in Priority::ALL {
-            let micros = self.throttle_micros[priority.index()].load(Ordering::Relaxed);
+            let micros = self.0.count(slot(THROTTLE_SLOT + priority.index()));
             writeln!(
                 out,
                 "{name}{{priority=\"{}\"}} {}.{:06}",
@@ -193,9 +274,12 @@ impl PrefetchMetrics {
                 micros % 1_000_000
             )?;
         }
-        for (name, values) in [
-            ("racer_prefetch_queued_bytes", &self.queued_bytes),
-            ("racer_prefetch_tickets", &self.tickets),
+        for (name, value) in [
+            (
+                "racer_prefetch_queued_bytes",
+                Self::queued_bytes as fn(&Self, Priority) -> u64,
+            ),
+            ("racer_prefetch_tickets", Self::tickets),
         ] {
             writeln!(out, "# TYPE {name} gauge")?;
             for priority in Priority::ALL {
@@ -203,43 +287,42 @@ impl PrefetchMetrics {
                     out,
                     "{name}{{priority=\"{}\"}} {}",
                     priority.as_str(),
-                    values[priority.index()].load(Ordering::Relaxed)
+                    value(self, priority)
                 )?;
             }
         }
         let name = "racer_prefetch_tickets_finished_total";
         writeln!(out, "# TYPE {name} counter")?;
         for priority in Priority::ALL {
-            for (index, outcome) in Outcome::ALL.iter().enumerate() {
+            for outcome in Outcome::ALL {
                 writeln!(
                     out,
                     "{name}{{priority=\"{}\",outcome=\"{}\"}} {}",
                     priority.as_str(),
                     outcome.as_str(),
-                    self.finished[priority.index()][index].load(Ordering::Relaxed)
+                    self.finished_count(priority, outcome)
                 )?;
             }
         }
         let name = "racer_prefetch_demand_wait_seconds";
         writeln!(out, "# TYPE {name} histogram")?;
         for priority in Priority::ALL {
-            let histogram = &self.demand_wait[priority.index()];
             let label = priority.as_str();
-            for (bucket, bound) in histogram.buckets.iter().zip(WAIT_BUCKETS_MS) {
+            for (offset, bound) in WAIT_BUCKETS_MS.into_iter().enumerate() {
                 writeln!(
                     out,
                     "{name}_bucket{{priority=\"{label}\",le=\"{}.{:03}\"}} {}",
                     bound / 1000,
                     bound % 1000,
-                    bucket.load(Ordering::Relaxed)
+                    self.bucket(priority, offset)
                 )?;
             }
-            let count = histogram.count.load(Ordering::Relaxed);
+            let count = self.bucket(priority, WAIT_BUCKETS_MS.len());
             writeln!(
                 out,
                 "{name}_bucket{{priority=\"{label}\",le=\"+Inf\"}} {count}"
             )?;
-            let micros = histogram.sum_micros.load(Ordering::Relaxed);
+            let micros = self.bucket(priority, WAIT_BUCKETS_MS.len() + 1);
             writeln!(
                 out,
                 "{name}_sum{{priority=\"{label}\"}} {}.{:06}",
@@ -252,22 +335,34 @@ impl PrefetchMetrics {
     }
 }
 
-fn saturating_add(counter: &AtomicU64, value: u64) {
-    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
-        Some(old.saturating_add(value))
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn bucket_counts(metrics: &PrefetchMetrics, priority: Priority) -> Vec<u64> {
-        metrics.demand_wait[priority.index()]
-            .buckets
-            .iter()
-            .map(|b| b.load(Ordering::Relaxed))
+        (0..WAIT_BUCKETS_MS.len())
+            .map(|offset| metrics.bucket(priority, offset))
             .collect()
+    }
+
+    #[test]
+    fn slot_layout_follows_declaration_order() {
+        for (index, (counter, _)) in COUNTERS.iter().enumerate() {
+            assert_eq!(*counter as usize, index);
+        }
+        for (index, outcome) in Outcome::ALL.iter().enumerate() {
+            assert_eq!(*outcome as usize, index);
+        }
+        use crate::telemetry::primitives::Metric;
+        assert_eq!(Slot::ALL.len(), SLOTS);
+        assert_eq!(
+            Slot(SLOTS as u8 - 1).name(),
+            "racer_prefetch_demand_wait_seconds"
+        );
+        assert_eq!(
+            Slot(THROTTLE_SLOT as u8).name(),
+            "racer_prefetch_throttle_seconds_total"
+        );
     }
 
     #[test]
@@ -296,16 +391,19 @@ mod tests {
                 .iter()
                 .all(|&c| c == 0)
         );
-        let histogram = &metrics.demand_wait[Priority::Low.index()];
-        assert_eq!(histogram.count.load(Ordering::Relaxed), 1);
-        assert_eq!(histogram.sum_micros.load(Ordering::Relaxed), u64::MAX);
+        assert_eq!(metrics.bucket(Priority::Low, WAIT_BUCKETS_MS.len()), 1);
+        assert_eq!(
+            metrics.bucket(Priority::Low, WAIT_BUCKETS_MS.len() + 1),
+            u64::MAX
+        );
     }
 
     #[test]
-    fn exposition_has_fixed_labels_and_saturates() {
-        let metrics = PrefetchMetrics::default();
+    fn exposition_has_fixed_labels_and_wraps() {
+        let shards = PrefetchMetrics::shards(2);
+        let metrics = &shards[0];
         metrics.add(Counter::Retries, Priority::Low, u64::MAX);
-        metrics.add(Counter::Retries, Priority::Low, 7);
+        shards[1].add(Counter::Retries, Priority::Low, 7);
         metrics.throttled(Priority::Normal, Duration::from_millis(1500));
         metrics.finished(Priority::High, Outcome::Partial);
         metrics.demand_wait(Priority::High, Duration::from_millis(7));
@@ -314,7 +412,7 @@ mod tests {
         metrics.write(&mut out).unwrap();
         assert!(out.contains(&format!(
             "racer_prefetch_retries_total{{priority=\"low\"}} {}\n",
-            u64::MAX
+            6
         )));
         assert!(
             out.contains("racer_prefetch_throttle_seconds_total{priority=\"normal\"} 1.500000\n")

@@ -7,7 +7,7 @@ use crate::peer::forwarding::VerifiedResponse;
 use crate::peer::protocol::PeerRequest;
 use crate::test_support::security::network;
 use crate::test_support::security::node;
-use racer_control_wire::NodeId;
+use racer_wire::control::NodeId;
 use std::collections::VecDeque;
 
 enum Reply {
@@ -33,7 +33,9 @@ struct ScriptedPeers {
 
     canceled_primary: Cell<bool>,
 
-    advance_primary: RefCell<Option<uring_runtime::environment::SimulationClock>>,
+    advance_primary: RefCell<Option<racer_io::SimClock>>,
+
+    env: racer_io::Env,
 
     local: usize,
 
@@ -58,6 +60,7 @@ impl ScriptedPeers {
     }
     fn requester(self: &Rc<Self>) -> Rc<Requester> {
         Requester::scripted(
+            self.env.ctx.clock.clone(),
             self.clone(),
             Self::direct_hedge_available,
             Self::request,
@@ -156,7 +159,7 @@ impl ScriptedPeers {
                 }
                 Reply::Cancel(parent) => {
                     parent.cancel()?;
-                    return Err(Error::Cancelled);
+                    return Err(Error::Canceled);
                 }
                 Reply::Deadline => return Err(Error::DeadlineExceeded),
                 Reply::Serve => {
@@ -180,7 +183,7 @@ impl ScriptedPeers {
                                     ciphertext.bytes().len(),
                                 )?,
                                 ciphertext.envelope().clone(),
-                                ciphertext.bytes().to_vec(),
+                                ciphertext.bytes(),
                             )?;
                             PeerResponse::Page {
                                 metadata,
@@ -206,7 +209,10 @@ impl ScriptedPeers {
                             membership: request.route.membership,
                             receiver: node(self.local),
                             deadline: crate::peer::protocol::number(
-                                &crate::peer::protocol::request_head(&request)?,
+                                &crate::peer::protocol::request_head(
+                                    &self.env.ctx.clock,
+                                    &request,
+                                )?,
                                 "racer-route-deadline",
                             )?,
                             remaining_page_budget: subscription.page_budget - 1,
@@ -236,10 +242,14 @@ impl ScriptedPeers {
     }
 }
 
-fn install_peers(f: &mut Fixture, rank: Option<usize>) -> (Rc<ScriptedPeers>, Vec<NodeId>) {
+fn install_peers(
+    env: &racer_io::Env,
+    f: &mut Fixture,
+    rank: Option<usize>,
+) -> (Rc<ScriptedPeers>, Vec<NodeId>) {
     f.membership = Arc::new(
         Membership::validate(
-            racer_control_wire::MembershipVersion(1),
+            racer_wire::control::MembershipVersion(1),
             (0..4)
                 .map(|i| Member {
                     node: node(i),
@@ -260,6 +270,7 @@ fn install_peers(f: &mut Fixture, rank: Option<usize>) -> (Rc<ScriptedPeers>, Ve
         .map(|rank| ordered[rank].clone())
         .unwrap_or_else(|| (0..4).map(node).find(|n| !ordered.contains(n)).unwrap());
     let peers = Rc::new(ScriptedPeers {
+        env: env.clone(),
         receiver: RefCell::new(None),
         admission: f.fill.dependencies.admission.clone(),
         hedge: Cell::new(false),
@@ -267,7 +278,7 @@ fn install_peers(f: &mut Fixture, rank: Option<usize>) -> (Rc<ScriptedPeers>, Ve
         canceled_primary: Cell::new(false),
         advance_primary: RefCell::new(None),
         local: (0..4).find(|i| node(*i) == local).unwrap(),
-        signing: network(4).into_iter().map(Forwarding::new).collect(),
+        signing: network(env, 4).into_iter().map(Forwarding::new).collect(),
         replies: RefCell::new(VecDeque::new()),
         calls: RefCell::new(Vec::new()),
         memberships: RefCell::new(Vec::new()),
@@ -279,15 +290,18 @@ fn install_peers(f: &mut Fixture, rank: Option<usize>) -> (Rc<ScriptedPeers>, Ve
         local,
         placement,
         Requester::scripted(
+            env.ctx.clock.clone(),
             peers.clone(),
             ScriptedPeers::direct_hedge_available,
             ScriptedPeers::request,
             ScriptedPeers::request_direct,
         ),
         dependencies.credentials.clone(),
-        Arc::new(controlplane::Published::new(
+        Arc::new(crate::control::cell::PublicationCell::new(
             crate::control::Snapshot::retention(2),
         )),
+        env.ctx.clone(),
+        f.fill.drivers().clone(),
     ));
     f.fill = Fill::new(dependencies);
     f.fill
@@ -301,13 +315,14 @@ fn install_peers(f: &mut Fixture, rank: Option<usize>) -> (Rc<ScriptedPeers>, Ve
 #[test]
 fn bounded_admission_reciprocal_signed_peers_reject_while_both_owners_are_full() {
     use crate::peer::server::LocalPageService;
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
-    let mut a = fixture();
-    let mut b = fixture();
-    let (pa, _) = install_peers(&mut a, Some(0));
-    let (pb, _) = install_peers(&mut b, Some(1));
+    let env = racer_io::Env::host();
+    let mut a = fixture(&env);
+    let mut b = fixture(&env);
+    let (pa, _) = install_peers(&env, &mut a, Some(0));
+    let (pb, _) = install_peers(&env, &mut b, Some(1));
     let graph = |f: &Fixture| {
         f.read_graph(
+            &env,
             Rc::new(f.fill.clone()),
             &f.membership,
             ReadGraphSettings {
@@ -400,10 +415,11 @@ fn bounded_admission_reciprocal_signed_peers_reject_while_both_owners_are_full()
 
 #[test]
 fn bounded_admission_signed_remote_saturation_exits_without_request_expiry() {
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
-    let mut target = fixture();
-    install_peers(&mut target, Some(0));
+    let env = racer_io::Env::host();
+    let mut target = fixture(&env);
+    install_peers(&env, &mut target, Some(0));
     let (receiver, _endpoint, _) = target.read_graph(
+        &env,
         Rc::new(target.fill.clone()),
         &target.membership,
         ReadGraphSettings {
@@ -423,8 +439,8 @@ fn bounded_admission_signed_remote_saturation_exits_without_request_expiry() {
             admission.limit(ResourceClass::Flight),
         )
         .unwrap();
-    let mut source = fixture();
-    let (peers, ordered) = install_peers(&mut source, None);
+    let mut source = fixture(&env);
+    let (peers, ordered) = install_peers(&env, &mut source, None);
     *peers.receiver.borrow_mut() = Some(receiver);
     peers.replies.borrow_mut().extend([
         (ordered[0].clone(), Reply::Serve),
@@ -452,9 +468,9 @@ fn bounded_admission_signed_remote_saturation_exits_without_request_expiry() {
 
 #[test]
 fn serial_zero_grant_reaches_real_pending_and_disk_copy() {
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
+    let env = racer_io::Env::host();
     for (disk, missing) in [(false, false), (true, false), (false, true)] {
-        let mut target = fixture();
+        let mut target = fixture(&env);
         target.reactor.init().unwrap();
         let _ = futures::executor::block_on(target.fill.dependencies.writer.open()).unwrap();
         let mut seed_budget = AcquisitionBudget::new(target.scope.deadline.0, 4, 8);
@@ -503,8 +519,9 @@ fn serial_zero_grant_reaches_real_pending_and_disk_copy() {
                 .is_none(),
             disk || missing
         );
-        install_peers(&mut target, Some(2));
+        install_peers(&env, &mut target, Some(2));
         let (receiver, endpoint, _) = target.read_graph(
+            &env,
             Rc::new(target.fill.clone()),
             &target.membership,
             ReadGraphSettings {
@@ -516,8 +533,8 @@ fn serial_zero_grant_reaches_real_pending_and_disk_copy() {
                 seed: None,
             },
         );
-        let mut source = fixture();
-        let (peers, ordered) = install_peers(&mut source, None);
+        let mut source = fixture(&env);
+        let (peers, ordered) = install_peers(&env, &mut source, None);
         *peers.receiver.borrow_mut() = Some(receiver);
         peers.replies.borrow_mut().extend([
             (ordered[0].clone(), Reply::Deadline),
@@ -542,9 +559,9 @@ fn serial_zero_grant_reaches_real_pending_and_disk_copy() {
         let mut result = None;
         for _ in 0..4096 {
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-            uring_runtime::drivers::poll(&mut cx, 64);
             for f in [&mut source, &mut target] {
-                uring_runtime::group::Service::poll_budgeted(&mut f.engine, &mut cx, 64).unwrap();
+                f.fill.drivers().poll(&mut cx, 64);
+                crate::lifecycle::Service::poll_budgeted(&mut f.engine, &mut cx, 64).unwrap();
                 f.crypto.poll_budgeted(64).unwrap();
             }
             target.reactor.poll_budgeted(64).unwrap();
@@ -607,8 +624,9 @@ fn serial_zero_grant_reaches_real_pending_and_disk_copy() {
         let mut copy = None;
         for _ in 0..4096 {
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-            uring_runtime::drivers::poll(&mut cx, 64);
-            uring_runtime::group::Service::poll_budgeted(&mut target.engine, &mut cx, 64).unwrap();
+            source.fill.drivers().poll(&mut cx, 64);
+            target.fill.drivers().poll(&mut cx, 64);
+            crate::lifecycle::Service::poll_budgeted(&mut target.engine, &mut cx, 64).unwrap();
             target.crypto.poll_budgeted(64).unwrap();
             target.reactor.poll_budgeted(64).unwrap();
             if let Poll::Ready(done) = control.as_mut().poll(&mut cx) {
@@ -641,11 +659,12 @@ fn serial_zero_grant_reaches_real_pending_and_disk_copy() {
 
 #[test]
 fn serial_zero_grant_copy_failures_and_positive_grant_acquire() {
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
+    let env = racer_io::Env::host();
+    let drivers = Rc::new(crate::drivers::DriverQueue::new(1024));
     for attempts in [8, 16] {
         for case in ["good", "corrupt", "missing", "auth", "cancel"] {
-            let mut f = fixture();
-            let (peers, ordered) = install_peers(&mut f, None);
+            let mut f = fixture(&env);
+            let (peers, ordered) = install_peers(&env, &mut f, None);
             let failures = crate::telemetry::Failures::default();
             let mut deps = f.fill.dependencies.clone();
             deps.candidates = Rc::new(
@@ -654,9 +673,11 @@ fn serial_zero_grant_copy_failures_and_positive_grant_acquire() {
                     Rc::new(Placement::new(16)),
                     peers.requester(),
                     deps.credentials.clone(),
-                    Arc::new(controlplane::Published::new(
+                    Arc::new(crate::control::cell::PublicationCell::new(
                         crate::control::Snapshot::retention(2),
                     )),
+                    racer_io::WorkerCtx::host(),
+                    drivers.clone(),
                 )
                 .with_observer(failures.observer(WorkerId(0))),
             );
@@ -685,8 +706,9 @@ fn serial_zero_grant_copy_failures_and_positive_grant_acquire() {
                     assert_eq!(result.plaintext.bytes(), b"abc");
                     assert_eq!(result.ciphertext.bytes(), good.ciphertext.bytes());
                 }
-                "auth" => assert!(matches!(result, Err(Error::Unauthorized))),
-                "cancel" => assert!(matches!(result, Err(Error::Cancelled))),
+                // A last owner whose answer fails verification is that owner's unusable copy,
+                // not the read's end (formerly terminal `Unauthorized`).
+                "cancel" => assert!(matches!(result, Err(Error::Canceled))),
                 _ => assert!(matches!(result, Err(Error::Unavailable))),
             }
             if case != "good" {
@@ -740,9 +762,9 @@ fn serial_zero_grant_copy_failures_and_positive_grant_acquire() {
 
 #[test]
 fn serial_zero_grant_cancel_waits_for_accepted_copy_fence() {
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
-    let mut f = fixture();
-    let (peers, ordered) = install_peers(&mut f, None);
+    let env = racer_io::Env::host();
+    let mut f = fixture(&env);
+    let (peers, ordered) = install_peers(&env, &mut f, None);
     let copy = encrypted_copy(&mut f);
     let allocation = Arc::downgrade(&copy.ciphertext.inner);
     let accepted = Rc::new(Cell::new(false));
@@ -790,7 +812,7 @@ fn serial_zero_grant_cancel_waits_for_accepted_copy_fence() {
     completed.set(true);
     assert!(matches!(
         resolve.as_mut().poll(&mut cx),
-        Poll::Ready(Err(Error::Cancelled))
+        Poll::Ready(Err(Error::Canceled))
     ));
     drop(resolve);
     assert!(allocation.upgrade().is_none());
@@ -807,10 +829,10 @@ fn serial_zero_grant_cancel_waits_for_accepted_copy_fence() {
 
 #[test]
 fn serial_zero_grant_predicate_matches_unpartitioned_remote_grant() {
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
+    let env = racer_io::Env::host();
     for attempts in 0u32..=16 {
-        let mut f = fixture();
-        let (peers, ordered) = install_peers(&mut f, None);
+        let mut f = fixture(&env);
+        let (peers, ordered) = install_peers(&env, &mut f, None);
         peers.reply(&ordered[0], Reply::Copy(encrypted_copy(&mut f)));
         let mut budget = AcquisitionBudget::new(f.scope.deadline.0, attempts, 16);
         let result = acquire(&mut f, &mut budget);
@@ -832,11 +854,11 @@ fn serial_zero_grant_predicate_matches_unpartitioned_remote_grant() {
 
 #[test]
 fn invalid_signed_selection_falls_back_without_resetting_acquisition_budget() {
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
+    let env = racer_io::Env::host();
     for missing_key in [false, true] {
         for origin in [false, true] {
-            let mut f = fixture();
-            let (peers, ordered) = install_peers(&mut f, Some(1));
+            let mut f = fixture(&env);
+            let (peers, ordered) = install_peers(&env, &mut f, Some(1));
             let good = encrypted_copy(&mut f);
             let bad = unusable_copy(&f, &good, missing_key);
             peers.replies.borrow_mut().extend([
@@ -850,8 +872,9 @@ fn invalid_signed_selection_falls_back_without_resetting_acquisition_budget() {
                     },
                 ),
             ]);
-            let signers = network(4);
+            let signers = network(&env, 4);
             let (_local, mut endpoint, _published) = super::hot_reads::coordinator(
+                &env,
                 &f,
                 &signers[peers.local],
                 &f.membership,
@@ -862,7 +885,8 @@ fn invalid_signed_selection_falls_back_without_resetting_acquisition_budget() {
                 flow_control::subscriptions::Interval { start: 0, end: 1 },
             ])
             .unwrap();
-            let scheduler = crate::read::range_stream::Scheduler::new(1);
+            let scheduler =
+                crate::read::range_stream::Scheduler::new(1, racer_io::WorkerCtx::host());
             let selection = crate::read::range_stream::Selection::for_test(
                 &scheduler,
                 f.page.version.clone(),
@@ -883,8 +907,8 @@ fn invalid_signed_selection_falls_back_without_resetting_acquisition_budget() {
                     break;
                 }
                 endpoint.poll(&mut cx, 64).unwrap();
-                uring_runtime::drivers::poll(&mut cx, 64);
-                uring_runtime::group::Service::poll_budgeted(
+                f.fill.drivers().poll(&mut cx, 64);
+                crate::lifecycle::Service::poll_budgeted(
                     &mut f.engine,
                     &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
                     64,
@@ -911,12 +935,17 @@ fn invalid_signed_selection_falls_back_without_resetting_acquisition_budget() {
 
 #[test]
 fn open_subscription_selects_no_peers_after_switching_to_passthrough_local() {
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
-    let mut f = fixture();
-    let (peers, _ordered) = install_peers(&mut f, None);
-    let signers = network(4);
-    let (_local, mut endpoint, _published) =
-        super::hot_reads::coordinator(&f, &signers[peers.local], &f.membership, peers.requester());
+    let env = racer_io::Env::host();
+    let mut f = fixture(&env);
+    let (peers, _ordered) = install_peers(&env, &mut f, None);
+    let signers = network(&env, 4);
+    let (_local, mut endpoint, _published) = super::hot_reads::coordinator(
+        &env,
+        &f,
+        &signers[peers.local],
+        &f.membership,
+        peers.requester(),
+    );
     let demand =
         racer_core::subscriptions::Demand::new(vec![flow_control::subscriptions::Interval {
             start: 0,
@@ -924,10 +953,10 @@ fn open_subscription_selects_no_peers_after_switching_to_passthrough_local() {
         }])
         .unwrap();
     // The subscription and its selection exist before the switch.
-    let scheduler = crate::read::range_stream::Scheduler::new(1);
+    let scheduler = crate::read::range_stream::Scheduler::new(1, racer_io::WorkerCtx::host());
     let selection =
         crate::read::range_stream::Selection::for_test(&scheduler, f.page.version.clone(), demand);
-    f.set_mode(racer_control_wire::CacheMode::PassthroughLocal);
+    f.set_mode(&env, racer_wire::control::CacheMode::PassthroughLocal);
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 10, 18);
     let mut work = Box::pin(f.fill.select_subscription(
         &selection,
@@ -944,8 +973,8 @@ fn open_subscription_selects_no_peers_after_switching_to_passthrough_local() {
             break;
         }
         endpoint.poll(&mut cx, 64).unwrap();
-        uring_runtime::drivers::poll(&mut cx, 64);
-        uring_runtime::group::Service::poll_budgeted(
+        f.fill.drivers().poll(&mut cx, 64);
+        crate::lifecycle::Service::poll_budgeted(
             &mut f.engine,
             &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
             64,
@@ -971,10 +1000,10 @@ fn open_subscription_selects_no_peers_after_switching_to_passthrough_local() {
 
 #[test]
 fn hedged_plaintext_validates_aead_and_preserves_singleflight_and_original_credits() {
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
+    let env = racer_io::Env::host();
     for corrupt in [false, true] {
-        let mut f = fixture();
-        let (peers, ordered) = install_peers(&mut f, None);
+        let mut f = fixture(&env);
+        let (peers, ordered) = install_peers(&env, &mut f, None);
         let good = encrypted_copy(&mut f);
         let alternative = if corrupt {
             unusable_copy(&f, &good, false)
@@ -986,7 +1015,7 @@ fn hedged_plaintext_validates_aead_and_preserves_singleflight_and_original_credi
             (ordered[1].clone(), Reply::Copy(alternative)),
         ]);
         peers.primary_polls.set(40);
-        let metrics = enable_hedge(&mut f, &peers);
+        let metrics = enable_hedge(&env, &mut f, &peers);
         let mut first_budget = AcquisitionBudget::new(f.scope.deadline.0, 10, 18);
         let mut second_budget = AcquisitionBudget::new(f.scope.deadline.0, 10, 18);
         let (first, second) = drive(
@@ -1010,6 +1039,7 @@ fn hedged_plaintext_validates_aead_and_preserves_singleflight_and_original_credi
             },
             &mut f.engine,
             &f.crypto,
+            f.fill.drivers(),
         );
         let first = first.unwrap();
         let second = second.unwrap();
@@ -1054,10 +1084,11 @@ fn hedged_plaintext_validates_aead_and_preserves_singleflight_and_original_credi
 
 #[test]
 fn hedge_suppresses_without_independent_route_credits_or_local_memory() {
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
+    let env = racer_io::Env::host();
+    let drivers = Rc::new(crate::drivers::DriverQueue::new(1024));
     for reason in ["route", "credits", "memory", "slots"] {
-        let mut f = fixture();
-        let (peers, ordered) = install_peers(&mut f, None);
+        let mut f = fixture(&env);
+        let (peers, ordered) = install_peers(&env, &mut f, None);
         peers.hedge.set(reason != "route");
         let metrics = crate::telemetry::Metrics::default();
         let hedges = crate::read::candidates::Hedges::new(
@@ -1067,9 +1098,11 @@ fn hedge_suppresses_without_independent_route_credits_or_local_memory() {
                 bytes: crate::read::candidates::DUPLICATE_BYTES,
             },
             metrics.clone(),
+            racer_io::Clock::host(),
         )
         .unwrap();
-        let _slot = (reason == "slots").then(|| hedges.acquire().unwrap());
+        let _slot =
+            (reason == "slots").then(|| hedges.acquire(crate::model::PAGE_BYTES as usize).unwrap());
         let mut deps = f.fill.dependencies.clone();
         deps.candidates = Rc::new(
             CandidatePolicy::new(
@@ -1077,9 +1110,11 @@ fn hedge_suppresses_without_independent_route_credits_or_local_memory() {
                 Rc::new(Placement::new(16)),
                 peers.requester(),
                 deps.credentials.clone(),
-                Arc::new(controlplane::Published::new(
+                Arc::new(crate::control::cell::PublicationCell::new(
                     crate::control::Snapshot::retention(2),
                 )),
+                racer_io::WorkerCtx::host(),
+                drivers.clone(),
             )
             .with_hedges(hedges),
         );
@@ -1123,6 +1158,7 @@ fn hedge_suppresses_without_independent_route_credits_or_local_memory() {
             &f.scope,
             &mut budget,
             admission,
+            f.fill.page_plaintext_bytes().unwrap(),
             |_, _| Box::pin(async { panic!("suppressed hedge validation") }),
         ));
         assert!(matches!(
@@ -1154,12 +1190,16 @@ fn encrypted_copy(f: &mut Fixture) -> CiphertextCopy {
     let mut plaintext = f.fill.dependencies.buffers.plaintext(plaintext, 3).unwrap();
     plaintext.bytes_mut().unwrap().copy_from_slice(b"abc");
     let (_, ciphertext) = drive(
-        f.fill
-            .dependencies
-            .crypto
-            .encrypt(f.page.clone(), plaintext, ciphertext, &f.scope),
+        f.fill.dependencies.crypto.encrypt(
+            f.page.clone(),
+            racer_wire::object::PageSize::DEFAULT,
+            plaintext,
+            ciphertext,
+            &f.scope,
+        ),
         &mut f.engine,
         &f.crypto,
+        f.fill.drivers(),
     )
     .unwrap();
     CiphertextCopy {
@@ -1170,12 +1210,12 @@ fn encrypted_copy(f: &mut Fixture) -> CiphertextCopy {
 
 #[test]
 fn retained_small_copy_admits_actual_plaintext_with_live_pressure() {
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
-    for free in [3, 4096] {
-        let mut f = fixture();
+    let env = racer_io::Env::host();
+    // Pooled plaintext is charged at one 4 KiB granule, not a full page.
+    for free in [4096, 8192] {
+        let mut f = fixture(&env);
         let copy = encrypted_copy(&mut f);
         let admission = f.fill.dependencies.admission.clone();
-        admission.reclaim_buffers();
         let pressure = admission
             .reserve(
                 None,
@@ -1202,6 +1242,7 @@ fn retained_small_copy_admits_actual_plaintext_with_live_pressure() {
             ),
             &mut f.engine,
             &f.crypto,
+            f.fill.drivers(),
         )
         .expect("known three-byte ciphertext must not require a full plaintext page");
         assert_eq!(result.plaintext.bytes(), b"abc");
@@ -1215,7 +1256,7 @@ fn retained_small_copy_admits_actual_plaintext_with_live_pressure() {
         );
         assert_eq!(
             admission.used(ResourceClass::Plaintext),
-            pressure.amount() + 3
+            pressure.amount() + 4096
         );
         assert_eq!(f.origin.calls.get(), 0);
         assert_eq!(budget.remaining_attempts(), 8);
@@ -1225,13 +1266,13 @@ fn retained_small_copy_admits_actual_plaintext_with_live_pressure() {
 
 #[test]
 fn known_copy_admission_validates_before_reclaim_and_preserves_failures() {
+    let env = racer_io::Env::host();
     for case in [
         "success", "short", "canceled", "metadata", "identity", "corrupt",
     ] {
-        let mut f = fixture();
+        let mut f = fixture(&env);
         let mut copy = encrypted_copy(&mut f);
         let admission = f.fill.dependencies.admission.clone();
-        admission.reclaim_buffers();
         if case == "metadata" {
             copy.metadata.length = 4;
         }
@@ -1240,10 +1281,9 @@ fn known_copy_admission_validates_before_reclaim_and_preserves_failures() {
         }
         if case == "corrupt" {
             let inner = Arc::get_mut(&mut copy.ciphertext.inner).unwrap();
-            inner.bytes[0] ^= 1;
-            inner.checksum.take();
+            inner.fixture_bytes_mut()[0] ^= 1;
         }
-        let free = if case == "short" { 2 } else { 3 };
+        let free = if case == "short" { 4095 } else { 4096 };
         let pressure = admission
             .reserve(
                 None,
@@ -1262,6 +1302,7 @@ fn known_copy_admission_validates_before_reclaim_and_preserves_failures() {
                 f.fill.accept_selected(copy, &f.scope),
                 &mut f.engine,
                 &f.crypto,
+                f.fill.drivers(),
             )
             .map(|p| {
                 assert_eq!(p.plaintext.bytes(), b"abc");
@@ -1270,7 +1311,7 @@ fn known_copy_admission_validates_before_reclaim_and_preserves_failures() {
         match case {
             "success" => assert!(result.is_ok(), "{result:?}"),
             "short" => assert_eq!(result, Err(Error::Overloaded)),
-            "canceled" => assert_eq!(result, Err(Error::Cancelled)),
+            "canceled" => assert_eq!(result, Err(Error::Canceled)),
             _ => assert_eq!(result, Err(Error::CorruptRecord)),
         }
         assert_eq!(pressure.amount(), before);
@@ -1285,7 +1326,6 @@ fn known_copy_admission_validates_before_reclaim_and_preserves_failures() {
                     .unwrap()
                     .is_none()
             );
-            admission.reclaim_buffers();
             assert_eq!(admission.used(ResourceClass::Plaintext), before);
         }
     }
@@ -1293,10 +1333,10 @@ fn known_copy_admission_validates_before_reclaim_and_preserves_failures() {
 
 #[test]
 fn known_copy_reclaims_only_idle_bytes_after_validation() {
-    let mut f = fixture();
+    let env = racer_io::Env::host();
+    let mut f = fixture(&env);
     let copy = encrypted_copy(&mut f);
     let admission = f.fill.dependencies.admission.clone();
-    admission.reclaim_buffers();
     let mut descriptor = copy.metadata.immutable();
     descriptor.version.etag = StrongEtag::test_value("busy");
     let busy = crate::memory::tests::bundle_for(&admission, descriptor.clone());
@@ -1306,15 +1346,16 @@ fn known_copy_reclaims_only_idle_bytes_after_validation() {
     let idle_id = idle.plaintext.page().clone();
     f.fill.dependencies.memory.publish(idle).unwrap();
     // Only the busy reader's plaintext is charged; the cache released the idle
-    // page's plaintext at publication. Leave room for exactly one small page.
-    assert_eq!(admission.used(ResourceClass::Plaintext), 3);
+    // page's plaintext at publication. Leave room for exactly one small page,
+    // charged at its 4 KiB pooled granule.
+    assert_eq!(admission.used(ResourceClass::Plaintext), 4096);
     let pressure = admission
         .reserve(
             None,
             ResourceClass::Plaintext,
             admission.limit(ResourceClass::Plaintext)
                 - admission.used(ResourceClass::Plaintext)
-                - 3,
+                - 4096,
         )
         .unwrap();
     let mut wrong = copy.clone();
@@ -1332,7 +1373,7 @@ fn known_copy_reclaims_only_idle_bytes_after_validation() {
             .is_some()
     );
     let reservation = f.fill.reserve_copy_plaintext(&f.page, &copy).unwrap();
-    assert_eq!(reservation.amount(), 3);
+    assert_eq!(reservation.amount(), 4096);
     // Plaintext admission never needs to evict cached ciphertext.
     assert!(
         f.fill
@@ -1353,13 +1394,14 @@ fn known_copy_reclaims_only_idle_bytes_after_validation() {
     assert_eq!(busy.plaintext.bytes(), &[1; 3]);
     assert_eq!(
         admission.used(ResourceClass::Plaintext),
-        pressure.amount() + 6
+        pressure.amount() + 8192
     );
 }
 
 #[test]
 fn known_copy_full_page_still_requires_full_plaintext_admission() {
-    let mut f = fixture_with(PAGE_BYTES, None);
+    let env = racer_io::Env::host();
+    let mut f = fixture_with(&env, PAGE_BYTES, None);
     let admission = f.fill.dependencies.admission.clone();
     let plaintext = f.fill.reserve_bootstrap(&f.context.object.cache).unwrap();
     let plaintext = f
@@ -1376,19 +1418,22 @@ fn known_copy_full_page_still_requires_full_plaintext_admission() {
         )
         .unwrap();
     let (_, ciphertext) = drive(
-        f.fill
-            .dependencies
-            .crypto
-            .encrypt(f.page.clone(), plaintext, ciphertext, &f.scope),
+        f.fill.dependencies.crypto.encrypt(
+            f.page.clone(),
+            racer_wire::object::PageSize::DEFAULT,
+            plaintext,
+            ciphertext,
+            &f.scope,
+        ),
         &mut f.engine,
         &f.crypto,
+        f.fill.drivers(),
     )
     .unwrap();
     let copy = CiphertextCopy {
         metadata: f.origin.metadata.clone(),
         ciphertext,
     };
-    admission.reclaim_buffers();
     let pressure = admission
         .reserve(
             None,
@@ -1405,7 +1450,11 @@ fn known_copy_full_page_still_requires_full_plaintext_admission() {
     assert_eq!(reservation.amount(), PAGE_BYTES as usize);
 }
 
-fn enable_hedge(f: &mut Fixture, peers: &Rc<ScriptedPeers>) -> crate::telemetry::Metrics {
+fn enable_hedge(
+    env: &racer_io::Env,
+    f: &mut Fixture,
+    peers: &Rc<ScriptedPeers>,
+) -> crate::telemetry::Metrics {
     peers.hedge.set(true);
     let metrics = crate::telemetry::Metrics::default();
     let hedges = crate::read::candidates::Hedges::new(
@@ -1415,6 +1464,7 @@ fn enable_hedge(f: &mut Fixture, peers: &Rc<ScriptedPeers>) -> crate::telemetry:
             bytes: crate::read::candidates::DUPLICATE_BYTES,
         },
         metrics.clone(),
+        env.ctx.clock.clone(),
     )
     .unwrap();
     let mut deps = f.fill.dependencies.clone();
@@ -1424,9 +1474,11 @@ fn enable_hedge(f: &mut Fixture, peers: &Rc<ScriptedPeers>) -> crate::telemetry:
             Rc::new(Placement::new(16)),
             peers.requester(),
             deps.credentials.clone(),
-            Arc::new(controlplane::Published::new(
+            Arc::new(crate::control::cell::PublicationCell::new(
                 crate::control::Snapshot::retention(2),
             )),
+            env.ctx.clone(),
+            deps.candidates.drivers().clone(),
         )
         .with_hedges(hedges),
     );
@@ -1436,19 +1488,21 @@ fn enable_hedge(f: &mut Fixture, peers: &Rc<ScriptedPeers>) -> crate::telemetry:
 
 #[test]
 fn hedge_stalled_primary_copy_miss_keeps_time_and_credits_for_later_acquire() {
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
     for third in [false, true] {
-        let clock = uring_runtime::environment::SimulationClock::new(920);
-        let _env = clock.environment(0).enter();
-        let mut f = fixture();
-        f.scope = RequestScope::new(
+        let clock = racer_io::SimClock::new(920);
+        let sim_env = clock.ctx(0);
+        let env = racer_io::Env::new(racer_io::Driver::Uring, sim_env.clone());
+        let sim_ctx = sim_env.clone();
+        let mut f = fixture(&env);
+        f.scope = RequestScope::on(
+            &sim_ctx.clock,
             f.scope.request,
-            uring_runtime::environment::now() + Duration::from_secs(30),
+            sim_ctx.clock.now() + Duration::from_secs(30),
         )
         .unwrap();
-        let (peers, ordered) = install_peers(&mut f, None);
+        let (peers, ordered) = install_peers(&env, &mut f, None);
         let good = encrypted_copy(&mut f);
-        let metrics = enable_hedge(&mut f, &peers);
+        let metrics = enable_hedge(&env, &mut f, &peers);
         peers.primary_polls.set(100);
         *peers.advance_primary.borrow_mut() = Some(clock.clone());
         peers.replies.borrow_mut().extend([
@@ -1466,13 +1520,13 @@ fn hedge_stalled_primary_copy_miss_keeps_time_and_credits_for_later_acquire() {
         if third {
             peers.reply(&ordered[2], Reply::Copy(good));
         }
-        let start = uring_runtime::environment::now();
+        let start = sim_ctx.clock.now();
         let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 10, 18);
         let result = acquire(&mut f, &mut budget).unwrap();
         assert_eq!(result.plaintext.bytes(), b"abc");
         assert!(peers.canceled_primary.get());
-        assert!(uring_runtime::environment::now() < f.scope.deadline.0);
-        assert!(uring_runtime::environment::now().duration_since(start) <= Duration::from_secs(12));
+        assert!(sim_ctx.clock.now() < f.scope.deadline.0);
+        assert!(sim_ctx.clock.now().duration_since(start) <= Duration::from_secs(12));
         let calls = peers.calls.borrow();
         assert_eq!(calls.len(), if third { 4 } else { 3 });
         assert!(calls[1].1);
@@ -1491,16 +1545,17 @@ fn hedge_stalled_primary_copy_miss_keeps_time_and_credits_for_later_acquire() {
 
 #[test]
 fn hedge_stale_membership_refreshes_once_without_fresh_credits() {
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
+    let env = racer_io::Env::host();
+    let drivers = Rc::new(crate::drivers::DriverQueue::new(1024));
     for stale_again in [false, true] {
         for secondary_stale in [false, true] {
-            let mut f = fixture();
-            let (peers, ordered) = install_peers(&mut f, None);
+            let mut f = fixture(&env);
+            let (peers, ordered) = install_peers(&env, &mut f, None);
             let good = encrypted_copy(&mut f);
-            let metrics = enable_hedge(&mut f, &peers);
+            let metrics = enable_hedge(&env, &mut f, &peers);
             let latest = Arc::new(
                 Membership::validate(
-                    racer_control_wire::MembershipVersion(2),
+                    racer_wire::control::MembershipVersion(2),
                     f.membership.members().to_vec(),
                 )
                 .unwrap(),
@@ -1513,6 +1568,8 @@ fn hedge_stale_membership_refreshes_once_without_fresh_credits() {
                     peers.requester(),
                     deps.credentials.clone(),
                     crate::test_support::published_membership(latest.clone()),
+                    racer_io::WorkerCtx::host(),
+                    drivers.clone(),
                 )
                 .with_hedges(deps.candidates.hedge_owner().unwrap().clone()),
             );
@@ -1561,10 +1618,10 @@ fn hedge_stale_membership_refreshes_once_without_fresh_credits() {
 
 #[test]
 fn hedge_continuation_preserves_version_failure_and_never_restarts_consumed_primary() {
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
-    let mut f = fixture();
-    let (peers, ordered) = install_peers(&mut f, None);
-    let metrics = enable_hedge(&mut f, &peers);
+    let env = racer_io::Env::host();
+    let mut f = fixture(&env);
+    let (peers, ordered) = install_peers(&env, &mut f, None);
+    let metrics = enable_hedge(&env, &mut f, &peers);
     peers.replies.borrow_mut().extend(
         ordered
             .iter()
@@ -1583,10 +1640,10 @@ fn hedge_continuation_preserves_version_failure_and_never_restarts_consumed_prim
 
 #[test]
 fn hedge_default_budget_never_sends_underfunded_second_cold_fallback() {
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
-    let mut f = fixture();
-    let (peers, ordered) = install_peers(&mut f, None);
-    let metrics = enable_hedge(&mut f, &peers);
+    let env = racer_io::Env::host();
+    let mut f = fixture(&env);
+    let (peers, ordered) = install_peers(&env, &mut f, None);
+    let metrics = enable_hedge(&env, &mut f, &peers);
     peers.primary_polls.set(40);
     peers.replies.borrow_mut().extend([
         (ordered[0].clone(), Reply::Miss),
@@ -1707,7 +1764,7 @@ impl Peer {
                             ciphertext.bytes().len(),
                         )?,
                         ciphertext.envelope().clone(),
-                        ciphertext.bytes().to_vec(),
+                        ciphertext.bytes(),
                     )?;
                     PeerResponse::Page {
                         metadata,
@@ -1725,16 +1782,17 @@ impl Peer {
 
 #[test]
 fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_original_budget() {
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
+    let env = racer_io::Env::host();
+    let drivers = Rc::new(crate::drivers::DriverQueue::new(1024));
     for target_rank in [1usize, 2] {
         let hedge_metrics = crate::telemetry::Metrics::default();
-        let mut fixtures: Vec<_> = (0..4).map(|_| fixture()).collect();
-        let (_, ordered) = install_peers(&mut fixtures[0], None);
+        let mut fixtures: Vec<_> = (0..4).map(|_| fixture(&env)).collect();
+        let (_, ordered) = install_peers(&env, &mut fixtures[0], None);
         let membership = fixtures[0].membership.clone();
         let source = (0..4).find(|i| !ordered.contains(&node(*i))).unwrap();
         let target = (0..4).find(|i| node(*i) == ordered[target_rank]).unwrap();
         let mesh = Rc::new(Mesh {
-            signing: network(4).into_iter().map(Forwarding::new).collect(),
+            signing: network(&env, 4).into_iter().map(Forwarding::new).collect(),
             nodes: RefCell::new(Vec::new()),
             calls: RefCell::new(Vec::new()),
             unavailable: RefCell::new(ordered[..target_rank].to_vec()),
@@ -1754,15 +1812,18 @@ fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_orig
                 node(i),
                 Rc::new(Placement::new(16)),
                 Requester::scripted(
+                    env.ctx.clock.clone(),
                     peers.clone(),
                     Peer::direct_hedge_available,
                     Peer::request,
                     Peer::request_direct,
                 ),
                 f.fill.dependencies.credentials.clone(),
-                Arc::new(controlplane::Published::new(
+                Arc::new(crate::control::cell::PublicationCell::new(
                     crate::control::Snapshot::retention(2),
                 )),
+                racer_io::WorkerCtx::host(),
+                drivers.clone(),
             );
             if i == source {
                 policy = policy.with_hedges(
@@ -1773,6 +1834,7 @@ fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_orig
                             bytes: crate::read::candidates::DUPLICATE_BYTES,
                         },
                         hedge_metrics.clone(),
+                        racer_io::Clock::host(),
                     )
                     .unwrap(),
                 );
@@ -1781,6 +1843,7 @@ fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_orig
             deps.candidates = Rc::new(policy);
             f.fill = Fill::new(deps);
             let (coordinator, endpoint, _) = f.read_graph(
+                &env,
                 Rc::new(f.fill.clone()),
                 &membership,
                 ReadGraphSettings {
@@ -1820,9 +1883,9 @@ fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_orig
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         let mut result = None;
         for _ in 0..512 {
-            uring_runtime::drivers::poll(&mut cx, 64);
             for f in &mut fixtures {
-                uring_runtime::group::Service::poll_budgeted(
+                f.fill.drivers().poll(&mut cx, 64);
+                crate::lifecycle::Service::poll_budgeted(
                     &mut f.engine,
                     &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
                     64,
@@ -1886,12 +1949,12 @@ fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_orig
 
 #[test]
 fn hedge_full_page_exact_plaintext_quotas_suppress_before_spending_serial_credits() {
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
+    let env = racer_io::Env::host();
     for pages in [2, 3, 4] {
         let mut limits = crate::test_support::cluster::config(false).limits;
         limits.plaintext_bytes = std::num::NonZeroUsize::new(PAGE_BYTES as usize * pages).unwrap();
-        let mut f = fixture_with(PAGE_BYTES, Some(limits));
-        let (peers, ordered) = install_peers(&mut f, None);
+        let mut f = fixture_with(&env, PAGE_BYTES, Some(limits));
+        let (peers, ordered) = install_peers(&env, &mut f, None);
         let plaintext = f.fill.reserve_bootstrap(&f.context.object.cache).unwrap();
         let ciphertext = f
             .fill
@@ -1910,12 +1973,16 @@ fn hedge_full_page_exact_plaintext_quotas_suppress_before_spending_serial_credit
             .plaintext(plaintext, PAGE_BYTES as usize)
             .unwrap();
         let (plain, ciphertext) = drive(
-            f.fill
-                .dependencies
-                .crypto
-                .encrypt(f.page.clone(), plaintext, ciphertext, &f.scope),
+            f.fill.dependencies.crypto.encrypt(
+                f.page.clone(),
+                racer_wire::object::PageSize::DEFAULT,
+                plaintext,
+                ciphertext,
+                &f.scope,
+            ),
             &mut f.engine,
             &f.crypto,
+            f.fill.drivers(),
         )
         .unwrap();
         drop(plain);
@@ -1924,7 +1991,7 @@ fn hedge_full_page_exact_plaintext_quotas_suppress_before_spending_serial_credit
             ciphertext,
         };
         peers.reply(&ordered[0], Reply::Copy(copy.clone()));
-        let metrics = enable_hedge(&mut f, &peers);
+        let metrics = enable_hedge(&env, &mut f, &peers);
         if pages == 4 {
             peers.primary_polls.set(40);
             peers.reply(&ordered[1], Reply::Copy(copy));
@@ -1951,10 +2018,10 @@ fn hedge_full_page_exact_plaintext_quotas_suppress_before_spending_serial_credit
 
 #[test]
 fn hedge_authenticated_metadata_conflict_cannot_win_over_retained_descriptor() {
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
+    let env = racer_io::Env::host();
     for content_type in [false, true] {
-        let mut f = fixture_with(PAGE_BYTES + 3, None);
-        let (peers, ordered) = install_peers(&mut f, None);
+        let mut f = fixture_with(&env, PAGE_BYTES + 3, None);
+        let (peers, ordered) = install_peers(&env, &mut f, None);
         f.page.number = crate::model::PageNumber(1);
         let mut retained = encrypted_copy(&mut f);
         retained.metadata.content_type =
@@ -1986,12 +2053,16 @@ fn hedge_authenticated_metadata_conflict_cannot_win_over_retained_descriptor() {
             .plaintext(plaintext, PAGE_BYTES as usize)
             .unwrap();
         let (plain, ciphertext) = drive(
-            f.fill
-                .dependencies
-                .crypto
-                .encrypt(f.page.clone(), plaintext, ciphertext, &f.scope),
+            f.fill.dependencies.crypto.encrypt(
+                f.page.clone(),
+                racer_wire::object::PageSize::DEFAULT,
+                plaintext,
+                ciphertext,
+                &f.scope,
+            ),
             &mut f.engine,
             &f.crypto,
+            f.fill.drivers(),
         )
         .unwrap();
         drop(plain);
@@ -2006,7 +2077,7 @@ fn hedge_authenticated_metadata_conflict_cannot_win_over_retained_descriptor() {
         } else {
             bad.metadata.length += 1;
         }
-        let metrics = enable_hedge(&mut f, &peers);
+        let metrics = enable_hedge(&env, &mut f, &peers);
         peers.primary_polls.set(40);
         peers.replies.borrow_mut().extend([
             (ordered[0].clone(), Reply::Copy(good)),
@@ -2024,11 +2095,11 @@ fn hedge_authenticated_metadata_conflict_cannot_win_over_retained_descriptor() {
 
 #[test]
 fn hedge_loser_child_cancels_accepted_crypto_but_waits_for_completion_fence() {
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
-    let mut f = fixture();
-    let (peers, ordered) = install_peers(&mut f, None);
+    let env = racer_io::Env::host();
+    let mut f = fixture(&env);
+    let (peers, ordered) = install_peers(&env, &mut f, None);
     let good = encrypted_copy(&mut f);
-    let metrics = enable_hedge(&mut f, &peers);
+    let metrics = enable_hedge(&env, &mut f, &peers);
     peers.replies.borrow_mut().extend([
         (ordered[0].clone(), Reply::Copy(good.clone())),
         (ordered[1].clone(), Reply::Copy(good)),
@@ -2052,6 +2123,7 @@ fn hedge_loser_child_cancels_accepted_crypto_but_waits_for_completion_fence() {
         &f.scope,
         &mut budget,
         &f.fill.dependencies.admission,
+        f.fill.page_plaintext_bytes().unwrap(),
         |response, child| {
             let first = scopes.borrow().is_empty();
             scopes.borrow_mut().push(child.clone());
@@ -2061,7 +2133,7 @@ fn hedge_loser_child_cancels_accepted_crypto_but_waits_for_completion_fence() {
             Box::pin(async move {
                 if first {
                     let result = fill.decrypt_response(page, response, None, &child).await;
-                    canceled.set(matches!(result, Err(Error::Cancelled)));
+                    canceled.set(matches!(result, Err(Error::Canceled)));
                     result
                 } else {
                     Ok(crate::read::tests::page(2))
@@ -2077,13 +2149,13 @@ fn hedge_loser_child_cancels_accepted_crypto_but_waits_for_completion_fence() {
         "primary crypto accepted before winner"
     );
     assert_eq!(scopes.borrow().len(), 2);
-    assert!(scopes.borrow()[0].cancellation.is_cancelled());
-    assert!(!f.scope.cancellation.is_cancelled());
+    assert!(scopes.borrow()[0].cancellation.is_canceled());
+    assert!(!f.scope.cancellation.is_canceled());
     assert!(
         pair.as_mut().poll(&mut cx).is_pending(),
         "cancellation is not the crypto fence"
     );
-    uring_runtime::group::Service::poll_budgeted(
+    crate::lifecycle::Service::poll_budgeted(
         &mut f.engine,
         &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
         8,
@@ -2106,11 +2178,11 @@ fn hedge_loser_child_cancels_accepted_crypto_but_waits_for_completion_fence() {
 /// Both hedge validations remain one composite driver call while crypto is parked.
 #[test]
 fn expiry_snapshot_overlapped_hedge_validation_stays_composite() {
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
-    let mut f = fixture();
-    let (peers, ordered) = install_peers(&mut f, None);
+    let env = racer_io::Env::host();
+    let mut f = fixture(&env);
+    let (peers, ordered) = install_peers(&env, &mut f, None);
     let good = encrypted_copy(&mut f);
-    enable_hedge(&mut f, &peers);
+    enable_hedge(&env, &mut f, &peers);
     peers.replies.borrow_mut().extend([
         (ordered[0].clone(), Reply::Copy(good.clone())),
         (ordered[1].clone(), Reply::Copy(good)),
@@ -2138,7 +2210,7 @@ fn expiry_snapshot_overlapped_hedge_validation_stays_composite() {
     let flights = &f.fill.dependencies.flights;
     for _ in 0..2 {
         let entry = flights
-            .expiry_snapshot_without_ticket(uring_runtime::environment::now())
+            .expiry_snapshot_without_ticket(racer_io::Clock::host().now())
             .entries[0]
             .unwrap();
         assert_eq!(
@@ -2148,18 +2220,18 @@ fn expiry_snapshot_overlapped_hedge_validation_stays_composite() {
         assert_eq!(entry.cancel_request_seen_age_us, None);
         assert!(acquire.as_mut().poll(&mut cx).is_pending());
     }
-    assert!(drive(acquire, &mut f.engine, &f.crypto).is_ok());
+    assert!(drive(acquire, &mut f.engine, &f.crypto, f.fill.drivers()).is_ok());
     assert_eq!(f.crypto.outstanding(), 0);
 }
 
 #[test]
 fn hedge_child_cancellation_removes_crypto_admission_wait_without_canceling_accepted_job() {
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
+    let env = racer_io::Env::host();
     let mut limits = crate::test_support::cluster::config(false).limits;
     limits.queue_entries = std::num::NonZeroUsize::new(1).unwrap();
-    let mut f = fixture_with(3, Some(limits));
+    let mut f = fixture_with(&env, 3, Some(limits));
     let copy = encrypted_copy(&mut f);
-    let child = RequestScope::new(f.scope.request, f.scope.deadline.0).unwrap();
+    let child = RequestScope::host(f.scope.request, f.scope.deadline.0).unwrap();
     let mut accepted = Box::pin(f.fill.decrypt(
         &f.page,
         copy.clone(),
@@ -2182,12 +2254,12 @@ fn hedge_child_cancellation_removes_crypto_admission_wait_without_canceling_acce
     child.cancel().unwrap();
     assert!(matches!(
         waiting.as_mut().poll(&mut cx),
-        Poll::Ready(Err(Error::Cancelled))
+        Poll::Ready(Err(Error::Canceled))
     ));
     drop(waiting);
-    assert!(!f.scope.cancellation.is_cancelled());
+    assert!(!f.scope.cancellation.is_canceled());
     assert_eq!(f.crypto.outstanding(), 1);
-    uring_runtime::group::Service::poll_budgeted(
+    crate::lifecycle::Service::poll_budgeted(
         &mut f.engine,
         &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
         8,
@@ -2206,7 +2278,7 @@ fn unusable_copy(f: &Fixture, good: &CiphertextCopy, missing_key: bool) -> Ciphe
     let mut envelope = good.ciphertext.envelope().clone();
     let mut bytes = good.ciphertext.bytes().to_vec();
     if missing_key {
-        envelope.key_id = racer_control_wire::KeyId([99; 16]);
+        envelope.key_id = racer_wire::control::KeyId([99; 16]);
     } else {
         bytes[0] ^= 1;
     }
@@ -2232,13 +2304,14 @@ fn unusable_copy(f: &Fixture, good: &CiphertextCopy, missing_key: bool) -> Ciphe
         metadata: good.metadata.clone(),
         ciphertext,
     };
-    validate_copy(&copy, &f.page).unwrap(); // Structural checks cannot detect flipped ciphertext.
+    validate_copy(&copy, &f.page, crate::model::PageSize::DEFAULT).unwrap(); // Structural checks cannot detect flipped ciphertext.
     copy
 }
 
 #[test]
 fn corrupt_disk_decrypt_is_counted_without_publishing_plaintext() {
-    let mut f = fixture();
+    let env = racer_io::Env::host();
+    let mut f = fixture(&env);
     let good = encrypted_copy(&mut f);
     let bad = unusable_copy(&f, &good, false);
     let dirty = f
@@ -2260,6 +2333,7 @@ fn corrupt_disk_decrypt_is_counted_without_publishing_plaintext() {
         &f.reactor,
         &mut f.engine,
         &f.crypto,
+        f.fill.drivers(),
     )
     .unwrap();
     assert!(result.is_none());
@@ -2281,7 +2355,7 @@ fn assert_published(f: &Fixture, result: &PageResult, persist: bool) {
         assert_eq!(copy.ciphertext.bytes(), result.ciphertext.bytes());
     }
     assert_eq!(f.crypto.outstanding(), 0);
-    assert_eq!(uring_runtime::drivers::pending(), 0);
+    assert_eq!(f.fill.drivers().pending(), 0);
 }
 
 fn assert_unpublished(f: &Fixture) {
@@ -2315,13 +2389,46 @@ fn assert_unpublished(f: &Fixture) {
     assert_eq!(f.crypto.outstanding(), 0);
 }
 
+/// Rank 0 signing any answer to this node shows it alive: a page this node noted busy on rank 0
+/// stays `Fetching` past its interval instead of turning `Overdue` and reaching origin.
+#[test]
+fn a_signed_rank0_answer_keeps_its_busy_pages_waiting() {
+    use racer_core::liveness::{HANG_AFTER, Rank0State};
+    let env = racer_io::Env::host();
+    let mut f = fixture(&env);
+    let (peers, ordered) = install_peers(&env, &mut f, Some(1));
+    let mut other = f.page.clone();
+    other.number = PageNumber(f.page.number.0 + 1);
+    let earlier = racer_io::Clock::host().now() - HANG_AFTER - Duration::from_secs(1);
+    f.fill
+        .dependencies
+        .candidates
+        .rank0_watch
+        .borrow_mut()
+        .busy(other.clone(), ordered[0].clone(), earlier, earlier);
+    let state = |f: &Fixture| {
+        f.fill.dependencies.candidates.rank0_watch.borrow().state(
+            &other,
+            &ordered[0],
+            racer_io::Clock::host().now(),
+        )
+    };
+    assert_eq!(state(&f), Rank0State::Overdue);
+    // Rank 0 answers this page's probe with a miss: this owner fetches it, and rank 0 is alive.
+    peers.reply(&ordered[0], Reply::Miss);
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
+    acquire(&mut f, &mut budget).unwrap();
+    assert_eq!(f.fill.metrics.count(Event::OriginWalkRank0Miss), 1);
+    assert_eq!(state(&f), Rank0State::Fetching);
+}
+
 #[test]
 fn unusable_peer_copy_advances_to_alternate_or_authorized_origin() {
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
+    let env = racer_io::Env::host();
     for missing_key in [false, true] {
         for (rank, use_origin) in [(None, false), (Some(2), false), (Some(2), true)] {
-            let mut f = fixture();
-            let (peers, ordered) = install_peers(&mut f, rank);
+            let mut f = fixture(&env);
+            let (peers, ordered) = install_peers(&env, &mut f, rank);
             let good = encrypted_copy(&mut f);
             let bad = unusable_copy(&f, &good, missing_key);
             peers.replies.borrow_mut().extend([
@@ -2340,6 +2447,12 @@ fn unusable_peer_copy_advances_to_alternate_or_authorized_origin() {
                 u64::from(use_origin)
             );
             assert_eq!(f.fill.metrics.count(Event::PeerHit), u64::from(!use_origin));
+            // Rank 0's unusable copy is why the walk reached origin.
+            assert_eq!(
+                f.fill.metrics.count(Event::OriginWalkRank0Unusable),
+                u64::from(use_origin)
+            );
+            assert_eq!(f.fill.metrics.count(Event::OriginWalkRank0Miss), 0);
             assert_eq!(
                 f.fill.metrics.count(Event::FillDecryptPeerCorrupt),
                 if missing_key {
@@ -2401,9 +2514,9 @@ fn unusable_peer_copy_advances_to_alternate_or_authorized_origin() {
 
 #[test]
 fn peer_ciphertext_from_another_version_cannot_be_published_under_the_pin() {
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
-    let mut f = fixture();
-    let (peers, ordered) = install_peers(&mut f, Some(1));
+    let env = racer_io::Env::host();
+    let mut f = fixture(&env);
+    let (peers, ordered) = install_peers(&env, &mut f, Some(1));
     let pinned = f.page.version.etag.clone();
     f.page.version.etag = StrongEtag::test_value("different-version");
     let other = encrypted_copy(&mut f);
@@ -2449,10 +2562,10 @@ fn peer_ciphertext_from_another_version_cannot_be_published_under_the_pin() {
 
 #[test]
 fn origin_version_miss_checks_every_later_copy_without_claiming_false_absence() {
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
+    let env = racer_io::Env::host();
     for healthy_last in [false, true] {
-        let mut f = fixture();
-        let (peers, ordered) = install_peers(&mut f, Some(0));
+        let mut f = fixture(&env);
+        let (peers, ordered) = install_peers(&env, &mut f, Some(0));
         f.origin.version_unavailable.set(true);
         let good = encrypted_copy(&mut f);
         let bad = unusable_copy(&f, &good, false);
@@ -2489,9 +2602,9 @@ fn origin_version_miss_checks_every_later_copy_without_claiming_false_absence() 
 
 #[test]
 fn corrupt_predecessor_evidence_survives_origin_and_later_copy_misses() {
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
-    let mut f = fixture();
-    let (peers, ordered) = install_peers(&mut f, Some(1));
+    let env = racer_io::Env::host();
+    let mut f = fixture(&env);
+    let (peers, ordered) = install_peers(&env, &mut f, Some(1));
     f.origin.version_unavailable.set(true);
     let good = encrypted_copy(&mut f);
     let bad = unusable_copy(&f, &good, false);
@@ -2514,7 +2627,7 @@ fn corrupt_predecessor_evidence_survives_origin_and_later_copy_misses() {
 
 #[test]
 fn corrupt_copies_exhaust_sources_or_original_credits_without_origin_for_noncandidate() {
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
+    let env = racer_io::Env::host();
     for (attempts, links, expected_calls, expected_error) in [
         (8, 16, 3, Error::Unavailable),
         (1, 16, 1, Error::Unavailable),
@@ -2523,8 +2636,8 @@ fn corrupt_copies_exhaust_sources_or_original_credits_without_origin_for_noncand
         // `Unavailable`, not `HopBudgetExhausted`.
         (8, 4, 1, Error::Unavailable),
     ] {
-        let mut f = fixture();
-        let (peers, ordered) = install_peers(&mut f, None);
+        let mut f = fixture(&env);
+        let (peers, ordered) = install_peers(&env, &mut f, None);
         let good = encrypted_copy(&mut f);
         let bad = unusable_copy(&f, &good, false);
         peers.replies.borrow_mut().extend(
@@ -2554,10 +2667,10 @@ fn corrupt_copies_exhaust_sources_or_original_credits_without_origin_for_noncand
 }
 
 #[test]
-fn unauthorized_after_corrupt_copy_is_terminal_not_origin_evidence() {
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
-    let mut f = fixture();
-    let (peers, ordered) = install_peers(&mut f, Some(2));
+fn unauthorized_after_corrupt_copy_falls_through_to_local_origin() {
+    let env = racer_io::Env::host();
+    let mut f = fixture(&env);
+    let (peers, ordered) = install_peers(&env, &mut f, Some(2));
     let good = encrypted_copy(&mut f);
     let bad = unusable_copy(&f, &good, false);
     peers.replies.borrow_mut().extend([
@@ -2565,28 +2678,27 @@ fn unauthorized_after_corrupt_copy_is_terminal_not_origin_evidence() {
         (ordered[1].clone(), Reply::Unauthorized),
     ]);
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
-    assert!(matches!(
-        acquire(&mut f, &mut budget),
-        Err(Error::Unauthorized)
-    ));
-    assert_eq!(f.origin.calls.get(), 0);
+    // Formerly terminal `Unauthorized`: a verification failure is rank 1's unusable copy, so
+    // the local rank 2 owner fetches from origin. Both failures are transient evidence.
+    assert!(acquire(&mut f, &mut budget).is_ok());
+    assert_eq!(f.origin.calls.get(), 1);
     assert_eq!(peers.calls.borrow().len(), 2);
-    // The Acquire to rank 0 spends its exchange and rank 0's origin credit.
-    assert_eq!(budget.remaining_attempts(), 5);
-    assert_unpublished(&f);
+    // The Acquire to rank 0 spends its exchange and rank 0's origin credit; rank 1 its exchange.
+    assert_eq!(budget.remaining_attempts(), 4);
 }
 
 #[test]
 fn corrupt_copy_cannot_extend_original_budget_deadline() {
-    let clock = uring_runtime::environment::SimulationClock::new(921);
-    let _environment = clock.environment(0).enter();
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
-    let mut f = fixture();
-    let (peers, ordered) = install_peers(&mut f, Some(2));
+    let clock = racer_io::SimClock::new(921);
+    let sim_env = clock.ctx(0);
+    let env = racer_io::Env::new(racer_io::Driver::Uring, sim_env.clone());
+    let sim_ctx = sim_env.clone();
+    let mut f = fixture(&env);
+    let (peers, ordered) = install_peers(&env, &mut f, Some(2));
     let good = encrypted_copy(&mut f);
     let bad = unusable_copy(&f, &good, false);
     peers.reply(&ordered[0], Reply::Copy(bad));
-    let deadline = uring_runtime::environment::now() + Duration::from_millis(100);
+    let deadline = sim_ctx.clock.now() + Duration::from_millis(100);
     let mut budget = AcquisitionBudget::new(deadline, 8, 16);
     let mut future = Box::pin(f.fill.acquire_once(
         &f.page,
@@ -2601,7 +2713,7 @@ fn corrupt_copy_cannot_extend_original_budget_deadline() {
     assert_eq!(f.crypto.outstanding(), 1);
     // Complete AEAD while live, then resume fallback after the tighter budget
     // deadline. The caller scope is still live and must not renew that deadline.
-    uring_runtime::group::Service::poll_budgeted(
+    crate::lifecycle::Service::poll_budgeted(
         &mut f.engine,
         &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
         64,
@@ -2609,7 +2721,7 @@ fn corrupt_copy_cannot_extend_original_budget_deadline() {
     .unwrap();
     clock.advance(Duration::from_millis(100));
     assert!(matches!(
-        drive(future, &mut f.engine, &f.crypto),
+        drive(future, &mut f.engine, &f.crypto, f.fill.drivers()),
         Err(Error::DeadlineExceeded)
     ));
     assert_eq!(peers.calls.borrow().len(), 1);
@@ -2628,14 +2740,15 @@ fn corrupt_copy_cannot_extend_original_budget_deadline() {
 #[test]
 fn replica_selection_orders_first_acquire_and_non_primary_owner_fills() {
     use crate::read::candidates::ReplicaSelection;
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
+    let env = racer_io::Env::host();
+    let drivers = Rc::new(crate::drivers::DriverQueue::new(1024));
     for selection in [ReplicaSelection::Primary, ReplicaSelection::Spread] {
-        let mut fixtures: Vec<_> = (0..4).map(|_| fixture()).collect();
-        let (_, ordered) = install_peers(&mut fixtures[0], None);
+        let mut fixtures: Vec<_> = (0..4).map(|_| fixture(&env)).collect();
+        let (_, ordered) = install_peers(&env, &mut fixtures[0], None);
         let membership = fixtures[0].membership.clone();
         let source = (0..4).find(|i| !ordered.contains(&node(*i))).unwrap();
         let mesh = Rc::new(Mesh {
-            signing: network(4).into_iter().map(Forwarding::new).collect(),
+            signing: network(&env, 4).into_iter().map(Forwarding::new).collect(),
             nodes: RefCell::new(Vec::new()),
             calls: RefCell::new(Vec::new()),
             unavailable: RefCell::new(Vec::new()),
@@ -2656,15 +2769,18 @@ fn replica_selection_orders_first_acquire_and_non_primary_owner_fills() {
                 node(i),
                 Rc::new(Placement::new(16)),
                 Requester::scripted(
+                    env.ctx.clock.clone(),
                     peers.clone(),
                     Peer::direct_hedge_available,
                     Peer::request,
                     Peer::request_direct,
                 ),
                 f.fill.dependencies.credentials.clone(),
-                Arc::new(controlplane::Published::new(
+                Arc::new(crate::control::cell::PublicationCell::new(
                     crate::control::Snapshot::retention(2),
                 )),
+                racer_io::WorkerCtx::host(),
+                drivers.clone(),
             )
             .with_replica_selection(selection);
             if i == source {
@@ -2678,6 +2794,7 @@ fn replica_selection_orders_first_acquire_and_non_primary_owner_fills() {
             deps.candidates = Rc::new(policy);
             f.fill = Fill::new(deps);
             let (coordinator, endpoint, _) = f.read_graph(
+                &env,
                 Rc::new(f.fill.clone()),
                 &membership,
                 ReadGraphSettings {
@@ -2714,9 +2831,9 @@ fn replica_selection_orders_first_acquire_and_non_primary_owner_fills() {
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         let mut result = None;
         for _ in 0..512 {
-            uring_runtime::drivers::poll(&mut cx, 64);
             for f in &mut fixtures {
-                uring_runtime::group::Service::poll_budgeted(
+                f.fill.drivers().poll(&mut cx, 64);
+                crate::lifecycle::Service::poll_budgeted(
                     &mut f.engine,
                     &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
                     64,
@@ -2788,6 +2905,7 @@ fn replica_selection_orders_first_acquire_and_non_primary_owner_fills() {
 
 /// Wrap `copy`'s ciphertext as a received registered RDMA page on `f`'s pool.
 fn registered_copy(
+    env: &racer_io::Env,
     f: &Fixture,
     w: &mut crate::rdma::links::tests::World,
     copy: &CiphertextCopy,
@@ -2798,7 +2916,7 @@ fn registered_copy(
         copy.ciphertext.envelope().clone(),
         bytes,
     );
-    let received = crate::rdma::links::tests::receive_registered(w, &sent);
+    let received = crate::rdma::links::tests::receive_registered(env, w, &sent);
     let admission = &f.fill.dependencies.admission;
     let reservation = admission
         .reserve(
@@ -2818,13 +2936,16 @@ fn registered_copy(
 }
 
 fn free_buffers(w: &crate::rdma::links::tests::World) -> Option<usize> {
-    w.a.links
-        .buffers(racer_control_wire::RailId(7), rdma_verbs::BufferState::Free)
+    w.a.links.buffers(
+        racer_wire::control::RailId(7),
+        rdma_verbs::BufferState::Free,
+    )
 }
 
 #[test]
 fn registered_ciphertext_decrypts_in_place_and_persists_a_copy() {
-    let mut f = fixture_with(3, None);
+    let env = racer_io::Env::host();
+    let mut f = fixture_with(&env, 3, None);
     let mut w = crate::rdma::links::tests::world_for(
         [
             crate::rdma::links::tests::node_id(1),
@@ -2832,25 +2953,32 @@ fn registered_ciphertext_decrypts_in_place_and_persists_a_copy() {
         ],
         false,
     );
-    crate::rdma::links::tests::link_up(&mut w);
+    let env = w.env.clone();
+    crate::rdma::links::tests::link_up(&env, &mut w);
     let good = encrypted_copy(&mut f);
     // Tampered page-backed ciphertext fails authentication and frees the buffer.
     let mut tampered = good.ciphertext.bytes().to_vec();
     tampered[0] ^= 1;
-    let bad = registered_copy(&f, &mut w, &good, tampered);
+    let bad = registered_copy(&env, &f, &mut w, &good, tampered);
     let reservation = f.fill.reserve_bootstrap(&f.context.object.cache).unwrap();
+    let before = crate::memory::registered_copy_outs();
     let decrypted = drive(
         f.fill
             .decrypt(&f.page, bad, reservation, &f.scope, DecryptSource::Peer),
         &mut f.engine,
         &f.crypto,
+        f.fill.drivers(),
     );
     assert_eq!(decrypted.err(), Some(Error::CorruptRecord));
+    // The copy-out precedes decryption, so the crypto helper never reads the
+    // registered buffer; the failed page's copy is simply dropped.
+    assert_eq!(crate::memory::registered_copy_outs(), before + 1);
     crate::rdma::links::tests::pump(&mut w.a.owner, &mut w.b.owner);
     assert_eq!(free_buffers(&w), Some(2));
-    // Page-backed ciphertext decrypts in place, then is copied out once into
-    // pooled aligned storage so the cache and write queue share one page.
-    let copy = registered_copy(&f, &mut w, &good, good.ciphertext.bytes().to_vec());
+    // Page-backed ciphertext is copied out once into pooled aligned storage
+    // before decryption, so the cache and write queue share one page and the
+    // crypto helper reads that worker-local copy.
+    let copy = registered_copy(&env, &f, &mut w, &good, good.ciphertext.bytes().to_vec());
     let reservation = f.fill.reserve_bootstrap(&f.context.object.cache).unwrap();
     let copies = crate::memory::registered_copy_outs();
     let result = drive(
@@ -2858,6 +2986,7 @@ fn registered_ciphertext_decrypts_in_place_and_persists_a_copy() {
             .decrypt(&f.page, copy, reservation, &f.scope, DecryptSource::Peer),
         &mut f.engine,
         &f.crypto,
+        f.fill.drivers(),
     )
     .unwrap();
     assert_eq!(result.plaintext.bytes(), b"abc");
@@ -2901,9 +3030,13 @@ fn registered_ciphertext_decrypts_in_place_and_persists_a_copy() {
     );
 }
 
+/// A sealed page lives until the client sink's decrypt and the verdict's
+/// persist finish, so sealing copies a registered page out first and the
+/// RDMA buffer returns to its pool before either starts.
 #[test]
-fn registered_copy_out_refused_by_admission_keeps_the_registered_page() {
-    let mut f = fixture_with(3, None);
+fn sealing_registered_ciphertext_releases_the_buffer_before_decrypt_and_persist() {
+    let env = racer_io::Env::host();
+    let mut f = fixture_with(&env, 3, None);
     let mut w = crate::rdma::links::tests::world_for(
         [
             crate::rdma::links::tests::node_id(1),
@@ -2911,9 +3044,405 @@ fn registered_copy_out_refused_by_admission_keeps_the_registered_page() {
         ],
         false,
     );
-    crate::rdma::links::tests::link_up(&mut w);
+    let env = w.env.clone();
+    crate::rdma::links::tests::link_up(&env, &mut w);
     let good = encrypted_copy(&mut f);
-    let copy = registered_copy(&f, &mut w, &good, good.ciphertext.bytes().to_vec());
+    let copy = registered_copy(&env, &f, &mut w, &good, good.ciphertext.bytes().to_vec());
+    crate::rdma::links::tests::pump(&mut w.a.owner, &mut w.b.owner);
+    assert_eq!(
+        free_buffers(&w),
+        Some(1),
+        "the received page holds a buffer"
+    );
+    let copies = crate::memory::registered_copy_outs();
+    let sealed = f
+        .fill
+        .seal(
+            &f.page,
+            crate::memory::UnverifiedPage {
+                copy,
+                disk_token: None,
+            },
+            None,
+        )
+        .unwrap();
+    assert_eq!(crate::memory::registered_copy_outs(), copies + 1);
+    let crate::read::sealed::SealedSource::Host(host) = &sealed.source else {
+        panic!("host source");
+    };
+    assert!(!host.copy.ciphertext.is_registered());
+    assert_eq!(host.copy.ciphertext.bytes(), good.ciphertext.bytes());
+    crate::rdma::links::tests::pump(&mut w.a.owner, &mut w.b.owner);
+    assert_eq!(
+        free_buffers(&w),
+        Some(2),
+        "released while the sealed page still awaits decrypt and persist"
+    );
+    // The verdict persists the detached copy without another copy-out.
+    f.fill.sealed_verdict(sealed.report(), true);
+    assert_eq!(crate::memory::registered_copy_outs(), copies + 1);
+    drop(sealed);
+}
+
+/// For a host-read sink, sealing keeps the registered page and attaches
+/// empty aligned storage instead; the crypto worker's fused pass fills it,
+/// and the verdict persists that copy without copying the registered
+/// buffer again.
+#[test]
+fn sealing_registered_ciphertext_for_a_host_sink_detaches_during_decrypt() {
+    use std::os::unix::fs::FileExt;
+    let env = racer_io::Env::host();
+    let mut f = fixture_with(&env, 3, None);
+    let mut w = crate::rdma::links::tests::world_for(
+        [
+            crate::rdma::links::tests::node_id(1),
+            crate::rdma::links::tests::node_id(2),
+        ],
+        false,
+    );
+    let env = w.env.clone();
+    crate::rdma::links::tests::link_up(&env, &mut w);
+    let good = encrypted_copy(&mut f);
+    let copy = registered_copy(&env, &f, &mut w, &good, good.ciphertext.bytes().to_vec());
+    let copies = crate::memory::registered_copy_outs();
+    let sealed = f
+        .fill
+        .seal(
+            &f.page,
+            crate::memory::UnverifiedPage {
+                copy,
+                disk_token: None,
+            },
+            Some(None),
+        )
+        .unwrap();
+    assert_eq!(crate::memory::registered_copy_outs(), copies);
+    assert!(sealed.fused_store.is_some());
+    let crate::read::sealed::SealedSource::Host(host) = &sealed.source else {
+        panic!("host source");
+    };
+    assert!(host.copy.ciphertext.is_registered());
+    let length = sealed.plaintext_length() as u64;
+    // SAFETY: plain syscalls on a descriptor this test owns.
+    let file = unsafe {
+        use std::os::fd::FromRawFd;
+        let fd = libc::memfd_create(
+            c"racer-fused".as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        );
+        assert!(fd >= 0);
+        let file = std::fs::File::from_raw_fd(fd);
+        file.set_len(4096).unwrap();
+        assert_eq!(libc::fcntl(fd, libc::F_ADD_SEALS, libc::F_SEAL_SHRINK), 0);
+        file
+    };
+    let mapping = crate::client::direct::HostMapping::new(
+        &file,
+        racer_wire::object::client::Destination { offset: 0, length },
+    )
+    .unwrap();
+    let mut job = Box::new(crate::client::direct::DecryptInto {
+        page: sealed,
+        range: 0..length,
+        mapping: std::sync::Arc::new(mapping),
+        destination: 0,
+        stored: None,
+        node: None,
+        numa: None,
+    });
+    job.run().unwrap();
+    assert!(job.fused());
+    // Every buffer was written by this thread, so none is on another node.
+    let numa = job.numa.expect("a fused decrypt samples NUMA locality");
+    for locality in [numa.registered, numa.store, numa.destination] {
+        assert_ne!(locality, crate::client::direct::Locality::Remote);
+    }
+    let mut plaintext = vec![0; length as usize];
+    file.read_exact_at(&mut plaintext, 0).unwrap();
+    assert_eq!(plaintext, b"abc");
+    job.publish_store();
+    assert_eq!(crate::memory::registered_copy_outs(), copies + 1);
+    let mut report = job.page.report();
+    report.prefer_retained();
+    drop(job);
+    crate::rdma::links::tests::pump(&mut w.a.owner, &mut w.b.owner);
+    assert_eq!(free_buffers(&w), Some(2), "released once the pass ends");
+    f.fill.sealed_verdict(report, true);
+    assert_eq!(crate::memory::registered_copy_outs(), copies + 1);
+    // The verdict caches the detached copy, not the registered buffer.
+    let cached = f
+        .fill
+        .dependencies
+        .memory
+        .unverified(&f.page)
+        .unwrap()
+        .expect("cached after the verdict");
+    assert!(!cached.copy.ciphertext.is_registered());
+    assert_eq!(
+        f.fill
+            .metrics
+            .count(Event::HostReadFusedSkippedNotRegistered),
+        0
+    );
+    assert_eq!(f.fill.metrics.count(Event::HostReadFusedSkippedRetained), 0);
+    assert_eq!(
+        f.fill.metrics.count(Event::HostReadFusedSkippedReservation),
+        0
+    );
+}
+
+/// An elected driver for a host-read fetch leaves a registered page out of
+/// the memory cache, so the page reaches the host sink still registered and
+/// with no retained copy, and is fused. Other acquisitions publish it, which
+/// copies it out of the RDMA buffer.
+#[test]
+fn host_read_acquisition_defers_registered_publish_so_the_sink_fuses() {
+    let env = racer_io::Env::host();
+    let mut f = fixture_with(&env, 3, None);
+    let mut w = crate::rdma::links::tests::world_for(
+        [
+            crate::rdma::links::tests::node_id(1),
+            crate::rdma::links::tests::node_id(2),
+        ],
+        false,
+    );
+    let env = w.env.clone();
+    crate::rdma::links::tests::link_up(&env, &mut w);
+    let good = encrypted_copy(&mut f);
+    let bytes = good.ciphertext.bytes().to_vec();
+
+    // Deferred: nothing copied, nothing cached, and the sink fuses.
+    let mut host = f.fill.clone();
+    host.defer_registered_publish = true;
+    let page = crate::memory::UnverifiedPage {
+        copy: registered_copy(&env, &f, &mut w, &good, bytes.clone()),
+        disk_token: None,
+    };
+    let copies = crate::memory::registered_copy_outs();
+    host.publish_acquired_ciphertext(&page).unwrap();
+    assert_eq!(crate::memory::registered_copy_outs(), copies);
+    assert!(
+        f.fill
+            .dependencies
+            .memory
+            .unverified(&f.page)
+            .unwrap()
+            .is_none()
+    );
+    // The storage is bound to the decrypting helper's node when it is large
+    // enough for mmap storage, and never to another node.
+    let sealed = host.seal(&f.page, page, Some(Some(0))).unwrap();
+    let store = sealed.fused_store.as_ref().unwrap();
+    assert!(matches!(store.node(), None | Some(0)));
+    drop(sealed);
+
+    // Not deferred: publishing copies the page out, so the sink skips the
+    // fused pass and counts why.
+    let page = crate::memory::UnverifiedPage {
+        copy: registered_copy(&env, &f, &mut w, &good, bytes),
+        disk_token: None,
+    };
+    let copies = crate::memory::registered_copy_outs();
+    f.fill.publish_acquired_ciphertext(&page).unwrap();
+    assert_eq!(crate::memory::registered_copy_outs(), copies + 1);
+    assert!(page.copy.ciphertext.retained_copy().is_some());
+    assert!(
+        f.fill
+            .dependencies
+            .memory
+            .unverified(&f.page)
+            .unwrap()
+            .is_some()
+    );
+    let retained = f.fill.metrics.count(Event::HostReadFusedSkippedRetained);
+    let sealed = f.fill.seal(&f.page, page, Some(None)).unwrap();
+    assert!(sealed.fused_store.is_none());
+    assert_eq!(
+        f.fill.metrics.count(Event::HostReadFusedSkippedRetained),
+        retained + 1
+    );
+    drop(sealed);
+
+    // A page that is not registered (memory, disk, HTTP) is not fused.
+    let skipped = f
+        .fill
+        .metrics
+        .count(Event::HostReadFusedSkippedNotRegistered);
+    let sealed = f
+        .fill
+        .seal(
+            &f.page,
+            crate::memory::UnverifiedPage {
+                copy: good.clone(),
+                disk_token: None,
+            },
+            Some(None),
+        )
+        .unwrap();
+    assert!(sealed.fused_store.is_none());
+    assert_eq!(
+        f.fill
+            .metrics
+            .count(Event::HostReadFusedSkippedNotRegistered),
+        skipped + 1
+    );
+}
+
+/// A host-read page ahead of its window's head is fused only while its
+/// receive buffer's pool keeps a reserve free for heads. Below it, the page
+/// is copied out at once so it never waits for its head in a receive buffer,
+/// and when even the copy is refused it fails `Overloaded`, returning the
+/// buffer. A head is still fused. Without this, ahead pages fill the pool
+/// and every head waits for a buffer until request deadlines.
+#[test]
+fn ahead_host_read_page_leaves_its_receive_buffer_when_the_pool_is_low() {
+    let env = racer_io::Env::host();
+    let mut f = fixture_with(&env, 3, None);
+    let mut w = crate::rdma::links::tests::world_for(
+        [
+            crate::rdma::links::tests::node_id(1),
+            crate::rdma::links::tests::node_id(2),
+        ],
+        false,
+    );
+    let env = w.env.clone();
+    crate::rdma::links::tests::link_up(&env, &mut w);
+    let good = encrypted_copy(&mut f);
+    let bytes = good.ciphertext.bytes().to_vec();
+    let mut host = f.fill.clone();
+    host.defer_registered_publish = true;
+    let receive = |w: &mut crate::rdma::links::tests::World| crate::memory::UnverifiedPage {
+        copy: registered_copy(&env, &f, w, &good, bytes.clone()),
+        disk_token: None,
+    };
+    let low = |host: &Fill| host.metrics.count(Event::HostReadFusedSkippedPoolLow);
+
+    // Plenty free: an ahead page is fused like a head.
+    let page = receive(&mut w);
+    let (free, total) = page.copy.ciphertext.registered_pool_free().unwrap();
+    let reserve = ahead_registered_reserve(total);
+    assert!(free >= reserve, "free {free} of {total}");
+    let sealed = host.seal_for(&f.page, page, Some(None), true).unwrap();
+    assert!(sealed.fused_store.is_some());
+    assert_eq!(low(&host), 0);
+    drop(sealed);
+
+    // Hold buffers, as ahead pages waiting for their heads do, until the
+    // next page leaves fewer than the reserve free.
+    let mut held = Vec::new();
+    loop {
+        let page = receive(&mut w);
+        let (free, _) = page.copy.ciphertext.registered_pool_free().unwrap();
+        if free < reserve {
+            held.push(page);
+            break;
+        }
+        held.push(page);
+    }
+    let page = held.pop().unwrap();
+    let (free, _) = page.copy.ciphertext.registered_pool_free().unwrap();
+
+    // A head is still fused.
+    let head = host.seal_for(&f.page, page, Some(None), false).unwrap();
+    assert!(head.fused_store.is_some());
+    assert_eq!(low(&host), 0);
+    drop(head);
+
+    // An ahead page is copied out, returning its buffer at once.
+    let page = receive(&mut w);
+    let copies = crate::memory::registered_copy_outs();
+    let sealed = host.seal_for(&f.page, page, Some(None), true).unwrap();
+    assert!(sealed.fused_store.is_none());
+    assert_eq!(low(&host), 1);
+    assert_eq!(crate::memory::registered_copy_outs(), copies + 1);
+    let crate::read::sealed::SealedSource::Host(copy) = &sealed.source else {
+        panic!("host source");
+    };
+    assert!(!copy.copy.ciphertext.is_registered());
+    let probe = receive(&mut w);
+    assert_eq!(
+        probe.copy.ciphertext.registered_pool_free().unwrap().0,
+        free,
+        "the ahead page's buffer is free again"
+    );
+    drop(probe);
+    drop(sealed);
+
+    // A non-host (GPU) seal ignores the ahead flag.
+    let page = receive(&mut w);
+    let sealed = host.seal_for(&f.page, page, None, true).unwrap();
+    assert!(sealed.fused_store.is_none());
+    assert_eq!(low(&host), 1);
+    drop(sealed);
+
+    // With the copy refused as well, the ahead page fails Overloaded and
+    // drops its buffer, so the window retries it later.
+    let page = receive(&mut w);
+    let admission = f.fill.dependencies.admission.clone();
+    let cache = f.context.object.cache.clone();
+    let mut charges = Vec::new();
+    for amount in [65536, 4096, 1] {
+        while let Ok(charge) = admission.reserve(Some(&cache), ResourceClass::Ciphertext, amount) {
+            charges.push(charge);
+        }
+    }
+    let result = host.seal_for(&f.page, page, Some(None), true);
+    assert!(matches!(result, Err(Error::Overloaded)));
+    assert_eq!(low(&host), 2);
+    assert_eq!(host.metrics.count(Event::HostReadAheadRegisteredDropped), 1);
+    drop(charges);
+    let probe = receive(&mut w);
+    assert_eq!(
+        probe.copy.ciphertext.registered_pool_free().unwrap().0,
+        free
+    );
+    drop(probe);
+    drop(held);
+}
+
+/// A rejected host-read page is never cached by its verdict.
+#[test]
+fn rejected_host_read_page_is_not_cached() {
+    let env = racer_io::Env::host();
+    let mut f = fixture_with(&env, 3, None);
+    let good = encrypted_copy(&mut f);
+    let sealed = f
+        .fill
+        .seal(
+            &f.page,
+            crate::memory::UnverifiedPage {
+                copy: good,
+                disk_token: None,
+            },
+            Some(None),
+        )
+        .unwrap();
+    f.fill.sealed_verdict(sealed.report(), false);
+    assert!(
+        f.fill
+            .dependencies
+            .memory
+            .unverified(&f.page)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn registered_copy_out_refused_by_admission_keeps_the_registered_page() {
+    let env = racer_io::Env::host();
+    let mut f = fixture_with(&env, 3, None);
+    let mut w = crate::rdma::links::tests::world_for(
+        [
+            crate::rdma::links::tests::node_id(1),
+            crate::rdma::links::tests::node_id(2),
+        ],
+        false,
+    );
+    let env = w.env.clone();
+    crate::rdma::links::tests::link_up(&env, &mut w);
+    let good = encrypted_copy(&mut f);
+    let copy = registered_copy(&env, &f, &mut w, &good, good.ciphertext.bytes().to_vec());
     let reservation = f.fill.reserve_bootstrap(&f.context.object.cache).unwrap();
     // Exhaust ciphertext admission so the optional copy-out is refused.
     let admission = f.fill.dependencies.admission.clone();
@@ -2931,6 +3460,7 @@ fn registered_copy_out_refused_by_admission_keeps_the_registered_page() {
             .decrypt(&f.page, copy, reservation, &f.scope, DecryptSource::Peer),
         &mut f.engine,
         &f.crypto,
+        f.fill.drivers(),
     )
     .unwrap();
     assert_eq!(result.plaintext.bytes(), b"abc");
@@ -2941,6 +3471,52 @@ fn registered_copy_out_refused_by_admission_keeps_the_registered_page() {
     drop(held);
     crate::rdma::links::tests::pump(&mut w.a.owner, &mut w.b.owner);
     assert_eq!(free_buffers(&w), Some(2));
+}
+
+/// When ciphertext admission refuses the fused store, a host-read page is
+/// sealed without it and the reason is counted.
+#[test]
+fn host_read_fused_store_refused_by_admission_is_counted() {
+    let env = racer_io::Env::host();
+    let mut f = fixture_with(&env, 3, None);
+    let mut w = crate::rdma::links::tests::world_for(
+        [
+            crate::rdma::links::tests::node_id(1),
+            crate::rdma::links::tests::node_id(2),
+        ],
+        false,
+    );
+    let env = w.env.clone();
+    crate::rdma::links::tests::link_up(&env, &mut w);
+    let good = encrypted_copy(&mut f);
+    let copy = registered_copy(&env, &f, &mut w, &good, good.ciphertext.bytes().to_vec());
+    let admission = f.fill.dependencies.admission.clone();
+    let cache = f.context.object.cache.clone();
+    let mut held = Vec::new();
+    for amount in [65536, 4096, 1] {
+        while let Ok(charge) = admission.reserve(Some(&cache), ResourceClass::Ciphertext, amount) {
+            held.push(charge);
+        }
+    }
+    let refused = f.fill.metrics.count(Event::HostReadFusedSkippedReservation);
+    let sealed = f
+        .fill
+        .seal(
+            &f.page,
+            crate::memory::UnverifiedPage {
+                copy,
+                disk_token: None,
+            },
+            Some(None),
+        )
+        .unwrap();
+    assert!(sealed.fused_store.is_none());
+    assert_eq!(
+        f.fill.metrics.count(Event::HostReadFusedSkippedReservation),
+        refused + 1
+    );
+    drop(sealed);
+    drop(held);
 }
 
 /// GPU landing for `gpu-read` (GPUDirect RDMA) through `Fill::acquire_sealed`.
@@ -2965,14 +3541,15 @@ mod landing {
     /// With `lands`, the script answers with the real ciphertext written into
     /// the landing buffer, as a NIC would; otherwise the request goes to the
     /// usual peer script.
-    fn landing(ordinal: i32, lands: bool) -> Landing {
-        landing_on(ordinal, lands.then_some(1))
+    fn landing(env: &racer_io::Env, ordinal: i32, lands: bool) -> Landing {
+        landing_on(env, ordinal, lands.then_some(1))
     }
 
     /// Like [`landing`], but only the `call`th landing request (1-based)
     /// lands; the others go to the usual peer script.
-    fn landing_on(ordinal: i32, call: Option<usize>) -> Landing {
+    fn landing_on(env: &racer_io::Env, ordinal: i32, call: Option<usize>) -> Landing {
         landing_with(
+            env,
             ordinal,
             move |n| call == Some(n),
             crate::gpu::testing::helper(&[None, None]),
@@ -2980,8 +3557,9 @@ mod landing {
     }
 
     /// Like [`landing`], but every landing request lands.
-    fn landing_every(ordinal: i32) -> Landing {
+    fn landing_every(env: &racer_io::Env, ordinal: i32) -> Landing {
         landing_with(
+            env,
             ordinal,
             |_| true,
             crate::gpu::testing::helper(&[None, None]),
@@ -2991,23 +3569,25 @@ mod landing {
     /// Like [`landing_on`], on the GPUs of `helper`, which has at least two.
     /// The `n`th landing request (1-based) lands when `lands(n)`.
     fn landing_with(
+        env: &racer_io::Env,
         ordinal: i32,
         lands: impl Fn(usize) -> bool + 'static,
         helper: Arc<GpuHelper>,
     ) -> Landing {
-        landing_with_buffer(ordinal, 0, lands, helper)
+        landing_with_buffer(env, ordinal, 0, lands, helper)
     }
 
     /// Like [`landing_with`], with the landing buffer on GPU `buffer`.
     fn landing_with_buffer(
+        env: &racer_io::Env,
         ordinal: i32,
         buffer: i32,
         lands: impl Fn(usize) -> bool + 'static,
         helper: Arc<GpuHelper>,
     ) -> Landing {
-        let mut f = fixture();
+        let mut f = fixture(env);
         let copy = encrypted_copy(&mut f);
-        let (peers, ordered) = install_peers(&mut f, None);
+        let (peers, ordered) = install_peers(env, &mut f, None);
         let buffer =
             crate::gpu::testing::landing(&helper, buffer, 2 * crate::gpu::SLOT_BYTES).unwrap();
         crate::gpu::testing::nic_write(&buffer, 0, copy.ciphertext.bytes());
@@ -3041,6 +3621,7 @@ mod landing {
                             headers: vec![],
                         },
                         signature: vec![],
+                        chain: None,
                     }),
                     hops: vec![],
                 },
@@ -3054,6 +3635,7 @@ mod landing {
             node(peers.local),
             Rc::new(Placement::new(16)),
             Requester::scripted(
+                env.ctx.clock.clone(),
                 peers.clone(),
                 ScriptedPeers::direct_hedge_available,
                 ScriptedPeers::request,
@@ -3061,9 +3643,11 @@ mod landing {
             )
             .with_scripted_landing(ordinal, land),
             dependencies.credentials.clone(),
-            Arc::new(controlplane::Published::new(
+            Arc::new(crate::control::cell::PublicationCell::new(
                 crate::control::Snapshot::retention(2),
             )),
+            racer_io::WorkerCtx::host(),
+            f.fill.drivers().clone(),
         ));
         f.fill = Fill::new(dependencies);
         own(&f, false);
@@ -3082,10 +3666,7 @@ mod landing {
     }
 
     fn acquire_sealed_on(l: &mut Landing, ordinal: i32) -> Result<Fetched> {
-        let target = SealedTarget {
-            helper: l.helper.clone(),
-            ordinal,
-        };
+        let target = SealedTarget::gpu(l.helper.clone(), ordinal);
         let mut budget = AcquisitionBudget::new(l.f.scope.deadline.0, 16, 32);
         let f = &mut l.f;
         drive(
@@ -3099,6 +3680,7 @@ mod landing {
             ),
             &mut f.engine,
             &f.crypto,
+            f.fill.drivers(),
         )
     }
 
@@ -3107,10 +3689,7 @@ mod landing {
         let f = &mut l.f;
         let targets: Vec<SealedTarget> = ordinals
             .iter()
-            .map(|&ordinal| SealedTarget {
-                helper: l.helper.clone(),
-                ordinal,
-            })
+            .map(|&ordinal| SealedTarget::gpu(l.helper.clone(), ordinal))
             .collect();
         let deadline = f.scope.deadline.0;
         let fill = f.fill.clone();
@@ -3126,7 +3705,12 @@ mod landing {
                     .await
             }
         });
-        drive(futures::future::join_all(fetches), &mut f.engine, &f.crypto)
+        drive(
+            futures::future::join_all(fetches),
+            &mut f.engine,
+            &f.crypto,
+            f.fill.drivers(),
+        )
     }
 
     /// Ready on the second poll, so a concurrent future runs in between.
@@ -3189,8 +3773,8 @@ mod landing {
     /// CPU decrypt, no memory publication, no persistence, no host
     /// ciphertext charge, and a later plain read fetches it again.
     fn landed_peer_page_decrypts_on_the_gpu_and_stays_private() {
-        let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
-        let mut l = landing(0, true);
+        let env = racer_io::Env::host();
+        let mut l = landing(&env, 0, true);
         let ciphertext =
             l.f.fill
                 .dependencies
@@ -3200,7 +3784,6 @@ mod landing {
             panic!("expected a sealed page");
         };
         assert!(matches!(sealed.source, SealedSource::Landed(_)));
-        assert!(sealed.expected_crc.is_none());
         // One landing request to the first provider, none through the script.
         assert_eq!(l.asked.get(), 1);
         assert!(l.peers.calls.borrow().is_empty());
@@ -3235,8 +3818,8 @@ mod landing {
     /// No free landing slot at this node: the provider sends the page to
     /// host memory, and that answer is used once rather than fetched again.
     fn host_answer_to_a_landing_request_is_used_once_and_not_published() {
-        let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
-        let mut l = landing(0, false);
+        let env = racer_io::Env::host();
+        let mut l = landing(&env, 0, false);
         l.peers.reply(&l.ordered[0], Reply::Copy(l.copy.clone()));
         let Fetched::Sealed(sealed) = acquire_sealed(&mut l).unwrap() else {
             panic!("expected a sealed page");
@@ -3262,8 +3845,8 @@ mod landing {
     /// A landing buffer on another GPU is never used, and a failed landing
     /// request falls back to the usual acquisition.
     fn landing_falls_back_to_the_usual_path() {
-        let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
-        let mut l = landing(1, true);
+        let env = racer_io::Env::host();
+        let mut l = landing(&env, 1, true);
         l.peers.reply(&l.ordered[0], Reply::Copy(l.copy.clone()));
         let fetched = acquire_sealed(&mut l).unwrap();
         assert!(!matches!(
@@ -3272,7 +3855,7 @@ mod landing {
         ));
         assert_eq!(l.asked.get(), 0);
         assert_eq!(l.peers.calls.borrow().len(), 1);
-        let mut l = landing(0, false);
+        let mut l = landing(&env, 0, false);
         {
             let mut replies = l.peers.replies.borrow_mut();
             replies.push_back((l.ordered[0].clone(), Reply::Unauthorized));
@@ -3291,9 +3874,8 @@ mod landing {
     /// The first provider misses: the next provider in visit order is asked
     /// to land the page, and its page lands in GPU memory.
     fn next_provider_lands_after_a_miss() {
-        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
-        let _owner = queue.enter();
-        let mut l = landing_on(0, Some(2));
+        let env = racer_io::Env::host();
+        let mut l = landing_on(&env, 0, Some(2));
         l.peers
             .replies
             .borrow_mut()
@@ -3318,9 +3900,8 @@ mod landing {
     /// Landing asks at most `LANDING_PROVIDERS` providers; after that the
     /// usual path runs.
     fn landing_stops_after_its_provider_limit() {
-        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
-        let _owner = queue.enter();
-        let mut l = landing_on(0, None);
+        let env = racer_io::Env::host();
+        let mut l = landing_on(&env, 0, None);
         {
             let mut replies = l.peers.replies.borrow_mut();
             replies.push_back((l.ordered[0].clone(), Reply::Miss));
@@ -3341,9 +3922,9 @@ mod landing {
     /// other make one landing request. The others reuse the landed
     /// ciphertext, and each GPU still verifies and decrypts it itself.
     fn concurrent_sealed_fetches_on_peer_gpus_share_one_landing() {
-        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
-        let _owner = queue.enter();
+        let env = racer_io::Env::host();
         let mut l = landing_with(
+            &env,
             0,
             |n| n == 1,
             crate::gpu::testing::helper(&[None, None, None]),
@@ -3379,9 +3960,8 @@ mod landing {
     #[test]
     /// Fetches for the same GPU share one landed page.
     fn concurrent_sealed_fetches_on_one_gpu_share_one_landing() {
-        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
-        let _owner = queue.enter();
-        let mut l = landing(0, true);
+        let env = racer_io::Env::host();
+        let mut l = landing(&env, 0, true);
         let mut pages: Vec<_> = acquire_sealed_together(&mut l, &[0, 0])
             .into_iter()
             .map(sealed)
@@ -3398,12 +3978,11 @@ mod landing {
     /// A GPU that cannot copy from the GPU holding the page fetches for
     /// itself rather than move the page through host memory.
     fn gpu_without_a_peer_path_fetches_for_itself() {
-        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
-        let _owner = queue.enter();
+        let env = racer_io::Env::host();
         let helper = crate::gpu::testing::helper_with(&[None, None], |simulation| {
             simulation.set_peer(1, 0, false)
         });
-        let mut l = landing_with(0, |n| n == 1, helper);
+        let mut l = landing_with(&env, 0, |n| n == 1, helper);
         let first = sealed(acquire_sealed_on(&mut l, 0));
         l.peers
             .replies
@@ -3425,13 +4004,12 @@ mod landing {
     /// which has no peer path to it, lead a flight of their own: the first
     /// lands the page on GPU 1 and the second joins it.
     fn gpus_without_a_peer_path_share_among_themselves() {
-        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
-        let _owner = queue.enter();
+        let env = racer_io::Env::host();
         let helper = crate::gpu::testing::helper_with(&[None, None], |simulation| {
             simulation.set_peer(1, 0, false);
             simulation.set_peer(0, 1, false);
         });
-        let mut l = landing_with_buffer(1, 1, |n| n == 1, helper);
+        let mut l = landing_with_buffer(&env, 1, 1, |n| n == 1, helper);
         let crate::read::gpu_copies::Lookup::Lead(lead) =
             l.f.fill.gpu_copies.lookup(&l.f.page, &l.helper, 0)
         else {
@@ -3458,9 +4036,8 @@ mod landing {
     /// A held copy is reused by a later fetch; once every holder dropped
     /// it, the table keeps nothing alive and the page is fetched again.
     fn shared_copy_lives_only_while_a_request_holds_it() {
-        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
-        let _owner = queue.enter();
-        let mut l = landing_every(0);
+        let env = racer_io::Env::host();
+        let mut l = landing_every(&env, 0);
         let first = sealed(acquire_sealed_on(&mut l, 0));
         let second = sealed(acquire_sealed_on(&mut l, 1));
         assert_eq!(l.asked.get(), 1);
@@ -3485,9 +4062,8 @@ mod landing {
     /// A fetch waiting on another request's fetch gets its copy when it
     /// finishes, without a request of its own.
     fn waiting_fetch_gets_the_leaders_copy() {
-        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
-        let _owner = queue.enter();
-        let mut l = landing(0, true);
+        let env = racer_io::Env::host();
+        let mut l = landing(&env, 0, true);
         let copy = sealed(acquire_sealed_on(&mut l, 0));
         // Forget the copy, then stand in for a leader still fetching it.
         l.f.fill.gpu_copies.forget(&l.f.page);
@@ -3497,10 +4073,7 @@ mod landing {
             panic!("expected to lead");
         };
         let shared = crate::read::gpu_copies::SharedCopy::from_sealed(&copy).unwrap();
-        let target = SealedTarget {
-            helper: l.helper.clone(),
-            ordinal: 1,
-        };
+        let target = SealedTarget::gpu(l.helper.clone(), 1);
         let f = &mut l.f;
         let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 16, 32);
         let fetch = f.fill.acquire_sealed(
@@ -3519,6 +4092,7 @@ mod landing {
             futures::future::join(fetch, finish),
             &mut f.engine,
             &f.crypto,
+            f.fill.drivers(),
         );
         let joined = sealed(fetched);
         assert!(Arc::ptr_eq(&landed_arc(&copy), &landed_arc(&joined)));
@@ -3531,9 +4105,8 @@ mod landing {
     /// A leader that finishes with nothing sends a waiting fetch straight to
     /// the host path without a GPU attempt of its own.
     fn finished_lead_without_a_copy_skips_the_waiters_gpu_fetch() {
-        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
-        let _owner = queue.enter();
-        let mut l = landing(0, true);
+        let env = racer_io::Env::host();
+        let mut l = landing(&env, 0, true);
         l.peers
             .replies
             .borrow_mut()
@@ -3543,10 +4116,7 @@ mod landing {
         else {
             panic!("expected to lead");
         };
-        let target = SealedTarget {
-            helper: l.helper.clone(),
-            ordinal: 0,
-        };
+        let target = SealedTarget::gpu(l.helper.clone(), 0);
         let f = &mut l.f;
         let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 16, 32);
         let fetch = f.fill.acquire_sealed(
@@ -3565,6 +4135,7 @@ mod landing {
             futures::future::join(fetch, finish),
             &mut f.engine,
             &f.crypto,
+            f.fill.drivers(),
         );
         let fetched = fetched.unwrap();
         assert!(!matches!(
@@ -3580,18 +4151,14 @@ mod landing {
     /// When the leading request ends before its fetch does, a waiting
     /// fetch looks again and fetches the page itself.
     fn abandoned_lead_lets_the_waiting_fetch_fetch() {
-        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
-        let _owner = queue.enter();
-        let mut l = landing(0, true);
+        let env = racer_io::Env::host();
+        let mut l = landing(&env, 0, true);
         let crate::read::gpu_copies::Lookup::Lead(lead) =
             l.f.fill.gpu_copies.lookup(&l.f.page, &l.helper, 0)
         else {
             panic!("expected to lead");
         };
-        let target = SealedTarget {
-            helper: l.helper.clone(),
-            ordinal: 0,
-        };
+        let target = SealedTarget::gpu(l.helper.clone(), 0);
         let f = &mut l.f;
         let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 16, 32);
         let fetch = f.fill.acquire_sealed(
@@ -3604,13 +4171,14 @@ mod landing {
         );
         let cancel = async move {
             yield_once().await;
-            // The leading request was cancelled: its future is dropped.
+            // The leading request was canceled: its future is dropped.
             drop(lead);
         };
         let (fetched, ()) = drive(
             futures::future::join(fetch, cancel),
             &mut f.engine,
             &f.crypto,
+            f.fill.drivers(),
         );
         let page = sealed(fetched);
         assert!(matches!(page.source, SealedSource::Landed(_)));
@@ -3620,19 +4188,15 @@ mod landing {
     }
 
     #[test]
-    /// A cancelled leading fetch abandons its lead, and the next fetch
+    /// A canceled leading fetch abandons its lead, and the next fetch
     /// leads instead of waiting forever.
-    fn cancelled_leading_fetch_does_not_block_later_fetches() {
-        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
-        let _owner = queue.enter();
-        let mut l = landing(0, true);
+    fn canceled_leading_fetch_does_not_block_later_fetches() {
+        let env = racer_io::Env::host();
+        let mut l = landing(&env, 0, true);
         l.f.scope.cancellation.cancel().unwrap();
-        assert!(matches!(
-            acquire_sealed_on(&mut l, 0),
-            Err(Error::Cancelled)
-        ));
+        assert!(matches!(acquire_sealed_on(&mut l, 0), Err(Error::Canceled)));
         assert_eq!(l.f.fill.gpu_copies.len(), 0);
-        l.f.scope = RequestScope::new(l.f.scope.request, l.f.scope.deadline.0).unwrap();
+        l.f.scope = RequestScope::host(l.f.scope.request, l.f.scope.deadline.0).unwrap();
         let page = sealed(acquire_sealed_on(&mut l, 0));
         assert_eq!(l.asked.get(), 1);
         assert_decrypts(&l.helper, 1, 0, page);
@@ -3642,9 +4206,8 @@ mod landing {
     /// A GPU that rejects a shared copy makes the owner forget it, so the
     /// next fetch does not reuse it even while another request holds it.
     fn failed_verdict_forgets_the_shared_copy() {
-        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
-        let _owner = queue.enter();
-        let mut l = landing_every(0);
+        let env = racer_io::Env::host();
+        let mut l = landing_every(&env, 0);
         let first = sealed(acquire_sealed_on(&mut l, 0));
         let report = first.report();
         assert!(report.landed && report.has_owner_state(false) && !report.has_owner_state(true));
@@ -3667,9 +4230,8 @@ mod landing {
     /// rejected ciphertext, so its copy is not shared once it finishes: the
     /// next fetch fetches again.
     fn failed_verdict_detaches_an_in_flight_fetch() {
-        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
-        let _owner = queue.enter();
-        let mut l = landing_every(0);
+        let env = racer_io::Env::host();
+        let mut l = landing_every(&env, 0);
         let first = sealed(acquire_sealed_on(&mut l, 0));
         // Stand in for a fetch that started before the verdict and will
         // finish with the same ciphertext.
@@ -3702,9 +4264,9 @@ mod landing {
     /// A local-route passthrough sealed read on a non-owner fills from this
     /// node's origin without asking any peer to land the page.
     fn passthrough_local_sealed_read_never_asks_peers() {
-        let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
-        let mut l = landing(0, true);
-        l.f.set_mode(racer_control_wire::CacheMode::PassthroughLocal);
+        let env = racer_io::Env::host();
+        let mut l = landing(&env, 0, true);
+        l.f.set_mode(&env, racer_wire::control::CacheMode::PassthroughLocal);
         let fetched = acquire_sealed(&mut l);
         assert!(fetched.is_ok(), "{:?}", fetched.err());
         assert_eq!(l.asked.get(), 0);
@@ -3725,12 +4287,12 @@ mod landing {
     /// A disk copy written before a switch to passthrough is not staged for a
     /// sealed read in either passthrough mode.
     fn passthrough_sealed_read_does_not_stage_a_residual_disk_copy() {
+        let env = racer_io::Env::host();
         for mode in [
-            racer_control_wire::CacheMode::PassthroughPeers,
-            racer_control_wire::CacheMode::PassthroughLocal,
+            racer_wire::control::CacheMode::PassthroughPeers,
+            racer_wire::control::CacheMode::PassthroughLocal,
         ] {
-            let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
-            let mut l = landing(0, false);
+            let mut l = landing(&env, 0, false);
             let deps = l.f.fill.dependencies.clone();
             let dirty = deps
                 .admission
@@ -3747,7 +4309,7 @@ mod landing {
                 "{mode:?}"
             );
             deps.memory.remove_cache(&l.f.context.object.cache).unwrap();
-            l.f.set_mode(mode);
+            l.f.set_mode(&env, mode);
             l.peers.reply(&l.ordered[0], Reply::Copy(l.copy.clone()));
             let fetched = acquire_sealed(&mut l);
             assert!(fetched.is_ok(), "{mode:?}: {:?}", fetched.err());
@@ -3777,7 +4339,7 @@ fn version(
     let members = f.membership.members().iter().filter(|m| keep(&m.node));
     Arc::new(
         Membership::validate_with_predecessor(
-            racer_control_wire::MembershipVersion(v),
+            racer_wire::control::MembershipVersion(v),
             members.cloned().collect(),
             old,
         )
@@ -3794,13 +4356,13 @@ fn install_versions(
     versions: &[(Arc<Membership>, u64)],
     wait: bool,
 ) -> Rc<Placement> {
-    let published = Arc::new(controlplane::Published::new(
+    let published = Arc::new(crate::control::cell::PublicationCell::new(
         crate::control::Snapshot::retention(2),
     ));
-    let now = uring_runtime::environment::now();
+    let now = racer_io::Clock::host().now();
     for (i, (membership, ago)) in versions.iter().enumerate() {
         let mut snapshot = crate::control::Snapshot::membership_fixture(membership.clone());
-        snapshot.sequence = racer_control_wire::PublicationSequence(i as u64 + 1);
+        snapshot.sequence = racer_wire::control::PublicationSequence(i as u64 + 1);
         let at = now - Duration::from_secs(*ago);
         published
             .publish(Arc::new(snapshot), at, |_, _| Ok::<_, Error>(()), || ())
@@ -3814,6 +4376,8 @@ fn install_versions(
         peers.requester(),
         deps.credentials.clone(),
         published,
+        racer_io::WorkerCtx::host(),
+        deps.candidates.drivers().clone(),
     );
     policy.instant_stale_wait.set(wait);
     deps.candidates = Rc::new(policy);
@@ -3830,6 +4394,8 @@ fn publish_same_membership(f: &mut Fixture, peers: &Rc<ScriptedPeers>) {
         peers.requester(),
         deps.credentials.clone(),
         crate::test_support::published_membership(f.membership.clone()),
+        racer_io::WorkerCtx::host(),
+        deps.candidates.drivers().clone(),
     ));
     f.fill = Fill::new(deps);
 }
@@ -3840,7 +4406,7 @@ fn publish_same_membership(f: &mut Fixture, peers: &Rc<ScriptedPeers>) {
 /// Without any published membership the stale answer is terminal `Unavailable`.
 #[test]
 fn stale_answers_without_a_newer_membership() {
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
+    let env = racer_io::Env::host();
     // (this node's rank, a membership is published, stale owners, a copy follows) ->
     // (probes, origin calls)
     for (rank, published, stale, copy, probes, origin) in [
@@ -3849,8 +4415,8 @@ fn stale_answers_without_a_newer_membership() {
         (Some(1), true, 1, false, 1, 1),
         (None, false, 1, false, 1, 0),
     ] {
-        let mut f = fixture();
-        let (peers, ordered) = install_peers(&mut f, rank);
+        let mut f = fixture(&env);
+        let (peers, ordered) = install_peers(&env, &mut f, rank);
         if published {
             publish_same_membership(&mut f, &peers);
         }
@@ -3894,7 +4460,7 @@ fn stale_answers_without_a_newer_membership() {
 /// fallback never reaches the origin and never grows the budget.
 #[test]
 fn stale_owners_fall_back_to_the_recent_previous_membership() {
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
+    let env = racer_io::Env::host();
     // (seconds since version 1 was replaced, version 1 lists this node,
     // previous owners copy) -> fell back
     for (age, member, copy, fell_back) in [
@@ -3904,8 +4470,8 @@ fn stale_owners_fall_back_to_the_recent_previous_membership() {
         (0, false, true, false),
         (0, true, false, true),
     ] {
-        let mut f = fixture();
-        let (peers, ordered) = install_peers(&mut f, None);
+        let mut f = fixture(&env);
+        let (peers, ordered) = install_peers(&env, &mut f, None);
         let good = encrypted_copy(&mut f);
         let local = node(peers.local);
         let current = version(&f, 2, |_| true, None);
@@ -3973,7 +4539,7 @@ fn stale_owners_fall_back_to_the_recent_previous_membership() {
 /// goes on as before and fails `Unavailable` without reaching the origin.
 #[test]
 fn readers_that_cannot_fall_back_wait_for_an_owner_that_is_behind() {
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
+    let env = racer_io::Env::host();
     // (wait available, read attempts and links, owners asked in order
     // (indexes into the visit order), whether the last one answers with the
     // copy)
@@ -3994,8 +4560,8 @@ fn readers_that_cannot_fall_back_wait_for_an_owner_that_is_behind() {
         (false, 8, 16, &[0, 1, 2], false),
     ];
     for (wait, attempts, links, asked, adopts) in cases {
-        let mut f = fixture();
-        let (peers, ordered) = install_peers(&mut f, None);
+        let mut f = fixture(&env);
+        let (peers, ordered) = install_peers(&env, &mut f, None);
         let good = encrypted_copy(&mut f);
         let local = node(peers.local);
         let current = version(&f, 2, |_| true, None);
@@ -4054,15 +4620,15 @@ fn readers_that_cannot_fall_back_wait_for_an_owner_that_is_behind() {
 /// chain where every owner arrived together it asks no one and fetches.
 #[test]
 fn a_newer_owner_asks_older_later_owners_before_origin() {
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
+    let env = racer_io::Env::host();
     for (chained, holder) in [
         (true, Some(1)),
         (true, Some(2)),
         (true, None),
         (false, None),
     ] {
-        let mut f = fixture();
-        let (peers, ordered) = install_peers(&mut f, Some(0));
+        let mut f = fixture(&env);
+        let (peers, ordered) = install_peers(&env, &mut f, Some(0));
         let good = encrypted_copy(&mut f);
         let members = f.membership.members().to_vec();
         let local = node(peers.local);
@@ -4131,7 +4697,7 @@ fn a_newer_owner_asks_older_later_owners_before_origin() {
 /// at once, and keeps the credit.
 #[test]
 fn a_delegated_rank_zero_asks_lineage_and_demoted_targets_on_their_own_grant() {
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
+    let env = racer_io::Env::host();
     // (chained, holder: canonical rank 1 or 2, or 3 for the demoted member)
     for (chained, holder) in [
         (true, Some(1)),
@@ -4140,8 +4706,8 @@ fn a_delegated_rank_zero_asks_lineage_and_demoted_targets_on_their_own_grant() {
         (true, None),
         (false, None),
     ] {
-        let mut f = fixture();
-        let (peers, ordered) = install_peers(&mut f, Some(0));
+        let mut f = fixture(&env);
+        let (peers, ordered) = install_peers(&env, &mut f, Some(0));
         let good = encrypted_copy(&mut f);
         let members = f.membership.members().to_vec();
         let local = node(peers.local);
@@ -4227,9 +4793,9 @@ fn a_delegated_rank_zero_asks_lineage_and_demoted_targets_on_their_own_grant() {
 #[test]
 fn a_granted_batch_feeds_silence_evidence() {
     use racer_core::read::Answering;
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
-    let mut f = fixture();
-    let (peers, ordered) = install_peers(&mut f, Some(0));
+    let env = racer_io::Env::host();
+    let mut f = fixture(&env);
+    let (peers, ordered) = install_peers(&env, &mut f, Some(0));
     let members = f.membership.members().to_vec();
     let local = node(peers.local);
     let demoted = members
@@ -4266,7 +4832,7 @@ fn a_granted_batch_feeds_silence_evidence() {
     // No ping is due for a granted target.
     assert!(
         health
-            .due_pings(uring_runtime::environment::now(), 8)
+            .due_pings(racer_io::Clock::host().now(), 8)
             .is_empty()
     );
 }
@@ -4278,10 +4844,10 @@ fn a_granted_batch_feeds_silence_evidence() {
 /// that owner when it can.
 #[test]
 fn stale_fallback_never_makes_a_previous_owner_fetch() {
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
+    let env = racer_io::Env::host();
     for wait in [false, true] {
-        let mut f = fixture();
-        let (peers, ordered) = install_peers(&mut f, None);
+        let mut f = fixture(&env);
+        let (peers, ordered) = install_peers(&env, &mut f, None);
         let local = node(peers.local);
         let current = version(&f, 2, |_| true, None);
         // Without rank 0, version 1 has three members, this node among them, so
@@ -4331,10 +4897,10 @@ fn stale_fallback_never_makes_a_previous_owner_fetch() {
 /// origin directly.
 #[test]
 fn owner_asks_previous_membership_owners_before_origin() {
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
+    let env = racer_io::Env::host();
     for (retained, copy) in [(true, true), (true, false), (false, false)] {
-        let mut f = fixture();
-        let (peers, ordered) = install_peers(&mut f, Some(0));
+        let mut f = fixture(&env);
+        let (peers, ordered) = install_peers(&env, &mut f, Some(0));
         let good = encrypted_copy(&mut f);
         let current = version(&f, 2, |_| true, None);
         let old = version(&f, 1, |n| *n != ordered[0], None);
@@ -4388,7 +4954,7 @@ fn owner_asks_previous_membership_owners_before_origin() {
 /// the page to this owner's origin attempt.
 #[test]
 fn owner_asks_unchanged_predecessors_under_the_recent_previous_membership() {
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
+    let env = racer_io::Env::host();
     // (superseded seconds ago, rank 0 unchanged under version 1, rank 0
     // copies) -> (version rank 0 is asked under, origin calls)
     for (age, same, copy, expected) in [
@@ -4402,8 +4968,8 @@ fn owner_asks_unchanged_predecessors_under_the_recent_previous_membership() {
         // membership refresh, and this owner reaches origin.
         (0, true, false, (1, 1)),
     ] {
-        let mut f = fixture();
-        let (peers, ordered) = install_peers(&mut f, Some(1));
+        let mut f = fixture(&env);
+        let (peers, ordered) = install_peers(&env, &mut f, Some(1));
         let good = encrypted_copy(&mut f);
         let current = version(&f, 2, |_| true, None);
         // Without rank 0, version 1 ranks someone else first.
@@ -4453,11 +5019,11 @@ fn owner_asks_unchanged_predecessors_under_the_recent_previous_membership() {
 /// forwards its spare credits so rank 0 can ask the previous owners too.
 #[test]
 fn owner_with_handoff_targets_delegates_with_spare_credits() {
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
+    let env = racer_io::Env::host();
     // Owner credits -> remote credits the Acquire carries to rank 0.
     for (attempts, remote) in [(3, 1), (4, 2), (6, 4), (8, 4)] {
-        let mut f = fixture();
-        let (peers, ordered) = install_peers(&mut f, Some(1));
+        let mut f = fixture(&env);
+        let (peers, ordered) = install_peers(&env, &mut f, Some(1));
         let good = encrypted_copy(&mut f);
         let current = version(&f, 2, |_| true, None);
         // Rank 0 joined in version 2.
@@ -4534,16 +5100,17 @@ struct SuccessorFixture {
 }
 
 impl SuccessorFixture {
-    fn new() -> Self {
-        Self::at_rank(0, "successor", 0x41)
+    fn new(env: &racer_io::Env) -> Self {
+        Self::at_rank(env, 0, "successor", 0x41)
     }
 
     /// The fixture's node as the page's owner at `rank`, signing request
     /// attempts from `ids` on.
-    fn at_rank(rank: usize, name: &'static str, ids: u8) -> Self {
-        let mut f = fixture();
-        let (peers, ordered) = install_peers(&mut f, Some(rank));
+    fn at_rank(env: &racer_io::Env, rank: usize, name: &'static str, ids: u8) -> Self {
+        let mut f = fixture(env);
+        let (peers, ordered) = install_peers(env, &mut f, Some(rank));
         let (coordinator, _, _) = f.read_graph(
+            env,
             Rc::new(f.fill.clone()),
             &f.membership,
             ReadGraphSettings {
@@ -4565,10 +5132,11 @@ impl SuccessorFixture {
     }
 
     /// Restart the request scope with a deadline `secs` from now.
-    fn deadline(&mut self, secs: u64) {
-        self.f.scope = RequestScope::new(
+    fn deadline(&mut self, env: &racer_io::Env, secs: u64) {
+        self.f.scope = RequestScope::on(
+            &env.ctx.clock,
             self.f.scope.request,
-            uring_runtime::environment::now() + Duration::from_secs(secs),
+            env.ctx.now() + Duration::from_secs(secs),
         )
         .unwrap();
     }
@@ -4591,6 +5159,7 @@ impl SuccessorFixture {
             coordinator.serve_peer(admitted, f.membership.clone(), &f.scope),
             &mut f.engine,
             &f.crypto,
+            f.fill.drivers(),
         )
         .unwrap()
     }
@@ -4619,11 +5188,10 @@ impl SuccessorFixture {
 fn rank_zero_defers_readers_to_the_owner_it_missed() {
     use crate::telemetry::Event;
     use racer_core::read::hints::MAX_DEFERRALS;
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
-    let clock = uring_runtime::environment::SimulationClock::new(931);
-    let _env = clock.environment(0).enter();
-    let mut s = SuccessorFixture::new();
-    s.deadline(60);
+    let clock = racer_io::SimClock::new(931);
+    let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
+    let mut s = SuccessorFixture::new(&env);
+    s.deadline(&env, 60);
     let (reader, successor, other) = (s.index(None), s.index(Some(1)), s.index(Some(2)));
     // A copy-only miss is noted without ranking, but a reader's hint never
     // defers anyone: deferral checks that the hinted node owns the page.
@@ -4668,11 +5236,10 @@ fn rank_zero_defers_readers_to_the_owner_it_missed() {
 fn a_reader_returning_from_an_offer_sender_is_not_deferred_again() {
     use crate::telemetry::Event;
     use racer_core::read::hints::PROBE_AFTER;
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
-    let clock = uring_runtime::environment::SimulationClock::new(932);
-    let _env = clock.environment(0).enter();
-    let mut s = SuccessorFixture::new();
-    s.deadline(600);
+    let clock = racer_io::SimClock::new(932);
+    let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
+    let mut s = SuccessorFixture::new(&env);
+    s.deadline(&env, 600);
     let (reader, successor, sender) = (s.index(None), s.index(Some(1)), s.index(Some(2)));
     // Rank 1 missed here (a hint that defers readers), then rank 2 offered
     // its copy: the reader is deferred to the newest later owner, rank 2.
@@ -4703,11 +5270,10 @@ fn a_reader_returning_from_an_offer_sender_is_not_deferred_again() {
 fn rank_zero_never_defers_owner_requesters() {
     use crate::telemetry::Event;
     use racer_core::read::walk::{SUCCESSOR_GRANT_ATTEMPTS, SUCCESSOR_GRANT_LINKS};
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
-    let clock = uring_runtime::environment::SimulationClock::new(931);
-    let _env = clock.environment(0).enter();
-    let mut s = SuccessorFixture::new();
-    s.deadline(60);
+    let clock = racer_io::SimClock::new(931);
+    let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
+    let mut s = SuccessorFixture::new(&env);
+    s.deadline(&env, 60);
     let (successor, other) = (s.index(Some(1)), s.index(Some(2)));
     s.miss(successor, FetchMode::CopyOnly);
     assert_eq!(s.count(Event::SuccessorHint), 1);
@@ -4734,11 +5300,10 @@ fn rank_zero_never_defers_owner_requesters() {
 #[test]
 fn rank_zero_copies_from_the_owner_it_missed() {
     use crate::telemetry::Event;
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
-    let clock = uring_runtime::environment::SimulationClock::new(931);
-    let _env = clock.environment(0).enter();
-    let mut s = SuccessorFixture::new();
-    s.deadline(60);
+    let clock = racer_io::SimClock::new(931);
+    let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
+    let mut s = SuccessorFixture::new(&env);
+    s.deadline(&env, 60);
     let (successor, other) = (s.index(Some(1)), s.index(Some(2)));
     s.miss(successor, FetchMode::CopyOnly);
     // The hinted owner's own fetch has had time to finish.
@@ -4759,8 +5324,8 @@ fn rank_zero_copies_from_the_owner_it_missed() {
 #[test]
 fn rank_one_never_defers_to_rank_zero() {
     use crate::telemetry::Event;
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
-    let mut s = SuccessorFixture::at_rank(1, "successor-rank1", 0x61);
+    let env = racer_io::Env::host();
+    let mut s = SuccessorFixture::at_rank(&env, 1, "successor-rank1", 0x61);
     let (rank0, reader) = (s.index(Some(0)), s.index(None));
     s.miss(rank0, FetchMode::CopyOnly);
     assert_eq!(s.count(Event::SuccessorHint), 1);
@@ -4777,8 +5342,8 @@ fn rank_one_never_defers_to_rank_zero() {
 #[test]
 fn rank_zero_without_hints_acquires_for_readers() {
     use crate::telemetry::Event;
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
-    let mut s = SuccessorFixture::new();
+    let env = racer_io::Env::host();
+    let mut s = SuccessorFixture::new(&env);
     let reader = s.index(None);
     s.page(reader, FetchMode::Acquire);
     assert_eq!(s.f.origin.calls.get(), 1);
@@ -4791,8 +5356,8 @@ fn rank_zero_without_hints_acquires_for_readers() {
 #[test]
 fn rank_zero_never_defers_to_a_reader() {
     use crate::telemetry::Event;
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
-    let mut s = SuccessorFixture::new();
+    let env = racer_io::Env::host();
+    let mut s = SuccessorFixture::new(&env);
     let reader = s.index(None);
     s.miss(reader, FetchMode::CopyOnly);
     assert_eq!(s.count(Event::SuccessorHint), 1);
@@ -4864,6 +5429,7 @@ impl SuccessorFixture {
             coordinator.serve_peer(admitted, f.membership.clone(), &f.scope),
             &mut f.engine,
             &f.crypto,
+            f.fill.drivers(),
         )
         .unwrap()
     }
@@ -4877,11 +5443,10 @@ impl SuccessorFixture {
 #[test]
 fn rank_zero_notes_an_offer_and_copies_from_its_sender() {
     use crate::telemetry::Event;
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
-    let clock = uring_runtime::environment::SimulationClock::new(937);
-    let _env = clock.environment(0).enter();
-    let mut s = SuccessorFixture::new();
-    s.deadline(60);
+    let clock = racer_io::SimClock::new(937);
+    let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
+    let mut s = SuccessorFixture::new(&env);
+    s.deadline(&env, 60);
     let (holder, reader) = (s.index(Some(1)), s.index(None));
     assert!(matches!(s.offer(holder), PeerResponse::Miss));
     assert_eq!(s.count(Event::OrphanOfferNoted), 1);
@@ -4904,8 +5469,8 @@ fn rank_zero_notes_an_offer_and_copies_from_its_sender() {
 #[test]
 fn offer_to_a_holder_is_answered_without_a_body_or_hint() {
     use crate::telemetry::Event;
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
-    let mut s = SuccessorFixture::new();
+    let env = racer_io::Env::host();
+    let mut s = SuccessorFixture::new(&env);
     let (reader, holder) = (s.index(None), s.index(Some(1)));
     s.page(reader, FetchMode::Acquire);
     assert_eq!(s.f.origin.calls.get(), 1);
@@ -4919,9 +5484,9 @@ fn offer_to_a_holder_is_answered_without_a_body_or_hint() {
 /// non-page operation, and keeps the mode on the wire.
 #[test]
 fn offer_encoding_is_restricted_to_credential_free_page_requests() {
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
-    let mut f = fixture();
-    let (peers, _) = install_peers(&mut f, Some(0));
+    let env = racer_io::Env::host();
+    let mut f = fixture(&env);
+    let (peers, _) = install_peers(&env, &mut f, Some(0));
     let from = (peers.local + 1) % 4;
     let admitted = offer_request(&f, &peers, from, 0x31);
     assert!(matches!(
@@ -4959,11 +5524,11 @@ fn offer_encoding_is_restricted_to_credential_free_page_requests() {
         metadata: None,
         authorization: None,
     };
-    assert!(crate::peer::protocol::request_head(&base(1, &bare)).is_err());
+    assert!(crate::peer::protocol::request_head(&env.ctx.clock, &base(1, &bare)).is_err());
     // Origin credentials (the fixture's context carries them).
     let sealed = base(0, &f.context);
     if sealed.origin.authorization.is_some() || sealed.origin.metadata.is_some() {
-        assert!(crate::peer::protocol::request_head(&sealed).is_err());
+        assert!(crate::peer::protocol::request_head(&env.ctx.clock, &sealed).is_err());
     }
     // Not a page.
     let mut metadata = base(0, &bare);
@@ -4972,8 +5537,8 @@ fn offer_encoding_is_restricted_to_credential_free_page_requests() {
         selector: crate::model::MetadataSelector::Fresh,
         mode: FetchMode::Offer,
     };
-    assert!(crate::peer::protocol::request_head(&metadata).is_err());
-    assert!(crate::peer::protocol::request_head(&base(0, &bare)).is_ok());
+    assert!(crate::peer::protocol::request_head(&env.ctx.clock, &metadata).is_err());
+    assert!(crate::peer::protocol::request_head(&env.ctx.clock, &base(0, &bare)).is_ok());
 }
 
 /// Drive this node's due copy offers until `n` more of them ended.
@@ -5003,6 +5568,7 @@ fn drive_offers(f: &mut Fixture, now: Instant, n: u64, holds_all: bool) {
         }),
         &mut f.engine,
         &f.crypto,
+        f.fill.drivers(),
     );
 }
 
@@ -5014,9 +5580,9 @@ fn drive_offers(f: &mut Fixture, now: Instant, n: u64, holds_all: bool) {
 fn owner_after_rank_zero_offers_its_origin_fetch_later() {
     use crate::telemetry::Event;
     use racer_core::read::hints::{NOTICE_DELAYS, NOTICE_LINKS};
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
-    let mut f = fixture();
-    let (peers, ordered) = install_peers(&mut f, Some(1));
+    let env = racer_io::Env::host();
+    let mut f = fixture(&env);
+    let (peers, ordered) = install_peers(&env, &mut f, Some(1));
     publish_same_membership(&mut f, &peers);
     own(&f, true);
     peers.reply(&ordered[0], Reply::Stale);
@@ -5027,7 +5593,7 @@ fn owner_after_rank_zero_offers_its_origin_fetch_later() {
     assert_eq!(f.fill.metrics.count(Event::OrphanNotice), 1);
     let candidates = f.fill.dependencies.candidates.clone();
     assert_eq!(candidates.notices.borrow().len(), 1);
-    let start = uring_runtime::environment::now();
+    let start = racer_io::Clock::host().now();
     // Not due yet: nothing is sent.
     let fill = f.fill.clone();
     candidates.poll_offers(start, |page| fill.holds(page), &fill.metrics);
@@ -5073,25 +5639,34 @@ fn owner_after_rank_zero_offers_its_origin_fetch_later() {
 fn offers_wait_out_a_cut_toward_their_site() {
     use crate::telemetry::Event;
     use racer_core::read::hints::{NOTICE_DELAYS, PROBE_HOLD};
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
-    let mut f = fixture();
-    let (peers, ordered) = install_peers(&mut f, Some(1));
+    let env = racer_io::Env::host();
+    let mut f = fixture(&env);
+    let (peers, ordered) = install_peers(&env, &mut f, Some(1));
     publish_same_membership(&mut f, &peers);
     own(&f, true);
     peers.reply(&ordered[0], Reply::Stale);
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
     assert!(acquire(&mut f, &mut budget).is_ok());
     let candidates = f.fill.dependencies.candidates.clone();
-    let start = uring_runtime::environment::now();
+    let start = env.ctx.now();
     let poll = |f: &mut Fixture, now: Instant, n: u64| drive_offers(f, now, n, true);
     // The first offer fails in transport: the group is blocked until its
-    // next offer, 15 s after the failure. The offer task reports at the
-    // runtime clock, which this test does not advance, so that is
-    // `start + 15 s` while `poll` passes later times explicitly.
+    // next offer, 15 s after the failure. The offer task reports the failure
+    // at the runtime clock, which keeps running while `poll` passes explicit
+    // times, so the block's end is read back rather than assumed to be
+    // `start + 15 s`: under load the report lands measurably after `start`.
     peers.reply(&ordered[0], Reply::Deadline);
     let first = start + NOTICE_DELAYS[0];
     poll(&mut f, first, 1);
     assert_eq!(peers.calls.borrow().len(), 2);
+    let reported = env.ctx.now();
+    let until = candidates
+        .notices
+        .borrow()
+        .blocked(&String::new(), first)
+        .expect("a transport failure blocks the group");
+    assert!(until >= start + NOTICE_DELAYS[1]);
+    assert!(until <= reported + NOTICE_DELAYS[1]);
     // A second notice, due at `first` too, is deferred: no request.
     // A page with the same rank 0 and this node after it.
     let local = candidates.node.clone();
@@ -5114,17 +5689,13 @@ fn offers_wait_out_a_cut_toward_their_site() {
         &[crate::read::candidates::ProbeOutcome::CopyMiss]
     ));
     poll(&mut f, first, 0);
-    poll(
-        &mut f,
-        start + NOTICE_DELAYS[1] - Duration::from_millis(1),
-        0,
-    );
+    poll(&mut f, until - Duration::from_millis(1), 0);
     assert_eq!(peers.calls.borrow().len(), 2);
     assert_eq!(candidates.notices.borrow().len(), 2);
     // The block ends: one probe offer, delivered; the other stays held
     // behind it, then goes on its first try.
     peers.reply(&ordered[0], Reply::Miss);
-    let open = start + NOTICE_DELAYS[1] + Duration::from_millis(1);
+    let open = until + Duration::from_millis(1);
     poll(&mut f, open, 1);
     assert_eq!(peers.calls.borrow().len(), 3);
     assert_eq!(candidates.notices.borrow().len(), 1);
@@ -5144,10 +5715,10 @@ fn offers_wait_out_a_cut_toward_their_site() {
 fn rank_two_offers_its_origin_fetch_to_rank_one_too() {
     use crate::telemetry::Event;
     use racer_core::read::hints::NOTICE_DELAYS;
+    let env = racer_io::Env::host();
     for answered in [false, true] {
-        let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
-        let mut f = fixture();
-        let (peers, ordered) = install_peers(&mut f, Some(2));
+        let mut f = fixture(&env);
+        let (peers, ordered) = install_peers(&env, &mut f, Some(2));
         publish_same_membership(&mut f, &peers);
         own(&f, true);
         peers.reply(&ordered[0], Reply::Stale);
@@ -5176,7 +5747,7 @@ fn rank_two_offers_its_origin_fetch_to_rank_one_too() {
                 peers.reply(&ordered[1], Reply::Miss);
             }
             candidates.poll_offers(
-                uring_runtime::environment::now() + NOTICE_DELAYS[0] + Duration::from_secs(30 * i),
+                racer_io::Clock::host().now() + NOTICE_DELAYS[0] + Duration::from_secs(30 * i),
                 |page| fill.holds(page),
                 &fill.metrics,
             );
@@ -5193,6 +5764,7 @@ fn rank_two_offers_its_origin_fetch_to_rank_one_too() {
                 }),
                 &mut f.engine,
                 &f.crypto,
+                f.fill.drivers(),
             );
         }
         let calls = peers.calls.borrow();
@@ -5210,23 +5782,23 @@ fn rank_two_offers_its_origin_fetch_to_rank_one_too() {
 fn offers_need_a_held_copy_and_an_owner_after_rank_zero() {
     use crate::telemetry::Event;
     use racer_core::read::hints::NOTICE_DELAYS;
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
-    let mut f = fixture();
-    let (peers, ordered) = install_peers(&mut f, Some(1));
+    let env = racer_io::Env::host();
+    let mut f = fixture(&env);
+    let (peers, ordered) = install_peers(&env, &mut f, Some(1));
     publish_same_membership(&mut f, &peers);
     peers.reply(&ordered[0], Reply::Stale);
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
     assert!(acquire(&mut f, &mut budget).is_ok());
     let candidates = f.fill.dependencies.candidates.clone();
     assert_eq!(candidates.notices.borrow().len(), 1);
-    let due = uring_runtime::environment::now() + NOTICE_DELAYS[0];
+    let due = racer_io::Clock::host().now() + NOTICE_DELAYS[0];
     candidates.poll_offers(due, |_| false, &f.fill.metrics);
     assert!(candidates.notices.borrow().is_empty());
     assert_eq!(peers.calls.borrow().len(), 1);
     assert_eq!(f.fill.metrics.count(Event::OrphanOfferSent), 0);
 
-    let mut f = fixture();
-    let (peers, _) = install_peers(&mut f, Some(0));
+    let mut f = fixture(&env);
+    let (peers, _) = install_peers(&env, &mut f, Some(0));
     publish_same_membership(&mut f, &peers);
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
     assert!(acquire(&mut f, &mut budget).is_ok());
@@ -5253,6 +5825,7 @@ fn drive_pings(f: &mut Fixture, now: Instant, n: u64) {
         }),
         &mut f.engine,
         &f.crypto,
+        f.fill.drivers(),
     );
     assert_eq!(ended(&metrics), target, "pings sent");
 }
@@ -5267,9 +5840,9 @@ fn drive_pings(f: &mut Fixture, now: Instant, n: u64) {
 fn an_owner_pings_a_rank_zero_that_timed_out_and_skips_it_while_silent() {
     use crate::telemetry::Event;
     use racer_core::read::hints::NOTICE_LINKS;
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
-    let mut f = fixture();
-    let (peers, ordered) = install_peers(&mut f, Some(1));
+    let env = racer_io::Env::host();
+    let mut f = fixture(&env);
+    let (peers, ordered) = install_peers(&env, &mut f, Some(1));
     publish_same_membership(&mut f, &peers);
     let health = f.fill.dependencies.candidates.link_health();
     // No minimum wait, so the scripted timeout counts.
@@ -5282,7 +5855,7 @@ fn an_owner_pings_a_rank_zero_that_timed_out_and_skips_it_while_silent() {
     assert!(!health.silent(&ordered[0]));
     // The ping goes unanswered: rank 0 is silent.
     peers.reply(&ordered[0], Reply::Deadline);
-    let now = uring_runtime::environment::now();
+    let now = racer_io::Clock::host().now();
     drive_pings(&mut f, now, 1);
     {
         let calls = peers.calls.borrow();
@@ -5303,7 +5876,7 @@ fn an_owner_pings_a_rank_zero_that_timed_out_and_skips_it_while_silent() {
     assert_eq!(peers.calls.borrow().len(), sent);
     // Recovered: the recheck ping (due at once with no hold) is answered.
     peers.reply(&ordered[0], Reply::Miss);
-    drive_pings(&mut f, uring_runtime::environment::now(), 1);
+    drive_pings(&mut f, racer_io::Clock::host().now(), 1);
     assert!(!health.silent(&ordered[0]));
     assert_eq!(f.fill.metrics.count(Event::SilencePeerSilent), 1);
 }
@@ -5314,8 +5887,8 @@ fn an_owner_pings_a_rank_zero_that_timed_out_and_skips_it_while_silent() {
 #[test]
 fn a_ping_is_answered_miss_at_once_without_a_body() {
     use crate::telemetry::Event;
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
-    let mut s = SuccessorFixture::new();
+    let env = racer_io::Env::host();
+    let mut s = SuccessorFixture::new(&env);
     let (reader, holder) = (s.index(None), s.index(Some(1)));
     s.page(reader, FetchMode::Acquire);
     assert_eq!(s.f.origin.calls.get(), 1);
@@ -5336,6 +5909,7 @@ fn a_ping_is_answered_miss_at_once_without_a_body() {
             coordinator.serve_peer(admitted, f.membership.clone(), &f.scope),
             &mut f.engine,
             &f.crypto,
+            f.fill.drivers(),
         )
         .unwrap()
     };
@@ -5373,15 +5947,15 @@ fn a_ping_is_answered_miss_at_once_without_a_body() {
             .seal(&bare, crate::model::AttemptId([0x41; 16]), &f.scope)
             .unwrap(),
     };
-    assert!(crate::peer::protocol::request_head(&base(0)).is_ok());
-    assert!(crate::peer::protocol::request_head(&base(1)).is_err());
+    assert!(crate::peer::protocol::request_head(&env.ctx.clock, &base(0)).is_ok());
+    assert!(crate::peer::protocol::request_head(&env.ctx.clock, &base(1)).is_err());
     let mut metadata = base(0);
     metadata.operation = PeerOperation::Metadata {
         object: f.context.object.clone(),
         selector: crate::model::MetadataSelector::Fresh,
         mode: FetchMode::Ping,
     };
-    assert!(crate::peer::protocol::request_head(&metadata).is_err());
+    assert!(crate::peer::protocol::request_head(&env.ctx.clock, &metadata).is_err());
 }
 
 /// An owner whose walk refreshed to a newer membership after a
@@ -5392,11 +5966,12 @@ fn a_ping_is_answered_miss_at_once_without_a_body() {
 /// bookkeeping was skipped or aimed at the wrong rank 0.
 #[test]
 fn refreshed_owner_order_keys_orphan_notice_and_failure_hold() {
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
+    let env = racer_io::Env::host();
+    let drivers = Rc::new(crate::drivers::DriverQueue::new(1024));
     // (origin fails) -> notice noted, failure hold set on the new rank 0.
     for fail in [false, true] {
-        let mut f = fixture();
-        let (peers, ordered) = install_peers(&mut f, Some(1));
+        let mut f = fixture(&env);
+        let (peers, ordered) = install_peers(&env, &mut f, Some(1));
         let local = node(peers.local);
         let placement = Placement::new(16);
         // A version 2 that ranks the page differently and still makes this
@@ -5418,7 +5993,8 @@ fn refreshed_owner_order_keys_orphan_notice_and_failure_hold() {
                     })
                     .collect();
                 let latest = Arc::new(
-                    Membership::validate(racer_control_wire::MembershipVersion(2), members).ok()?,
+                    Membership::validate(racer_wire::control::MembershipVersion(2), members)
+                        .ok()?,
                 );
                 let next = placement
                     .rank(latest.clone(), &f.context.object, f.page.number)
@@ -5436,6 +6012,8 @@ fn refreshed_owner_order_keys_orphan_notice_and_failure_hold() {
             peers.requester(),
             deps.credentials.clone(),
             crate::test_support::published_membership(latest.clone()),
+            racer_io::WorkerCtx::host(),
+            drivers.clone(),
         ));
         f.fill = Fill::new(deps);
         own(&f, true);
@@ -5453,7 +6031,7 @@ fn refreshed_owner_order_keys_orphan_notice_and_failure_hold() {
         assert_eq!(f.origin.calls.get(), 1);
         assert_eq!(peers.calls.borrow().len(), 1 + rank);
         let candidates = &f.fill.dependencies.candidates;
-        let now = uring_runtime::environment::now();
+        let now = racer_io::Clock::host().now();
         if fail {
             assert!(candidates.notices.borrow().is_empty());
             // The hold names the version 2 rank 0, not the version 1 one.
@@ -5482,13 +6060,14 @@ fn refreshed_owner_order_keys_orphan_notice_and_failure_hold() {
 /// node retains the page afterward.
 #[test]
 fn passthrough_peers_coalesces_reads_from_distinct_nodes_on_the_owner() {
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
-    let mut fixtures: Vec<_> = (0..4).map(|_| fixture()).collect();
-    let (_, ordered) = install_peers(&mut fixtures[0], None);
+    let env = racer_io::Env::host();
+    let drivers = Rc::new(crate::drivers::DriverQueue::new(1024));
+    let mut fixtures: Vec<_> = (0..4).map(|_| fixture(&env)).collect();
+    let (_, ordered) = install_peers(&env, &mut fixtures[0], None);
     let membership = fixtures[0].membership.clone();
     let owner = (0..4).find(|i| node(*i) == ordered[0]).unwrap();
     let mesh = Rc::new(Mesh {
-        signing: network(4).into_iter().map(Forwarding::new).collect(),
+        signing: network(&env, 4).into_iter().map(Forwarding::new).collect(),
         nodes: RefCell::new(Vec::new()),
         calls: RefCell::new(Vec::new()),
         unavailable: RefCell::new(Vec::new()),
@@ -5508,22 +6087,26 @@ fn passthrough_peers_coalesces_reads_from_distinct_nodes_on_the_owner() {
             node(i),
             Rc::new(Placement::new(16)),
             Requester::scripted(
+                env.ctx.clock.clone(),
                 peers,
                 Peer::direct_hedge_available,
                 Peer::request,
                 Peer::request_direct,
             ),
             f.fill.dependencies.credentials.clone(),
-            Arc::new(controlplane::Published::new(
+            Arc::new(crate::control::cell::PublicationCell::new(
                 crate::control::Snapshot::retention(2),
             )),
+            racer_io::WorkerCtx::host(),
+            drivers.clone(),
         );
         let mut deps = f.fill.dependencies.clone();
         deps.candidates = Rc::new(policy);
         f.fill = Fill::new(deps);
-        f.set_mode(racer_control_wire::CacheMode::PassthroughPeers);
+        f.set_mode(&env, racer_wire::control::CacheMode::PassthroughPeers);
         f.origin.blocked_pages.borrow_mut().insert(0);
         let (coordinator, endpoint, _) = f.read_graph(
+            &env,
             Rc::new(f.fill.clone()),
             &membership,
             ReadGraphSettings {
@@ -5568,9 +6151,9 @@ fn passthrough_peers_coalesces_reads_from_distinct_nodes_on_the_owner() {
     let mut results: Vec<Option<Result<PageResult>>> = (0..4).map(|_| None).collect();
     macro_rules! step {
         () => {{
-            uring_runtime::drivers::poll(&mut cx, 64);
             for f in fixtures.iter_mut() {
-                uring_runtime::group::Service::poll_budgeted(
+                f.fill.drivers().poll(&mut cx, 64);
+                crate::lifecycle::Service::poll_budgeted(
                     &mut f.engine,
                     &mut Context::from_waker(futures::task::noop_waker_ref()),
                     64,
@@ -5655,4 +6238,82 @@ fn passthrough_peers_coalesces_reads_from_distinct_nodes_on_the_owner() {
         assert!(!f.fill.holds(&f.page), "node {i}");
     }
     drop(endpoints);
+}
+
+/// A full flight is proof the owner is fetching: a peer asking that owner hears `FlightFull`,
+/// not `Overloaded`, so the walk leaves origin to it instead of asking a second time.
+#[test]
+fn a_peer_joining_a_waiter_capped_flight_hears_flight_full() {
+    use crate::peer::server::LocalPageService;
+    let env = racer_io::Env::host();
+    let mut limits = crate::test_support::cluster::config(false).limits;
+    limits.waiters_per_flight = std::num::NonZeroUsize::new(1).unwrap();
+    let mut target = fixture_with(&env, 3, Some(limits));
+    let (peers, _) = install_peers(&env, &mut target, Some(0));
+    let (receiver, _endpoint, _) = target.read_graph(
+        &env,
+        Rc::new(target.fill.clone()),
+        &target.membership,
+        ReadGraphSettings {
+            name: "flight-full",
+            snapshots: 4,
+            metadata: 16,
+            window: 1,
+            stall: Duration::from_secs(10),
+            seed: None,
+        },
+    );
+    // The one waiter the flight admits.
+    let mut budget = AcquisitionBudget::new(target.scope.deadline.0, 4, 8);
+    let held = target
+        .fill
+        .dependencies
+        .flights
+        .join(
+            target.page.clone(),
+            target.membership.clone(),
+            &target.context,
+            &target.scope,
+            &mut budget,
+        )
+        .unwrap();
+    let requester = (peers.local + 1) % 4;
+    let attempt = crate::model::AttemptId([73; 16]);
+    let request = PeerRequest {
+        operation: PeerOperation::Page {
+            page: target.page.clone(),
+            mode: FetchMode::Acquire,
+        },
+        route: crate::topology::RouteBudget {
+            membership: target.membership.version,
+            request: target.scope.request,
+            attempt,
+            destination: node(peers.local),
+            visited: vec![node(requester)],
+            remaining_links: 4,
+            remaining_attempts: 4,
+            deadline: target.scope.deadline,
+        },
+        origin: target
+            .fill
+            .dependencies
+            .credentials
+            .seal(&target.context, attempt, &target.scope)
+            .unwrap(),
+    };
+    let (signed, _) = peers.signing[requester].sign_request(request).unwrap();
+    let verified = peers.signing[peers.local].verify_request(signed).unwrap();
+    let response = drive(
+        receiver.serve_peer(verified, target.membership.clone(), &target.scope),
+        &mut target.engine,
+        &target.crypto,
+        target.fill.drivers(),
+    );
+    assert!(
+        matches!(response, Ok(PeerResponse::FlightFull)),
+        "{:?}",
+        response.map(|r| r.kind())
+    );
+    assert_eq!(target.origin.calls.get(), 0);
+    drop(held);
 }

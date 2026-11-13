@@ -1,6 +1,6 @@
 //! Process entry point. Configuration and application lifecycle own all resources.
 //!
-//! In managed deployments the embedded cluster-control service starts first, on
+//! In managed deployments the embedded authority service starts first, on
 //! its own bounded thread, and the dataplane waits for its bootstrap before any
 //! worker is assembled. Standalone fixtures set a static endpoint instead.
 
@@ -25,7 +25,7 @@ fn main() -> std::process::ExitCode {
 }
 
 /// Cluster-control handle adapted to the dataplane startup contract.
-struct Embedded(racer_cluster_control::Handle);
+struct Embedded(racer_authority::Handle);
 
 impl ClusterControl for Embedded {
     fn bootstrap(&self, timeout: Duration) -> Result<Bootstrapped, BootstrapError> {
@@ -34,8 +34,8 @@ impl ClusterControl for Embedded {
                 cluster: bootstrap.cluster,
                 block_devices: bootstrap.block_devices,
             }),
-            Err(racer_cluster_control::Error::Unavailable) => Err(BootstrapError::Retry),
-            Err(racer_cluster_control::Error::Timeout) => Err(BootstrapError::Pending),
+            Err(racer_authority::Error::Unavailable) => Err(BootstrapError::Retry),
+            Err(racer_authority::Error::Timeout) => Err(BootstrapError::Pending),
             Err(error) => {
                 eprintln!("racer: stage=cluster-bootstrap control error={error}");
                 Err(BootstrapError::Fatal)
@@ -43,11 +43,11 @@ impl ClusterControl for Embedded {
         }
     }
 
-    fn endpoints(&self) -> wire_codec::DiscoveredEndpoints {
+    fn endpoints(&self) -> racer::control::rest::DiscoveredEndpoints {
         self.0.endpoints()
     }
 
-    fn report(&self, shares: u32, rails: Vec<racer_control_wire::RailMapping>) {
+    fn report(&self, shares: u32, rails: Vec<racer_wire::control::RailMapping>) {
         // Reports are retried by control; a refused enqueue is logged, never fatal.
         if let Err(error) = self.0.report(shares, rails) {
             eprintln!("racer: stage=cluster-report error={error}");
@@ -56,22 +56,23 @@ impl ClusterControl for Embedded {
 }
 
 fn run() -> std::result::Result<(), (&'static str, Error)> {
-    let mut config = Config::from_env().map_err(|error| ("config", error))?;
+    // The only process-environment read: everything else gets an explicit Config.
+    let mut config = Config::from_env().map_err(|error| {
+        eprintln!("racer: stage=config error={error}");
+        ("config", Error::from(error))
+    })?;
     // Held across cluster bootstrap and the application so SIGTERM/SIGINT stop a
     // managed bootstrap wait; the application shares, never resets, this state.
     let signals = StopSignals::install().map_err(|error| ("signals", error))?;
-    let control = racer_cluster_control::Config::from_env().map_err(|error| {
-        eprintln!("racer: stage=cluster-control-config error={error}");
-        ("cluster-control-config", Error::InvalidConfiguration)
-    })?;
+    let control = config.authority.take();
     // Retained until the application stops; dropping it stops control boundedly.
     // The concrete handle is kept beside the trait object for fatal diagnostics.
     let control = match (control, config.managed()) {
         (None, false) => None,
         (Some(control), true) => {
-            let handle = racer_cluster_control::start(control).map_err(|error| {
-                eprintln!("racer: stage=cluster-control-start error={error}");
-                ("cluster-control-start", Error::Unavailable)
+            let handle = racer_authority::start(control).map_err(|error| {
+                eprintln!("racer: stage=authority-start error={error}");
+                ("authority-start", Error::Unavailable)
             })?;
             let concrete = Arc::new(Embedded(handle));
             let embedded: Arc<dyn ClusterControl> = concrete.clone();
@@ -79,7 +80,7 @@ fn run() -> std::result::Result<(), (&'static str, Error)> {
                 Ok(()) => {}
                 // A requested stop during bootstrap is a clean exit; dropping the
                 // handle stops embedded control boundedly.
-                Err(Error::Cancelled) if signals.requested() => {
+                Err(Error::Canceled) if signals.requested() => {
                     eprintln!("racer: stage=cluster-bootstrap stopped by signal");
                     return Ok(());
                 }

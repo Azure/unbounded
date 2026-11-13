@@ -38,6 +38,8 @@ const (
 	mpiBackoffLimit         = int64(0)
 	mpiHostfilePath         = "/tmp/project-signal-hostfile"
 	mpiKnownHostsPath       = "/tmp/project-signal-known-hosts"
+	mpiSSHAuthMountPath     = "/tmp/project-signal-ssh"
+	mpiSSHPort              = int64(2222)
 	resultPrefix            = "PROJECT_SIGNAL_RESULT_V2 "
 	workloadIdentityID      = int64(65532)
 )
@@ -989,6 +991,7 @@ func mpiLauncherPrelude(hostfile string, hosts []mpiWorkerHost, timeoutSeconds i
 umask 077
 printf '%%s\n' %s > %s
 export OMPI_MCA_orte_default_hostfile=%s
+export OMPI_MCA_plm_rsh_args="-p %d -i %s/id_rsa -o IdentitiesOnly=yes -o ConnectionAttempts=10 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=%s"
 wait_for_mpi_workers() {
   local hostfile=%s
   local timeout_seconds=%d
@@ -1000,6 +1003,9 @@ wait_for_mpi_workers() {
     for host in "${hosts[@]}"; do
       remaining=$((deadline - SECONDS))
       if (( remaining < 1 )) || ! timeout "${remaining}s" ssh \
+        -p %d \
+        -i %s/id_rsa \
+        -o IdentitiesOnly=yes \
         -o BatchMode=yes \
         -o ConnectTimeout=2 \
         -o ConnectionAttempts=1 \
@@ -1016,7 +1022,7 @@ wait_for_mpi_workers() {
     fi
     sleep 1
   done
-  printf 'Project Signal MPI readiness timed out after %%ds waiting for every worker in %%s to resolve and accept SSH/22; last unready host=%%s\n' \
+  printf 'Project Signal MPI readiness timed out after %%ds waiting for every worker in %%s to resolve and accept SSH/%d; last unready host=%%s\n' \
     "${timeout_seconds}" "${hostfile}" "${last_unready:-unknown}" >&2
   return 124
 }
@@ -1025,10 +1031,16 @@ wait_for_mpi_workers
 		strings.Join(quotedShellArguments(hostfileLines), " "),
 		shellQuote(hostfile),
 		shellQuote(hostfile),
+		mpiSSHPort,
+		shellQuote(mpiSSHAuthMountPath),
+		shellQuote(mpiKnownHostsPath),
 		shellQuote(hostfile),
 		timeoutSeconds,
 		strings.Join(hostArguments, " "),
+		mpiSSHPort,
+		shellQuote(mpiSSHAuthMountPath),
 		shellQuote(mpiKnownHostsPath),
+		mpiSSHPort,
 	)
 }
 
@@ -1071,6 +1083,7 @@ func ordinaryPod(
 			Tolerations:                  tolerations,
 			ActiveDeadlineSeconds:        &backendDeadlineSeconds,
 			AutomountServiceAccountToken: ptr(false),
+			SecurityContext:              workloadPodSecurityContext(),
 			Containers:                   []corev1.Container{container},
 			Volumes:                      workloadVolumes(config.ScriptConfigMap, policy),
 		},
@@ -1111,6 +1124,13 @@ func mpiJob(
 			},
 		},
 	)
+	mpiEnvironment := []corev1.EnvVar{
+		{Name: "PROJECT_SIGNAL_MPI_SSH_AUTH_DIR", Value: mpiSSHAuthMountPath},
+		{Name: "PROJECT_SIGNAL_MPI_SSH_PORT", Value: strconv.FormatInt(mpiSSHPort, 10)},
+		{Name: "PROJECT_SIGNAL_MPI_KNOWN_HOSTS", Value: mpiKnownHostsPath},
+	}
+	launcherEnv = append(launcherEnv, mpiEnvironment...)
+	workerEnv = append(workerEnv, mpiEnvironment...)
 	readinessTimeout := mpiWorkerReadinessTimeout(backendDeadlineSeconds)
 
 	workerHosts, err := mpiWorkerHosts(config.Namespace, jobName, int64(len(participants)), gpuCount)
@@ -1143,6 +1163,7 @@ func mpiJob(
 			"launcherCreationPolicy": "WaitForWorkersReady",
 			"mpiImplementation":      "OpenMPI",
 			"runLauncherAsWorker":    false,
+			"sshAuthMountPath":       mpiSSHAuthMountPath,
 			"slotsPerWorker":         gpuCount,
 			"runPolicy": map[string]any{
 				"activeDeadlineSeconds": backendDeadlineSeconds,
@@ -1203,6 +1224,8 @@ func podTemplate(
 		policy = policies[0]
 	}
 
+	applyWorkloadIdentity(&container)
+
 	template := corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
 			Labels: labels,
@@ -1212,6 +1235,7 @@ func podTemplate(
 			Affinity:                     affinity,
 			Tolerations:                  tolerations,
 			AutomountServiceAccountToken: ptr(false),
+			SecurityContext:              workloadPodSecurityContext(),
 			Containers:                   []corev1.Container{container},
 			Volumes:                      workloadVolumes(scriptConfigMap, policy),
 		},
@@ -1297,6 +1321,25 @@ func applyPodPolicy(spec *corev1.PodSpec, policy signalv1.WorkloadPolicy) {
 	spec.DNSPolicy = corev1.DNSClusterFirstWithHostNet
 }
 
+func workloadPodSecurityContext() *corev1.PodSecurityContext {
+	return &corev1.PodSecurityContext{
+		RunAsUser:    ptr(workloadIdentityID),
+		RunAsGroup:   ptr(workloadIdentityID),
+		RunAsNonRoot: ptr(true),
+		FSGroup:      ptr(workloadIdentityID),
+	}
+}
+
+func applyWorkloadIdentity(container *corev1.Container) {
+	if container.SecurityContext == nil {
+		container.SecurityContext = &corev1.SecurityContext{}
+	}
+
+	container.SecurityContext.RunAsUser = ptr(workloadIdentityID)
+	container.SecurityContext.RunAsGroup = ptr(workloadIdentityID)
+	container.SecurityContext.RunAsNonRoot = ptr(true)
+}
+
 func workloadEnvironment(
 	config Config,
 	participant signalv1.Participant,
@@ -1358,6 +1401,8 @@ func workloadContainer(
 	container corev1.Container,
 	gpuCount int64,
 ) corev1.Container {
+	applyWorkloadIdentity(&container)
+
 	container.Resources = *policy.Resources.DeepCopy()
 	if gpuCount > 0 {
 		if container.Resources.Requests == nil {
@@ -1374,9 +1419,7 @@ func workloadContainer(
 	}
 
 	if policy.Privileged || policy.IPCLock {
-		container.SecurityContext = &corev1.SecurityContext{
-			Privileged: ptr(policy.Privileged),
-		}
+		container.SecurityContext.Privileged = ptr(policy.Privileged)
 		if policy.IPCLock {
 			container.SecurityContext.Capabilities = &corev1.Capabilities{
 				Add: []corev1.Capability{"IPC_LOCK"},

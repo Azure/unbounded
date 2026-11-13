@@ -39,7 +39,7 @@ func TestParseOptionsDefaults(t *testing.T) {
 			Profile: profileShuffle, ZipfExponent: defaultZipfExponent,
 			Target: "http://127.0.0.1:5000", Namespace: "loadgen.invalid",
 			Concurrency: 64, BlobConcurrency: 4, Timeout: 2 * time.Minute,
-			RetryDelay: time.Second, Verify: false,
+			RetryDelay: time.Second, Verify: false, Delivery: deliveryStream,
 		},
 	}, opts)
 }
@@ -64,6 +64,7 @@ func TestParseOptionsOverrides(t *testing.T) {
 			Target: "https://mirror.example/base", Namespace: "registry.example:5000",
 			Concurrency: 0, BlobConcurrency: 3, Timeout: 9 * time.Second,
 			RetryDelay: 20 * time.Millisecond, Interval: 30 * time.Millisecond,
+			Delivery: deliveryStream,
 		},
 	}, opts)
 }

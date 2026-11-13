@@ -29,6 +29,8 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
+
+	"github.com/Azure/unbounded/pkg/agent/isolation"
 )
 
 // AgentConfig is the core configuration needed to bootstrap a Kubernetes
@@ -56,6 +58,22 @@ type AgentConfig struct {
 	// selects automatically. HTTPS URLs may contain signed query parameters.
 	// When empty the agent uses the built-in default image.
 	OCIImage string `json:"OCIImage,omitempty"`
+
+	// Isolation selects where the node stack runs: nspawn, none or container.
+	// Empty means nspawn, which is also what every config written before this
+	// field existed means. Only the modes this agent can operate are accepted,
+	// and container only with Experimental.ContainerIsolation.
+	Isolation string `json:"Isolation,omitempty"`
+
+	// Experimental opts the host in to experimental agent features. Nil
+	// enables none of them.
+	Experimental *ExperimentalConfig `json:"Experimental,omitempty"`
+
+	// NvidiaToolkit overrides where the NVIDIA Container Toolkit tools are on
+	// the host. It applies to Isolation none only, the one mode that runs them
+	// from the host; nspawn uses the copies in the rootfs image. Nil means the
+	// default paths.
+	NvidiaToolkit *NvidiaToolkitConfig `json:"NvidiaToolkit,omitempty"`
 
 	// AdditionalHostDevices lists extra host device nodes under /dev or systemd
 	// device group specifiers that should be exposed to the nspawn machine in
@@ -283,6 +301,16 @@ func (a *AgentConfig) DeepCopy() *AgentConfig {
 
 	out.OfflineArtifacts = a.OfflineArtifacts.DeepCopy()
 
+	if a.NvidiaToolkit != nil {
+		toolkit := *a.NvidiaToolkit
+		out.NvidiaToolkit = &toolkit
+	}
+
+	if a.Experimental != nil {
+		experimental := *a.Experimental
+		out.Experimental = &experimental
+	}
+
 	return &out
 }
 
@@ -319,6 +347,18 @@ func (a *AgentConfig) Validate() error {
 	}
 
 	if err := ValidateNSpawnLifecycle(a.NSpawnLifecycle); err != nil {
+		errs = append(errs, err)
+	}
+
+	if _, err := isolation.ParseMode(a.Isolation); err != nil {
+		errs = append(errs, fmt.Errorf("invalid Isolation: %w", err))
+	}
+
+	if err := a.validateExperimental(); err != nil {
+		errs = append(errs, err)
+	}
+
+	if err := a.validateNvidiaToolkit(); err != nil {
 		errs = append(errs, err)
 	}
 
@@ -778,4 +818,10 @@ type RuncConfig struct {
 type CNIConfig struct {
 	// PluginVersion overrides the default CNI plugin version (e.g. "1.5.1").
 	PluginVersion string `json:"PluginVersion,omitempty"`
+}
+
+// IsolationMode returns the configured isolation mode. An empty value is the
+// default mode; a value this agent cannot operate is an error.
+func (a *AgentConfig) IsolationMode() (isolation.Mode, error) {
+	return isolation.ParseMode(a.Isolation)
 }

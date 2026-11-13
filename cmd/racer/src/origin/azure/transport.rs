@@ -14,20 +14,20 @@
 use super::{AzureExchange, AzureTransport};
 use crate::admission::AdmissionPolicy;
 use crate::error::{Error, Operation, Result};
-use crate::http::{ConnectionLease, Endpoint, HttpIo, HttpPool};
+use crate::http::{ConnectionLease, Endpoint, HttpIo, HttpPool, exchange_head};
 use crate::memory::PlaintextBuffer;
 use crate::model::parse_decimal;
 use crate::remote::{RemoteEndpoint, Resolver};
 use crate::runtime::RequestScope;
 use http1::tls::rustls::ClientConfig;
 use http1::{MessageHead, StartLine};
-use racer_control_wire::{AzureContainerUrl, OriginDefinition};
+use racer_wire::control::{AzureContainerUrl, OriginDefinition};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
 /// Largest response head accepted from Azure.
 pub const MAX_RESPONSE_HEAD: usize = 32 * 1024;
@@ -48,12 +48,12 @@ const ATTEMPT_FLOOR: Duration = Duration::from_millis(250);
 /// past the request deadline), so an address that blackholes the TCP connect
 /// or stalls the TLS handshake cannot consume the whole request before the
 /// next resolved address is tried. The narrowed clone shares the request's
-/// cancellation, so cancelling the request still releases every attempt.
+/// cancellation, so canceling the request still releases every attempt.
 fn attempt_scope(scope: &RequestScope, remaining: usize) -> RequestScope {
     if remaining <= 1 {
         return scope.clone();
     }
-    let now = uring_runtime::environment::now();
+    let now = scope.clock().now();
     let budget = scope.deadline.0.saturating_duration_since(now);
     let share = (budget / remaining as u32)
         .min(ATTEMPT_CAP)
@@ -63,74 +63,48 @@ fn attempt_scope(scope: &RequestScope, remaining: usize) -> RequestScope {
     attempt
 }
 
-/// How long a failed trust bundle load is reported before loading again.
-const TRUST_RETRY: Duration = Duration::from_secs(30);
-
-/// Process-wide TLS client configuration, loaded on first HTTPS use so nodes
-/// whose caches use only plain HTTP never need a trust bundle.
+/// Process-wide TLS client configuration for HTTPS origins, loaded once when
+/// the node is assembled, before any worker serves, so no worker reactor ever
+/// blocks on the file. A bundle that fails to load is logged then and fails
+/// each HTTPS request with `Unavailable` until restart; plain-HTTP origins
+/// never need it. A successful load was never reread before either.
 pub struct TrustRoots {
     path: PathBuf,
-    state: Mutex<TrustState>,
-}
-
-#[derive(Default)]
-struct TrustState {
     config: Option<Arc<ClientConfig>>,
-    failed: Option<Instant>,
 }
 
 impl TrustRoots {
-    /// Load from `RACER_ORIGIN_TRUST_BUNDLE`, or the system bundle, when needed.
-    pub fn from_env() -> Self {
-        Self::at(http1::tls::trust_bundle_path())
+    /// Load `path` now. Call off the worker reactors (node assembly).
+    pub fn load(path: PathBuf) -> Self {
+        let config = match http1::tls::load_trust_bundle(&path) {
+            Ok(roots) => Some(http1::tls::client_config(roots)),
+            Err(error) => {
+                eprintln!(
+                    "racer: stage=azure-origin-trust path={} error={error} https_origins=unavailable",
+                    path.display()
+                );
+                None
+            }
+        };
+        Self { path, config }
     }
 
-    /// Load from `path` when needed.
-    pub fn at(path: PathBuf) -> Self {
-        Self {
-            path,
-            state: Mutex::default(),
-        }
+    /// No trust roots: every HTTPS request fails with `Unavailable`.
+    pub fn unavailable(path: PathBuf) -> Self {
+        Self { path, config: None }
     }
 
     /// Use a fixed configuration.
     pub fn fixed(config: Arc<ClientConfig>) -> Self {
         Self {
             path: PathBuf::new(),
-            state: Mutex::new(TrustState {
-                config: Some(config),
-                failed: None,
-            }),
+            config: Some(config),
         }
     }
 
-    /// The shared configuration. A load failure fails this request with
-    /// `Unavailable` and is retried after [`TRUST_RETRY`].
+    /// The shared configuration, or `Unavailable` if the bundle failed to load.
     pub fn config(&self) -> Result<Arc<ClientConfig>> {
-        let mut state = self.state.lock().map_err(|_| Error::Internal)?;
-        if let Some(config) = &state.config {
-            return Ok(config.clone());
-        }
-        let now = Instant::now();
-        if state.failed.is_some_and(|at| now < at + TRUST_RETRY) {
-            return Err(Error::Unavailable);
-        }
-        match http1::tls::load_trust_bundle(&self.path) {
-            Ok(roots) => {
-                let config = http1::tls::client_config(roots);
-                state.config = Some(config.clone());
-                state.failed = None;
-                Ok(config)
-            }
-            Err(error) => {
-                eprintln!(
-                    "racer: stage=azure-origin-trust path={} error={error}",
-                    self.path.display()
-                );
-                state.failed = Some(now);
-                Err(Error::Unavailable)
-            }
-        }
+        self.config.clone().ok_or(Error::Unavailable)
     }
 }
 
@@ -176,6 +150,44 @@ impl PoolTransport {
     #[cfg(test)]
     pub(crate) fn endpoint_count(&self) -> usize {
         self.endpoints.borrow().len()
+    }
+
+    /// Check out a connection, failing over across resolved addresses.
+    async fn checkout(
+        &self,
+        remote: &RemoteEndpoint,
+        sequence: &RemoteEndpoint,
+        endpoint: &Endpoint,
+        is_head: bool,
+        scope: &RequestScope,
+    ) -> Result<ConnectionLease> {
+        let attempts = remote.address_count().max(1);
+        loop {
+            let before = sequence.addresses_taken();
+            let attempt_scope = attempt_scope(scope, attempts.saturating_sub(before));
+            let checkout = if is_head {
+                self.pool.checkout_metadata(endpoint, &attempt_scope).await
+            } else {
+                self.pool.checkout_wait(endpoint, &attempt_scope).await
+            };
+            let taken = sequence.addresses_taken();
+            match checkout {
+                Ok(lease) => return Ok(lease),
+                // An admission wait that hit the narrowed deadline took no
+                // address; wait again under a fresh share of the request.
+                Err(Error::DeadlineExceeded) if taken == before && scope.check().is_ok() => {}
+                // A narrowed attempt's deadline is a stalled connect;
+                // the request scope check rules out the request's own.
+                Err(Error::Io | Error::Os(_) | Error::Unavailable | Error::DeadlineExceeded)
+                    if taken > before && taken < attempts && scope.check().is_ok() => {}
+                Err(error) => {
+                    if matches!(error, Error::Io | Error::Os(_) | Error::Unavailable) {
+                        remote.expire_addresses();
+                    }
+                    return Err(error);
+                }
+            }
+        }
     }
 
     fn endpoint(&self, url: &AzureContainerUrl) -> Result<Endpoint> {
@@ -245,39 +257,28 @@ impl AzureTransport for PoolTransport {
             // address. Only checkout is narrowed: a reused idle connection
             // returns at once, and the send and response read below use the
             // full request scope.
-            let attempts = remote.address_count().max(1);
-            let lease = loop {
-                let before = sequence.addresses_taken();
-                let attempt_scope = attempt_scope(scope, attempts.saturating_sub(before));
-                let checkout = if is_head {
-                    self.pool.checkout_metadata(&endpoint, &attempt_scope).await
-                } else {
-                    self.pool.checkout_wait(&endpoint, &attempt_scope).await
-                };
-                let taken = sequence.addresses_taken();
-                match checkout {
-                    Ok(lease) => break lease,
-                    // An admission wait that hit the narrowed deadline took no
-                    // address; wait again under a fresh share of the request.
-                    Err(Error::DeadlineExceeded) if taken == before && scope.check().is_ok() => {}
-                    // A narrowed attempt's deadline is a stalled connect;
-                    // the request scope check rules out the request's own.
-                    Err(
-                        Error::Io | Error::Os(_) | Error::Unavailable | Error::DeadlineExceeded,
-                    ) if taken > before && taken < attempts && scope.check().is_ok() => {}
-                    Err(error) => {
-                        if matches!(error, Error::Io | Error::Os(_) | Error::Unavailable) {
-                            remote.expire_addresses();
-                        }
-                        return Err(error);
+            // A GET or HEAD that fails on a reused idle connection before any
+            // response byte retries once after dropping the endpoint's idle
+            // connections, so it runs on a fresh one: the peer most likely
+            // closed the idle socket and never saw the request.
+            let mut retry = Some(crate::http::copy_head(&head));
+            let mut head = head;
+            let response = loop {
+                let lease = self
+                    .checkout(&remote, &sequence, &endpoint, is_head, scope)
+                    .await?;
+                match exchange_head(&self.io, lease, head, scope, MAX_RESPONSE_HEAD).await {
+                    Ok(response) => break response,
+                    Err(failure) if failure.stale && scope.check().is_ok() => {
+                        let Some(again) = retry.take() else {
+                            return Err(failure.error);
+                        };
+                        self.pool.discard_idle(&endpoint);
+                        head = again;
                     }
+                    Err(failure) => return Err(failure.error),
                 }
             };
-            let sent = self.io.send_head(lease, head, scope).await?;
-            let response = self
-                .io
-                .receive_head_limited(sent.connection, scope, MAX_RESPONSE_HEAD)
-                .await?;
             Ok(PoolExchange {
                 head: response.value,
                 lease: response.connection,

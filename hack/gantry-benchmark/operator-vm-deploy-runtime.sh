@@ -178,6 +178,8 @@ runtime_paths=(
   cmd/gantry/agent_metrics.go
   cmd/gantry/main.go
   cmd/gantry/origin_pull_test.go
+  hack/cmd/gantry-benchmark/job.go
+  hack/cmd/gantry-benchmark/job_test.go
   internal/gantry/coldstart/chair.go
   internal/gantry/coldstart/chair_test.go
   internal/gantry/config/config.go
@@ -262,8 +264,8 @@ trap failed ERR
 
 cd "$BENCHMARK_REPO_ROOT"
 
-write_progress test "running Gantry runtime tests"
-GOTOOLCHAIN=auto go test ./cmd/gantry ./internal/gantry/...
+write_progress test "running Gantry runtime and benchmark tests"
+GOTOOLCHAIN=auto go test ./cmd/gantry ./internal/gantry/... ./hack/cmd/gantry-benchmark
 
 write_progress authenticate "authenticating managed identity to Gantry ACR"
 az login --identity --allow-no-subscriptions --output none

@@ -84,6 +84,7 @@ func TestRenderedExecutionProvenanceIsPinnedAndDeterministic(t *testing.T) {
 	}
 
 	adapterArgs := workflow.Spec.Templates[0].Container.Args
+
 	serviceAccountFlag := slices.Index(adapterArgs, "--workflow-service-account")
 	if serviceAccountFlag < 0 || serviceAccountFlag+1 >= len(adapterArgs) ||
 		adapterArgs[serviceAccountFlag+1] != "project-signal-adapter" {
@@ -130,13 +131,36 @@ func TestRenderedPrometheusScrapesSignalController(t *testing.T) {
 	t.Parallel()
 
 	output := renderSignal(t, signalRenderData())
+
 	documents := splitYAMLDocuments(string(readRenderedFile(t, output, "13-prometheus.yaml")))
-	if len(documents) != 4 {
-		t.Fatalf("Prometheus documents = %d, want 4", len(documents))
+	if len(documents) != 7 {
+		t.Fatalf("Prometheus documents = %d, want 7", len(documents))
+	}
+
+	var serviceAccount corev1.ServiceAccount
+	if err := yaml.Unmarshal([]byte(documents[0]), &serviceAccount); err != nil {
+		t.Fatalf("decode Prometheus ServiceAccount: %v", err)
+	}
+
+	if serviceAccount.Name != "project-signal-prometheus" ||
+		serviceAccount.AutomountServiceAccountToken == nil ||
+		!*serviceAccount.AutomountServiceAccountToken {
+		t.Fatalf("Prometheus ServiceAccount = %#v", serviceAccount)
+	}
+
+	var role rbacv1.Role
+	if err := yaml.Unmarshal([]byte(documents[1]), &role); err != nil {
+		t.Fatalf("decode Prometheus Role: %v", err)
+	}
+
+	if len(role.Rules) != 1 ||
+		!slices.Equal(role.Rules[0].Resources, []string{"pods"}) ||
+		!slices.Equal(role.Rules[0].Verbs, []string{"get", "list", "watch"}) {
+		t.Fatalf("Prometheus Role = %#v", role)
 	}
 
 	var metricsService corev1.Service
-	if err := yaml.Unmarshal([]byte(documents[0]), &metricsService); err != nil {
+	if err := yaml.Unmarshal([]byte(documents[3]), &metricsService); err != nil {
 		t.Fatalf("decode metrics Service: %v", err)
 	}
 
@@ -146,7 +170,7 @@ func TestRenderedPrometheusScrapesSignalController(t *testing.T) {
 	}
 
 	var config corev1.ConfigMap
-	if err := yaml.Unmarshal([]byte(documents[1]), &config); err != nil {
+	if err := yaml.Unmarshal([]byte(documents[4]), &config); err != nil {
 		t.Fatalf("decode Prometheus ConfigMap: %v", err)
 	}
 
@@ -155,11 +179,15 @@ func TestRenderedPrometheusScrapesSignalController(t *testing.T) {
 		config.Data["prometheus.yml"],
 		"scrape_interval: 15s",
 		"project-signal-controller-metrics.signal-ns.svc:8080",
+		"job_name: project-signal-live-workloads",
+		"scrape_interval: 5s",
+		"role: pod",
+		"__meta_kubernetes_pod_annotation_prometheus_io_scrape",
 		"127.0.0.1:9090",
 	)
 
 	var deployment appsv1.Deployment
-	if err := yaml.Unmarshal([]byte(documents[2]), &deployment); err != nil {
+	if err := yaml.Unmarshal([]byte(documents[5]), &deployment); err != nil {
 		t.Fatalf("decode Prometheus Deployment: %v", err)
 	}
 
@@ -167,12 +195,14 @@ func TestRenderedPrometheusScrapesSignalController(t *testing.T) {
 	if container.Image != testPrometheusImage ||
 		!slices.Contains(container.Args, "--storage.tsdb.retention.time=24h") ||
 		!slices.Contains(container.Args, "--storage.tsdb.retention.size=1GB") ||
+		deployment.Spec.Template.Spec.ServiceAccountName != "project-signal-prometheus" ||
 		deployment.Spec.Template.Spec.AutomountServiceAccountToken == nil ||
-		*deployment.Spec.Template.Spec.AutomountServiceAccountToken {
+		!*deployment.Spec.Template.Spec.AutomountServiceAccountToken {
 		t.Fatalf("Prometheus Deployment = %#v", deployment.Spec.Template.Spec)
 	}
 
 	podSecurityContext := deployment.Spec.Template.Spec.SecurityContext
+
 	containerSecurityContext := container.SecurityContext
 	if podSecurityContext == nil ||
 		podSecurityContext.RunAsNonRoot == nil ||
@@ -199,7 +229,7 @@ func TestRenderedPrometheusScrapesSignalController(t *testing.T) {
 	}
 
 	var queryService corev1.Service
-	if err := yaml.Unmarshal([]byte(documents[3]), &queryService); err != nil {
+	if err := yaml.Unmarshal([]byte(documents[6]), &queryService); err != nil {
 		t.Fatalf("decode Prometheus query Service: %v", err)
 	}
 
@@ -253,6 +283,7 @@ func TestRenderedGPUInventoryCatalogPinsSource(t *testing.T) {
 	}
 
 	script, _ := artifact["content"].(string)
+
 	scriptDigest, _ := artifact["digest"].(string)
 	if artifact["name"] != "gpu-inventory.sh" {
 		t.Fatalf("CertificationTest artifact name = %v, want gpu-inventory.sh", artifact["name"])

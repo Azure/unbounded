@@ -4,7 +4,7 @@
 //! its retention policy (disk, pending writes). Admission policies are cloned
 //! into transferable handles, so the table uses a lock rather than `RefCell`.
 //! Reads are short and happen once per scoring pass or admission decision.
-use racer_control_wire::{CacheDefinition, CacheId, DEFAULT_PRIORITY};
+use racer_wire::control::{CacheDefinition, CacheId, DEFAULT_PRIORITY};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -188,7 +188,7 @@ mod tests {
             client_socket: "/client".into(),
             origin_socket: "/origin".into(),
             priority,
-            mode: racer_control_wire::CacheMode::Cached,
+            mode: racer_wire::control::CacheMode::Cached,
             origin: None,
         }
     }

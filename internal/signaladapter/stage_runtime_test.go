@@ -25,11 +25,76 @@ type fakeStageClock struct {
 	now time.Time
 }
 
+func TestStageSummaryRetainsDeclaredTypedMeasurements(t *testing.T) {
+	t.Parallel()
+
+	request := stageExecutionRequest(signalv1.StageSchedule{
+		Mode:              signalv1.CheckExecutionModeRunOnce,
+		InvocationTimeout: metav1.Duration{Duration: time.Second},
+	})
+	request.Stage.Test.Metrics = []signalv1.TestMetricDefinition{
+		{Name: "gpu0MinTflops", Type: signalv1.MetricValueTypeThroughput, Unit: "TFLOP/s"},
+		{Name: "scriptResult", Type: signalv1.MetricValueTypeStatus},
+	}
+
+	tflops := "812.5"
+	scriptResult := "Pass"
+	clock := &fakeStageClock{now: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
+	executor := &measurementStageExecutor{
+		fakeStageExecutor: fakeStageExecutor{clock: clock, duration: time.Second},
+		measurements: []signalv1.MetricMeasurement{
+			{
+				Name:  "gpu0MinTflops",
+				Value: signalv1.TypedValue{Type: signalv1.TypedValueTypeDecimal, DecimalValue: &tflops},
+				Unit:  "TFLOP/s",
+			},
+			{
+				Name:  "legacyText",
+				Value: signalv1.TypedValue{Type: signalv1.TypedValueTypeString, StringValue: &scriptResult},
+			},
+			{
+				Name:  "scriptResult",
+				Value: signalv1.TypedValue{Type: signalv1.TypedValueTypeString, StringValue: &scriptResult},
+			},
+		},
+	}
+
+	summary, err := (StageRunner{Clock: clock, Executor: executor}).Execute(t.Context(), request)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	if len(summary.Measurements) != 2 {
+		t.Fatalf("measurements = %#v, want two declared measurements", summary.Measurements)
+	}
+
+	if summary.Measurements[0].Name != "gpu0MinTflops" ||
+		summary.Measurements[0].Unit != "TFLOP/s" ||
+		summary.Measurements[1].Name != "scriptResult" {
+		t.Fatalf("measurements = %#v", summary.Measurements)
+	}
+}
+
 func (c *fakeStageClock) Now() time.Time {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	return c.now
+}
+
+type measurementStageExecutor struct {
+	fakeStageExecutor
+	measurements []signalv1.MetricMeasurement
+}
+
+func (e *measurementStageExecutor) ExecuteInvocation(
+	ctx context.Context,
+	invocation StageInvocation,
+) (signalv1.InvocationResultEnvelope, error) {
+	envelope, err := e.fakeStageExecutor.ExecuteInvocation(ctx, invocation)
+	envelope.Measurements = append([]signalv1.MetricMeasurement(nil), e.measurements...)
+
+	return envelope, err
 }
 
 func (c *fakeStageClock) Sleep(ctx context.Context, duration time.Duration) error {

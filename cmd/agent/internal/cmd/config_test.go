@@ -5,11 +5,13 @@ package cmd
 
 import (
 	"encoding/json"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -363,4 +365,104 @@ func TestLoadConfig_FromFile_WithAttest(t *testing.T) {
 	assert.NotNil(t, got.Attest)
 	assert.Equal(t, "http://192.168.1.1:8880", got.Attest.URL)
 	assert.Empty(t, got.Kubelet.Auth.BootstrapToken)
+}
+
+func TestConfigOverrides_Isolation(t *testing.T) {
+	tests := []struct {
+		name    string
+		file    string
+		flag    string
+		optIn   bool
+		want    string
+		wantErr string
+	}{
+		{name: "unset leaves an absent key untouched", want: ""},
+		{name: "unset leaves the file value untouched", file: "none", want: "none"},
+		{name: "flag sets the mode when the file has none", flag: "none", want: "none"},
+		{name: "flag overrides the file", file: "nspawn", flag: "none", want: "none"},
+		{name: "flag nspawn overrides a non-default file value", file: "none", flag: "nspawn", want: "nspawn"},
+		{name: "an experimental mode is refused without the opt-in", flag: "container", wantErr: "Experimental.ContainerIsolation"},
+		{name: "an experimental mode is accepted with the opt-in", file: "nspawn", flag: "container", optIn: true, want: "container"},
+		{name: "invalid flag value", flag: "docker", wantErr: "invalid --isolation"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := sampleConfig()
+			cfg.Isolation = tt.file
+
+			if tt.optIn {
+				cfg.Experimental = &provision.ExperimentalConfig{ContainerIsolation: true}
+			}
+
+			t.Setenv(configFileEnv, writeConfigFile(t, cfg))
+
+			got, err := loadConfigWith(testLogger(), configOverrides{Isolation: tt.flag})
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+				return
+			}
+
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got.Isolation)
+			require.NoError(t, got.Validate())
+		})
+	}
+}
+
+func TestConfigOverrides_InvalidFileValueStillFailsValidation(t *testing.T) {
+	cfg := sampleConfig()
+	cfg.Isolation = "docker"
+	t.Setenv(configFileEnv, writeConfigFile(t, cfg))
+
+	got, err := loadConfigWith(testLogger(), configOverrides{})
+	require.NoError(t, err)
+	require.ErrorContains(t, got.Validate(), "invalid Isolation")
+}
+
+func TestConfigOverrides_UnsetMatchesLoadConfig(t *testing.T) {
+	cfg := sampleConfig()
+	t.Setenv(configFileEnv, writeConfigFile(t, cfg))
+
+	want, err := loadConfig(testLogger())
+	require.NoError(t, err)
+
+	got, err := loadConfigWith(testLogger(), configOverrides{})
+	require.NoError(t, err)
+	assert.Equal(t, want, got)
+}
+
+func TestIsolationFlagOnStartAndPreflight(t *testing.T) {
+	ctx := &CommandContext{LogFormat: "text"}
+
+	for name, cmd := range map[string]*cobra.Command{"start": newCmdStart(ctx), "preflight": newCmdPreflight(ctx)} {
+		flag := cmd.Flags().Lookup("isolation")
+		require.NotNil(t, flag, "%s must take --isolation", name)
+		assert.Empty(t, flag.DefValue, "unset by default so the config file decides")
+		assert.Contains(t, flag.Usage, "nspawn, none or container")
+	}
+
+	for name, cmd := range map[string]*cobra.Command{"daemon": newCmdDaemon(ctx), "reset": newCmdReset(ctx)} {
+		assert.Nil(t, cmd.Flags().Lookup("isolation"), "%s reads the applied mode, not a flag", name)
+	}
+}
+
+func TestPreflightRejectsAnInvalidIsolationFlag(t *testing.T) {
+	t.Setenv(configFileEnv, writeConfigFile(t, sampleConfig()))
+
+	cmd := newCmdPreflight(&CommandContext{LogFormat: "text"})
+	cmd.SetArgs([]string{"--isolation", "docker"})
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+
+	require.ErrorContains(t, cmd.ExecuteContext(t.Context()), "invalid --isolation")
+}
+
+func TestPreflightIsolationFlagReachesTheConfig(t *testing.T) {
+	cmd := newCmdPreflight(&CommandContext{LogFormat: "text"})
+	require.NoError(t, cmd.ParseFlags([]string{"--isolation", "container"}))
+
+	flag := cmd.Flags().Lookup("isolation")
+	require.NotNil(t, flag)
+	assert.Equal(t, "container", flag.Value.String())
 }

@@ -11,7 +11,7 @@ use crate::model::StrongEtag;
 use http1::Header;
 use http1::MessageHead;
 use http1::StartLine;
-use racer_control_wire::AzureContainerUrl;
+use racer_wire::control::AzureContainerUrl;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The service version azblob v1.8.2 (the Go SDK in go.mod) sends.
@@ -124,15 +124,15 @@ pub fn head(
     range: Option<ByteRange>,
     if_match: Option<&StrongEtag>,
     bearer: Option<&[u8]>,
+    now: SystemTime,
 ) -> Result<MessageHead> {
     let mut headers = Vec::with_capacity(7);
     headers.push(Header::new("Host", url.host_header().as_bytes()));
     headers.push(Header::new("x-ms-version", AZURE_SERVICE_VERSION));
     // Azure Storage rejects authorized requests without a request date. The
-    // head is rebuilt per attempt, so retries carry a fresh date.
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
+    // head is rebuilt per attempt, so retries carry a fresh date. `now` is
+    // the worker clock's wall time.
+    let now = now.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
     headers.push(Header::new("x-ms-date", http_date(now).as_bytes()));
     headers.push(Header::new("User-Agent", b"racer"));
     if let Some(range) = range {
@@ -235,6 +235,7 @@ mod tests {
             }),
             Some(&etag),
             Some(b"token"),
+            UNIX_EPOCH + std::time::Duration::from_secs(784_111_777),
         )
         .unwrap();
         assert!(matches!(
@@ -248,11 +249,18 @@ mod tests {
         assert_eq!(get("x-ms-range"), b"bytes=0-16777215");
         assert_eq!(get("If-Match"), b"\"0x8D\"");
         assert_eq!(get("Authorization"), b"Bearer token");
-        let date = std::str::from_utf8(get("x-ms-date")).unwrap();
-        assert_eq!(date.len(), 29);
-        assert!(date.ends_with(" GMT"));
-        let anonymous =
-            super::head(&url, &object("k", ""), AzureMethod::Head, None, None, None).unwrap();
+        // The date comes from the caller's clock, not the host's.
+        assert_eq!(get("x-ms-date"), b"Sun, 06 Nov 1994 08:49:37 GMT");
+        let anonymous = super::head(
+            &url,
+            &object("k", ""),
+            AzureMethod::Head,
+            None,
+            None,
+            None,
+            SystemTime::now(),
+        )
+        .unwrap();
         for name in ["Authorization", "If-Match", "x-ms-range"] {
             assert_eq!(anonymous.unique(name).unwrap(), None);
         }

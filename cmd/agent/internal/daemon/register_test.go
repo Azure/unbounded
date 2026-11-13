@@ -5,15 +5,18 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	netv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
@@ -27,6 +30,7 @@ func discardLogger() *slog.Logger {
 func fakeScheme() *runtime.Scheme {
 	s := runtime.NewScheme()
 	utilruntime.Must(v1alpha3.AddToScheme(s))
+	utilruntime.Must(corev1.AddToScheme(s))
 
 	return s
 }
@@ -181,4 +185,45 @@ func Test_registerMachine_Labels_Preserved(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, map[string]string{"env": "prod", "zone": "us-west"}, machine.Spec.Kubernetes.NodeLabels)
 	assert.Equal(t, []string{"gpu=true:NoSchedule"}, machine.Spec.Kubernetes.RegisterWithTaints)
+}
+
+func Test_registerMachine_AllocationHost_NotFound_DoesNotCreate(t *testing.T) {
+	cfg := allocationConfig(t, testAllocationUID)
+
+	var creates int
+
+	c := fake.NewClientBuilder().
+		WithScheme(fakeScheme()).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Create: func(context.Context, client.WithWatch, client.Object, ...client.CreateOption) error {
+				creates++
+
+				return errors.New("unexpected create")
+			},
+		}).
+		Build()
+
+	err := registerMachine(context.Background(), discardLogger(), c, cfg)
+	require.NoError(t, err)
+	assert.Zero(t, creates)
+
+	var list v1alpha3.MachineList
+	require.NoError(t, c.List(context.Background(), &list))
+	assert.Empty(t, list.Items)
+}
+
+func Test_registerMachine_AllocationHost_Exists_ReportsProvisioningFormat(t *testing.T) {
+	cfg := allocationConfig(t, testAllocationUID)
+	cfg.ProvisioningFormat = "ignition"
+
+	c := fakeStatusClient(allocationMachine(testAllocationUID))
+
+	err := registerMachine(context.Background(), discardLogger(), c, cfg)
+	require.NoError(t, err)
+
+	var machine v1alpha3.Machine
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "test-machine"}, &machine))
+	assert.Equal(t, v1alpha3.ProvisioningFormatIgnition, machine.Status.ObservedProvisioningFormat)
+	require.NotNil(t, machine.Spec.AllocationRef)
+	assert.Equal(t, testAllocationUID, string(machine.Spec.AllocationRef.UID))
 }

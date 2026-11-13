@@ -6,11 +6,16 @@ license = "Apache-2.0"
 publish = false
 description = "Worker-local aligned buffers and lease-fenced sparse slab storage"
 
-[features]
-default = []
-simulation = ["uring-runtime/simulation"]
-
 [dependencies]
 libc = "0.2"
 zeroize = "1"
-uring-runtime = { path = "../runtime" }
+racer-io = { path = "../io" }
+
+[dev-dependencies]
+racer-io = { path = "../io" }
+
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }

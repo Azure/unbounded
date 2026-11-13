@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	pathpkg "path"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,6 +25,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/metalman/hostnetwork"
 	"github.com/Azure/unbounded/internal/metalman/indexing"
 	"github.com/Azure/unbounded/internal/provision"
 )
@@ -74,6 +76,23 @@ type FileResolver struct {
 	KubernetesVersion string
 	ClusterDNS        string
 	ProviderLabels    map[string]string
+
+	// ExperimentalContainerIsolation enables the experimental container
+	// isolation mode (serve-pxe --experimental-container-isolation). When set,
+	// every agent configuration the resolver renders opts in
+	// (Experimental.ContainerIsolation); when not, a Machine that declares
+	// container gets no agent configuration and no installer boot, since its
+	// agent would refuse it, but still gets a grub.cfg that chainloads its
+	// local disk when no install is pending.
+	ExperimentalContainerIsolation bool
+}
+
+// CheckIsolationEnabled returns an error when machine declares an
+// experimental isolation mode that this metalman does not enable. Metalman then
+// neither renders an agent configuration for it nor starts a HostReplace of it.
+func CheckIsolationEnabled(machine *v1alpha3.Machine, containerEnabled bool) error {
+	return provision.CheckIsolationEnabled(machine.Spec.Isolation, containerEnabled, "metalman",
+		"start metalman serve-pxe with --experimental-container-isolation")
 }
 
 func (f *FileResolver) NetbootImageRef(node *v1alpha3.Machine) string {
@@ -223,6 +242,23 @@ func (f *FileResolver) ResolveFileByPathForIP(ctx context.Context, path string, 
 		}
 
 		if node != nil {
+			installRequested, err := f.installRequested(ctx, node)
+			if err != nil {
+				return nil, err
+			}
+
+			// The experimental gate refuses only what would act on the
+			// Machine's isolation mode: a template that embeds the agent
+			// configuration, or any template while an install is pending
+			// (which boots the installer). Without either, the template
+			// (grub.cfg chainloading the local disk) must still render so
+			// a refused Machine keeps booting what it has installed.
+			if installRequested || templateEmbedsAgentConfig(content) {
+				if err := CheckIsolationEnabled(node, f.ExperimentalContainerIsolation); err != nil {
+					return nil, fmt.Errorf("rendering %s for Machine %s: %w", path, node.Name, err)
+				}
+			}
+
 			ci := f.Cluster.ClusterInfo()
 
 			agentConfig := provision.BuildAgentConfig(provision.BuildAgentConfigParams{
@@ -241,8 +277,9 @@ func (f *FileResolver) ResolveFileByPathForIP(ctx context.Context, path string, 
 					ClusterDNS:   f.ClusterDNS,
 					KubeVersion:  f.KubernetesVersion,
 				},
-				ProviderLabels: f.ProviderLabels,
-				AttestURL:      f.ServeURL,
+				ProviderLabels:                 f.ProviderLabels,
+				AttestURL:                      f.ServeURL,
+				ExperimentalContainerIsolation: f.ExperimentalContainerIsolation,
 			})
 
 			// The MarshalIndent prefix "    " (4 spaces) must match the
@@ -254,12 +291,12 @@ func (f *FileResolver) ResolveFileByPathForIP(ctx context.Context, path string, 
 				return nil, fmt.Errorf("marshal agent config: %w", err)
 			}
 
-			installRequested, err := f.installRequested(ctx, node)
+			td, err := newHostTemplateData(node, ci, f.ServeURL, string(agentConfigJSON), requestIP, installRequested)
 			if err != nil {
 				return nil, err
 			}
 
-			data, err := renderTemplate(string(content), newTemplateData(node, ci, f.ServeURL, string(agentConfigJSON), requestIP, installRequested))
+			data, err := renderTemplate(string(content), td)
 			if err != nil {
 				return nil, err
 			}
@@ -310,9 +347,18 @@ func (f *FileResolver) resolveUserDataFromConfigMap(ctx context.Context, node *v
 	return nil, false, fmt.Errorf("key %q not found in ConfigMap %s/%s", key, ref.Namespace, ref.Name)
 }
 
+// templateData is the input of the netboot templates. Templates live in the
+// netboot image, which can be newer or older than this metalman, so they are
+// rendered from values() rather than from the struct: a template that names a
+// field this metalman does not have renders it as the zero value instead of
+// failing to render.
 type templateData struct {
-	Machine          *v1alpha3.Machine
-	BootLease        *v1alpha3.DHCPLease
+	Machine   *v1alpha3.Machine
+	BootLease *v1alpha3.DHCPLease
+	// DHCPHoldLease mirrors BootLease.HoldLease as a top-level key. Templates
+	// must read this key rather than the nested lease field, so an older
+	// controller that lacks it renders the DHCP-free default instead of failing.
+	DHCPHoldLease    bool
 	ApiserverURL     string
 	ServeURL         string
 	AgentConfigJSON  string
@@ -322,6 +368,28 @@ type templateData struct {
 	VirtualMedia     bool
 	ArtifactRoot     string
 	MediaCallbackURL string
+	// HostNetplan is the declared host network as a netplan version 2
+	// document without the network: key, or empty when none is declared.
+	HostNetplan string
+}
+
+// newHostTemplateData is newTemplateData plus the declared host network.
+// A network that cannot be rendered fails the request rather than serving a
+// config without it.
+func newHostTemplateData(node *v1alpha3.Machine, ci ClusterInfo, serveURL, agentConfigJSON, requestIP string, installRequested bool) (templateData, error) {
+	d := newTemplateData(node, ci, serveURL, agentConfigJSON, requestIP, installRequested)
+	if node == nil || node.Spec.Netboot() == nil || node.Spec.Netboot().Network == nil {
+		return d, nil
+	}
+
+	doc, err := hostnetwork.RenderNetplanConfig(node.Spec.Netboot().Network)
+	if err != nil {
+		return templateData{}, fmt.Errorf("rendering host network: %w", err)
+	}
+
+	d.HostNetplan = strings.TrimRight(string(doc), "\n")
+
+	return d, nil
 }
 
 func newTemplateData(node *v1alpha3.Machine, ci ClusterInfo, serveURL, agentConfigJSON, requestIP string, installRequested bool) templateData {
@@ -338,6 +406,7 @@ func newTemplateData(node *v1alpha3.Machine, ci ClusterInfo, serveURL, agentConf
 	return templateData{
 		Machine:          node,
 		BootLease:        bootLease,
+		DHCPHoldLease:    bootLease != nil && bootLease.HoldLease,
 		ApiserverURL:     ci.ApiserverURL,
 		ServeURL:         serveURL,
 		AgentConfigJSON:  agentConfigJSON,
@@ -359,6 +428,16 @@ func selectBootLease(node *v1alpha3.Machine, requestIP string) *v1alpha3.DHCPLea
 	}
 
 	return &node.Spec.Netboot().DHCPLeases[0]
+}
+
+// agentConfigField is the template field that carries the rendered agent
+// configuration.
+const agentConfigField = ".AgentConfigJSON"
+
+// templateEmbedsAgentConfig reports whether a template renders the agent
+// configuration into what it serves.
+func templateEmbedsAgentConfig(content []byte) bool {
+	return bytes.Contains(content, []byte(agentConfigField))
 }
 
 func (f *FileResolver) installRequested(ctx context.Context, node *v1alpha3.Machine) (bool, error) {
@@ -454,6 +533,21 @@ func indentTemplateBlock(spaces int, value string) string {
 	return prefix + strings.ReplaceAll(value, "\n", "\n"+prefix)
 }
 
+// values returns the template data as a map keyed by field name. A map lets a
+// template reference a key that does not exist (it yields no value, which is
+// false and empty), where a struct fails the whole render.
+func (d templateData) values() map[string]any {
+	v := reflect.ValueOf(d)
+	t := v.Type()
+
+	m := make(map[string]any, t.NumField())
+	for i := range t.NumField() {
+		m[t.Field(i).Name] = v.Field(i).Interface()
+	}
+
+	return m
+}
+
 func renderTemplate(tmplStr string, data templateData) ([]byte, error) {
 	t, err := template.New("").Funcs(templateFuncMap).Parse(tmplStr)
 	if err != nil {
@@ -469,7 +563,7 @@ func renderTemplate(tmplStr string, data templateData) ([]byte, error) {
 
 	defer templatePool.Put(buf)
 
-	if err := t.Execute(buf, data); err != nil {
+	if err := t.Execute(buf, data.values()); err != nil {
 		return nil, fmt.Errorf("executing template: %w", err)
 	}
 

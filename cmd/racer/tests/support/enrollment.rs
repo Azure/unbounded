@@ -23,10 +23,19 @@ pub fn default_config(cluster: &str) -> dataplane::config::Config {
     .unwrap()
 }
 
+/// A production reactor on the host io_uring backend.
 pub fn reactor() -> Rc<Reactor> {
+    reactor_in(&racer_io::Env::new(
+        racer_io::Driver::Uring,
+        racer_io::WorkerCtx::host(),
+    ))
+}
+
+/// A production reactor on an explicit backend, such as a simulated world.
+pub fn reactor_in(env: &racer_io::Env) -> Rc<Reactor> {
     let n = NonZeroUsize::new(1024 * 1024).unwrap();
-    let reactor = Rc::new(Reactor::new(Rc::new(flow_control::Quotas::new(
-        AdmissionPolicy::new(Limits {
+    let reactor = Rc::new(Reactor::new(
+        Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(Limits {
             plaintext_bytes: n,
             ciphertext_bytes: n,
             dirty_bytes: n,
@@ -37,6 +46,8 @@ pub fn reactor() -> Rc<Reactor> {
             queue_entries: NonZeroUsize::new(32).unwrap(),
             connections_per_neighbor: n,
             client_connections: n,
+            peer_connections: n,
+            outbound_connections: n,
             pipes: n,
             range_window_pages: n,
             header_bytes: n,
@@ -47,8 +58,9 @@ pub fn reactor() -> Rc<Reactor> {
             retained_snapshots: n,
             metadata_entries: n,
             relay_transfers: n,
-        }),
-    ))));
+        }))),
+        env,
+    ));
     reactor.init().unwrap();
     reactor
 }
@@ -99,27 +111,27 @@ pub fn fields(head: &str) -> std::collections::BTreeMap<String, String> {
 pub use racer_crypto::identity::test_util::ca;
 
 pub fn issue(
-    request: &racer_control_wire::EnrollmentRequest,
+    request: &racer_wire::control::EnrollmentRequest,
     ca: &rcgen::Certificate,
     key: &rcgen::KeyPair,
     node: &str,
-) -> racer_control_wire::EnrollmentResponse {
+) -> racer_wire::control::EnrollmentResponse {
     issue_at(
         request,
         ca,
         key,
         node,
-        uring_runtime::environment::wall_now() - std::time::Duration::from_secs(1),
+        std::time::SystemTime::now() - std::time::Duration::from_secs(1),
     )
 }
 
 pub fn issue_at(
-    request: &racer_control_wire::EnrollmentRequest,
+    request: &racer_wire::control::EnrollmentRequest,
     ca: &rcgen::Certificate,
     key: &rcgen::KeyPair,
     node: &str,
     not_before: std::time::SystemTime,
-) -> racer_control_wire::EnrollmentResponse {
+) -> racer_wire::control::EnrollmentResponse {
     let der = rustls::pki_types::CertificateSigningRequestDer::from(request.csr_der.clone());
     let mut csr = rcgen::CertificateSigningRequestParams::from_der(&der).unwrap();
     csr.params.not_before = not_before.into();
@@ -132,11 +144,11 @@ pub fn issue_at(
     csr.params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
     csr.params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
     let cert = csr.signed_by(ca, key).unwrap();
-    racer_control_wire::EnrollmentResponse {
+    racer_wire::control::EnrollmentResponse {
         block_devices: None,
-        schema_version: racer_control_wire::SCHEMA_VERSION,
+        schema_version: racer_wire::control::SCHEMA_VERSION,
         cluster: request.cluster.clone(),
-        node: racer_control_wire::NodeId(node.into()),
+        node: racer_wire::control::NodeId(node.into()),
         enrollment: request.enrollment.clone(),
         certificate_chain: vec![cert.der().to_vec()],
     }
@@ -146,8 +158,8 @@ pub fn signing_identity(
     pending: racer_crypto::identity::PendingIdentity,
     ca: &rcgen::Certificate,
     ca_key: &rcgen::KeyPair,
-    cluster: racer_control_wire::ClusterId,
-    node: racer_control_wire::NodeId,
+    cluster: racer_wire::control::ClusterId,
+    node: racer_wire::control::NodeId,
 ) -> std::sync::Arc<racer_crypto::identity::SigningIdentity> {
     let (pending, chain) = racer_crypto::identity::test_util::issue_pending(
         pending,
@@ -159,7 +171,13 @@ pub fn signing_identity(
     );
     std::sync::Arc::new(
         pending
-            .accept(cluster, node, chain, &[ca.der().to_vec()])
+            .accept(
+                cluster,
+                node,
+                chain,
+                &[ca.der().to_vec()],
+                &racer_crypto::identity::WallClock::host(),
+            )
             .unwrap(),
     )
 }
