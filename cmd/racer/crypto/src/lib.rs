@@ -21,6 +21,8 @@
 #![deny(missing_docs)]
 
 mod fused;
+#[cfg(target_arch = "aarch64")]
+mod ghash_arm;
 #[cfg(target_arch = "x86_64")]
 mod ghash_x86;
 
@@ -370,10 +372,13 @@ impl PageCipher {
 }
 
 /// GHASH with an aggregated PCLMULQDQ/VPCLMULQDQ path on x86_64 and the
-/// portable `ghash` crate everywhere else (or when the CPU lacks CLMUL).
+/// a PMULL path on aarch64, and the portable `ghash` crate everywhere else
+/// (or when the CPU lacks carry-less multiply).
 enum PageGhash {
     #[cfg(target_arch = "x86_64")]
     Fast(ghash_x86::Ghash),
+    #[cfg(target_arch = "aarch64")]
+    Fast(ghash_arm::Ghash),
     Portable(ghash::GHash),
 }
 
@@ -383,13 +388,17 @@ impl PageGhash {
         if let Some(fast) = ghash_x86::Ghash::new(h) {
             return Self::Fast(fast);
         }
+        #[cfg(target_arch = "aarch64")]
+        if let Some(fast) = ghash_arm::Ghash::new(h) {
+            return Self::Fast(fast);
+        }
         Self::Portable(ghash::GHash::new(h.into()))
     }
 
     fn update_padded(&mut self, data: &[u8]) {
         use ghash::universal_hash::UniversalHash;
         match self {
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             Self::Fast(g) => g.update_padded(data),
             Self::Portable(g) => g.update_padded(data),
         }
@@ -398,7 +407,7 @@ impl PageGhash {
     fn finalize(self) -> [u8; 16] {
         use ghash::universal_hash::UniversalHash;
         match self {
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             Self::Fast(g) => g.finalize(),
             Self::Portable(g) => g.finalize().into(),
         }
