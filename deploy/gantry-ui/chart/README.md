@@ -59,7 +59,16 @@ payload layer. It checks the resulting ACR digest, builder Job completion, and
 the generated DaemonSet's availability on every matching Flex worker. This
 small test image and workload remain in ACR and the demo namespace for viewing.
 Verification is for ordinary OCI images; it does not enable Gantry Artifact
-Streaming on the cluster. Disk reclamation remains disabled.
+Streaming on the cluster. New `aks-flex-cluster.sh` deployments enable streaming
+by default; existing non-streaming workers require the
+[staged Flex streaming procedure](../../../docs/content/guides/gantry.md#enable-streaming-on-existing-aks-flex-workers).
+
+Full setup also enables the **Reclaim disk space** button and its dedicated
+Kubernetes account/RBAC. No cleanup is performed during setup or verification.
+Clicking the button requires typing `DELETE ALL DEMOS`; it removes this
+dashboard's demo workloads and reclaims unused node images, preserving ACR
+images and active or uncertain runtime leases. Use `--no-reclaimer` to leave
+this privileged capability disabled. The manual chart defaults remain unchanged.
 
 The script prints the dashboard's local URL and keeps the tunnel running until
 Ctrl-C. This closes only the tunnel, not the installed dashboard. Use

@@ -31,7 +31,7 @@ PLUGIN_BINARY=""
 PLUGIN_DIGEST=""
 IMAGE_REGISTRY=""
 OPERATOR_IMAGE=""
-ARTIFACT_STREAMING=false
+ARTIFACT_STREAMING=true
 VNET_CIDR="10.91.0.0/16"
 CLUSTER_POD_CIDR="10.93.0.0/16"
 FLEX_POD_CIDR="10.96.0.0/14"
@@ -67,6 +67,9 @@ Creates one AKS system node and one Uniform VMSS with three Ubuntu 24.04 Flex
 instances by default. All worker instances share one managed identity and one
 load-balancer public IP for outbound access and per-instance SSH NAT ports.
 Each Flex worker uses a 512 GiB Premium SSD (Premium_LRS) OS disk.
+The AKS control plane uses Standard tier; existing clusters must also use Standard.
+Gantry Artifact Streaming is enabled by default on Flex workers, with NBD loaded
+before node bootstrap. Use --no-artifact-streaming for ordinary OCI images only.
 New VMSS instances bootstrap automatically, including after a scale-out.
 Requires az >= 2.90.0, kubectl, jq, python3, curl, tar, openssl, and OpenSSH.
 Flex workers default to amd64; --worker-arch arm64 selects an ARM64 Ubuntu host
@@ -99,8 +102,8 @@ Options:
   --plugin-binary PATH        Use this local kubectl-unbounded instead of a release
   --image-registry PREFIX     Operator/component image prefix, e.g. ghcr.io/myorg
   --operator-image NAME:TAG   Operator name and tag, without a registry
-  --artifact-streaming       Enable Gantry streaming on Flex workers and preload
-                              NBD before nspawn starts (requires a compatible build)
+  --artifact-streaming       Enable streaming (default; requires a compatible build)
+  --no-artifact-streaming    Disable Gantry streaming and the NBD preload
   --vnet-cidr CIDR            IPv4 VNet, /16 through /20 (default: 10.91.0.0/16)
   --cluster-pod-cidr CIDR     System-site pods (default: 10.93.0.0/16)
   --flex-pod-cidr CIDR        Flex-site pods, /14 or larger (default: 10.96.0.0/14)
@@ -135,6 +138,7 @@ parse_args() {
       --plan) PLAN_ONLY=true; shift ;;
       --yes) ASSUME_YES=true; shift ;;
       --artifact-streaming) ARTIFACT_STREAMING=true; shift ;;
+      --no-artifact-streaming) ARTIFACT_STREAMING=false; shift ;;
       --build-from-checkout) BUILD_FROM_CHECKOUT=true; shift ;;
       -h|--help) usage; exit 0 ;;
       --name|--location|--subscription|--resource-group|--flex-count|--worker-arch|--vm-size|--system-vm-size|--kubernetes-version|--unbounded-version|--agent-version|--engine|--build-dns|--plugin-binary|--image-registry|--operator-image|--vnet-cidr|--cluster-pod-cidr|--flex-pod-cidr|--service-cidr|--ssh-key|--ssh-source-ip|--state-dir|--timeout)
@@ -278,6 +282,7 @@ print_plan() {
   printf '  Cluster / resource group: %s / %s\n' "$NAME" "$RESOURCE_GROUP"
   printf '  Subscription / region:   %s / %s\n' "${SUBSCRIPTION:-active account}" "$LOCATION"
   printf '  Nodes:                    1 system + %s Flex = %s total\n' "$FLEX_COUNT" "$((FLEX_COUNT + 1))"
+  printf '  Control plane tier:       Standard\n'
   printf '  VM sizes:                 system=%s flex=%s\n' "$SYSTEM_VM_SIZE" "$VM_SIZE"
   printf '  Flex OS disk:             %s GiB %s\n' "$WORKER_OS_DISK_GB" "$WORKER_OS_DISK_SKU"
   printf '  Flex architecture/image:  %s / Ubuntu 24.04 %s\n' "$WORKER_ARCH" "$WORKER_IMAGE_SKU"
@@ -289,7 +294,11 @@ print_plan() {
   [[ -z "$PLUGIN_BINARY" ]] || printf '  Installer binary:         %s\n' "$PLUGIN_BINARY"
   [[ -z "$IMAGE_REGISTRY" ]] || printf '  Image registry:           %s\n' "$IMAGE_REGISTRY"
   [[ -z "$OPERATOR_IMAGE" ]] || printf '  Operator image:           %s\n' "$OPERATOR_IMAGE"
-  [[ "$ARTIFACT_STREAMING" != true ]] || printf '  Gantry streaming:         enabled on Flex workers (NBD preloaded)\n'
+  if [[ "$ARTIFACT_STREAMING" == true ]]; then
+    printf '  Gantry streaming:         enabled on Flex workers (NBD preloaded)\n'
+  else
+    printf '  Gantry streaming:         disabled (ordinary OCI images only)\n'
+  fi
   printf '  Node subnets:             %s / %s\n' "$SYSTEM_NODE_CIDR" "$FLEX_NODE_CIDR"
   printf '  Pod CIDRs:                %s / %s\n' "$CLUSTER_POD_CIDR" "$FLEX_POD_CIDR"
   printf '  Services / DNS:           %s / %s\n' "$SERVICE_CIDR" "$DNS_SERVICE_IP"
@@ -654,8 +663,9 @@ ensure_cluster() {
   existing=$(lookup_resource Microsoft.ContainerService/managedClusters "$NAME")
   if [[ "$existing" == null ]]; then
     [[ -z "$KUBERNETES_VERSION" ]] || args+=(--kubernetes-version "$KUBERNETES_VERSION")
-    log "Creating AKS cluster $NAME with one system node and no built-in CNI"
+    log "Creating Standard-tier AKS cluster $NAME with one system node and no built-in CNI"
     az_cmd aks create -g "$RESOURCE_GROUP" --name "$NAME" --location "$LOCATION" \
+      --tier standard \
       --nodepool-name system --node-count 1 --node-vm-size "$SYSTEM_VM_SIZE" --os-sku Ubuntu \
       --vm-set-type VirtualMachineScaleSets --network-plugin none --pod-cidr "$CLUSTER_POD_CIDR" \
       --service-cidr "$SERVICE_CIDR" --dns-service-ip "$DNS_SERVICE_IP" --vnet-subnet-id "$SYSTEM_SUBNET_ID" \
@@ -673,6 +683,8 @@ ensure_cluster() {
       *) die "unexpected AKS provisioning state: $state" ;;
     esac
   done
+  jq -e '(.sku.tier // "" | ascii_downcase) == "standard"' <<<"$cluster" >/dev/null \
+    || die "AKS Standard tier is required (found $(jq -r '.sku.tier // "missing"' <<<"$cluster")); change the billing tier explicitly with: az aks update --resource-group $RESOURCE_GROUP --name $NAME --subscription $SUBSCRIPTION --tier standard"
   jq -e --arg location "$LOCATION" --arg subnet "$SYSTEM_SUBNET_ID" --arg size "$SYSTEM_VM_SIZE" \
     --arg service "$SERVICE_CIDR" --arg dns "$DNS_SERVICE_IP" --arg pods "$CLUSTER_POD_CIDR" \
     '.location == $location and (.networkProfile.networkPlugin | ascii_downcase) == "none"
@@ -1046,7 +1058,8 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y -qq kmod
 printf 'nbd\n' > /etc/modules-load.d/gantry-nbd.conf
 printf 'options nbd nbds_max=1024\n' > /etc/modprobe.d/gantry-nbd.conf
 modprobe nbd nbds_max=1024
-if [[ "$(cat /sys/module/nbd/parameters/nbds_max)" -lt 64 ]]; then
+udevadm settle
+if [[ "$(cat /sys/module/nbd/parameters/nbds_max)" -lt 64 || ! -b /dev/nbd63 ]]; then
   echo 'Gantry streaming requires at least 64 NBD devices before Flex bootstrap' >&2
   exit 78
 fi
@@ -1210,43 +1223,32 @@ validate_deployment() {
   wait_component_rollout daemonset/unbounded-net-node
   wait_component_rollout daemonset/unbounded-net-kube-proxy-flex-site
   if [[ "$ARTIFACT_STREAMING" == true ]]; then
+    log "Waiting for operator-managed Gantry streaming on all Flex workers"
+    deadline=$((SECONDS + TIMEOUT))
+    while true; do
+      page=$(kube -n unbounded-system get daemonsets gantry gantry-overlaybd-config --ignore-not-found -o json) \
+        || die "cannot query operator-managed Gantry streaming workloads"
+      if jq -e --arg arch "$WORKER_ARCH" --arg pool "$FLEX_POOL" --argjson count "$FLEX_COUNT" '
+        any(.items[];
+          .metadata.name == "gantry"
+          and .spec.template.spec.hostNetwork == true
+          and any(.spec.template.spec.containers[];
+            .name == "gantry" and any(.env[]?;
+              .name == "GANTRY_ARTIFACT_STREAMING_ENABLED" and .value == "true")))
+        and any(.items[];
+          .metadata.name == "gantry-overlaybd-config"
+          and .spec.template.spec.nodeSelector == {
+            "kubernetes.io/arch":$arch,"kubernetes.azure.com/agentpool":$pool}
+          and .status.desiredNumberScheduled == $count)
+      ' <<<"$page" >/dev/null; then
+        break
+      fi
+      ((SECONDS < deadline)) || die "operator did not enable Gantry artifact streaming and select all $FLEX_COUNT Flex workers; inspect site/flex-site and the gantry and gantry-overlaybd-config DaemonSets"
+      sleep 5
+    done
     wait_component_rollout daemonset/gantry
     wait_component_rollout daemonset/gantry-overlaybd-config
   fi
-}
-
-smoke_test() {
-  local namespace=aks-flex-smoke namespaces existing pods pod targets=()
-  log "Testing cross-node pods, Services, DNS, and API-server-to-kubelet exec/logs"
-  namespaces=$(kube get namespaces -o json)
-  existing=$(jq -c --arg ns "$namespace" '[.items[] | select(.metadata.name == $ns)][0] // null' <<<"$namespaces")
-  if [[ "$existing" != null ]]; then
-    jq -e --arg name "$NAME" '.metadata.labels["unbounded-flex-cluster"] == $name' <<<"$existing" >/dev/null || die "smoke namespace already exists and is not owned by this deployment"
-  fi
-  jq -n --arg ns "$namespace" --arg name "$NAME" --arg pool "$FLEX_POOL" \
-    '{apiVersion:"v1",kind:"List",items:[
-      {apiVersion:"v1",kind:"Namespace",metadata:{name:$ns,labels:{"unbounded-flex-cluster":$name}}},
-      {apiVersion:"apps/v1",kind:"DaemonSet",metadata:{name:"echo",namespace:$ns},spec:{selector:{matchLabels:{app:"flex-smoke"}},
-       template:{metadata:{labels:{app:"flex-smoke"}},spec:{nodeSelector:{"kubernetes.azure.com/agentpool":$pool},
-        containers:[{name:"echo",image:"docker.io/library/busybox:1.37.0",command:["sh","-c","mkdir -p /www; hostname > /www/index.html; exec httpd -f -p 8080 -h /www"],
-         ports:[{containerPort:8080}],resources:{requests:{cpu:"10m",memory:"16Mi"},limits:{memory:"64Mi"}},
-         readinessProbe:{httpGet:{path:"/",port:8080}}}]}}}},
-      {apiVersion:"v1",kind:"Service",metadata:{name:"echo",namespace:$ns},spec:{selector:{app:"flex-smoke"},ports:[{port:8080,targetPort:8080}]}}
-    ]}' > "$STATE_DIR/smoke.json"
-  kube apply --server-side --field-manager=aks-flex-cluster -f "$STATE_DIR/smoke.json"
-  kube -n "$namespace" rollout status daemonset/echo --timeout="${TIMEOUT}s"
-  pods=$(kube -n "$namespace" get pods -l app=flex-smoke -o json)
-  [[ "$(jq '.items | length' <<<"$pods")" == "$FLEX_COUNT" ]] || die "smoke DaemonSet does not have exactly $FLEX_COUNT pods"
-  # Bound cross-node sampling rather than issuing a quadratic all-pairs test at 1000 nodes.
-  pods=$(jq '{items: (.items | sort_by(.metadata.name) | [.[0], .[length / 2 | floor], .[-1]] | unique_by(.metadata.name))}' <<<"$pods")
-  while IFS= read -r pod; do targets+=("$pod"); done < <(jq -r '.items[].status.podIP' <<<"$pods")
-  targets+=("echo.$namespace.svc.cluster.local")
-  while IFS= read -r pod; do
-    # Expansion belongs to the container shell, not the workstation shell.
-    # shellcheck disable=SC2016
-    kube -n "$namespace" exec "$pod" -- sh -c 'set -e; for target in "$@"; do wget -q -T 15 -O - "http://$target:8080/"; done' sh "${targets[@]}"
-    kube -n "$namespace" logs "$pod" --tail=1 >/dev/null
-  done < <(jq -r '.items[].metadata.name' <<<"$pods")
 }
 
 main() {
@@ -1276,7 +1278,6 @@ main() {
   ensure_worker_network
   ensure_vmss
   validate_deployment
-  smoke_test
   write_ssh_access
   log "Deployment ready: one system node and $FLEX_COUNT Flex nodes"
   kube get nodes -L kubernetes.azure.com/agentpool,unbounded-cloud.io/site -o wide

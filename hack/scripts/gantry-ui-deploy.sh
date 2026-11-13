@@ -13,7 +13,8 @@ Usage: hack/scripts/gantry-ui-deploy.sh --kubeconfig PATH --context NAME --value
 Azure workload identities, ACR read/push access, worker pull authentication, and
 a single-platform runtime base in ACR. It enables image generation, installs
 the UI, and verifies a 1 MB generate/push/Flex-pull workflow before opening a
-local tunnel. It never creates a cluster, deletes demos, or enables disk reclamation.
+local tunnel. The cleanup button is enabled, but cleanup never runs automatically.
+It never creates a cluster or deletes demos during deployment.
 
   --image REPO        Image repository (default ghcr.io/vpatelsj/gantry-ui)
   --tag TAG           Unique image tag (default dev-COMMIT-TIMESTAMP)
@@ -24,12 +25,15 @@ local tunnel. It never creates a cluster, deletes demos, or enables disk reclama
   --build-dns IP      Override DNS for Podman build containers only
   --yes              Confirm Azure setup without prompting
   --no-port-forward  Close the verification tunnel and exit after full setup
+  --no-reclaimer     Hide privileged cluster image cleanup in full setup
   --help             Show this help
 
 Sign in to GHCR using the selected engine first. UI build artifacts go to GHCR;
 runtime bases and generated images go to your ACR. Full setup requires anonymous
 pull access to the GHCR UI package; it stops with instructions if it is private.
 Managed worker ACR authentication may restart Flex kubelets without draining.
+The cleanup button requires an explicit DELETE ALL DEMOS confirmation before
+deleting dashboard demo workloads and reclaiming unused node images, not ACR images.
 Without --cluster-state, --values retains the existing externally configured
 identity/registry workflow and does not change Azure resources or open a tunnel.
 EOF
@@ -41,6 +45,8 @@ cluster_state= acr_name= build_dns=
 scratch= state_lock= port_forward_pid=
 assume_yes=false
 serve=true
+reclaimer=true
+reclaimer_option=false
 image=ghcr.io/vpatelsj/gantry-ui
 tag= platform=linux/amd64 namespace=gantry-demo release=gantry-ui
 
@@ -128,15 +134,19 @@ PY
 
     values="$scratch/values.json"
     jq -n --arg registry "$registry" --arg arch "$arch" --arg base "$registry/gantry-demo/runtime@$placeholder_digest" \
+        --argjson reclaimer "$reclaimer" \
         '{registry:$registry,architecture:$arch,nodePool:"flexpool",gantryNamespace:"unbounded-system",
           azure:{clientID:"pending"},builder:{enabled:true,azure:{clientID:"pending"},base:$base},
-          reclaimer:{enabled:false}}' > "$values"
+          reclaimer:{enabled:$reclaimer}}' > "$values"
     render_chart "$placeholder_digest" --show-only templates/serviceaccounts.yaml > "$scratch/serviceaccounts.yaml"
     kube create --dry-run=client --validate=false -f "$scratch/serviceaccounts.yaml" -o json > "$scratch/serviceaccounts.json"
-    jq -s '[.[] | if .kind == "List" then .items[] else . end | select(.kind == "ServiceAccount")]
-        | if length == 2 then . else error("expected dashboard and builder service accounts") end' \
+    jq -s --argjson reclaimer "$reclaimer" \
+        '[.[] | if .kind == "List" then .items[] else . end | select(.kind == "ServiceAccount")]
+        | if length == (if $reclaimer then 3 else 2 end) then .
+          else error("unexpected dashboard/helper service account count") end' \
         "$scratch/serviceaccounts.json" > "$scratch/accounts.json"
-    dashboard_sa=$(jq -er '[.[] | select(.metadata.name | endswith("-builder") | not)]
+    dashboard_sa=$(jq -er '[.[] | select(.metadata.name |
+        (endswith("-builder") or endswith("-reclaimer")) | not)]
         | if length == 1 then .[0].metadata.name else error("ambiguous dashboard account") end' "$scratch/accounts.json")
     builder_sa=$(jq -er '[.[] | select(.metadata.name | endswith("-builder"))]
         | if length == 1 then .[0].metadata.name else error("ambiguous builder account") end' "$scratch/accounts.json")
@@ -144,6 +154,9 @@ PY
     if [[ "$assume_yes" != true ]]; then
         printf 'This will configure Azure identities/ACR roles, managed Flex pull authentication,\n'
         printf 'and a 1 MB generation/push/pull test. Flex kubelets may restart without draining.\n'
+        if [[ "$reclaimer" == true ]]; then
+            printf 'The UI will expose privileged image cleanup; deployment does not run cleanup.\n'
+        fi
         read -r -p 'Continue? [y/N] ' confirmation
         [[ "$confirmation" == y || "$confirmation" == Y ]] || die "UI setup canceled"
     fi
@@ -239,10 +252,10 @@ configure_cluster() {
     runtime_base="$registry/gantry-demo/runtime@$base_digest"
     values="$state_dir/values.json"
     jq -n --arg registry "$registry" --arg arch "$arch" --arg reader "$dashboard_client" \
-        --arg builder "$builder_client" --arg base "$runtime_base" \
+        --arg builder "$builder_client" --arg base "$runtime_base" --argjson reclaimer "$reclaimer" \
         '{registry:$registry,architecture:$arch,nodePool:"flexpool",gantryNamespace:"unbounded-system",
           azure:{clientID:$reader},builder:{enabled:true,azure:{clientID:$builder},base:$base,
-          repository:"gantry-demo/generated",concurrency:1},reclaimer:{enabled:false}}' > "$values"
+          repository:"gantry-demo/generated",concurrency:1},reclaimer:{enabled:$reclaimer}}' > "$values"
     cp "$scratch/setup.json" "$state_dir/setup.json"
 }
 
@@ -263,7 +276,8 @@ verify_public_image() {
 verify_ui() {
     local deadline=$((SECONDS + 900)) port= build_name stage workload expected actual reference
     log "Opening a temporary UI tunnel for end-to-end verification"
-    kube -n "$namespace" port-forward --address 127.0.0.1 "deployment/$dashboard_sa" :8088 \
+    kubectl --kubeconfig "$kubeconfig" --context "$context" -n "$namespace" \
+        port-forward --address 127.0.0.1 "deployment/$dashboard_sa" :8088 \
         > "$scratch/port-forward.log" 2>&1 &
     port_forward_pid=$!
     while [[ -z "$port" ]]; do
@@ -277,8 +291,9 @@ verify_ui() {
     done
     ui_url="http://127.0.0.1:$port"
     curl -fsS --max-time 30 "$ui_url/api/config" > "$scratch/response.json"
-    jq -e --arg registry "$registry" '.registry == $registry and .generation.enabled == true' \
-        "$scratch/response.json" >/dev/null || die "UI image generation is not enabled for the expected ACR"
+    jq -e --arg registry "$registry" --argjson reclaimer "$reclaimer" \
+        '.registry == $registry and .generation.enabled == true and .reclaim.enabled == $reclaimer' \
+        "$scratch/response.json" >/dev/null || die "UI generation or cleanup capability does not match the requested configuration"
     log "Waiting for dashboard ACR catalog access and Azure role propagation"
     while true; do
         if curl -fsS --max-time 30 "$ui_url/api/images" > "$scratch/response.json" &&
@@ -344,6 +359,7 @@ while (($#)); do
         --help|-h) usage; exit 0 ;;
         --yes) assume_yes=true; shift ;;
         --no-port-forward) serve=false; shift ;;
+        --no-reclaimer) reclaimer=false; reclaimer_option=true; shift ;;
         --kubeconfig|--context|--values|--image|--tag|--platform|--namespace|--release|--engine|--cluster-state|--acr-name|--build-dns)
             if (($# < 2)) || [[ "$2" == --* || -z "$2" ]]; then echo "Missing value for $1" >&2; exit 2; fi
             case "$1" in
@@ -364,8 +380,8 @@ if [[ -n "$cluster_state" ]]; then
     cluster_state=$(cd "$cluster_state" && pwd)
     kubeconfig="${kubeconfig:-$cluster_state/kubeconfig}"
     [[ -f "$kubeconfig" ]] || die "cluster kubeconfig is missing"
-elif [[ -n "$acr_name" || "$assume_yes" == true || "$serve" == false ]]; then
-    die "--acr-name, --yes, and --no-port-forward require --cluster-state"
+elif [[ -n "$acr_name" || "$assume_yes" == true || "$serve" == false || "$reclaimer_option" == true ]]; then
+    die "--acr-name, --yes, --no-port-forward, and --no-reclaimer require --cluster-state"
 elif [[ ! -f "$kubeconfig" || ! -f "$values" || -z "$context" ]]; then
     echo "--kubeconfig, --context, and an existing --values file are required" >&2; exit 2
 fi

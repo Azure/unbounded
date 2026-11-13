@@ -128,7 +128,8 @@ For the full walkthrough including pod networking verification, see the
 Create one AKS system node and three automatically bootstrapped VMSS workers,
 with Unbounded networking and Gantry. AMD64 Flex workers default to
 `Standard_D8s_v3`, each with a 512 GiB Premium SSD (`Premium_LRS`) OS disk.
-The AKS system node remains `Standard_D4s_v6`:
+The AKS system node remains `Standard_D4s_v6`. The control plane always uses
+**AKS Standard tier**, independently of the VM SKU:
 
 ```bash
 bash hack/scripts/aks-flex-cluster.sh \
@@ -146,6 +147,11 @@ Keep the state directory (`tmp/aks-flex/my-flex-cluster/` by default), which
 contains the kubeconfig and SSH key. Rerun with the same arguments to resume
 provisioning. Scale workers separately with `az vmss scale`; reruns preserve
 capacity. The script is not an upgrade or teardown tool.
+It validates node registration and component readiness without deploying a
+smoke-test workload or checking workload-level networking.
+Existing clusters must also use Standard tier. A different or missing tier is
+rejected with an explicit upgrade command; the script never changes an existing
+cluster's billing tier automatically.
 The new worker defaults do not resize or convert existing disks; deployments
 with a different disk configuration are rejected.
 
@@ -153,11 +159,16 @@ For ARM64 Flex workers, add `--worker-arch arm64`. This selects the ARM64
 Ubuntu 24.04 host and agent archive, with `Standard_D4ps_v6` as the default
 worker VM size; the system node keeps its existing AMD64 default.
 
-For a streaming-capable build, add `--artifact-streaming` to preload NBD before
-Flex bootstrap and enable operator-managed Gantry Artifact Streaming only on the
-Flex workers. The setting is pinned in deployment state and applies to new VMSS
-instances after scale-out. ARM64 streaming is experimental; successful ACR
-conversion does not by itself establish runtime compatibility.
+Gantry Artifact Streaming is enabled by default on Flex workers. The script
+preloads NBD before Flex bootstrap and configures the operator-managed streaming
+snapshotter. Before reporting success, it verifies the Gantry streaming feature
+gate, the snapshotter's Flex worker selector and coverage, and both DaemonSets'
+readiness. Use a compatible build, or pass `--no-artifact-streaming` for ordinary
+OCI images only. The setting is pinned in deployment state and applies to new
+VMSS instances after scale-out. These defaults do not retrofit existing workers;
+see the [staged Flex streaming procedure](docs/content/guides/gantry.md#enable-streaming-on-existing-aks-flex-workers).
+ARM64 streaming is experimental; successful ACR conversion does not by itself
+establish runtime compatibility.
 
 To install an unreleased build, use `--plugin-binary /path/to/kubectl-unbounded`,
 `--image-registry ghcr.io/myorg`, and `--operator-image unbounded-operator:TAG`.
@@ -228,8 +239,9 @@ bash hack/scripts/gantry-ui-deploy.sh \
 
 UI build artifacts stay in GHCR; runtime bases and images generated through the
 UI stay in your ACR. The script verifies a small generate/push/Flex-pull workflow
-before printing the local dashboard URL and keeping its tunnel open. It does
-not enable destructive disk reclamation. See the
+before printing the local dashboard URL and keeping its tunnel open. It
+exposes the cleanup button but never runs cleanup during deployment; use
+`--no-reclaimer` to omit that privileged capability. See the
 [dashboard setup guide](deploy/gantry-ui/chart/README.md#full-setup-for-an-existing-aks-flex-cluster)
 for permissions, GHCR visibility, DNS options, and rerun behavior.
 
