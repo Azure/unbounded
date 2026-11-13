@@ -21,6 +21,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/yaml"
 
 	signalv1 "github.com/Azure/unbounded/api/signal/v1alpha1"
 )
@@ -589,7 +590,11 @@ func (r *Runner) stageRunnerImages(
 			return nil, errors.New("approved WorkflowTemplate has no spec")
 		}
 
-		images = workflowTemplateImages(spec)
+		images, err = workflowTemplateImages(spec)
+		if err != nil {
+			return nil, err
+		}
+
 		for _, image := range images {
 			if !signalv1.IsDigestPinnedImage(image) {
 				return nil, fmt.Errorf("WorkflowTemplate image %q is not digest pinned", image)
@@ -602,12 +607,12 @@ func (r *Runner) stageRunnerImages(
 	return slicesCompact(images), nil
 }
 
-func workflowTemplateImages(value any) []string {
+func workflowTemplateImages(value any) ([]string, error) {
 	images := make([]string, 0, 4)
 
-	var walk func(any)
+	var walk func(any) error
 
-	walk = func(current any) {
+	walk = func(current any) error {
 		switch typed := current.(type) {
 		case map[string]any:
 			for key, child := range typed {
@@ -619,18 +624,49 @@ func workflowTemplateImages(value any) []string {
 					continue
 				}
 
-				walk(child)
+				if key == "resource" {
+					resource, ok := child.(map[string]any)
+					if !ok {
+						return errors.New("WorkflowTemplate resource must be an object")
+					}
+
+					manifest, ok := resource["manifest"].(string)
+					if !ok {
+						return errors.New("WorkflowTemplate resource manifest must be a string")
+					}
+
+					embedded := map[string]any{}
+					if err := yaml.Unmarshal([]byte(manifest), &embedded); err != nil {
+						return fmt.Errorf("decode WorkflowTemplate resource manifest: %w", err)
+					}
+
+					if err := walk(embedded); err != nil {
+						return err
+					}
+
+					continue
+				}
+
+				if err := walk(child); err != nil {
+					return err
+				}
 			}
 		case []any:
 			for _, child := range typed {
-				walk(child)
+				if err := walk(child); err != nil {
+					return err
+				}
 			}
 		}
+
+		return nil
 	}
 
-	walk(value)
+	if err := walk(value); err != nil {
+		return nil, err
+	}
 
-	return slicesCompact(images)
+	return slicesCompact(images), nil
 }
 
 func slicesCompact(values []string) []string {

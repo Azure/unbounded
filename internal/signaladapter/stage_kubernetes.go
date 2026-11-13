@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -23,6 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	utilptr "k8s.io/utils/ptr"
@@ -257,6 +259,20 @@ func (e *KubernetesStageExecutor) executePods(
 
 		participantResults = append(participantResults, participantEnvelope.Participants[0])
 		for _, measurement := range participantEnvelope.Measurements {
+			if existing, found := measurements[measurement.Name]; found &&
+				(existing.Unit != measurement.Unit ||
+					!reflect.DeepEqual(existing.Value, measurement.Value)) {
+				return signalv1.InvocationResultEnvelope{}, errors.Join(
+					fmt.Errorf(
+						"participant measurements conflict for metric %q",
+						measurement.Name,
+					),
+					podCleanupErr,
+					e.cleanupStagePods(ctx, createdPods),
+					errInvocationEvidenceIntegrity,
+				)
+			}
+
 			measurements[measurement.Name] = measurement
 		}
 
@@ -834,11 +850,30 @@ func (e *KubernetesStageExecutor) executeWorkflowTemplate(
 		return signalv1.InvocationResultEnvelope{}, err
 	}
 
-	if err := applyWorkflowRuntimeIdentity(templateSpec); err != nil {
+	tolerations, err := e.participantTolerations(ctx, invocation.Participants)
+	if err != nil {
 		return signalv1.InvocationResultEnvelope{}, err
 	}
 
-	templateSpec["podSpecPatch"] = workloadPodSpecPatch
+	if err := applyWorkflowRuntimeIdentity(templateSpec, tolerations); err != nil {
+		return signalv1.InvocationResultEnvelope{}, err
+	}
+
+	podSpecPatch := []byte(workloadPodSpecPatch)
+	if len(tolerations) > 0 {
+		podSpecPatch, err = json.Marshal(struct {
+			SecurityContext *corev1.PodSecurityContext `json:"securityContext"`
+			Tolerations     []corev1.Toleration        `json:"tolerations"`
+		}{
+			SecurityContext: workloadPodSecurityContext(),
+			Tolerations:     tolerations,
+		})
+		if err != nil {
+			return signalv1.InvocationResultEnvelope{}, fmt.Errorf("encode WorkflowTemplate Pod spec patch: %w", err)
+		}
+	}
+
+	templateSpec["podSpecPatch"] = string(podSpecPatch)
 
 	claims := workflowPersistentVolumeClaims(templateSpec)
 
@@ -1442,7 +1477,20 @@ func collectPersistentVolumeClaims(value any, claims map[string]struct{}) {
 			}
 		}
 
-		for _, child := range typed {
+		for key, child := range typed {
+			if key == "resource" {
+				if resourceTemplate, ok := child.(map[string]any); ok {
+					if manifest, ok := resourceTemplate["manifest"].(string); ok {
+						resource := map[string]any{}
+						if yaml.Unmarshal([]byte(manifest), &resource) == nil {
+							collectPersistentVolumeClaims(resource, claims)
+						}
+					}
+				}
+
+				continue
+			}
+
 			collectPersistentVolumeClaims(child, claims)
 		}
 	case []any:
@@ -1579,6 +1627,25 @@ func validateWorkflowServiceAccountFields(value any, allowed string) error {
 				}
 			case "templateRef", "workflowTemplateRef":
 				return fmt.Errorf("approved WorkflowTemplate cannot use external reference %q", key)
+			case "resource":
+				resourceTemplate, ok := child.(map[string]any)
+				if !ok {
+					return errors.New("WorkflowTemplate resource must be an object")
+				}
+
+				manifest, ok := resourceTemplate["manifest"].(string)
+				if !ok {
+					return errors.New("WorkflowTemplate resource manifest must be a string")
+				}
+
+				resource := map[string]any{}
+				if err := yaml.Unmarshal([]byte(manifest), &resource); err != nil {
+					return fmt.Errorf("decode WorkflowTemplate resource manifest: %w", err)
+				}
+
+				if err := validateWorkflowServiceAccountFields(resource, allowed); err != nil {
+					return err
+				}
 			case "metadata":
 				metadata, ok := child.(map[string]any)
 				if !ok {
@@ -1610,7 +1677,12 @@ func validateWorkflowServiceAccountFields(value any, allowed string) error {
 	return nil
 }
 
-func applyWorkflowRuntimeIdentity(value any) error {
+func applyWorkflowRuntimeIdentity(value any, workloadTolerations ...[]corev1.Toleration) error {
+	var tolerations []corev1.Toleration
+	if len(workloadTolerations) > 0 {
+		tolerations = workloadTolerations[0]
+	}
+
 	switch typed := value.(type) {
 	case map[string]any:
 		for key, child := range typed {
@@ -1646,18 +1718,18 @@ func applyWorkflowRuntimeIdentity(value any) error {
 					return errors.New("WorkflowTemplate resource must be an object")
 				}
 
-				if err := applyWorkflowResourceRuntimeIdentity(resourceTemplate); err != nil {
+				if err := applyWorkflowResourceRuntimeIdentity(resourceTemplate, tolerations); err != nil {
 					return err
 				}
 			}
 
-			if err := applyWorkflowRuntimeIdentity(child); err != nil {
+			if err := applyWorkflowRuntimeIdentity(child, tolerations); err != nil {
 				return err
 			}
 		}
 	case []any:
 		for _, child := range typed {
-			if err := applyWorkflowRuntimeIdentity(child); err != nil {
+			if err := applyWorkflowRuntimeIdentity(child, tolerations); err != nil {
 				return err
 			}
 		}
@@ -1666,7 +1738,10 @@ func applyWorkflowRuntimeIdentity(value any) error {
 	return nil
 }
 
-func applyWorkflowResourceRuntimeIdentity(resourceTemplate map[string]any) error {
+func applyWorkflowResourceRuntimeIdentity(
+	resourceTemplate map[string]any,
+	tolerations []corev1.Toleration,
+) error {
 	manifest, ok := resourceTemplate["manifest"].(string)
 	if !ok {
 		return errors.New("WorkflowTemplate resource manifest must be a string")
@@ -1684,16 +1759,17 @@ func applyWorkflowResourceRuntimeIdentity(resourceTemplate map[string]any) error
 
 	switch kind {
 	case "Pod":
-		if err := applyNestedPodSpecIdentity(resource, "spec"); err != nil {
+		if err := applyNestedPodSpecIdentity(resource, tolerations, "spec"); err != nil {
 			return err
 		}
 	case "Job", "Deployment", "DaemonSet", "StatefulSet", "ReplicaSet":
-		if err := applyNestedPodSpecIdentity(resource, "spec", "template", "spec"); err != nil {
+		if err := applyNestedPodSpecIdentity(resource, tolerations, "spec", "template", "spec"); err != nil {
 			return err
 		}
 	case "CronJob":
 		if err := applyNestedPodSpecIdentity(
 			resource,
+			tolerations,
 			"spec",
 			"jobTemplate",
 			"spec",
@@ -1714,7 +1790,7 @@ func applyWorkflowResourceRuntimeIdentity(resourceTemplate map[string]any) error
 				return fmt.Errorf("WorkflowTemplate MPIJob replica %q must be an object", role)
 			}
 
-			if err := applyNestedPodSpecIdentity(replicaSpec, "template", "spec"); err != nil {
+			if err := applyNestedPodSpecIdentity(replicaSpec, tolerations, "template", "spec"); err != nil {
 				return fmt.Errorf("apply WorkflowTemplate MPIJob replica %q identity: %w", role, err)
 			}
 		}
@@ -1740,13 +1816,17 @@ func applyWorkflowResourceRuntimeIdentity(resourceTemplate map[string]any) error
 	return nil
 }
 
-func applyNestedPodSpecIdentity(resource map[string]any, fields ...string) error {
+func applyNestedPodSpecIdentity(
+	resource map[string]any,
+	tolerations []corev1.Toleration,
+	fields ...string,
+) error {
 	spec, found, err := unstructured.NestedMap(resource, fields...)
 	if err != nil || !found {
 		return fmt.Errorf("WorkflowTemplate resource has no Pod spec at %q", strings.Join(fields, "."))
 	}
 
-	if err := applyUnstructuredPodSpecIdentity(spec); err != nil {
+	if err := applyUnstructuredPodSpecIdentity(spec, tolerations); err != nil {
 		return err
 	}
 
@@ -1757,7 +1837,10 @@ func applyNestedPodSpecIdentity(resource map[string]any, fields ...string) error
 	return nil
 }
 
-func applyUnstructuredPodSpecIdentity(spec map[string]any) error {
+func applyUnstructuredPodSpecIdentity(
+	spec map[string]any,
+	tolerations []corev1.Toleration,
+) error {
 	securityContext := map[string]any{}
 
 	if value, found := spec["securityContext"]; found {
@@ -1778,6 +1861,20 @@ func applyUnstructuredPodSpecIdentity(spec map[string]any) error {
 	securityContext["runAsNonRoot"] = true
 	securityContext["fsGroup"] = workloadIdentityID
 	spec["securityContext"] = securityContext
+
+	if len(tolerations) > 0 {
+		converted := make([]any, 0, len(tolerations))
+		for index := range tolerations {
+			value, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&tolerations[index])
+			if err != nil {
+				return fmt.Errorf("convert participant toleration: %w", err)
+			}
+
+			converted = append(converted, value)
+		}
+
+		spec["tolerations"] = converted
+	}
 
 	for _, field := range []string{"initContainers", "containers", "ephemeralContainers"} {
 		value, found := spec[field]
@@ -1827,6 +1924,59 @@ func applyUnstructuredContainerIdentity(container map[string]any) error {
 	container["securityContext"] = securityContext
 
 	return nil
+}
+
+func (e *KubernetesStageExecutor) participantTolerations(
+	ctx context.Context,
+	participants []signalv1.Participant,
+) ([]corev1.Toleration, error) {
+	byIdentity := map[string]corev1.Toleration{}
+
+	for _, participant := range participants {
+		node, err := e.Runner.Kubernetes.CoreV1().Nodes().
+			Get(ctx, participant.NodeName, metav1.GetOptions{})
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+
+			return nil, fmt.Errorf("get participant node %s tolerations: %w", participant.NodeName, err)
+		}
+
+		if node.UID != participant.NodeUID {
+			return nil, fmt.Errorf("participant node %s identity changed", participant.NodeName)
+		}
+
+		for _, taint := range node.Spec.Taints {
+			if taint.Effect != corev1.TaintEffectNoSchedule &&
+				taint.Effect != corev1.TaintEffectNoExecute {
+				continue
+			}
+
+			toleration := corev1.Toleration{
+				Key:      taint.Key,
+				Operator: corev1.TolerationOpEqual,
+				Value:    taint.Value,
+				Effect:   taint.Effect,
+			}
+			identity := toleration.Key + "\x00" + toleration.Value + "\x00" + string(toleration.Effect)
+			byIdentity[identity] = toleration
+		}
+	}
+
+	identities := make([]string, 0, len(byIdentity))
+	for identity := range byIdentity {
+		identities = append(identities, identity)
+	}
+
+	sort.Strings(identities)
+
+	tolerations := make([]corev1.Toleration, 0, len(identities))
+	for _, identity := range identities {
+		tolerations = append(tolerations, byIdentity[identity])
+	}
+
+	return tolerations, nil
 }
 
 func validateWorkflowTemplateIdentity(

@@ -2542,39 +2542,15 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 
 		checkStatuses := compactCheckStatuses(runningCheckStatuses(workflow, &run))
 
-		identity := run.Status.Evidence.Identity
-		if run.Spec.ResolvedPlan != nil {
-			stages, runnerImages, stageErr := r.completedStageSummaries(ctx, workflow, &run)
-			if stageErr != nil {
-				return ctrl.Result{}, stageErr
-			}
-
-			partial, _, _, identityErr := r.resolvedQualificationEvidenceIdentity(
-				ctx,
-				&run,
-				stages,
-				runnerImages,
-				"Inconclusive",
-				"RunActive",
-			)
-			if identityErr != nil {
-				return ctrl.Result{}, identityErr
-			}
-
-			identity = partial
-		}
-
 		if run.Status.Phase != signalv1.RunPhaseRunning ||
 			run.Status.Workflow.Phase != phase ||
-			!reflect.DeepEqual(run.Status.Checks, checkStatuses) ||
-			!reflect.DeepEqual(run.Status.Evidence.Identity, identity) {
+			!reflect.DeepEqual(run.Status.Checks, checkStatuses) {
 			before := run.DeepCopy()
 			run.Status.Phase = signalv1.RunPhaseRunning
 
 			run.Status.Workflow.Phase = phase
 
 			run.Status.Checks = checkStatuses
-			run.Status.Evidence.Identity = identity
 
 			return ctrl.Result{}, r.Status().Patch(ctx, &run, client.MergeFrom(before))
 		}
@@ -5009,12 +4985,20 @@ func (r *RunReconciler) resolvedQualificationEvidenceIdentity(
 			return nil, "Inconclusive", "ParticipantIdentityChanged: node UID changed during execution", nil
 		}
 
+		end := nodeBaseFingerprint(&node)
+		if !sameBaseFingerprint(starts[index], end) {
+			return nil,
+				"Inconclusive",
+				fmt.Sprintf("ParticipantIdentityChanged: participant %d rebooted or changed during execution", index),
+				nil
+		}
+
 		participants[index] = signalv1.ParticipantEvidenceIdentity{
 			Index:   int32(index),
 			Role:    resolvedParticipantRole(int32(index)),
 			Verdict: "",
 			Start:   starts[index],
-			End:     nodeBaseFingerprint(&node),
+			End:     end,
 		}
 	}
 
