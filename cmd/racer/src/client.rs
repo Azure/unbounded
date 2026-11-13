@@ -954,9 +954,13 @@ impl Responses {
                                         slice,
                                         offset,
                                     });
-                                    observation
-                                        .add(Event::HostReadInflightPages, inflight.len() as u64);
-                                    observation.add(Event::HostReadInflightPagesCount, 1);
+                                    if host {
+                                        observation.add(
+                                            Event::HostReadInflightPages,
+                                            inflight.len() as u64,
+                                        );
+                                        observation.add(Event::HostReadInflightPagesCount, 1);
+                                    }
                                 }
                                 Err(sealed) => {
                                     held = Some((
