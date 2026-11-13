@@ -80,7 +80,10 @@ def parallel_info(parallel_config=None) -> dict:
     """tp, pp, ep, dp sizes, enable_expert_parallel, and this rank, from vLLM (best effort).
 
     dp is not part of the fingerprint: artifacts are laid out per tensor and
-    pipeline rank, so every data parallel replica loads the same ones.
+    pipeline rank, so every data parallel replica loads the same ones. rank is
+    therefore pp_rank * tp + tp_rank from the tensor and pipeline groups, not
+    the world rank, which vLLM widens across data parallel replicas. Only
+    when those groups have no rank is the world rank used.
 
     enable_expert_parallel comes from the parallel config when there is one,
     since vLLM builds an EP group whether or not expert parallelism is on;
@@ -111,9 +114,13 @@ def parallel_info(parallel_config=None) -> dict:
     try:
         tp = d.get_tensor_model_parallel_world_size()
         pp = d.get_pp_group().world_size
-        rank = d.get_world_group().rank_in_group
     except Exception as exc:
         log.debug("racer: parallel info unavailable: %s", exc)
+        return out
+    try:
+        rank = _shard_rank(d, tp)
+    except Exception as exc:
+        log.debug("racer: parallel rank unavailable: %s", exc)
         return out
     out.update(tp=tp, pp=pp, rank=rank, world_size=tp * pp)
     ep = getattr(d, "get_ep_group", None)
@@ -125,6 +132,16 @@ def parallel_info(parallel_config=None) -> dict:
         except Exception:
             pass
     return out
+
+
+def _shard_rank(d, tp: int) -> int:
+    """This rank's index among the tp * pp ranks of one data parallel replica."""
+    try:
+        tp_rank = d.get_tp_group().rank_in_group
+        pp_rank = d.get_pp_group().rank_in_group
+    except Exception:
+        return d.get_world_group().rank_in_group
+    return pp_rank * tp + tp_rank
 
 
 def rank_problem(par: dict):

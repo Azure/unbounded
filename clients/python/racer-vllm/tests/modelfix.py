@@ -187,10 +187,21 @@ def install_fake_vllm(monkeypatch, base=DefaultModelLoader):
     return registry
 
 
-def set_parallel(dist, tp=1, pp=1, rank=0):
-    """Give a fake vllm.distributed module a parallel layout."""
+def set_parallel(dist, tp=1, pp=1, rank=0, tp_rank=None, pp_rank=None):
+    """Give a fake vllm.distributed module a parallel layout.
+
+    rank is the world rank. tp_rank and pp_rank, when given, are the group
+    ranks; otherwise the groups have no rank, like an older vLLM.
+    """
     dist.get_tensor_model_parallel_world_size = lambda: tp
-    dist.get_pp_group = lambda: types.SimpleNamespace(world_size=pp)
+    pp_group = types.SimpleNamespace(world_size=pp)
+    if pp_rank is not None:
+        pp_group.rank_in_group = pp_rank
+    dist.get_pp_group = lambda: pp_group
+    if tp_rank is not None:
+        dist.get_tp_group = lambda: types.SimpleNamespace(world_size=tp, rank_in_group=tp_rank)
+    elif hasattr(dist, "get_tp_group"):
+        del dist.get_tp_group
     dist.get_world_group = lambda: types.SimpleNamespace(rank_in_group=rank)
 
 
