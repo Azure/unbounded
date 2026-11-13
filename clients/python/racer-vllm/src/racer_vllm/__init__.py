@@ -11,7 +11,7 @@ from __future__ import annotations
 from .loader import LOAD_FORMAT, CaptureComplete
 from .uri import ModelURI, parse_uri
 
-__all__ = ["LOAD_FORMAT", "CaptureComplete", "ModelURI", "RacerModelLoader", "fetch_main", "main", "parse_uri", "register"]
+__all__ = ["LOAD_FORMAT", "CaptureComplete", "ModelURI", "fetch_main", "main", "parse_uri", "register"]
 
 _registered = False
 
@@ -40,6 +40,8 @@ def fetch_main(argv=None) -> int:
 
 
 def __getattr__(name: str):
+    # RacerModelLoader subclasses a vLLM class, so it is built on first access
+    # and is not listed in __all__: the package must import without vLLM.
     if name == "RacerModelLoader":
         from .loader import loader_class
 
