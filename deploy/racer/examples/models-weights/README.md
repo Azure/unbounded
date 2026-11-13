@@ -27,7 +27,7 @@ Check that your release includes them.
 | `<vllm-version>` | A supported `vllm/vllm-openai` tag (0.30 or 0.33 series) |
 | `<model-name>`, `<model-prefix>`, `<glm5-prefix>` | The model's name and its path inside the `models` container |
 | `<node-with-snapshot>` | The node whose disk holds the snapshot to import |
-| `<hf-cache>`, `<org>`, `<model>`, `<revision>` | The model's cache directory on that node, usually `/root/.cache/huggingface/hub/models--<org>--<model>`, and the snapshot revision under it. The Job mounts the whole directory at `/model` and imports `/model/snapshots/<revision>`, because snapshot entries are relative symlinks into `../../blobs` |
+| `<hf-cache>`, `<org>`, `<model>`, `<revision>` | The Hugging Face cache root on that node, usually `/root/.cache/huggingface`, the model's org and name, and the snapshot revision. The Job mounts the model directory `<hf-cache>/hub/models--<org>--<model>` at `/model` and imports `/model/snapshots/<revision>`, because snapshot entries are relative symlinks into `../../blobs` |
 
 To add a site, copy one ClusterCache, give it a new name and site, and
 change `racer.unbounded-cloud.io/client-cache` and the `racer://` URIs in the
