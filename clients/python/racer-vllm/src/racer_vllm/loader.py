@@ -254,7 +254,7 @@ class RacerLoaderMixin:
             req = uri.request(name)
             reads = plan(name, sf.tensors, keep, self.racer.staging_bytes, file_size=sf.size)
             if self.racer.verify == "full":
-                hashers[name] = self._full_hasher(client, req, sf, reads, etag)
+                hashers[name] = self._full_hasher(client, req, sf, reads, etag, rd)
                 if hashers[name].gaps:
                     gaps.append(name)
             jobs += [(req, r, etag) for r in reads]
@@ -323,22 +323,29 @@ class RacerLoaderMixin:
             raise RuntimeError(f"racer loader: the mm-encoder-only filter removed every weight file of {path}")
         return list(kept)
 
-    def _full_hasher(self, client, req, sf, reads, etag=None):
+    def _full_hasher(self, client, req, sf, reads, etag=None, rd=None):
         """An on_data callback hashing the whole file; finish() checks the sha256.
 
         Bytes the reads skip (filtered tensors, the header, a tail) are read
         from Racer when the hasher reaches them, so the hash always covers the
-        file. The callback's gaps attribute is True when that happens.
+        file. The callback's gaps attribute is True when that happens. Gaps
+        are read in chunks of at most staging_bytes and counted in rd's stats
+        like any other read.
         """
         import hashlib
 
         h = hashlib.sha256()
         state = {"pos": 0, "done": False}
+        chunk = max(1, self.racer.staging_bytes)
 
         def fill(upto):
-            if upto > state["pos"]:
-                h.update(client.read(req, state["pos"], upto - state["pos"], if_match=etag))
-                state["pos"] = upto
+            while upto > state["pos"]:
+                n = min(chunk, upto - state["pos"])
+                h.update(client.read(req, state["pos"], n, if_match=etag))
+                state["pos"] += n
+                if rd is not None:
+                    rd.stats["reads"][rd.mode] += 1
+                    rd.stats["bytes"][rd.mode] += n
 
         def update(read, mv):
             fill(read.offset)
