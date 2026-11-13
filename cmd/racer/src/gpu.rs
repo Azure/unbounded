@@ -4718,11 +4718,105 @@ mod tests {
         let (mut sink, _fd) = gpu_sink(&helper);
         let scope = scope();
         let size = racer_gpu::simulation::GRANULARITY;
+        let page = staged(&helper, 0, &page_bytes(0));
+        let mark = helper.run(|| simulation().trace().len());
+        let decrypted = counter(&helper.counters().decrypted);
         let write = sink
-            .deliver_sealed_detached(staged(&helper, 0, &page_bytes(0)), 0..PAGE, size, &scope)
+            .deliver_sealed_detached(page, 0..PAGE, size, &scope)
             .unwrap_or_else(|_| panic!("page was not detached"));
         assert_eq!(futures::executor::block_on(write), Err(Error::InvalidRange));
+        // Nothing was submitted: no queued work and no decrypt.
+        assert_eq!(helper.queued(0), 0);
+        assert_eq!(decrypts_since(&helper, mark), 0);
+        assert_eq!(counter(&helper.counters().decrypted), decrypted);
         futures::executor::block_on(sink.finish(&scope)).unwrap();
+        assert_eq!(helper.leaked(), 0);
+    }
+
+    #[test]
+    /// The page itself comes back, with nothing queued, while the import
+    /// has not answered and once the sink is released.
+    fn detached_page_is_handed_back_before_ready_and_after_release() {
+        let helper = helper(&[None]);
+        let size = racer_gpu::simulation::GRANULARITY;
+        let fd = helper.run(move || simulation().allocate(0, size));
+        let client = GpuClient::new(helper.clone());
+        let scope = scope();
+        let mut sink = client
+            .open(
+                fd.try_clone().unwrap(),
+                Destination {
+                    offset: 0,
+                    length: size,
+                },
+                size,
+                None,
+            )
+            .unwrap();
+        let mark = helper.run(|| simulation().trace().len());
+        let page = staged(&helper, 0, &page_bytes(0));
+        let Err(page) = sink.deliver_sealed_detached(page, 0..PAGE, 0, &scope) else {
+            panic!("detached before the import answered");
+        };
+        futures::executor::block_on(sink.ready(&scope)).unwrap();
+        futures::executor::block_on(sink.finish(&scope)).unwrap();
+        let Err(_page) = sink.deliver_sealed_detached(page, 0..PAGE, 0, &scope) else {
+            panic!("detached after release");
+        };
+        assert_eq!(helper.queued(0), 0);
+        assert_eq!(decrypts_since(&helper, mark), 0);
+        assert_eq!(
+            racer_gpu::simulation::read_allocation(&fd, 0, PAGE as usize),
+            vec![0; PAGE as usize]
+        );
+        drop(sink);
+        assert_eq!(helper.leaked(), 0);
+    }
+
+    #[test]
+    /// A page refused before it starts, by the scratch taint check, does
+    /// not count against a sibling page of its request that is still
+    /// running: a release waits for the sibling, keeps the import until it
+    /// completes, and then frees everything.
+    fn refused_page_does_not_end_a_running_sibling() {
+        use racer_gpu::simulation::Operation;
+        let helper = helper(&[None, None]);
+        let plaintext = page_bytes(0);
+        let _first = import(&helper, 1, 1);
+        let fd = import(&helper, 2, 1);
+        helper.run(|| simulation().set_query_delay(u32::MAX));
+        let mark = helper.run(|| simulation().trace().len());
+        let running = submit(&helper, 2, staged(&helper, 1, &plaintext), 0..PAGE).unwrap();
+        await_decrypts(&helper, mark, 1);
+        taint_gpu_one(&helper);
+        // The retried fence fails: the sibling is refused before it starts.
+        helper.run(|| simulation().fault(Operation::StreamSync, -5));
+        let before = scratch_work(&helper);
+        assert_eq!(
+            write(&helper, 2, staged(&helper, 1, &plaintext), 0..PAGE),
+            Err(Error::Unavailable)
+        );
+        assert_eq!(scratch_work(&helper), before, "refused page did no work");
+        // Release while the failed page's sibling still runs.
+        let (reply, mut released) = oneshot::channel();
+        helper.release(2, Some(reply)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(
+            released.try_recv(),
+            Ok(None),
+            "released under a running page"
+        );
+        assert_eq!(helper.run(|| simulation().live().imports), 2);
+        helper.run(|| simulation().set_query_delay(50));
+        assert_eq!(futures::executor::block_on(running).unwrap().1, Ok(()));
+        assert_eq!(futures::executor::block_on(released).unwrap(), Ok(()));
+        assert_eq!(
+            racer_gpu::simulation::read_allocation(&fd, 0, PAGE as usize),
+            plaintext
+        );
+        assert_eq!(helper.run(|| simulation().live().imports), 1);
+        assert!(helper.run(|| simulation().take_violations()).is_empty());
+        assert_eq!(helper.leaked(), 0);
     }
 
     #[test]
