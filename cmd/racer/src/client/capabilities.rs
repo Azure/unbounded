@@ -26,7 +26,6 @@ struct Capabilities {
     delivery: Vec<&'static str>,
     gpu_uuids: Vec<String>,
     page_bytes: u64,
-    retain_local: bool,
     page_ciphers: [&'static str; 1],
 }
 
@@ -56,7 +55,6 @@ pub(crate) fn body(built: bool, gpu_uuids: Vec<String>) -> Vec<u8> {
         delivery,
         gpu_uuids,
         page_bytes: crate::model::PAGE_BYTES,
-        retain_local: true,
         page_ciphers: PAGE_CIPHERS,
     };
     serde_json::to_vec(&capabilities).unwrap_or_default()
@@ -128,7 +126,7 @@ mod tests {
         assert_eq!(
             text,
             format!(
-                r#"{{"schema":1,"delivery":["host","stream"],"gpu_uuids":[],"page_bytes":{},"retain_local":true,"page_ciphers":["xaes256gcm"]}}"#,
+                r#"{{"schema":1,"delivery":["host","stream"],"gpu_uuids":[],"page_bytes":{},"page_ciphers":["xaes256gcm"]}}"#,
                 crate::model::PAGE_BYTES
             )
         );

@@ -1237,7 +1237,6 @@ fn capabilities_without_gpu() {
     assert_eq!(value["delivery"], serde_json::json!(["host", "stream"]));
     assert_eq!(value["gpu_uuids"], serde_json::json!([]));
     assert_eq!(value["page_bytes"], crate::model::PAGE_BYTES);
-    assert_eq!(value["retain_local"], true);
     assert_eq!(value["page_ciphers"], serde_json::json!(["xaes256gcm"]));
     settle(&fixture);
     // A read on a fresh connection is unaffected.

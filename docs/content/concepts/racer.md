@@ -251,13 +251,6 @@ chance of one-off reads pushing out useful data. This policy is called
 **second-sight**. Eligibility does not guarantee retention: admission limits,
 available capacity, and eviction still apply.
 
-A reader can ask for **local retention** (`Racer-Retain: local`). Pages it
-receives from peers are then kept on its node after the first read, up to the
-node's retained-segment cap. This helps when the same node reads the same
-data again soon, for example several model replicas starting there one after
-another, and most on sites without RDMA, where peer pages otherwise arrive
-over HTTP and are not kept.
-
 When caches compete for space, each gets a share of the node's capacity in
 proportion to its `spec.priority`. Under pressure, eviction prefers data from
 caches above their share, within bounded scans. Among pages in the same state,

@@ -1,7 +1,7 @@
 # Racer model weights
 
 Status: in progress. This note records the design of the model-weight path
-for vLLM: the `racer-vllm` package, local retention, and the capacity plan.
+for vLLM: the `racer-vllm` package and the capacity plan.
 User-facing documentation is in `docs/content/guides/racer-vllm.md`.
 
 ## Goals
@@ -54,15 +54,6 @@ manifest, the vLLM version, the parallel layout (tensor, pipeline, and expert
 parallel sizes), quantization, and dtype. A loader computes its own
 fingerprint and uses only a matching directory. `sharded: auto` falls back to
 the full checkpoint on a miss; `require` fails; `off` never looks.
-
-## Local retention
-
-Second-sight keeps peer pages only after a second read. Replicas on one node
-read the same pages once each, close together, and without RDMA the pages
-arrive over HTTP and are not kept, so the next replica fetches them again.
-`Racer-Retain: local` (Python `retain=True`, prefetch `retain_local`) makes a
-peer page eligible on first sight, under `RACER_RETAINED_SEGMENT_PERCENT`.
-`racer-vllm warm` uses it to fill a node before replicas start.
 
 ## Capacity plan
 
