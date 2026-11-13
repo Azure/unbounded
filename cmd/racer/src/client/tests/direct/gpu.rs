@@ -1448,6 +1448,22 @@ fn gpu_read_frames_wait_for_the_oldest_page() {
     assert_eq!(completed.len(), 3, "{completed:?}");
     assert_eq!(completed[0], 1, "page 1 finished first: {completed:?}");
     assert!(read_allocation(&allocation, 64, length as usize) == data);
+    // The detached path is shared with host reads: a GPU read must not show
+    // up in the host-read in-flight metrics.
+    assert_eq!(
+        fixture
+            .listeners
+            .metrics
+            .count(Event::HostReadInflightPagesCount),
+        0
+    );
+    assert_eq!(
+        fixture
+            .listeners
+            .metrics
+            .count(Event::HostReadInflightPages),
+        0
+    );
     assert_idle(&fixture, &helper, default_slots());
 }
 
