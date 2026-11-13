@@ -66,16 +66,41 @@ def _dp_size(d, parallel_config) -> int:
     return int(getattr(parallel_config, "data_parallel_size", 1) or 1)
 
 
+def _current_parallel_config():
+    """vLLM's current ParallelConfig, or None."""
+    try:
+        from vllm.config import get_current_vllm_config
+
+        return get_current_vllm_config().parallel_config
+    except Exception:
+        return None
+
+
 def parallel_info(parallel_config=None) -> dict:
     """tp, pp, ep, dp sizes, enable_expert_parallel, and this rank, from vLLM (best effort).
 
     dp is not part of the fingerprint: artifacts are laid out per tensor and
     pipeline rank, so every data parallel replica loads the same ones.
 
+    enable_expert_parallel comes from the parallel config when there is one,
+    since vLLM builds an EP group whether or not expert parallelism is on;
+    otherwise an EP group larger than one rank stands for it.
+
     rank and world_size are None when the layout cannot be read, so callers
     never mistake an unknown rank for rank 0.
     """
-    out = {"tp": 1, "pp": 1, "ep": 1, "dp": 1, "enable_expert_parallel": False, "rank": None, "world_size": None}
+    if parallel_config is None:
+        parallel_config = _current_parallel_config()
+    ep_known = hasattr(parallel_config, "enable_expert_parallel")
+    out = {
+        "tp": 1,
+        "pp": 1,
+        "ep": 1,
+        "dp": 1,
+        "enable_expert_parallel": bool(getattr(parallel_config, "enable_expert_parallel", False)),
+        "rank": None,
+        "world_size": None,
+    }
     try:
         from vllm import distributed as d
     except Exception as exc:
@@ -84,7 +109,6 @@ def parallel_info(parallel_config=None) -> dict:
         return out
     out["dp"] = _dp_size(d, parallel_config)
     try:
-
         tp = d.get_tensor_model_parallel_world_size()
         pp = d.get_pp_group().world_size
         rank = d.get_world_group().rank_in_group
@@ -96,6 +120,8 @@ def parallel_info(parallel_config=None) -> dict:
     if ep is not None:
         try:
             out["ep"] = ep().world_size
+            if not ep_known:
+                out["enable_expert_parallel"] = out["ep"] > 1
         except Exception:
             pass
     return out
@@ -115,7 +141,6 @@ def fingerprint(model, role: str, manifest, vllm_version: str, *, model_config=N
     """32 hex chars identifying everything that shapes a rank's state dict."""
     digest = manifest if isinstance(manifest, str) else mf.digest(manifest)
     p = dict(parallel or {})
-    pc = getattr(model_config, "parallel_config", None)
     quant_cfg = getattr(getattr(model_config, "hf_config", None), "quantization_config", None)
     doc = {
         "format": FORMAT,
@@ -128,9 +153,7 @@ def fingerprint(model, role: str, manifest, vllm_version: str, *, model_config=N
         "tp": p.get("tp", 1),
         "pp": p.get("pp", 1),
         "ep": p.get("ep", 1),
-        "enable_expert_parallel": bool(
-            p.get("enable_expert_parallel", getattr(pc, "enable_expert_parallel", False))
-        ),
+        "enable_expert_parallel": bool(p.get("enable_expert_parallel", False)),
         "hf_overrides": _json_safe(getattr(model_config, "hf_overrides", None)),
     }
     return hashlib.sha256(mf.canonical(doc)).hexdigest()[:32]

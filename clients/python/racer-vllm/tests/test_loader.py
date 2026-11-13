@@ -589,3 +589,32 @@ def test_mm_encoder_only_filter_reads_the_index_of_a_uri(monkeypatch, server, to
     ld.load_weights(model, model_config(URI))
     assert set(model.got) == {"w1", "w2"}
     assert calls == [["w1", "w2", "w3", "w4"]]
+
+
+def test_parallel_info_reads_enable_expert_parallel(monkeypatch):
+    import sys
+
+    install_fake_vllm(monkeypatch)
+    dist = sys.modules["vllm.distributed"]
+    # No EP group (older vLLM): the parallel config decides.
+    on = types.SimpleNamespace(enable_expert_parallel=True)
+    assert sharded.parallel_info(on)["enable_expert_parallel"] is True
+    assert sharded.parallel_info(types.SimpleNamespace(enable_expert_parallel=False))["enable_expert_parallel"] is False
+    # vLLM's current config is used when none is passed.
+    cfgmod = types.ModuleType("vllm.config")
+    cfgmod.get_current_vllm_config = lambda: types.SimpleNamespace(parallel_config=on)
+    monkeypatch.setitem(sys.modules, "vllm.config", cfgmod)
+    assert sharded.parallel_info()["enable_expert_parallel"] is True
+    monkeypatch.delitem(sys.modules, "vllm.config")
+    # Without a config, an EP group of more than one rank means EP is on.
+    dist.get_ep_group = lambda: types.SimpleNamespace(world_size=4)
+    par = sharded.parallel_info()
+    assert par["ep"] == 4 and par["enable_expert_parallel"] is True
+    dist.get_ep_group = lambda: types.SimpleNamespace(world_size=1)
+    assert sharded.parallel_info()["enable_expert_parallel"] is False
+    # The flag reaches the fingerprint.
+    cfg = model_config("x")
+    fps = {sharded.fingerprint(Model(), "target", "a" * 64, "0.33.0", model_config=cfg,
+                               parallel=sharded.parallel_info(types.SimpleNamespace(enable_expert_parallel=v)))
+           for v in (True, False)}
+    assert len(fps) == 2
