@@ -518,7 +518,6 @@ pub async fn seat_task(shared: Rc<Shared>, seat: Rc<Seat>, mut object: serde_jso
             &view,
             seat.index,
             &shared.config.node_name,
-            shared.is_primary.get(),
             shared.stopping.get(),
             serving_rotation_due(&seat.control.borrow(), seat.index, crate::rt::wall_now()),
             ready_changed(&shared, &seat, &object),
@@ -1039,6 +1038,56 @@ mod tests {
         assert!(!v.live(Some(t), t + limits::LEASE_DURATION));
         assert!(!v.live(None, t));
         assert!(!PrimaryView::default().live(Some(t), t));
+    }
+
+    #[test]
+    fn a_primary_releases_a_seat_at_or_beyond_the_desired_count() {
+        fake::run(|api, kube| async move {
+            let shared = crate::shared::tests::shared(kube);
+            // Three seats exist, the configured count shrinks to two, and
+            // this Pod is the primary holding seat 2. Keeping the seat would
+            // pin a Lease above the count forever, because no other Pod may
+            // claim it.
+            *shared.primary.borrow_mut() = PrimaryView {
+                holder: Some("p1/00".into()),
+                desired: 2,
+                ..Default::default()
+            };
+            shared.is_primary.set(true);
+            let seat = Rc::new(new_seat(&shared, 2).unwrap());
+            *shared.seat.borrow_mut() = Some(seat.clone());
+            let name = annotations::seat_lease(2);
+            let path = paths::lease(&shared.config.namespace, &name);
+            let object = api.put_object(
+                &path,
+                serde_json::json!({
+                    "metadata": {"name": name, "uid": "seat-2"},
+                    "spec": {
+                        "holderIdentity": shared.config.pod_name,
+                        "leaseDurationSeconds": limits::LEASE_DURATION.as_secs(),
+                        "acquireTime": "2026-01-01T00:00:00.000000Z",
+                        "renewTime": "2026-01-01T00:00:00.000000Z",
+                        "leaseTransitions": 1,
+                    },
+                }),
+            );
+            // Wake the renewal loop early. The timeout covers the case where
+            // this fires before the loop starts waiting and it instead takes
+            // the scheduled renewal.
+            let wake = shared.clone();
+            let _ = rt::spawn(async move {
+                rt::sleep(Duration::from_millis(100)).await;
+                wake.changed.notify();
+            });
+            let _ = rt::timeout(
+                limits::LEASE_RENEW + Duration::from_secs(5),
+                seat_task(shared.clone(), seat, object),
+            )
+            .await;
+            let stored = api.object(&path).unwrap();
+            assert_eq!(stored["spec"]["holderIdentity"], serde_json::Value::Null);
+            assert!(shared.seat.borrow().is_none());
+        });
     }
 
     fn record(sequence: u64) -> state::StateRecord {

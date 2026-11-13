@@ -1866,7 +1866,6 @@ impl ControlSim {
             &self.view,
             index as usize,
             &format!("n{pod}"),
-            p.primary.is_some(),
             false,
             false,
             ready != self.seats[index as usize].lease.ready,

@@ -179,7 +179,7 @@ pub struct RenewInputs {
     pub duplicate: bool,
     /// The serving identity is due, see `seat::serving_rotation_due`.
     pub rotation: bool,
-    /// The seat is at or beyond the desired count and this Pod is not primary.
+    /// The seat is at or beyond the desired count.
     pub shrink: bool,
     /// The READY annotation would change.
     pub ready_changed: bool,
@@ -187,11 +187,15 @@ pub struct RenewInputs {
 
 impl RenewInputs {
     /// Fill `duplicate` and `shrink` from the primary view.
+    ///
+    /// The primary shrinks too. A primary that keeps a seat at or beyond the
+    /// desired count leaves that Lease held forever, because no other Pod may
+    /// claim a seat above the count. It releases the primary Lease when it
+    /// loses the seat, and a kept seat takes over.
     pub fn from_view(
         view: &PrimaryView,
         index: usize,
         node: &str,
-        is_primary: bool,
         stopping: bool,
         rotation: bool,
         ready_changed: bool,
@@ -201,8 +205,7 @@ impl RenewInputs {
             .iter()
             .enumerate()
             .any(|(i, n)| i < index && n == node);
-        let shrink =
-            view.holder.is_some() && election::must_release(index, view.desired) && !is_primary;
+        let shrink = view.holder.is_some() && election::must_release(index, view.desired);
         Self {
             stopping,
             duplicate,
@@ -601,17 +604,18 @@ mod tests {
             seat_nodes: vec!["n1".into(), "n2".into(), "n1".into()],
             ..Default::default()
         };
-        let i = RenewInputs::from_view(&v, 2, "n1", false, false, false, false);
+        let i = RenewInputs::from_view(&v, 2, "n1", false, false, false);
         assert!(i.duplicate && i.shrink);
-        let i = RenewInputs::from_view(&v, 2, "n1", true, false, false, false);
-        assert!(!i.shrink, "the primary keeps its seat");
-        let i = RenewInputs::from_view(&v, 1, "n2", false, false, false, false);
+        // A primary holding this seat is not exempt: keeping it would leave a
+        // seat above the desired count held forever, see `from_view`.
+        assert!(RenewInputs::from_view(&v, 2, "n3", false, false, false).shrink);
+        let i = RenewInputs::from_view(&v, 1, "n2", false, false, false);
         assert!(!i.duplicate && !i.shrink);
         let none = PrimaryView {
             holder: None,
             ..v.clone()
         };
-        assert!(!RenewInputs::from_view(&none, 5, "x", false, false, false, false).shrink);
+        assert!(!RenewInputs::from_view(&none, 5, "x", false, false, false).shrink);
     }
 
     const C: &str = "c1c1c1c1-0000-4000-8000-000000000001";
