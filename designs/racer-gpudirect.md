@@ -9,8 +9,14 @@ ClusterCache through a loader plugin, with no other special code.
 Out of scope for now:
 
 - AMD GPUs. The design is NVIDIA-only.
-- A capability endpoint such as `GET /v1/gpus`. Clients find out what works by
-  trying it (see [Fallback](#fallback)).
+
+The dataplane serves `GET /v1/capabilities` on the client socket
+(`cmd/racer/src/client/capabilities.rs`). It lists the delivery modes it can
+offer, the visible GPU UUIDs, the page size and the page ciphers, and never
+starts the GPU helper. The Python client exposes it as `Client.capabilities()`.
+A client may call it before choosing a mode, but must still fall back when a
+mode is refused with 501, or with 400, 404 or 405 (see [Fallback](#fallback)).
+An older dataplane without the endpoint answers 404.
 
 ## Delivery modes
 
