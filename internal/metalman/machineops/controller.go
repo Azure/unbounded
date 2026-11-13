@@ -49,7 +49,9 @@ const (
 	reasonTimedOut                 = "TimedOut"
 	reasonExperimentalModeDisabled = "ExperimentalModeDisabled"
 
-	cloudInitTimeout = 5 * time.Minute
+	// cloudInitTimeout covers firmware POST as well as cloud-init. Large GPU
+	// servers can spend several minutes in POST alone before the OS starts.
+	cloudInitTimeout = 20 * time.Minute
 )
 
 // PowerClient is the Redfish power operation subset used by MachineOperation reconciliation.

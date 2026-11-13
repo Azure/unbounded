@@ -1545,7 +1545,7 @@ func TestReconcilerTimesOutHostReplaceCloudInitCondition(t *testing.T) {
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &updated))
 	require.Equal(t, v1alpha3.OperationPhaseFailed, updated.Status.Phase)
 	require.Equal(t, v1alpha3.OperationPhaseFailed, updated.Status.Targets[0].Phase)
-	require.Contains(t, updated.Status.Targets[0].Message, "cloud-init did not complete within 5m0s")
+	require.Contains(t, updated.Status.Targets[0].Message, "cloud-init did not complete within 20m0s")
 }
 
 func TestReconcilerUsesKubernetesNodeRefForHostReplaceCompletion(t *testing.T) {

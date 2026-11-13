@@ -1039,6 +1039,31 @@ func TestVirtualMediaLongInstallAndLateHandoff(t *testing.T) {
 	require.Equal(t, v1alpha3.OperationPhaseFailed, current.Status.Phase)
 }
 
+func TestVirtualMediaCloudInitAllowsSlowFirmwarePOST(t *testing.T) {
+	r, _, _, op := mediaFixture(t)
+	current := mediaStep(t, r, op.Name)
+	target := current.Status.Targets[0]
+	target.BootMedia.Cleaned = true
+	target.BootMedia.CleanedAt = ptrTo(fixedNow())
+	target.BootMedia.ImageWritten = true
+	reboot := fixedNow()
+	target.BootMedia.RebootRequestedAt = &reboot
+
+	// Large GPU servers can spend most of ten minutes in POST before cloud-init
+	// reports anything.
+	change := r.advanceMediaInstalled(t.Context(), target, metav1.NewTime(reboot.Add(10*time.Minute)))
+	require.Equal(t, v1alpha3.OperationPhaseInProgress, change.target.Phase)
+	require.Equal(t, v1alpha3.OperationStageWaitingCloudInit, change.target.Stage)
+
+	change.target.Conditions = []metav1.Condition{{
+		Type: v1alpha3.MachineOperationConditionCloudInitDone, Status: metav1.ConditionFalse,
+		Reason: "Running", LastTransitionTime: metav1.NewTime(reboot.Add(9 * time.Minute)),
+	}}
+	change = r.advanceMediaInstalled(t.Context(), change.target, metav1.NewTime(reboot.Add(15*time.Minute)))
+	require.Equal(t, v1alpha3.OperationPhaseInProgress, change.target.Phase)
+	require.Equal(t, v1alpha3.OperationStageWaitingCloudInit, change.target.Stage)
+}
+
 func TestVirtualMediaCloudInitDeadlineStartsAtRebootHandoff(t *testing.T) {
 	r, _, _, op := mediaFixture(t)
 	current := mediaStep(t, r, op.Name)
