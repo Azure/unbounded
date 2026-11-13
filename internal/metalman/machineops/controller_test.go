@@ -1610,6 +1610,7 @@ func TestReconcilerUsesMachineCloudInitTimeout(t *testing.T) {
 			updated.Status.Conditions[i].LastTransitionTime = metav1.NewTime(fixedNow().Add(-30 * time.Minute))
 		}
 	}
+
 	require.NoError(t, c.Status().Update(context.Background(), &updated))
 
 	_, err = reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
