@@ -1,17 +1,15 @@
 # Model weights through Racer: example manifests
 
-Plain YAML examples for serving vLLM models whose weights come from a
-plaintext Racer cache. They are templates: replace every `<placeholder>`
-before applying. The full walkthrough is the
-[vLLM guide](../../../../docs/content/guides/racer-vllm.md).
+Plain YAML examples for serving vLLM models whose weights come from a Racer
+cache. They are templates: replace every `<placeholder>` before applying. The
+full walkthrough is the [vLLM guide](../../../../docs/content/guides/racer-vllm.md).
 
-These examples depend on `spec.encryption`, local retention, and the
-`racer-vllm` commands described in the guide. Check that your release
-includes them.
+These examples depend on local retention and the `racer-vllm` commands
+described in the guide. Check that your release includes them.
 
 | File | What it holds |
 |------|---------------|
-| `clustercaches.yaml` | Two plaintext ClusterCaches, `models-hillsboro` and `models-dapple`, one per site |
+| `clustercaches.yaml` | Two ClusterCaches, `models-hillsboro` and `models-dapple`, one per site |
 | `import-job.yaml` | Namespace `racer-models`, ServiceAccount `model-importer`, and a Job that imports a node's Hugging Face snapshot |
 | `serve-qwen.yaml` | A single-GPU Deployment; the simplest template |
 | `serve-glm5.yaml` | An 8-GPU tensor and expert parallel Deployment that uses sharded artifacts when present |
@@ -55,9 +53,10 @@ serve manifests to the new cache name.
 
 ## Rollout order
 
-1. Upgrade the Racer dataplanes on every node to a release that supports
-   `spec.encryption`. Older dataplanes reject a cache that sets it.
-2. Apply `clustercaches.yaml`. The mode cannot change after creation.
+1. Upgrade the Racer dataplanes on every node to a release with local
+   retention and the current prefetch fields. Older dataplanes reject
+   `retain_local`.
+2. Apply `clustercaches.yaml`.
 3. Run the import job and wait for it to finish:
    `kubectl apply -f import-job.yaml`.
 4. Apply a serve manifest: `kubectl apply -f serve-qwen.yaml`.

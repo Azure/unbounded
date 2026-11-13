@@ -1,13 +1,10 @@
-# Plaintext model-weight caches, one per site. Replace every <placeholder>;
-# see README.md. Upgrade all Racer dataplanes before applying: older
-# dataplanes reject a cache that sets spec.encryption.
+# Model-weight caches, one per site. Replace every <placeholder>; see
+# README.md.
 apiVersion: racer.unbounded-cloud.io/v1alpha1
 kind: ClusterCache
 metadata:
   name: models-hillsboro
 spec:
-  encryption:
-    mode: Plaintext
   priority: 900
   nodeSelector:
     matchLabels:
@@ -25,8 +22,6 @@ kind: ClusterCache
 metadata:
   name: models-dapple
 spec:
-  encryption:
-    mode: Plaintext
   priority: 900
   nodeSelector:
     matchLabels:

@@ -19,7 +19,7 @@ See [Racer concepts]({{< relref "concepts/racer" >}}) and the [Azure Blob cache 
 | API | `racer.unbounded-cloud.io/v1alpha1`, kind `ClusterCache` |
 | Resource / short name | `clustercaches` / `ccache` |
 | Scope | Cluster-scoped |
-| Fields | Optional `spec.origin` for an Azure Blob origin that the dataplane reads directly; optional `spec.priority` for the cache's share of node capacity; optional `spec.passthrough` to proxy reads without caching; optional `spec.nodeSelector` to limit the cache to some nodes; optional `spec.encryption` to store pages in plaintext; no `status` |
+| Fields | Optional `spec.origin` for an Azure Blob origin that the dataplane reads directly; optional `spec.priority` for the cache's share of node capacity; optional `spec.passthrough` to proxy reads without caching; optional `spec.nodeSelector` to limit the cache to some nodes; no `status` |
 | Name | DNS subdomain, at most 82 characters total and 63 per dot-separated label |
 | Identity | Kubernetes UID, not name; deleting and recreating a cache creates a new identity |
 
@@ -129,33 +129,11 @@ spec:
 
 ### Encryption
 
-`spec.encryption.mode` chooses how the cache stores and moves pages. It is
-optional and defaults to `Encrypted`. Set it when you create the cache; it
-cannot be changed later. To switch, create a new ClusterCache.
-
-```yaml
-apiVersion: racer.unbounded-cloud.io/v1alpha1
-kind: ClusterCache
-metadata:
-  name: models
-spec:
-  encryption:
-    mode: Plaintext
-```
-
-| Mode | Behavior |
-|------|----------|
-| `Encrypted` (default) | Pages are sealed with AES-GCM under a per-cache key, in memory, on disk, and between nodes. GPU reads decrypt on the GPU or CPU |
-| `Plaintext` | Pages are not sealed. Each page carries a CRC32C that is checked on read, which catches corruption but not tampering. Disk records use format version 6. GPU reads take the plain host-to-device or GPUDirect path |
-
-Use `Plaintext` only for data that needs no confidentiality from anyone who
-can reach the nodes' disks or the network between them, such as public model
-weights. Request signing and enrollment are unchanged.
-
-**Rollout:** dataplanes that predate this field reject a cache catalog that
-carries it, because the catalog rejects unknown fields. Upgrade every
-dataplane before you create a plaintext cache. Sealed caches do not carry the
-field and are unaffected.
+Every page is sealed with AES-256-GCM under a per-cache key: in memory, on
+disk, and between nodes, including pages that come from object storage.
+Readers decrypt in the dataplane or on the GPU, and plaintext lives only as
+long as a reader needs it. There is no setting to turn this off, so plan for
+the CPU cost of sealing on the nodes that fill the cache.
 
 ### Node selector
 
@@ -1915,6 +1893,27 @@ the pod gets one shared volume. The webhook rejects the pod when the cache name
 is missing or invalid, when a listed container does not exist, or when a
 container already sets `RACER_SOCKET` or mounts that path.
 
+## Capabilities
+
+`GET /v1/capabilities` on the client socket returns what this dataplane can
+do, so a client can pick a delivery mode instead of trying one and handling
+the refusal. The connection closes after the response. The answer never
+starts the GPU helper and never waits for a start in flight.
+
+```json
+{"schema":1,"delivery":["gpu","host","stream"],
+ "gpu_uuids":["gpu-0123..."],"page_bytes":16777216,
+ "retain_local":true,"page_ciphers":["xaes256gcm"]}
+```
+
+- `delivery` lists the read modes this build and node can serve. `stream` is
+  always present, `host` needs nothing extra, and `gpu` appears only in a
+  CUDA build on a node whose NVIDIA driver reports at least one GPU.
+- `gpu_uuids` lists those GPUs, sorted, without loading CUDA.
+- `page_ciphers` lists the page ciphers the build decodes.
+
+The Python client exposes this as `Client.capabilities()`.
+
 ## GPU reads
 
 GPU reads let a client on the node read an object straight into its own NVIDIA
@@ -1927,10 +1926,13 @@ GPU memory. They need:
   container runtime and a CDI spec.
 - `RACER_ENABLE_GPU` in `racer-settings`. `auto`, the default, does
   not touch any GPU until a client sends the first `gpu-read`. Only then does
-  the dataplane load CUDA, look for GPUs, and turn GPU mode on, or off if it
-  finds no usable GPU. It does not try again until the pod restarts. `true`
-  sets up the GPUs at startup and makes startup fail when there is no usable
-  GPU. `false` turns it off.
+  the dataplane load CUDA, look for GPUs, and turn GPU mode on. If that
+  attempt fails, `gpu-read` returns 501 and the dataplane retries in the
+  background with a 5 s delay that doubles to 60 s, one attempt at a time.
+  Reads keep getting 501 until an attempt succeeds, and the dataplane logs
+  `stage=gpu state=starting attempt=<n>` and `state=recovered attempt=<n>`.
+  `true` sets up the GPUs at startup and makes startup fail when there is no
+  usable GPU. `false` turns it off.
 
 When it sets up the GPUs, the dataplane logs each GPU it finds: ordinal, UUID, PCI address,
 NUMA node, compute mode, and whether it can use it. It skips GPUs in

@@ -20,18 +20,16 @@ among themselves instead of each downloading the full model.
 
 {{< callout type="note" >}}
 This guide describes the `racer-vllm` package layout (`racer-vllm materialize`,
-`import`, `prepare`, `warm`, `inspect`), plaintext caches, and local
-retention. These land together; check that your release includes them. On
-older releases only `racer-vllm-fetch` and the `racer-model.json` flow exist.
+`import`, `prepare`, `warm`, `inspect`) and local retention. These land
+together; check that your release includes them. On older releases only
+`racer-vllm-fetch` and the `racer-model.json` flow exist.
 {{< /callout >}}
 
 ## Prerequisites
 
 - **A cache.** A ClusterCache with an Azure Blob origin that holds the model.
   The [Azure Blob guide]({{< relref "guides/azure-blob-cache" >}}) shows how
-  to make one. For public model weights, use a plaintext cache (see
-  [Encryption]({{< relref "reference/racer" >}}#encryption)). The examples use a cache
-  named `models-hillsboro`.
+  to make one. The examples use a cache named `models-hillsboro`.
 - **Identity.** The dataplane reads the origin as the `racer` ServiceAccount.
   Its managed identity needs a federated credential for
   `system:serviceaccount:unbounded-system:racer` and the
@@ -247,20 +245,15 @@ kubectl -n unbounded-system logs <dataplane-pod> | grep 'stage=gpu state='
 loader falls back to host delivery and logs the reason once. Set
 `delivery: gpu` to make the fallback an error.
 
-**Plaintext or sealed.** On a sealed (default) cache, every page is
-encrypted with AES-GCM, and the GPU or CPU decrypts it on the way in. On a
-plaintext cache, pages skip that step and take the plain host-to-device or
-GPUDirect path. Public weights do not need confidentiality, so a plaintext
-cache saves the decrypt work. A cache's mode cannot change after creation:
-create a new cache to switch. Upgrade every dataplane before creating a
-plaintext cache; older dataplanes reject it. See
-[ClusterCache]({{< relref "reference/racer" >}}#clustercache).
+**Decrypt cost.** Every page is sealed, so the GPU or CPU decrypts each one on
+the way in. On large checkpoints that work is real, and it is the price of
+leaving encryption on everywhere.
 
 **No RDMA.** Without RDMA, pages from peers arrive over HTTP and are not
 kept on the reading node, so every replica start on a node fetches them
 again. Use `racer-vllm warm`, which prefetches with local retention, or let
-the loader read with retention. Retained pages are limited by
-`RACER_RETAINED_SEGMENT_PERCENT`.
+the loader read with retention. Retained pages are admitted and evicted like
+any other page a node does not own.
 
 **Capacity.** A model larger than a node's cache share is evicted while it
 loads. Raise the cache's `spec.priority`, add capacity, or use raw NVMe

@@ -1,9 +1,8 @@
 # Racer model weights
 
 Status: in progress. This note records the design of the model-weight path
-for vLLM: the `racer-vllm` package, plaintext caches, local retention, and the
-capacity plan. User-facing documentation is in
-`docs/content/guides/racer-vllm.md`.
+for vLLM: the `racer-vllm` package, local retention, and the capacity plan.
+User-facing documentation is in `docs/content/guides/racer-vllm.md`.
 
 ## Goals
 
@@ -11,7 +10,6 @@ capacity plan. User-facing documentation is in
   fetched from the origin only a few times.
 - Put bytes in GPU memory with no extra host copies where hardware allows.
 - Keep working on sites without RDMA.
-- Avoid paying for encryption on public weights.
 
 ## Manifest
 
@@ -65,18 +63,6 @@ arrive over HTTP and are not kept, so the next replica fetches them again.
 `Racer-Retain: local` (Python `retain=True`, prefetch `retain_local`) makes a
 peer page eligible on first sight, under `RACER_RETAINED_SEGMENT_PERCENT`.
 `racer-vllm warm` uses it to fill a node before replicas start.
-
-## Plaintext mode
-
-ClusterCache `spec.encryption.mode` is `Encrypted` (default) or `Plaintext`,
-immutable. Plaintext pages skip AES-GCM, carry a CRC32C per page, and use disk
-record format version 6. GPU delivery takes the plain host-to-device or
-GPUDirect path with no decrypt kernel. Sealed caches are unchanged.
-
-The CRC32C catches corruption, not tampering. Plaintext is for data that is
-already public. Older dataplanes reject a catalog that carries the field
-(`deny_unknown_fields`), so all dataplanes must be upgraded before a
-plaintext cache is created.
 
 ## Capacity plan
 
