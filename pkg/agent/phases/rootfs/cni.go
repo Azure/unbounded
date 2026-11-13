@@ -57,16 +57,22 @@ func (d *downloadCNIBinaries) Do(ctx context.Context) error {
 		return nil
 	}
 
-	for tarFile, err := range downloadURL.DecompressTarGz(ctx) {
-		if err != nil {
-			return fmt.Errorf("decompress CNI plugins tar: %w", err)
-		}
+	return downloadCNIPlugins(ctx, downloadURL, destDir)
+}
 
+// downloadCNIPlugins downloads and extracts CNI plugin binaries from a tar.gz archive.
+func downloadCNIPlugins(ctx context.Context, downloadURL artifactsource.Source, destDir string) error {
+	err := downloadURL.ForEachTarGzFile(ctx, func(tarFile *utilio.TarFile) error {
 		targetFilePath := filepath.Join(destDir, tarFile.Name)
 
 		if err := utilio.InstallFile(targetFilePath, tarFile.Body, 0o755); err != nil {
 			return fmt.Errorf("install CNI plugin %q: %w", targetFilePath, err)
 		}
+
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("download CNI plugins: %w", err)
 	}
 
 	return nil

@@ -4,10 +4,62 @@
 package rootfs
 
 import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
 
+	"github.com/stretchr/testify/require"
+
+	"github.com/Azure/unbounded/pkg/agent/artifactsource"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
+
+func TestDownloadContainerdRetriesTruncatedArchive(t *testing.T) {
+	t.Parallel()
+
+	content := strings.Repeat("containerd-binary-", 512)
+	archive := tarGzArchive(t, map[string]string{
+		"bin/containerd":        content,
+		"bin/ctr":               content,
+		"bin/containerd-stress": content,
+		"README.md":             "ignored",
+	})
+
+	var attempts atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprint(len(archive)))
+
+		if attempts.Add(1) == 1 {
+			_, _ = w.Write(archive[:len(archive)/2])
+
+			return
+		}
+
+		_, _ = w.Write(archive)
+	}))
+	defer server.Close()
+
+	source, err := artifactsource.Parse(server.URL + "/containerd.tar.gz")
+	require.NoError(t, err)
+
+	destDir := t.TempDir()
+	require.NoError(t, downloadContainerd(t.Context(), source, destDir))
+	require.EqualValues(t, 2, attempts.Load())
+
+	for _, name := range []string{"containerd", "ctr", "containerd-stress"} {
+		got, err := os.ReadFile(filepath.Join(destDir, name))
+		require.NoError(t, err)
+		require.Equal(t, content, string(got))
+	}
+
+	require.NoFileExists(t, filepath.Join(destDir, "README.md"))
+}
 
 func TestContainerdDownloadURL(t *testing.T) {
 	t.Parallel()
