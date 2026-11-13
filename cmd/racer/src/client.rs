@@ -1087,9 +1087,7 @@ impl Responses {
         } else if let Some(slot) = &self.lazy_gpu {
             match slot.get() {
                 Some(helper) => display(helper),
-                None if built && slot.standby() => {
-                    capabilities::procfs_gpu_uuids(std::path::Path::new("/proc/driver/nvidia/gpus"))
-                }
+                None if built && slot.standby() => capabilities::driver_gpu_uuids(),
                 None => Vec::new(),
             }
         } else {
