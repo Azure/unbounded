@@ -760,12 +760,13 @@ jobs:
             platforms: linux/amd64,linux/arm64
             trivy: true
           # vLLM (VLLM_VERSION in the Containerfile) with racer-client and
-          # racer-vllm. The base image alone is larger than a hosted runner's
-          # free disk.
+          # racer-vllm. The upstream vLLM base is not ours to patch, so it is
+          # not gated on Trivy. The base image alone is larger than a hosted
+          # runner's free disk.
           - name: racer-vllm
             file: images/racer-vllm/Containerfile
             platforms: linux/amd64,linux/arm64
-            trivy: true
+            trivy: false
             large: true
             large-sbom: true
           - name: host-ubuntu2404
