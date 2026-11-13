@@ -2451,7 +2451,7 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 			return ctrl.Result{}, nil
 		}
 
-		if run.Status.Evidence.URI == "" {
+		if run.Status.Evidence.URI == "" && run.Status.Evidence.Identity == nil {
 			result, recovered, err := r.resumeGroupedEvidence(ctx, &run)
 			if err != nil || recovered {
 				return result, err
@@ -4029,7 +4029,8 @@ func (r *RunReconciler) persistedEvidenceFinishedAt(
 		return time.Time{}, errors.New("terminal Run is missing durable evidence")
 	}
 
-	if uri != run.Status.Evidence.URI || digest != run.Status.Evidence.Digest {
+	if (run.Status.Evidence.URI != "" || run.Status.Evidence.Digest != "") &&
+		(uri != run.Status.Evidence.URI || digest != run.Status.Evidence.Digest) {
 		return time.Time{}, errors.New("durable evidence identity does not match Run status")
 	}
 

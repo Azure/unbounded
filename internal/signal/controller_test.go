@@ -1063,6 +1063,95 @@ func TestTerminalRunRecoversDurableEvidenceBeforeCleanup(t *testing.T) {
 	}
 }
 
+func TestTerminalRunWithExistingIdentityCleansUpFromImmutableEvidence(t *testing.T) {
+	t.Parallel()
+
+	scheme := resolvedCleanupScheme(t)
+	finishedAt := time.Date(2026, 11, 13, 0, 9, 53, 0, time.UTC)
+	node := qualificationNode("node", "node-uid", "boot-a")
+	run := &signalv1.CertificationRun{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "partially-recovered-run",
+			Namespace:  "signal-system",
+			UID:        "partially-recovered-run-uid",
+			Finalizers: []string{RunFinalizer},
+		},
+		Spec: signalv1.CertificationRunSpec{
+			Release: true,
+			Participants: []signalv1.Participant{{
+				NodeName: node.Name,
+				NodeUID:  node.UID,
+			}},
+		},
+		Status: signalv1.CertificationRunStatus{
+			Phase: signalv1.RunPhaseCancelled,
+			Evidence: signalv1.EvidenceStatus{
+				Identity: &signalv1.QualificationEvidenceIdentity{
+					PlanDigest: "sha256:" + strings.Repeat("b", 64),
+					Participants: []signalv1.ParticipantEvidenceIdentity{{
+						Index:   0,
+						Role:    signalv1.ParticipantRoleRequester,
+						Verdict: signalv1.QualificationVerdictInconclusive,
+					}},
+					Stages: []signalv1.StageEvidenceSummary{{
+						Name:       "partial-stage",
+						PhaseOrder: 0,
+						StageOrder: 0,
+						Role:       signalv1.CheckStageRoleValidation,
+						Mode:       signalv1.CheckExecutionModeRunOnce,
+						Verdict:    signalv1.StageVerdictPassed,
+					}},
+				},
+			},
+		},
+	}
+	evidence := []byte(fmt.Sprintf(
+		`{"runID":%q,"runName":%q,"finishedAt":%q}`,
+		run.UID,
+		run.Name,
+		finishedAt.Format(time.RFC3339Nano),
+	))
+	store := staticEvidenceStore{
+		data:   evidence,
+		uri:    "kubernetes://signal-system/partially-recovered-run-evidence/evidence.json.gz",
+		digest: "sha256:" + strings.Repeat("a", 64),
+	}
+	kube := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&signalv1.CertificationRun{}).
+		WithObjects(node, run).
+		Build()
+	reconciler := &RunReconciler{Client: kube, APIReader: kube, Evidence: store}
+
+	if _, err := reconciler.Reconcile(
+		context.Background(),
+		ctrl.Request{NamespacedName: client.ObjectKey{
+			Namespace: run.Namespace,
+			Name:      run.Name,
+		}},
+	); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+
+	var current signalv1.CertificationRun
+	if err := kube.Get(
+		context.Background(),
+		client.ObjectKey{Namespace: run.Namespace, Name: run.Name},
+		&current,
+	); err != nil {
+		t.Fatalf("get cleaned Run: %v", err)
+	}
+
+	if slices.Contains(current.Finalizers, RunFinalizer) {
+		t.Fatalf("Run finalizers = %#v", current.Finalizers)
+	}
+	if current.Status.Evidence.URI != "" ||
+		current.Status.Evidence.Digest != "" ||
+		current.Status.Evidence.Identity == nil {
+		t.Fatalf("partial evidence status was rewritten: %#v", current.Status.Evidence)
+	}
+}
+
 func TestResolvedCleanupWaitsForAndFencesChildWorkflowsAndPods(t *testing.T) {
 	t.Parallel()
 
