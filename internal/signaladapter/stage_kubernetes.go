@@ -855,7 +855,10 @@ func (e *KubernetesStageExecutor) executeWorkflowTemplate(
 		return signalv1.InvocationResultEnvelope{}, err
 	}
 
-	if err := applyWorkflowRuntimeIdentity(templateSpec, tolerations); err != nil {
+	if err := applyWorkflowRuntimeIdentity(templateSpec, workflowRuntimeIdentityOptions{
+		AllowRoot:   invocation.Stage.Test.Security.AllowRoot,
+		Tolerations: tolerations,
+	}); err != nil {
 		return signalv1.InvocationResultEnvelope{}, err
 	}
 
@@ -1677,10 +1680,15 @@ func validateWorkflowServiceAccountFields(value any, allowed string) error {
 	return nil
 }
 
-func applyWorkflowRuntimeIdentity(value any, workloadTolerations ...[]corev1.Toleration) error {
-	var tolerations []corev1.Toleration
-	if len(workloadTolerations) > 0 {
-		tolerations = workloadTolerations[0]
+type workflowRuntimeIdentityOptions struct {
+	AllowRoot   bool
+	Tolerations []corev1.Toleration
+}
+
+func applyWorkflowRuntimeIdentity(value any, runtimeOptions ...workflowRuntimeIdentityOptions) error {
+	options := workflowRuntimeIdentityOptions{}
+	if len(runtimeOptions) > 0 {
+		options = runtimeOptions[0]
 	}
 
 	switch typed := value.(type) {
@@ -1693,7 +1701,7 @@ func applyWorkflowRuntimeIdentity(value any, workloadTolerations ...[]corev1.Tol
 					return fmt.Errorf("WorkflowTemplate %s must be an object", key)
 				}
 
-				if err := applyUnstructuredContainerIdentity(container); err != nil {
+				if err := applyUnstructuredContainerIdentity(container, options.AllowRoot); err != nil {
 					return err
 				}
 			case "containers", "initContainers", "sidecars", "ephemeralContainers":
@@ -1708,7 +1716,7 @@ func applyWorkflowRuntimeIdentity(value any, workloadTolerations ...[]corev1.Tol
 						return fmt.Errorf("WorkflowTemplate %s[%d] must be an object", key, index)
 					}
 
-					if err := applyUnstructuredContainerIdentity(container); err != nil {
+					if err := applyUnstructuredContainerIdentity(container, options.AllowRoot); err != nil {
 						return err
 					}
 				}
@@ -1718,18 +1726,18 @@ func applyWorkflowRuntimeIdentity(value any, workloadTolerations ...[]corev1.Tol
 					return errors.New("WorkflowTemplate resource must be an object")
 				}
 
-				if err := applyWorkflowResourceRuntimeIdentity(resourceTemplate, tolerations); err != nil {
+				if err := applyWorkflowResourceRuntimeIdentity(resourceTemplate, options); err != nil {
 					return err
 				}
 			}
 
-			if err := applyWorkflowRuntimeIdentity(child, tolerations); err != nil {
+			if err := applyWorkflowRuntimeIdentity(child, options); err != nil {
 				return err
 			}
 		}
 	case []any:
 		for _, child := range typed {
-			if err := applyWorkflowRuntimeIdentity(child, tolerations); err != nil {
+			if err := applyWorkflowRuntimeIdentity(child, options); err != nil {
 				return err
 			}
 		}
@@ -1740,7 +1748,7 @@ func applyWorkflowRuntimeIdentity(value any, workloadTolerations ...[]corev1.Tol
 
 func applyWorkflowResourceRuntimeIdentity(
 	resourceTemplate map[string]any,
-	tolerations []corev1.Toleration,
+	options workflowRuntimeIdentityOptions,
 ) error {
 	manifest, ok := resourceTemplate["manifest"].(string)
 	if !ok {
@@ -1759,17 +1767,17 @@ func applyWorkflowResourceRuntimeIdentity(
 
 	switch kind {
 	case "Pod":
-		if err := applyNestedPodSpecIdentity(resource, tolerations, "spec"); err != nil {
+		if err := applyNestedPodSpecIdentity(resource, options, "spec"); err != nil {
 			return err
 		}
 	case "Job", "Deployment", "DaemonSet", "StatefulSet", "ReplicaSet":
-		if err := applyNestedPodSpecIdentity(resource, tolerations, "spec", "template", "spec"); err != nil {
+		if err := applyNestedPodSpecIdentity(resource, options, "spec", "template", "spec"); err != nil {
 			return err
 		}
 	case "CronJob":
 		if err := applyNestedPodSpecIdentity(
 			resource,
-			tolerations,
+			options,
 			"spec",
 			"jobTemplate",
 			"spec",
@@ -1790,7 +1798,7 @@ func applyWorkflowResourceRuntimeIdentity(
 				return fmt.Errorf("WorkflowTemplate MPIJob replica %q must be an object", role)
 			}
 
-			if err := applyNestedPodSpecIdentity(replicaSpec, tolerations, "template", "spec"); err != nil {
+			if err := applyNestedPodSpecIdentity(replicaSpec, options, "template", "spec"); err != nil {
 				return fmt.Errorf("apply WorkflowTemplate MPIJob replica %q identity: %w", role, err)
 			}
 		}
@@ -1818,7 +1826,7 @@ func applyWorkflowResourceRuntimeIdentity(
 
 func applyNestedPodSpecIdentity(
 	resource map[string]any,
-	tolerations []corev1.Toleration,
+	options workflowRuntimeIdentityOptions,
 	fields ...string,
 ) error {
 	spec, found, err := unstructured.NestedMap(resource, fields...)
@@ -1826,7 +1834,7 @@ func applyNestedPodSpecIdentity(
 		return fmt.Errorf("WorkflowTemplate resource has no Pod spec at %q", strings.Join(fields, "."))
 	}
 
-	if err := applyUnstructuredPodSpecIdentity(spec, tolerations); err != nil {
+	if err := applyUnstructuredPodSpecIdentity(spec, options); err != nil {
 		return err
 	}
 
@@ -1839,7 +1847,7 @@ func applyNestedPodSpecIdentity(
 
 func applyUnstructuredPodSpecIdentity(
 	spec map[string]any,
-	tolerations []corev1.Toleration,
+	options workflowRuntimeIdentityOptions,
 ) error {
 	securityContext := map[string]any{}
 
@@ -1862,10 +1870,10 @@ func applyUnstructuredPodSpecIdentity(
 	securityContext["fsGroup"] = workloadIdentityID
 	spec["securityContext"] = securityContext
 
-	if len(tolerations) > 0 {
-		converted := make([]any, 0, len(tolerations))
-		for index := range tolerations {
-			value, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&tolerations[index])
+	if len(options.Tolerations) > 0 {
+		converted := make([]any, 0, len(options.Tolerations))
+		for index := range options.Tolerations {
+			value, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&options.Tolerations[index])
 			if err != nil {
 				return fmt.Errorf("convert participant toleration: %w", err)
 			}
@@ -1893,7 +1901,7 @@ func applyUnstructuredPodSpecIdentity(
 				return fmt.Errorf("WorkflowTemplate Pod %s entry must be an object", field)
 			}
 
-			if err := applyUnstructuredContainerIdentity(container); err != nil {
+			if err := applyUnstructuredContainerIdentity(container, options.AllowRoot); err != nil {
 				return err
 			}
 		}
@@ -1902,7 +1910,7 @@ func applyUnstructuredPodSpecIdentity(
 	return nil
 }
 
-func applyUnstructuredContainerIdentity(container map[string]any) error {
+func applyUnstructuredContainerIdentity(container map[string]any, allowRoot ...bool) error {
 	securityContext := map[string]any{}
 
 	if value, found := container["securityContext"]; found {
@@ -1916,6 +1924,17 @@ func applyUnstructuredContainerIdentity(container map[string]any) error {
 
 	if securityContext == nil {
 		securityContext = map[string]any{}
+	}
+
+	if len(allowRoot) > 0 && allowRoot[0] && securityContext["runAsUser"] == int64(0) {
+		if securityContext["runAsGroup"] != int64(0) ||
+			securityContext["runAsNonRoot"] != false {
+			return errors.New("WorkflowTemplate root container must set runAsGroup 0 and runAsNonRoot false")
+		}
+
+		container["securityContext"] = securityContext
+
+		return nil
 	}
 
 	securityContext["runAsUser"] = workloadIdentityID
@@ -2391,11 +2410,20 @@ func driverResources(driver signalv1.CertificationTestDriver) corev1.ResourceReq
 }
 
 func applyStageSecurity(container *corev1.Container, security signalv1.ResolvedSecurityRequirements) {
+	runAsUser := workloadIdentityID
+	runAsGroup := workloadIdentityID
+	runAsNonRoot := true
+	if security.AllowRoot {
+		runAsUser = 0
+		runAsGroup = 0
+		runAsNonRoot = false
+	}
+
 	container.SecurityContext = &corev1.SecurityContext{
 		Privileged:   &security.Privileged,
-		RunAsUser:    utilptr.To(workloadIdentityID),
-		RunAsGroup:   utilptr.To(workloadIdentityID),
-		RunAsNonRoot: utilptr.To(true),
+		RunAsUser:    utilptr.To(runAsUser),
+		RunAsGroup:   utilptr.To(runAsGroup),
+		RunAsNonRoot: utilptr.To(runAsNonRoot),
 	}
 	if security.IPCLock || len(security.Capabilities) > 0 {
 		container.SecurityContext.Capabilities = &corev1.Capabilities{}

@@ -1649,6 +1649,8 @@ spec:
                                     type: string
                                   security:
                                     properties:
+                                      allowRoot:
+                                        type: boolean
                                       capabilities:
                                         items:
                                           pattern: ^[A-Z][A-Z0-9_]*$
@@ -1719,6 +1721,10 @@ spec:
                                       privileged:
                                         type: boolean
                                     type: object
+                                    x-kubernetes-validations:
+                                    - message: allowRoot requires privileged execution
+                                      rule: '!has(self.allowRoot) || !self.allowRoot
+                                        || (has(self.privileged) && self.privileged)'
                                   securityRequirementsDigest:
                                     pattern: ^sha256:[0-9a-f]{64}$
                                     type: string

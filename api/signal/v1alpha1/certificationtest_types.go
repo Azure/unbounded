@@ -269,8 +269,10 @@ type CertificationTestDriver struct {
 	WorkflowTemplate *WorkflowTemplateTestDriver `json:"workflowTemplate,omitempty"`
 }
 
+// +kubebuilder:validation:XValidation:rule="!has(self.allowRoot) || !self.allowRoot || (has(self.privileged) && self.privileged)",message="allowRoot requires privileged execution"
 type TestSecurityRequirements struct {
 	Privileged  bool `json:"privileged,omitempty"`
+	AllowRoot   bool `json:"allowRoot,omitempty"`
 	HostNetwork bool `json:"hostNetwork,omitempty"`
 	IPCLock     bool `json:"ipcLock,omitempty"`
 	// +kubebuilder:validation:MaxItems=16
