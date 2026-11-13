@@ -68,7 +68,7 @@ Reach a dataplane's diagnostics port through the API server:
 POD=<dataplane-pod>
 kubectl get --raw "/api/v1/namespaces/unbounded-system/pods/${POD}:9090/proxy/debug/hardware"
 kubectl get --raw "/api/v1/namespaces/unbounded-system/pods/${POD}:9090/proxy/metrics" \
-  | grep -E 'racer_effective_payload_bytes|racer_delivery_bytes_total|racer_gpu_read_requests_total|lookup_(hits|misses)_total'
+  | grep -E 'racer_effective_payload_bytes|racer_delivery_bytes_total|racer_gpu_read_requests_total|lookup_(hits|misses)_total|racer_peer_hits_total'
 ```
 
 - `/debug/hardware` lists block devices and the ones Racer claimed. Use it
@@ -78,5 +78,7 @@ kubectl get --raw "/api/v1/namespaces/unbounded-system/pods/${POD}:9090/proxy/me
 - `racer_delivery_bytes_total` grows by about the model size for each load.
 - `racer_gpu_read_requests_total{outcome="gpu"}` counts GPU deliveries;
   other outcomes explain fallbacks.
-- `racer_*_lookup_hits_total` and `racer_*_lookup_misses_total` show where
-  pages came from.
+- `racer_{plaintext,ciphertext,pending,disk_index}_lookup_hits_total` and the
+  matching `_lookup_misses_total` series show which local tier answered each
+  page lookup. There is no peer lookup series; `racer_peer_hits_total` counts
+  pages received from peers.
