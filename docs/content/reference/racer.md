@@ -19,7 +19,7 @@ See [Racer concepts]({{< relref "concepts/racer" >}}) and the [Azure Blob cache 
 | API | `racer.unbounded-cloud.io/v1alpha1`, kind `ClusterCache` |
 | Resource / short name | `clustercaches` / `ccache` |
 | Scope | Cluster-scoped |
-| Fields | Optional `spec.origin` for an Azure Blob origin that the dataplane reads directly; optional `spec.priority` for the cache's share of node capacity; optional `spec.passthrough` to proxy reads without caching; optional `spec.nodeSelector` to limit the cache to some nodes; no `status` |
+| Fields | Optional `spec.origin` for an Azure Blob origin that the dataplane reads directly; optional `spec.priority` for the cache's share of node capacity; optional `spec.passthrough` to proxy reads without caching; optional `spec.nodeSelector` to limit the cache to some nodes; optional `spec.encryption` to store pages in plaintext; no `status` |
 | Name | DNS subdomain, at most 82 characters total and 63 per dot-separated label |
 | Identity | Kubernetes UID, not name; deleting and recreating a cache creates a new identity |
 
@@ -126,6 +126,36 @@ spec:
   pages that a node read from its own origin.
 - `spec.passthrough` can be added, changed, or removed at any time. When a cache
   switches to passthrough, data previously cached for it is dropped.
+
+### Encryption
+
+`spec.encryption.mode` chooses how the cache stores and moves pages. It is
+optional and defaults to `Encrypted`. Set it when you create the cache; it
+cannot be changed later. To switch, create a new ClusterCache.
+
+```yaml
+apiVersion: racer.unbounded-cloud.io/v1alpha1
+kind: ClusterCache
+metadata:
+  name: models
+spec:
+  encryption:
+    mode: Plaintext
+```
+
+| Mode | Behavior |
+|------|----------|
+| `Encrypted` (default) | Pages are sealed with AES-GCM under a per-cache key, in memory, on disk, and between nodes. GPU reads decrypt on the GPU or CPU |
+| `Plaintext` | Pages are not sealed. Each page carries a CRC32C that is checked on read, which catches corruption but not tampering. Disk records use format version 6. GPU reads take the plain host-to-device or GPUDirect path |
+
+Use `Plaintext` only for data that needs no confidentiality from anyone who
+can reach the nodes' disks or the network between them, such as public model
+weights. Request signing and enrollment are unchanged.
+
+**Rollout:** dataplanes that predate this field reject a cache catalog that
+carries it, because the catalog rejects unknown fields. Upgrade every
+dataplane before you create a plaintext cache. Sealed caches do not carry the
+field and are unaffected.
 
 ### Node selector
 
@@ -679,6 +709,28 @@ Older dataplanes send pages out of order unless the client sends
 `Racer-Ordered: 1`, which current SDKs no longer send. Upgrade dataplanes
 before SDKs. Older peers accept only one page request at a time from a node.
 The dataplane detects this and falls back to one request at a time for that peer.
+
+### Local retention
+
+A read or prefetch can ask the dataplane to keep the pages it receives from
+peers on this node:
+
+```
+GET /v1/objects/<key> HTTP/1.1
+Racer-Retain: local
+```
+
+- `local` is the only value. Without the header, pages from peers follow
+  [second-sight](#second-sight-disk-retention) and pages that arrive over HTTP
+  are not kept.
+- With it, a peer-delivered page is eligible for local disk on first sight,
+  under the spill-hold cap `RACER_RETAINED_SEGMENT_PERCENT`. Over the cap the
+  page is delivered but not kept.
+- The Python client takes `retain=True`; a prefetch spec takes `retainLocal`.
+
+This matters most on sites without RDMA, where every replica start would
+otherwise fetch the same peer pages again. Dataplanes that predate the header
+ignore it.
 
 ### Host reads
 
@@ -1882,8 +1934,11 @@ GPU memory. They need:
 
 When it sets up the GPUs, the dataplane logs each GPU it finds: ordinal, UUID, PCI address,
 NUMA node, compute mode, and whether it can use it. It skips GPUs in
-`EXCLUSIVE_PROCESS` or `PROHIBITED` mode. One helper thread does all GPU work
-for the process, except cuFile disk reads, which run on four reader threads. At most 256 GPU reads run at once; more get 503.
+`EXCLUSIVE_PROCESS` or `PROHIBITED` mode. One coordinator thread sets up the GPUs.
+Each usable GPU then gets its own executor thread (`racer-gpu-<ordinal>`), which
+runs that GPU's copies and decrypts on four CUDA streams. cuFile disk reads run
+on four reader threads (`racer-gpu-read`), and the cuFile driver opens on one
+more thread at startup. At most 256 GPU reads run at once; more get 503.
 
 Where the bytes come from decides who decrypts them:
 
@@ -1947,7 +2002,8 @@ pods. The dataplane logs `stage=gpu-landing` lines when it registers them, and
 `racer_rdma_pages_landed_total` counts pages that landed in GPU memory.
 
 `RACER_GPU_STAGING_BYTES` is the GPU memory the dataplane keeps on each GPU for
-encrypted pages. It is split into slots of one page rounded up to whole 2 MiB pages (18 MiB). Two
+encrypted pages. It is split into slots of one sealed page (16 MiB plus a 16-byte tag) rounded
+up to whole 4 KiB blocks, so 16 MiB + 4 KiB each. Two
 slots are needed for decryption, so a smaller cap means the CPU decrypts. The
 other slots hold pages read with cuFile. When all of them are in use, the
 dataplane reads the next page through host memory instead. If the image has no

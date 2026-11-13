@@ -1,0 +1,63 @@
+# Imports a Hugging Face snapshot that already exists on a node into the
+# models container. Replace every <placeholder>; see README.md.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: racer-models
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: model-importer
+  namespace: racer-models
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: import-<model-name>
+  namespace: racer-models
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      serviceAccountName: model-importer
+      restartPolicy: Never
+      nodeSelector:
+        kubernetes.io/hostname: <node-with-snapshot>
+      containers:
+        - name: import
+          image: <registry>/racer-vllm-plugin:<tag>
+          command:
+            - racer-vllm
+            - import
+            - --source
+            - /snapshot
+            - --dest
+            - https://<storage-account>.blob.core.windows.net/models/<model-prefix>
+            - --azcopy
+          env:
+            - name: AZURE_CLIENT_ID
+              value: <writer-identity-client-id>
+            - name: AZURE_TENANT_ID
+              value: <tenant-id>
+            - name: AZURE_FEDERATED_TOKEN_FILE
+              value: /var/run/secrets/azure/tokens/azure-identity-token
+          volumeMounts:
+            - name: snapshot
+              mountPath: /snapshot
+              readOnly: true
+            - name: azure-identity-token
+              mountPath: /var/run/secrets/azure/tokens
+              readOnly: true
+      volumes:
+        - name: snapshot
+          hostPath:
+            path: <hf-cache>/hub/models--<org>--<model>/snapshots/<revision>
+            type: Directory
+        - name: azure-identity-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: azure-identity-token
+                  audience: api://AzureADTokenExchange
+                  expirationSeconds: 3600
