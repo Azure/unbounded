@@ -180,7 +180,11 @@ racer-vllm prepare racer://models-hillsboro/models/glm/GLM-5 \
 ```
 
 Run it in an image that has vLLM, `racer-vllm[azure]`, and the GPUs the
-layout needs. `--dest` is the model's own location in the origin, the same
+layout needs. No shipped image runs `prepare` against an `https` destination:
+the `racer-vllm` convenience image has no Azure SDK, and the
+`racer-vllm-plugin` image has no vLLM. Build a custom image with both. The
+pod also needs the Racer client socket (see [Socket access](#socket-access))
+and write access to `--dest`, the same writer identity the import Job uses. `--dest` is the model's own location in the origin, the same
 URL given to `import`. The command materializes the model into
 `--workdir`, builds a vLLM engine with the arguments after `--`, and uploads
 each rank's artifact under `sharded/<fingerprint>/` with its
@@ -196,7 +200,8 @@ checkpoint; with `sharded: require` it fails.
 
 `racer-vllm warm` asks the dataplane to prefetch every weight file into the
 cache, so the first replica does not pay for origin reads. Run it before a
-rollout, for example from a Job on a node of the site:
+rollout, for example from a Job on a node of the site with the Racer client
+socket (see [Socket access](#socket-access)):
 
 ```bash
 racer-vllm warm racer://models-hillsboro/models/qwen/Qwen3-8B
@@ -210,6 +215,15 @@ pages stay as long as the cache's normal eviction keeps them.
 artifacts listed in `racer-sharded-index.json` with how many ranks are
 present, and whether the dataplane serves each file at the manifest's size.
 It exits nonzero if a file is missing.
+
+### Socket Access
+
+`prepare`, `warm`, and `inspect` open a Racer client. It uses `--socket` if
+given, then `RACER_SOCKET`, then `/run/racer/<cache>/client/socket`. In a pod, that
+socket exists only when the admission webhook injects it, so the pod needs
+the label `racer.unbounded-cloud.io/client-socket: enabled` and the
+annotation `racer.unbounded-cloud.io/client-cache: <cache>`, as in the
+Deployment above.
 
 ## Settings
 
