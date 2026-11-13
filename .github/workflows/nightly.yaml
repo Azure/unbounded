@@ -268,6 +268,7 @@ jobs:
   #   - gantry-node-config            : optional AKS OverlayBD configurator
   #   - orca                          : deployed separately by deploy-orca
   #   - racer-object                  : sidecars injected by the racer component
+  #   - racer-vllm-plugin             : pure-Python Racer loader for any vLLM image
   #   - racer-vllm                    : vLLM with the Racer loader; not deployed
   #
   # machine-ops-controller is omitted on purpose: the operator synthesizes
@@ -300,6 +301,8 @@ jobs:
             file: images/racer/Containerfile
           - name: racer-object
             file: images/racer-object/Containerfile
+          - name: racer-vllm-plugin
+            file: images/racer-vllm-plugin/Containerfile
           - name: racer-vllm
             file: images/racer-vllm/Containerfile
             large: true

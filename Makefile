@@ -401,6 +401,10 @@ help: ## Show this help
 	@echo "  racer-object | racer-object-build  Build the Rust racer-object sidecar (with/without tests)"
 	@echo "  racer-object-test                 Check formatting, lint, and test the racer-object crate"
 	@echo "  image-racer-local       Build the racer container image"
+	@echo "  racer-vllm-test                  Test racer-client and racer-vllm in a throwaway venv"
+	@echo "  racer-vllm-plugin-dist           Build racer-client and racer-vllm wheels into tmp/racer-vllm-plugin-dist"
+	@echo "  image-racer-vllm-plugin-local    Build the pure-Python racer-vllm-plugin image"
+	@echo "  image-racer-vllm-local           Build vLLM with the Racer plugin (VLLM_VERSION, default v0.33.0)"
 	@echo "  image-racer-loadgen-local         Build the loadgen container image"
 	@echo "  image-racer-object-local          Build the racer-object container image"
 	@echo ""
@@ -683,6 +687,22 @@ racer-python-dist: ## Build sdists and wheels for racer-client and racer-vllm in
 	timeout --signal=TERM --kill-after=10s 300s "$(RACER_PY_VENV)/bin/python" -m build -o tmp/racer-python-dist clients/python/racer
 	timeout --signal=TERM --kill-after=10s 300s "$(RACER_PY_VENV)/bin/python" -m build -o tmp/racer-python-dist clients/python/racer-vllm
 
+RACER_VLLM_TEST_VENV ?= $(CURDIR)/tmp/racer-vllm-test-venv
+
+.PHONY: racer-vllm-test
+racer-vllm-test: ## Run racer-client and racer-vllm tests against installed packages in a fresh throwaway venv (PYTEST_ARGS)
+	rm -rf "$(RACER_VLLM_TEST_VENV)"
+	timeout --signal=TERM --kill-after=10s 120s python3 -m venv "$(RACER_VLLM_TEST_VENV)"
+	timeout --signal=TERM --kill-after=10s 300s "$(RACER_VLLM_TEST_VENV)/bin/pip" install -q pytest ./clients/python/racer ./clients/python/racer-vllm
+	cd clients/python/racer && timeout --signal=TERM --kill-after=10s 300s "$(RACER_VLLM_TEST_VENV)/bin/pytest" -q -p no:cacheprovider $(PYTEST_ARGS)
+	cd clients/python/racer-vllm && timeout --signal=TERM --kill-after=10s 300s "$(RACER_VLLM_TEST_VENV)/bin/pytest" -q -p no:cacheprovider $(PYTEST_ARGS)
+	rm -rf "$(RACER_VLLM_TEST_VENV)"
+
+.PHONY: racer-vllm-plugin-dist
+racer-vllm-plugin-dist: ## Build racer-client and racer-vllm wheels into tmp/racer-vllm-plugin-dist
+	rm -rf tmp/racer-vllm-plugin-dist
+	timeout --signal=TERM --kill-after=10s 300s python3 -m pip wheel --no-deps --no-cache-dir -w tmp/racer-vllm-plugin-dist ./clients/python/racer ./clients/python/racer-vllm
+
 RACER_DST_TIMEOUT ?= 1200s
 
 # DST_SEEDS: seed file or count N (seeds 1..=N per scenario); default dst/seeds/{ci,regressions}.txt.
@@ -724,6 +744,23 @@ image-racer-local: ## Build the racer container image locally (single-arch)
 		-t racer:$(VERSION_TAG) -t $(RACER_IMAGE) \
 		-f ./images/racer/Containerfile .
 	$(call trivy-maybe,$(RACER_IMAGE))
+
+RACER_VLLM_PLUGIN_IMAGE ?= $(CONTAINER_REGISTRY)/racer-vllm-plugin:$(VERSION_TAG)
+RACER_VLLM_IMAGE ?= $(CONTAINER_REGISTRY)/racer-vllm:$(VERSION_TAG)
+VLLM_VERSION ?= v0.33.0
+
+.PHONY: image-racer-vllm-plugin-local image-racer-vllm-local
+image-racer-vllm-plugin-local: ## Build the pure-Python racer-vllm-plugin image locally (single-arch)
+	$(CONTAINER_ENGINE) build \
+		-t racer-vllm-plugin:$(VERSION_TAG) -t $(RACER_VLLM_PLUGIN_IMAGE) \
+		-f ./images/racer-vllm-plugin/Containerfile .
+	$(call trivy-maybe,$(RACER_VLLM_PLUGIN_IMAGE))
+
+image-racer-vllm-local: ## Build vLLM (VLLM_VERSION) with the Racer plugin locally (single-arch)
+	$(CONTAINER_ENGINE) build \
+		--build-arg VLLM_VERSION=$(VLLM_VERSION) \
+		-t racer-vllm:$(VERSION_TAG) -t $(RACER_VLLM_IMAGE) \
+		-f ./images/racer-vllm/Containerfile .
 
 RACER_LOADGEN_BIN=bin/racer-loadgen
 RACER_LOADGEN_CMD=./cmd/racer-loadgen

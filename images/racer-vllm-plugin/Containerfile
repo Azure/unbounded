@@ -1,0 +1,37 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+# racer-client and racer-vllm as a pure-Python tree under /opt/racer/python.
+# Inject the plugin into any vLLM image by copying that directory (for example
+# from an init container into a shared volume) and setting
+# PYTHONPATH=/opt/racer/python. Neither package has native dependencies, so the
+# tree is the same on linux/amd64 and linux/arm64.
+ARG PYTHON_IMAGE=docker.io/library/python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b
+
+# Build stage
+FROM ${PYTHON_IMAGE} AS builder
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PYTHONDONTWRITEBYTECODE=1 SOURCE_DATE_EPOCH=0
+WORKDIR /src
+COPY clients/python/racer ./clients/python/racer
+COPY clients/python/racer-vllm ./clients/python/racer-vllm
+# Install both together so racer-vllm's racer-client dependency resolves to
+# the local tree, not an index. --no-compile keeps the output free of
+# timestamped bytecode.
+RUN pip install --no-cache-dir --no-compile --target /opt/racer/python \
+        ./clients/python/racer ./clients/python/racer-vllm \
+    && rm -rf /opt/racer/python/bin
+
+# Runtime stage
+FROM ${PYTHON_IMAGE}
+ENV PYTHONPATH=/opt/racer/python PYTHONDONTWRITEBYTECODE=1
+COPY --from=builder /opt/racer/python /opt/racer/python
+# Console-script wrapper; pip --target places entry points in a bin directory
+# whose shebang points at the builder's interpreter, so write our own.
+RUN printf '#!/bin/sh\nexec python3 -c "import sys, racer_vllm; sys.exit(racer_vllm.main())" "$@"\n' \
+        > /usr/local/bin/racer-vllm-fetch \
+    && chmod 0755 /usr/local/bin/racer-vllm-fetch \
+    && python3 -c "import racer, racer_vllm" \
+    && useradd --system --uid 65532 --no-create-home --shell /usr/sbin/nologin racer
+COPY LICENSE NOTICE /unbounded/licenses/
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/racer-vllm-fetch"]
