@@ -279,15 +279,34 @@ class RacerLoaderMixin:
             h.finish()
 
     def _encoder_only_filter(self, path: str, m: dict, names: list) -> list:
-        """vLLM's --mm-encoder-only shard filter, applied to the manifest's file list."""
+        """vLLM's --mm-encoder-only shard filter, applied to the manifest's file list.
+
+        vLLM's filter reads the index from a folder. For a racer:// model the
+        index is read from Racer (at the ETag its stat returned) into a
+        temporary folder first.
+        """
         prefixes = getattr(self, "_encoder_only_lm_prefixes", None)
         index = m.get("index")
-        if prefixes is None or not index or path.startswith(SCHEME):
+        if prefixes is None or not index:
             return names
         fn = compat.mm_encoder_only_filter()
         if fn is None:
             return names
-        kept = fn(names, path, index, prefixes, weights_mapper=getattr(self, "_encoder_only_weights_mapper", None))
+        mapper = getattr(self, "_encoder_only_weights_mapper", None)
+        if path.startswith(SCHEME):
+            import tempfile
+
+            uri = parse_uri(path)
+            client = self._client(uri)
+            req = uri.request(index)
+            meta = client.stat(req)
+            data = client.read(req, if_match=meta.etag)
+            with tempfile.TemporaryDirectory(prefix="racer-vllm-index-") as folder:
+                with open(os.path.join(folder, os.path.basename(index)), "wb") as f:
+                    f.write(data)
+                kept = fn(names, folder, os.path.basename(index), prefixes, weights_mapper=mapper)
+        else:
+            kept = fn(names, path, index, prefixes, weights_mapper=mapper)
         if not kept:
             raise RuntimeError(f"racer loader: the mm-encoder-only filter removed every weight file of {path}")
         return list(kept)
