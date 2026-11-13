@@ -1120,6 +1120,7 @@ func boundedInvocationReferences(
 			Digest:       "sha256:" + hex.EncodeToString(digest[:]),
 			Outcome:      envelope.Outcome,
 			ReasonCode:   envelope.ReasonCode,
+			Message:      envelope.Message,
 			StartedAt:    envelope.StartedAt,
 			FinishedAt:   envelope.FinishedAt,
 		})

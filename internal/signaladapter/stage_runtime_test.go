@@ -714,6 +714,28 @@ func TestStageRunnerBoundsInvocationReferences(t *testing.T) {
 	}
 }
 
+func TestBoundedInvocationReferencesPreserveFailureMessage(t *testing.T) {
+	t.Parallel()
+
+	at := metav1.NewTime(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	envelope := signalv1.InvocationResultEnvelope{
+		InvocationID: "inv-failed",
+		Outcome:      signalv1.InvocationOutcomeInconclusive,
+		ReasonCode:   signalv1.ResultReasonInvalidResult,
+		Message:      "BurnInterrupted",
+		StartedAt:    at,
+		FinishedAt:   at,
+	}
+
+	references, err := boundedInvocationReferences([]signalv1.InvocationResultEnvelope{envelope})
+	if err != nil {
+		t.Fatalf("boundedInvocationReferences() error = %v", err)
+	}
+	if len(references) != 1 || references[0].Message != envelope.Message {
+		t.Fatalf("invocation references = %#v", references)
+	}
+}
+
 func TestStageRunnerPersistsNegativeOutcomesBeforeAssertions(t *testing.T) {
 	t.Parallel()
 

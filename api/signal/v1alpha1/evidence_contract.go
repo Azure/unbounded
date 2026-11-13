@@ -151,8 +151,10 @@ type InvocationEvidenceReference struct {
 	Digest     string            `json:"digest"`
 	Outcome    InvocationOutcome `json:"outcome"`
 	ReasonCode ResultReasonCode  `json:"reasonCode"`
-	StartedAt  metav1.Time       `json:"startedAt"`
-	FinishedAt metav1.Time       `json:"finishedAt"`
+	// +kubebuilder:validation:MaxLength=1024
+	Message    string      `json:"message,omitempty"`
+	StartedAt  metav1.Time `json:"startedAt"`
+	FinishedAt metav1.Time `json:"finishedAt"`
 }
 
 // +kubebuilder:validation:XValidation:rule="self.finishedAt >= self.startedAt",message="stage finishedAt must not precede startedAt"
