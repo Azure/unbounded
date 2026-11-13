@@ -216,7 +216,7 @@ def capture(
         "world_size": world_size,
         "role": role,
         "source_manifest_sha256": source_manifest_sha256,
-        "files": [{"name": DATA_NAME, "tensors": entries}],
+        "files": [{"name": DATA_NAME, "size": 8 + len(h) + pos, "tensors": entries}],
     }
     path = os.path.join(d, mf.SHARDED_NAME)
     with open(path + ".tmp", "w") as f:
@@ -278,16 +278,23 @@ def load_sharded(client, uri, model, rank: int, role: str, fp: str, make_reader,
         return fail(why)
     reader = make_reader()
     jobs = []
-    for f in doc["files"]:
-        fmeta = client.stat(prefix.request(f["name"]))
-        tensors = [
-            mf.Tensor(n, t["dtype"], tuple(t["shape"]), t["offset"], t["offset"] + t["size"])
-            for n, t in f["tensors"].items()
-        ]
-        req = prefix.request(f["name"])
-        for r in plan(f["name"], tensors, None, reader.pool.staging_bytes, file_size=fmeta.size):
-            jobs.append((req, r, fmeta.etag))
-        reader.stats["files"] += 1
+    try:
+        for f in doc["files"]:
+            req = prefix.request(f["name"])
+            fmeta = client.stat(req)
+            if f.get("size") is not None and fmeta.size != f["size"]:
+                raise mf.ManifestError(f"{f['name']} is {fmeta.size} bytes in Racer but {f['size']} in the manifest")
+            tensors = [
+                mf.Tensor(n, t["dtype"], tuple(t["shape"]), t["offset"], t["offset"] + t["size"])
+                for n, t in f["tensors"].items()
+            ]
+            for r in plan(f["name"], tensors, None, reader.pool.staging_bytes, file_size=fmeta.size):
+                jobs.append((req, r, fmeta.etag))
+            reader.stats["files"] += 1
+    except racer.NotFound as exc:
+        return fail(f"data file missing: {exc}")
+    except (mf.ManifestError, ValueError) as exc:
+        return fail(str(exc))
     for name, tensor in reader.iter(jobs):
         state[name].data.copy_(tensor)
     return True

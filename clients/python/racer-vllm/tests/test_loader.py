@@ -504,3 +504,62 @@ def test_verify_full_never_uses_gpu_delivery(monkeypatch, server, torch):
     model = Model()
     ld.load_weights(model, model_config(URI))
     assert model.got == W and asked == ["host"]
+
+
+def _tamper(doc, data, how):
+    f = doc["files"][0]
+    a, b = f["tensors"]["layer.a"], f["tensors"]["layer.b"]
+    if how == "truncated":  # an old artifact without a recorded size, and a short data file
+        del f["size"]
+        data = data[:-8]
+    elif how == "overlap":
+        b["offset"] = a["offset"] + 8
+    elif how == "past_end":
+        del f["size"]
+        b["offset"] = len(data)
+    return doc, data
+
+
+@pytest.mark.parametrize("how", ["truncated", "overlap", "past_end"])
+def test_corrupt_sharded_artifact_falls_back(monkeypatch, server, torch, tmp_path, how):
+    import json
+
+    u, files, m, d = materialized(server, tmp_path)
+    ld = make_loader(monkeypatch, server, sharded="auto")
+    fp, _, _ = ld._fingerprint(Model(), model_config(d))
+    root = tmp_path / "origin"
+    cli.publish_captured(LocalStore(str(root)), capture_to(tmp_path, STATE, fp), out=lambda *_: None)
+    serve_dir(server, u, str(root))
+    art = u.child(sharded.artifact_prefix(fp, "target", 0))
+    doc = json.loads(server.objects[art.request(mf.SHARDED_NAME).hex].data)
+    data = server.objects[art.request(sharded.DATA_NAME).hex].data
+    doc, data = _tamper(doc, data, how)
+    put(server, art, mf.SHARDED_NAME, mf.canonical(doc))
+    put(server, art, sharded.DATA_NAME, data)
+    model = Model(model_state({n: b"\0" * len(v) for n, v in STATE.items()}))
+    ld.load_weights(model, model_config(d))
+    assert model.got == W
+    reader.forget()
+    ld = make_loader(monkeypatch, server, sharded="require")
+    with pytest.raises(sharded.ShardedMismatch):
+        ld.load_weights(Model(model_state(STATE)), model_config(d))
+
+
+def test_sharded_manifest_checks_offsets():
+    good = {"schema": mf.SHARDED_SCHEMA, "fingerprint": "f" * 32, "rank": 0, "world_size": 1, "role": "target",
+            "source_manifest_sha256": "0" * 64,
+            "files": [{"name": "m", "size": 24, "tensors": {
+                "a": {"dtype": "U8", "shape": [8], "offset": 8, "size": 8, "sha256": "0" * 64},
+                "b": {"dtype": "U8", "shape": [8], "offset": 16, "size": 8, "sha256": "0" * 64}}}]}
+    mf.validate_sharded(good)
+    import copy
+
+    for path, value, match in [(("size",), 23, "past the end"), (("tensors", "b", "offset"), 12, "overlaps"),
+                               (("tensors", "a", "offset"), 0, "length prefix")]:
+        doc = copy.deepcopy(good)
+        node = doc["files"][0]
+        for k in path[:-1]:
+            node = node[k]
+        node[path[-1]] = value
+        with pytest.raises(mf.ManifestError, match=match):
+            mf.validate_sharded(doc)

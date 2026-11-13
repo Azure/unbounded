@@ -300,6 +300,8 @@ def validate_sharded(doc) -> dict:
         seen_files.add(f["name"])
         tensors = f.get("tensors")
         _need(isinstance(tensors, dict), f"files[{i}].tensors must be an object")
+        fsize = f.get("size")
+        _need(fsize is None or (type(fsize) is int and fsize >= 8), f"files[{i}].size must be an integer >= 8")
         for tname, t in tensors.items():
             _need(tname not in seen_tensors, f"tensor {tname!r} appears twice")
             seen_tensors.add(tname)
@@ -309,6 +311,12 @@ def validate_sharded(doc) -> dict:
             size = math.prod(t["shape"]) * DTYPES[t["dtype"]][0]
             _need(t.get("size") == size, f"tensor {tname!r}: size does not match dtype and shape")
             _need(isinstance(t.get("sha256"), str) and _SHA.fullmatch(t["sha256"]), f"tensor {tname!r}: bad sha256")
+            _need(t["offset"] >= 8, f"tensor {tname!r}: offset is inside the safetensors length prefix")
+            _need(fsize is None or t["offset"] + size <= fsize, f"tensor {tname!r}: data is past the end of the file")
+        end = 0
+        for tname, t in sorted(tensors.items(), key=lambda kv: kv[1]["offset"]):
+            _need(t["offset"] >= end, f"tensor {tname!r} overlaps the tensor before it")
+            end = t["offset"] + t["size"]
     return doc
 
 
