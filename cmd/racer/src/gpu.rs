@@ -196,6 +196,21 @@ impl AsRef<[u8]> for HostCiphertext {
 /// Builds the GPU backend on the coordinator thread.
 pub type Loader = Box<dyn FnOnce() -> racer_gpu::Result<racer_gpu::Gpu> + Send>;
 
+/// Makes a [`Loader`] per GPU start attempt, so a failed lazy start can be
+/// retried.
+pub type Loaders = Box<dyn FnMut() -> Loader + Send>;
+
+/// [`Loaders`] that yields `loader` once, then loaders that fail with
+/// `Unavailable`.
+pub fn loaders_once(loader: Loader) -> Loaders {
+    let mut loader = Some(loader);
+    Box::new(move || {
+        loader
+            .take()
+            .unwrap_or_else(|| Box::new(|| Err(racer_gpu::Error::Unavailable)))
+    })
+}
+
 /// Plaintext bytes handed to the helper. The page is immutable and its
 /// storage is reference counted, so the helper reads it in place; the handle
 /// goes back with the answer so the page is released on the I/O thread.
@@ -1137,6 +1152,14 @@ impl GpuClient {
 }
 
 impl GpuService for GpuClient {
+    fn gpu_uuids(&self) -> Vec<String> {
+        self.helper
+            .devices()
+            .iter()
+            .map(DeviceInfo::display_id)
+            .collect()
+    }
+
     fn open(
         &self,
         descriptor: OwnedFd,

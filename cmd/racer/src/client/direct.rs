@@ -149,6 +149,11 @@ pub trait GpuService {
         allocation_size: u64,
         gpu_uuid: Option<[u8; 16]>,
     ) -> Result<Box<dyn DirectSink>>;
+
+    /// UUIDs (`GPU-...`) of the GPUs this backend can target.
+    fn gpu_uuids(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Writes pages into a client file with positioned io_uring writes, or, for a

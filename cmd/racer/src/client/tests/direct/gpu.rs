@@ -860,7 +860,13 @@ fn slot(
 ) -> crate::error::Result<Arc<crate::gpu_slot::GpuSlot>> {
     let mut config = crate::test_support::cluster::config(links.is_some());
     config.enable_gpu = mode;
-    crate::app::gpu_slot(&config, true, telemetry, links, loader)
+    crate::app::gpu_slot(
+        &config,
+        true,
+        telemetry,
+        links,
+        crate::gpu::loaders_once(loader),
+    )
 }
 
 fn lazy_fixture(
@@ -999,9 +1005,10 @@ fn concurrent_first_gpu_reads_start_the_gpu_once() {
 }
 
 #[test]
-/// A failed start or a node with no usable GPU leaves `gpu-read` off (501)
-/// for good, so clients use host reads, and it is never retried.
-fn auto_start_failure_is_501_and_not_retried() {
+/// A failed start or a node with no usable GPU answers `gpu-read` with 501,
+/// so clients use host reads, and leaves the slot in standby; requests
+/// within the backoff do not start it again.
+fn auto_start_failure_is_501_and_backs_off() {
     let env = racer_io::Env::host();
     let failing = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counted = failing.clone();
@@ -1034,7 +1041,7 @@ fn auto_start_failure_is_501_and_not_retried() {
             settle(&fixture);
         }
         assert_eq!(calls_now(calls), 1);
-        assert!(!slot.standby());
+        assert!(slot.standby());
         assert!(slot.get().is_none());
         assert!(!links.gpu_landing_configured());
         use crate::gpu_telemetry::GpuReadOutcome;
@@ -1046,7 +1053,7 @@ fn auto_start_failure_is_501_and_not_retried() {
             3
         );
         let text = render(&telemetry);
-        assert!(text.contains("racer_gpu_standby 0\n"), "{text}");
+        assert!(text.contains("racer_gpu_standby 1\n"), "{text}");
         assert!(text.contains("racer_gpu_enabled 0\n"), "{text}");
     }
 }
@@ -1110,7 +1117,7 @@ fn required_starts_eagerly_and_off_modes_never_load() {
         false,
         Default::default(),
         None,
-        counted_loader(1, &off),
+        crate::gpu::loaders_once(counted_loader(1, &off)),
     )
     .unwrap();
     assert!(!unbuilt.standby());
@@ -1206,5 +1213,91 @@ fn stalled_gpu_start_honors_request_expiry_and_cancellation() {
             assert_released(&helper);
             assert_eq!(calls_now(&calls), 1);
         }
+    }
+}
+
+/// Send `GET /v1/capabilities` and return the status line and JSON body.
+fn capabilities(fixture: &Fixture) -> (String, serde_json::Value) {
+    let output = exchange(fixture, b"GET /v1/capabilities HTTP/1.1\r\n\r\n", &[]);
+    let (head, body) = split(&output);
+    assert!(head.contains("content-type: application/json"), "{head}");
+    let status = head.lines().next().unwrap_or_default().to_string();
+    (status, serde_json::from_slice(body).expect("json body"))
+}
+
+#[test]
+/// `GET /v1/capabilities` answers on the client socket with the delivery
+/// modes this build offers, without a GPU backend.
+fn capabilities_without_gpu() {
+    let env = racer_io::Env::host();
+    let fixture = direct_fixture_with(&env, b"hello".to_vec(), |responses| responses);
+    let (status, value) = capabilities(&fixture);
+    assert!(status.starts_with("http/1.1 200"), "{status}");
+    assert_eq!(value["schema"], 1);
+    assert_eq!(value["delivery"], serde_json::json!(["host", "stream"]));
+    assert_eq!(value["gpu_uuids"], serde_json::json!([]));
+    assert_eq!(value["page_bytes"], crate::model::PAGE_BYTES);
+    assert_eq!(value["retain_local"], true);
+    assert_eq!(
+        value["page_ciphers"],
+        serde_json::json!(["xaes256gcm", "none"])
+    );
+    settle(&fixture);
+    // A read on a fresh connection is unaffected.
+    let memfd = Memfd::new();
+    let output = exchange(
+        &fixture,
+        &direct_request("host-read", &fields("", 0, 5, GRANULE)),
+        &[memfd.file.as_raw_fd()],
+    );
+    let (head, _) = split(&output);
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+}
+
+#[test]
+/// Capabilities never start the lazy GPU helper and do not wait behind a
+/// start in flight; a started helper reports its GPUs.
+fn capabilities_do_not_start_or_wait_on_gpu() {
+    let env = racer_io::Env::host();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (open, gate) = std::sync::mpsc::channel();
+    let slot = slot(
+        GpuMode::Auto,
+        gated_loader(&calls, gate),
+        Default::default(),
+        None,
+    )
+    .unwrap();
+    let fixture = lazy_fixture(&env, b"hello".to_vec(), &slot);
+    let (status, value) = capabilities(&fixture);
+    assert!(status.starts_with("http/1.1 200"), "{status}");
+    assert!(value["delivery"].as_array().unwrap().len() >= 2);
+    settle(&fixture);
+    assert_eq!(calls_now(&calls), 0);
+    assert!(slot.standby());
+    // Hold a start in flight; capabilities still answer at once.
+    let starting = slot.clone();
+    let start = std::thread::spawn(move || futures::executor::block_on(starting.get_or_start()));
+    // Let the start thread reach the gate.
+    std::thread::sleep(Duration::from_millis(50));
+    let (status, _) = capabilities(&fixture);
+    assert!(status.starts_with("http/1.1 200"), "{status}");
+    settle(&fixture);
+    open.send(()).unwrap();
+    assert!(start.join().unwrap().is_some());
+    assert_eq!(calls_now(&calls), 1);
+    let (_, value) = capabilities(&fixture);
+    let uuids = value["gpu_uuids"].as_array().unwrap();
+    if cfg!(feature = "cuda") {
+        assert_eq!(
+            value["delivery"],
+            serde_json::json!(["gpu", "host", "stream"])
+        );
+        assert_eq!(uuids.len(), 1);
+        assert!(uuids[0].as_str().unwrap().starts_with("GPU-"));
+    } else {
+        // Without `cuda` the build cannot offer GPU delivery.
+        assert_eq!(value["delivery"], serde_json::json!(["host", "stream"]));
+        assert!(uuids.is_empty());
     }
 }

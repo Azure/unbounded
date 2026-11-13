@@ -44,6 +44,7 @@ use std::task::Context;
 use std::task::Poll;
 use std::time::Duration;
 
+mod capabilities;
 pub mod direct;
 pub mod listener;
 pub mod origin_directory;
@@ -1067,6 +1068,34 @@ impl Responses {
             *gpu = Some(Rc::new(crate::gpu::GpuClient::new(helper)));
         }
         Ok(())
+    }
+
+    /// The `GET /v1/capabilities` body. Never starts the GPU helper or
+    /// waits on a start: a started helper reports its usable GPUs, a slot in
+    /// standby reports the GPUs the kernel driver lists.
+    pub(crate) fn capabilities(&self) -> Vec<u8> {
+        let built = cfg!(feature = "cuda");
+        let display = |helper: &crate::gpu::GpuHelper| {
+            helper
+                .devices()
+                .iter()
+                .map(|device| device.display_id())
+                .collect::<Vec<_>>()
+        };
+        let uuids = if let Some(gpu) = self.gpu.borrow().as_ref() {
+            gpu.gpu_uuids()
+        } else if let Some(slot) = &self.lazy_gpu {
+            match slot.get() {
+                Some(helper) => display(helper),
+                None if built && slot.standby() => {
+                    capabilities::procfs_gpu_uuids(std::path::Path::new("/proc/driver/nvidia/gpus"))
+                }
+                None => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+        capabilities::body(built, uuids)
     }
 
     /// Whether this worker serves `gpu-read`.

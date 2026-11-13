@@ -2712,7 +2712,7 @@ impl Application {
             self.config
                 .enable_rdma
                 .then(|| self.node.native.link_node()),
-            Box::new(racer_gpu::Gpu::load),
+            Box::new(|| Box::new(racer_gpu::Gpu::load)),
         )
     }
 
@@ -4154,15 +4154,17 @@ impl WorkerPressure {
 }
 
 /// Resolve `RACER_ENABLE_GPU` into the process GPU slot. `built` says
-/// whether the binary has the `cuda` feature; `loader` loads the driver.
+/// whether the binary has the `cuda` feature; `loaders` makes a driver
+/// loader per start attempt.
 ///
 /// - `false`: off; nothing GPU-related runs.
 /// - `true`: an explicit request. Start the helper now and fail startup when
 ///   no GPU is usable.
 /// - `auto` with `cuda`: touch no GPU now. The helper (driver load, cuInit,
 ///   contexts, decrypt probe, cuFile open) starts on the first `gpu-read`
-///   request head, once per process; if that start fails or finds no usable
-///   GPU, GPU mode stays off (501) and is never retried.
+///   request head; if that start fails or finds no usable GPU, the slot
+///   stays in standby (501) and a later `gpu-read` retries after a bounded
+///   exponential backoff (see [`crate::gpu_slot::retry_delay`]).
 /// - `auto` without `cuda`: off, logged as `reason=not-built`.
 ///
 /// Once a helper exists, metrics report it and, with RDMA on (`links`),
@@ -4175,7 +4177,7 @@ pub(crate) fn gpu_slot(
     built: bool,
     telemetry: Arc<crate::gpu_telemetry::GpuTelemetry>,
     links: Option<Arc<crate::rdma::LinkNode>>,
-    loader: crate::gpu::Loader,
+    mut loaders: crate::gpu::Loaders,
 ) -> Result<Arc<crate::gpu_slot::GpuSlot>> {
     use crate::config::GpuMode;
     let landing_bytes = config.gpu_landing_bytes;
@@ -4196,11 +4198,11 @@ pub(crate) fn gpu_slot(
     if mode == GpuMode::Auto && built {
         eprintln!("racer: stage=gpu state=standby start=first-gpu-read");
         return Ok(Arc::new(crate::gpu_slot::GpuSlot::lazy(
-            Box::new(move || crate::gpu::GpuHelper::start_built(mode, built, options, loader)),
+            Box::new(move || crate::gpu::GpuHelper::start_built(mode, built, options, loaders())),
             Box::new(on_start),
         )));
     }
-    let gpu = crate::gpu::GpuHelper::start_built(mode, built, options, loader)?;
+    let gpu = crate::gpu::GpuHelper::start_built(mode, built, options, loaders())?;
     if let Some(gpu) = &gpu {
         on_start(gpu);
     }
