@@ -1,0 +1,40 @@
+# Plaintext model-weight caches, one per site. Replace every <placeholder>;
+# see README.md. Upgrade all Racer dataplanes before applying: older
+# dataplanes reject a cache that sets spec.encryption.
+apiVersion: racer.unbounded-cloud.io/v1alpha1
+kind: ClusterCache
+metadata:
+  name: models-hillsboro
+spec:
+  encryption:
+    mode: Plaintext
+  priority: 900
+  nodeSelector:
+    matchLabels:
+      unbounded-cloud.io/site: <hillsboro-site>
+  origin:
+    metadataTTL: 1h
+    azure:
+      containerURL: https://<storage-account>.blob.core.windows.net/models
+      credential:
+        workloadIdentity:
+          clientID: <managed-identity-client-id>
+---
+apiVersion: racer.unbounded-cloud.io/v1alpha1
+kind: ClusterCache
+metadata:
+  name: models-dapple
+spec:
+  encryption:
+    mode: Plaintext
+  priority: 900
+  nodeSelector:
+    matchLabels:
+      unbounded-cloud.io/site: <dapple-site>
+  origin:
+    metadataTTL: 1h
+    azure:
+      containerURL: https://<storage-account>.blob.core.windows.net/models
+      credential:
+        workloadIdentity:
+          clientID: <managed-identity-client-id>

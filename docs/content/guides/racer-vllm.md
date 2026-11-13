@@ -9,103 +9,281 @@ Racer is pre-release. Its APIs, flags, and on-disk formats may change without a
 migration path. See the [Racer reference]({{< relref "reference/racer" >}}).
 {{< /callout >}}
 
-This guide loads vLLM model weights from a Racer cache. The `racer` load format
-reads each safetensors file through the local Racer dataplane. When GPU mode is
-on, the dataplane writes the bytes straight into GPU memory. Otherwise the
-client falls back to host memory, then to a plain stream.
+This guide serves a vLLM model whose weights live in a Racer cache. The
+`racer-vllm` plugin adds the `racer` load format. It reads each weight file
+through the node's Racer dataplane, which writes the bytes straight into GPU
+memory when it can, and otherwise into host memory.
 
 This helps most when many vLLM replicas start at once. Each page of the
-weights comes from the source only a few times, and the replicas share the
-pages among themselves instead of each downloading the full model.
+weights comes from the origin only a few times, and replicas share the pages
+among themselves instead of each downloading the full model.
 
-## Before You Start
+{{< callout type="info" >}}
+This guide describes the `racer-vllm` package layout (`racer-vllm materialize`,
+`import`, `prepare`, `warm`, `inspect`), plaintext caches, and local
+retention. These land together; check that your release includes them. On
+older releases only `racer-vllm-fetch` and the `racer-model.json` flow exist.
+{{< /callout >}}
 
-- A ClusterCache whose origin holds the model files. The
-  [Azure Blob guide]({{< relref "guides/azure-blob-cache" >}}) shows how to make
-  one. This guide uses a cache named `models`, a bucket named `llama`, and the
-  prefix `Llama-3.1-8B-Instruct`.
-- NVIDIA nodes set up by the unbounded agent.
+## Prerequisites
 
-## 1. Check GPU Mode
+- **A cache.** A ClusterCache with an Azure Blob origin that holds the model.
+  The [Azure Blob guide]({{< relref "guides/azure-blob-cache" >}}) shows how
+  to make one. For public model weights, use a plaintext cache (see
+  [Encryption]({{< relref "reference/racer" >}}#encryption)). The examples use a cache
+  named `models-hillsboro`.
+- **Identity.** The dataplane reads the origin as the `racer` ServiceAccount.
+  Its managed identity needs a federated credential for
+  `system:serviceaccount:unbounded-system:racer` and the
+  `Storage Blob Data Reader` role on the container. Importing weights needs a
+  separate identity that can write blobs.
+- **A plugin image.** Either the `racer-vllm` convenience image, which is a
+  vLLM image with both Python packages installed, or a small plugin image
+  that holds the packages under `/opt/racer/python` and is mounted into your
+  own vLLM image.
+- **NVIDIA nodes** set up by the unbounded agent. GPU mode is on by default
+  (`RACER_ENABLE_GPU=auto`). See [GPU reads]({{< relref "reference/racer" >}}#gpu-reads).
 
-GPU mode is on by default. The `racer` image is built with CUDA, and
-`RACER_ENABLE_GPU` is `auto`. The dataplane does not touch the GPUs until the
-first GPU read, so vLLM's first load turns GPU mode on. After a load, check a
-dataplane log on the GPU node:
+Complete example manifests live in
+[`deploy/racer/examples/models-weights/`](https://github.com/Azure/unbounded/tree/main/deploy/racer/examples/models-weights).
+
+## 1. Import the Weights
+
+`racer-vllm import` copies a Hugging Face snapshot into the origin container
+and writes `racer-manifest.json` next to it:
+
+```bash
+racer-vllm import \
+  --source /root/.cache/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/<revision> \
+  --dest https://<storage-account>.blob.core.windows.net/models/qwen/Qwen3-8B \
+  --azcopy
+```
+
+The manifest lists every file with its size and SHA-256, and the parsed
+safetensors header of each weight file. The command uploads the blobs first
+and writes the manifest last, so a reader never sees a manifest that names a
+missing blob. `--azcopy` uses `azcopy` for the bulk copy.
+
+The model's location in Racer is `racer://<cache>/<bucket>/<prefix>`. For an
+Azure origin the bucket is the container, so the example above is
+`racer://models-hillsboro/models/qwen/Qwen3-8B`.
+
+See `import-job.yaml` in the examples for a Job that imports a snapshot
+already on a node.
+
+## 2. Serve
+
+vLLM reads the model config and tokenizer before it loads weights, so those
+small files must be on local disk. An init container runs
+`racer-vllm materialize`, which copies config, tokenizer, chat template,
+index, other small files, and `racer-manifest.json` into an `emptyDir`. The
+main container then runs `vllm serve` on that directory with
+`--load-format racer`:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qwen3-8b
+  namespace: racer-models
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: qwen3-8b
+  template:
+    metadata:
+      labels:
+        app: qwen3-8b
+        racer.unbounded-cloud.io/client-socket: enabled
+      annotations:
+        racer.unbounded-cloud.io/client-cache: models-hillsboro
+    spec:
+      initContainers:
+        - name: plugin
+          image: <registry>/racer-vllm-plugin:<tag>
+          command: ["cp", "-a", "/opt/racer/python/.", "/plugin/"]
+          volumeMounts:
+            - name: plugin
+              mountPath: /plugin
+        - name: materialize
+          image: <registry>/racer-vllm-plugin:<tag>
+          command:
+            - racer-vllm
+            - materialize
+            - racer://models-hillsboro/models/qwen/Qwen3-8B
+            - /models/Qwen3-8B
+          volumeMounts:
+            - name: models
+              mountPath: /models
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:<vllm-version>
+          env:
+            - name: PYTHONPATH
+              value: /opt/racer/python
+          args:
+            - /models/Qwen3-8B
+            - --load-format
+            - racer
+            - --model-loader-extra-config
+            - '{"uri": "racer://models-hillsboro/models/qwen/Qwen3-8B", "delivery": "auto"}'
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+          volumeMounts:
+            - name: models
+              mountPath: /models
+            - name: plugin
+              mountPath: /opt/racer/python
+              readOnly: true
+      volumes:
+        - name: models
+          emptyDir: {}
+        - name: plugin
+          emptyDir: {}
+```
+
+The admission webhook mounts the client socket into every container,
+including init containers, and sets `RACER_SOCKET`. To limit the mount, add
+`racer.unbounded-cloud.io/client-containers: materialize,vllm`. The
+`vllm/vllm-openai` image's entrypoint is `vllm serve`, so `args` starts with
+the model directory.
+
+With the `racer-vllm` convenience image, drop the `plugin` init container,
+the `plugin` volume, and `PYTHONPATH`, and use that image for both
+`materialize` and `vllm`.
+
+The plugin registers the `racer` load format through vLLM's
+`vllm.general_plugins` entry point. With `PYTHONPATH`, vLLM finds the entry
+point from the package metadata under `/opt/racer/python`.
+
+## 3. Optional: Prepare Sharded Artifacts
+
+With tensor or expert parallelism, a regular checkpoint makes every rank read
+and slice full tensors. `racer-vllm prepare` runs vLLM once, captures each
+rank's weights after loading and before `process_weights_after_loading`, and
+writes them as versioned artifacts:
+
+```bash
+racer-vllm prepare racer://models-hillsboro/models/glm/GLM-5 /tmp/glm-prepare -- \
+  --tensor-parallel-size 8 --enable-expert-parallel
+```
+
+The artifacts go under `sharded/<fingerprint>/` and must be uploaded next to
+the model. The fingerprint covers what changes the per-rank layout: the
+checkpoint manifest, the vLLM version, the parallel layout, and the
+quantization and dtype settings. A loader with a different fingerprint does
+not find matching artifacts. With `sharded: auto` it falls back to the full
+checkpoint; with `sharded: require` it fails.
+
+## 4. Optional: Warm the Cache
+
+`racer-vllm warm` asks the local dataplane to prefetch every weight file and
+keep the pages on this node (local retention). Run it on a node before
+replicas start there, for example from a Job pinned to the node:
+
+```bash
+racer-vllm warm racer://models-hillsboro/models/qwen/Qwen3-8B
+```
+
+`racer-vllm inspect <racer://...>` prints the manifest, the sharded artifacts
+it found, and which files are already cached.
+
+## Settings
+
+Pass these in `--model-loader-extra-config` as one JSON object. All are
+optional.
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `uri` | From `racer-manifest.json` | The `racer://` model location |
+| `sharded` | `auto` | `auto` uses matching `sharded/<fingerprint>/` artifacts when present; `require` fails without them; `off` always reads the full checkpoint |
+| `delivery` | `auto` | `auto` tries GPU delivery, then host; `gpu` fails rather than fall back; `host` never asks for GPU delivery |
+| `staging_bytes` | 256 MiB | Size of each staging buffer |
+| `max_staging_bytes` | 4 GiB | Cap on all staging memory |
+| `concurrency` | `4` | Reads in flight |
+| `clone` | `auto` | Copy each tensor out of staging: `auto` copies only when the tensor would otherwise alias reused staging memory; `always`; `never` |
+| `verify` | `size` | `none`; `size` checks each file's length against the manifest; `full` also checks SHA-256 |
+| `capture_dir` | Unset | Used by `prepare`; leave unset when serving |
+| `socket` | `RACER_SOCKET` | Client socket path |
+
+The settings `use_vmm`, `pattern`, `mode_retry_seconds`, and `sharded_state`
+from earlier releases are gone, and so is `racer-model.json`.
+
+The loader follows vLLM's own weight filters: expert-parallel
+`local_expert_ids`, `secondary_weights`, name prefixes, and the encoder-only
+and unused-weight filters. It reads the file list from the manifest instead of
+probing for part files, and it does not read the full checkpoint again for a
+speculative-decoding draft model.
+
+## Verify the Load
+
+After each load, vLLM logs one `racer: loaded ...` line with the file count,
+bytes, time, throughput, and the number of reads in each delivery mode
+(`gpu`, `host`). On the dataplane, compare before and after a load:
+
+```bash
+kubectl get --raw "/api/v1/namespaces/unbounded-system/pods/<dataplane-pod>:9090/proxy/metrics" \
+  | grep -E 'racer_delivery_bytes_total|racer_gpu_read_requests_total|lookup_(hits|misses)_total'
+```
+
+- `racer_delivery_bytes_total` should grow by about the model size per
+  replica.
+- `racer_gpu_read_requests_total{outcome="gpu"}` counts GPU deliveries.
+- The `racer_*_lookup_hits_total` and `racer_*_lookup_misses_total` series
+  show how many pages came from memory, disk, and peers.
+
+## Troubleshooting
+
+**The load used host delivery.** Check the dataplane log on the GPU node:
 
 ```bash
 kubectl -n unbounded-system logs <dataplane-pod> | grep 'stage=gpu state='
 ```
 
-`state=enabled` means GPU mode is on. `state=disabled` gives the reason.
-`state=standby` means no GPU read has come in yet.
+`state=enabled` means GPU mode is on. `state=disabled` gives the reason, and
+`state=standby` means no GPU read has come in yet. With `delivery: auto` the
+loader falls back to host delivery and logs the reason once. Set
+`delivery: gpu` to make the fallback an error.
 
-To make the dataplane set up the GPUs at startup and fail when it finds none,
-so a broken setup is not silent, set `RACER_ENABLE_GPU` to `true`:
+**Plaintext or sealed.** On a sealed (default) cache, every page is
+encrypted with AES-GCM, and the GPU or CPU decrypts it on the way in. On a
+plaintext cache, pages skip that step and take the plain host-to-device or
+GPUDirect path. Public weights do not need confidentiality, so a plaintext
+cache saves the decrypt work. A cache's mode cannot change after creation:
+create a new cache to switch. Upgrade every dataplane before creating a
+plaintext cache; older dataplanes reject it. See
+[ClusterCache]({{< relref "reference/racer" >}}#clustercache).
 
-```bash
-kubectl -n unbounded-system patch configmap racer-settings \
-  --type merge -p '{"data":{"RACER_ENABLE_GPU":"true"}}'
-```
+**No RDMA.** Without RDMA, pages from peers arrive over HTTP and are not
+kept on the reading node, so every replica start on a node fetches them
+again. Use `racer-vllm warm`, which prefetches with local retention, or let
+the loader read with retention. Retained pages are limited by
+`RACER_RETAINED_SEGMENT_PERCENT`.
 
-The image also has NVIDIA's cuFile library and a `cufile.json` for GPUDirect
-Storage. Without GPUDirect Storage on the host, disk reads go through host
-memory.
+**Capacity.** A model larger than a node's cache share is evicted while it
+loads. Raise the cache's `spec.priority`, add capacity, or use raw NVMe
+devices (`racer.unbounded-cloud.io/block-devices`). Check
+`racer_effective_payload_bytes` and `/debug/hardware` on the dataplane. See
+[Raw-device storage]({{< relref "reference/racer" >}}#raw-device-storage).
 
-The dataplane gets the NVIDIA driver libraries without requesting a GPU. This
-is on by default (`RACER_NVIDIA: env` in `racer-settings`). See
-[GPU reads]({{< relref "reference/racer" >}}#gpu-reads).
+**The model changed at the origin.** The loader reads each file at the ETag
+recorded when `materialize` ran. If the origin changed since, the load fails;
+restart the pod so `materialize` runs again.
 
-## 2. Deploy vLLM
+## Compatibility
 
-Add the client socket label and the cache annotation to the vLLM pod:
+- The plugin is pure Python. It needs `racer-client`, which needs nothing
+  else, so it works with any vLLM image whose Python can import it.
+- It targets vLLM 0.30 and 0.33. It hooks the loader interface that vLLM
+  exposes for custom load formats; other versions may work but are not
+  tested.
 
-```yaml
-apiVersion: v1
-kind: Pod
-metadata:
-  name: vllm
-  labels:
-    racer.unbounded-cloud.io/client-socket: enabled
-  annotations:
-    racer.unbounded-cloud.io/client-cache: models
-spec:
-  containers:
-    - name: vllm
-      image: <registry>/racer-vllm:<tag>
-      command:
-        - sh
-        - -c
-        - |
-          racer-vllm-fetch racer://models/llama/Llama-3.1-8B-Instruct /models/llama &&
-          exec vllm serve /models/llama --load-format racer
-      volumeMounts:
-        - name: model-config
-          mountPath: /models
-      resources:
-        limits:
-          nvidia.com/gpu: 1
-  volumes:
-    - name: model-config
-      emptyDir: {}
-```
+## Install Without an Image
 
-The webhook mounts `/run/racer/models/client` read-only into the container and
-sets `RACER_SOCKET` to the socket in it. To limit the mount to some containers,
-add `racer.unbounded-cloud.io/client-containers: vllm`. Init containers get
-the mount too, so `racer-vllm-fetch` can run in an init container that writes
-to the shared `emptyDir`.
-
-## 3. Install racer-vllm
-
-Release and nightly builds publish the image `racer-vllm` next to the other
-images, at the same registry and tag. It is `vllm/vllm-openai:v0.25.1` with
-both packages installed, so it needs no changes.
-
-To use another vLLM image, install both Python packages into it. They are not
-on PyPI. GitHub releases include their wheels and sdists (`racer_client-*` and
-`racer_vllm-*`) as assets. Releases made before the packages were added do not.
-Set `VERSION` to a release tag and point pip at it:
+The packages are not on PyPI. GitHub releases include their wheels and sdists
+(`racer_client-*` and `racer_vllm-*`):
 
 ```bash
 VERSION=vX.Y.Z
@@ -114,24 +292,8 @@ pip install --no-index \
   racer-vllm
 ```
 
-`--find-links` reads the asset links from the release page. `--no-index` keeps
-pip off PyPI, so a package there with the same name cannot be installed by
-mistake. This works because `racer-vllm` needs only `racer-client`, and
-`racer-client` needs nothing else.
-
-You can also install the wheels by URL. The file names carry the package
-version, not the release tag:
-
-```bash
-pip install --no-index \
-  "https://github.com/Azure/unbounded/releases/download/${VERSION}/racer_client-0.2.0-py3-none-any.whl" \
-  "https://github.com/Azure/unbounded/releases/download/${VERSION}/racer_vllm-0.2.0-py3-none-any.whl"
-```
-
-To build an image without network access, download the wheels first and use
-`--find-links <dir>`.
-
-From a checkout:
+`--no-index` keeps pip off PyPI, so a package there with the same name cannot
+be installed by mistake. From a checkout:
 
 ```bash
 pip install ./clients/python/racer ./clients/python/racer-vllm
@@ -139,44 +301,3 @@ pip install ./clients/python/racer ./clients/python/racer-vllm
 
 `make racer-python-dist` builds wheels for both packages into
 `tmp/racer-python-dist`.
-
-`racer-vllm` registers the `racer` load format with vLLM through a plugin entry
-point. No other code change is needed.
-
-## 4. Run
-
-vLLM reads the model config and tokenizer before it loads weights, so loading
-takes two steps:
-
-1. `racer-vllm-fetch racer://<cache>/<bucket>/<prefix> <dir>` copies
-   `config.json`, the tokenizer files, and the safetensors index into `<dir>`.
-   It also writes `racer-model.json`, which records the `racer://` location and
-   the ETag of each fetched file and each weight file.
-   The prefix is the directory that holds `model.safetensors.index.json` and
-   the safetensors files.
-2. `vllm serve <dir> --load-format racer` reads the weights through Racer, at
-   the ETags in `racer-model.json`. If the model changed at the origin since
-   the fetch, or changes during the load, the load fails with
-   `ModelChangedError`. It also fails if the checkpoint layout changed, for
-   example an index was added after a single-file fetch, because a weight file
-   it would read has no ETag in `racer-model.json`. Run `racer-vllm-fetch`
-   again to pick up the new version.
-
-After each load, vLLM's log shows one `racer: loaded ...` line with the file
-count, bytes, time, throughput, and the number of reads in each delivery mode
-(`gpu`, `host`, `stream`). When the dataplane refuses a mode, the client logs a
-warning with the reason once, then retries the mode after
-`mode_retry_seconds` (default 300) or when the dataplane restarts.
-
-With tensor parallelism, each rank reads every weight file of a regular
-checkpoint. Ranks on one node share the dataplane, so repeat reads come from
-its cache, not the origin. To have each rank read only its own files, save a
-vLLM `sharded_state` checkpoint and pass
-`--model-loader-extra-config '{"sharded_state": true}'`. `racer-vllm-fetch`
-records every rank's files; pass `--pattern` if the checkpoint uses a custom
-file name pattern.
-
-See the `racer-vllm` README for loader options such as `staging_bytes`.
-
-The first load fills the cache from the origin. Later loads on any node read
-from the cache.

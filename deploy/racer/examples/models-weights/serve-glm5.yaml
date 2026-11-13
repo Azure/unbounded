@@ -1,0 +1,82 @@
+# Serves GLM-5 on one 8-GPU node with tensor and expert parallelism, using
+# prepared sharded artifacts when they match. Replace every <placeholder>;
+# see README.md.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: glm5
+  namespace: racer-models
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: glm5
+  template:
+    metadata:
+      labels:
+        app: glm5
+        racer.unbounded-cloud.io/client-socket: enabled
+      annotations:
+        racer.unbounded-cloud.io/client-cache: models-hillsboro
+    spec:
+      initContainers:
+        - name: plugin
+          image: <registry>/racer-vllm-plugin:<tag>
+          command: ["cp", "-a", "/opt/racer/python/.", "/plugin/"]
+          volumeMounts:
+            - name: plugin
+              mountPath: /plugin
+        - name: materialize
+          image: <registry>/racer-vllm-plugin:<tag>
+          command:
+            - racer-vllm
+            - materialize
+            - racer://models-hillsboro/models/<glm5-prefix>
+            - /models/GLM-5
+          volumeMounts:
+            - name: models
+              mountPath: /models
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:<vllm-version>
+          env:
+            - name: PYTHONPATH
+              value: /opt/racer/python
+          args:
+            - /models/GLM-5
+            - --served-model-name
+            - glm5
+            - --tensor-parallel-size
+            - "8"
+            - --enable-expert-parallel
+            - --load-format
+            - racer
+            - --model-loader-extra-config
+            - '{"uri": "racer://models-hillsboro/models/<glm5-prefix>", "sharded": "auto", "delivery": "auto", "max_staging_bytes": 4294967296}'
+          ports:
+            - name: http
+              containerPort: 8000
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 30
+          resources:
+            limits:
+              nvidia.com/gpu: 8
+          volumeMounts:
+            - name: models
+              mountPath: /models
+            - name: plugin
+              mountPath: /opt/racer/python
+              readOnly: true
+            - name: dshm
+              mountPath: /dev/shm
+      volumes:
+        - name: models
+          emptyDir: {}
+        - name: plugin
+          emptyDir: {}
+        - name: dshm
+          emptyDir:
+            medium: Memory
