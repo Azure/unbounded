@@ -56,15 +56,34 @@ def _json_safe(v):
         return repr(v)
 
 
-def parallel_info() -> dict:
-    """tp, pp, ep sizes, enable_expert_parallel, and this rank, from vLLM (best effort).
+def _dp_size(d, parallel_config) -> int:
+    get = getattr(d, "get_dp_group", None)
+    if get is not None:
+        try:
+            return int(get().world_size)
+        except Exception:
+            pass
+    return int(getattr(parallel_config, "data_parallel_size", 1) or 1)
+
+
+def parallel_info(parallel_config=None) -> dict:
+    """tp, pp, ep, dp sizes, enable_expert_parallel, and this rank, from vLLM (best effort).
+
+    dp is not part of the fingerprint: artifacts are laid out per tensor and
+    pipeline rank, so every data parallel replica loads the same ones.
 
     rank and world_size are None when the layout cannot be read, so callers
     never mistake an unknown rank for rank 0.
     """
-    out = {"tp": 1, "pp": 1, "ep": 1, "enable_expert_parallel": False, "rank": None, "world_size": None}
+    out = {"tp": 1, "pp": 1, "ep": 1, "dp": 1, "enable_expert_parallel": False, "rank": None, "world_size": None}
     try:
         from vllm import distributed as d
+    except Exception as exc:
+        log.debug("racer: parallel info unavailable: %s", exc)
+        out["dp"] = _dp_size(None, parallel_config)
+        return out
+    out["dp"] = _dp_size(d, parallel_config)
+    try:
 
         tp = d.get_tensor_model_parallel_world_size()
         pp = d.get_pp_group().world_size

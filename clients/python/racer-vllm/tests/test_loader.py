@@ -439,3 +439,19 @@ def test_parallel_info_reports_an_unknown_rank(monkeypatch):
     par = sharded.parallel_info()
     assert par["rank"] is None and par["world_size"] is None
     assert sharded.rank_problem(par) and sharded.rank_problem({"rank": 2, "world_size": 2})
+
+
+@pytest.mark.parametrize("source", ["group", "config"])
+def test_capture_refuses_data_parallelism(monkeypatch, server, torch, tmp_path, source):
+    import sys
+
+    u, files, m, d = materialized(server, tmp_path)
+    ld = make_loader(monkeypatch, server, capture_dir=str(tmp_path / "cap"))
+    cfg = model_config(d)
+    if source == "group":
+        sys.modules["vllm.distributed"].get_dp_group = lambda: types.SimpleNamespace(world_size=2)
+    else:
+        cfg.parallel_config = types.SimpleNamespace(data_parallel_size=2)
+    with pytest.raises(RuntimeError, match="data parallel size is 2"):
+        ld.load_weights(Model(model_state(STATE)), cfg)
+    assert not (tmp_path / "cap" / "sharded").exists()

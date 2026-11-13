@@ -187,8 +187,30 @@ def publish_captured(store, capture_dir: str, vllm_version: str = "", out=print)
     return entries
 
 
+def _data_parallel_size(vllm_args: list) -> int:
+    """The --data-parallel-size (-dp) in vllm_args, or 1."""
+    size = "1"
+    for i, a in enumerate(vllm_args):
+        for flag in ("--data-parallel-size", "-dp"):
+            if a == flag and i + 1 < len(vllm_args):
+                size = vllm_args[i + 1]
+            elif a.startswith(flag + "="):
+                size = a.split("=", 1)[1]
+    try:
+        return int(size)
+    except ValueError:
+        raise CommandError(f"--data-parallel-size {size!r} is not an integer") from None
+
+
 def prepare(uri: ModelURI, dest: str, workdir: str, vllm_args: list, *, socket_path=None, role="target", runner=None):
     from .store import open_store
+
+    dp = _data_parallel_size(vllm_args)
+    if dp > 1:
+        raise CommandError(
+            f"racer-vllm prepare does not support --data-parallel-size {dp}: sharded artifacts are per tensor and "
+            "pipeline rank and every replica loads the same ones, so capture with --data-parallel-size 1"
+        )
 
     store = open_store(dest)  # fail on a bad destination before loading anything
     model_dir = os.path.join(workdir, "model")
