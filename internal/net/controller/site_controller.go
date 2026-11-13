@@ -40,6 +40,7 @@ import (
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 	"github.com/Azure/unbounded/internal/net/allocator"
+	"github.com/Azure/unbounded/internal/net/azurepodcidr"
 )
 
 const (
@@ -115,8 +116,9 @@ type assignmentAllocator struct {
 
 // SiteController manages site labeling and pod CIDR assignment for nodes.
 type SiteController struct {
-	clientset     kubernetes.Interface
-	dynamicClient dynamic.Interface
+	clientset            kubernetes.Interface
+	dynamicClient        dynamic.Interface
+	azurePodCIDRInformer cache.SharedIndexInformer
 
 	nodeLister corev1listers.NodeLister
 	nodeSynced cache.InformerSynced
@@ -251,7 +253,13 @@ func NewSiteController(
 
 	nodeInformer := nodeInformerFactory.Core().V1().Nodes()
 
+	azureInformer, err := azurepodcidr.InformerIfAvailable(clientset.Discovery(), dynamicInformerFactory)
+	if err != nil {
+		return nil, err
+	}
+
 	sc := &SiteController{
+		azurePodCIDRInformer: azureInformer,
 		clientset:            clientset,
 		dynamicClient:        dynamicClient,
 		nodeLister:           nodeInformer.Lister(),
@@ -267,6 +275,16 @@ func NewSiteController(
 		loggedNoSiteNodes:    make(map[string]struct{}),
 		sliceDirtySites:      make(map[string]struct{}),
 		ready:                make(chan struct{}),
+	}
+
+	if azureInformer != nil {
+		if _, err := azureInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+			AddFunc:    sc.handleAzurePodCIDRChange,
+			UpdateFunc: func(_, current any) { sc.handleAzurePodCIDRChange(current) },
+			DeleteFunc: sc.handleAzurePodCIDRChange,
+		}); err != nil {
+			return nil, fmt.Errorf("register Azure PodCIDR events: %w", err)
+		}
 	}
 
 	// Set up event handlers for nodes
@@ -854,6 +872,10 @@ func (sc *SiteController) Run(ctx context.Context, workers int) error {
 	defer sc.workqueue.ShutDown()
 
 	klog.Info("Starting site controller")
+
+	if sc.azurePodCIDRInformer != nil && !cache.WaitForCacheSync(ctx.Done(), sc.azurePodCIDRInformer.HasSynced) {
+		return fmt.Errorf("failed to sync Azure PodCIDR cache")
+	}
 
 	// Wait for caches to sync
 	klog.Info("Waiting for site controller informer caches to sync")
@@ -1779,9 +1801,14 @@ func normalizeValue(v interface{}) interface{} {
 
 // buildNodeInfo constructs a NodeInfo struct from a Node object
 func (sc *SiteController) buildNodeInfo(node *corev1.Node) unboundednetv1alpha1.NodeInfo {
+	cidrs, err := azurepodcidr.FromCache(node, sc.azurePodCIDRInformer)
+	if err != nil {
+		klog.Errorf("Read PodCIDRs for node %s: %v", node.Name, err)
+	}
+
 	info := unboundednetv1alpha1.NodeInfo{
 		Name:     node.Name,
-		PodCIDRs: node.Spec.PodCIDRs,
+		PodCIDRs: cidrs,
 	}
 
 	// Get WireGuard public key from annotation

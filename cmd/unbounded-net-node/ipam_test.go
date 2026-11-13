@@ -85,7 +85,7 @@ func TestDelegatedIPAMWaitsForStartupAssignment(t *testing.T) {
 	go func() {
 		defer close(done)
 
-		acquireDelegatedIPAMAssignment(ctx, client, &config{NodeName: "node-a", cniRetryInterval: time.Millisecond}, health)
+		acquireDelegatedIPAMAssignment(ctx, client, nil, &config{NodeName: "node-a", cniRetryInterval: time.Millisecond}, health)
 	}()
 
 	if _, err := health.getIPAMConfig(); err == nil {

@@ -28,6 +28,7 @@ import (
 	"k8s.io/klog/v2"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/net/azurepodcidr"
 	configpkg "github.com/Azure/unbounded/internal/net/config"
 	"github.com/Azure/unbounded/internal/net/ipam"
 	"github.com/Azure/unbounded/internal/net/metrics"
@@ -956,13 +957,17 @@ func run(cfg *config) (resultErr error) {
 			klog.Fatalf("Failed to get node: %v", err)
 		}
 
-		nodePodCIDRs = node.Spec.PodCIDRs
+		nodePodCIDRs, err = azurepodcidr.Get(ctx, dynamicClient, node)
+		if err != nil {
+			klog.Warningf("Existing CNI assignment pending for node %s: %v", node.Name, err)
+		}
+
 		healthState.setCNIAssignment(nodePodCIDRs)
 
 		if _, err := ipam.ConfigFromCIDRs(nodePodCIDRs); err == nil {
 			healthState.setVerifiedIPAMAssignment(nodePodCIDRs)
 		} else {
-			go acquireDelegatedIPAMAssignment(ctx, clientset, cfg, healthState)
+			go acquireDelegatedIPAMAssignment(ctx, clientset, dynamicClient, cfg, healthState)
 		}
 	}
 

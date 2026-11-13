@@ -15,9 +15,11 @@ import (
 
 	"github.com/spf13/pflag"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
 
+	"github.com/Azure/unbounded/internal/net/azurepodcidr"
 	"github.com/Azure/unbounded/internal/net/ipam"
 	ipamproto "github.com/Azure/unbounded/internal/net/ipam/proto"
 	unboundednetnetlink "github.com/Azure/unbounded/internal/net/netlink"
@@ -90,14 +92,20 @@ func (h *nodeHealthState) getIPAMConfig() (*ipamproto.Config, error) {
 	return ipam.ConfigFromCIDRs(h.verifiedIPAMCIDRs)
 }
 
-func acquireDelegatedIPAMAssignment(ctx context.Context, client kubernetes.Interface, cfg *config, health *nodeHealthState) {
+func acquireDelegatedIPAMAssignment(ctx context.Context, client kubernetes.Interface, dynamicClient dynamic.Interface, cfg *config, health *nodeHealthState) {
 	for {
 		node, err := client.CoreV1().Nodes().Get(ctx, cfg.NodeName, metav1.GetOptions{})
 		if err == nil {
-			_, err = ipam.ConfigFromCIDRs(node.Spec.PodCIDRs)
+			var cidrs []string
+
+			cidrs, err = azurepodcidr.Get(ctx, dynamicClient, node)
 			if err == nil {
-				health.setVerifiedIPAMAssignment(node.Spec.PodCIDRs)
-				klog.Infof("Verified delegated IPAM PodCIDRs for node %s: %v", cfg.NodeName, node.Spec.PodCIDRs)
+				_, err = ipam.ConfigFromCIDRs(cidrs)
+			}
+
+			if err == nil {
+				health.setVerifiedIPAMAssignment(cidrs)
+				klog.Infof("Verified delegated IPAM PodCIDRs for node %s: %v", cfg.NodeName, cidrs)
 
 				return
 			}
