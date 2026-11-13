@@ -13,12 +13,25 @@ Example manifests are in
 
 | Command | What it does |
 |---------|--------------|
-| `racer-vllm materialize <racer://cache/bucket/prefix> <dest-dir>` | Copies config, tokenizer, chat template, index, other small files, and `racer-manifest.json` into a directory vLLM can serve |
-| `racer-vllm import --source <snapshot-dir> --dest <blob-prefix> [--azcopy]` | Builds `racer-manifest.json` (sizes, SHA-256, safetensors headers), uploads the blobs, and writes the manifest last |
-| `racer-vllm prepare <racer://...> <out-dir> -- <vllm serve args>` | Captures per-rank weights after loading and before `process_weights_after_loading` into `sharded/<fingerprint>/` |
-| `racer-vllm warm <racer://...>` | Prefetches every weight file with local retention |
-| `racer-vllm inspect <racer://...>` | Prints the manifest and sharded artifacts |
-| `racer-vllm-fetch` | Deprecated alias of `materialize` |
+| `racer-vllm materialize <racer://cache/bucket/prefix> <dir>` | Copies config, tokenizer, chat template, index, other small files, and `racer-manifest.json` into a directory vLLM can serve, and records each file's ETag in `racer-source.json` |
+| `racer-vllm import --source <snapshot-dir> --dest <container-url>[/<prefix>]` | Hashes every file of a Hugging Face snapshot, uploads the blobs that changed, and writes `racer-manifest.json` last. Needs the `azure` extra |
+| `racer-vllm prepare <racer://...> --dest <container-url>[/<prefix>] [--workdir <dir>] -- <vLLM engine args>` | Loads the model once with vLLM, captures each rank's weights after loading and before `process_weights_after_loading`, uploads them under `sharded/<fingerprint>/`, and writes `racer-sharded-index.json` last |
+| `racer-vllm warm <racer://...>` | Prefetches every weight file into the cache and waits for the prefetch to finish |
+| `racer-vllm inspect <racer://...>` | Prints the manifest summary, the sharded artifacts, and whether each file is served at its manifest size |
+| `racer-vllm-fetch <racer://...> <dir>` | Deprecated alias of `materialize` |
+
+`racer-vllm import` and `prepare` upload with the Azure SDK and
+`DefaultAzureCredential`, which picks up workload identity from
+`AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, and `AZURE_FEDERATED_TOKEN_FILE`.
+Install the extra for them:
+
+```
+pip install './clients/python/racer-vllm[azure]'
+```
+
+A `file:///path` destination writes to a local directory instead, which
+needs no extra. Only `prepare` imports vLLM; the other commands run without
+vLLM or torch.
 
 Serve with:
 
@@ -31,7 +44,7 @@ vllm serve /models/<name> --load-format racer \
 
 | Key | Default | Meaning |
 |-----|---------|---------|
-| `uri` | From `racer-manifest.json` | The `racer://` model location |
+| `uri` | From `racer-source.json` | The `racer://` model location |
 | `sharded` | `auto` | `auto`, `require`, or `off` for `sharded/<fingerprint>/` artifacts |
 | `delivery` | `auto` | `auto`, `gpu`, or `host` |
 | `staging_bytes` | 256 MiB | Size of each staging buffer |
@@ -41,6 +54,14 @@ vllm serve /models/<name> --load-format racer \
 | `verify` | `size` | `none`, `size`, or `full` |
 | `capture_dir` | Unset | Used by `prepare` |
 | `socket` | `RACER_SOCKET` | Client socket path |
+
+## Tests
+
+```
+cd clients/python/racer-vllm
+PYTHONPATH=../racer/src:src pytest -q
+pytest -q -m vllm   # with vLLM installed: checks the loader against its real DefaultModelLoader
+```
 
 ## Build
 
