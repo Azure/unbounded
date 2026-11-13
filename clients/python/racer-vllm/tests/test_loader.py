@@ -669,3 +669,26 @@ def test_mm_encoder_only_filter_keeps_the_index_subdirectory(monkeypatch, server
                                   ["a.safetensors", "b.safetensors"])
     assert got == ["a.safetensors"]
     assert seen == ["sub/model.safetensors.index.json"]
+
+
+def test_verify_full_reads_gaps_in_bounded_chunks(monkeypatch, server):
+    import hashlib
+
+    data = bytes(range(256)) * 80  # 20480 bytes, all of it a gap
+    calls = []
+
+    class Client:
+        def read(self, req, off, n, if_match=None):
+            calls.append((off, n, if_match))
+            return data[off : off + n]
+
+    ld = make_loader(monkeypatch, server, verify="full")
+    rd = types.SimpleNamespace(mode=reader.HOST, stats=reader.new_stats())
+    sf = types.SimpleNamespace(name="f", size=len(data), header_bytes=0, sha256=hashlib.sha256(data).hexdigest())
+    h = ld._full_hasher(Client(), "req", sf, [], '"v1"', rd)
+    assert h.gaps
+    h.finish()
+    assert max(n for _, n, _ in calls) <= ld.racer.staging_bytes
+    assert all(etag == '"v1"' for _, _, etag in calls)
+    assert rd.stats["reads"][reader.HOST] == len(calls) == 5
+    assert rd.stats["bytes"][reader.HOST] == len(data)
