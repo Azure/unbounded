@@ -1339,7 +1339,8 @@ func TestScriptInvocationWrapperUsesApprovedLanguage(t *testing.T) {
 
 	python := scriptInvocationWrapper(signalv1.ScriptLanguagePython, "check.py", testStageDigest("script"))
 	if !strings.Contains(python, `python3 "$script"`) ||
-		!strings.Contains(python, `measurements.json`) {
+		!strings.Contains(python, `measurements.json`) ||
+		!strings.Contains(python, `except (OSError, json.JSONDecodeError):`) {
 		t.Fatalf("python wrapper = %q", python)
 	}
 

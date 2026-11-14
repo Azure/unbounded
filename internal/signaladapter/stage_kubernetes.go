@@ -2503,7 +2503,7 @@ for _ in range(30):
             break
     except urllib.error.HTTPError as error:
         raise SystemExit("metric contract violation") from error
-    except OSError:
+    except (OSError, json.JSONDecodeError):
         time.sleep(1)
 if final is None:
     raise SystemExit("metric telemetry timeout")
