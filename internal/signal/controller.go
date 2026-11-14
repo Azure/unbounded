@@ -5324,15 +5324,12 @@ func mergeResolvedQualificationFingerprint(
 		return errors.New("driver version disagrees across qualification stages")
 	}
 
-	if current.Start.GPUInventoryDigest != "" &&
-		current.Start.GPUInventoryDigest != observed.Start.GPUInventoryDigest {
-		return errors.New("GPU inventory digest disagrees across qualification stages")
-	}
-
 	current.Start.DriverVersion = observed.Start.DriverVersion
 	current.End.DriverVersion = observed.End.DriverVersion
-	current.Start.GPUInventoryDigest = observed.Start.GPUInventoryDigest
-	current.End.GPUInventoryDigest = observed.End.GPUInventoryDigest
+	if current.Start.GPUInventoryDigest == "" {
+		current.Start.GPUInventoryDigest = observed.Start.GPUInventoryDigest
+		current.End.GPUInventoryDigest = observed.End.GPUInventoryDigest
+	}
 
 	return nil
 }

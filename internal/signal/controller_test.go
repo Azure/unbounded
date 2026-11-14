@@ -848,6 +848,42 @@ func TestResolvedQualificationEvidenceHandlesNonPassingStages(t *testing.T) {
 	})
 }
 
+func TestMergeResolvedQualificationFingerprintAllowsDifferentVisibleGPUInventory(t *testing.T) {
+	t.Parallel()
+
+	fullInventory := "sha256:" + strings.Repeat("1", 64)
+	subsetInventory := "sha256:" + strings.Repeat("2", 64)
+	current := signalv1.ParticipantEvidenceIdentity{
+		Start: signalv1.NodeFingerprint{
+			DriverVersion:      "590.48.01",
+			GPUInventoryDigest: fullInventory,
+		},
+		End: signalv1.NodeFingerprint{
+			DriverVersion:      "590.48.01",
+			GPUInventoryDigest: fullInventory,
+		},
+	}
+	observed := signalv1.ParticipantEvidenceIdentity{
+		Start: signalv1.NodeFingerprint{
+			DriverVersion:      "590.48.01",
+			GPUInventoryDigest: subsetInventory,
+		},
+		End: signalv1.NodeFingerprint{
+			DriverVersion:      "590.48.01",
+			GPUInventoryDigest: subsetInventory,
+		},
+	}
+
+	if err := mergeResolvedQualificationFingerprint(&current, observed); err != nil {
+		t.Fatalf("mergeResolvedQualificationFingerprint() error = %v", err)
+	}
+
+	if current.Start.GPUInventoryDigest != fullInventory ||
+		current.End.GPUInventoryDigest != fullInventory {
+		t.Fatalf("participant inventory digest = %#v, want retained full inventory", current)
+	}
+}
+
 func TestValidateStageEvidenceSummaryRejectsOmittedFailedAssertion(t *testing.T) {
 	t.Parallel()
 
