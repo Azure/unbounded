@@ -99,7 +99,7 @@ func newRenderCommand() *cobra.Command {
 		&options.testsOnly,
 		"tests-only",
 		false,
-		"render only CertificationTests while bootstrapping a plan that defines a Suite",
+		"render WorkflowTemplates and CertificationTests while bootstrapping a plan that defines a Suite",
 	)
 	cmd.MarkFlagsMutuallyExclusive("bindings", "tests-only")
 	cmd.MarkFlagsMutuallyExclusive("inputs", "tests-only")

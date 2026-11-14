@@ -38,17 +38,17 @@ spec:
   tests:
   - name: gpu-identity
     displayName: GPU identity
-    artifacts:
-    - name: runner.py
-      path: scripts/runner.py
-    - name: gpu-identity.sh
-      path: scripts/gpu-identity.sh
+    artifact:
+      name: gpu-identity.sh
+      path: scripts/project-signal-entrypoint.sh
+      files:
+      - name: gpu-identity-source.sh
+        path: scripts/gpu-identity.sh
     driver:
       type: Script
       script:
         language: Shell
         runtime: base
-        artifact: gpu-identity.sh
         resources:
           requests:
             nvidia.com/gpu: "8"
@@ -83,24 +83,37 @@ spec:
         - stage: gpu-identity
 ```
 
-Use singular `artifact` for a one-file Test. Use `artifacts` when the selected
-entrypoint needs supporting files. Every file is embedded with its own digest,
-and a multi-artifact Script or WorkflowTemplate driver must select its
-entrypoint by artifact name. Script Pods materialize every approved artifact,
-but execute only the selected entrypoint. Container drivers do not accept
-artifacts.
+Use singular `artifact` for one selected entrypoint. Its optional `files` list
+creates one compressed, digest-verified bundle from readable repository files.
+The entrypoint can unpack those files at runtime while Script and
+WorkflowTemplate drivers continue to approve and transport one immutable
+artifact. Use plural `artifacts` only when the runtime needs independently
+materialized files; a multi-artifact driver must select its entrypoint by
+artifact name. Script Pods materialize every approved artifact, but execute
+only the selected entrypoint. Container drivers do not accept artifacts.
 
 Supported drivers are:
 
 - `Script`, with one selected artifact, `Shell` or `Python` language, and a
   named runtime.
 - `Container`, with a named runtime plus optional command and arguments.
-- `WorkflowTemplate`, with a template name, canonical SHA-256 digest, and an
-  optional artifact passed through the standard script parameters.
+- `WorkflowTemplate`, with either a repository `path` or a preinstalled
+  template `name` and canonical SHA-256 `digest`, plus an optional artifact
+  passed through the standard script parameters. A source path must contain
+  one `argoproj.io/v1alpha1` `WorkflowTemplate` without a namespace. The
+  compiler emits it before the generated Test and computes the digest from its
+  canonical `spec`.
 
 When omitted, topology defaults to one participant and metrics default to the
 required `scriptResult` status metric. Runtime images and WorkflowTemplate
 digests must be immutable SHA-256 references.
+
+Keep the experiment contract in the plan: the driver selects the script,
+container, or WorkflowTemplate; `metrics` declares the collected result
+schema; and Suite `assertions` define pass/fail policy. Runtimes write canonical
+results under `/results`, the Signal adapter collects them into evidence, and
+the dashboard reads the resulting Run and stage verdicts. Environment-specific
+values belong in `CertificationPlanInputs`, not generated manifests.
 
 ## Ordered Suite workflow
 
@@ -110,7 +123,7 @@ been applied and approved, so Suite compilation is intentionally two-phase.
 This keeps the source workflow repeatable without weakening the qualification
 trust boundary.
 
-First render and apply only the Tests:
+First render and apply the source WorkflowTemplates and Tests:
 
 ```bash
 kubectl unbounded signal render \

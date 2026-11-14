@@ -4,15 +4,21 @@
 package signalplan
 
 import (
+	"bytes"
+	"compress/gzip"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/yaml"
 
 	signalv1alpha1 "github.com/Azure/unbounded/api/signal/v1alpha1"
@@ -653,6 +659,152 @@ spec:
 	}
 }
 
+func TestCompileFileBundlesArtifactFiles(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	entrypoint := []byte("#!/bin/sh\nexit 0\n")
+	script := []byte("#!/bin/bash\nprintf 'ok\\n'\n")
+
+	require.NoError(t, os.WriteFile(filepath.Join(root, "entrypoint.sh"), entrypoint, 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "check.sh"), script, 0o600))
+
+	plan := fmt.Sprintf(`apiVersion: signal.unbounded-cloud.io/v1alpha1
+kind: CertificationPlan
+metadata:
+  name: qualification
+spec:
+  owner: qualification-team
+  version: source-123
+  runtimes:
+    base: %s
+  tests:
+  - name: script-check
+    displayName: Script check
+    artifact:
+      name: bundled-check.sh
+      path: entrypoint.sh
+      files:
+      - name: source.sh
+        path: check.sh
+    driver:
+      type: Script
+      script:
+        language: Shell
+        runtime: base
+`, testRuntimeA)
+	planPath := filepath.Join(root, "certification-plan.yaml")
+	require.NoError(t, os.WriteFile(planPath, []byte(plan), 0o600))
+
+	rendered, err := CompileFile(planPath)
+	require.NoError(t, err)
+
+	var test signalv1alpha1.CertificationTest
+	require.NoError(t, yaml.Unmarshal(rendered, &test))
+	require.Len(t, test.Spec.Artifacts, 1)
+
+	parts := strings.Split(test.Spec.Artifacts[0].Content, artifactFilesMarker)
+	require.Len(t, parts, 2)
+	require.Equal(t, string(entrypoint), parts[0])
+
+	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(parts[1]))
+	require.NoError(t, err)
+
+	reader, err := gzip.NewReader(bytes.NewReader(decoded))
+	require.NoError(t, err)
+	decoded, err = io.ReadAll(reader)
+	require.NoError(t, err)
+	require.NoError(t, reader.Close())
+
+	var files []signalv1alpha1.TestArtifact
+	require.NoError(t, json.Unmarshal(decoded, &files))
+
+	sum := sha256.Sum256(script)
+	require.Equal(t, []signalv1alpha1.TestArtifact{{
+		Name:    "source.sh",
+		Content: string(script),
+		Digest:  "sha256:" + hex.EncodeToString(sum[:]),
+	}}, files)
+}
+
+func TestCompileFileRejectsInvalidArtifactFiles(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		files     string
+		wantError string
+	}{
+		{
+			name: "duplicate name",
+			files: `      files:
+      - name: source.sh
+        path: first.sh
+      - name: source.sh
+        path: second.sh
+`,
+			wantError: `files[1].name "source.sh" is duplicated`,
+		},
+		{
+			name: "path escape",
+			files: `      files:
+      - path: ../outside.sh
+`,
+			wantError: `files[0].path "../outside.sh" escapes spec.sourceRoot`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			parent := t.TempDir()
+			root := filepath.Join(parent, "plan")
+			require.NoError(t, os.Mkdir(root, 0o755))
+
+			for _, name := range []string{"entrypoint.sh", "first.sh", "second.sh"} {
+				require.NoError(t, os.WriteFile(
+					filepath.Join(root, name),
+					[]byte("#!/bin/sh\n"),
+					0o600,
+				))
+			}
+
+			require.NoError(t, os.WriteFile(
+				filepath.Join(parent, "outside.sh"),
+				[]byte("#!/bin/sh\n"),
+				0o600,
+			))
+
+			plan := fmt.Sprintf(`apiVersion: signal.unbounded-cloud.io/v1alpha1
+kind: CertificationPlan
+metadata:
+  name: qualification
+spec:
+  owner: qualification-team
+  version: source-123
+  runtimes:
+    base: %s
+  tests:
+  - name: script-check
+    displayName: Script check
+    artifact:
+      path: entrypoint.sh
+%s    driver:
+      type: Script
+      script:
+        language: Shell
+        runtime: base
+`, testRuntimeA, tt.files)
+			planPath := filepath.Join(root, "certification-plan.yaml")
+			require.NoError(t, os.WriteFile(planPath, []byte(plan), 0o600))
+
+			_, err := CompileFile(planPath)
+			require.ErrorContains(t, err, tt.wantError)
+		})
+	}
+}
+
 func TestCompileFileRejectsOversizedArtifact(t *testing.T) {
 	t.Parallel()
 
@@ -689,6 +841,272 @@ spec:
 
 	_, err := CompileFile(planPath)
 	require.ErrorContains(t, err, fmt.Sprintf("exceeds the %d-byte limit", signalv1alpha1.MaxTestArtifactBytes))
+}
+
+func TestCompileTestsFileIncludesSourceWorkflowTemplate(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	require.NoError(t, os.Mkdir(filepath.Join(root, "scripts"), 0o755))
+	require.NoError(t, os.Mkdir(filepath.Join(root, "workflows"), 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(root, "scripts", "check.sh"),
+		[]byte("#!/bin/sh\nprintf ok\n"),
+		0o600,
+	))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(root, "workflows", "check.yaml"),
+		[]byte(`apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: source-workflow
+spec:
+  entrypoint: main
+  templates:
+  - name: main
+    container:
+      image: example.invalid/check@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      command: [/bin/true]
+`),
+		0o600,
+	))
+
+	plan := `apiVersion: signal.unbounded-cloud.io/v1alpha1
+kind: CertificationPlan
+metadata:
+  name: source-workflow
+spec:
+  owner: qualification-team
+  version: source-123
+  tests:
+  - name: workflow-check
+    displayName: Workflow check
+    artifact:
+      path: scripts/check.sh
+    driver:
+      type: WorkflowTemplate
+      workflowTemplate:
+        path: workflows/check.yaml
+        artifact: check.sh
+`
+	planPath := filepath.Join(root, "certification-plan.yaml")
+	require.NoError(t, os.WriteFile(planPath, []byte(plan), 0o600))
+
+	rendered, err := CompileTestsFile(planPath)
+	require.NoError(t, err)
+
+	documents := strings.Split(string(rendered), "---\n")
+	require.Len(t, documents, 2)
+
+	template := unstructured.Unstructured{}
+	require.NoError(t, yaml.Unmarshal([]byte(documents[0]), &template.Object))
+	require.Equal(t, "source-workflow", template.GetName())
+
+	test := signalv1alpha1.CertificationTest{}
+	require.NoError(t, yaml.Unmarshal([]byte(documents[1]), &test))
+	require.Equal(t, "source-workflow", test.Spec.Driver.WorkflowTemplate.Name)
+	require.Equal(t, "check.sh", test.Spec.Driver.WorkflowTemplate.Artifact)
+
+	digest, err := workflowTemplateSpecDigest(template)
+	require.NoError(t, err)
+	require.Equal(t, digest, test.Spec.Driver.WorkflowTemplate.Digest)
+}
+
+func TestCompileTestsFileRejectsInvalidSourceWorkflowTemplate(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	require.NoError(t, os.Mkdir(filepath.Join(root, "scripts"), 0o755))
+	require.NoError(t, os.Mkdir(filepath.Join(root, "workflows"), 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(root, "scripts", "check.sh"),
+		[]byte("#!/bin/sh\nprintf ok\n"),
+		0o600,
+	))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(root, "workflows", "check.yaml"),
+		[]byte(`apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: wrong-kind
+`),
+		0o600,
+	))
+
+	plan := `apiVersion: signal.unbounded-cloud.io/v1alpha1
+kind: CertificationPlan
+metadata:
+  name: source-workflow
+spec:
+  owner: qualification-team
+  version: source-123
+  tests:
+  - name: workflow-check
+    displayName: Workflow check
+    artifact:
+      path: scripts/check.sh
+    driver:
+      type: WorkflowTemplate
+      workflowTemplate:
+        path: workflows/check.yaml
+        artifact: check.sh
+`
+	planPath := filepath.Join(root, "certification-plan.yaml")
+	require.NoError(t, os.WriteFile(planPath, []byte(plan), 0o600))
+
+	_, err := CompileTestsFile(planPath)
+	require.ErrorContains(
+		t,
+		err,
+		"must contain an argoproj.io/v1alpha1 WorkflowTemplate",
+	)
+}
+
+func TestCompileTestsFileRejectsInvalidSourceWorkflowTemplateReferences(t *testing.T) {
+	t.Parallel()
+
+	const validWorkflow = `apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: source-workflow
+spec:
+  entrypoint: main
+  templates:
+  - name: main
+    container:
+      image: example.invalid/check@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      command: [/bin/true]
+`
+
+	tests := []struct {
+		name           string
+		workflow       string
+		workflowSource string
+		wantError      string
+	}{
+		{
+			name: "namespace",
+			workflow: strings.Replace(
+				validWorkflow,
+				"  name: source-workflow\n",
+				"  name: source-workflow\n  namespace: project-signal\n",
+				1,
+			),
+			workflowSource: "        path: workflows/check.yaml\n",
+			wantError:      "must not set metadata.namespace",
+		},
+		{
+			name:     "mixed path and identity",
+			workflow: validWorkflow,
+			workflowSource: `        path: workflows/check.yaml
+        name: source-workflow
+        digest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+`,
+			wantError: "path is mutually exclusive with name and digest",
+		},
+		{
+			name:           "path escape",
+			workflow:       validWorkflow,
+			workflowSource: "        path: ../outside.yaml\n",
+			wantError:      `path "../outside.yaml" escapes spec.sourceRoot`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			parent := t.TempDir()
+			root := filepath.Join(parent, "plan")
+			require.NoError(t, os.MkdirAll(filepath.Join(root, "workflows"), 0o755))
+			require.NoError(t, os.WriteFile(
+				filepath.Join(root, "workflows", "check.yaml"),
+				[]byte(tt.workflow),
+				0o600,
+			))
+			require.NoError(t, os.WriteFile(
+				filepath.Join(parent, "outside.yaml"),
+				[]byte(tt.workflow),
+				0o600,
+			))
+
+			plan := `apiVersion: signal.unbounded-cloud.io/v1alpha1
+kind: CertificationPlan
+metadata:
+  name: source-workflow
+spec:
+  owner: qualification-team
+  version: source-123
+  tests:
+  - name: workflow-check
+    displayName: Workflow check
+    driver:
+      type: WorkflowTemplate
+      workflowTemplate:
+` + tt.workflowSource
+			planPath := filepath.Join(root, "certification-plan.yaml")
+			require.NoError(t, os.WriteFile(planPath, []byte(plan), 0o600))
+
+			_, err := CompileTestsFile(planPath)
+			require.ErrorContains(t, err, tt.wantError)
+		})
+	}
+}
+
+func TestCompileTestsFileRejectsConflictingSourceWorkflowTemplates(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	require.NoError(t, os.Mkdir(filepath.Join(root, "workflows"), 0o755))
+
+	for name, command := range map[string]string{
+		"first.yaml":  "true",
+		"second.yaml": "false",
+	} {
+		require.NoError(t, os.WriteFile(
+			filepath.Join(root, "workflows", name),
+			[]byte(fmt.Sprintf(`apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: shared-workflow
+spec:
+  entrypoint: main
+  templates:
+  - name: main
+    container:
+      image: example.invalid/check@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      command: [%s]
+`, command)),
+			0o600,
+		))
+	}
+
+	plan := `apiVersion: signal.unbounded-cloud.io/v1alpha1
+kind: CertificationPlan
+metadata:
+  name: source-workflow
+spec:
+  owner: qualification-team
+  version: source-123
+  tests:
+  - name: first-check
+    displayName: First check
+    driver:
+      type: WorkflowTemplate
+      workflowTemplate:
+        path: workflows/first.yaml
+  - name: second-check
+    displayName: Second check
+    driver:
+      type: WorkflowTemplate
+      workflowTemplate:
+        path: workflows/second.yaml
+`
+	planPath := filepath.Join(root, "certification-plan.yaml")
+	require.NoError(t, os.WriteFile(planPath, []byte(plan), 0o600))
+
+	_, err := CompileTestsFile(planPath)
+	require.ErrorContains(t, err, `WorkflowTemplate "shared-workflow" is defined with multiple specs`)
 }
 
 func mustCompileFile(t *testing.T, path string) []byte {

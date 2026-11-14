@@ -5,19 +5,24 @@ package signalplan
 
 import (
 	"bytes"
+	"compress/gzip"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/yaml"
 
@@ -25,10 +30,11 @@ import (
 )
 
 const (
-	planAPIVersion  = "signal.unbounded-cloud.io/v1alpha1"
-	planKind        = "CertificationPlan"
-	bindingsKind    = "CertificationPlanBindings"
-	maxPlanFileSize = 1024 * 1024
+	planAPIVersion      = "signal.unbounded-cloud.io/v1alpha1"
+	planKind            = "CertificationPlan"
+	bindingsKind        = "CertificationPlanBindings"
+	maxPlanFileSize     = 1024 * 1024
+	artifactFilesMarker = "\n__PROJECT_SIGNAL_FILES_V1__\n"
 )
 
 var (
@@ -137,6 +143,12 @@ type CertificationTestSource struct {
 }
 
 type ArtifactSource struct {
+	Name  string               `json:"name,omitempty"`
+	Path  string               `json:"path"`
+	Files []ArtifactFileSource `json:"files,omitempty"`
+}
+
+type ArtifactFileSource struct {
 	Name string `json:"name,omitempty"`
 	Path string `json:"path"`
 }
@@ -165,7 +177,13 @@ type ContainerDriverSource struct {
 type WorkflowTemplateDriverSource struct {
 	Name     string `json:"name"`
 	Digest   string `json:"digest"`
+	Path     string `json:"path,omitempty"`
 	Artifact string `json:"artifact,omitempty"`
+}
+
+type compiledPlan struct {
+	WorkflowTemplates []unstructured.Unstructured
+	Tests             []signalv1alpha1.CertificationTest
 }
 
 func CompileFile(filename string) ([]byte, error) {
@@ -194,14 +212,18 @@ func compileFile(filename, bindingsFilename, inputsFilename string, testsOnly bo
 		return nil, err
 	}
 
-	tests, err := compilePlan(filename, plan)
+	compiled, err := compilePlan(filename, plan)
 	if err != nil {
 		return nil, err
 	}
 
-	resources := make([]any, 0, len(tests)+1)
-	for index := range tests {
-		resources = append(resources, &tests[index])
+	resources := make([]any, 0, len(compiled.WorkflowTemplates)+len(compiled.Tests)+1)
+	for index := range compiled.WorkflowTemplates {
+		resources = append(resources, &compiled.WorkflowTemplates[index])
+	}
+
+	for index := range compiled.Tests {
+		resources = append(resources, &compiled.Tests[index])
 	}
 
 	if plan.Spec.Suite != nil && !testsOnly {
@@ -265,7 +287,7 @@ func BindingTargets(filename string) (string, []string, error) {
 		return "", nil, errors.New("spec.suite is required to resolve bindings")
 	}
 
-	tests, err := compilePlan(filename, plan)
+	compiled, err := compilePlan(filename, plan)
 	if err != nil {
 		return "", nil, err
 	}
@@ -279,10 +301,10 @@ func BindingTargets(filename string) (string, []string, error) {
 	}
 
 	names := make([]string, 0, len(referenced))
-	for index := range tests {
-		if _, exists := referenced[tests[index].Name]; exists {
-			names = append(names, tests[index].Name)
-			delete(referenced, tests[index].Name)
+	for index := range compiled.Tests {
+		if _, exists := referenced[compiled.Tests[index].Name]; exists {
+			names = append(names, compiled.Tests[index].Name)
+			delete(referenced, compiled.Tests[index].Name)
 		}
 	}
 
@@ -416,60 +438,104 @@ func readFileBounded(path string, limit int64) (content []byte, err error) {
 	return content, nil
 }
 
-func compilePlan(filename string, plan CertificationPlan) ([]signalv1alpha1.CertificationTest, error) {
+func compilePlan(filename string, plan CertificationPlan) (compiledPlan, error) {
 	if plan.APIVersion != planAPIVersion {
-		return nil, fmt.Errorf("apiVersion must be %q", planAPIVersion)
+		return compiledPlan{}, fmt.Errorf("apiVersion must be %q", planAPIVersion)
 	}
 
 	if plan.Kind != planKind {
-		return nil, fmt.Errorf("kind must be %q", planKind)
+		return compiledPlan{}, fmt.Errorf("kind must be %q", planKind)
 	}
 
 	if errors := validation.IsDNS1123Subdomain(plan.Metadata.Name); len(errors) > 0 {
-		return nil, fmt.Errorf("metadata.name is invalid: %s", strings.Join(errors, ", "))
+		return compiledPlan{}, fmt.Errorf("metadata.name is invalid: %s", strings.Join(errors, ", "))
 	}
 
 	if plan.Spec.Owner == "" {
-		return nil, errors.New("spec.owner is required")
+		return compiledPlan{}, errors.New("spec.owner is required")
 	}
 
 	if plan.Spec.Version == "" {
-		return nil, errors.New("spec.version is required")
+		return compiledPlan{}, errors.New("spec.version is required")
 	}
 
 	if len(plan.Spec.Tests) == 0 {
-		return nil, errors.New("spec.tests must contain at least one test")
+		return compiledPlan{}, errors.New("spec.tests must contain at least one test")
 	}
 
 	sourceRoot, err := resolveSourceRoot(filename, plan.Spec.SourceRoot)
 	if err != nil {
-		return nil, err
+		return compiledPlan{}, err
 	}
 
 	if err := validateRuntimes(plan.Spec.Runtimes); err != nil {
-		return nil, err
+		return compiledPlan{}, err
 	}
 
 	seen := make(map[string]struct{}, len(plan.Spec.Tests))
+	workflowTemplates := make(map[string]unstructured.Unstructured)
 
 	tests := make([]signalv1alpha1.CertificationTest, 0, len(plan.Spec.Tests))
 	for index := range plan.Spec.Tests {
 		source := plan.Spec.Tests[index]
 		if _, exists := seen[source.Name]; exists {
-			return nil, fmt.Errorf("spec.tests[%d].name %q is duplicated", index, source.Name)
+			return compiledPlan{}, fmt.Errorf("spec.tests[%d].name %q is duplicated", index, source.Name)
 		}
 
 		seen[source.Name] = struct{}{}
 
-		test, err := compileTest(plan, sourceRoot, source)
+		test, workflowTemplate, err := compileTest(plan, sourceRoot, source)
 		if err != nil {
-			return nil, fmt.Errorf("compile test %q: %w", source.Name, err)
+			return compiledPlan{}, fmt.Errorf("compile test %q: %w", source.Name, err)
 		}
 
 		tests = append(tests, test)
+
+		if workflowTemplate == nil {
+			continue
+		}
+
+		name := workflowTemplate.GetName()
+		if existing, exists := workflowTemplates[name]; exists {
+			existingDigest, digestErr := workflowTemplateSpecDigest(existing)
+			if digestErr != nil {
+				return compiledPlan{}, digestErr
+			}
+
+			currentDigest, digestErr := workflowTemplateSpecDigest(*workflowTemplate)
+			if digestErr != nil {
+				return compiledPlan{}, digestErr
+			}
+
+			if existingDigest != currentDigest {
+				return compiledPlan{}, fmt.Errorf(
+					"WorkflowTemplate %q is defined with multiple specs",
+					name,
+				)
+			}
+
+			continue
+		}
+
+		workflowTemplates[name] = *workflowTemplate
 	}
 
-	return tests, nil
+	templateNames := make([]string, 0, len(workflowTemplates))
+	for name := range workflowTemplates {
+		templateNames = append(templateNames, name)
+	}
+
+	sort.Strings(templateNames)
+
+	templates := make([]unstructured.Unstructured, 0, len(templateNames))
+	for _, name := range templateNames {
+		templates = append(templates, workflowTemplates[name])
+	}
+
+	return compiledPlan{
+		WorkflowTemplates: templates,
+		Tests:             tests,
+	}, nil
 }
 
 func resolveSourceRoot(filename, configured string) (string, error) {
@@ -514,35 +580,43 @@ func compileTest(
 	plan CertificationPlan,
 	sourceRoot string,
 	source CertificationTestSource,
-) (signalv1alpha1.CertificationTest, error) {
+) (signalv1alpha1.CertificationTest, *unstructured.Unstructured, error) {
 	if errors := validation.IsDNS1123Subdomain(source.Name); len(errors) > 0 {
-		return signalv1alpha1.CertificationTest{}, fmt.Errorf("name is invalid: %s", strings.Join(errors, ", "))
+		return signalv1alpha1.CertificationTest{}, nil, fmt.Errorf(
+			"name is invalid: %s",
+			strings.Join(errors, ", "),
+		)
 	}
 
 	if source.DisplayName == "" {
-		return signalv1alpha1.CertificationTest{}, errors.New("displayName is required")
+		return signalv1alpha1.CertificationTest{}, nil, errors.New("displayName is required")
 	}
 
 	if (source.Topology.MinParticipants == 0) != (source.Topology.MaxParticipants == 0) {
-		return signalv1alpha1.CertificationTest{}, errors.New(
+		return signalv1alpha1.CertificationTest{}, nil, errors.New(
 			"topology.minParticipants and topology.maxParticipants must be set together",
 		)
 	}
 
 	if source.Topology.MinParticipants > source.Topology.MaxParticipants {
-		return signalv1alpha1.CertificationTest{}, errors.New(
+		return signalv1alpha1.CertificationTest{}, nil, errors.New(
 			"topology.minParticipants must not exceed topology.maxParticipants",
 		)
 	}
 
 	artifacts, err := compileArtifacts(sourceRoot, source.Artifact, source.Artifacts)
 	if err != nil {
-		return signalv1alpha1.CertificationTest{}, err
+		return signalv1alpha1.CertificationTest{}, nil, err
 	}
 
-	driver, err := compileDriver(plan.Spec.Runtimes, source.Driver, artifacts)
+	driver, workflowTemplate, err := compileDriver(
+		plan.Spec.Runtimes,
+		sourceRoot,
+		source.Driver,
+		artifacts,
+	)
 	if err != nil {
-		return signalv1alpha1.CertificationTest{}, err
+		return signalv1alpha1.CertificationTest{}, nil, err
 	}
 
 	metrics := source.Metrics
@@ -590,10 +664,10 @@ func compileTest(
 		},
 	}
 	if err := signalv1alpha1.ValidateTestArtifacts(test.Spec); err != nil {
-		return signalv1alpha1.CertificationTest{}, err
+		return signalv1alpha1.CertificationTest{}, nil, err
 	}
 
-	return test, nil
+	return test, workflowTemplate, nil
 }
 
 func compileSuite(
@@ -1108,35 +1182,90 @@ func compileArtifact(
 		return signalv1alpha1.TestArtifact{}, errors.New("path is required")
 	}
 
-	if filepath.IsAbs(source.Path) {
-		return signalv1alpha1.TestArtifact{}, errors.New("path must be relative to spec.sourceRoot")
-	}
-
-	path, err := filepath.EvalSymlinks(filepath.Join(sourceRoot, filepath.Clean(source.Path)))
+	content, err := readSourceFile(
+		sourceRoot,
+		source.Path,
+		signalv1alpha1.MaxTestArtifactBytes,
+		"path",
+	)
 	if err != nil {
-		return signalv1alpha1.TestArtifact{}, fmt.Errorf("resolve path %q: %w", source.Path, err)
+		return signalv1alpha1.TestArtifact{}, err
 	}
 
-	relative, err := filepath.Rel(sourceRoot, path)
-	if err != nil {
-		return signalv1alpha1.TestArtifact{}, fmt.Errorf("compare path with spec.sourceRoot: %w", err)
+	if bytes.Contains(content, []byte(artifactFilesMarker)) {
+		return signalv1alpha1.TestArtifact{}, errors.New("path contains the reserved artifact files marker")
 	}
 
-	if relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-		return signalv1alpha1.TestArtifact{}, fmt.Errorf("path %q escapes spec.sourceRoot", source.Path)
-	}
+	if len(source.Files) > 0 {
+		files := make([]signalv1alpha1.TestArtifact, 0, len(source.Files))
+		seen := make(map[string]struct{}, len(source.Files))
 
-	content, err := readFileBounded(path, signalv1alpha1.MaxTestArtifactBytes)
-	if err != nil {
-		return signalv1alpha1.TestArtifact{}, fmt.Errorf("read path %q: %w", source.Path, err)
-	}
+		for index := range source.Files {
+			fileSource := source.Files[index]
 
-	if len(content) == 0 {
-		return signalv1alpha1.TestArtifact{}, fmt.Errorf("path %q is empty", source.Path)
-	}
+			fileContent, err := readSourceFile(
+				sourceRoot,
+				fileSource.Path,
+				signalv1alpha1.MaxTestArtifactBytes,
+				fmt.Sprintf("files[%d].path", index),
+			)
+			if err != nil {
+				return signalv1alpha1.TestArtifact{}, err
+			}
 
-	if !utf8.Valid(content) {
-		return signalv1alpha1.TestArtifact{}, fmt.Errorf("path %q is not valid UTF-8", source.Path)
+			name := fileSource.Name
+			if name == "" {
+				name = filepath.Base(fileSource.Path)
+			}
+
+			if !artifactNamePattern.MatchString(name) {
+				return signalv1alpha1.TestArtifact{}, fmt.Errorf(
+					"files[%d].name %q must match %s",
+					index,
+					name,
+					artifactNamePattern,
+				)
+			}
+
+			if _, exists := seen[name]; exists {
+				return signalv1alpha1.TestArtifact{}, fmt.Errorf("files[%d].name %q is duplicated", index, name)
+			}
+
+			seen[name] = struct{}{}
+			sum := sha256.Sum256(fileContent)
+			files = append(files, signalv1alpha1.TestArtifact{
+				Name:    name,
+				Content: string(fileContent),
+				Digest:  "sha256:" + hex.EncodeToString(sum[:]),
+			})
+		}
+
+		encodedFiles, err := json.Marshal(files)
+		if err != nil {
+			return signalv1alpha1.TestArtifact{}, fmt.Errorf("marshal artifact files: %w", err)
+		}
+
+		var compressedFiles bytes.Buffer
+
+		compressor := gzip.NewWriter(&compressedFiles)
+		if _, err := compressor.Write(encodedFiles); err != nil {
+			return signalv1alpha1.TestArtifact{}, fmt.Errorf("compress artifact files: %w", err)
+		}
+
+		if err := compressor.Close(); err != nil {
+			return signalv1alpha1.TestArtifact{}, fmt.Errorf("finish compressing artifact files: %w", err)
+		}
+
+		content = append(content, artifactFilesMarker...)
+		content = base64.StdEncoding.AppendEncode(content, compressedFiles.Bytes())
+		content = append(content, '\n')
+
+		if len(content) > signalv1alpha1.MaxTestArtifactBytes {
+			return signalv1alpha1.TestArtifact{}, fmt.Errorf(
+				"path and files exceed the %d-byte artifact limit",
+				signalv1alpha1.MaxTestArtifactBytes,
+			)
+		}
 	}
 
 	name := source.Name
@@ -1157,36 +1286,83 @@ func compileArtifact(
 	}, nil
 }
 
+func readSourceFile(
+	sourceRoot,
+	configuredPath string,
+	limit int64,
+	field string,
+) ([]byte, error) {
+	if configuredPath == "" {
+		return nil, fmt.Errorf("%s is required", field)
+	}
+
+	if filepath.IsAbs(configuredPath) {
+		return nil, fmt.Errorf("%s must be relative to spec.sourceRoot", field)
+	}
+
+	path, err := filepath.EvalSymlinks(
+		filepath.Join(sourceRoot, filepath.Clean(configuredPath)),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("resolve %s %q: %w", field, configuredPath, err)
+	}
+
+	relative, err := filepath.Rel(sourceRoot, path)
+	if err != nil {
+		return nil, fmt.Errorf("compare %s with spec.sourceRoot: %w", field, err)
+	}
+
+	if relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return nil, fmt.Errorf("%s %q escapes spec.sourceRoot", field, configuredPath)
+	}
+
+	content, err := readFileBounded(path, limit)
+	if err != nil {
+		return nil, fmt.Errorf("read %s %q: %w", field, configuredPath, err)
+	}
+
+	if len(content) == 0 {
+		return nil, fmt.Errorf("%s %q is empty", field, configuredPath)
+	}
+
+	if !utf8.Valid(content) {
+		return nil, fmt.Errorf("%s %q is not valid UTF-8", field, configuredPath)
+	}
+
+	return content, nil
+}
+
 func compileDriver(
 	runtimes map[string]string,
+	sourceRoot string,
 	source CertificationTestDriverSource,
 	artifacts []signalv1alpha1.TestArtifact,
-) (signalv1alpha1.CertificationTestDriver, error) {
+) (signalv1alpha1.CertificationTestDriver, *unstructured.Unstructured, error) {
 	switch source.Type {
 	case signalv1alpha1.TestDriverTypeScript:
 		if source.Script == nil || source.Container != nil || source.WorkflowTemplate != nil {
-			return signalv1alpha1.CertificationTestDriver{}, errors.New(
+			return signalv1alpha1.CertificationTestDriver{}, nil, errors.New(
 				"script driver requires only driver.script",
 			)
 		}
 
 		artifactName, err := selectDriverArtifact(artifacts, source.Script.Artifact, true)
 		if err != nil {
-			return signalv1alpha1.CertificationTestDriver{}, errors.New(
+			return signalv1alpha1.CertificationTestDriver{}, nil, errors.New(
 				"script driver: " + err.Error(),
 			)
 		}
 
 		if source.Script.Language != signalv1alpha1.ScriptLanguageShell &&
 			source.Script.Language != signalv1alpha1.ScriptLanguagePython {
-			return signalv1alpha1.CertificationTestDriver{}, errors.New(
+			return signalv1alpha1.CertificationTestDriver{}, nil, errors.New(
 				"driver.script.language must be Shell or Python",
 			)
 		}
 
 		image, err := resolveRuntime(runtimes, source.Script.Runtime)
 		if err != nil {
-			return signalv1alpha1.CertificationTestDriver{}, err
+			return signalv1alpha1.CertificationTestDriver{}, nil, err
 		}
 
 		return signalv1alpha1.CertificationTestDriver{
@@ -1197,23 +1373,23 @@ func compileDriver(
 				RunnerImage: image,
 				Resources:   source.Script.Resources,
 			},
-		}, nil
+		}, nil, nil
 	case signalv1alpha1.TestDriverTypeContainer:
 		if source.Container == nil || source.Script != nil || source.WorkflowTemplate != nil {
-			return signalv1alpha1.CertificationTestDriver{}, errors.New(
+			return signalv1alpha1.CertificationTestDriver{}, nil, errors.New(
 				"container driver requires only driver.container",
 			)
 		}
 
 		if len(artifacts) != 0 {
-			return signalv1alpha1.CertificationTestDriver{}, errors.New(
+			return signalv1alpha1.CertificationTestDriver{}, nil, errors.New(
 				"container driver must not declare artifacts",
 			)
 		}
 
 		image, err := resolveRuntime(runtimes, source.Container.Runtime)
 		if err != nil {
-			return signalv1alpha1.CertificationTestDriver{}, err
+			return signalv1alpha1.CertificationTestDriver{}, nil, err
 		}
 
 		return signalv1alpha1.CertificationTestDriver{
@@ -1224,24 +1400,51 @@ func compileDriver(
 				Args:      source.Container.Args,
 				Resources: source.Container.Resources,
 			},
-		}, nil
+		}, nil, nil
 	case signalv1alpha1.TestDriverTypeWorkflowTemplate:
 		if source.WorkflowTemplate == nil || source.Script != nil || source.Container != nil {
-			return signalv1alpha1.CertificationTestDriver{}, errors.New(
+			return signalv1alpha1.CertificationTestDriver{}, nil, errors.New(
 				"WorkflowTemplate driver requires only driver.workflowTemplate",
 			)
 		}
 
-		if !signalv1alpha1.IsSHA256Digest(source.WorkflowTemplate.Digest) {
-			return signalv1alpha1.CertificationTestDriver{}, errors.New(
-				"driver.workflowTemplate.digest must be a SHA-256 digest",
-			)
-		}
+		var (
+			name             = source.WorkflowTemplate.Name
+			digest           = source.WorkflowTemplate.Digest
+			workflowTemplate *unstructured.Unstructured
+		)
 
-		if source.WorkflowTemplate.Name == "" {
-			return signalv1alpha1.CertificationTestDriver{}, errors.New(
-				"driver.workflowTemplate.name is required",
-			)
+		if source.WorkflowTemplate.Path != "" {
+			if name != "" || digest != "" {
+				return signalv1alpha1.CertificationTestDriver{}, nil, errors.New(
+					"driver.workflowTemplate.path is mutually exclusive with name and digest",
+				)
+			}
+
+			compiled, err := compileWorkflowTemplate(sourceRoot, source.WorkflowTemplate.Path)
+			if err != nil {
+				return signalv1alpha1.CertificationTestDriver{}, nil, err
+			}
+
+			workflowTemplate = &compiled
+			name = compiled.GetName()
+
+			digest, err = workflowTemplateSpecDigest(compiled)
+			if err != nil {
+				return signalv1alpha1.CertificationTestDriver{}, nil, err
+			}
+		} else {
+			if !signalv1alpha1.IsSHA256Digest(digest) {
+				return signalv1alpha1.CertificationTestDriver{}, nil, errors.New(
+					"driver.workflowTemplate.digest must be a SHA-256 digest",
+				)
+			}
+
+			if name == "" {
+				return signalv1alpha1.CertificationTestDriver{}, nil, errors.New(
+					"driver.workflowTemplate.name is required",
+				)
+			}
 		}
 
 		artifactName, err := selectDriverArtifact(
@@ -1250,7 +1453,7 @@ func compileDriver(
 			false,
 		)
 		if err != nil {
-			return signalv1alpha1.CertificationTestDriver{}, errors.New(
+			return signalv1alpha1.CertificationTestDriver{}, nil, errors.New(
 				"WorkflowTemplate driver: " + err.Error(),
 			)
 		}
@@ -1258,17 +1461,100 @@ func compileDriver(
 		return signalv1alpha1.CertificationTestDriver{
 			Type: signalv1alpha1.TestDriverTypeWorkflowTemplate,
 			WorkflowTemplate: &signalv1alpha1.WorkflowTemplateTestDriver{
-				Name:     source.WorkflowTemplate.Name,
-				Digest:   source.WorkflowTemplate.Digest,
+				Name:     name,
+				Digest:   digest,
 				Artifact: artifactName,
 			},
-		}, nil
+		}, workflowTemplate, nil
 	default:
-		return signalv1alpha1.CertificationTestDriver{}, fmt.Errorf(
+		return signalv1alpha1.CertificationTestDriver{}, nil, fmt.Errorf(
 			"unsupported driver.type %q",
 			source.Type,
 		)
 	}
+}
+
+func compileWorkflowTemplate(
+	sourceRoot,
+	configuredPath string,
+) (unstructured.Unstructured, error) {
+	content, err := readSourceFile(
+		sourceRoot,
+		configuredPath,
+		maxPlanFileSize,
+		"driver.workflowTemplate.path",
+	)
+	if err != nil {
+		return unstructured.Unstructured{}, err
+	}
+
+	object := map[string]any{}
+	if err := yaml.UnmarshalStrict(content, &object); err != nil {
+		return unstructured.Unstructured{}, fmt.Errorf(
+			"decode driver.workflowTemplate.path %q: %w",
+			configuredPath,
+			err,
+		)
+	}
+
+	template := unstructured.Unstructured{Object: object}
+	if template.GetAPIVersion() != "argoproj.io/v1alpha1" ||
+		template.GetKind() != "WorkflowTemplate" {
+		return unstructured.Unstructured{}, fmt.Errorf(
+			"driver.workflowTemplate.path %q must contain an argoproj.io/v1alpha1 WorkflowTemplate",
+			configuredPath,
+		)
+	}
+
+	if errors := validation.IsDNS1123Subdomain(template.GetName()); len(errors) > 0 {
+		return unstructured.Unstructured{}, fmt.Errorf(
+			"driver.workflowTemplate.path %q metadata.name is invalid: %s",
+			configuredPath,
+			strings.Join(errors, ", "),
+		)
+	}
+
+	if template.GetNamespace() != "" {
+		return unstructured.Unstructured{}, fmt.Errorf(
+			"driver.workflowTemplate.path %q must not set metadata.namespace",
+			configuredPath,
+		)
+	}
+
+	if _, found, err := unstructured.NestedFieldNoCopy(template.Object, "spec"); err != nil {
+		return unstructured.Unstructured{}, fmt.Errorf(
+			"decode driver.workflowTemplate.path %q spec: %w",
+			configuredPath,
+			err,
+		)
+	} else if !found {
+		return unstructured.Unstructured{}, fmt.Errorf(
+			"driver.workflowTemplate.path %q must define spec",
+			configuredPath,
+		)
+	}
+
+	return template, nil
+}
+
+func workflowTemplateSpecDigest(template unstructured.Unstructured) (string, error) {
+	spec, found, err := unstructured.NestedFieldNoCopy(template.Object, "spec")
+	if err != nil {
+		return "", fmt.Errorf("decode WorkflowTemplate spec: %w", err)
+	}
+
+	if !found {
+		return "", errors.New("WorkflowTemplate has no spec")
+	}
+
+	content, err := json.Marshal(spec)
+	if err != nil {
+		return "", fmt.Errorf("encode WorkflowTemplate spec: %w", err)
+	}
+
+	digest := sha256.Sum256(content)
+
+	return "sha256:" + hex.EncodeToString(digest[:]), nil
 }
 
 func selectDriverArtifact(
