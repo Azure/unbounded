@@ -38,6 +38,7 @@ type Problem struct {
 	// kind the component emits. Nil Sites means every Site.
 	Component string
 	Kind      string
+	Name      string
 	Sites     []string
 
 	Err error
@@ -115,6 +116,7 @@ func entryProblem(source Source, entry Entry, err error) Problem {
 		Source:    &source,
 		Component: entry.Component,
 		Kind:      entry.Kind,
+		Name:      entry.Name,
 		Sites:     entry.Sites,
 		Err:       err,
 	}

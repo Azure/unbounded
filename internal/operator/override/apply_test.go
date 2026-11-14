@@ -15,6 +15,64 @@ import (
 	"github.com/Azure/unbounded/internal/racer/workload"
 )
 
+func TestApplyWorkloadNameScopesSameComponentAndKind(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		want int
+	}{
+		{name: "gantry", want: 1},
+		{name: "", want: 2},
+		{name: "missing", want: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plan := component.NewPlan()
+
+			for _, name := range []string{"gantry", "gantry-overlaybd-config"} {
+				workload := testWorkload("west")
+				workload.SetKind("DaemonSet")
+				workload.SetName(name)
+				plan.Add(component.Operation{
+					Kind: component.OpApply, Object: workload, Component: "gantry", Overridable: true,
+				})
+			}
+
+			entries, err := parseAll(map[string]string{"image.yaml": `
+apiVersion: overrides.unbounded-cloud.io/v1alpha1
+overrides:
+  - component: gantry
+    kind: DaemonSet
+    name: "` + tc.name + `"
+    patch:
+      spec:
+        template:
+          spec:
+            containers:
+              - name: run
+                image: example.com/gantry:custom
+`})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			report := Apply(plan, entries, nil)
+			if report.Failed() || len(report.Workloads) != tc.want || len(plan.Operations) != 2 {
+				t.Fatalf("unexpected scoped override: %+v", report)
+			}
+
+			for _, op := range plan.Operations {
+				changed := podSpec(t, op.Object).Containers[0].Image == "example.com/gantry:custom"
+				if changed != (tc.name == "" || tc.name == op.Object.GetName()) {
+					t.Fatalf("workload %s changed=%v for selector %q", op.Object.GetName(), changed, tc.name)
+				}
+			}
+
+			if tc.want == 0 && len(report.InertEntries) != 1 {
+				t.Fatal("unmatched name must be reported as inert")
+			}
+		})
+	}
+}
+
 func TestApplyRacerEnvironmentParity(t *testing.T) {
 	env := []any{
 		map[string]any{"name": "POD_NAMESPACE", "valueFrom": map[string]any{"fieldRef": map[string]any{"fieldPath": "metadata.namespace"}}},
