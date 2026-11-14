@@ -30,9 +30,11 @@ func TestConfiguratorReadinessUsesWallClockBudget(t *testing.T) {
 			bin := filepath.Join(root, "bin")
 			clock := filepath.Join(root, "clock")
 			probes := filepath.Join(root, "probes")
+
 			if err := os.WriteFile(clock, []byte("100\n"), 0o600); err != nil {
 				t.Fatal(err)
 			}
+
 			writeExecutable(t, bin, "date", `#!/bin/sh
 read -r now < "$TEST_CLOCK"
 printf '%s\n' "$now"
@@ -50,28 +52,36 @@ read -r now < "$TEST_CLOCK"
 printf '%s\n' "$((now + $1))" > "$TEST_CLOCK"
 exit 1
 `)
+
 			if test.missingSocket {
 				_ = fixture.listener.Close()
 			}
+
 			command := exec.Command("/bin/sh", "configure-overlaybd.sh", "apply")
+
 			command.Env = append(fixture.env, "TEST_CONFIG_RESULT=changed", "TEST_CLOCK="+clock, "TEST_PROBES="+probes,
 				fmt.Sprintf("TEST_MISSING_SOCKET=%t", test.missingSocket), fmt.Sprintf("GANTRY_READY_TIMEOUT_SECONDS=%d", test.budget))
 			if output, err := command.CombinedOutput(); err == nil || !strings.Contains(string(output), "did not become ready") {
 				t.Fatalf("timeout error = %v\n%s", err, output)
 			}
+
 			data, err := os.ReadFile(clock)
 			if err != nil {
 				t.Fatal(err)
 			}
+
 			if string(data) != fmt.Sprintf("%d\n", 100+test.budget) {
 				t.Fatalf("clock exceeded startup budget: %s", data)
 			}
+
 			if got := readLines(t, probes); strings.Join(got, ",") != strings.Join(test.wantProbes, ",") {
 				t.Fatalf("probe budgets = %v, want %v", got, test.wantProbes)
 			}
+
 			if _, err := os.Stat(fixture.readyMarker); !os.IsNotExist(err) {
 				t.Fatalf("timeout left readiness marker: %v", err)
 			}
+
 			if len(readLines(t, fixture.systemctlLog)) != 0 {
 				t.Fatal("timeout activated containerd configuration")
 			}

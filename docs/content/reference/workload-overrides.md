@@ -101,7 +101,8 @@ data:
 | Field | Required | Meaning |
 |---|---|---|
 | `component` | yes | `net`, `machina`, `gantry`, `token-refresher` or `metalman`. |
-| `kind` | yes | The kind that component emits. With `component` this identifies every workload the operator emits, so you never write a derived per-Site name. A pair the component cannot produce, such as `machina`/`DaemonSet`, is rejected rather than left to match nothing. |
+| `kind` | yes | The kind that component emits. With `component` this selects matching workloads. A pair the component cannot produce, such as `machina`/`DaemonSet`, is rejected rather than left to match nothing. |
+| `name` | no | Exact workload name, not a container name. Omit to match all workloads of the selected component and kind. For example, `name: gantry` excludes the `gantry-overlaybd-config` DaemonSet. Requires an operator version supporting this field. |
 | `sites` | no | **Per-Site components only**, meaning `metalman`. Naming it on `net`, `machina`, `gantry` or `token-refresher` is an error, because those are cluster singletons and there is one of each for the whole cluster. **Omit it to match every Site.** An empty list is an error, since it is far likelier to be a mistake than an intent to match nothing. |
 | `patch` | no | A strategic merge patch against the whole workload object, so `metadata.labels`, `metadata.annotations`, `spec.replicas` and the pod template are all reachable. |
 | `extraArgs` | no | Arguments to append, keyed by container name. See below. |

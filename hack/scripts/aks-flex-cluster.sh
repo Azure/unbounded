@@ -3,8 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Self-contained, repeatable AKS + Unbounded-Net + AKS Flex Node deployment.
-# All Azure resources are created through az; no other checkout, templates,
-# local Go build, or preinstalled kubectl-unbounded is required.
+# All Azure resources are created through az. Release mode needs no local build;
+# --build-from-checkout builds and publishes the local Unbounded components.
 set -euo pipefail
 
 SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -16,15 +16,22 @@ FLEX_COUNT=3
 WORKER_ARCH="amd64"
 WORKER_IMAGE_SKU="server"
 VM_SIZE=""
+WORKER_OS_DISK_GB=512
+WORKER_OS_DISK_SKU="Premium_LRS"
 SYSTEM_VM_SIZE="Standard_D4s_v6"
 KUBERNETES_VERSION=""
 UNBOUNDED_VERSION="v0.8.0"
+UNBOUNDED_VERSION_SET=false
 AGENT_VERSION="v0.2.0"
+BUILD_FROM_CHECKOUT=false
+CHECKOUT_SOURCE_HASH=""
+CONTAINER_ENGINE=""
+BUILD_DNS=""
 PLUGIN_BINARY=""
 PLUGIN_DIGEST=""
 IMAGE_REGISTRY=""
 OPERATOR_IMAGE=""
-ARTIFACT_STREAMING=false
+ARTIFACT_STREAMING=true
 VNET_CIDR="10.91.0.0/16"
 CLUSTER_POD_CIDR="10.93.0.0/16"
 FLEX_POD_CIDR="10.96.0.0/14"
@@ -59,6 +66,10 @@ usage() {
 Creates one AKS system node and one Uniform VMSS with three Ubuntu 24.04 Flex
 instances by default. All worker instances share one managed identity and one
 load-balancer public IP for outbound access and per-instance SSH NAT ports.
+Each Flex worker uses a 512 GiB Premium SSD (Premium_LRS) OS disk.
+The AKS control plane uses Standard tier; existing clusters must also use Standard.
+Gantry Artifact Streaming is enabled by default on Flex workers, with NBD loaded
+before node bootstrap. Use --no-artifact-streaming for ordinary OCI images only.
 New VMSS instances bootstrap automatically, including after a scale-out.
 Requires az >= 2.90.0, kubectl, jq, python3, curl, tar, openssl, and OpenSSH.
 Flex workers default to amd64; --worker-arch arm64 selects an ARM64 Ubuntu host
@@ -66,6 +77,8 @@ and agent archive. The system node remains amd64 unless its VM size is changed.
 Uses the active Azure account unless --subscription is supplied. The selected
 subscription must support the Flex preview and publish the Flex Node Agent Role.
 Gantry is installed without registry-specific configuration or authentication setup.
+Checkout builds additionally require git, make, Go, npm, sha256sum, and Podman
+or Docker Buildx configured for linux/amd64 and linux/arm64, with registry push access.
 
 Options:
   --name NAME                 Required, lowercase resource prefix (3-30 characters)
@@ -74,17 +87,23 @@ Options:
   --resource-group NAME       Dedicated resource group (default: NAME)
   --flex-count N              Initial VMSS capacity (default: 3, range: 1-1000)
   --worker-arch ARCH          Flex architecture: amd64 or arm64 (default: amd64)
-  --vm-size SKU               Flex VM size (default: Standard_D4s_v6 for amd64,
+  --vm-size SKU               Flex VM size (default: Standard_D8s_v3 for amd64,
                               Standard_D4ps_v6 for arm64)
   --system-vm-size SKU        AKS system VM size (default: Standard_D4s_v6)
   --kubernetes-version V      Initial AKS version (default: AKS default)
   --unbounded-version TAG     Pinned plugin/operator release (default: v0.8.0)
   --agent-version TAG         Pinned Flex agent release (default: v0.2.0)
+  --build-from-checkout       Build/push the local installer and components;
+                              requires --image-registry and public pull access
+  --engine NAME               Checkout builder: podman or docker
+                              (default: Podman if installed, otherwise Docker)
+  --build-dns IP              DNS server for Podman build containers only;
+                              requires --build-from-checkout --engine podman
   --plugin-binary PATH        Use this local kubectl-unbounded instead of a release
   --image-registry PREFIX     Operator/component image prefix, e.g. ghcr.io/myorg
   --operator-image NAME:TAG   Operator name and tag, without a registry
-  --artifact-streaming       Enable Gantry streaming on Flex workers and preload
-                              NBD before nspawn starts (requires a compatible build)
+  --artifact-streaming       Enable streaming (default; requires a compatible build)
+  --no-artifact-streaming    Disable Gantry streaming and the NBD preload
   --vnet-cidr CIDR            IPv4 VNet, /16 through /20 (default: 10.91.0.0/16)
   --cluster-pod-cidr CIDR     System-site pods (default: 10.93.0.0/16)
   --flex-pod-cidr CIDR        Flex-site pods, /14 or larger (default: 10.96.0.0/14)
@@ -105,6 +124,9 @@ capacity. Custom installer/image selections are pinned in the saved intent.
 The compiled operator version must match the component image tags published
 under --image-registry. ACR attachment is performed once with a compatible
 plugin/operator; future Linux Flex nodes inherit that policy without reattaching ACR.
+Checkout mode pins source contents and reuses its saved build on reruns. Source
+changes require a new deployment/state directory, not an in-place upgrade.
+The separate AKS Flex host agent still uses --agent-version in checkout mode.
 This is not an upgrade, reset, or teardown tool. It never deletes Azure
 resources or resets an existing node. A partially bootstrapped host that needs a
 reset is reported, not automatically destroyed. See README.md for the quickstart.'
@@ -116,8 +138,10 @@ parse_args() {
       --plan) PLAN_ONLY=true; shift ;;
       --yes) ASSUME_YES=true; shift ;;
       --artifact-streaming) ARTIFACT_STREAMING=true; shift ;;
+      --no-artifact-streaming) ARTIFACT_STREAMING=false; shift ;;
+      --build-from-checkout) BUILD_FROM_CHECKOUT=true; shift ;;
       -h|--help) usage; exit 0 ;;
-      --name|--location|--subscription|--resource-group|--flex-count|--worker-arch|--vm-size|--system-vm-size|--kubernetes-version|--unbounded-version|--agent-version|--plugin-binary|--image-registry|--operator-image|--vnet-cidr|--cluster-pod-cidr|--flex-pod-cidr|--service-cidr|--ssh-key|--ssh-source-ip|--state-dir|--timeout)
+      --name|--location|--subscription|--resource-group|--flex-count|--worker-arch|--vm-size|--system-vm-size|--kubernetes-version|--unbounded-version|--agent-version|--engine|--build-dns|--plugin-binary|--image-registry|--operator-image|--vnet-cidr|--cluster-pod-cidr|--flex-pod-cidr|--service-cidr|--ssh-key|--ssh-source-ip|--state-dir|--timeout)
         [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || die "$1 requires a value"
         case "$1" in
           --name) NAME="$2" ;;
@@ -129,8 +153,10 @@ parse_args() {
           --vm-size) VM_SIZE="$2" ;;
           --system-vm-size) SYSTEM_VM_SIZE="$2" ;;
           --kubernetes-version) KUBERNETES_VERSION="$2" ;;
-          --unbounded-version) UNBOUNDED_VERSION="$2" ;;
+          --unbounded-version) UNBOUNDED_VERSION="$2"; UNBOUNDED_VERSION_SET=true ;;
           --agent-version) AGENT_VERSION="$2" ;;
+          --engine) CONTAINER_ENGINE="$2" ;;
+          --build-dns) BUILD_DNS="$2" ;;
           --plugin-binary) PLUGIN_BINARY="$2" ;;
           --image-registry) IMAGE_REGISTRY="$2" ;;
           --operator-image) OPERATOR_IMAGE="$2" ;;
@@ -158,7 +184,7 @@ validate_args() {
   ((FLEX_COUNT <= MAX_FLEX_COUNT)) || die "--flex-count must be 1-1000"
   [[ "$TIMEOUT" =~ ^[1-9][0-9]{0,5}$ ]] || die "--timeout must be a positive integer of at most six digits"
   case "$WORKER_ARCH" in
-    amd64) VM_SIZE="${VM_SIZE:-Standard_D4s_v6}"; WORKER_IMAGE_SKU="server" ;;
+    amd64) VM_SIZE="${VM_SIZE:-Standard_D8s_v3}"; WORKER_IMAGE_SKU="server" ;;
     arm64) VM_SIZE="${VM_SIZE:-Standard_D4ps_v6}"; WORKER_IMAGE_SKU="server-arm64" ;;
     *) die "--worker-arch must be amd64 or arm64" ;;
   esac
@@ -171,9 +197,35 @@ validate_args() {
   [[ -z "$OPERATOR_IMAGE" || "$OPERATOR_IMAGE" =~ ^[a-z0-9][a-z0-9._-]*:[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$ ]] || die "--operator-image must be NAME:TAG without a registry"
   [[ -z "$KUBERNETES_VERSION" || "$KUBERNETES_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "--kubernetes-version must be a full x.y.z version"
   local tag
-  for tag in "$UNBOUNDED_VERSION" "$AGENT_VERSION"; do
+  for tag in "$AGENT_VERSION" "$UNBOUNDED_VERSION"; do
     [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][a-zA-Z0-9.-]+)?$ ]] || die "release versions must be pinned vX.Y.Z tags (optionally prerelease)"
   done
+  case "$CONTAINER_ENGINE" in
+    ""|podman|docker) ;;
+    *) die "--engine must be podman or docker" ;;
+  esac
+  [[ -z "$CONTAINER_ENGINE" || "$BUILD_FROM_CHECKOUT" == true ]] || die "--engine requires --build-from-checkout"
+  if [[ -n "$BUILD_DNS" ]]; then
+    [[ "$BUILD_FROM_CHECKOUT" == true && "$CONTAINER_ENGINE" == podman ]] \
+      || die "--build-dns requires --build-from-checkout --engine podman"
+    python3 - "$BUILD_DNS" <<'PY' || die "--build-dns must be an IPv4 or IPv6 address"
+import ipaddress
+import sys
+try:
+    ipaddress.ip_address(sys.argv[1])
+except ValueError:
+    sys.exit(1)
+PY
+  fi
+  if [[ "$BUILD_FROM_CHECKOUT" == true ]]; then
+    [[ -n "$IMAGE_REGISTRY" ]] || die "--build-from-checkout requires --image-registry"
+    [[ -z "$PLUGIN_BINARY" && -z "$OPERATOR_IMAGE" && "$UNBOUNDED_VERSION_SET" == false ]] \
+      || die "--build-from-checkout cannot be combined with --plugin-binary, --operator-image, or --unbounded-version"
+    command -v git >/dev/null 2>&1 || die "git is required for --build-from-checkout"
+    CHECKOUT_SOURCE_HASH=$(checkout_source_hash) || die "cannot fingerprint checkout sources"
+    UNBOUNDED_VERSION="checkout-$CHECKOUT_SOURCE_HASH"
+    OPERATOR_IMAGE="unbounded-operator:$UNBOUNDED_VERSION"
+  fi
   if [[ -n "$SUBSCRIPTION" ]]; then validate_subscription; fi
   if [[ -n "$SSH_SOURCE_IP" ]]; then validate_ssh_ip; fi
   local network
@@ -230,14 +282,23 @@ print_plan() {
   printf '  Cluster / resource group: %s / %s\n' "$NAME" "$RESOURCE_GROUP"
   printf '  Subscription / region:   %s / %s\n' "${SUBSCRIPTION:-active account}" "$LOCATION"
   printf '  Nodes:                    1 system + %s Flex = %s total\n' "$FLEX_COUNT" "$((FLEX_COUNT + 1))"
+  printf '  Control plane tier:       Standard\n'
   printf '  VM sizes:                 system=%s flex=%s\n' "$SYSTEM_VM_SIZE" "$VM_SIZE"
+  printf '  Flex OS disk:             %s GiB %s\n' "$WORKER_OS_DISK_GB" "$WORKER_OS_DISK_SKU"
   printf '  Flex architecture/image:  %s / Ubuntu 24.04 %s\n' "$WORKER_ARCH" "$WORKER_IMAGE_SKU"
   printf '  Initial Kubernetes:       %s\n' "${KUBERNETES_VERSION:-AKS default}"
   printf '  Operator / Flex agent:    %s / %s\n' "$UNBOUNDED_VERSION" "$AGENT_VERSION"
+  [[ "$BUILD_FROM_CHECKOUT" != true ]] || printf '  Checkout build:           build/push linux/amd64,linux/arm64 before Azure provisioning\n'
+  [[ "$BUILD_FROM_CHECKOUT" != true ]] || printf '  Container engine:         %s\n' "${CONTAINER_ENGINE:-auto (Podman preferred)}"
+  [[ -z "$BUILD_DNS" ]] || printf '  Build-container DNS:      %s (host and cluster DNS unchanged)\n' "$BUILD_DNS"
   [[ -z "$PLUGIN_BINARY" ]] || printf '  Installer binary:         %s\n' "$PLUGIN_BINARY"
   [[ -z "$IMAGE_REGISTRY" ]] || printf '  Image registry:           %s\n' "$IMAGE_REGISTRY"
   [[ -z "$OPERATOR_IMAGE" ]] || printf '  Operator image:           %s\n' "$OPERATOR_IMAGE"
-  [[ "$ARTIFACT_STREAMING" != true ]] || printf '  Gantry streaming:         enabled on Flex workers (NBD preloaded)\n'
+  if [[ "$ARTIFACT_STREAMING" == true ]]; then
+    printf '  Gantry streaming:         enabled on Flex workers (NBD preloaded)\n'
+  else
+    printf '  Gantry streaming:         disabled (ordinary OCI images only)\n'
+  fi
   printf '  Node subnets:             %s / %s\n' "$SYSTEM_NODE_CIDR" "$FLEX_NODE_CIDR"
   printf '  Pod CIDRs:                %s / %s\n' "$CLUSTER_POD_CIDR" "$FLEX_POD_CIDR"
   printf '  Services / DNS:           %s / %s\n' "$SERVICE_CIDR" "$DNS_SERVICE_IP"
@@ -254,6 +315,92 @@ print_plan() {
 az_cmd() { az "$@" --subscription "$SUBSCRIPTION" --only-show-errors; }
 kube() { kubectl --kubeconfig "$STATE_DIR/kubeconfig" "$@"; }
 sha256() { openssl dgst -sha256 "$1" | awk '{print $NF}'; }
+
+checkout_source_hash() {
+  python3 - "$SCRIPT_ROOT" <<'PY'
+import hashlib
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+root = Path(sys.argv[1])
+files = subprocess.run(
+    ["git", "-C", str(root), "ls-files", "-co", "--exclude-standard", "-z"],
+    check=True, capture_output=True,
+).stdout.split(b"\0")
+digest = hashlib.sha256()
+for name in sorted(set(files) - {b""}):
+    path = root / os.fsdecode(name)
+    digest.update(name + b"\0")
+    if path.is_symlink():
+        digest.update(b"symlink\0" + os.fsencode(os.readlink(path)))
+    elif path.is_file():
+        digest.update(b"executable\0" if path.stat().st_mode & 0o111 else b"file\0")
+        digest.update(hashlib.sha256(path.read_bytes()).digest())
+    elif not path.exists():
+        digest.update(b"deleted\0")
+    else:
+        raise ValueError(f"unsupported checkout entry: {name}")
+print(digest.hexdigest())
+PY
+}
+
+build_checkout() {
+  local build_dir="$STATE_DIR/checkout/$CHECKOUT_SOURCE_HASH" marker image file commit build_time digest manifest
+  local target_args=() build_args=()
+  marker="$build_dir/complete.json"
+  if [[ -f "$STATE_DIR/intent.json" ]]; then
+    jq -e --arg source "$CHECKOUT_SOURCE_HASH" --arg registry "$IMAGE_REGISTRY" \
+      '.checkoutSourceSHA256 == $source and .imageRegistry == $registry' "$STATE_DIR/intent.json" >/dev/null \
+      || die "checkout source or registry differs from saved intent; use a new deployment and state directory"
+    [[ -f "$marker" ]] || die "saved checkout build is missing; restore the state directory instead of rebuilding a deployed tag"
+  fi
+  PLUGIN_BINARY="$build_dir/kubectl-unbounded"
+  if [[ -f "$marker" ]]; then
+    [[ -x "$PLUGIN_BINARY" ]] || die "saved checkout installer is missing or not executable"
+    digest=$(sha256 "$PLUGIN_BINARY")
+    jq -e --arg registry "$IMAGE_REGISTRY" --arg digest "$digest" \
+      '.imageRegistry == $registry and .pluginSHA256 == $digest' "$marker" >/dev/null \
+      || die "saved checkout build registry or installer checksum does not match"
+    log "Reusing saved checkout build $UNBOUNDED_VERSION"
+    return
+  fi
+  mkdir -p "$build_dir"
+  commit=$(git -C "$SCRIPT_ROOT" rev-parse HEAD)
+  build_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  log "Building checkout installer and publishing matching images to $IMAGE_REGISTRY"
+  make -C "$SCRIPT_ROOT" net-image-resources kubectl-unbounded-build \
+    "VERSION=$UNBOUNDED_VERSION" "VERSION_TAG=$UNBOUNDED_VERSION" \
+    "GIT_COMMIT=$commit" "BUILD_TIME=$build_time" "CONTAINER_REGISTRY=$IMAGE_REGISTRY" \
+    "KUBECTL_UNBOUNDED_BIN=$PLUGIN_BINARY"
+  [[ -x "$PLUGIN_BINARY" ]] || die "checkout build did not produce an executable installer"
+  for image in unbounded-operator machina token-refresher gantry gantry-node-config unbounded-net-controller unbounded-net-node; do
+    target_args=()
+    case "$image" in
+      unbounded-net-controller) file=images/net/Containerfile; target_args=(--target controller) ;;
+      unbounded-net-node) file=images/net/Containerfile; target_args=(--target node) ;;
+      *) file="images/$image/Containerfile" ;;
+    esac
+    build_args=(--platform linux/amd64,linux/arm64 --file "$SCRIPT_ROOT/$file" \
+      --build-arg "VERSION=$UNBOUNDED_VERSION" --build-arg "GIT_COMMIT=$commit" \
+      --build-arg "BUILD_TIME=$build_time" --build-arg "CONTAINER_REGISTRY=$IMAGE_REGISTRY")
+    if [[ "$CONTAINER_ENGINE" == podman ]]; then
+      [[ -z "$BUILD_DNS" ]] || build_args+=(--dns "$BUILD_DNS")
+      # Use a fresh local index so interrupted builds cannot leave stale entries.
+      manifest="localhost/aks-flex-$image:build-$(openssl rand -hex 16)"
+      podman build "${build_args[@]}" ${target_args[@]+"${target_args[@]}"} \
+        --manifest "$manifest" "$SCRIPT_ROOT"
+      podman manifest push --all --rm "$manifest" "docker://$IMAGE_REGISTRY/$image:$UNBOUNDED_VERSION"
+    else
+      docker buildx build "${build_args[@]}" ${target_args[@]+"${target_args[@]}"} \
+        --tag "$IMAGE_REGISTRY/$image:$UNBOUNDED_VERSION" --push "$SCRIPT_ROOT"
+    fi
+  done
+  [[ "$(checkout_source_hash)" == "$CHECKOUT_SOURCE_HASH" ]] || die "checkout changed during the build; no deployment was provisioned"
+  jq -n --arg registry "$IMAGE_REGISTRY" --arg digest "$(sha256 "$PLUGIN_BINARY")" \
+    '{imageRegistry:$registry,pluginSHA256:$digest}' > "$marker"
+}
 
 version_at_least() {
   # Azure CLI has final versions; aks-preview also uses versions like 22.0.0b8.
@@ -278,6 +425,21 @@ preflight() {
   for tool in az kubectl jq python3 curl tar openssl ssh ssh-keygen base64; do
     command -v "$tool" >/dev/null 2>&1 || die "required command not found: $tool"
   done
+  if [[ "$BUILD_FROM_CHECKOUT" == true ]]; then
+    if [[ -z "$CONTAINER_ENGINE" ]]; then
+      if command -v podman >/dev/null 2>&1; then CONTAINER_ENGINE=podman
+      elif command -v docker >/dev/null 2>&1; then CONTAINER_ENGINE=docker
+      else die "checkout builds require Podman or Docker Buildx; install one or select it with --engine"
+      fi
+    fi
+    for tool in git make go npm sha256sum "$CONTAINER_ENGINE"; do
+      command -v "$tool" >/dev/null 2>&1 || die "required checkout build command not found: $tool"
+    done
+    "$CONTAINER_ENGINE" info >/dev/null || die "$CONTAINER_ENGINE is not running; on macOS, start its VM first"
+    if [[ "$CONTAINER_ENGINE" == docker ]]; then
+      docker buildx inspect --bootstrap >/dev/null || die "a working Docker Buildx builder is required"
+    fi
+  fi
   cli_version=$(az version --query '"azure-cli"' -o tsv) || die "cannot read Azure CLI version"
   version_at_least "$cli_version" 2.90.0 || die "Azure CLI >= 2.90.0 required; found $cli_version"
   if [[ -z "$SUBSCRIPTION" ]]; then
@@ -343,6 +505,7 @@ prepare_state() {
     BOOTSTRAP_TIMEOUT=$(jq -r '.bootstrapTimeout // empty' "$STATE_DIR/intent.json")
     [[ "$BOOTSTRAP_TIMEOUT" =~ ^[1-9][0-9]{0,5}$ ]] || die "saved intent is not a VMSS deployment; this script does not migrate standalone VMs"
   fi
+  [[ "$BUILD_FROM_CHECKOUT" != true ]] || build_checkout
   [[ -z "$PLUGIN_BINARY" ]] || PLUGIN_DIGEST=$(sha256 "$PLUGIN_BINARY")
   # Preserve default intent bytes so existing resource ownership hashes still match.
   jq -n --arg subscription "$SUBSCRIPTION" --arg name "$NAME" --arg rg "$RESOURCE_GROUP" \
@@ -350,6 +513,7 @@ prepare_state() {
     --arg systemVM "$SYSTEM_VM_SIZE" --arg k8s "$KUBERNETES_VERSION" \
     --arg unbounded "$UNBOUNDED_VERSION" --arg agent "$AGENT_VERSION" \
     --arg arch "$WORKER_ARCH" --arg plugin "$PLUGIN_DIGEST" --argjson streaming "$ARTIFACT_STREAMING" \
+    --arg source "$CHECKOUT_SOURCE_HASH" \
     --arg registry "$IMAGE_REGISTRY" --arg operator "$OPERATOR_IMAGE" \
     --arg vnet "$VNET_CIDR" --arg clusterPods "$CLUSTER_POD_CIDR" \
     --arg flexPods "$FLEX_POD_CIDR" --arg services "$SERVICE_CIDR" \
@@ -359,6 +523,7 @@ prepare_state() {
       unboundedVersion:$unbounded,agentVersion:$agent,vnetCIDR:$vnet,
       clusterPodCIDR:$clusterPods,flexPodCIDR:$flexPods,serviceCIDR:$services,sshKey:$sshKey}
       | if $arch == "amd64" then . else . + {workerArchitecture:$arch} end
+      | if $source == "" then . else . + {checkoutSourceSHA256:$source} end
       | if $streaming then . + {artifactStreaming:true} else . end
       | if $plugin == "" then . else . + {pluginSHA256:$plugin} end
       | if $registry == "" then . else . + {imageRegistry:$registry} end
@@ -498,8 +663,9 @@ ensure_cluster() {
   existing=$(lookup_resource Microsoft.ContainerService/managedClusters "$NAME")
   if [[ "$existing" == null ]]; then
     [[ -z "$KUBERNETES_VERSION" ]] || args+=(--kubernetes-version "$KUBERNETES_VERSION")
-    log "Creating AKS cluster $NAME with one system node and no built-in CNI"
+    log "Creating Standard-tier AKS cluster $NAME with one system node and no built-in CNI"
     az_cmd aks create -g "$RESOURCE_GROUP" --name "$NAME" --location "$LOCATION" \
+      --tier standard \
       --nodepool-name system --node-count 1 --node-vm-size "$SYSTEM_VM_SIZE" --os-sku Ubuntu \
       --vm-set-type VirtualMachineScaleSets --network-plugin none --pod-cidr "$CLUSTER_POD_CIDR" \
       --service-cidr "$SERVICE_CIDR" --dns-service-ip "$DNS_SERVICE_IP" --vnet-subnet-id "$SYSTEM_SUBNET_ID" \
@@ -517,6 +683,8 @@ ensure_cluster() {
       *) die "unexpected AKS provisioning state: $state" ;;
     esac
   done
+  jq -e '(.sku.tier // "" | ascii_downcase) == "standard"' <<<"$cluster" >/dev/null \
+    || die "AKS Standard tier is required (found $(jq -r '.sku.tier // "missing"' <<<"$cluster")); change the billing tier explicitly with: az aks update --resource-group $RESOURCE_GROUP --name $NAME --subscription $SUBSCRIPTION --tier standard"
   jq -e --arg location "$LOCATION" --arg subnet "$SYSTEM_SUBNET_ID" --arg size "$SYSTEM_VM_SIZE" \
     --arg service "$SERVICE_CIDR" --arg dns "$DNS_SERVICE_IP" --arg pods "$CLUSTER_POD_CIDR" \
     '.location == $location and (.networkProfile.networkPlugin | ascii_downcase) == "none"
@@ -585,12 +753,30 @@ wait_component_rollout() {
   # Site reconciliation is asynchronous. A successful Site apply does not
   # imply that the operator has created its component workloads yet.
   while true; do
-    found=$(kube -n unbounded-system get "$resource" --ignore-not-found -o name) \
+    found=$(kube -n unbounded-system get "$resource" --ignore-not-found -o json) \
       || die "cannot query $resource while waiting for operator reconciliation"
     [[ -z "$found" ]] || break
     ((SECONDS < deadline)) || die "operator did not create $resource before the timeout"
     sleep 5
   done
+  if jq -e '.kind == "DaemonSet" and .spec.updateStrategy.type == "OnDelete"' <<<"$found" >/dev/null; then
+    log "Waiting for $resource current-generation pods to become available"
+    while ! jq -e '
+      (.status.desiredNumberScheduled // 0) as $desired |
+      $desired > 0
+      and (.status.observedGeneration // 0) >= .metadata.generation
+      and .status.currentNumberScheduled == $desired
+      and .status.updatedNumberScheduled == $desired
+      and .status.numberReady == $desired
+      and .status.numberAvailable == $desired
+    ' <<<"$found" >/dev/null; do
+      ((SECONDS < deadline)) || die "timed out waiting for $resource current-generation pods to become available"
+      sleep 5
+      found=$(kube -n unbounded-system get "$resource" -o json) \
+        || die "cannot query $resource while waiting for readiness"
+    done
+    return
+  fi
   kube -n unbounded-system rollout status "$resource" --timeout="${TIMEOUT}s"
 }
 
@@ -730,6 +916,7 @@ ensure_vmss() {
     log "Creating Uniform Flex VMSS $VMSS_NAME with $FLEX_COUNT instances and one shared identity"
     jq -n --arg location "$LOCATION" --arg size "$VM_SIZE" --argjson count "$FLEX_COUNT" \
       --arg imageSKU "$WORKER_IMAGE_SKU" \
+      --argjson diskSize "$WORKER_OS_DISK_GB" --arg diskSKU "$WORKER_OS_DISK_SKU" \
       --arg owner "$NAME" --arg hash "$CONFIG_HASH" --arg bootstrap "$bootstrap_hash" \
       --arg prefix "${NAME:0:9}" --arg user "$ADMIN_USER" --rawfile key "$STATE_DIR/ssh.pub" \
       --arg data "$(base64 < "$STATE_DIR/vmss-custom-data.sh" | tr -d '\n')" \
@@ -743,7 +930,7 @@ ensure_vmss() {
               linuxConfiguration:{disablePasswordAuthentication:true,
                 ssh:{publicKeys:[{path:("/home/"+$user+"/.ssh/authorized_keys"),keyData:($key | rtrimstr("\n"))}]}}},
             storageProfile:{imageReference:{publisher:"Canonical",offer:"ubuntu-24_04-lts",sku:$imageSKU,version:"latest"},
-              osDisk:{createOption:"FromImage",diskSizeGB:128,managedDisk:{storageAccountType:"StandardSSD_LRS"}}},
+              osDisk:{createOption:"FromImage",diskSizeGB:$diskSize,managedDisk:{storageAccountType:$diskSKU}}},
             networkProfile:{networkInterfaceConfigurations:[{name:"worker-nic",properties:{
               primary:true,enableIPForwarding:true,networkSecurityGroup:{id:$nsg},
               ipConfigurations:[{name:"worker-ip",properties:{primary:true,subnet:{id:$subnet},
@@ -757,6 +944,7 @@ ensure_vmss() {
     assert_owned "$model" "worker VMSS"
     jq -e --arg size "$VM_SIZE" --arg subnet "$FLEX_SUBNET_ID" --arg backend "$WORKER_BACKEND_ID" \
       --arg imageSKU "$WORKER_IMAGE_SKU" \
+      --argjson diskSize "$WORKER_OS_DISK_GB" --arg diskSKU "$WORKER_OS_DISK_SKU" \
       --arg nsg "$NSG_ID" --arg bootstrap "$bootstrap_hash" --arg user "$ADMIN_USER" --arg prefix "${NAME:0:9}" --rawfile key "$STATE_DIR/ssh.pub" \
       '.sku.name == $size and .sku.capacity >= 1 and .sku.capacity <= 1000
        and .identity.type == "SystemAssigned" and ((.identity.userAssignedIdentities // {}) | length) == 0
@@ -770,8 +958,8 @@ ensure_vmss() {
        and .properties.virtualMachineProfile.storageProfile.imageReference.publisher == "Canonical"
        and .properties.virtualMachineProfile.storageProfile.imageReference.offer == "ubuntu-24_04-lts"
        and .properties.virtualMachineProfile.storageProfile.imageReference.sku == $imageSKU
-       and .properties.virtualMachineProfile.storageProfile.osDisk.diskSizeGB == 128
-       and .properties.virtualMachineProfile.storageProfile.osDisk.managedDisk.storageAccountType == "StandardSSD_LRS"
+       and .properties.virtualMachineProfile.storageProfile.osDisk.diskSizeGB == $diskSize
+       and .properties.virtualMachineProfile.storageProfile.osDisk.managedDisk.storageAccountType == $diskSKU
        and (.properties.virtualMachineProfile.securityProfile.securityType // "Standard") == "Standard"
        and (.properties.virtualMachineProfile.networkProfile.networkInterfaceConfigurations | length) == 1
        and .properties.virtualMachineProfile.networkProfile.networkInterfaceConfigurations[0].properties.enableIPForwarding == true
@@ -870,7 +1058,8 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y -qq kmod
 printf 'nbd\n' > /etc/modules-load.d/gantry-nbd.conf
 printf 'options nbd nbds_max=1024\n' > /etc/modprobe.d/gantry-nbd.conf
 modprobe nbd nbds_max=1024
-if [[ "$(cat /sys/module/nbd/parameters/nbds_max)" -lt 64 ]]; then
+udevadm settle
+if [[ "$(cat /sys/module/nbd/parameters/nbds_max)" -lt 64 || ! -b /dev/nbd63 ]]; then
   echo 'Gantry streaming requires at least 64 NBD devices before Flex bootstrap' >&2
   exit 78
 fi
@@ -1034,43 +1223,32 @@ validate_deployment() {
   wait_component_rollout daemonset/unbounded-net-node
   wait_component_rollout daemonset/unbounded-net-kube-proxy-flex-site
   if [[ "$ARTIFACT_STREAMING" == true ]]; then
+    log "Waiting for operator-managed Gantry streaming on all Flex workers"
+    deadline=$((SECONDS + TIMEOUT))
+    while true; do
+      page=$(kube -n unbounded-system get daemonsets gantry gantry-overlaybd-config --ignore-not-found -o json) \
+        || die "cannot query operator-managed Gantry streaming workloads"
+      if jq -e --arg arch "$WORKER_ARCH" --arg pool "$FLEX_POOL" --argjson count "$FLEX_COUNT" '
+        any(.items[];
+          .metadata.name == "gantry"
+          and .spec.template.spec.hostNetwork == true
+          and any(.spec.template.spec.containers[];
+            .name == "gantry" and any(.env[]?;
+              .name == "GANTRY_ARTIFACT_STREAMING_ENABLED" and .value == "true")))
+        and any(.items[];
+          .metadata.name == "gantry-overlaybd-config"
+          and .spec.template.spec.nodeSelector == {
+            "kubernetes.io/arch":$arch,"kubernetes.azure.com/agentpool":$pool}
+          and .status.desiredNumberScheduled == $count)
+      ' <<<"$page" >/dev/null; then
+        break
+      fi
+      ((SECONDS < deadline)) || die "operator did not enable Gantry artifact streaming and select all $FLEX_COUNT Flex workers; inspect site/flex-site and the gantry and gantry-overlaybd-config DaemonSets"
+      sleep 5
+    done
     wait_component_rollout daemonset/gantry
     wait_component_rollout daemonset/gantry-overlaybd-config
   fi
-}
-
-smoke_test() {
-  local namespace=aks-flex-smoke namespaces existing pods pod targets=()
-  log "Testing cross-node pods, Services, DNS, and API-server-to-kubelet exec/logs"
-  namespaces=$(kube get namespaces -o json)
-  existing=$(jq -c --arg ns "$namespace" '[.items[] | select(.metadata.name == $ns)][0] // null' <<<"$namespaces")
-  if [[ "$existing" != null ]]; then
-    jq -e --arg name "$NAME" '.metadata.labels["unbounded-flex-cluster"] == $name' <<<"$existing" >/dev/null || die "smoke namespace already exists and is not owned by this deployment"
-  fi
-  jq -n --arg ns "$namespace" --arg name "$NAME" --arg pool "$FLEX_POOL" \
-    '{apiVersion:"v1",kind:"List",items:[
-      {apiVersion:"v1",kind:"Namespace",metadata:{name:$ns,labels:{"unbounded-flex-cluster":$name}}},
-      {apiVersion:"apps/v1",kind:"DaemonSet",metadata:{name:"echo",namespace:$ns},spec:{selector:{matchLabels:{app:"flex-smoke"}},
-       template:{metadata:{labels:{app:"flex-smoke"}},spec:{nodeSelector:{"kubernetes.azure.com/agentpool":$pool},
-        containers:[{name:"echo",image:"docker.io/library/busybox:1.37.0",command:["sh","-c","mkdir -p /www; hostname > /www/index.html; exec httpd -f -p 8080 -h /www"],
-         ports:[{containerPort:8080}],resources:{requests:{cpu:"10m",memory:"16Mi"},limits:{memory:"64Mi"}},
-         readinessProbe:{httpGet:{path:"/",port:8080}}}]}}}},
-      {apiVersion:"v1",kind:"Service",metadata:{name:"echo",namespace:$ns},spec:{selector:{app:"flex-smoke"},ports:[{port:8080,targetPort:8080}]}}
-    ]}' > "$STATE_DIR/smoke.json"
-  kube apply --server-side --field-manager=aks-flex-cluster -f "$STATE_DIR/smoke.json"
-  kube -n "$namespace" rollout status daemonset/echo --timeout="${TIMEOUT}s"
-  pods=$(kube -n "$namespace" get pods -l app=flex-smoke -o json)
-  [[ "$(jq '.items | length' <<<"$pods")" == "$FLEX_COUNT" ]] || die "smoke DaemonSet does not have exactly $FLEX_COUNT pods"
-  # Bound cross-node sampling rather than issuing a quadratic all-pairs test at 1000 nodes.
-  pods=$(jq '{items: (.items | sort_by(.metadata.name) | [.[0], .[length / 2 | floor], .[-1]] | unique_by(.metadata.name))}' <<<"$pods")
-  while IFS= read -r pod; do targets+=("$pod"); done < <(jq -r '.items[].status.podIP' <<<"$pods")
-  targets+=("echo.$namespace.svc.cluster.local")
-  while IFS= read -r pod; do
-    # Expansion belongs to the container shell, not the workstation shell.
-    # shellcheck disable=SC2016
-    kube -n "$namespace" exec "$pod" -- sh -c 'set -e; for target in "$@"; do wget -q -T 15 -O - "http://$target:8080/"; done' sh "${targets[@]}"
-    kube -n "$namespace" logs "$pod" --tail=1 >/dev/null
-  done < <(jq -r '.items[].metadata.name' <<<"$pods")
 }
 
 main() {
@@ -1100,7 +1278,6 @@ main() {
   ensure_worker_network
   ensure_vmss
   validate_deployment
-  smoke_test
   write_ssh_access
   log "Deployment ready: one system node and $FLEX_COUNT Flex nodes"
   kube get nodes -L kubernetes.azure.com/agentpool,unbounded-cloud.io/site -o wide
