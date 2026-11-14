@@ -6,11 +6,11 @@ package cmd
 import (
 	"context"
 
-	"github.com/Azure/unbounded/cmd/agent/internal/containerops"
-	"github.com/Azure/unbounded/cmd/agent/internal/noneops"
+	"github.com/Azure/unbounded/pkg/agent/containerops"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/isolation"
 	"github.com/Azure/unbounded/pkg/agent/isolation/container"
+	"github.com/Azure/unbounded/pkg/agent/noneops"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 	"github.com/Azure/unbounded/pkg/agent/phases/host"
 )

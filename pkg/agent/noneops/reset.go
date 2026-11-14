@@ -13,8 +13,9 @@ import (
 	"path/filepath"
 	"syscall"
 
-	"github.com/Azure/unbounded/cmd/agent/internal/hostnode"
+	"github.com/Azure/unbounded/internal/fsutil"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/hostnode"
 	"github.com/Azure/unbounded/pkg/agent/isolation/none"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
@@ -36,6 +37,9 @@ type Teardown struct {
 	Layout     none.Layout
 	SystemdDir string
 	Run        none.Runner
+	// StateDir holds the durable reset marker. Empty uses the agent config
+	// directory. Root prefixes this path, as it does other host paths.
+	StateDir string
 
 	// Root prefixes every host path the teardown removes outside the layout and
 	// systemd directory. Empty is the real host; tests use a temporary tree.
@@ -52,6 +56,14 @@ type Teardown struct {
 func (t *Teardown) logger() *slog.Logger { return hostnode.Logger(t.Log) }
 
 func (t *Teardown) path(p string) string { return filepath.Join(t.Root, p) }
+
+func (t *Teardown) resetPath() string {
+	return t.path(filepath.Join(hostnode.OrDefault(t.StateDir, goalstates.AgentConfigDir), "none-reset"))
+}
+
+func (t *Teardown) markReset() error {
+	return fsutil.WriteFileDurable(t.resetPath(), []byte("resetting\n"), 0o600)
+}
 
 func (t *Teardown) backend() *none.Backend {
 	proc, cgroups := t.Proc, t.CgroupRoot
@@ -72,6 +84,10 @@ func (t *Teardown) backend() *none.Backend {
 // directory or an agent-owned unit. Reset uses it to choose the none teardown
 // even after the applied config is gone.
 func (t *Teardown) Present() bool {
+	if _, err := os.Lstat(t.resetPath()); err == nil {
+		return true
+	}
+
 	if _, err := os.Lstat(filepath.Dir(t.Layout.CurrentLink())); err == nil {
 		return true
 	}
@@ -96,6 +112,14 @@ func Present() bool { return (&Teardown{}).Present() }
 // Stop returns the task that stops the node stack's units.
 func (t *Teardown) Stop() phases.Task {
 	return hostnode.Func("stop-none-node", func(ctx context.Context) error {
+		if !t.Present() {
+			return nil
+		}
+
+		if err := t.markReset(); err != nil {
+			return err
+		}
+
 		b := t.backend()
 
 		var errs []error
@@ -182,11 +206,18 @@ func (t *Teardown) removeGantryHosts() error {
 // directories after unmounting whatever pods left mounted below them.
 func (t *Teardown) Destroy() phases.Task {
 	return hostnode.Func("remove-none-node", func(ctx context.Context) error {
-		errs := []error{t.backend().Destroy(ctx, none.Root{Layout: t.Layout})}
+		// Keep retry discovery even if Destroy removes the units and layout
+		// before reporting a reaping failure. The caller's final state-directory
+		// cleanup removes the marker only after the entire reset succeeds.
+		if err := t.markReset(); err != nil {
+			return err
+		}
 
-		errs = append(errs, t.removeData(ctx))
+		if err := t.backend().Destroy(ctx, none.Root{Layout: t.Layout}); err != nil {
+			return err
+		}
 
-		return errors.Join(errs...)
+		return t.removeData(ctx)
 	})
 }
 
@@ -194,10 +225,10 @@ func (t *Teardown) Destroy() phases.Task {
 // mode they live in the machine rootfs and disappear with it. The CNI plugin
 // directory is not one: the backend removes the links it made there and leaves
 // the plugins other components installed.
-var dataDirs = []string{"/var/lib/kubelet", "/var/lib/containerd", goalstates.CNIConfigDir}
+var dataDirs = []string{"/var/lib/kubelet", "/var/lib/containerd", goalstates.CNIConfigDir, hostnode.CNIStateDir}
 
 // unmountedDataDirs are the data directories pods can leave mounts below.
-var unmountedDataDirs = []string{hostnode.KubeletDir, "/var/lib/containerd"}
+var unmountedDataDirs = []string{hostnode.KubeletDir, "/var/lib/containerd", hostnode.CNIStateDir}
 
 // removeData unmounts what pods left mounted below the data directories, then
 // removes them. A directory with a mount that could not be unmounted is kept

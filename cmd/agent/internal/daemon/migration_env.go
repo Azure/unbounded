@@ -15,7 +15,6 @@ import (
 
 	"k8s.io/client-go/rest"
 
-	"github.com/Azure/unbounded/cmd/agent/internal/nspawnops"
 	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/confsnap"
@@ -23,6 +22,7 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/isolation"
 	"github.com/Azure/unbounded/pkg/agent/isolation/migrate"
 	"github.com/Azure/unbounded/pkg/agent/isolation/nspawn"
+	"github.com/Azure/unbounded/pkg/agent/nspawnops"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 	"github.com/Azure/unbounded/pkg/agent/phases/host"
 	"github.com/Azure/unbounded/pkg/agent/phases/nodestart"
