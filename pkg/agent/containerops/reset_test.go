@@ -12,12 +12,12 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/Azure/unbounded/cmd/agent/internal/noneops"
 	"github.com/Azure/unbounded/pkg/agent/isolation/container"
+	"github.com/Azure/unbounded/pkg/agent/noneops"
 )
 
-// teardownFixture has both slots prepared and kube1 running, plus the shared
-// host state a node leaves behind.
+// teardownFixture has both slots prepared and kube1 running, plus shared node
+// data and pre-existing host CNI configuration.
 func teardownFixture(t *testing.T) (*fixture, *Teardown, string) {
 	t.Helper()
 
@@ -109,7 +109,7 @@ func TestTeardownDestroyRemovesEverythingTheNodeLeft(t *testing.T) {
 	for _, p := range []string{
 		td.Layout.RootfsDir(""), filepath.Join(td.SystemdDir, container.UnitName("kube1")), filepath.Join(td.SystemdDir, container.UnitName("kube2")),
 		runtime, filepath.Dir(runtime),
-		f.hostPath("/var/lib/kubelet"), f.hostPath("/opt/cni/bin"), f.hostPath("/etc/cni/net.d"), f.hostPath("/var/lib/unbounded/container-images"),
+		f.hostPath("/var/lib/kubelet"), f.hostPath("/opt/cni/bin"), f.hostPath("/var/lib/unbounded/container-images"),
 		f.hostPath(noneops.ModulesLoadPath),
 	} {
 		_, err := os.Lstat(p)
@@ -117,6 +117,7 @@ func TestTeardownDestroyRemovesEverythingTheNodeLeft(t *testing.T) {
 	}
 
 	require.False(t, td.Present())
+	require.FileExists(t, f.hostPath("/etc/cni/net.d/10.conf"), "host CNI configuration is not owned by container slots")
 
 	// Repeating a finished teardown succeeds.
 	require.NoError(t, td.Stop().Do(t.Context()))
@@ -198,6 +199,6 @@ func TestTeardownDestroyKeepsSharedDataWhenAPodMountCannotBeUnmounted(t *testing
 
 	require.FileExists(t, f.hostPath("/var/lib/kubelet/config.yaml"), "kubelet state may sit on the mounted volume")
 	require.NoFileExists(t, f.hostPath("/opt/cni/bin/bridge"), "nothing is mounted below the CNI directories")
-	require.NoFileExists(t, f.hostPath("/etc/cni/net.d/10.conf"))
+	require.FileExists(t, f.hostPath("/etc/cni/net.d/10.conf"), "host CNI configuration is not owned by container slots")
 	require.NoDirExists(t, td.Layout.RootfsDir("kube2"), "the slots are unaffected by the mount")
 }

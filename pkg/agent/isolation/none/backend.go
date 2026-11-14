@@ -517,6 +517,11 @@ func (b *Backend) removeKubeletLaunchCheck(ctx context.Context, kubeletRunning b
 	return nil
 }
 
+// ReapPods ends the agent's container shims and pod cgroups after a successful
+// Stop. It does not stop units itself; callers must stop the stack first.
+// Proc and CgroupRoot scope cleanup exactly as they do for Destroy.
+func (b *Backend) ReapPods() error { return b.reapPods() }
+
 // reapPods ends what stopping the units leaves running: containerd runs with
 // KillMode=process so pods survive a containerd restart, which also means they
 // survive stopping it. The shims of the agent's containerd are killed, then the

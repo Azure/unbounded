@@ -14,7 +14,7 @@
 //
 // The agent wires the backend in its mode composition table. Its operations on
 // a live host (unpack, start, repave, reset) are composed by
-// cmd/agent/internal/containerops, which the daemon and bootstrap use.
+// pkg/agent/containerops, which the daemon and bootstrap use.
 package container
 
 import (

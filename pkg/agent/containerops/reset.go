@@ -12,10 +12,10 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/Azure/unbounded/cmd/agent/internal/hostnode"
-	"github.com/Azure/unbounded/cmd/agent/internal/noneops"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/hostnode"
 	"github.com/Azure/unbounded/pkg/agent/isolation/container"
+	"github.com/Azure/unbounded/pkg/agent/noneops"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
 
@@ -127,8 +127,10 @@ func (t *Teardown) RemoveConfig() phases.Task {
 
 // Destroy returns the task that removes the nodes: for each slot the unit,
 // bundle and rootfs through the backend, then the shared data the node left on
-// the host (pod mounts, kubelet state, CNI binaries and configuration), the
-// layout directory and the host runtime.
+// the host (pod mounts, kubelet state and CNI binaries), the layout directory
+// and the host runtime. CNI configuration, IPAM state and containerd data are
+// private to each slot and disappear with its rootfs; their host copies are
+// not owned by this teardown.
 //
 // The shared data goes only once every slot is destroyed, which the backend
 // reports only after the runtime confirmed its container gone: a container
@@ -164,7 +166,7 @@ func (t *Teardown) Destroy() phases.Task {
 			keepKubelet = true
 		}
 
-		for _, d := range []string{hostnode.KubeletDir, goalstates.CNIConfigDir, goalstates.CNIBinDir, container.ImageArchiveDir} {
+		for _, d := range []string{hostnode.KubeletDir, goalstates.CNIBinDir, container.ImageArchiveDir} {
 			if keepKubelet && d == hostnode.KubeletDir {
 				t.logger().Warn("keeping the kubelet directory because mounts below it could not be unmounted", "dir", d)
 

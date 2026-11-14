@@ -40,10 +40,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Azure/unbounded/cmd/agent/internal/hostnode"
+	"github.com/Azure/unbounded/internal/fsutil"
 	"github.com/Azure/unbounded/pkg/agent/config"
 	"github.com/Azure/unbounded/pkg/agent/confsnap"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/hostnode"
 	"github.com/Azure/unbounded/pkg/agent/isolation"
 	"github.com/Azure/unbounded/pkg/agent/isolation/container"
 	"github.com/Azure/unbounded/pkg/agent/phases"
@@ -68,6 +69,11 @@ type Params struct {
 	// the goal state it has already resolved so GPU and device discovery happens
 	// once.
 	GoalState *goalstates.MachineGoalState
+	// Install optionally installs caller-owned artifacts into the prepared root
+	// after base provisioning and before start. It receives the resolved goal
+	// state with container path overrides applied. It runs on every Prepare and
+	// must be idempotent; an error fails Prepare.
+	Install func(context.Context, *goalstates.MachineGoalState) error
 
 	// Overrides and Hooks are left zero in production, which is the real host.
 	// Tests set them to run a node against a temporary tree and a fake host.
@@ -118,8 +124,8 @@ type Node struct {
 	slot    string
 	backend *container.Backend
 
-	// snapshot is the shared configuration saved by a running Upgrade, until it
-	// is restored or discarded.
+	// snapshot is the shared configuration saved by an upgrade, until it is
+	// restored or discarded. UpgradeWithStartup keeps it until CommitUpgrade.
 	snapshot *hostnode.Snapshot
 
 	once sync.Once
@@ -262,7 +268,8 @@ func (n *Node) unpack(ctx context.Context, dir string) error {
 // Prepare builds the slot: installs the host runtime and lifecycle helper,
 // unpacks the image, renders the bundle and unit, and provisions the rootfs
 // (Kubernetes, CRI and CNI binaries and OS configuration). It does not start
-// anything. It is safe to repeat on a slot that is not running.
+// anything. Params.Install, when set, runs after the base rootfs provisioning.
+// It is safe to repeat on a slot that is not running.
 func (n *Node) Prepare(ctx context.Context) (isolation.NodeRoot, error) {
 	if err := n.resolve(); err != nil {
 		return nil, err
@@ -287,6 +294,12 @@ func (n *Node) Prepare(ctx context.Context) (isolation.NodeRoot, error) {
 
 	if err := n.provisionRootfs(ctx); err != nil {
 		return nil, err
+	}
+
+	if n.p.Install != nil {
+		if err := n.p.Install(ctx, n.gs); err != nil {
+			return nil, fmt.Errorf("install caller artifacts: %w", err)
+		}
 	}
 
 	return r, nil
@@ -565,7 +578,72 @@ func (n *Node) resetSharedKubeletState(ctx context.Context) error {
 // and the returned error says whether that worked. The files both slots share
 // at the same host paths, such as the kubelet identity, are saved first (see
 // confsnap) and restored before the old slot starts again.
-func (n *Node) Upgrade(ctx context.Context, old *Node) (err error) {
+func (n *Node) Upgrade(ctx context.Context, old *Node) error {
+	return n.upgrade(ctx, old, nil)
+}
+
+// UpgradeWithStartup upgrades to this slot, publishing caller-owned startup
+// state after resetting the shared kubelet identity and configuring the target,
+// before starting its container. publish is required. Before publication is
+// attempted, failures roll back as Upgrade does. Once publish is invoked, even
+// if it returns an error, failures retain both slots and the shared snapshot
+// without restoring or restarting the source. The caller owns recovery from
+// that point and must persist its applied state before calling CommitUpgrade.
+// A successful call also retains the snapshot and the stopped source slot.
+func (n *Node) UpgradeWithStartup(ctx context.Context, old *Node, publish func(context.Context) error) error {
+	if publish == nil {
+		return errors.New("startup publication callback is required")
+	}
+
+	// Refuse a retry before touching either slot: the snapshot may belong to a
+	// previous attempt whose startup publication is already durable.
+	pending, err := n.PendingUpgrade()
+	if err != nil {
+		return err
+	}
+
+	if pending {
+		return fmt.Errorf("%w in %s", confsnap.ErrSnapshotExists, n.configSnapshotDir())
+	}
+
+	return n.upgrade(ctx, old, publish)
+}
+
+// PendingUpgrade reports whether the saved upgrade snapshot path exists,
+// including an incomplete snapshot. Inspection failures are returned so callers
+// do not mistake unreadable recovery state for an idle node.
+func (n *Node) PendingUpgrade() (bool, error) {
+	_, err := os.Lstat(n.configSnapshotDir())
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+
+	if err != nil {
+		return false, fmt.Errorf("inspect container upgrade snapshot: %w", err)
+	}
+
+	return true, nil
+}
+
+// CommitUpgrade discards the saved shared configuration after the caller has
+// durably recorded its applied state. It does not remove either slot. It can
+// also be called on a new Node with the same snapshot directory after recovery.
+func (n *Node) CommitUpgrade() error {
+	dir := n.configSnapshotDir()
+	if err := confsnap.Discard(dir); err != nil {
+		return fmt.Errorf("discard container upgrade snapshot: %w", err)
+	}
+
+	if err := fsutil.SyncDir(filepath.Dir(dir)); err != nil {
+		return fmt.Errorf("sync container upgrade snapshot parent: %w", err)
+	}
+
+	n.snapshot = nil
+
+	return nil
+}
+
+func (n *Node) upgrade(ctx context.Context, old *Node, publish func(context.Context) error) (err error) {
 	if n.slot == old.slot {
 		return fmt.Errorf("upgrade needs a different slot than the running %s", old.slot)
 	}
@@ -589,7 +667,7 @@ func (n *Node) Upgrade(ctx context.Context, old *Node) (err error) {
 
 	defer func() {
 		// A snapshot that is still set was not restored, and is kept for that.
-		if err == nil && n.snapshot != nil {
+		if publish == nil && err == nil && n.snapshot != nil {
 			n.snapshot.Discard()
 
 			n.snapshot = nil
@@ -609,7 +687,22 @@ func (n *Node) Upgrade(ctx context.Context, old *Node) (err error) {
 		return n.rollback(ctx, old, fmt.Errorf("clean up network: %w", err))
 	}
 
-	if err := n.Activate(ctx); err != nil {
+	publicationAttempted := false
+
+	var beforeStart func(context.Context) error
+
+	if publish != nil {
+		beforeStart = func(ctx context.Context) error {
+			publicationAttempted = true
+			return publish(ctx)
+		}
+	}
+
+	if err := n.activate(ctx, beforeStart); err != nil {
+		if publicationAttempted {
+			return fmt.Errorf("startup publication attempted; slots and shared snapshot retained: %w", err)
+		}
+
 		return n.rollback(ctx, old, err)
 	}
 
@@ -623,6 +716,10 @@ func (n *Node) Upgrade(ctx context.Context, old *Node) (err error) {
 // of Upgrade, shared with an isolation migration into this mode, and removes
 // nothing on failure: the caller decides how to roll back.
 func (n *Node) Activate(ctx context.Context) error {
+	return n.activate(ctx, nil)
+}
+
+func (n *Node) activate(ctx context.Context, publish func(context.Context) error) error {
 	if err := n.resolve(); err != nil {
 		return err
 	}
@@ -634,6 +731,12 @@ func (n *Node) Activate(ctx context.Context) error {
 	containerdChanged, kubeletChanged, err := n.Configure(ctx)
 	if err != nil {
 		return fmt.Errorf("configure slot %s: %w", n.slot, err)
+	}
+
+	if publish != nil {
+		if err := publish(ctx); err != nil {
+			return fmt.Errorf("publish startup for slot %s: %w", n.slot, err)
+		}
 	}
 
 	if err := n.Start(ctx, false, containerdChanged, kubeletChanged); err != nil {
