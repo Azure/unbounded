@@ -1516,11 +1516,15 @@ func TestRunningRunStatusesTracksResolvedStages(t *testing.T) {
 	workflow.SetName(run.Name + "-a1")
 
 	nodes := workflow.Object["status"].(map[string]any)["nodes"].(map[string]any)
-	nodes[workflow.GetName()+"."+stageTaskName(0, 0, "prepare")] = map[string]any{
-		"phase": "Succeeded",
+	nodes[workflow.GetName()+"-1234567890"] = map[string]any{
+		"name":        workflow.GetName() + "." + stageTaskName(0, 0, "prepare"),
+		"displayName": stageTaskName(0, 0, "prepare"),
+		"phase":       "Succeeded",
 	}
-	nodes[workflow.GetName()+"."+stageTaskName(0, 1, "optional-observer")] = map[string]any{
-		"phase": "Running",
+	nodes[workflow.GetName()+"-2345678901"] = map[string]any{
+		"name":        workflow.GetName() + "." + stageTaskName(0, 1, "optional-observer"),
+		"displayName": stageTaskName(0, 1, "optional-observer"),
+		"phase":       "Running",
 	}
 
 	statuses := runningRunStatuses(workflow, run)

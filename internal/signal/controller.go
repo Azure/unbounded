@@ -4190,7 +4190,7 @@ func runningRunStatuses(
 			stage := &phase.Stages[stageIndex]
 			taskName := stageTaskName(int32(phaseIndex), int32(stageIndex), stage.Name)
 
-			node, exists := nodes[workflow.GetName()+"."+taskName].(map[string]any)
+			node, exists := workflowTaskNode(nodes, workflow.GetName(), taskName)
 			if !exists {
 				statusIndex++
 
@@ -4203,6 +4203,31 @@ func runningRunStatuses(
 	}
 
 	return statuses
+}
+
+func workflowTaskNode(
+	nodes map[string]any,
+	workflowName string,
+	taskName string,
+) (map[string]any, bool) {
+	nodeName := workflowName + "." + taskName
+	if node, exists := nodes[nodeName].(map[string]any); exists {
+		return node, true
+	}
+
+	for _, value := range nodes {
+		node, ok := value.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		if nodeString(node, "name") == nodeName ||
+			nodeString(node, "displayName") == taskName {
+			return node, true
+		}
+	}
+
+	return nil, false
 }
 
 func workflowNodeCheckPhase(phase string) signalv1.CheckPhase {
