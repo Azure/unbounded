@@ -207,6 +207,48 @@ func TestCertificationMetricsCollectorPublishesTerminalNodeStatus(t *testing.T) 
 	}
 }
 
+func TestCertificationMetricsCollectorPublishesCanceledResolvedStage(t *testing.T) {
+	t.Parallel()
+
+	run := certificationStatusRun(
+		"canceled-run",
+		"2026-01-01T00:00:00Z",
+		signalv1.RunPhaseCancelled,
+		[]signalv1.CheckPhase{signalv1.CheckPhaseSucceeded, signalv1.CheckPhaseInconclusive},
+	)
+
+	families := gatherCertificationMetrics(t, run)
+
+	status := families["project_signal_node_certification_status"]
+	if status == nil || len(status.Metric) != 1 {
+		t.Fatalf("node status metrics = %#v, want one metric", status)
+	}
+
+	assertMetricLabels(t, status.Metric[0], map[string]string{
+		"status":      "failed",
+		"phase":       "Canceled",
+		"stage":       "r02-second",
+		"stage_index": "2",
+		"stage_total": "2",
+	})
+}
+
+func TestCurrentParticipantStageReportsCanceledBeforeStart(t *testing.T) {
+	t.Parallel()
+
+	run := certificationStatusRun(
+		"canceled-before-start",
+		"2026-01-01T00:00:00Z",
+		signalv1.RunPhaseCancelled,
+		nil,
+	)
+
+	stage, index, total := currentParticipantStage(run, 0)
+	if stage != "canceled" || index != 0 || total != 2 {
+		t.Fatalf("stage = %q %d/%d, want canceled 0/2", stage, index, total)
+	}
+}
+
 func TestCertificationMetricsCollectorUsesParticipantSpecificStage(t *testing.T) {
 	t.Parallel()
 

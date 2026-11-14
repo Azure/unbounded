@@ -221,6 +221,7 @@ func currentParticipantStage(
 				}
 
 				lastCompleted = state
+			case signalv1.CheckPhaseSkipped:
 			default:
 				lastCompleted = state
 			}
@@ -245,6 +246,10 @@ func currentParticipantStage(
 
 	if lastCompleted != nil {
 		return lastCompleted.name, lastCompleted.index, total
+	}
+
+	if run.Status.Phase == signalv1.RunPhaseCancelled {
+		return "canceled", 0, total
 	}
 
 	return "pending", 0, total

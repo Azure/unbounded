@@ -420,7 +420,8 @@ type CertificationRunStatus struct {
 	Reason   string         `json:"reason,omitempty"`
 	Workflow WorkflowStatus `json:"workflow,omitempty"`
 	Evidence EvidenceStatus `json:"evidence,omitempty"`
-	// Checks remains positionally aligned with spec.checks.
+	// Checks remains positionally aligned with spec.checks for legacy Runs or
+	// the flattened resolved plan stages for phase-based Runs.
 	// +kubebuilder:validation:MaxItems=256
 	// +listType=atomic
 	Checks []CheckStatus `json:"checks,omitempty"`

@@ -1504,6 +1504,119 @@ func resolvedWorkflowTestRun() *signalv1.CertificationRun {
 	}
 }
 
+func TestRunningRunStatusesTracksResolvedStages(t *testing.T) {
+	t.Parallel()
+
+	run := resolvedWorkflowTestRun()
+	workflow := &unstructured.Unstructured{Object: map[string]any{
+		"status": map[string]any{
+			"nodes": map[string]any{},
+		},
+	}}
+	workflow.SetName(run.Name + "-a1")
+
+	nodes := workflow.Object["status"].(map[string]any)["nodes"].(map[string]any)
+	nodes[workflow.GetName()+"."+stageTaskName(0, 0, "prepare")] = map[string]any{
+		"phase": "Succeeded",
+	}
+	nodes[workflow.GetName()+"."+stageTaskName(0, 1, "optional-observer")] = map[string]any{
+		"phase": "Running",
+	}
+
+	statuses := runningRunStatuses(workflow, run)
+
+	want := []signalv1.CheckPhase{
+		signalv1.CheckPhaseSucceeded,
+		signalv1.CheckPhaseRunning,
+		signalv1.CheckPhasePending,
+	}
+	if len(statuses) != len(want) {
+		t.Fatalf("status count = %d, want %d", len(statuses), len(want))
+	}
+
+	for index := range want {
+		if statuses[index].Phase != want[index] {
+			t.Fatalf("status %d phase = %q, want %q", index, statuses[index].Phase, want[index])
+		}
+	}
+}
+
+func TestCanceledRunStatusesPreservesCompletedResolvedStages(t *testing.T) {
+	t.Parallel()
+
+	run := resolvedWorkflowTestRun()
+	workflow := &unstructured.Unstructured{Object: map[string]any{
+		"status": map[string]any{
+			"nodes": map[string]any{},
+		},
+	}}
+	workflow.SetName(run.Name + "-a1")
+
+	nodes := workflow.Object["status"].(map[string]any)["nodes"].(map[string]any)
+	nodes[workflow.GetName()+"."+stageTaskName(0, 0, "prepare")] = map[string]any{
+		"phase": "Succeeded",
+	}
+	nodes[workflow.GetName()+"."+stageTaskName(0, 1, "optional-observer")] = map[string]any{
+		"phase": "Running",
+	}
+
+	statuses := canceledRunStatuses(workflow, run)
+	if statuses[0].Phase != signalv1.CheckPhaseSucceeded {
+		t.Fatalf("completed stage phase = %q, want %q", statuses[0].Phase, signalv1.CheckPhaseSucceeded)
+	}
+
+	if statuses[1].Phase != signalv1.CheckPhaseInconclusive ||
+		statuses[1].Reason != "Canceled" {
+		t.Fatalf("active canceled stage = %#v", statuses[1])
+	}
+
+	if statuses[2].Phase != signalv1.CheckPhaseSkipped ||
+		statuses[2].Reason != "Canceled" {
+		t.Fatalf("pending canceled stage = %#v", statuses[2])
+	}
+}
+
+func TestTerminalResolvedRunStatusesUsesStageEvidence(t *testing.T) {
+	t.Parallel()
+
+	run := resolvedWorkflowTestRun()
+	workflow := &unstructured.Unstructured{Object: map[string]any{
+		"status": map[string]any{
+			"nodes": map[string]any{},
+		},
+	}}
+	workflow.SetName(run.Name + "-a1")
+
+	nodes := workflow.Object["status"].(map[string]any)["nodes"].(map[string]any)
+	nodes[workflow.GetName()+"."+stageTaskName(0, 0, "prepare")] = map[string]any{
+		"phase": "Running",
+	}
+	nodes[workflow.GetName()+"."+stageTaskName(0, 1, "optional-observer")] = map[string]any{
+		"phase": "Running",
+	}
+
+	statuses := terminalResolvedRunStatuses(
+		workflow,
+		run,
+		[]signalv1.StageEvidenceSummary{
+			{PhaseOrder: 0, StageOrder: 0, Verdict: signalv1.StageVerdictPassed},
+			{PhaseOrder: 0, StageOrder: 1, Verdict: signalv1.StageVerdictFailed},
+			{PhaseOrder: 99, StageOrder: 99, Verdict: signalv1.StageVerdictPassed},
+		},
+	)
+
+	want := []signalv1.CheckPhase{
+		signalv1.CheckPhaseSucceeded,
+		signalv1.CheckPhaseFailed,
+		signalv1.CheckPhasePending,
+	}
+	for index := range want {
+		if statuses[index].Phase != want[index] {
+			t.Fatalf("status %d phase = %q, want %q", index, statuses[index].Phase, want[index])
+		}
+	}
+}
+
 func testDurationPointer(value time.Duration) *metav1.Duration {
 	return &metav1.Duration{Duration: value}
 }

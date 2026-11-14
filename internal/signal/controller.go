@@ -2548,7 +2548,7 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 			return ctrl.Result{}, err
 		}
 
-		checkStatuses := compactCheckStatuses(runningCheckStatuses(workflow, &run))
+		checkStatuses := compactCheckStatuses(runningRunStatuses(workflow, &run))
 
 		if run.Status.Phase != signalv1.RunPhaseRunning ||
 			run.Status.Workflow.Phase != phase ||
@@ -2792,7 +2792,7 @@ func (r *RunReconciler) startWorkflow(ctx context.Context, run *signalv1.Certifi
 		Name:  workflow.GetName(),
 		Phase: "Creating",
 	}
-	run.Status.Checks = initialCheckStatuses(run.Spec.Checks)
+	run.Status.Checks = initialRunStatuses(run)
 
 	if err := r.Status().Patch(ctx, run, client.MergeFrom(before)); err != nil {
 		return ctrl.Result{}, fmt.Errorf("record Workflow creation intent: %w", err)
@@ -2833,7 +2833,7 @@ func (r *RunReconciler) finishInvalidExecutionPlan(
 		Name:  run.Name + "-a1",
 		Phase: "Error",
 	}
-	evidenceRun.Status.Checks = initialCheckStatuses(run.Spec.Checks)
+	evidenceRun.Status.Checks = initialRunStatuses(run)
 
 	for index := range evidenceRun.Status.Checks {
 		evidenceRun.Status.Checks[index].Phase = signalv1.CheckPhaseInconclusive
@@ -2893,7 +2893,7 @@ func (r *RunReconciler) recordWorkflowStarted(
 		UID:   string(workflow.GetUID()),
 		Phase: "Pending",
 	}
-	run.Status.Checks = initialCheckStatuses(run.Spec.Checks)
+	run.Status.Checks = initialRunStatuses(run)
 
 	if err := r.Status().Patch(ctx, run, client.MergeFrom(before)); err != nil {
 		return ctrl.Result{}, fmt.Errorf("record Workflow identity: %w", err)
@@ -3336,6 +3336,7 @@ func (r *RunReconciler) finishResolved(
 	evidenceRun.Status.Phase = runPhaseForVerdict(verdict)
 	evidenceRun.Status.Workflow.Phase = workflowPhase
 	evidenceRun.Status.Evidence.Identity = identity
+	evidenceRun.Status.Checks = terminalResolvedRunStatuses(workflow, run, stages)
 
 	startedAt := groupedStartedAt(workflow, run)
 	finishedAt := groupedFinishedAt(workflow, run)
@@ -4148,6 +4149,159 @@ func initialCheckStatuses(checks []signalv1.CertificationCheckSnapshot) []signal
 			Order: checks[index].Order,
 			Phase: signalv1.CheckPhasePending,
 		}
+	}
+
+	return statuses
+}
+
+func initialRunStatuses(run *signalv1.CertificationRun) []signalv1.CheckStatus {
+	if run.Spec.ResolvedPlan == nil {
+		return initialCheckStatuses(run.Spec.Checks)
+	}
+
+	statuses := make([]signalv1.CheckStatus, resolvedStageCount(*run.Spec.ResolvedPlan))
+	for index := range statuses {
+		statuses[index].Phase = signalv1.CheckPhasePending
+	}
+
+	return statuses
+}
+
+func runningRunStatuses(
+	workflow *unstructured.Unstructured,
+	run *signalv1.CertificationRun,
+) []signalv1.CheckStatus {
+	if run.Spec.ResolvedPlan == nil {
+		return runningCheckStatuses(workflow, run)
+	}
+
+	statuses := initialRunStatuses(run)
+
+	nodes, found, err := unstructured.NestedMap(workflow.Object, "status", "nodes")
+	if err != nil || !found {
+		return statuses
+	}
+
+	statusIndex := 0
+
+	for phaseIndex := range run.Spec.ResolvedPlan.Phases {
+		phase := &run.Spec.ResolvedPlan.Phases[phaseIndex]
+		for stageIndex := range phase.Stages {
+			stage := &phase.Stages[stageIndex]
+			taskName := stageTaskName(int32(phaseIndex), int32(stageIndex), stage.Name)
+
+			node, exists := nodes[workflow.GetName()+"."+taskName].(map[string]any)
+			if !exists {
+				statusIndex++
+
+				continue
+			}
+
+			statuses[statusIndex].Phase = workflowNodeCheckPhase(nodeString(node, "phase"))
+			statusIndex++
+		}
+	}
+
+	return statuses
+}
+
+func workflowNodeCheckPhase(phase string) signalv1.CheckPhase {
+	switch phase {
+	case "Running":
+		return signalv1.CheckPhaseRunning
+	case "Succeeded":
+		return signalv1.CheckPhaseSucceeded
+	case "Failed":
+		return signalv1.CheckPhaseFailed
+	case "Error":
+		return signalv1.CheckPhaseInconclusive
+	case "Skipped", "Omitted":
+		return signalv1.CheckPhaseSkipped
+	default:
+		return signalv1.CheckPhasePending
+	}
+}
+
+func canceledRunStatuses(
+	workflow *unstructured.Unstructured,
+	run *signalv1.CertificationRun,
+) []signalv1.CheckStatus {
+	statuses := initialRunStatuses(run)
+	if workflow != nil {
+		statuses = runningRunStatuses(workflow, run)
+	}
+
+	return markCanceledStatuses(statuses)
+}
+
+func terminalResolvedRunStatuses(
+	workflow *unstructured.Unstructured,
+	run *signalv1.CertificationRun,
+	stages []signalv1.StageEvidenceSummary,
+) []signalv1.CheckStatus {
+	statuses := runningRunStatuses(workflow, run)
+
+	for index := range stages {
+		stage := &stages[index]
+
+		statusIndex, ok := resolvedStageStatusIndex(
+			run.Spec.ResolvedPlan,
+			stage.PhaseOrder,
+			stage.StageOrder,
+		)
+		if !ok {
+			continue
+		}
+
+		switch stage.Verdict {
+		case signalv1.StageVerdictPassed:
+			statuses[statusIndex].Phase = signalv1.CheckPhaseSucceeded
+		case signalv1.StageVerdictFailed:
+			statuses[statusIndex].Phase = signalv1.CheckPhaseFailed
+		case signalv1.StageVerdictInconclusive, signalv1.StageVerdictCanceled:
+			statuses[statusIndex].Phase = signalv1.CheckPhaseInconclusive
+		case signalv1.StageVerdictSkipped:
+			statuses[statusIndex].Phase = signalv1.CheckPhaseSkipped
+		}
+	}
+
+	return statuses
+}
+
+func resolvedStageStatusIndex(
+	plan *signalv1.ResolvedCertificationPlan,
+	phaseOrder int32,
+	stageOrder int32,
+) (int, bool) {
+	if plan == nil || phaseOrder < 0 || int(phaseOrder) >= len(plan.Phases) ||
+		stageOrder < 0 || int(stageOrder) >= len(plan.Phases[phaseOrder].Stages) {
+		return 0, false
+	}
+
+	index := int(stageOrder)
+	for phaseIndex := range int(phaseOrder) {
+		index += len(plan.Phases[phaseIndex].Stages)
+	}
+
+	return index, true
+}
+
+func markCanceledStatuses(statuses []signalv1.CheckStatus) []signalv1.CheckStatus {
+	for index := range statuses {
+		if statuses[index].Phase == signalv1.CheckPhaseSucceeded ||
+			statuses[index].Phase == signalv1.CheckPhaseFailed ||
+			statuses[index].Phase == signalv1.CheckPhaseInconclusive {
+			continue
+		}
+
+		if statuses[index].Phase == signalv1.CheckPhaseRunning {
+			statuses[index].Phase = signalv1.CheckPhaseInconclusive
+		} else {
+			statuses[index].Phase = signalv1.CheckPhaseSkipped
+		}
+
+		statuses[index].Verdict = "Inconclusive"
+		statuses[index].Reason = "Canceled"
 	}
 
 	return statuses
@@ -5725,7 +5879,9 @@ func (r *RunReconciler) cancel(ctx context.Context, run *signalv1.CertificationR
 
 	evidenceRun.Status.Workflow.Phase = "Canceled"
 
-	statuses := initialCheckStatuses(run.Spec.Checks)
+	statuses := initialRunStatuses(run)
+
+	var stageSummaries []signalv1.StageEvidenceSummary
 
 	workflow, err := r.workflowForCancellation(ctx, run)
 	if err != nil {
@@ -5742,35 +5898,34 @@ func (r *RunReconciler) cancel(ctx context.Context, run *signalv1.CertificationR
 			evidenceRun.Status.Workflow.Phase = phase
 		}
 
-		completed, _, _ := r.terminalCheckStatuses(ctx, workflow, run)
+		if run.Spec.ResolvedPlan != nil {
+			statuses = runningRunStatuses(workflow, run)
 
-		nodes, found, nodesErr := unstructured.NestedMap(workflow.Object, "status", "nodes")
-		if nodesErr != nil {
-			return ctrl.Result{}, fmt.Errorf("read Workflow nodes during cancellation: %w", nodesErr)
-		}
+			stageSummaries, _, err = r.completedStageSummaries(ctx, workflow, run)
+			if err != nil {
+				return ctrl.Result{}, fmt.Errorf("read completed stage evidence during cancellation: %w", err)
+			}
+		} else {
+			completed, _, _ := r.terminalCheckStatuses(ctx, workflow, run)
 
-		if found {
-			for index := range run.Spec.Checks {
-				node, count := exactCheckNode(nodes, workflow.GetName(), &run.Spec.Checks[index])
+			nodes, found, nodesErr := unstructured.NestedMap(workflow.Object, "status", "nodes")
+			if nodesErr != nil {
+				return ctrl.Result{}, fmt.Errorf("read Workflow nodes during cancellation: %w", nodesErr)
+			}
 
-				if count == 1 && nodeString(node, "phase") == "Succeeded" {
-					statuses[index] = completed[index]
+			if found {
+				for index := range run.Spec.Checks {
+					node, count := exactCheckNode(nodes, workflow.GetName(), &run.Spec.Checks[index])
+
+					if count == 1 && nodeString(node, "phase") == "Succeeded" {
+						statuses[index] = completed[index]
+					}
 				}
 			}
 		}
 	}
 
-	for index := range statuses {
-		if statuses[index].Phase == signalv1.CheckPhaseSucceeded ||
-			statuses[index].Phase == signalv1.CheckPhaseFailed ||
-			statuses[index].Phase == signalv1.CheckPhaseInconclusive {
-			continue
-		}
-
-		statuses[index].Phase = signalv1.CheckPhaseSkipped
-		statuses[index].Verdict = "Inconclusive"
-		statuses[index].Reason = "Canceled"
-	}
+	statuses = markCanceledStatuses(statuses)
 
 	evidenceRun.Status.Checks = statuses
 
@@ -5780,7 +5935,7 @@ func (r *RunReconciler) cancel(ctx context.Context, run *signalv1.CertificationR
 	evidence, err := r.evidenceDocument(
 		ctx,
 		evidenceRun,
-		nil,
+		stageSummaries,
 		"Interrupted",
 		"Inconclusive",
 		evidenceRun.Status.Reason,
