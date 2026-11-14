@@ -72,8 +72,8 @@ jobs:
 
           if [[ -n "$INPUT_PLATFORMS" ]]; then
             platforms="$INPUT_PLATFORMS"
-          elif [[ "$name" == host-azurelinux3-mshv ]]; then
-            # The Microsoft Hypervisor packages are x86_64 only.
+          elif [[ "$name" == host-azurelinux3-mshv || "$name" == project-signal-certification-runner ]]; then
+            # The Microsoft Hypervisor packages and the locked CUDA runner are x86_64 only.
             platforms="linux/amd64"
           else
             platforms="linux/amd64,linux/arm64"
@@ -133,3 +133,4 @@ jobs:
       tags: ${{ needs.resolve.outputs.tag }}
       build-args: |
         VERSION=${{ needs.resolve.outputs.tag }}
+        GIT_COMMIT=${{ github.sha }}

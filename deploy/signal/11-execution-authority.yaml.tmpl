@@ -1,0 +1,192 @@
+{{- if eq (default "false" .ExecutionAuthorityEnabled) "true" }}
+{{- if ne (default "false" .AcceptanceSuitesEnabled) "true" }}
+{{- fail "ExecutionAuthorityEnabled requires AcceptanceSuitesEnabled=true" }}
+{{- end }}
+{{- if ne (default "false" .CutoverApproved) "true" }}
+{{- fail "ExecutionAuthorityEnabled requires CutoverApproved=true" }}
+{{- end }}
+{{- if not (or (eq (default "true" .HardAbort) "true") (eq (default "true" .HardAbort) "false")) }}
+{{- fail "HardAbort must be true or false" }}
+{{- end }}
+{{- if not (regexMatch "^[0-9a-f]{40}$" .SourceCommit) }}
+{{- fail "SourceCommit must be an exact 40-character hexadecimal commit" }}
+{{- end }}
+{{- if not (regexMatch "^sha256:[0-9a-f]{64}$" .StaticPackageDigest) }}
+{{- fail "StaticPackageDigest must be an algorithm-qualified sha256 digest" }}
+{{- end }}
+{{- $authorityNamespace := default "project-signal-authority" .AuthorityNamespace }}
+{{- if or (eq (default "project-signal" .Namespace) $authorityNamespace) (eq (default (default "project-signal" .Namespace) .ScriptNamespace) $authorityNamespace) }}
+{{- fail "AuthorityNamespace must be distinct from Namespace and ScriptNamespace" }}
+{{- end }}
+{{- $expectedAuthorityName := printf "project-signal-execution-authority-%s-%s" (trunc 12 .SourceCommit) (trunc 12 (trimPrefix "sha256:" .StaticPackageDigest)) }}
+{{- if ne .AuthorityName $expectedAuthorityName }}
+{{- fail "AuthorityName must match the exact source and static package digest" }}
+{{- end }}
+{{- $vllmCanaryEnabled := default "false" .VLLMCanaryEnabled }}
+{{- if not (regexMatch "^(true|false)$" $vllmCanaryEnabled) }}
+{{- fail "VLLMCanaryEnabled must be true or false" }}
+{{- end }}
+{{- if not (regexMatch "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" .BaselineProfileUID) }}
+{{- fail "BaselineProfileUID must be the exact live Profile UID" }}
+{{- end }}
+{{ if eq $vllmCanaryEnabled "true" }}
+{{- if not (regexMatch "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" .VLLMProfileUID) }}
+{{- fail "VLLMProfileUID must be the exact live Profile UID" }}
+{{ end }}
+{{- if empty .VLLMModelCachePVC }}
+{{- fail "VLLMModelCachePVC is required for execution authority" }}
+{{- end }}
+{{- if not (regexMatch "^sha256:[0-9a-f]{64}$" .VLLMModelCacheManifestDigest) }}
+{{- fail "VLLMModelCacheManifestDigest must be an algorithm-qualified sha256 digest for execution authority" }}
+{{- end }}
+{{- end }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ $authorityNamespace }}
+  labels:
+    app.kubernetes.io/name: project-signal-execution-authority
+    app.kubernetes.io/part-of: project-signal
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: project-signal-execution-authority-reader
+  namespace: {{ $authorityNamespace }}
+  labels:
+    app.kubernetes.io/part-of: project-signal
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    resourceNames:
+      - {{ .AuthorityName }}
+      - project-signal-execution-state
+    verbs: [get]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: project-signal-execution-authority-reader
+  namespace: {{ $authorityNamespace }}
+  labels:
+    app.kubernetes.io/part-of: project-signal
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: project-signal-execution-authority-reader
+subjects:
+  - kind: ServiceAccount
+    name: project-signal-controller
+    namespace: {{ default "project-signal" .Namespace }}
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .AuthorityName }}
+  namespace: {{ $authorityNamespace }}
+  labels:
+    app.kubernetes.io/name: project-signal-execution-authority
+    app.kubernetes.io/part-of: project-signal
+immutable: true
+data:
+  acceptanceSuitesEnabled: "true"
+  cutoverApproved: "true"
+  sourceCommit: {{ .SourceCommit | quote }}
+  staticPackageDigest: {{ .StaticPackageDigest }}
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: project-signal-execution-state
+  namespace: {{ $authorityNamespace }}
+  labels:
+    app.kubernetes.io/name: project-signal-execution-authority
+    app.kubernetes.io/part-of: project-signal
+data:
+  hardAbort: "true"
+
+---
+apiVersion: signal.unbounded-cloud.io/v1alpha1
+kind: CertificationProfile
+metadata:
+  name: project-signal-gpu-baseline-8x-v1
+  labels:
+    app.kubernetes.io/part-of: project-signal
+spec:
+  participants:
+    count: 1
+    selector:
+      matchLabels:
+        nvidia.com/gpu.present: "true"
+        nvidia.com/gpu.count: "8"
+        nvidia.com/gpu.product: NVIDIA-B200
+  suite:
+    name: project-signal-gpu-baseline-v1
+
+{{ if eq $vllmCanaryEnabled "true" }}
+---
+apiVersion: signal.unbounded-cloud.io/v1alpha1
+kind: CertificationProfile
+metadata:
+  name: project-signal-vllm-canary-8x-v1
+  labels:
+    app.kubernetes.io/part-of: project-signal
+spec:
+  participants:
+    count: 1
+    selector:
+      matchLabels:
+        nvidia.com/gpu.present: "true"
+        nvidia.com/gpu.count: "8"
+        nvidia.com/gpu.product: NVIDIA-B200
+  suite:
+    name: project-signal-vllm-canary-v1
+  environment:
+    namespace: {{ default "project-signal" .Namespace }}
+    modelCaches:
+      - name: project-signal-vllm-model-cache
+        reference: {{ printf "pvc://%s/%s@%s" (default "project-signal" .Namespace) .VLLMModelCachePVC .VLLMModelCacheManifestDigest | quote }}
+{{ end }}
+
+---
+apiVersion: signal.unbounded-cloud.io/v1alpha1
+kind: CertificationPolicy
+metadata:
+  name: project-signal-production-v1
+  labels:
+    app.kubernetes.io/part-of: project-signal
+spec:
+  requirements:
+    - name: canonical-gpu-inventory
+      profile:
+        name: project-signal-gpu-baseline-8x-v1
+        uid: {{ .BaselineProfileUID }}
+      requiredPassCount: 1
+      creditRule: PerParticipant
+      acceptedPlans:
+        mode: Current
+{{ if eq $vllmCanaryEnabled "true" }}
+    - name: offline-vllm-canary
+      profile:
+        name: project-signal-vllm-canary-8x-v1
+        uid: {{ .VLLMProfileUID }}
+      requiredPassCount: 1
+      creditRule: PerParticipant
+      acceptedPlans:
+        mode: Current
+{{ end }}
+  validity: 24h
+  renewBefore: 1h
+  invalidationFingerprintFields:
+    - NodeUID
+    - BootID
+    - DriverVersion
+    - GPUInventory
+  nonPassBehavior: Revoke
+  gateProjection:
+    mode: None
+{{- end }}

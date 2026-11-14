@@ -1,0 +1,2970 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.1
+  name: certificationruns.signal.unbounded-cloud.io
+spec:
+  group: signal.unbounded-cloud.io
+  names:
+    kind: CertificationRun
+    listKind: CertificationRunList
+    plural: certificationruns
+    shortNames:
+    - certrun
+    singular: certificationrun
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.profile.name
+      name: Profile
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.workflow.name
+      name: Workflow
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            properties:
+              cancel:
+                type: boolean
+              checks:
+                description: |-
+                  Checks is the immutable ordered snapshot of the Suite. A check's position
+                  defines its stable ID. New Runs use resolvedPlan.
+                items:
+                  properties:
+                    backend:
+                      enum:
+                      - Pod
+                      - MPIJob
+                      type: string
+                    backendActiveDeadline:
+                      type: string
+                    continuity:
+                      properties:
+                        maxSampleGap:
+                          description: MaxSampleGap is the maximum permitted gap between
+                            consecutive evidence samples.
+                          type: string
+                          x-kubernetes-validations:
+                          - message: maxSampleGap must be positive
+                            rule: duration(self) > duration('0s')
+                        requirePerDeviceCoverage:
+                          description: RequirePerDeviceCoverage requires evidence
+                            for every device in the starting inventory.
+                          type: boolean
+                        requireSameBootID:
+                          description: RequireSameBootID rejects evidence spanning
+                            a participant reboot.
+                          type: boolean
+                      type: object
+                    execution:
+                      properties:
+                        coverageWindow:
+                          description: CoverageWindow is the sustained activity window
+                            owned by the runner.
+                          type: string
+                        interval:
+                          description: Interval is the target separation between Periodic
+                            invocation starts.
+                          type: string
+                        iterationTimeout:
+                          description: IterationTimeout bounds each runner-owned script
+                            invocation.
+                          type: string
+                        maxGap:
+                          description: MaxGap bounds the observed gap between consecutive
+                            invocation starts.
+                          type: string
+                        minExecutions:
+                          description: MinExecutions is the minimum completed invocation
+                            count in the window.
+                          format: int32
+                          maximum: 1000000
+                          minimum: 2
+                          type: integer
+                        mode:
+                          enum:
+                          - RunOnce
+                          - Continuous
+                          - Periodic
+                          type: string
+                        role:
+                          enum:
+                          - Startup
+                          - Validation
+                          - Terminal
+                          type: string
+                      required:
+                      - mode
+                      - role
+                      type: object
+                      x-kubernetes-validations:
+                      - message: Startup and Terminal stages must use RunOnce mode
+                        rule: self.role == 'Validation' || self.mode == 'RunOnce'
+                      - message: RunOnce mode must not declare repeated-execution
+                          fields
+                        rule: self.mode != 'RunOnce' || (!has(self.coverageWindow)
+                          && !has(self.iterationTimeout) && !has(self.interval) &&
+                          !has(self.minExecutions) && !has(self.maxGap))
+                      - message: Continuous and Periodic modes require coverageWindow,
+                          iterationTimeout, minExecutions, and maxGap
+                        rule: self.mode == 'RunOnce' || (has(self.coverageWindow)
+                          && has(self.iterationTimeout) && has(self.minExecutions)
+                          && has(self.maxGap))
+                      - message: Periodic mode requires interval
+                        rule: self.mode != 'Periodic' || has(self.interval)
+                      - message: only Periodic mode may declare interval
+                        rule: self.mode == 'Periodic' || !has(self.interval)
+                      - message: coverageWindow must be positive
+                        rule: '!has(self.coverageWindow) || duration(self.coverageWindow)
+                          > duration(''0s'')'
+                      - message: coverageWindow must use whole-second precision
+                        rule: '!has(self.coverageWindow) || duration(self.coverageWindow).getMilliseconds()
+                          % 1000 == 0'
+                      - message: iterationTimeout must be positive
+                        rule: '!has(self.iterationTimeout) || duration(self.iterationTimeout)
+                          > duration(''0s'')'
+                      - message: iterationTimeout must use whole-second precision
+                        rule: '!has(self.iterationTimeout) || duration(self.iterationTimeout).getMilliseconds()
+                          % 1000 == 0'
+                      - message: iterationTimeout must not exceed coverageWindow
+                        rule: '!has(self.coverageWindow) || !has(self.iterationTimeout)
+                          || duration(self.iterationTimeout) <= duration(self.coverageWindow)'
+                      - message: interval must be positive
+                        rule: '!has(self.interval) || duration(self.interval) > duration(''0s'')'
+                      - message: interval must use whole-second precision
+                        rule: '!has(self.interval) || duration(self.interval).getMilliseconds()
+                          % 1000 == 0'
+                      - message: Periodic iterationTimeout must not exceed interval
+                        rule: '!has(self.interval) || !has(self.iterationTimeout)
+                          || duration(self.iterationTimeout) <= duration(self.interval)'
+                      - message: maxGap must be positive
+                        rule: '!has(self.maxGap) || duration(self.maxGap) > duration(''0s'')'
+                      - message: maxGap must use whole-second precision
+                        rule: '!has(self.maxGap) || duration(self.maxGap).getMilliseconds()
+                          % 1000 == 0'
+                      - message: maxGap must not exceed coverageWindow
+                        rule: '!has(self.coverageWindow) || !has(self.maxGap) || duration(self.maxGap)
+                          <= duration(self.coverageWindow)'
+                      - message: Periodic maxGap must not be less than interval
+                        rule: '!has(self.interval) || !has(self.maxGap) || duration(self.interval)
+                          <= duration(self.maxGap)'
+                      - message: minExecutions must fit within coverageWindow
+                        rule: '!has(self.interval) || !has(self.coverageWindow) ||
+                          !has(self.iterationTimeout) || !has(self.minExecutions)
+                          || duration(self.iterationTimeout).getMilliseconds() + duration(self.interval).getMilliseconds()
+                          * (self.minExecutions - 1) <= duration(self.coverageWindow).getMilliseconds()'
+                    gpuCount:
+                      format: int32
+                      minimum: 0
+                      type: integer
+                    minDuration:
+                      type: string
+                    runnerImage:
+                      pattern: ^[^@\s]+@sha256:[0-9a-f]{64}$
+                      type: string
+                    script:
+                      properties:
+                        digest:
+                          description: Digest is the algorithm-qualified SHA-256 digest
+                            of the selected script bytes.
+                          pattern: ^sha256:[0-9a-f]{64}$
+                          type: string
+                        key:
+                          maxLength: 253
+                          minLength: 1
+                          pattern: ^[-._a-zA-Z0-9]+$
+                          type: string
+                      required:
+                      - digest
+                      - key
+                      type: object
+                    workloadPolicy:
+                      properties:
+                        hostNetwork:
+                          type: boolean
+                        hostPaths:
+                          items:
+                            properties:
+                              mountPath:
+                                maxLength: 1024
+                                minLength: 1
+                                type: string
+                              path:
+                                maxLength: 1024
+                                minLength: 1
+                                type: string
+                              readOnly:
+                                type: boolean
+                            required:
+                            - mountPath
+                            - path
+                            type: object
+                            x-kubernetes-validations:
+                            - message: mountPath must be a clean absolute path
+                              rule: self.mountPath.startsWith('/') && !self.mountPath.contains('//')
+                                && !self.mountPath.contains('/./') && !self.mountPath.contains('/../')
+                                && !self.mountPath.endsWith('/.') && !self.mountPath.endsWith('/..')
+                            - message: mountPath must not replace or shadow a reserved
+                                Project Signal mount
+                              rule: self.mountPath != '/scripts' && !self.mountPath.startsWith('/scripts/')
+                                && self.mountPath != '/results' && !self.mountPath.startsWith('/results/')
+                            - message: path must be an approved proc leaf, journal
+                                path, or a clean path under /sys or /var/lib/project-signal
+                              rule: (self.path == '/proc/cpuinfo' || self.path ==
+                                '/proc/meminfo' || self.path == '/proc/version' ||
+                                self.path == '/proc/sys/kernel/random/boot_id' ||
+                                self.path == '/sys' || self.path.startsWith('/sys/')
+                                || self.path == '/var/lib/project-signal' || self.path.startsWith('/var/lib/project-signal/')
+                                || self.path == '/var/log' || self.path == '/run/log'
+                                || self.path == '/etc/machine-id') && !self.path.contains('//')
+                                && !self.path.contains('/./') && !self.path.contains('/../')
+                                && !self.path.endsWith('/.') && !self.path.endsWith('/..')
+                            - message: proc, sys, and journal host paths must be read-only
+                              rule: '!(self.path.startsWith(''/proc/'') || self.path
+                                == ''/sys'' || self.path.startsWith(''/sys/'') ||
+                                self.path == ''/var/log'' || self.path == ''/run/log''
+                                || self.path == ''/etc/machine-id'') || self.readOnly'
+                          maxItems: 16
+                          type: array
+                          x-kubernetes-list-map-keys:
+                          - mountPath
+                          x-kubernetes-list-type: map
+                        ipcLock:
+                          type: boolean
+                        privileged:
+                          type: boolean
+                        resources:
+                          description: ResourceRequirements describes the compute
+                            resource requirements.
+                          properties:
+                            claims:
+                              description: |-
+                                Claims lists the names of resources, defined in spec.resourceClaims,
+                                that are used by this container.
+
+                                This field depends on the
+                                DynamicResourceAllocation feature gate.
+
+                                This field is immutable. It can only be set for containers.
+                              items:
+                                description: ResourceClaim references one entry in
+                                  PodSpec.ResourceClaims.
+                                properties:
+                                  name:
+                                    description: |-
+                                      Name must match the name of one entry in pod.spec.resourceClaims of
+                                      the Pod where this field is used. It makes that resource available
+                                      inside a container.
+                                    type: string
+                                  request:
+                                    description: |-
+                                      Request is the name chosen for a request in the referenced claim.
+                                      If empty, everything from the claim is made available, otherwise
+                                      only the result of this request.
+                                    type: string
+                                required:
+                                - name
+                                type: object
+                              type: array
+                              x-kubernetes-list-map-keys:
+                              - name
+                              x-kubernetes-list-type: map
+                            limits:
+                              additionalProperties:
+                                anyOf:
+                                - type: integer
+                                - type: string
+                                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                                x-kubernetes-int-or-string: true
+                              description: |-
+                                Limits describes the maximum amount of compute resources allowed.
+                                More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                              type: object
+                            requests:
+                              additionalProperties:
+                                anyOf:
+                                - type: integer
+                                - type: string
+                                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                                x-kubernetes-int-or-string: true
+                              description: |-
+                                Requests describes the minimum amount of compute resources required.
+                                If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                                otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                                More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                              type: object
+                          type: object
+                      type: object
+                  required:
+                  - backend
+                  - backendActiveDeadline
+                  - runnerImage
+                  - script
+                  type: object
+                  x-kubernetes-validations:
+                  - message: backendActiveDeadline must be positive
+                    rule: duration(self.backendActiveDeadline) > duration('0s')
+                  - message: MPIJob checks require a positive gpuCount
+                    rule: self.backend != 'MPIJob' || (has(self.gpuCount) && self.gpuCount
+                      > 0)
+                  - message: minDuration must be positive
+                    rule: '!has(self.minDuration) || duration(self.minDuration) >
+                      duration(''0s'')'
+                  - message: minDuration must not exceed backendActiveDeadline
+                    rule: '!has(self.minDuration) || duration(self.minDuration) <=
+                      duration(self.backendActiveDeadline)'
+                  - message: maxSampleGap must not exceed backendActiveDeadline
+                    rule: '!has(self.continuity) || !has(self.continuity.maxSampleGap)
+                      || duration(self.continuity.maxSampleGap) <= duration(self.backendActiveDeadline)'
+                  - message: maxSampleGap must not exceed minDuration
+                    rule: '!has(self.minDuration) || !has(self.continuity) || !has(self.continuity.maxSampleGap)
+                      || duration(self.continuity.maxSampleGap) <= duration(self.minDuration)'
+                  - message: coverageWindow must not exceed backendActiveDeadline
+                    rule: '!has(self.execution) || !has(self.execution.coverageWindow)
+                      || duration(self.execution.coverageWindow) <= duration(self.backendActiveDeadline)'
+                  - message: repeated execution requires a whole-second backendActiveDeadline
+                    rule: '!has(self.execution) || self.execution.mode == ''RunOnce''
+                      || duration(self.backendActiveDeadline).getMilliseconds() %
+                      1000 == 0'
+                maxItems: 256
+                type: array
+                x-kubernetes-list-type: atomic
+              environment:
+                description: Environment is the immutable Profile environment binding
+                  snapshot.
+                properties:
+                  modelCaches:
+                    items:
+                      properties:
+                        name:
+                          maxLength: 63
+                          minLength: 1
+                          type: string
+                        reference:
+                          maxLength: 253
+                          minLength: 1
+                          type: string
+                      required:
+                      - name
+                      - reference
+                      type: object
+                    maxItems: 16
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                  namespace:
+                    description: Namespace is the approved execution namespace.
+                    maxLength: 63
+                    minLength: 1
+                    type: string
+                  networks:
+                    items:
+                      properties:
+                        attachmentDefinition:
+                          maxLength: 253
+                          type: string
+                        interfaceClass:
+                          maxLength: 128
+                          minLength: 1
+                          type: string
+                        name:
+                          maxLength: 63
+                          minLength: 1
+                          type: string
+                      required:
+                      - interfaceClass
+                      - name
+                      type: object
+                    maxItems: 16
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                  objectStores:
+                    items:
+                      properties:
+                        name:
+                          maxLength: 63
+                          minLength: 1
+                          type: string
+                        reference:
+                          maxLength: 253
+                          minLength: 1
+                          type: string
+                      required:
+                      - name
+                      - reference
+                      type: object
+                    maxItems: 16
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                  resolvers:
+                    items:
+                      properties:
+                        name:
+                          maxLength: 63
+                          minLength: 1
+                          type: string
+                        reference:
+                          maxLength: 253
+                          minLength: 1
+                          type: string
+                      required:
+                      - name
+                      - reference
+                      type: object
+                    maxItems: 16
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                  resources:
+                    description: ResourceRequirements describes the compute resource
+                      requirements.
+                    properties:
+                      claims:
+                        description: |-
+                          Claims lists the names of resources, defined in spec.resourceClaims,
+                          that are used by this container.
+
+                          This field depends on the
+                          DynamicResourceAllocation feature gate.
+
+                          This field is immutable. It can only be set for containers.
+                        items:
+                          description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                          properties:
+                            name:
+                              description: |-
+                                Name must match the name of one entry in pod.spec.resourceClaims of
+                                the Pod where this field is used. It makes that resource available
+                                inside a container.
+                              type: string
+                            request:
+                              description: |-
+                                Request is the name chosen for a request in the referenced claim.
+                                If empty, everything from the claim is made available, otherwise
+                                only the result of this request.
+                              type: string
+                          required:
+                          - name
+                          type: object
+                        type: array
+                        x-kubernetes-list-map-keys:
+                        - name
+                        x-kubernetes-list-type: map
+                      limits:
+                        additionalProperties:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                        description: |-
+                          Limits describes the maximum amount of compute resources allowed.
+                          More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                        type: object
+                      requests:
+                        additionalProperties:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                        description: |-
+                          Requests describes the minimum amount of compute resources required.
+                          If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                          otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                          More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                        type: object
+                    type: object
+                  runtimeClassName:
+                    maxLength: 253
+                    type: string
+                  secretRefs:
+                    description: |-
+                      SecretRefs contain names only. Secret values must never enter Profile,
+                      Run, plan digest, or evidence objects.
+                    items:
+                      description: |-
+                        LocalObjectReference contains enough information to let you locate the
+                        referenced object inside the same namespace.
+                      properties:
+                        name:
+                          default: ""
+                          description: |-
+                            Name of the referent.
+                            This field is effectively required, but due to backwards compatibility is
+                            allowed to be empty. Instances of this type with an empty value here are
+                            almost certainly wrong.
+                            More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                          type: string
+                      type: object
+                      x-kubernetes-map-type: atomic
+                    maxItems: 32
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                  storage:
+                    items:
+                      properties:
+                        accessModes:
+                          items:
+                            type: string
+                          maxItems: 4
+                          type: array
+                          x-kubernetes-list-type: set
+                        capacity:
+                          description: Capacity uses Kubernetes quantity syntax.
+                          maxLength: 64
+                          minLength: 1
+                          type: string
+                        disposable:
+                          type: boolean
+                        mountPath:
+                          maxLength: 1024
+                          minLength: 1
+                          type: string
+                        name:
+                          maxLength: 63
+                          minLength: 1
+                          type: string
+                        storageClassName:
+                          maxLength: 253
+                          minLength: 1
+                          type: string
+                      required:
+                      - capacity
+                      - mountPath
+                      - name
+                      - storageClassName
+                      type: object
+                    maxItems: 16
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                required:
+                - namespace
+                type: object
+                x-kubernetes-validations:
+                - message: environment resource limits must not exceed 16 entries
+                  rule: '!has(self.resources) || !has(self.resources.limits) || size(self.resources.limits)
+                    <= 16'
+                - message: environment resource requests must not exceed 16 entries
+                  rule: '!has(self.resources) || !has(self.resources.requests) ||
+                    size(self.resources.requests) <= 16'
+                - message: environment resource claims must not exceed 16 entries
+                  rule: '!has(self.resources) || !has(self.resources.claims) || size(self.resources.claims)
+                    <= 16'
+              participants:
+                items:
+                  properties:
+                    nodeName:
+                      maxLength: 253
+                      minLength: 1
+                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                      type: string
+                    nodeUID:
+                      description: |-
+                        UID is a type that holds unique ID values, including UUIDs.  Because we
+                        don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                        intent and helps make sure that UIDs and names do not get conflated.
+                      type: string
+                  required:
+                  - nodeName
+                  - nodeUID
+                  type: object
+                  x-kubernetes-validations:
+                  - message: nodeUID is required
+                    rule: size(self.nodeUID) > 0
+                maxItems: 8
+                minItems: 1
+                type: array
+              planDigest:
+                description: |-
+                  PlanDigest is the canonical digest of all execution-affecting inputs.
+                  It is optional only for backward decoding of Runs created before this contract.
+                pattern: ^sha256:[0-9a-f]{64}$
+                type: string
+              planProvenance:
+                description: PlanProvenance pins shared execution inputs not carried
+                  by individual checks.
+                properties:
+                  adapterImage:
+                    description: AdapterImage is the immutable adapter image included
+                      in the execution plan.
+                    pattern: ^[^@\s]+@sha256:[0-9a-f]{64}$
+                    type: string
+                  controllerImage:
+                    description: ControllerImage is the immutable controller image
+                      that resolved the plan.
+                    pattern: ^[^@\s]+@sha256:[0-9a-f]{64}$
+                    type: string
+                  resolverImages:
+                    items:
+                      pattern: ^[^@\s]+@sha256:[0-9a-f]{64}$
+                      type: string
+                    maxItems: 16
+                    type: array
+                    x-kubernetes-list-type: set
+                  workflowTemplateDigest:
+                    description: WorkflowTemplateDigest identifies the rendered workflow/template
+                      semantics.
+                    pattern: ^sha256:[0-9a-f]{64}$
+                    type: string
+                required:
+                - adapterImage
+                - workflowTemplateDigest
+                type: object
+              profile:
+                properties:
+                  generation:
+                    format: int64
+                    minimum: 1
+                    type: integer
+                  name:
+                    minLength: 1
+                    type: string
+                  uid:
+                    description: |-
+                      UID is a type that holds unique ID values, including UUIDs.  Because we
+                      don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                      intent and helps make sure that UIDs and names do not get conflated.
+                    type: string
+                required:
+                - generation
+                - name
+                - uid
+                type: object
+                x-kubernetes-validations:
+                - message: uid is required
+                  rule: size(self.uid) > 0
+              release:
+                type: boolean
+              resolvedPlan:
+                description: |-
+                  ResolvedPlan freezes every test, driver, parameter, assertion, schedule,
+                  mutable authoring input, and trust decision before execution.
+                properties:
+                  phases:
+                    items:
+                      properties:
+                        displayName:
+                          maxLength: 128
+                          type: string
+                        name:
+                          maxLength: 63
+                          minLength: 1
+                          type: string
+                        role:
+                          enum:
+                          - Startup
+                          - Validation
+                          - Terminal
+                          type: string
+                        stages:
+                          items:
+                            properties:
+                              assertions:
+                                items:
+                                  properties:
+                                    expected:
+                                      properties:
+                                        booleanValue:
+                                          type: boolean
+                                        decimalValue:
+                                          description: DecimalValue is a base-10 JSON-independent
+                                            decimal representation.
+                                          maxLength: 128
+                                          pattern: ^-?(0|[1-9][0-9]*)(\.[0-9]+)?$
+                                          type: string
+                                        durationValue:
+                                          type: string
+                                        integerValue:
+                                          format: int64
+                                          type: integer
+                                        quantityValue:
+                                          description: QuantityValue uses Kubernetes
+                                            quantity syntax.
+                                          maxLength: 64
+                                          minLength: 1
+                                          type: string
+                                        stringValue:
+                                          maxLength: 65536
+                                          type: string
+                                        type:
+                                          enum:
+                                          - String
+                                          - Integer
+                                          - Decimal
+                                          - Boolean
+                                          - Duration
+                                          - Quantity
+                                          type: string
+                                      required:
+                                      - type
+                                      type: object
+                                      x-kubernetes-validations:
+                                      - message: exactly the value field matching
+                                          type must be set
+                                        rule: (self.type == 'String' && has(self.stringValue)
+                                          && !has(self.integerValue) && !has(self.decimalValue)
+                                          && !has(self.booleanValue) && !has(self.durationValue)
+                                          && !has(self.quantityValue)) || (self.type
+                                          == 'Integer' && !has(self.stringValue) &&
+                                          has(self.integerValue) && !has(self.decimalValue)
+                                          && !has(self.booleanValue) && !has(self.durationValue)
+                                          && !has(self.quantityValue)) || (self.type
+                                          == 'Decimal' && !has(self.stringValue) &&
+                                          !has(self.integerValue) && has(self.decimalValue)
+                                          && !has(self.booleanValue) && !has(self.durationValue)
+                                          && !has(self.quantityValue)) || (self.type
+                                          == 'Boolean' && !has(self.stringValue) &&
+                                          !has(self.integerValue) && !has(self.decimalValue)
+                                          && has(self.booleanValue) && !has(self.durationValue)
+                                          && !has(self.quantityValue)) || (self.type
+                                          == 'Duration' && !has(self.stringValue)
+                                          && !has(self.integerValue) && !has(self.decimalValue)
+                                          && !has(self.booleanValue) && has(self.durationValue)
+                                          && !has(self.quantityValue)) || (self.type
+                                          == 'Quantity' && !has(self.stringValue)
+                                          && !has(self.integerValue) && !has(self.decimalValue)
+                                          && !has(self.booleanValue) && !has(self.durationValue)
+                                          && has(self.quantityValue))
+                                    maximum:
+                                      properties:
+                                        booleanValue:
+                                          type: boolean
+                                        decimalValue:
+                                          description: DecimalValue is a base-10 JSON-independent
+                                            decimal representation.
+                                          maxLength: 128
+                                          pattern: ^-?(0|[1-9][0-9]*)(\.[0-9]+)?$
+                                          type: string
+                                        durationValue:
+                                          type: string
+                                        integerValue:
+                                          format: int64
+                                          type: integer
+                                        quantityValue:
+                                          description: QuantityValue uses Kubernetes
+                                            quantity syntax.
+                                          maxLength: 64
+                                          minLength: 1
+                                          type: string
+                                        stringValue:
+                                          maxLength: 65536
+                                          type: string
+                                        type:
+                                          enum:
+                                          - String
+                                          - Integer
+                                          - Decimal
+                                          - Boolean
+                                          - Duration
+                                          - Quantity
+                                          type: string
+                                      required:
+                                      - type
+                                      type: object
+                                      x-kubernetes-validations:
+                                      - message: exactly the value field matching
+                                          type must be set
+                                        rule: (self.type == 'String' && has(self.stringValue)
+                                          && !has(self.integerValue) && !has(self.decimalValue)
+                                          && !has(self.booleanValue) && !has(self.durationValue)
+                                          && !has(self.quantityValue)) || (self.type
+                                          == 'Integer' && !has(self.stringValue) &&
+                                          has(self.integerValue) && !has(self.decimalValue)
+                                          && !has(self.booleanValue) && !has(self.durationValue)
+                                          && !has(self.quantityValue)) || (self.type
+                                          == 'Decimal' && !has(self.stringValue) &&
+                                          !has(self.integerValue) && has(self.decimalValue)
+                                          && !has(self.booleanValue) && !has(self.durationValue)
+                                          && !has(self.quantityValue)) || (self.type
+                                          == 'Boolean' && !has(self.stringValue) &&
+                                          !has(self.integerValue) && !has(self.decimalValue)
+                                          && has(self.booleanValue) && !has(self.durationValue)
+                                          && !has(self.quantityValue)) || (self.type
+                                          == 'Duration' && !has(self.stringValue)
+                                          && !has(self.integerValue) && !has(self.decimalValue)
+                                          && !has(self.booleanValue) && has(self.durationValue)
+                                          && !has(self.quantityValue)) || (self.type
+                                          == 'Quantity' && !has(self.stringValue)
+                                          && !has(self.integerValue) && !has(self.decimalValue)
+                                          && !has(self.booleanValue) && !has(self.durationValue)
+                                          && has(self.quantityValue))
+                                    metric:
+                                      description: Metric names must exist in the
+                                        referenced CertificationTest metric schema.
+                                      maxLength: 63
+                                      minLength: 1
+                                      type: string
+                                    minimum:
+                                      properties:
+                                        booleanValue:
+                                          type: boolean
+                                        decimalValue:
+                                          description: DecimalValue is a base-10 JSON-independent
+                                            decimal representation.
+                                          maxLength: 128
+                                          pattern: ^-?(0|[1-9][0-9]*)(\.[0-9]+)?$
+                                          type: string
+                                        durationValue:
+                                          type: string
+                                        integerValue:
+                                          format: int64
+                                          type: integer
+                                        quantityValue:
+                                          description: QuantityValue uses Kubernetes
+                                            quantity syntax.
+                                          maxLength: 64
+                                          minLength: 1
+                                          type: string
+                                        stringValue:
+                                          maxLength: 65536
+                                          type: string
+                                        type:
+                                          enum:
+                                          - String
+                                          - Integer
+                                          - Decimal
+                                          - Boolean
+                                          - Duration
+                                          - Quantity
+                                          type: string
+                                      required:
+                                      - type
+                                      type: object
+                                      x-kubernetes-validations:
+                                      - message: exactly the value field matching
+                                          type must be set
+                                        rule: (self.type == 'String' && has(self.stringValue)
+                                          && !has(self.integerValue) && !has(self.decimalValue)
+                                          && !has(self.booleanValue) && !has(self.durationValue)
+                                          && !has(self.quantityValue)) || (self.type
+                                          == 'Integer' && !has(self.stringValue) &&
+                                          has(self.integerValue) && !has(self.decimalValue)
+                                          && !has(self.booleanValue) && !has(self.durationValue)
+                                          && !has(self.quantityValue)) || (self.type
+                                          == 'Decimal' && !has(self.stringValue) &&
+                                          !has(self.integerValue) && has(self.decimalValue)
+                                          && !has(self.booleanValue) && !has(self.durationValue)
+                                          && !has(self.quantityValue)) || (self.type
+                                          == 'Boolean' && !has(self.stringValue) &&
+                                          !has(self.integerValue) && !has(self.decimalValue)
+                                          && has(self.booleanValue) && !has(self.durationValue)
+                                          && !has(self.quantityValue)) || (self.type
+                                          == 'Duration' && !has(self.stringValue)
+                                          && !has(self.integerValue) && !has(self.decimalValue)
+                                          && !has(self.booleanValue) && has(self.durationValue)
+                                          && !has(self.quantityValue)) || (self.type
+                                          == 'Quantity' && !has(self.stringValue)
+                                          && !has(self.integerValue) && !has(self.decimalValue)
+                                          && !has(self.booleanValue) && !has(self.durationValue)
+                                          && has(self.quantityValue))
+                                    name:
+                                      maxLength: 63
+                                      minLength: 1
+                                      pattern: ^[a-z]([-a-z0-9]*[a-z0-9])?$
+                                      type: string
+                                    operator:
+                                      enum:
+                                      - BooleanEquals
+                                      - StatusEquals
+                                      - Minimum
+                                      - Maximum
+                                      - Range
+                                      - CountMinimum
+                                      - ErrorRateMaximum
+                                      - PercentileMaximum
+                                      type: string
+                                    percentile:
+                                      format: int32
+                                      maximum: 100
+                                      minimum: 0
+                                      type: integer
+                                  required:
+                                  - metric
+                                  - name
+                                  - operator
+                                  type: object
+                                  x-kubernetes-validations:
+                                  - message: Range assertions require minimum and
+                                      maximum and forbid expected
+                                    rule: self.operator != 'Range' || (has(self.minimum)
+                                      && has(self.maximum) && !has(self.expected))
+                                  - message: minimum and expected are mutually exclusive
+                                      outside Range
+                                    rule: self.operator == 'Range' || !has(self.minimum)
+                                      || !has(self.expected)
+                                  - message: maximum and expected are mutually exclusive
+                                      outside Range
+                                    rule: self.operator == 'Range' || !has(self.maximum)
+                                      || !has(self.expected)
+                                  - message: non-Range assertions require expected
+                                    rule: self.operator == 'Range' || has(self.expected)
+                                  - message: PercentileMaximum assertions require
+                                      percentile
+                                    rule: self.operator != 'PercentileMaximum' ||
+                                      has(self.percentile)
+                                  - message: percentile is valid only for PercentileMaximum
+                                      assertions
+                                    rule: self.operator == 'PercentileMaximum' ||
+                                      !has(self.percentile)
+                                maxItems: 16
+                                type: array
+                                x-kubernetes-list-map-keys:
+                                - name
+                                x-kubernetes-list-type: map
+                              dependsOn:
+                                items:
+                                  properties:
+                                    condition:
+                                      description: |-
+                                        Condition defaults to Succeeded. Completed allows terminal cleanup or
+                                        evidence stages to run after any terminal dependency outcome.
+                                      enum:
+                                      - Succeeded
+                                      - Completed
+                                      type: string
+                                    stage:
+                                      description: Stage is the stable name of another
+                                        stage in this Suite.
+                                      maxLength: 63
+                                      minLength: 1
+                                      pattern: ^[a-z]([-a-z0-9]*[a-z0-9])?$
+                                      type: string
+                                  required:
+                                  - stage
+                                  type: object
+                                maxItems: 16
+                                type: array
+                                x-kubernetes-list-map-keys:
+                                - stage
+                                x-kubernetes-list-type: map
+                              diagnosticOnly:
+                                type: boolean
+                              displayName:
+                                maxLength: 128
+                                type: string
+                              name:
+                                maxLength: 63
+                                minLength: 1
+                                type: string
+                              optional:
+                                type: boolean
+                              parameters:
+                                items:
+                                  properties:
+                                    name:
+                                      maxLength: 63
+                                      minLength: 1
+                                      type: string
+                                    value:
+                                      properties:
+                                        booleanValue:
+                                          type: boolean
+                                        decimalValue:
+                                          description: DecimalValue is a base-10 JSON-independent
+                                            decimal representation.
+                                          maxLength: 128
+                                          pattern: ^-?(0|[1-9][0-9]*)(\.[0-9]+)?$
+                                          type: string
+                                        durationValue:
+                                          type: string
+                                        integerValue:
+                                          format: int64
+                                          type: integer
+                                        quantityValue:
+                                          description: QuantityValue uses Kubernetes
+                                            quantity syntax.
+                                          maxLength: 64
+                                          minLength: 1
+                                          type: string
+                                        stringValue:
+                                          maxLength: 65536
+                                          type: string
+                                        type:
+                                          enum:
+                                          - String
+                                          - Integer
+                                          - Decimal
+                                          - Boolean
+                                          - Duration
+                                          - Quantity
+                                          type: string
+                                      required:
+                                      - type
+                                      type: object
+                                      x-kubernetes-validations:
+                                      - message: exactly the value field matching
+                                          type must be set
+                                        rule: (self.type == 'String' && has(self.stringValue)
+                                          && !has(self.integerValue) && !has(self.decimalValue)
+                                          && !has(self.booleanValue) && !has(self.durationValue)
+                                          && !has(self.quantityValue)) || (self.type
+                                          == 'Integer' && !has(self.stringValue) &&
+                                          has(self.integerValue) && !has(self.decimalValue)
+                                          && !has(self.booleanValue) && !has(self.durationValue)
+                                          && !has(self.quantityValue)) || (self.type
+                                          == 'Decimal' && !has(self.stringValue) &&
+                                          !has(self.integerValue) && has(self.decimalValue)
+                                          && !has(self.booleanValue) && !has(self.durationValue)
+                                          && !has(self.quantityValue)) || (self.type
+                                          == 'Boolean' && !has(self.stringValue) &&
+                                          !has(self.integerValue) && !has(self.decimalValue)
+                                          && has(self.booleanValue) && !has(self.durationValue)
+                                          && !has(self.quantityValue)) || (self.type
+                                          == 'Duration' && !has(self.stringValue)
+                                          && !has(self.integerValue) && !has(self.decimalValue)
+                                          && !has(self.booleanValue) && has(self.durationValue)
+                                          && !has(self.quantityValue)) || (self.type
+                                          == 'Quantity' && !has(self.stringValue)
+                                          && !has(self.integerValue) && !has(self.decimalValue)
+                                          && !has(self.booleanValue) && !has(self.durationValue)
+                                          && has(self.quantityValue))
+                                  required:
+                                  - name
+                                  - value
+                                  type: object
+                                maxItems: 16
+                                type: array
+                                x-kubernetes-list-map-keys:
+                                - name
+                                x-kubernetes-list-type: map
+                              participantRoles:
+                                items:
+                                  properties:
+                                    participantIndexes:
+                                      description: ParticipantIndexes freezes the
+                                        ordered Run participants assigned to this
+                                        role.
+                                      items:
+                                        format: int32
+                                        maximum: 7
+                                        minimum: 0
+                                        type: integer
+                                      maxItems: 8
+                                      minItems: 1
+                                      type: array
+                                      x-kubernetes-list-type: set
+                                    role:
+                                      maxLength: 63
+                                      minLength: 1
+                                      type: string
+                                  required:
+                                  - participantIndexes
+                                  - role
+                                  type: object
+                                maxItems: 8
+                                type: array
+                                x-kubernetes-list-map-keys:
+                                - role
+                                x-kubernetes-list-type: map
+                              perDeviceCoverageInterval:
+                                type: string
+                              qualificationEligible:
+                                type: boolean
+                              resolvedInputs:
+                                items:
+                                  properties:
+                                    digest:
+                                      pattern: ^sha256:[0-9a-f]{64}$
+                                      type: string
+                                    incompleteReason:
+                                      maxLength: 256
+                                      type: string
+                                    kind:
+                                      enum:
+                                      - Image
+                                      - Model
+                                      - Tokenizer
+                                      - Artifact
+                                      - WorkflowTemplate
+                                      - ResolverOutput
+                                      type: string
+                                    name:
+                                      maxLength: 63
+                                      minLength: 1
+                                      type: string
+                                    requested:
+                                      description: |-
+                                        Requested preserves the authoring input, including a mutable channel such
+                                        as latest. It never authorizes execution by itself.
+                                      maxLength: 512
+                                      minLength: 1
+                                      type: string
+                                    resolved:
+                                      description: Resolved is the immutable revision
+                                        or identity selected before Run start.
+                                      maxLength: 512
+                                      type: string
+                                    state:
+                                      enum:
+                                      - Complete
+                                      - Incomplete
+                                      type: string
+                                  required:
+                                  - kind
+                                  - name
+                                  - requested
+                                  - state
+                                  type: object
+                                  x-kubernetes-validations:
+                                  - message: complete inputs require an immutable
+                                      resolved identity and digest
+                                    rule: self.state != 'Complete' || (has(self.resolved)
+                                      && size(self.resolved.trim()) > 0 && has(self.digest))
+                                  - message: complete inputs must not declare incompleteReason
+                                    rule: self.state != 'Complete' || !has(self.incompleteReason)
+                                  - message: incomplete inputs require incompleteReason
+                                      and must not claim a digest
+                                    rule: self.state != 'Incomplete' || (has(self.incompleteReason)
+                                      && size(self.incompleteReason.trim()) > 0 &&
+                                      !has(self.digest))
+                                maxItems: 8
+                                type: array
+                                x-kubernetes-list-map-keys:
+                                - name
+                                x-kubernetes-list-type: map
+                              retry:
+                                properties:
+                                  maxAttempts:
+                                    description: MaxAttempts includes the initial
+                                      attempt.
+                                    format: int32
+                                    maximum: 8
+                                    minimum: 1
+                                    type: integer
+                                  retryableFailures:
+                                    items:
+                                      enum:
+                                      - InfrastructureFailure
+                                      type: string
+                                    maxItems: 1
+                                    type: array
+                                    x-kubernetes-list-type: set
+                                required:
+                                - maxAttempts
+                                type: object
+                              schedule:
+                                properties:
+                                  coverageWindow:
+                                    type: string
+                                  interval:
+                                    type: string
+                                  invocationTimeout:
+                                    description: InvocationTimeout bounds every invocation,
+                                      including RunOnce.
+                                    type: string
+                                  maxGap:
+                                    type: string
+                                  minExecutions:
+                                    format: int32
+                                    maximum: 1000000
+                                    minimum: 2
+                                    type: integer
+                                  mode:
+                                    enum:
+                                    - RunOnce
+                                    - Continuous
+                                    - Periodic
+                                    type: string
+                                required:
+                                - invocationTimeout
+                                - mode
+                                type: object
+                                x-kubernetes-validations:
+                                - message: RunOnce schedules must not declare repeated-execution
+                                    fields
+                                  rule: self.mode != 'RunOnce' || (!has(self.coverageWindow)
+                                    && !has(self.interval) && !has(self.minExecutions)
+                                    && !has(self.maxGap))
+                                - message: Continuous and Periodic schedules require
+                                    coverageWindow, minExecutions, and maxGap
+                                  rule: self.mode == 'RunOnce' || (has(self.coverageWindow)
+                                    && has(self.minExecutions) && has(self.maxGap))
+                                - message: Periodic schedules require interval
+                                  rule: self.mode != 'Periodic' || has(self.interval)
+                                - message: only Periodic schedules may declare interval
+                                  rule: self.mode == 'Periodic' || !has(self.interval)
+                                - message: invocationTimeout must be positive
+                                  rule: duration(self.invocationTimeout) > duration('0s')
+                                - message: invocationTimeout must use whole-second
+                                    precision
+                                  rule: duration(self.invocationTimeout).getMilliseconds()
+                                    % 1000 == 0
+                                - message: coverageWindow must be positive
+                                  rule: '!has(self.coverageWindow) || duration(self.coverageWindow)
+                                    > duration(''0s'')'
+                                - message: coverageWindow must use whole-second precision
+                                  rule: '!has(self.coverageWindow) || duration(self.coverageWindow).getMilliseconds()
+                                    % 1000 == 0'
+                                - message: invocationTimeout must not exceed coverageWindow
+                                  rule: '!has(self.coverageWindow) || duration(self.invocationTimeout)
+                                    <= duration(self.coverageWindow)'
+                                - message: interval must be positive
+                                  rule: '!has(self.interval) || duration(self.interval)
+                                    > duration(''0s'')'
+                                - message: interval must use whole-second precision
+                                  rule: '!has(self.interval) || duration(self.interval).getMilliseconds()
+                                    % 1000 == 0'
+                                - message: Periodic invocationTimeout must not exceed
+                                    interval
+                                  rule: '!has(self.interval) || duration(self.invocationTimeout)
+                                    <= duration(self.interval)'
+                                - message: maxGap must be positive
+                                  rule: '!has(self.maxGap) || duration(self.maxGap)
+                                    > duration(''0s'')'
+                                - message: maxGap must use whole-second precision
+                                  rule: '!has(self.maxGap) || duration(self.maxGap).getMilliseconds()
+                                    % 1000 == 0'
+                                - message: maxGap must not exceed coverageWindow
+                                  rule: '!has(self.coverageWindow) || !has(self.maxGap)
+                                    || duration(self.maxGap) <= duration(self.coverageWindow)'
+                                - message: Periodic maxGap must not be less than interval
+                                  rule: '!has(self.interval) || !has(self.maxGap)
+                                    || duration(self.interval) <= duration(self.maxGap)'
+                                - message: minExecutions must fit within coverageWindow
+                                  rule: '!has(self.interval) || !has(self.coverageWindow)
+                                    || !has(self.minExecutions) || duration(self.invocationTimeout).getMilliseconds()
+                                    + duration(self.interval).getMilliseconds() *
+                                    (self.minExecutions - 1) <= duration(self.coverageWindow).getMilliseconds()'
+                              test:
+                                properties:
+                                  driver:
+                                    properties:
+                                      container:
+                                        properties:
+                                          args:
+                                            items:
+                                              maxLength: 256
+                                              type: string
+                                            maxItems: 8
+                                            type: array
+                                          command:
+                                            items:
+                                              maxLength: 256
+                                              type: string
+                                            maxItems: 8
+                                            type: array
+                                          image:
+                                            pattern: ^[^@\s]+@sha256:[0-9a-f]{64}$
+                                            type: string
+                                          resources:
+                                            description: ResourceRequirements describes
+                                              the compute resource requirements.
+                                            properties:
+                                              claims:
+                                                description: |-
+                                                  Claims lists the names of resources, defined in spec.resourceClaims,
+                                                  that are used by this container.
+
+                                                  This field depends on the
+                                                  DynamicResourceAllocation feature gate.
+
+                                                  This field is immutable. It can only be set for containers.
+                                                items:
+                                                  description: ResourceClaim references
+                                                    one entry in PodSpec.ResourceClaims.
+                                                  properties:
+                                                    name:
+                                                      description: |-
+                                                        Name must match the name of one entry in pod.spec.resourceClaims of
+                                                        the Pod where this field is used. It makes that resource available
+                                                        inside a container.
+                                                      type: string
+                                                    request:
+                                                      description: |-
+                                                        Request is the name chosen for a request in the referenced claim.
+                                                        If empty, everything from the claim is made available, otherwise
+                                                        only the result of this request.
+                                                      type: string
+                                                  required:
+                                                  - name
+                                                  type: object
+                                                type: array
+                                                x-kubernetes-list-map-keys:
+                                                - name
+                                                x-kubernetes-list-type: map
+                                              limits:
+                                                additionalProperties:
+                                                  anyOf:
+                                                  - type: integer
+                                                  - type: string
+                                                  pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                                                  x-kubernetes-int-or-string: true
+                                                description: |-
+                                                  Limits describes the maximum amount of compute resources allowed.
+                                                  More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                                                type: object
+                                              requests:
+                                                additionalProperties:
+                                                  anyOf:
+                                                  - type: integer
+                                                  - type: string
+                                                  pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                                                  x-kubernetes-int-or-string: true
+                                                description: |-
+                                                  Requests describes the minimum amount of compute resources required.
+                                                  If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                                                  otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                                                  More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                                                type: object
+                                            type: object
+                                        required:
+                                        - image
+                                        type: object
+                                        x-kubernetes-validations:
+                                        - message: container resource limits must
+                                            not exceed 16 entries
+                                          rule: '!has(self.resources) || !has(self.resources.limits)
+                                            || size(self.resources.limits) <= 16'
+                                        - message: container resource requests must
+                                            not exceed 16 entries
+                                          rule: '!has(self.resources) || !has(self.resources.requests)
+                                            || size(self.resources.requests) <= 16'
+                                        - message: container resource claims must
+                                            not exceed 16 entries
+                                          rule: '!has(self.resources) || !has(self.resources.claims)
+                                            || size(self.resources.claims) <= 16'
+                                      script:
+                                        properties:
+                                          artifact:
+                                            description: Artifact names an entry in
+                                              CertificationTest.spec.artifacts.
+                                            maxLength: 253
+                                            minLength: 1
+                                            pattern: ^[A-Za-z0-9._-]+$
+                                            type: string
+                                          language:
+                                            enum:
+                                            - Shell
+                                            - Python
+                                            type: string
+                                          resources:
+                                            description: ResourceRequirements describes
+                                              the compute resource requirements.
+                                            properties:
+                                              claims:
+                                                description: |-
+                                                  Claims lists the names of resources, defined in spec.resourceClaims,
+                                                  that are used by this container.
+
+                                                  This field depends on the
+                                                  DynamicResourceAllocation feature gate.
+
+                                                  This field is immutable. It can only be set for containers.
+                                                items:
+                                                  description: ResourceClaim references
+                                                    one entry in PodSpec.ResourceClaims.
+                                                  properties:
+                                                    name:
+                                                      description: |-
+                                                        Name must match the name of one entry in pod.spec.resourceClaims of
+                                                        the Pod where this field is used. It makes that resource available
+                                                        inside a container.
+                                                      type: string
+                                                    request:
+                                                      description: |-
+                                                        Request is the name chosen for a request in the referenced claim.
+                                                        If empty, everything from the claim is made available, otherwise
+                                                        only the result of this request.
+                                                      type: string
+                                                  required:
+                                                  - name
+                                                  type: object
+                                                type: array
+                                                x-kubernetes-list-map-keys:
+                                                - name
+                                                x-kubernetes-list-type: map
+                                              limits:
+                                                additionalProperties:
+                                                  anyOf:
+                                                  - type: integer
+                                                  - type: string
+                                                  pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                                                  x-kubernetes-int-or-string: true
+                                                description: |-
+                                                  Limits describes the maximum amount of compute resources allowed.
+                                                  More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                                                type: object
+                                              requests:
+                                                additionalProperties:
+                                                  anyOf:
+                                                  - type: integer
+                                                  - type: string
+                                                  pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                                                  x-kubernetes-int-or-string: true
+                                                description: |-
+                                                  Requests describes the minimum amount of compute resources required.
+                                                  If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                                                  otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                                                  More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                                                type: object
+                                            type: object
+                                          runnerImage:
+                                            description: RunnerImage is the approved
+                                              digest-pinned runtime for the payload.
+                                            pattern: ^[^@\s]+@sha256:[0-9a-f]{64}$
+                                            type: string
+                                        required:
+                                        - artifact
+                                        - language
+                                        - runnerImage
+                                        type: object
+                                        x-kubernetes-validations:
+                                        - message: script resource limits must not
+                                            exceed 16 entries
+                                          rule: '!has(self.resources) || !has(self.resources.limits)
+                                            || size(self.resources.limits) <= 16'
+                                        - message: script resource requests must not
+                                            exceed 16 entries
+                                          rule: '!has(self.resources) || !has(self.resources.requests)
+                                            || size(self.resources.requests) <= 16'
+                                        - message: script resource claims must not
+                                            exceed 16 entries
+                                          rule: '!has(self.resources) || !has(self.resources.claims)
+                                            || size(self.resources.claims) <= 16'
+                                      type:
+                                        enum:
+                                        - Script
+                                        - Container
+                                        - WorkflowTemplate
+                                        type: string
+                                      workflowTemplate:
+                                        properties:
+                                          artifact:
+                                            description: |-
+                                              Artifact optionally names an entry in CertificationTest.spec.artifacts
+                                              passed to the WorkflowTemplate as the standard script parameters.
+                                            maxLength: 253
+                                            pattern: ^$|^[A-Za-z0-9._-]+$
+                                            type: string
+                                          digest:
+                                            pattern: ^sha256:[0-9a-f]{64}$
+                                            type: string
+                                          name:
+                                            maxLength: 253
+                                            minLength: 1
+                                            type: string
+                                        required:
+                                        - digest
+                                        - name
+                                        type: object
+                                    required:
+                                    - type
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: Script drivers require script
+                                      rule: self.type != 'Script' || has(self.script)
+                                    - message: script is valid only for Script drivers
+                                      rule: self.type == 'Script' || !has(self.script)
+                                    - message: Container drivers require container
+                                      rule: self.type != 'Container' || has(self.container)
+                                    - message: container is valid only for Container
+                                        drivers
+                                      rule: self.type == 'Container' || !has(self.container)
+                                    - message: WorkflowTemplate drivers require workflowTemplate
+                                      rule: self.type != 'WorkflowTemplate' || has(self.workflowTemplate)
+                                    - message: workflowTemplate is valid only for
+                                        WorkflowTemplate drivers
+                                      rule: self.type == 'WorkflowTemplate' || !has(self.workflowTemplate)
+                                  identity:
+                                    properties:
+                                      contentDigest:
+                                        pattern: ^sha256:[0-9a-f]{64}$
+                                        type: string
+                                      generation:
+                                        format: int64
+                                        minimum: 1
+                                        type: integer
+                                      name:
+                                        minLength: 1
+                                        type: string
+                                      trust:
+                                        enum:
+                                        - Approved
+                                        - Diagnostic
+                                        - Rejected
+                                        - Revoked
+                                        type: string
+                                      uid:
+                                        description: |-
+                                          UID is a type that holds unique ID values, including UUIDs.  Because we
+                                          don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                                          intent and helps make sure that UIDs and names do not get conflated.
+                                        type: string
+                                    required:
+                                    - contentDigest
+                                    - generation
+                                    - name
+                                    - trust
+                                    - uid
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: uid is required
+                                      rule: size(self.uid) > 0
+                                  metricSchemaDigest:
+                                    pattern: ^sha256:[0-9a-f]{64}$
+                                    type: string
+                                  metrics:
+                                    description: |-
+                                      Metrics are retained so the immutable Run remains self-contained when the
+                                      source CertificationTest changes or is deleted.
+                                    items:
+                                      properties:
+                                        displayName:
+                                          maxLength: 128
+                                          minLength: 1
+                                          type: string
+                                        name:
+                                          maxLength: 63
+                                          minLength: 1
+                                          pattern: ^[a-z][a-z0-9]*([A-Z][a-z0-9]*)*$
+                                          type: string
+                                        required:
+                                          type: boolean
+                                        telemetry:
+                                          properties:
+                                            dimensions:
+                                              description: |-
+                                                Dimensions are workload-provided label keys. Run, stage, invocation, role,
+                                                and node identity are injected by the trusted runtime and cannot be declared.
+                                              items:
+                                                maxLength: 32
+                                                minLength: 1
+                                                pattern: ^[a-z][a-z0-9_]*$
+                                                type: string
+                                              maxItems: 4
+                                              type: array
+                                              x-kubernetes-list-type: set
+                                            evidence:
+                                              description: |-
+                                                Evidence maps the validated records back to this metric's typed final
+                                                measurement. Omit it for operational-only telemetry.
+                                              enum:
+                                              - Latest
+                                              - Minimum
+                                              - Maximum
+                                              type: string
+                                            live:
+                                              enum:
+                                              - Gauge
+                                              - GaugeAndSamples
+                                              type: string
+                                            sampleLimit:
+                                              description: |-
+                                                SampleLimit bounds accepted records per dimension set. Gauge mode exports
+                                                only the latest value; GaugeAndSamples also exports the bounded history.
+                                              format: int32
+                                              maximum: 64
+                                              minimum: 1
+                                              type: integer
+                                            seriesLimit:
+                                              format: int32
+                                              maximum: 16
+                                              minimum: 1
+                                              type: integer
+                                          required:
+                                          - live
+                                          - sampleLimit
+                                          - seriesLimit
+                                          type: object
+                                        type:
+                                          enum:
+                                          - Boolean
+                                          - Status
+                                          - Count
+                                          - Gauge
+                                          - Duration
+                                          - Ratio
+                                          - Throughput
+                                          - IOPS
+                                          - Bandwidth
+                                          - Latency
+                                          type: string
+                                        unit:
+                                          maxLength: 32
+                                          type: string
+                                      required:
+                                      - displayName
+                                      - name
+                                      - type
+                                      type: object
+                                      x-kubernetes-validations:
+                                      - message: live telemetry requires a decimal
+                                          numeric metric type
+                                        rule: '!has(self.telemetry) || self.type in
+                                          [''Gauge'', ''Ratio'', ''Throughput'', ''IOPS'',
+                                          ''Bandwidth'', ''Latency'']'
+                                      - message: live telemetry requires a unit
+                                        rule: '!has(self.telemetry) || size(self.unit)
+                                          > 0'
+                                    maxItems: 16
+                                    minItems: 1
+                                    type: array
+                                    x-kubernetes-list-map-keys:
+                                    - name
+                                    x-kubernetes-list-type: map
+                                  parameterSchemaDigest:
+                                    pattern: ^sha256:[0-9a-f]{64}$
+                                    type: string
+                                  security:
+                                    properties:
+                                      allowRoot:
+                                        type: boolean
+                                      capabilities:
+                                        items:
+                                          pattern: ^[A-Z][A-Z0-9_]*$
+                                          type: string
+                                        maxItems: 16
+                                        type: array
+                                        x-kubernetes-list-type: set
+                                      hostNetwork:
+                                        type: boolean
+                                      hostPaths:
+                                        items:
+                                          properties:
+                                            mountPath:
+                                              maxLength: 1024
+                                              minLength: 1
+                                              type: string
+                                            path:
+                                              maxLength: 1024
+                                              minLength: 1
+                                              type: string
+                                            readOnly:
+                                              type: boolean
+                                          required:
+                                          - mountPath
+                                          - path
+                                          type: object
+                                          x-kubernetes-validations:
+                                          - message: mountPath must be a clean absolute
+                                              path
+                                            rule: self.mountPath.startsWith('/') &&
+                                              !self.mountPath.contains('//') && !self.mountPath.contains('/./')
+                                              && !self.mountPath.contains('/../')
+                                              && !self.mountPath.endsWith('/.') &&
+                                              !self.mountPath.endsWith('/..')
+                                          - message: mountPath must not replace or
+                                              shadow a reserved Project Signal mount
+                                            rule: self.mountPath != '/scripts' &&
+                                              !self.mountPath.startsWith('/scripts/')
+                                              && self.mountPath != '/results' && !self.mountPath.startsWith('/results/')
+                                          - message: path must be an approved proc
+                                              leaf, journal path, or a clean path
+                                              under /sys or /var/lib/project-signal
+                                            rule: (self.path == '/proc/cpuinfo' ||
+                                              self.path == '/proc/meminfo' || self.path
+                                              == '/proc/version' || self.path == '/proc/sys/kernel/random/boot_id'
+                                              || self.path == '/sys' || self.path.startsWith('/sys/')
+                                              || self.path == '/var/lib/project-signal'
+                                              || self.path.startsWith('/var/lib/project-signal/')
+                                              || self.path == '/var/log' || self.path
+                                              == '/run/log' || self.path == '/etc/machine-id')
+                                              && !self.path.contains('//') && !self.path.contains('/./')
+                                              && !self.path.contains('/../') && !self.path.endsWith('/.')
+                                              && !self.path.endsWith('/..')
+                                          - message: proc, sys, and journal host paths
+                                              must be read-only
+                                            rule: '!(self.path.startsWith(''/proc/'')
+                                              || self.path == ''/sys'' || self.path.startsWith(''/sys/'')
+                                              || self.path == ''/var/log'' || self.path
+                                              == ''/run/log'' || self.path == ''/etc/machine-id'')
+                                              || self.readOnly'
+                                        maxItems: 8
+                                        type: array
+                                        x-kubernetes-list-map-keys:
+                                        - mountPath
+                                        x-kubernetes-list-type: map
+                                      ipcLock:
+                                        type: boolean
+                                      privileged:
+                                        type: boolean
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: allowRoot requires privileged execution
+                                      rule: '!has(self.allowRoot) || !self.allowRoot
+                                        || (has(self.privileged) && self.privileged)'
+                                  securityRequirementsDigest:
+                                    pattern: ^sha256:[0-9a-f]{64}$
+                                    type: string
+                                  topology:
+                                    properties:
+                                      maxParticipants:
+                                        format: int32
+                                        maximum: 8
+                                        minimum: 1
+                                        type: integer
+                                      minParticipants:
+                                        format: int32
+                                        maximum: 8
+                                        minimum: 1
+                                        type: integer
+                                      roles:
+                                        items:
+                                          properties:
+                                            displayName:
+                                              maxLength: 128
+                                              minLength: 1
+                                              type: string
+                                            maxCount:
+                                              format: int32
+                                              maximum: 8
+                                              minimum: 1
+                                              type: integer
+                                            minCount:
+                                              format: int32
+                                              maximum: 8
+                                              minimum: 0
+                                              type: integer
+                                            name:
+                                              maxLength: 63
+                                              minLength: 1
+                                              pattern: ^[a-z]([-a-z0-9]*[a-z0-9])?$
+                                              type: string
+                                          required:
+                                          - displayName
+                                          - maxCount
+                                          - name
+                                          type: object
+                                        maxItems: 8
+                                        type: array
+                                        x-kubernetes-list-map-keys:
+                                        - name
+                                        x-kubernetes-list-type: map
+                                    required:
+                                    - maxParticipants
+                                    - minParticipants
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: role minCount must not exceed maxCount
+                                      rule: '!has(self.roles) || self.roles.all(x,
+                                        !has(x.minCount) || x.minCount <= x.maxCount)'
+                                    - message: role minimum counts must fit maxParticipants
+                                      rule: '!has(self.roles) || size(self.roles)
+                                        == 0 || self.roles.map(x, has(x.minCount)
+                                        ? x.minCount : 0).sum() <= self.maxParticipants'
+                                    - message: role maximum counts must cover minParticipants
+                                      rule: '!has(self.roles) || size(self.roles)
+                                        == 0 || self.roles.map(x, x.maxCount).sum()
+                                        >= self.minParticipants'
+                                required:
+                                - driver
+                                - identity
+                                - metricSchemaDigest
+                                - metrics
+                                - parameterSchemaDigest
+                                - securityRequirementsDigest
+                                - topology
+                                type: object
+                            required:
+                            - name
+                            - qualificationEligible
+                            - schedule
+                            - test
+                            type: object
+                            x-kubernetes-validations:
+                            - message: qualification-eligible stages require an approved
+                                test and must not be diagnostic-only
+                              rule: '!self.qualificationEligible || (self.test.identity.trust
+                                == ''Approved'' && (!has(self.diagnosticOnly) || !self.diagnosticOnly))'
+                            - message: qualification-eligible stages require complete
+                                resolved inputs
+                              rule: '!self.qualificationEligible || !has(self.resolvedInputs)
+                                || self.resolvedInputs.all(i, i.state == ''Complete'')'
+                            - message: stages with incomplete inputs must be diagnostic-only
+                              rule: '!has(self.resolvedInputs) || self.resolvedInputs.all(i,
+                                i.state != ''Incomplete'') || (has(self.diagnosticOnly)
+                                && self.diagnosticOnly && !self.qualificationEligible)'
+                            - message: unapproved tests are diagnostic-only and cannot
+                                grant qualification credit
+                              rule: self.test.identity.trust == 'Approved' || (has(self.diagnosticOnly)
+                                && self.diagnosticOnly && !self.qualificationEligible)
+                            - message: rejected or revoked tests cannot be resolved
+                                into new Runs
+                              rule: self.test.identity.trust != 'Rejected' && self.test.identity.trust
+                                != 'Revoked'
+                            - message: role-aware tests require resolved participant
+                                role assignments
+                              rule: ((!has(self.test.topology.roles) || size(self.test.topology.roles)
+                                == 0) && (!has(self.participantRoles) || size(self.participantRoles)
+                                == 0)) || (has(self.test.topology.roles) && size(self.test.topology.roles)
+                                > 0 && has(self.participantRoles) && size(self.participantRoles)
+                                > 0)
+                            - message: resolved participant roles must exist in the
+                                test topology
+                              rule: '!has(self.participantRoles) || (has(self.test.topology.roles)
+                                && self.participantRoles.all(b, self.test.topology.roles.exists(r,
+                                r.name == b.role)))'
+                            - message: resolved participant role counts must satisfy
+                                the test topology
+                              rule: '!has(self.test.topology.roles) || !has(self.participantRoles)
+                                || self.test.topology.roles.all(r, (self.participantRoles.filter(b,
+                                b.role == r.name).size() == 0 && (!has(r.minCount)
+                                || r.minCount == 0)) || (self.participantRoles.filter(b,
+                                b.role == r.name).size() == 1 && self.participantRoles.filter(b,
+                                b.role == r.name)[0].participantIndexes.size() >=
+                                (has(r.minCount) ? r.minCount : 0) && self.participantRoles.filter(b,
+                                b.role == r.name)[0].participantIndexes.size() <=
+                                r.maxCount))'
+                            - message: resolved participant role assignments must
+                                satisfy participant topology bounds
+                              rule: '!has(self.participantRoles) || self.participantRoles.map(r,
+                                r.participantIndexes.size()).sum() >= self.test.topology.minParticipants
+                                && self.participantRoles.map(r, r.participantIndexes.size()).sum()
+                                <= self.test.topology.maxParticipants'
+                            - message: a participant may fill only one role in a stage
+                              rule: '!has(self.participantRoles) || self.participantRoles.all(r,
+                                r.participantIndexes.all(i, self.participantRoles.filter(o,
+                                i in o.participantIndexes).size() == 1))'
+                            - message: perDeviceCoverageInterval requires Continuous
+                                or Periodic scheduling
+                              rule: '!has(self.perDeviceCoverageInterval) || self.schedule.mode
+                                != ''RunOnce'''
+                            - message: perDeviceCoverageInterval must be positive
+                              rule: '!has(self.perDeviceCoverageInterval) || duration(self.perDeviceCoverageInterval)
+                                > duration(''0s'')'
+                            - message: perDeviceCoverageInterval must use whole-second
+                                precision
+                              rule: '!has(self.perDeviceCoverageInterval) || duration(self.perDeviceCoverageInterval).getMilliseconds()
+                                % 1000 == 0'
+                            - message: perDeviceCoverageInterval must not exceed coverageWindow
+                              rule: '!has(self.schedule.coverageWindow) || !has(self.perDeviceCoverageInterval)
+                                || duration(self.perDeviceCoverageInterval) <= duration(self.schedule.coverageWindow)'
+                          maxItems: 32
+                          minItems: 1
+                          type: array
+                          x-kubernetes-list-type: atomic
+                      required:
+                      - name
+                      - role
+                      - stages
+                      type: object
+                      x-kubernetes-validations:
+                      - message: Startup and Terminal phases may contain only RunOnce
+                          stages
+                        rule: self.role == 'Validation' || self.stages.all(x, x.schedule.mode
+                          == 'RunOnce')
+                    maxItems: 16
+                    minItems: 1
+                    type: array
+                    x-kubernetes-list-type: atomic
+                required:
+                - phases
+                type: object
+                x-kubernetes-validations:
+                - message: total stage count must not exceed 32
+                  rule: self.phases.map(x, x.stages.size()).sum() <= 32
+              scriptBundle:
+                description: ScriptBundle is retained only for backward-compatible
+                  legacy check Runs.
+                properties:
+                  digest:
+                    description: |-
+                      Digest is the aggregate algorithm-qualified SHA-256 digest derived from
+                      the selected script bytes in check order.
+                    pattern: ^sha256:[0-9a-f]{64}$
+                    type: string
+                  name:
+                    minLength: 1
+                    type: string
+                  uid:
+                    description: |-
+                      UID is a type that holds unique ID values, including UUIDs.  Because we
+                      don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                      intent and helps make sure that UIDs and names do not get conflated.
+                    type: string
+                required:
+                - digest
+                - name
+                - uid
+                type: object
+                x-kubernetes-validations:
+                - message: uid is required
+                  rule: size(self.uid) > 0
+              suite:
+                properties:
+                  generation:
+                    format: int64
+                    minimum: 1
+                    type: integer
+                  name:
+                    minLength: 1
+                    type: string
+                  uid:
+                    description: |-
+                      UID is a type that holds unique ID values, including UUIDs.  Because we
+                      don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                      intent and helps make sure that UIDs and names do not get conflated.
+                    type: string
+                required:
+                - generation
+                - name
+                - uid
+                type: object
+                x-kubernetes-validations:
+                - message: uid is required
+                  rule: size(self.uid) > 0
+            required:
+            - participants
+            - profile
+            - suite
+            type: object
+            x-kubernetes-validations:
+            - message: profile is immutable
+              rule: self.profile == oldSelf.profile
+            - message: suite is immutable
+              rule: self.suite == oldSelf.suite
+            - message: participants are immutable
+              rule: self.participants == oldSelf.participants
+            - message: scriptBundle is immutable
+              rule: has(self.scriptBundle) == has(oldSelf.scriptBundle) && (!has(self.scriptBundle)
+                || self.scriptBundle == oldSelf.scriptBundle)
+            - message: checks are immutable
+              rule: has(self.checks) == has(oldSelf.checks) && (!has(self.checks)
+                || self.checks == oldSelf.checks)
+            - message: environment is immutable
+              rule: has(self.environment) == has(oldSelf.environment) && (!has(self.environment)
+                || self.environment == oldSelf.environment)
+            - message: resolvedPlan is immutable
+              rule: has(self.resolvedPlan) == has(oldSelf.resolvedPlan) && (!has(self.resolvedPlan)
+                || self.resolvedPlan == oldSelf.resolvedPlan)
+            - message: planDigest is immutable
+              rule: has(self.planDigest) == has(oldSelf.planDigest) && (!has(self.planDigest)
+                || self.planDigest == oldSelf.planDigest)
+            - message: planProvenance is immutable
+              rule: has(self.planProvenance) == has(oldSelf.planProvenance) && (!has(self.planProvenance)
+                || self.planProvenance == oldSelf.planProvenance)
+            - message: participants must use unique nodeName values
+              rule: self.participants.all(x, self.participants.filter(y, y.nodeName
+                == x.nodeName).size() == 1)
+            - message: exactly one of resolvedPlan or legacy checks must be configured
+              rule: (has(self.resolvedPlan) && size(self.resolvedPlan.phases) > 0)
+                != (has(self.checks) && size(self.checks) > 0)
+            - message: legacy checks require scriptBundle
+              rule: '!has(self.checks) || size(self.checks) == 0 || has(self.scriptBundle)'
+            - message: resolvedPlan Runs must not use legacy scriptBundle
+              rule: '!has(self.resolvedPlan) || !has(self.scriptBundle)'
+            - message: resolvedPlan Runs require planDigest and complete planProvenance
+              rule: '!has(self.resolvedPlan) || (has(self.planDigest) && has(self.planProvenance)
+                && has(self.planProvenance.controllerImage))'
+            - message: resolved stage participant indexes must reference Run participants
+              rule: '!has(self.resolvedPlan) || self.resolvedPlan.phases.all(p, p.stages.all(s,
+                !has(s.participantRoles) || s.participantRoles.all(r, r.participantIndexes.all(i,
+                i < size(self.participants)))))'
+            - message: resolved stages without explicit roles use all Run participants
+                and must satisfy the test topology
+              rule: '!has(self.resolvedPlan) || self.resolvedPlan.phases.all(p, p.stages.all(s,
+                (has(s.participantRoles) && size(s.participantRoles) > 0) || (size(self.participants)
+                >= s.test.topology.minParticipants && size(self.participants) <= s.test.topology.maxParticipants)))'
+            - message: cancel cannot be cleared
+              rule: '!has(oldSelf.cancel) || !oldSelf.cancel || (has(self.cancel)
+                && self.cancel)'
+            - message: release cannot be cleared
+              rule: '!has(oldSelf.release) || !oldSelf.release || (has(self.release)
+                && self.release)'
+          status:
+            properties:
+              checks:
+                description: Checks remains positionally aligned with spec.checks.
+                items:
+                  properties:
+                    phase:
+                      enum:
+                      - Pending
+                      - Running
+                      - Succeeded
+                      - Failed
+                      - Inconclusive
+                      - Skipped
+                      type: string
+                    reason:
+                      maxLength: 1024
+                      type: string
+                  required:
+                  - phase
+                  type: object
+                maxItems: 256
+                type: array
+                x-kubernetes-list-type: atomic
+              conditions:
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                maxItems: 8
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              evidence:
+                properties:
+                  digest:
+                    description: Digest is the algorithm-qualified SHA-256 digest
+                      of the evidence bytes.
+                    pattern: ^sha256:[0-9a-f]{64}$
+                    type: string
+                  identity:
+                    description: |-
+                      Identity contains bounded qualification inputs. Large measurements remain
+                      in the durable evidence document addressed by URI and Digest.
+                    properties:
+                      checks:
+                        items:
+                          properties:
+                            completed:
+                              type: boolean
+                            execution:
+                              description: Execution is absent for evidence produced
+                                by legacy one-shot Runs.
+                              properties:
+                                configuredCoverageWindow:
+                                  description: ConfiguredCoverageWindow is copied
+                                    from the immutable Run snapshot.
+                                  type: string
+                                failedInvocations:
+                                  format: int32
+                                  minimum: 0
+                                  type: integer
+                                finishedAt:
+                                  format: date-time
+                                  type: string
+                                firstInvocationAt:
+                                  format: date-time
+                                  type: string
+                                invocationCount:
+                                  format: int32
+                                  minimum: 1
+                                  type: integer
+                                lastInvocationAt:
+                                  format: date-time
+                                  type: string
+                                maxStartGap:
+                                  type: string
+                                  x-kubernetes-validations:
+                                  - message: maxStartGap must not be negative
+                                    rule: duration(self) >= duration('0s')
+                                mode:
+                                  enum:
+                                  - RunOnce
+                                  - Continuous
+                                  - Periodic
+                                  type: string
+                                observedCoverageWindow:
+                                  type: string
+                                  x-kubernetes-validations:
+                                  - message: observedCoverageWindow must not be negative
+                                    rule: duration(self) >= duration('0s')
+                                role:
+                                  enum:
+                                  - Startup
+                                  - Validation
+                                  - Terminal
+                                  type: string
+                                startedAt:
+                                  format: date-time
+                                  type: string
+                                successfulInvocations:
+                                  format: int32
+                                  minimum: 0
+                                  type: integer
+                                timedOutInvocations:
+                                  format: int32
+                                  minimum: 0
+                                  type: integer
+                              required:
+                              - failedInvocations
+                              - finishedAt
+                              - firstInvocationAt
+                              - invocationCount
+                              - lastInvocationAt
+                              - mode
+                              - observedCoverageWindow
+                              - role
+                              - startedAt
+                              - successfulInvocations
+                              - timedOutInvocations
+                              type: object
+                              x-kubernetes-validations:
+                              - message: execution window finishedAt must not precede
+                                  startedAt
+                                rule: self.finishedAt >= self.startedAt
+                              - message: firstInvocationAt must be inside the execution
+                                  window
+                                rule: self.firstInvocationAt >= self.startedAt &&
+                                  self.firstInvocationAt <= self.finishedAt
+                              - message: lastInvocationAt must be inside the execution
+                                  window
+                                rule: self.lastInvocationAt >= self.firstInvocationAt
+                                  && self.lastInvocationAt <= self.finishedAt
+                              - message: invocation outcome counts must equal invocationCount
+                                rule: self.successfulInvocations + self.timedOutInvocations
+                                  + self.failedInvocations == self.invocationCount
+                              - message: RunOnce evidence must describe exactly one
+                                  invocation without repeated-execution fields
+                                rule: self.mode != 'RunOnce' || (self.invocationCount
+                                  == 1 && !has(self.configuredCoverageWindow) && !has(self.maxStartGap))
+                              - message: Continuous and Periodic evidence requires
+                                  configuredCoverageWindow and maxStartGap
+                                rule: self.mode == 'RunOnce' || (has(self.configuredCoverageWindow)
+                                  && has(self.maxStartGap))
+                            finishedAt:
+                              format: date-time
+                              type: string
+                            maxSampleGap:
+                              type: string
+                              x-kubernetes-validations:
+                              - message: maxSampleGap must not be negative
+                                rule: duration(self) >= duration('0s')
+                            observedDuration:
+                              type: string
+                              x-kubernetes-validations:
+                              - message: observedDuration must not be negative
+                                rule: duration(self) >= duration('0s')
+                            order:
+                              format: int32
+                              maximum: 255
+                              minimum: 0
+                              type: integer
+                            perDeviceCoverage:
+                              type: boolean
+                            sameBootID:
+                              type: boolean
+                            startedAt:
+                              format: date-time
+                              type: string
+                          required:
+                          - completed
+                          - finishedAt
+                          - observedDuration
+                          - order
+                          - startedAt
+                          type: object
+                        maxItems: 256
+                        minItems: 1
+                        type: array
+                        x-kubernetes-list-type: atomic
+                      participants:
+                        items:
+                          properties:
+                            end:
+                              properties:
+                                bootID:
+                                  maxLength: 128
+                                  type: string
+                                driverVersion:
+                                  maxLength: 128
+                                  type: string
+                                gpuInventoryDigest:
+                                  pattern: ^sha256:[0-9a-f]{64}$
+                                  type: string
+                                kernelVersion:
+                                  maxLength: 256
+                                  type: string
+                                kubeletVersion:
+                                  maxLength: 128
+                                  type: string
+                                nodeUID:
+                                  description: |-
+                                    UID is a type that holds unique ID values, including UUIDs.  Because we
+                                    don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                                    intent and helps make sure that UIDs and names do not get conflated.
+                                  type: string
+                                osImage:
+                                  maxLength: 256
+                                  type: string
+                                systemUUID:
+                                  maxLength: 128
+                                  type: string
+                              required:
+                              - nodeUID
+                              type: object
+                              x-kubernetes-validations:
+                              - message: nodeUID is required
+                                rule: size(self.nodeUID) > 0
+                            index:
+                              format: int32
+                              maximum: 7
+                              minimum: 0
+                              type: integer
+                            role:
+                              enum:
+                              - Requester
+                              - Participant
+                              type: string
+                            start:
+                              properties:
+                                bootID:
+                                  maxLength: 128
+                                  type: string
+                                driverVersion:
+                                  maxLength: 128
+                                  type: string
+                                gpuInventoryDigest:
+                                  pattern: ^sha256:[0-9a-f]{64}$
+                                  type: string
+                                kernelVersion:
+                                  maxLength: 256
+                                  type: string
+                                kubeletVersion:
+                                  maxLength: 128
+                                  type: string
+                                nodeUID:
+                                  description: |-
+                                    UID is a type that holds unique ID values, including UUIDs.  Because we
+                                    don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                                    intent and helps make sure that UIDs and names do not get conflated.
+                                  type: string
+                                osImage:
+                                  maxLength: 256
+                                  type: string
+                                systemUUID:
+                                  maxLength: 128
+                                  type: string
+                              required:
+                              - nodeUID
+                              type: object
+                              x-kubernetes-validations:
+                              - message: nodeUID is required
+                                rule: size(self.nodeUID) > 0
+                            verdict:
+                              enum:
+                              - Pass
+                              - Fail
+                              - Inconclusive
+                              type: string
+                          required:
+                          - end
+                          - index
+                          - role
+                          - start
+                          - verdict
+                          type: object
+                        maxItems: 8
+                        minItems: 1
+                        type: array
+                        x-kubernetes-list-type: atomic
+                      planDigest:
+                        pattern: ^sha256:[0-9a-f]{64}$
+                        type: string
+                      provenance:
+                        properties:
+                          adapterImage:
+                            pattern: ^[^@\s]+@sha256:[0-9a-f]{64}$
+                            type: string
+                          controllerImage:
+                            pattern: ^[^@\s]+@sha256:[0-9a-f]{64}$
+                            type: string
+                          resolverImages:
+                            items:
+                              pattern: ^[^@\s]+@sha256:[0-9a-f]{64}$
+                              type: string
+                            maxItems: 16
+                            type: array
+                            x-kubernetes-list-type: set
+                          runnerImages:
+                            items:
+                              pattern: ^[^@\s]+@sha256:[0-9a-f]{64}$
+                              type: string
+                            maxItems: 32
+                            minItems: 1
+                            type: array
+                            x-kubernetes-list-type: set
+                          workflowTemplateDigest:
+                            pattern: ^sha256:[0-9a-f]{64}$
+                            type: string
+                        required:
+                        - adapterImage
+                        - controllerImage
+                        - runnerImages
+                        - workflowTemplateDigest
+                        type: object
+                      stages:
+                        description: |-
+                          Stages contains bounded phase/stage verdict summaries. Complete
+                          invocation envelopes remain in durable evidence.
+                        items:
+                          properties:
+                            assertions:
+                              items:
+                                properties:
+                                  actual:
+                                    description: |-
+                                      Actual is absent only when the metric could not be produced or observed.
+                                      The immutable Run assertion retains the typed expected value or threshold.
+                                    properties:
+                                      booleanValue:
+                                        type: boolean
+                                      decimalValue:
+                                        description: DecimalValue is a base-10 JSON-independent
+                                          decimal representation.
+                                        maxLength: 128
+                                        pattern: ^-?(0|[1-9][0-9]*)(\.[0-9]+)?$
+                                        type: string
+                                      durationValue:
+                                        type: string
+                                      integerValue:
+                                        format: int64
+                                        type: integer
+                                      quantityValue:
+                                        description: QuantityValue uses Kubernetes
+                                          quantity syntax.
+                                        maxLength: 64
+                                        minLength: 1
+                                        type: string
+                                      stringValue:
+                                        maxLength: 65536
+                                        type: string
+                                      type:
+                                        enum:
+                                        - String
+                                        - Integer
+                                        - Decimal
+                                        - Boolean
+                                        - Duration
+                                        - Quantity
+                                        type: string
+                                    required:
+                                    - type
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: exactly the value field matching type
+                                        must be set
+                                      rule: (self.type == 'String' && has(self.stringValue)
+                                        && !has(self.integerValue) && !has(self.decimalValue)
+                                        && !has(self.booleanValue) && !has(self.durationValue)
+                                        && !has(self.quantityValue)) || (self.type
+                                        == 'Integer' && !has(self.stringValue) &&
+                                        has(self.integerValue) && !has(self.decimalValue)
+                                        && !has(self.booleanValue) && !has(self.durationValue)
+                                        && !has(self.quantityValue)) || (self.type
+                                        == 'Decimal' && !has(self.stringValue) &&
+                                        !has(self.integerValue) && has(self.decimalValue)
+                                        && !has(self.booleanValue) && !has(self.durationValue)
+                                        && !has(self.quantityValue)) || (self.type
+                                        == 'Boolean' && !has(self.stringValue) &&
+                                        !has(self.integerValue) && !has(self.decimalValue)
+                                        && has(self.booleanValue) && !has(self.durationValue)
+                                        && !has(self.quantityValue)) || (self.type
+                                        == 'Duration' && !has(self.stringValue) &&
+                                        !has(self.integerValue) && !has(self.decimalValue)
+                                        && !has(self.booleanValue) && has(self.durationValue)
+                                        && !has(self.quantityValue)) || (self.type
+                                        == 'Quantity' && !has(self.stringValue) &&
+                                        !has(self.integerValue) && !has(self.decimalValue)
+                                        && !has(self.booleanValue) && !has(self.durationValue)
+                                        && has(self.quantityValue))
+                                  message:
+                                    description: Message explains the failure and
+                                      is required when Actual is absent.
+                                    maxLength: 256
+                                    type: string
+                                  name:
+                                    maxLength: 63
+                                    minLength: 1
+                                    type: string
+                                  passed:
+                                    type: boolean
+                                required:
+                                - name
+                                - passed
+                                type: object
+                                x-kubernetes-validations:
+                                - message: an assertion without an actual value must
+                                    fail with a reason
+                                  rule: has(self.actual) || (!self.passed && has(self.message)
+                                    && size(self.message.trim()) > 0)
+                              maxItems: 8
+                              type: array
+                              x-kubernetes-list-map-keys:
+                              - name
+                              x-kubernetes-list-type: map
+                            canceledInvocations:
+                              format: int32
+                              minimum: 0
+                              type: integer
+                            configuredCoverageWindow:
+                              type: string
+                            deviceIntervalCoverage:
+                              items:
+                                properties:
+                                  coveredIntervals:
+                                    format: int32
+                                    minimum: 0
+                                    type: integer
+                                  deviceID:
+                                    description: DeviceID is the stable device identity
+                                      used by the durable evidence.
+                                    maxLength: 128
+                                    minLength: 1
+                                    type: string
+                                  participantIndex:
+                                    format: int32
+                                    maximum: 7
+                                    minimum: 0
+                                    type: integer
+                                  requiredIntervals:
+                                    format: int32
+                                    minimum: 1
+                                    type: integer
+                                required:
+                                - coveredIntervals
+                                - deviceID
+                                - participantIndex
+                                - requiredIntervals
+                                type: object
+                                x-kubernetes-validations:
+                                - message: coveredIntervals must not exceed requiredIntervals
+                                  rule: self.coveredIntervals <= self.requiredIntervals
+                              maxItems: 64
+                              type: array
+                              x-kubernetes-list-map-keys:
+                              - participantIndex
+                              - deviceID
+                              x-kubernetes-list-type: map
+                            diagnosticOnly:
+                              type: boolean
+                            durableEvidenceDigest:
+                              pattern: ^sha256:[0-9a-f]{64}$
+                              type: string
+                            failedInvocations:
+                              format: int32
+                              minimum: 0
+                              type: integer
+                            finishedAt:
+                              format: date-time
+                              type: string
+                            firstInvocationAt:
+                              format: date-time
+                              type: string
+                            inconclusiveInvocations:
+                              format: int32
+                              minimum: 0
+                              type: integer
+                            invocationCount:
+                              format: int32
+                              minimum: 0
+                              type: integer
+                            invocationEvidence:
+                              description: |-
+                                InvocationEvidence is a bounded index into the durable invocation
+                                envelopes. The durable stage artifact remains authoritative.
+                              items:
+                                properties:
+                                  digest:
+                                    pattern: ^sha256:[0-9a-f]{64}$
+                                    type: string
+                                  finishedAt:
+                                    format: date-time
+                                    type: string
+                                  invocationID:
+                                    maxLength: 128
+                                    minLength: 1
+                                    type: string
+                                  message:
+                                    maxLength: 1024
+                                    type: string
+                                  outcome:
+                                    enum:
+                                    - Passed
+                                    - Failed
+                                    - Inconclusive
+                                    - Canceled
+                                    type: string
+                                  reasonCode:
+                                    enum:
+                                    - Completed
+                                    - AssertionFailed
+                                    - InfrastructureFailure
+                                    - InvalidResult
+                                    - IdentityMismatch
+                                    - EvidenceIntegrityFailure
+                                    - Timeout
+                                    - Canceled
+                                    - TestHarnessFailure
+                                    type: string
+                                  startedAt:
+                                    format: date-time
+                                    type: string
+                                required:
+                                - digest
+                                - finishedAt
+                                - invocationID
+                                - outcome
+                                - reasonCode
+                                - startedAt
+                                type: object
+                                x-kubernetes-validations:
+                                - message: invocation finishedAt must not precede
+                                    startedAt
+                                  rule: self.finishedAt >= self.startedAt
+                              maxItems: 8
+                              type: array
+                              x-kubernetes-list-map-keys:
+                              - invocationID
+                              x-kubernetes-list-type: map
+                            lastInvocationAt:
+                              format: date-time
+                              type: string
+                            maxStartGap:
+                              type: string
+                              x-kubernetes-validations:
+                              - message: maxStartGap must not be negative
+                                rule: duration(self) >= duration('0s')
+                            measurements:
+                              description: |-
+                                Measurements is the bounded typed projection from the last completed
+                                invocation. Complete per-invocation values remain in durable evidence.
+                              items:
+                                properties:
+                                  name:
+                                    maxLength: 63
+                                    minLength: 1
+                                    type: string
+                                  unit:
+                                    maxLength: 32
+                                    type: string
+                                  value:
+                                    properties:
+                                      booleanValue:
+                                        type: boolean
+                                      decimalValue:
+                                        description: DecimalValue is a base-10 JSON-independent
+                                          decimal representation.
+                                        maxLength: 128
+                                        pattern: ^-?(0|[1-9][0-9]*)(\.[0-9]+)?$
+                                        type: string
+                                      durationValue:
+                                        type: string
+                                      integerValue:
+                                        format: int64
+                                        type: integer
+                                      quantityValue:
+                                        description: QuantityValue uses Kubernetes
+                                          quantity syntax.
+                                        maxLength: 64
+                                        minLength: 1
+                                        type: string
+                                      stringValue:
+                                        maxLength: 65536
+                                        type: string
+                                      type:
+                                        enum:
+                                        - String
+                                        - Integer
+                                        - Decimal
+                                        - Boolean
+                                        - Duration
+                                        - Quantity
+                                        type: string
+                                    required:
+                                    - type
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: exactly the value field matching type
+                                        must be set
+                                      rule: (self.type == 'String' && has(self.stringValue)
+                                        && !has(self.integerValue) && !has(self.decimalValue)
+                                        && !has(self.booleanValue) && !has(self.durationValue)
+                                        && !has(self.quantityValue)) || (self.type
+                                        == 'Integer' && !has(self.stringValue) &&
+                                        has(self.integerValue) && !has(self.decimalValue)
+                                        && !has(self.booleanValue) && !has(self.durationValue)
+                                        && !has(self.quantityValue)) || (self.type
+                                        == 'Decimal' && !has(self.stringValue) &&
+                                        !has(self.integerValue) && has(self.decimalValue)
+                                        && !has(self.booleanValue) && !has(self.durationValue)
+                                        && !has(self.quantityValue)) || (self.type
+                                        == 'Boolean' && !has(self.stringValue) &&
+                                        !has(self.integerValue) && !has(self.decimalValue)
+                                        && has(self.booleanValue) && !has(self.durationValue)
+                                        && !has(self.quantityValue)) || (self.type
+                                        == 'Duration' && !has(self.stringValue) &&
+                                        !has(self.integerValue) && !has(self.decimalValue)
+                                        && !has(self.booleanValue) && has(self.durationValue)
+                                        && !has(self.quantityValue)) || (self.type
+                                        == 'Quantity' && !has(self.stringValue) &&
+                                        !has(self.integerValue) && !has(self.decimalValue)
+                                        && !has(self.booleanValue) && !has(self.durationValue)
+                                        && has(self.quantityValue))
+                                required:
+                                - name
+                                - value
+                                type: object
+                              maxItems: 16
+                              type: array
+                              x-kubernetes-list-map-keys:
+                              - name
+                              x-kubernetes-list-type: map
+                            mode:
+                              enum:
+                              - RunOnce
+                              - Continuous
+                              - Periodic
+                              type: string
+                            name:
+                              maxLength: 63
+                              minLength: 1
+                              type: string
+                            observedCoverageWindow:
+                              type: string
+                              x-kubernetes-validations:
+                              - message: observedCoverageWindow must not be negative
+                                rule: duration(self) >= duration('0s')
+                            participants:
+                              items:
+                                properties:
+                                  end:
+                                    properties:
+                                      bootID:
+                                        maxLength: 128
+                                        type: string
+                                      driverVersion:
+                                        maxLength: 128
+                                        type: string
+                                      gpuInventoryDigest:
+                                        pattern: ^sha256:[0-9a-f]{64}$
+                                        type: string
+                                      kernelVersion:
+                                        maxLength: 256
+                                        type: string
+                                      kubeletVersion:
+                                        maxLength: 128
+                                        type: string
+                                      nodeUID:
+                                        description: |-
+                                          UID is a type that holds unique ID values, including UUIDs.  Because we
+                                          don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                                          intent and helps make sure that UIDs and names do not get conflated.
+                                        type: string
+                                      osImage:
+                                        maxLength: 256
+                                        type: string
+                                      systemUUID:
+                                        maxLength: 128
+                                        type: string
+                                    required:
+                                    - nodeUID
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: nodeUID is required
+                                      rule: size(self.nodeUID) > 0
+                                  index:
+                                    format: int32
+                                    maximum: 7
+                                    minimum: 0
+                                    type: integer
+                                  role:
+                                    enum:
+                                    - Requester
+                                    - Participant
+                                    type: string
+                                  start:
+                                    properties:
+                                      bootID:
+                                        maxLength: 128
+                                        type: string
+                                      driverVersion:
+                                        maxLength: 128
+                                        type: string
+                                      gpuInventoryDigest:
+                                        pattern: ^sha256:[0-9a-f]{64}$
+                                        type: string
+                                      kernelVersion:
+                                        maxLength: 256
+                                        type: string
+                                      kubeletVersion:
+                                        maxLength: 128
+                                        type: string
+                                      nodeUID:
+                                        description: |-
+                                          UID is a type that holds unique ID values, including UUIDs.  Because we
+                                          don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                                          intent and helps make sure that UIDs and names do not get conflated.
+                                        type: string
+                                      osImage:
+                                        maxLength: 256
+                                        type: string
+                                      systemUUID:
+                                        maxLength: 128
+                                        type: string
+                                    required:
+                                    - nodeUID
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: nodeUID is required
+                                      rule: size(self.nodeUID) > 0
+                                  verdict:
+                                    enum:
+                                    - Pass
+                                    - Fail
+                                    - Inconclusive
+                                    type: string
+                                required:
+                                - end
+                                - index
+                                - role
+                                - start
+                                - verdict
+                                type: object
+                              maxItems: 16
+                              type: array
+                              x-kubernetes-list-map-keys:
+                              - index
+                              x-kubernetes-list-type: map
+                            phaseOrder:
+                              format: int32
+                              maximum: 15
+                              minimum: 0
+                              type: integer
+                            qualificationEligible:
+                              type: boolean
+                            role:
+                              enum:
+                              - Startup
+                              - Validation
+                              - Terminal
+                              type: string
+                            stageOrder:
+                              format: int32
+                              maximum: 63
+                              minimum: 0
+                              type: integer
+                            startedAt:
+                              format: date-time
+                              type: string
+                            successfulInvocations:
+                              format: int32
+                              minimum: 0
+                              type: integer
+                            test:
+                              properties:
+                                contentDigest:
+                                  pattern: ^sha256:[0-9a-f]{64}$
+                                  type: string
+                                generation:
+                                  format: int64
+                                  minimum: 1
+                                  type: integer
+                                name:
+                                  minLength: 1
+                                  type: string
+                                trust:
+                                  enum:
+                                  - Approved
+                                  - Diagnostic
+                                  - Rejected
+                                  - Revoked
+                                  type: string
+                                uid:
+                                  description: |-
+                                    UID is a type that holds unique ID values, including UUIDs.  Because we
+                                    don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                                    intent and helps make sure that UIDs and names do not get conflated.
+                                  type: string
+                              required:
+                              - contentDigest
+                              - generation
+                              - name
+                              - trust
+                              - uid
+                              type: object
+                              x-kubernetes-validations:
+                              - message: uid is required
+                                rule: size(self.uid) > 0
+                            timedOutInvocations:
+                              format: int32
+                              minimum: 0
+                              type: integer
+                            verdict:
+                              enum:
+                              - Passed
+                              - Failed
+                              - Inconclusive
+                              - Canceled
+                              - Skipped
+                              type: string
+                          required:
+                          - canceledInvocations
+                          - durableEvidenceDigest
+                          - failedInvocations
+                          - finishedAt
+                          - inconclusiveInvocations
+                          - invocationCount
+                          - mode
+                          - name
+                          - observedCoverageWindow
+                          - phaseOrder
+                          - qualificationEligible
+                          - role
+                          - stageOrder
+                          - startedAt
+                          - successfulInvocations
+                          - test
+                          - timedOutInvocations
+                          - verdict
+                          type: object
+                          x-kubernetes-validations:
+                          - message: stage finishedAt must not precede startedAt
+                            rule: self.finishedAt >= self.startedAt
+                          - message: invocation outcome counts must equal invocationCount
+                            rule: self.successfulInvocations + self.timedOutInvocations
+                              + self.failedInvocations + self.inconclusiveInvocations
+                              + self.canceledInvocations == self.invocationCount
+                          - message: qualification-eligible evidence requires an approved
+                              test and must not be diagnostic-only
+                            rule: '!self.qualificationEligible || (self.test.trust
+                              == ''Approved'' && (!has(self.diagnosticOnly) || !self.diagnosticOnly))'
+                        maxItems: 32
+                        type: array
+                        x-kubernetes-list-type: atomic
+                    required:
+                    - participants
+                    - planDigest
+                    - provenance
+                    type: object
+                    x-kubernetes-validations:
+                    - message: exactly one of stages or legacy checks must be present
+                      rule: (has(self.stages) && size(self.stages) > 0) != (has(self.checks)
+                        && size(self.checks) > 0)
+                  uri:
+                    maxLength: 2048
+                    type: string
+                type: object
+                x-kubernetes-validations:
+                - message: evidence URI is write-once
+                  rule: '!has(oldSelf.uri) || oldSelf.uri.size() == 0 || (has(self.uri)
+                    && self.uri == oldSelf.uri)'
+                - message: evidence digest is write-once
+                  rule: '!has(oldSelf.digest) || oldSelf.digest.size() == 0 || (has(self.digest)
+                    && self.digest == oldSelf.digest)'
+                - message: evidence identity is write-once
+                  rule: '!has(oldSelf.identity) || (has(self.identity) && self.identity
+                    == oldSelf.identity)'
+              observedGeneration:
+                format: int64
+                type: integer
+              phase:
+                enum:
+                - Pending
+                - Running
+                - Succeeded
+                - Failed
+                - Inconclusive
+                - Canceled
+                type: string
+              reason:
+                maxLength: 1024
+                type: string
+              workflow:
+                properties:
+                  name:
+                    type: string
+                  phase:
+                    type: string
+                  uid:
+                    type: string
+                type: object
+            type: object
+        required:
+        - spec
+        type: object
+        x-kubernetes-validations:
+        - message: evidence identity requires and must match spec.planDigest
+          rule: '!has(self.status) || !has(self.status.evidence) || !has(self.status.evidence.identity)
+            || (has(self.spec.planDigest) && self.status.evidence.identity.planDigest
+            == self.spec.planDigest)'
+    served: true
+    storage: true
+    subresources:
+      status: {}

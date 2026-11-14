@@ -1,0 +1,202 @@
+{{- $prometheusImage := .PrometheusImage }}
+{{- if not (regexMatch "^[^@[:space:]]+@sha256:[0-9a-f]{64}$" $prometheusImage) }}
+{{- fail "PrometheusImage must be an immutable sha256 digest reference" }}
+{{- end }}
+{{- $namespace := default "project-signal" .Namespace }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: project-signal-prometheus
+  namespace: {{ $namespace }}
+  labels:
+    app.kubernetes.io/name: project-signal-prometheus
+    app.kubernetes.io/part-of: project-signal
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: project-signal-prometheus-pod-discovery
+  namespace: {{ $namespace }}
+  labels:
+    app.kubernetes.io/name: project-signal-prometheus
+    app.kubernetes.io/part-of: project-signal
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: project-signal-prometheus-pod-discovery
+  namespace: {{ $namespace }}
+  labels:
+    app.kubernetes.io/name: project-signal-prometheus
+    app.kubernetes.io/part-of: project-signal
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: project-signal-prometheus-pod-discovery
+subjects:
+  - kind: ServiceAccount
+    name: project-signal-prometheus
+    namespace: {{ $namespace }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: project-signal-controller-metrics
+  namespace: {{ $namespace }}
+  labels:
+    app.kubernetes.io/name: project-signal-controller
+    app.kubernetes.io/part-of: project-signal
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/path: /metrics
+    prometheus.io/port: "8080"
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: project-signal-controller
+  ports:
+    - name: metrics
+      port: 8080
+      targetPort: metrics
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: project-signal-prometheus-config
+  namespace: {{ $namespace }}
+  labels:
+    app.kubernetes.io/name: project-signal-prometheus
+    app.kubernetes.io/part-of: project-signal
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+    scrape_configs:
+      - job_name: project-signal-controller
+        static_configs:
+          - targets:
+              - project-signal-controller-metrics.{{ $namespace }}.svc:8080
+      - job_name: project-signal-live-workloads
+        scrape_interval: 5s
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names:
+                - {{ $namespace }}
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: "(.+)"
+          - source_labels:
+              - __address__
+              - __meta_kubernetes_pod_annotation_prometheus_io_port
+            action: replace
+            regex: "([^:]+)(?::\\d+)?;(\\d+)"
+            replacement: "$1:$2"
+            target_label: __address__
+      - job_name: project-signal-prometheus
+        static_configs:
+          - targets:
+              - 127.0.0.1:9090
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: project-signal-prometheus
+  namespace: {{ $namespace }}
+  labels:
+    app.kubernetes.io/name: project-signal-prometheus
+    app.kubernetes.io/part-of: project-signal
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: project-signal-prometheus
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: project-signal-prometheus
+        app.kubernetes.io/part-of: project-signal
+    spec:
+      serviceAccountName: project-signal-prometheus
+      automountServiceAccountToken: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: prometheus
+          image: {{ $prometheusImage }}
+          imagePullPolicy: IfNotPresent
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+            - --storage.tsdb.retention.time=24h
+            - --storage.tsdb.retention.size=1GB
+            - --web.listen-address=:9090
+          ports:
+            - name: web
+              containerPort: 9090
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: web
+          livenessProbe:
+            httpGet:
+              path: /-/healthy
+              port: web
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus
+              readOnly: true
+            - name: data
+              mountPath: /prometheus
+      volumes:
+        - name: config
+          configMap:
+            name: project-signal-prometheus-config
+        - name: data
+          emptyDir:
+            sizeLimit: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: project-signal-prometheus
+  namespace: {{ $namespace }}
+  labels:
+    app.kubernetes.io/name: project-signal-prometheus
+    app.kubernetes.io/part-of: project-signal
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: project-signal-prometheus
+  ports:
+    - name: web
+      port: 9090
+      targetPort: web

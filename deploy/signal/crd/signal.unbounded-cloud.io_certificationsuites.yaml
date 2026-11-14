@@ -1,0 +1,981 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.1
+  name: certificationsuites.signal.unbounded-cloud.io
+spec:
+  group: signal.unbounded-cloud.io
+  names:
+    kind: CertificationSuite
+    listKind: CertificationSuiteList
+    plural: certificationsuites
+    shortNames:
+    - certsuite
+    singular: certificationsuite
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.checks.size()
+      name: Checks
+      type: integer
+    - jsonPath: .spec.scriptBundle.name
+      name: Script Bundle
+      type: string
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            properties:
+              checks:
+                description: |-
+                  Checks is the ordered executable test plan. A check's position defines
+                  its stable ID. New Suites should use phases and named stages.
+                items:
+                  properties:
+                    backend:
+                      enum:
+                      - Pod
+                      - MPIJob
+                      type: string
+                    backendActiveDeadline:
+                      type: string
+                    continuity:
+                      description: Continuity declares the evidence required to prove
+                        uninterrupted execution.
+                      properties:
+                        maxSampleGap:
+                          description: MaxSampleGap is the maximum permitted gap between
+                            consecutive evidence samples.
+                          type: string
+                          x-kubernetes-validations:
+                          - message: maxSampleGap must be positive
+                            rule: duration(self) > duration('0s')
+                        requirePerDeviceCoverage:
+                          description: RequirePerDeviceCoverage requires evidence
+                            for every device in the starting inventory.
+                          type: boolean
+                        requireSameBootID:
+                          description: RequireSameBootID rejects evidence spanning
+                            a participant reboot.
+                          type: boolean
+                      type: object
+                    execution:
+                      description: |-
+                        Execution declares runner-owned stage scheduling. When omitted, the check
+                        has legacy RunOnce semantics and is ineligible for sustained-duration
+                        qualification.
+                      properties:
+                        coverageWindow:
+                          description: CoverageWindow is the sustained activity window
+                            owned by the runner.
+                          type: string
+                        interval:
+                          description: Interval is the target separation between Periodic
+                            invocation starts.
+                          type: string
+                        iterationTimeout:
+                          description: IterationTimeout bounds each runner-owned script
+                            invocation.
+                          type: string
+                        maxGap:
+                          description: MaxGap bounds the observed gap between consecutive
+                            invocation starts.
+                          type: string
+                        minExecutions:
+                          description: MinExecutions is the minimum completed invocation
+                            count in the window.
+                          format: int32
+                          maximum: 1000000
+                          minimum: 2
+                          type: integer
+                        mode:
+                          enum:
+                          - RunOnce
+                          - Continuous
+                          - Periodic
+                          type: string
+                        role:
+                          enum:
+                          - Startup
+                          - Validation
+                          - Terminal
+                          type: string
+                      required:
+                      - mode
+                      - role
+                      type: object
+                      x-kubernetes-validations:
+                      - message: Startup and Terminal stages must use RunOnce mode
+                        rule: self.role == 'Validation' || self.mode == 'RunOnce'
+                      - message: RunOnce mode must not declare repeated-execution
+                          fields
+                        rule: self.mode != 'RunOnce' || (!has(self.coverageWindow)
+                          && !has(self.iterationTimeout) && !has(self.interval) &&
+                          !has(self.minExecutions) && !has(self.maxGap))
+                      - message: Continuous and Periodic modes require coverageWindow,
+                          iterationTimeout, minExecutions, and maxGap
+                        rule: self.mode == 'RunOnce' || (has(self.coverageWindow)
+                          && has(self.iterationTimeout) && has(self.minExecutions)
+                          && has(self.maxGap))
+                      - message: Periodic mode requires interval
+                        rule: self.mode != 'Periodic' || has(self.interval)
+                      - message: only Periodic mode may declare interval
+                        rule: self.mode == 'Periodic' || !has(self.interval)
+                      - message: coverageWindow must be positive
+                        rule: '!has(self.coverageWindow) || duration(self.coverageWindow)
+                          > duration(''0s'')'
+                      - message: coverageWindow must use whole-second precision
+                        rule: '!has(self.coverageWindow) || duration(self.coverageWindow).getMilliseconds()
+                          % 1000 == 0'
+                      - message: iterationTimeout must be positive
+                        rule: '!has(self.iterationTimeout) || duration(self.iterationTimeout)
+                          > duration(''0s'')'
+                      - message: iterationTimeout must use whole-second precision
+                        rule: '!has(self.iterationTimeout) || duration(self.iterationTimeout).getMilliseconds()
+                          % 1000 == 0'
+                      - message: iterationTimeout must not exceed coverageWindow
+                        rule: '!has(self.coverageWindow) || !has(self.iterationTimeout)
+                          || duration(self.iterationTimeout) <= duration(self.coverageWindow)'
+                      - message: interval must be positive
+                        rule: '!has(self.interval) || duration(self.interval) > duration(''0s'')'
+                      - message: interval must use whole-second precision
+                        rule: '!has(self.interval) || duration(self.interval).getMilliseconds()
+                          % 1000 == 0'
+                      - message: Periodic iterationTimeout must not exceed interval
+                        rule: '!has(self.interval) || !has(self.iterationTimeout)
+                          || duration(self.iterationTimeout) <= duration(self.interval)'
+                      - message: maxGap must be positive
+                        rule: '!has(self.maxGap) || duration(self.maxGap) > duration(''0s'')'
+                      - message: maxGap must use whole-second precision
+                        rule: '!has(self.maxGap) || duration(self.maxGap).getMilliseconds()
+                          % 1000 == 0'
+                      - message: maxGap must not exceed coverageWindow
+                        rule: '!has(self.coverageWindow) || !has(self.maxGap) || duration(self.maxGap)
+                          <= duration(self.coverageWindow)'
+                      - message: Periodic maxGap must not be less than interval
+                        rule: '!has(self.interval) || !has(self.maxGap) || duration(self.interval)
+                          <= duration(self.maxGap)'
+                      - message: minExecutions must fit within coverageWindow
+                        rule: '!has(self.interval) || !has(self.coverageWindow) ||
+                          !has(self.iterationTimeout) || !has(self.minExecutions)
+                          || duration(self.iterationTimeout).getMilliseconds() + duration(self.interval).getMilliseconds()
+                          * (self.minExecutions - 1) <= duration(self.coverageWindow).getMilliseconds()'
+                    gpuCount:
+                      format: int32
+                      minimum: 0
+                      type: integer
+                    minDuration:
+                      description: |-
+                        MinDuration is the legacy minimum observed backend lifetime. It does not
+                        establish sustained workload activity without an explicit Continuous or
+                        Periodic execution policy.
+                      type: string
+                    scriptKey:
+                      maxLength: 253
+                      minLength: 1
+                      pattern: ^[-._a-zA-Z0-9]+$
+                      type: string
+                    workloadPolicy:
+                      properties:
+                        hostNetwork:
+                          type: boolean
+                        hostPaths:
+                          items:
+                            properties:
+                              mountPath:
+                                maxLength: 1024
+                                minLength: 1
+                                type: string
+                              path:
+                                maxLength: 1024
+                                minLength: 1
+                                type: string
+                              readOnly:
+                                type: boolean
+                            required:
+                            - mountPath
+                            - path
+                            type: object
+                            x-kubernetes-validations:
+                            - message: mountPath must be a clean absolute path
+                              rule: self.mountPath.startsWith('/') && !self.mountPath.contains('//')
+                                && !self.mountPath.contains('/./') && !self.mountPath.contains('/../')
+                                && !self.mountPath.endsWith('/.') && !self.mountPath.endsWith('/..')
+                            - message: mountPath must not replace or shadow a reserved
+                                Project Signal mount
+                              rule: self.mountPath != '/scripts' && !self.mountPath.startsWith('/scripts/')
+                                && self.mountPath != '/results' && !self.mountPath.startsWith('/results/')
+                            - message: path must be an approved proc leaf, journal
+                                path, or a clean path under /sys or /var/lib/project-signal
+                              rule: (self.path == '/proc/cpuinfo' || self.path ==
+                                '/proc/meminfo' || self.path == '/proc/version' ||
+                                self.path == '/proc/sys/kernel/random/boot_id' ||
+                                self.path == '/sys' || self.path.startsWith('/sys/')
+                                || self.path == '/var/lib/project-signal' || self.path.startsWith('/var/lib/project-signal/')
+                                || self.path == '/var/log' || self.path == '/run/log'
+                                || self.path == '/etc/machine-id') && !self.path.contains('//')
+                                && !self.path.contains('/./') && !self.path.contains('/../')
+                                && !self.path.endsWith('/.') && !self.path.endsWith('/..')
+                            - message: proc, sys, and journal host paths must be read-only
+                              rule: '!(self.path.startsWith(''/proc/'') || self.path
+                                == ''/sys'' || self.path.startsWith(''/sys/'') ||
+                                self.path == ''/var/log'' || self.path == ''/run/log''
+                                || self.path == ''/etc/machine-id'') || self.readOnly'
+                          maxItems: 16
+                          type: array
+                          x-kubernetes-list-map-keys:
+                          - mountPath
+                          x-kubernetes-list-type: map
+                        ipcLock:
+                          type: boolean
+                        privileged:
+                          type: boolean
+                        resources:
+                          description: ResourceRequirements describes the compute
+                            resource requirements.
+                          properties:
+                            claims:
+                              description: |-
+                                Claims lists the names of resources, defined in spec.resourceClaims,
+                                that are used by this container.
+
+                                This field depends on the
+                                DynamicResourceAllocation feature gate.
+
+                                This field is immutable. It can only be set for containers.
+                              items:
+                                description: ResourceClaim references one entry in
+                                  PodSpec.ResourceClaims.
+                                properties:
+                                  name:
+                                    description: |-
+                                      Name must match the name of one entry in pod.spec.resourceClaims of
+                                      the Pod where this field is used. It makes that resource available
+                                      inside a container.
+                                    type: string
+                                  request:
+                                    description: |-
+                                      Request is the name chosen for a request in the referenced claim.
+                                      If empty, everything from the claim is made available, otherwise
+                                      only the result of this request.
+                                    type: string
+                                required:
+                                - name
+                                type: object
+                              type: array
+                              x-kubernetes-list-map-keys:
+                              - name
+                              x-kubernetes-list-type: map
+                            limits:
+                              additionalProperties:
+                                anyOf:
+                                - type: integer
+                                - type: string
+                                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                                x-kubernetes-int-or-string: true
+                              description: |-
+                                Limits describes the maximum amount of compute resources allowed.
+                                More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                              type: object
+                            requests:
+                              additionalProperties:
+                                anyOf:
+                                - type: integer
+                                - type: string
+                                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                                x-kubernetes-int-or-string: true
+                              description: |-
+                                Requests describes the minimum amount of compute resources required.
+                                If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                                otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                                More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                              type: object
+                          type: object
+                      type: object
+                  required:
+                  - backend
+                  - backendActiveDeadline
+                  - scriptKey
+                  type: object
+                  x-kubernetes-validations:
+                  - message: backendActiveDeadline must be positive
+                    rule: duration(self.backendActiveDeadline) > duration('0s')
+                  - message: MPIJob checks require a positive gpuCount
+                    rule: self.backend != 'MPIJob' || (has(self.gpuCount) && self.gpuCount
+                      > 0)
+                  - message: minDuration must be positive
+                    rule: '!has(self.minDuration) || duration(self.minDuration) >
+                      duration(''0s'')'
+                  - message: minDuration must not exceed backendActiveDeadline
+                    rule: '!has(self.minDuration) || duration(self.minDuration) <=
+                      duration(self.backendActiveDeadline)'
+                  - message: maxSampleGap must not exceed backendActiveDeadline
+                    rule: '!has(self.continuity) || !has(self.continuity.maxSampleGap)
+                      || duration(self.continuity.maxSampleGap) <= duration(self.backendActiveDeadline)'
+                  - message: maxSampleGap must not exceed minDuration
+                    rule: '!has(self.minDuration) || !has(self.continuity) || !has(self.continuity.maxSampleGap)
+                      || duration(self.continuity.maxSampleGap) <= duration(self.minDuration)'
+                  - message: coverageWindow must not exceed backendActiveDeadline
+                    rule: '!has(self.execution) || !has(self.execution.coverageWindow)
+                      || duration(self.execution.coverageWindow) <= duration(self.backendActiveDeadline)'
+                  - message: repeated execution requires a whole-second backendActiveDeadline
+                    rule: '!has(self.execution) || self.execution.mode == ''RunOnce''
+                      || duration(self.backendActiveDeadline).getMilliseconds() %
+                      1000 == 0'
+                maxItems: 256
+                type: array
+                x-kubernetes-list-type: atomic
+              phases:
+                description: Phases execute in order. Stages within a phase execute
+                  concurrently.
+                items:
+                  properties:
+                    displayName:
+                      maxLength: 128
+                      type: string
+                    name:
+                      maxLength: 63
+                      minLength: 1
+                      pattern: ^[a-z]([-a-z0-9]*[a-z0-9])?$
+                      type: string
+                    role:
+                      enum:
+                      - Startup
+                      - Validation
+                      - Terminal
+                      type: string
+                    stages:
+                      description: |-
+                        Stages execute concurrently. The phase completes after all required
+                        stages reach terminal verdicts.
+                      items:
+                        properties:
+                          assertions:
+                            items:
+                              properties:
+                                expected:
+                                  properties:
+                                    booleanValue:
+                                      type: boolean
+                                    decimalValue:
+                                      description: DecimalValue is a base-10 JSON-independent
+                                        decimal representation.
+                                      maxLength: 128
+                                      pattern: ^-?(0|[1-9][0-9]*)(\.[0-9]+)?$
+                                      type: string
+                                    durationValue:
+                                      type: string
+                                    integerValue:
+                                      format: int64
+                                      type: integer
+                                    quantityValue:
+                                      description: QuantityValue uses Kubernetes quantity
+                                        syntax.
+                                      maxLength: 64
+                                      minLength: 1
+                                      type: string
+                                    stringValue:
+                                      maxLength: 65536
+                                      type: string
+                                    type:
+                                      enum:
+                                      - String
+                                      - Integer
+                                      - Decimal
+                                      - Boolean
+                                      - Duration
+                                      - Quantity
+                                      type: string
+                                  required:
+                                  - type
+                                  type: object
+                                  x-kubernetes-validations:
+                                  - message: exactly the value field matching type
+                                      must be set
+                                    rule: (self.type == 'String' && has(self.stringValue)
+                                      && !has(self.integerValue) && !has(self.decimalValue)
+                                      && !has(self.booleanValue) && !has(self.durationValue)
+                                      && !has(self.quantityValue)) || (self.type ==
+                                      'Integer' && !has(self.stringValue) && has(self.integerValue)
+                                      && !has(self.decimalValue) && !has(self.booleanValue)
+                                      && !has(self.durationValue) && !has(self.quantityValue))
+                                      || (self.type == 'Decimal' && !has(self.stringValue)
+                                      && !has(self.integerValue) && has(self.decimalValue)
+                                      && !has(self.booleanValue) && !has(self.durationValue)
+                                      && !has(self.quantityValue)) || (self.type ==
+                                      'Boolean' && !has(self.stringValue) && !has(self.integerValue)
+                                      && !has(self.decimalValue) && has(self.booleanValue)
+                                      && !has(self.durationValue) && !has(self.quantityValue))
+                                      || (self.type == 'Duration' && !has(self.stringValue)
+                                      && !has(self.integerValue) && !has(self.decimalValue)
+                                      && !has(self.booleanValue) && has(self.durationValue)
+                                      && !has(self.quantityValue)) || (self.type ==
+                                      'Quantity' && !has(self.stringValue) && !has(self.integerValue)
+                                      && !has(self.decimalValue) && !has(self.booleanValue)
+                                      && !has(self.durationValue) && has(self.quantityValue))
+                                maximum:
+                                  properties:
+                                    booleanValue:
+                                      type: boolean
+                                    decimalValue:
+                                      description: DecimalValue is a base-10 JSON-independent
+                                        decimal representation.
+                                      maxLength: 128
+                                      pattern: ^-?(0|[1-9][0-9]*)(\.[0-9]+)?$
+                                      type: string
+                                    durationValue:
+                                      type: string
+                                    integerValue:
+                                      format: int64
+                                      type: integer
+                                    quantityValue:
+                                      description: QuantityValue uses Kubernetes quantity
+                                        syntax.
+                                      maxLength: 64
+                                      minLength: 1
+                                      type: string
+                                    stringValue:
+                                      maxLength: 65536
+                                      type: string
+                                    type:
+                                      enum:
+                                      - String
+                                      - Integer
+                                      - Decimal
+                                      - Boolean
+                                      - Duration
+                                      - Quantity
+                                      type: string
+                                  required:
+                                  - type
+                                  type: object
+                                  x-kubernetes-validations:
+                                  - message: exactly the value field matching type
+                                      must be set
+                                    rule: (self.type == 'String' && has(self.stringValue)
+                                      && !has(self.integerValue) && !has(self.decimalValue)
+                                      && !has(self.booleanValue) && !has(self.durationValue)
+                                      && !has(self.quantityValue)) || (self.type ==
+                                      'Integer' && !has(self.stringValue) && has(self.integerValue)
+                                      && !has(self.decimalValue) && !has(self.booleanValue)
+                                      && !has(self.durationValue) && !has(self.quantityValue))
+                                      || (self.type == 'Decimal' && !has(self.stringValue)
+                                      && !has(self.integerValue) && has(self.decimalValue)
+                                      && !has(self.booleanValue) && !has(self.durationValue)
+                                      && !has(self.quantityValue)) || (self.type ==
+                                      'Boolean' && !has(self.stringValue) && !has(self.integerValue)
+                                      && !has(self.decimalValue) && has(self.booleanValue)
+                                      && !has(self.durationValue) && !has(self.quantityValue))
+                                      || (self.type == 'Duration' && !has(self.stringValue)
+                                      && !has(self.integerValue) && !has(self.decimalValue)
+                                      && !has(self.booleanValue) && has(self.durationValue)
+                                      && !has(self.quantityValue)) || (self.type ==
+                                      'Quantity' && !has(self.stringValue) && !has(self.integerValue)
+                                      && !has(self.decimalValue) && !has(self.booleanValue)
+                                      && !has(self.durationValue) && has(self.quantityValue))
+                                metric:
+                                  description: Metric names must exist in the referenced
+                                    CertificationTest metric schema.
+                                  maxLength: 63
+                                  minLength: 1
+                                  type: string
+                                minimum:
+                                  properties:
+                                    booleanValue:
+                                      type: boolean
+                                    decimalValue:
+                                      description: DecimalValue is a base-10 JSON-independent
+                                        decimal representation.
+                                      maxLength: 128
+                                      pattern: ^-?(0|[1-9][0-9]*)(\.[0-9]+)?$
+                                      type: string
+                                    durationValue:
+                                      type: string
+                                    integerValue:
+                                      format: int64
+                                      type: integer
+                                    quantityValue:
+                                      description: QuantityValue uses Kubernetes quantity
+                                        syntax.
+                                      maxLength: 64
+                                      minLength: 1
+                                      type: string
+                                    stringValue:
+                                      maxLength: 65536
+                                      type: string
+                                    type:
+                                      enum:
+                                      - String
+                                      - Integer
+                                      - Decimal
+                                      - Boolean
+                                      - Duration
+                                      - Quantity
+                                      type: string
+                                  required:
+                                  - type
+                                  type: object
+                                  x-kubernetes-validations:
+                                  - message: exactly the value field matching type
+                                      must be set
+                                    rule: (self.type == 'String' && has(self.stringValue)
+                                      && !has(self.integerValue) && !has(self.decimalValue)
+                                      && !has(self.booleanValue) && !has(self.durationValue)
+                                      && !has(self.quantityValue)) || (self.type ==
+                                      'Integer' && !has(self.stringValue) && has(self.integerValue)
+                                      && !has(self.decimalValue) && !has(self.booleanValue)
+                                      && !has(self.durationValue) && !has(self.quantityValue))
+                                      || (self.type == 'Decimal' && !has(self.stringValue)
+                                      && !has(self.integerValue) && has(self.decimalValue)
+                                      && !has(self.booleanValue) && !has(self.durationValue)
+                                      && !has(self.quantityValue)) || (self.type ==
+                                      'Boolean' && !has(self.stringValue) && !has(self.integerValue)
+                                      && !has(self.decimalValue) && has(self.booleanValue)
+                                      && !has(self.durationValue) && !has(self.quantityValue))
+                                      || (self.type == 'Duration' && !has(self.stringValue)
+                                      && !has(self.integerValue) && !has(self.decimalValue)
+                                      && !has(self.booleanValue) && has(self.durationValue)
+                                      && !has(self.quantityValue)) || (self.type ==
+                                      'Quantity' && !has(self.stringValue) && !has(self.integerValue)
+                                      && !has(self.decimalValue) && !has(self.booleanValue)
+                                      && !has(self.durationValue) && has(self.quantityValue))
+                                name:
+                                  maxLength: 63
+                                  minLength: 1
+                                  pattern: ^[a-z]([-a-z0-9]*[a-z0-9])?$
+                                  type: string
+                                operator:
+                                  enum:
+                                  - BooleanEquals
+                                  - StatusEquals
+                                  - Minimum
+                                  - Maximum
+                                  - Range
+                                  - CountMinimum
+                                  - ErrorRateMaximum
+                                  - PercentileMaximum
+                                  type: string
+                                percentile:
+                                  format: int32
+                                  maximum: 100
+                                  minimum: 0
+                                  type: integer
+                              required:
+                              - metric
+                              - name
+                              - operator
+                              type: object
+                              x-kubernetes-validations:
+                              - message: Range assertions require minimum and maximum
+                                  and forbid expected
+                                rule: self.operator != 'Range' || (has(self.minimum)
+                                  && has(self.maximum) && !has(self.expected))
+                              - message: minimum and expected are mutually exclusive
+                                  outside Range
+                                rule: self.operator == 'Range' || !has(self.minimum)
+                                  || !has(self.expected)
+                              - message: maximum and expected are mutually exclusive
+                                  outside Range
+                                rule: self.operator == 'Range' || !has(self.maximum)
+                                  || !has(self.expected)
+                              - message: non-Range assertions require expected
+                                rule: self.operator == 'Range' || has(self.expected)
+                              - message: PercentileMaximum assertions require percentile
+                                rule: self.operator != 'PercentileMaximum' || has(self.percentile)
+                              - message: percentile is valid only for PercentileMaximum
+                                  assertions
+                                rule: self.operator == 'PercentileMaximum' || !has(self.percentile)
+                            maxItems: 16
+                            type: array
+                            x-kubernetes-list-map-keys:
+                            - name
+                            x-kubernetes-list-type: map
+                          dependsOn:
+                            description: DependsOn overrides the default previous-phase
+                              barrier for this stage.
+                            items:
+                              properties:
+                                condition:
+                                  description: |-
+                                    Condition defaults to Succeeded. Completed allows terminal cleanup or
+                                    evidence stages to run after any terminal dependency outcome.
+                                  enum:
+                                  - Succeeded
+                                  - Completed
+                                  type: string
+                                stage:
+                                  description: Stage is the stable name of another
+                                    stage in this Suite.
+                                  maxLength: 63
+                                  minLength: 1
+                                  pattern: ^[a-z]([-a-z0-9]*[a-z0-9])?$
+                                  type: string
+                              required:
+                              - stage
+                              type: object
+                            maxItems: 16
+                            type: array
+                            x-kubernetes-list-map-keys:
+                            - stage
+                            x-kubernetes-list-type: map
+                          displayName:
+                            maxLength: 128
+                            type: string
+                          name:
+                            description: Name is the stable operator-defined stage
+                              identity within the Suite.
+                            maxLength: 63
+                            minLength: 1
+                            pattern: ^[a-z]([-a-z0-9]*[a-z0-9])?$
+                            type: string
+                          optional:
+                            description: Optional stages are reported but do not determine
+                              phase or Run success.
+                            type: boolean
+                          parameters:
+                            items:
+                              properties:
+                                name:
+                                  maxLength: 63
+                                  minLength: 1
+                                  type: string
+                                value:
+                                  properties:
+                                    booleanValue:
+                                      type: boolean
+                                    decimalValue:
+                                      description: DecimalValue is a base-10 JSON-independent
+                                        decimal representation.
+                                      maxLength: 128
+                                      pattern: ^-?(0|[1-9][0-9]*)(\.[0-9]+)?$
+                                      type: string
+                                    durationValue:
+                                      type: string
+                                    integerValue:
+                                      format: int64
+                                      type: integer
+                                    quantityValue:
+                                      description: QuantityValue uses Kubernetes quantity
+                                        syntax.
+                                      maxLength: 64
+                                      minLength: 1
+                                      type: string
+                                    stringValue:
+                                      maxLength: 65536
+                                      type: string
+                                    type:
+                                      enum:
+                                      - String
+                                      - Integer
+                                      - Decimal
+                                      - Boolean
+                                      - Duration
+                                      - Quantity
+                                      type: string
+                                  required:
+                                  - type
+                                  type: object
+                                  x-kubernetes-validations:
+                                  - message: exactly the value field matching type
+                                      must be set
+                                    rule: (self.type == 'String' && has(self.stringValue)
+                                      && !has(self.integerValue) && !has(self.decimalValue)
+                                      && !has(self.booleanValue) && !has(self.durationValue)
+                                      && !has(self.quantityValue)) || (self.type ==
+                                      'Integer' && !has(self.stringValue) && has(self.integerValue)
+                                      && !has(self.decimalValue) && !has(self.booleanValue)
+                                      && !has(self.durationValue) && !has(self.quantityValue))
+                                      || (self.type == 'Decimal' && !has(self.stringValue)
+                                      && !has(self.integerValue) && has(self.decimalValue)
+                                      && !has(self.booleanValue) && !has(self.durationValue)
+                                      && !has(self.quantityValue)) || (self.type ==
+                                      'Boolean' && !has(self.stringValue) && !has(self.integerValue)
+                                      && !has(self.decimalValue) && has(self.booleanValue)
+                                      && !has(self.durationValue) && !has(self.quantityValue))
+                                      || (self.type == 'Duration' && !has(self.stringValue)
+                                      && !has(self.integerValue) && !has(self.decimalValue)
+                                      && !has(self.booleanValue) && has(self.durationValue)
+                                      && !has(self.quantityValue)) || (self.type ==
+                                      'Quantity' && !has(self.stringValue) && !has(self.integerValue)
+                                      && !has(self.decimalValue) && !has(self.booleanValue)
+                                      && !has(self.durationValue) && has(self.quantityValue))
+                              required:
+                              - name
+                              - value
+                              type: object
+                            maxItems: 16
+                            type: array
+                            x-kubernetes-list-map-keys:
+                            - name
+                            x-kubernetes-list-type: map
+                          participantRoles:
+                            items:
+                              properties:
+                                count:
+                                  format: int32
+                                  maximum: 8
+                                  minimum: 1
+                                  type: integer
+                                role:
+                                  maxLength: 63
+                                  minLength: 1
+                                  type: string
+                              required:
+                              - count
+                              - role
+                              type: object
+                            maxItems: 8
+                            type: array
+                            x-kubernetes-list-map-keys:
+                            - role
+                            x-kubernetes-list-type: map
+                          perDeviceCoverageInterval:
+                            description: |-
+                              PerDeviceCoverageInterval requires every starting device to be covered in
+                              each interval represented by durable stage evidence.
+                            type: string
+                          retry:
+                            properties:
+                              maxAttempts:
+                                description: MaxAttempts includes the initial attempt.
+                                format: int32
+                                maximum: 8
+                                minimum: 1
+                                type: integer
+                              retryableFailures:
+                                items:
+                                  enum:
+                                  - InfrastructureFailure
+                                  type: string
+                                maxItems: 1
+                                type: array
+                                x-kubernetes-list-type: set
+                            required:
+                            - maxAttempts
+                            type: object
+                          schedule:
+                            properties:
+                              coverageWindow:
+                                type: string
+                              interval:
+                                type: string
+                              invocationTimeout:
+                                description: InvocationTimeout bounds every invocation,
+                                  including RunOnce.
+                                type: string
+                              maxGap:
+                                type: string
+                              minExecutions:
+                                format: int32
+                                maximum: 1000000
+                                minimum: 2
+                                type: integer
+                              mode:
+                                enum:
+                                - RunOnce
+                                - Continuous
+                                - Periodic
+                                type: string
+                            required:
+                            - invocationTimeout
+                            - mode
+                            type: object
+                            x-kubernetes-validations:
+                            - message: RunOnce schedules must not declare repeated-execution
+                                fields
+                              rule: self.mode != 'RunOnce' || (!has(self.coverageWindow)
+                                && !has(self.interval) && !has(self.minExecutions)
+                                && !has(self.maxGap))
+                            - message: Continuous and Periodic schedules require coverageWindow,
+                                minExecutions, and maxGap
+                              rule: self.mode == 'RunOnce' || (has(self.coverageWindow)
+                                && has(self.minExecutions) && has(self.maxGap))
+                            - message: Periodic schedules require interval
+                              rule: self.mode != 'Periodic' || has(self.interval)
+                            - message: only Periodic schedules may declare interval
+                              rule: self.mode == 'Periodic' || !has(self.interval)
+                            - message: invocationTimeout must be positive
+                              rule: duration(self.invocationTimeout) > duration('0s')
+                            - message: invocationTimeout must use whole-second precision
+                              rule: duration(self.invocationTimeout).getMilliseconds()
+                                % 1000 == 0
+                            - message: coverageWindow must be positive
+                              rule: '!has(self.coverageWindow) || duration(self.coverageWindow)
+                                > duration(''0s'')'
+                            - message: coverageWindow must use whole-second precision
+                              rule: '!has(self.coverageWindow) || duration(self.coverageWindow).getMilliseconds()
+                                % 1000 == 0'
+                            - message: invocationTimeout must not exceed coverageWindow
+                              rule: '!has(self.coverageWindow) || duration(self.invocationTimeout)
+                                <= duration(self.coverageWindow)'
+                            - message: interval must be positive
+                              rule: '!has(self.interval) || duration(self.interval)
+                                > duration(''0s'')'
+                            - message: interval must use whole-second precision
+                              rule: '!has(self.interval) || duration(self.interval).getMilliseconds()
+                                % 1000 == 0'
+                            - message: Periodic invocationTimeout must not exceed
+                                interval
+                              rule: '!has(self.interval) || duration(self.invocationTimeout)
+                                <= duration(self.interval)'
+                            - message: maxGap must be positive
+                              rule: '!has(self.maxGap) || duration(self.maxGap) >
+                                duration(''0s'')'
+                            - message: maxGap must use whole-second precision
+                              rule: '!has(self.maxGap) || duration(self.maxGap).getMilliseconds()
+                                % 1000 == 0'
+                            - message: maxGap must not exceed coverageWindow
+                              rule: '!has(self.coverageWindow) || !has(self.maxGap)
+                                || duration(self.maxGap) <= duration(self.coverageWindow)'
+                            - message: Periodic maxGap must not be less than interval
+                              rule: '!has(self.interval) || !has(self.maxGap) || duration(self.interval)
+                                <= duration(self.maxGap)'
+                            - message: minExecutions must fit within coverageWindow
+                              rule: '!has(self.interval) || !has(self.coverageWindow)
+                                || !has(self.minExecutions) || duration(self.invocationTimeout).getMilliseconds()
+                                + duration(self.interval).getMilliseconds() * (self.minExecutions
+                                - 1) <= duration(self.coverageWindow).getMilliseconds()'
+                          test:
+                            properties:
+                              contentDigest:
+                                description: ContentDigest is the accepted canonical
+                                  CertificationTest definition.
+                                pattern: ^sha256:[0-9a-f]{64}$
+                                type: string
+                              generation:
+                                format: int64
+                                minimum: 1
+                                type: integer
+                              name:
+                                maxLength: 253
+                                minLength: 1
+                                type: string
+                              uid:
+                                description: |-
+                                  UID is a type that holds unique ID values, including UUIDs.  Because we
+                                  don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                                  intent and helps make sure that UIDs and names do not get conflated.
+                                type: string
+                            required:
+                            - contentDigest
+                            - generation
+                            - name
+                            - uid
+                            type: object
+                            x-kubernetes-validations:
+                            - message: uid is required
+                              rule: size(self.uid) > 0
+                        required:
+                        - name
+                        - schedule
+                        - test
+                        type: object
+                        x-kubernetes-validations:
+                        - message: perDeviceCoverageInterval requires Continuous or
+                            Periodic scheduling
+                          rule: '!has(self.perDeviceCoverageInterval) || self.schedule.mode
+                            != ''RunOnce'''
+                        - message: perDeviceCoverageInterval must be positive
+                          rule: '!has(self.perDeviceCoverageInterval) || duration(self.perDeviceCoverageInterval)
+                            > duration(''0s'')'
+                        - message: perDeviceCoverageInterval must use whole-second
+                            precision
+                          rule: '!has(self.perDeviceCoverageInterval) || duration(self.perDeviceCoverageInterval).getMilliseconds()
+                            % 1000 == 0'
+                        - message: perDeviceCoverageInterval must not exceed coverageWindow
+                          rule: '!has(self.schedule.coverageWindow) || !has(self.perDeviceCoverageInterval)
+                            || duration(self.perDeviceCoverageInterval) <= duration(self.schedule.coverageWindow)'
+                      maxItems: 32
+                      minItems: 1
+                      type: array
+                      x-kubernetes-list-type: atomic
+                  required:
+                  - name
+                  - role
+                  - stages
+                  type: object
+                  x-kubernetes-validations:
+                  - message: stage names must be unique within a phase
+                    rule: self.stages.all(x, self.stages.filter(y, y.name == x.name).size()
+                      == 1)
+                  - message: Startup and Terminal phases may contain only RunOnce
+                      stages
+                    rule: self.role == 'Validation' || self.stages.all(x, x.schedule.mode
+                      == 'RunOnce')
+                maxItems: 16
+                type: array
+                x-kubernetes-list-type: atomic
+              scriptBundle:
+                description: ScriptBundle is retained only for backward-compatible
+                  legacy checks.
+                properties:
+                  digest:
+                    description: |-
+                      Digest is the aggregate algorithm-qualified SHA-256 digest derived from
+                      the selected script bytes in check order.
+                    pattern: ^sha256:[0-9a-f]{64}$
+                    type: string
+                  name:
+                    maxLength: 253
+                    minLength: 1
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                    type: string
+                required:
+                - digest
+                - name
+                type: object
+            type: object
+            x-kubernetes-validations:
+            - message: exactly one of phases or legacy checks must be configured
+              rule: (has(self.phases) && size(self.phases) > 0) != (has(self.checks)
+                && size(self.checks) > 0)
+            - message: legacy checks require scriptBundle
+              rule: '!has(self.checks) || size(self.checks) == 0 || has(self.scriptBundle)'
+            - message: phase-based Suites must not use legacy scriptBundle
+              rule: '!has(self.phases) || size(self.phases) == 0 || !has(self.scriptBundle)'
+            - message: phase names must be unique
+              rule: '!has(self.phases) || self.phases.all(x, self.phases.filter(y,
+                y.name == x.name).size() == 1)'
+            - message: total stage count must not exceed 32
+              rule: '!has(self.phases) || self.phases.map(x, x.stages.size()).sum()
+                <= 32'
+            - message: at most one Startup phase is allowed
+              rule: '!has(self.phases) || self.phases.filter(x, x.role == ''Startup'').size()
+                <= 1'
+            - message: at most one Terminal phase is allowed
+              rule: '!has(self.phases) || self.phases.filter(x, x.role == ''Terminal'').size()
+                <= 1'
+            - message: Startup phase must be first
+              rule: '!has(self.phases) || self.phases.filter(x, x.role == ''Startup'').size()
+                == 0 || self.phases[0].role == ''Startup'''
+            - message: Terminal phase must be last
+              rule: '!has(self.phases) || self.phases.filter(x, x.role == ''Terminal'').size()
+                == 0 || self.phases[self.phases.size() - 1].role == ''Terminal'''
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources: {}

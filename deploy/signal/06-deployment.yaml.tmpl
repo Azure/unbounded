@@ -1,0 +1,121 @@
+{{- $controllerImage := default "example.invalid/project-signal-controller@sha256:0000000000000000000000000000000000000000000000000000000000000000" .ControllerImage }}
+{{- if not (regexMatch "^[^@[:space:]]+@sha256:[0-9a-f]{64}$" $controllerImage) }}
+{{- fail "ControllerImage must be an immutable sha256 digest reference" }}
+{{- end }}
+{{- $adapterImage := default "example.invalid/project-signal-adapter@sha256:0000000000000000000000000000000000000000000000000000000000000000" .AdapterImage }}
+{{- if not (regexMatch "^[^@[:space:]]+@sha256:[0-9a-f]{64}$" $adapterImage) }}
+{{- fail "AdapterImage must be an immutable sha256 digest reference" }}
+{{- end }}
+{{- $runnerImage := default "example.invalid/project-signal-runner@sha256:0000000000000000000000000000000000000000000000000000000000000000" .RunnerImage }}
+{{- if not (regexMatch "^[^@[:space:]]+@sha256:[0-9a-f]{64}$" $runnerImage) }}
+{{- fail "RunnerImage must be an immutable sha256 digest reference" }}
+{{- end }}
+{{- $workflowTemplateDigest := .WorkflowTemplateDigest }}
+{{- if not (regexMatch "^sha256:[0-9a-f]{64}$" $workflowTemplateDigest) }}
+{{- fail "WorkflowTemplateDigest must be an algorithm-qualified sha256 digest" }}
+{{- end }}
+{{- $qualificationGateProtected := default "false" .QualificationGateProtected }}
+{{- if not (regexMatch "^(true|false)$" $qualificationGateProtected) }}
+{{- fail "QualificationGateProtected must be true or false" }}
+{{- end }}
+{{- if and (eq $qualificationGateProtected "true") (ne .QualificationGateGuard "node-authorizer-node-restriction-rbac-verified") }}
+{{- fail "QualificationGateProtected requires an explicit Node authorizer, NodeRestriction, and restrictive Node-patch RBAC guard" }}
+{{- end }}
+{{- $executionAuthorityEnabled := default "false" .ExecutionAuthorityEnabled }}
+{{- if not (regexMatch "^(true|false)$" $executionAuthorityEnabled) }}
+{{- fail "ExecutionAuthorityEnabled must be true or false" }}
+{{- end }}
+{{- $authorityName := "project-signal-execution-authority-disabled" }}
+{{- $staticPackageDigest := "" }}
+{{- if eq $executionAuthorityEnabled "true" }}
+{{- if or (eq (default "project-signal" .Namespace) (default "project-signal-authority" .AuthorityNamespace)) (eq (default (default "project-signal" .Namespace) .ScriptNamespace) (default "project-signal-authority" .AuthorityNamespace)) }}
+{{- fail "AuthorityNamespace must be distinct from Namespace and ScriptNamespace" }}
+{{- end }}
+{{- $authorityName = .AuthorityName }}
+{{- $staticPackageDigest = .StaticPackageDigest }}
+{{- end }}
+{{- $resolverImages := compact (splitList "," (default "" .ResolverImages)) }}
+{{- range $resolverImage := $resolverImages }}
+{{- if not (regexMatch "^[^@[:space:]]+@sha256:[0-9a-f]{64}$" $resolverImage) }}
+{{- fail "ResolverImages entries must be immutable sha256 digest references" }}
+{{- end }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: project-signal-controller
+  namespace: {{ default "project-signal" .Namespace }}
+  annotations:
+    signal.unbounded-cloud.io/qualification-gate-protected: {{ $qualificationGateProtected | quote }}
+    signal.unbounded-cloud.io/qualification-gate-guard: {{ ternary "operator-verified" "disabled" (eq $qualificationGateProtected "true") | quote }}
+  labels:
+    app.kubernetes.io/name: project-signal-controller
+    app.kubernetes.io/part-of: project-signal
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: project-signal-controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: project-signal-controller
+        app.kubernetes.io/part-of: project-signal
+    spec:
+      serviceAccountName: project-signal-controller
+      automountServiceAccountToken: true
+      tolerations:
+        - key: node.kubernetes.io/unschedulable
+          operator: Exists
+          effect: NoSchedule
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: controller
+          image: {{ $controllerImage }}
+          imagePullPolicy: IfNotPresent
+          args:
+            - --namespace={{ default "project-signal" .Namespace }}
+            - --script-namespace={{ default (default "project-signal" .Namespace) .ScriptNamespace }}
+            - --authority-namespace={{ default "project-signal-authority" .AuthorityNamespace }}
+            - --authority-name={{ $authorityName }}
+            - --static-package-digest={{ $staticPackageDigest }}
+            - --runner-image={{ $runnerImage }}
+            - --controller-image={{ $controllerImage }}
+            - --adapter-image={{ $adapterImage }}
+            - --workflow-template-digest={{ $workflowTemplateDigest }}
+{{- range $resolverImage := $resolverImages }}
+            - --resolver-image={{ $resolverImage }}
+{{- end }}
+            - --qualification-gate-protected={{ $qualificationGateProtected }}
+            - --leader-elect=true
+            - --max-concurrent-runs=1
+            - --metrics-bind-address=:8080
+            - --health-probe-bind-address=:8081
+          ports:
+            - name: metrics
+              containerPort: 8080
+            - name: health
+              containerPort: 8081
+          resources:
+            requests:
+              cpu: 50m
+              memory: 96Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: [ALL]
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health

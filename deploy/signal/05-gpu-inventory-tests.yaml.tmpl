@@ -1,0 +1,211 @@
+{{- $runnerImage := default "example.invalid/project-signal-runner@sha256:0000000000000000000000000000000000000000000000000000000000000000" .RunnerImage }}
+{{- if not (regexMatch "^[^@[:space:]]+@sha256:[0-9a-f]{64}$" $runnerImage) }}
+{{- fail "RunnerImage must be an immutable sha256 digest reference" }}
+{{- end }}
+{{- $scriptDigest := .GPUInventoryScriptDigest }}
+{{- if not (regexMatch "^sha256:[0-9a-f]{64}$" $scriptDigest) }}
+{{- fail "GPUInventoryScriptDigest must be an algorithm-qualified sha256 digest" }}
+{{- end }}
+apiVersion: signal.unbounded-cloud.io/v1alpha1
+kind: CertificationTest
+metadata:
+  name: project-signal-gpu-inventory-v1
+  labels:
+    app.kubernetes.io/name: project-signal-gpu-inventory
+    app.kubernetes.io/part-of: project-signal
+    signal.unbounded-cloud.io/catalog-role: qualification
+spec:
+  displayName: GPU inventory
+  description: Collects a redacted GPU inventory and exposes typed availability, count, and driver consistency measurements.
+  owner: project-signal
+  version: "1"
+  tags: [gpu, inventory]
+  artifacts:
+    - name: gpu-inventory.sh
+      content: |
+        #!/bin/sh
+        set -eu
+
+        started_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+        nvidia_smi_available=false
+        observed_gpu_count=0
+        driver_version_set=unavailable
+        start_driver_version=
+        end_driver_version=
+        start_gpu_inventory_digest=
+        end_gpu_inventory_digest=
+        outcome=Inconclusive
+        reason_code=TestHarnessFailure
+        message="nvidia-smi is unavailable"
+
+        collect_fingerprint() {
+          expected_gpu_count="$1"
+          driver_versions="$(
+            nvidia-smi --query-gpu=driver_version --format=csv,noheader,nounits 2>/dev/null |
+              awk '{$1=$1; if (NF) print}'
+          )" || return 1
+          driver_version_count="$(printf '%s\n' "$driver_versions" | awk 'NF { count++ } END { print count + 0 }')"
+          distinct_driver_versions="$(
+            printf '%s\n' "$driver_versions" |
+              awk 'NF { seen[$0] = 1 } END { print length(seen) }'
+          )"
+          [ "$driver_version_count" -eq "$expected_gpu_count" ] || return 1
+          [ "$distinct_driver_versions" -eq 1 ] || return 1
+          driver_version="$(printf '%s\n' "$driver_versions" | awk 'NF { print; exit }')"
+          case "$driver_version" in
+            "" | *[!A-Za-z0-9._+-]*)
+              return 1
+              ;;
+          esac
+
+          indexed_gpu_uuids_unsorted="$(
+            nvidia-smi --query-gpu=index,uuid --format=csv,noheader,nounits 2>/dev/null |
+              awk -F ',' -v expected="$expected_gpu_count" '
+                function trim(value) {
+                  gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+                  return value
+                }
+                function canonical_uuid(value, compact) {
+                  if (length(value) != 40 || substr(value, 1, 4) != "GPU-" ||
+                      substr(value, 13, 1) != "-" || substr(value, 18, 1) != "-" ||
+                      substr(value, 23, 1) != "-" || substr(value, 28, 1) != "-") {
+                    return 0
+                  }
+                  compact = substr(value, 5)
+                  gsub(/-/, "", compact)
+                  return compact ~ /^[0-9A-Fa-f]+$/ && length(compact) == 32
+                }
+                {
+                  if (NF != 2) {
+                    exit 1
+                  }
+                  gpu_index = trim($1)
+                  uuid = trim($2)
+                  if (gpu_index !~ /^(0|[1-9][0-9]*)$/ || !canonical_uuid(uuid) ||
+                      seen_index[gpu_index] || seen_uuid[uuid]) {
+                    exit 1
+                  }
+                  seen_index[gpu_index] = 1
+                  seen_uuid[uuid] = 1
+                  uuids[gpu_index] = uuid
+                  count++
+                }
+                END {
+                  if (count != expected) {
+                    exit 1
+                  }
+                  for (gpu_index in uuids) {
+                    printf "%d\t%s\n", gpu_index, uuids[gpu_index]
+                  }
+                }
+              '
+          )" || return 1
+          indexed_gpu_uuids="$(
+            printf '%s\n' "$indexed_gpu_uuids_unsorted" |
+              LC_ALL=C sort -t "$(printf '\t')" -k1,1n |
+              awk -F "$(printf '\t')" -v expected="$expected_gpu_count" '
+                {
+                  if ($1 != NR - 1) {
+                    exit 1
+                  }
+                  print
+                }
+                END {
+                  if (NR != expected) {
+                    exit 1
+                  }
+                }
+              '
+          )" || return 1
+          gpu_inventory_digest="$(
+            printf '%s\n' "$indexed_gpu_uuids" |
+              while IFS="$(printf '\t')" read -r gpu_index gpu_uuid; do
+                [ -n "$gpu_uuid" ] || exit 1
+                if [ "${first_uuid:-true}" = true ]; then
+                  first_uuid=false
+                else
+                  printf '\000'
+                fi
+                printf '%s' "$gpu_uuid"
+              done |
+              sha256sum |
+              awk '{print "sha256:" $1}'
+          )" || return 1
+
+          printf '%s\n%s\n' "$driver_version" "$gpu_inventory_digest"
+        }
+
+        if command -v nvidia-smi >/dev/null 2>&1; then
+          inventory="$(nvidia-smi -L 2>/dev/null || true)"
+          if [ -n "$inventory" ]; then
+            nvidia_smi_available=true
+            observed_gpu_count="$(printf '%s\n' "$inventory" | awk 'NF { count++ } END { print count + 0 }')"
+            start_fingerprint="$(collect_fingerprint "$observed_gpu_count" || true)"
+            start_driver_version="$(printf '%s\n' "$start_fingerprint" | sed -n '1p')"
+            start_gpu_inventory_digest="$(printf '%s\n' "$start_fingerprint" | sed -n '2p')"
+            end_fingerprint="$(collect_fingerprint "$observed_gpu_count" || true)"
+            end_driver_version="$(printf '%s\n' "$end_fingerprint" | sed -n '1p')"
+            end_gpu_inventory_digest="$(printf '%s\n' "$end_fingerprint" | sed -n '2p')"
+            if [ -n "$start_driver_version" ] &&
+              [ "$start_driver_version" = "$end_driver_version" ] &&
+              [ -n "$start_gpu_inventory_digest" ] &&
+              [ "$start_gpu_inventory_digest" = "$end_gpu_inventory_digest" ]; then
+              driver_version_set=consistent
+              outcome=Passed
+              reason_code=Completed
+              message="GPU inventory collected"
+            else
+              driver_version_set=inconsistent
+              message="GPU identity or driver version is missing, invalid, mixed, or changed"
+            fi
+          else
+            message="nvidia-smi did not return a GPU inventory"
+          fi
+        fi
+
+        visible_devices=
+        device_index=0
+        while [ "$device_index" -lt "$observed_gpu_count" ]; do
+          separator=
+          if [ -n "$visible_devices" ]; then
+            separator=,
+          fi
+          visible_devices="${visible_devices}${separator}\"gpu-index-${device_index}\""
+          device_index=$((device_index + 1))
+        done
+
+        finished_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+        printf '%s\n' "PROJECT_SIGNAL_INVOCATION_RESULT_V1 {\"schemaVersion\":\"signal.unbounded-cloud.io/invocation-result/v1\",\"invocationID\":\"${PROJECT_SIGNAL_INVOCATION_ID}\",\"runUID\":\"${PROJECT_SIGNAL_RUN_UID}\",\"stageID\":\"${PROJECT_SIGNAL_STAGE_ID}\",\"stageOrder\":${PROJECT_SIGNAL_STAGE_ORDER},\"planDigest\":\"${PROJECT_SIGNAL_PLAN_DIGEST}\",\"test\":{\"name\":\"${PROJECT_SIGNAL_TEST_NAME}\",\"uid\":\"${PROJECT_SIGNAL_TEST_UID}\",\"generation\":${PROJECT_SIGNAL_TEST_GENERATION},\"contentDigest\":\"${PROJECT_SIGNAL_TEST_CONTENT_DIGEST}\",\"trust\":\"${PROJECT_SIGNAL_TEST_TRUST}\"},\"resolvedInputs\":${PROJECT_SIGNAL_RESOLVED_INPUTS_JSON:-[]},\"startedAt\":\"${started_at}\",\"finishedAt\":\"${finished_at}\",\"monotonicDuration\":\"0s\",\"outcome\":\"${outcome}\",\"reasonCode\":\"${reason_code}\",\"message\":\"${message}\",\"exitCode\":0,\"measurements\":[{\"name\":\"nvidiaSmiAvailable\",\"value\":{\"type\":\"Boolean\",\"booleanValue\":${nvidia_smi_available}}},{\"name\":\"observedGpuCount\",\"value\":{\"type\":\"Integer\",\"integerValue\":${observed_gpu_count}},\"unit\":\"devices\"},{\"name\":\"driverVersionSet\",\"value\":{\"type\":\"String\",\"stringValue\":\"${driver_version_set}\"}}],\"participants\":[{\"index\":${PROJECT_SIGNAL_PARTICIPANT_INDEX},\"role\":\"${PROJECT_SIGNAL_PARTICIPANT_ROLE}\",\"outcome\":\"${outcome}\",\"start\":{\"nodeUID\":\"${PROJECT_SIGNAL_NODE_UID}\",\"driverVersion\":\"${start_driver_version}\",\"gpuInventoryDigest\":\"${start_gpu_inventory_digest}\"},\"end\":{\"nodeUID\":\"${PROJECT_SIGNAL_NODE_UID}\",\"driverVersion\":\"${end_driver_version}\",\"gpuInventoryDigest\":\"${end_gpu_inventory_digest}\"},\"visibleDevices\":[${visible_devices}],\"coveredDevices\":[${visible_devices}]}],\"activity\":{\"sampleCount\":1},\"cleanup\":{\"outcome\":\"NotRequired\"}}"
+      digest: {{ $scriptDigest }}
+  metrics:
+    - name: nvidiaSmiAvailable
+      displayName: nvidia-smi available
+      type: Boolean
+      required: true
+    - name: observedGpuCount
+      displayName: Observed GPU count
+      type: Count
+      unit: devices
+      required: true
+    - name: driverVersionSet
+      displayName: Driver version consistency
+      type: Status
+      required: true
+  topology:
+    minParticipants: 1
+    maxParticipants: 1
+  driver:
+    type: Script
+    script:
+      language: Shell
+      artifact: gpu-inventory.sh
+      runnerImage: {{ $runnerImage }}
+      resources:
+        requests:
+          cpu: 100m
+          memory: 64Mi
+          nvidia.com/gpu: "8"
+        limits:
+          cpu: 500m
+          memory: 128Mi
+          nvidia.com/gpu: "8"

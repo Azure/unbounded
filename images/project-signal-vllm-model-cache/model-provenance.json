@@ -1,0 +1,7 @@
+{
+  "license": "Apache-2.0",
+  "manifestDigest": "sha256:52b9b0fa1a8a67424d2e8f7994675698c60e3eb1a7925091930ecc4958dbcd7e",
+  "model": "EleutherAI/pythia-70m-deduped",
+  "revision": "e93a9faa9c77e5d09219f6c868bfc7a1bd65593c",
+  "source": "https://huggingface.co/EleutherAI/pythia-70m-deduped"
+}
