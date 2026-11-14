@@ -46,7 +46,7 @@ type attachACRHandler struct {
 	timeout                                           time.Duration
 	client                                            kubernetes.Interface
 	restConfig                                        *rest.Config
-	runAzure                                          func(context.Context, ...string) ([]byte, error)
+	runAzure                                          func(context.Context, string, ...string) ([]byte, error)
 	out                                               io.Writer
 }
 
@@ -55,7 +55,7 @@ func gantryCommandGroup() *cobra.Command {
 	h := &attachACRHandler{}
 	cmd := &cobra.Command{
 		Use: "attach-acr", Short: "Attach an existing ACR without changing authentication by default",
-		Long: "Add an ACR upstream without replacing unrelated Gantry configuration. Authentication is externally managed by default and remains untouched. Opt in with --auth-mode aks-identity-binding to enable the stock ACR credential provider on current and future Linux Flex nodes, regardless of compute location.",
+		Long: "Add an ACR upstream without replacing unrelated Gantry configuration. Authentication is externally managed by default and remains untouched. Opt in with --auth-mode aks-identity-binding to enable the stock ACR credential provider on current and future Linux Flex nodes, regardless of compute location. ACR and AKS may be in different subscriptions within the same tenant; the Azure CLI caller needs permissions in both subscriptions.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error { h.out = cmd.OutOrStdout(); return h.execute(cmd.Context()) },
 	}
@@ -109,13 +109,8 @@ func (h *attachACRHandler) execute(ctx context.Context) error {
 	}
 
 	if h.authMode == registryauth.IdentityBindingMode {
-		clusterID, err := azureResourceID(h.clusterID, "Microsoft.ContainerService/managedClusters")
-		if err != nil {
+		if _, err := azureResourceID(h.clusterID, "Microsoft.ContainerService/managedClusters"); err != nil {
 			return fmt.Errorf("--cluster-resource-id is required for managed authentication: %w", err)
-		}
-
-		if !strings.EqualFold(clusterID.SubscriptionID, acrID.SubscriptionID) {
-			return errors.New("ACR and AKS cluster must be in the same subscription")
 		}
 
 		if _, err := fmt.Fprintln(h.out, "WARNING: managed ACR authentication may restart kubelets on all targeted Linux Flex nodes concurrently. Nodes are not drained automatically; you are responsible for the impact on existing workloads."); err != nil {
@@ -134,8 +129,8 @@ func (h *attachACRHandler) execute(ctx context.Context) error {
 	}
 
 	if h.runAzure == nil {
-		h.runAzure = func(ctx context.Context, args ...string) ([]byte, error) {
-			args = append(args, "--subscription", acrID.SubscriptionID, "--only-show-errors", "--output", "json")
+		h.runAzure = func(ctx context.Context, subscriptionID string, args ...string) ([]byte, error) {
+			args = append(args, "--subscription", subscriptionID, "--only-show-errors", "--output", "json")
 			cmd := exec.CommandContext(ctx, "az", args...)
 
 			var stderr bytes.Buffer
@@ -157,7 +152,7 @@ func (h *attachACRHandler) execute(ctx context.Context) error {
 	}
 
 	var registry struct{ ID, LoginServer, RoleAssignmentMode string }
-	if err := h.azureJSON(ctx, &registry, "acr", "show", "--name", acrID.Name, "--resource-group", acrID.ResourceGroupName); err != nil {
+	if err := h.azureJSON(ctx, acrID.SubscriptionID, &registry, "acr", "show", "--name", acrID.Name, "--resource-group", acrID.ResourceGroupName); err != nil {
 		return err
 	}
 
@@ -253,8 +248,8 @@ func (h *attachACRHandler) execute(ctx context.Context) error {
 	return err
 }
 
-func (h *attachACRHandler) azureJSON(ctx context.Context, output any, args ...string) error {
-	data, err := h.runAzure(ctx, args...)
+func (h *attachACRHandler) azureJSON(ctx context.Context, subscriptionID string, output any, args ...string) error {
+	data, err := h.runAzure(ctx, subscriptionID, args...)
 	if err != nil {
 		return err
 	}
