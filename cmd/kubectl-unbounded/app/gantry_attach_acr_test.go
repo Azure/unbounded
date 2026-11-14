@@ -37,13 +37,14 @@ import (
 )
 
 const (
-	attachSubscription = "11111111-2222-3333-4444-555555555555"
-	attachACRID        = "/subscriptions/" + attachSubscription + "/resourceGroups/registry-rg/providers/Microsoft.ContainerRegistry/registries/central"
-	attachClusterID    = "/subscriptions/" + attachSubscription + "/resourceGroups/cluster-rg/providers/Microsoft.ContainerService/managedClusters/cluster"
-	attachIdentityID   = "/subscriptions/" + attachSubscription + "/resourceGroups/cluster-rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/pull"
-	attachClientID     = "22222222-2222-3333-4444-555555555555"
-	attachTenantID     = "33333333-2222-3333-4444-555555555555"
-	attachPrincipalID  = "44444444-2222-3333-4444-555555555555"
+	attachSubscription      = "11111111-2222-3333-4444-555555555555"
+	attachACRID             = "/subscriptions/" + attachSubscription + "/resourceGroups/registry-rg/providers/Microsoft.ContainerRegistry/registries/central"
+	attachClusterID         = "/subscriptions/" + attachSubscription + "/resourceGroups/cluster-rg/providers/Microsoft.ContainerService/managedClusters/cluster"
+	attachIdentityID        = "/subscriptions/" + attachSubscription + "/resourceGroups/cluster-rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/pull"
+	attachClientID          = "22222222-2222-3333-4444-555555555555"
+	attachTenantID          = "33333333-2222-3333-4444-555555555555"
+	attachPrincipalID       = "44444444-2222-3333-4444-555555555555"
+	attachOtherSubscription = "aaaaaaaa-2222-3333-4444-555555555555"
 )
 
 func attachFixture(t *testing.T) (*attachACRHandler, *fake.Clientset, *[]string) {
@@ -59,18 +60,37 @@ func attachFixture(t *testing.T) (*attachACRHandler, *fake.Clientset, *[]string)
 		acrID: attachACRID, clusterID: attachClusterID, authMode: registryauth.ExternalMode,
 		namespace: source.Namespace, timeout: 5 * time.Second, client: client, restConfig: &rest.Config{Host: "https://cluster.example.com"}, out: &bytes.Buffer{},
 	}
-	h.runAzure = func(_ context.Context, args ...string) ([]byte, error) {
+	h.runAzure = func(_ context.Context, subscriptionID string, args ...string) ([]byte, error) {
 		calls = append(calls, strings.Join(args, " "))
+
+		acrID, err := azureResourceID(h.acrID, "Microsoft.ContainerRegistry/registries")
+		require.NoError(t, err)
+		clusterID, err := azureResourceID(h.clusterID, "Microsoft.ContainerService/managedClusters")
+		require.NoError(t, err)
+
+		switch args[0] {
+		case "acr", "role":
+			require.Equal(t, acrID.SubscriptionID, subscriptionID)
+		case "aks", "identity", "rest":
+			require.Equal(t, clusterID.SubscriptionID, subscriptionID)
+		case "account":
+			require.Contains(t, []string{acrID.SubscriptionID, clusterID.SubscriptionID}, subscriptionID)
+		}
+
+		identityID := strings.Replace(attachIdentityID, attachSubscription, clusterID.SubscriptionID, 1)
+
 		switch strings.Join(args[:min(2, len(args))], " ") {
+		case "account show":
+			return json.Marshal(map[string]string{"id": subscriptionID, "tenantId": attachTenantID})
 		case "acr show":
 			require.Equal(t, []string{"acr", "show", "--name", "central", "--resource-group", "registry-rg"}, args)
 
-			return json.Marshal(map[string]string{"id": attachACRID, "loginServer": "central.azurecr.io", "roleAssignmentMode": "LegacyRegistryPermissions"})
+			return json.Marshal(map[string]string{"id": h.acrID, "loginServer": "central.azurecr.io", "roleAssignmentMode": "LegacyRegistryPermissions"})
 		case "aks show":
 			require.Equal(t, []string{"aks", "show", "--name", "cluster", "--resource-group", "cluster-rg"}, args)
 
 			return json.Marshal(map[string]any{
-				"id": attachClusterID, "location": "eastus", "fqdn": "cluster.example.com", "provisioningState": "Succeeded",
+				"id": h.clusterID, "location": "eastus", "fqdn": "cluster.example.com", "provisioningState": "Succeeded",
 				"oidcIssuerProfile": map[string]bool{"enabled": true}, "securityProfile": map[string]any{"workloadIdentity": map[string]bool{"enabled": true}},
 			})
 		case "aks update":
@@ -84,8 +104,8 @@ func attachFixture(t *testing.T) (*attachACRHandler, *fake.Clientset, *[]string)
 			return []byte("[]"), nil
 		case "identity create":
 			return json.Marshal(map[string]any{
-				"id": attachIdentityID, "clientId": attachClientID, "tenantId": attachTenantID, "principalId": attachPrincipalID,
-				"tags": map[string]string{"unbounded-cluster-id": attachClusterID},
+				"id": identityID, "clientId": attachClientID, "tenantId": attachTenantID, "principalId": attachPrincipalID,
+				"tags": map[string]string{"unbounded-cluster-id": h.clusterID},
 			})
 		case "role assignment":
 			if args[2] == "list" {
@@ -102,7 +122,7 @@ func attachFixture(t *testing.T) (*attachACRHandler, *fake.Clientset, *[]string)
 				return []byte("{}"), nil
 			}
 
-			return json.Marshal(map[string]any{"properties": map[string]any{"managedIdentity": map[string]string{"resourceId": attachIdentityID}, "provisioningState": "Succeeded"}})
+			return json.Marshal(map[string]any{"properties": map[string]any{"managedIdentity": map[string]string{"resourceId": identityID}, "provisioningState": "Succeeded"}})
 		default:
 			return nil, fmt.Errorf("unexpected Azure operation: %v", args)
 		}
@@ -376,27 +396,37 @@ func TestGantryAttachACRABACRoleSelection(t *testing.T) {
 	const readerRole = "55555555-2222-3333-4444-555555555555"
 
 	for _, tc := range []struct {
-		name    string
-		roles   []map[string]string
-		wantErr bool
+		name              string
+		roles             []map[string]string
+		crossSubscription bool
+		wantErr           bool
 	}{
 		{name: "repository reader", roles: []map[string]string{{"name": readerRole, "roleType": "BuiltInRole"}}},
+		{name: "cross-subscription repository reader", roles: []map[string]string{{"name": readerRole, "roleType": "BuiltInRole"}}, crossSubscription: true},
 		{name: "unavailable", wantErr: true},
 		{name: "ambiguous", roles: []map[string]string{{"name": readerRole, "roleType": "BuiltInRole"}, {"name": attachClientID, "roleType": "BuiltInRole"}}, wantErr: true},
 		{name: "custom role", roles: []map[string]string{{"name": readerRole, "roleType": "CustomRole"}}, wantErr: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h, client, calls := managedAttachFixture(t)
+			if tc.crossSubscription {
+				h.acrID = strings.Replace(attachACRID, attachSubscription, attachOtherSubscription, 1)
+			}
+
 			run := h.runAzure
-			h.runAzure = func(ctx context.Context, args ...string) ([]byte, error) {
+			h.runAzure = func(ctx context.Context, subscriptionID string, args ...string) ([]byte, error) {
 				command := strings.Join(args, " ")
 				if strings.HasPrefix(command, "role definition list") {
+					acrID, err := azureResourceID(h.acrID, "Microsoft.ContainerRegistry/registries")
+					require.NoError(t, err)
+					require.Equal(t, acrID.SubscriptionID, subscriptionID)
+
 					*calls = append(*calls, command)
 
 					return json.Marshal(tc.roles)
 				}
 
-				data, err := run(ctx, args...)
+				data, err := run(ctx, subscriptionID, args...)
 				if err != nil || !strings.HasPrefix(command, "acr show") {
 					return data, err
 				}
@@ -424,7 +454,7 @@ func TestGantryAttachACRABACRoleSelection(t *testing.T) {
 				_, err := registryauth.Derive(source.Data["config.yaml"], source.Data[registryauth.ConfigKey])
 				require.NoError(t, err)
 				require.Contains(t, *calls, "role assignment create --assignee-object-id "+attachPrincipalID+
-					" --assignee-principal-type ServicePrincipal --role "+readerRole+" --scope "+attachACRID)
+					" --assignee-principal-type ServicePrincipal --role "+readerRole+" --scope "+h.acrID)
 			}
 		})
 	}
@@ -496,10 +526,10 @@ func TestGantryAttachACRClusterTrustBundleSelection(t *testing.T) {
 func TestGantryManagedACRWarningPrecedesEverySideEffect(t *testing.T) {
 	h, client, _ := managedAttachFixture(t)
 	run := h.runAzure
-	h.runAzure = func(ctx context.Context, args ...string) ([]byte, error) {
+	h.runAzure = func(ctx context.Context, subscriptionID string, args ...string) ([]byte, error) {
 		require.Contains(t, h.out.(*bytes.Buffer).String(), "WARNING:")
 
-		return run(ctx, args...)
+		return run(ctx, subscriptionID, args...)
 	}
 
 	client.PrependReactor("*", "*", func(k8stesting.Action) (bool, runtime.Object, error) {
@@ -567,6 +597,121 @@ func TestGantryAttachACRManagedUsesStockProviderWithoutComputeAssignment(t *test
 		if action.GetResource().Resource == "serviceaccounts" && action.GetVerb() == "create" {
 			require.Equal(t, "gantry-acr-discovery", action.(k8stesting.CreateAction).GetObject().(*corev1.ServiceAccount).Name)
 		}
+	}
+}
+
+func TestGantryAttachACRManagedCrossSubscription(t *testing.T) {
+	denied := errors.New("role assignment permission denied")
+
+	for _, tc := range []struct {
+		name          string
+		existingGrant bool
+		grantErr      error
+	}{
+		{name: "create pull grant"},
+		{name: "reuse pull grant", existingGrant: true},
+		{name: "missing role-assignment permission", grantErr: denied},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, client, calls := managedAttachFixture(t)
+			h.acrID = strings.Replace(attachACRID, attachSubscription, attachOtherSubscription, 1)
+			source, err := client.CoreV1().ConfigMaps(h.namespace).Get(t.Context(), "gantry-config", metav1.GetOptions{})
+			require.NoError(t, err)
+
+			var accounts []string
+
+			run := h.runAzure
+			h.runAzure = func(ctx context.Context, subscriptionID string, args ...string) ([]byte, error) {
+				if args[0] == "account" {
+					accounts = append(accounts, subscriptionID)
+				}
+
+				if args[0] == "role" && args[1] == "assignment" {
+					require.Equal(t, attachOtherSubscription, subscriptionID)
+
+					if args[2] == "list" && tc.existingGrant {
+						*calls = append(*calls, strings.Join(args, " "))
+
+						return json.Marshal([]map[string]string{{
+							"principalId": attachPrincipalID, "scope": h.acrID,
+							"roleDefinitionId": "/subscriptions/" + attachOtherSubscription +
+								"/providers/Microsoft.Authorization/roleDefinitions/7f951dda-4ed3-4680-a7ca-43fe172d538d",
+						}})
+					}
+
+					if args[2] == "create" && tc.grantErr != nil {
+						return nil, tc.grantErr
+					}
+				}
+
+				return run(ctx, subscriptionID, args...)
+			}
+
+			err = h.execute(t.Context())
+			require.ElementsMatch(t, []string{attachSubscription, attachOtherSubscription}, accounts)
+			current, readErr := client.CoreV1().ConfigMaps(h.namespace).Get(t.Context(), source.Name, metav1.GetOptions{})
+			require.NoError(t, readErr)
+
+			if tc.grantErr != nil {
+				require.ErrorIs(t, err, tc.grantErr)
+				require.Equal(t, source.Data, current.Data)
+
+				return
+			}
+
+			require.NoError(t, err)
+			cfg, err := registryauth.Derive(current.Data["config.yaml"], current.Data[registryauth.ConfigKey])
+			require.NoError(t, err)
+			require.Equal(t, attachClientID, cfg.ClientID)
+			require.Equal(t, attachTenantID, cfg.TenantID)
+
+			if tc.existingGrant {
+				for _, call := range *calls {
+					require.NotContains(t, call, "role assignment create")
+				}
+			} else {
+				require.Contains(t, *calls, "role assignment create --assignee-object-id "+attachPrincipalID+
+					" --assignee-principal-type ServicePrincipal --role 7f951dda-4ed3-4680-a7ca-43fe172d538d --scope "+h.acrID)
+			}
+		})
+	}
+}
+
+func TestGantryAttachACRRejectsIdentityOutsideClusterSubscription(t *testing.T) {
+	for _, tc := range []struct{ name, field, value, wantErr string }{
+		{
+			name: "identity in registry subscription", field: "id",
+			value: strings.Replace(attachIdentityID, attachSubscription, attachOtherSubscription, 1), wantErr: "AKS cluster subscription",
+		},
+		{name: "identity in another tenant", field: "tenantId", value: attachPrincipalID, wantErr: "identity tenant"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, client, calls := managedAttachFixture(t)
+			h.acrID = strings.Replace(attachACRID, attachSubscription, attachOtherSubscription, 1)
+			run := h.runAzure
+			h.runAzure = func(ctx context.Context, subscriptionID string, args ...string) ([]byte, error) {
+				data, err := run(ctx, subscriptionID, args...)
+				if err != nil || args[0] != "identity" || args[1] != "create" {
+					return data, err
+				}
+
+				var identity map[string]any
+				require.NoError(t, json.Unmarshal(data, &identity))
+				identity[tc.field] = tc.value
+
+				return json.Marshal(identity)
+			}
+
+			require.ErrorContains(t, h.execute(t.Context()), tc.wantErr)
+			source, err := client.CoreV1().ConfigMaps(h.namespace).Get(t.Context(), "gantry-config", metav1.GetOptions{})
+			require.NoError(t, err)
+			require.Empty(t, source.Data[registryauth.ConfigKey])
+
+			for _, call := range *calls {
+				require.NotContains(t, call, "rest --method put")
+				require.NotContains(t, call, "role assignment create")
+			}
+		})
 	}
 }
 
@@ -639,7 +784,7 @@ func TestGantryAttachACRDoesNotStageIdentityGrantWhenPolicySaveFails(t *testing.
 func TestGantryAttachACRRejectsConcurrentInvalidEndpoint(t *testing.T) {
 	h, client, _ := managedAttachFixture(t)
 	run := h.runAzure
-	h.runAzure = func(ctx context.Context, args ...string) ([]byte, error) {
+	h.runAzure = func(ctx context.Context, subscriptionID string, args ...string) ([]byte, error) {
 		if args[0] == "identity" && args[1] == "create" {
 			source, err := client.CoreV1().ConfigMaps(h.namespace).Get(t.Context(), "gantry-config", metav1.GetOptions{})
 			require.NoError(t, err)
@@ -649,7 +794,7 @@ func TestGantryAttachACRRejectsConcurrentInvalidEndpoint(t *testing.T) {
 			require.NoError(t, err)
 		}
 
-		return run(ctx, args...)
+		return run(ctx, subscriptionID, args...)
 	}
 	require.ErrorContains(t, h.execute(t.Context()), "matching HTTPS endpoint")
 	source, err := client.CoreV1().ConfigMaps(h.namespace).Get(t.Context(), "gantry-config", metav1.GetOptions{})
@@ -665,25 +810,30 @@ func TestGantryAttachACRRejectsWrongClusterBeforeAzureWrites(t *testing.T) {
 }
 
 func TestGantryAttachACREnablesPrerequisitesWithNamedCluster(t *testing.T) {
-	h, _, calls := managedAttachFixture(t)
-	run := h.runAzure
-	h.runAzure = func(ctx context.Context, args ...string) ([]byte, error) {
-		data, err := run(ctx, args...)
-		if err != nil || !strings.HasPrefix(strings.Join(args, " "), "aks show ") {
-			return data, err
-		}
+	for _, subscriptionID := range []string{attachSubscription, attachOtherSubscription} {
+		t.Run(subscriptionID, func(t *testing.T) {
+			h, _, calls := managedAttachFixture(t)
+			h.acrID = strings.Replace(attachACRID, attachSubscription, subscriptionID, 1)
+			run := h.runAzure
+			h.runAzure = func(ctx context.Context, subscriptionID string, args ...string) ([]byte, error) {
+				data, err := run(ctx, subscriptionID, args...)
+				if err != nil || !strings.HasPrefix(strings.Join(args, " "), "aks show ") {
+					return data, err
+				}
 
-		var cluster map[string]any
-		if err := json.Unmarshal(data, &cluster); err != nil {
-			return nil, err
-		}
+				var cluster map[string]any
+				if err := json.Unmarshal(data, &cluster); err != nil {
+					return nil, err
+				}
 
-		cluster["oidcIssuerProfile"] = map[string]bool{"enabled": false}
+				cluster["oidcIssuerProfile"] = map[string]bool{"enabled": false}
 
-		return json.Marshal(cluster)
+				return json.Marshal(cluster)
+			}
+			require.NoError(t, h.execute(t.Context()))
+			require.Contains(t, *calls, "aks update --name cluster --resource-group cluster-rg --enable-oidc-issuer --enable-workload-identity")
+		})
 	}
-	require.NoError(t, h.execute(t.Context()))
-	require.Contains(t, *calls, "aks update --name cluster --resource-group cluster-rg --enable-oidc-issuer --enable-workload-identity")
 }
 
 func TestGantryAttachACRManagedRerunsReuseOwnedResources(t *testing.T) {
@@ -693,7 +843,7 @@ func TestGantryAttachACRManagedRerunsReuseOwnedResources(t *testing.T) {
 	digest := sha256.Sum256([]byte(strings.ToLower(attachClusterID)))
 	name := "gantry-pull-" + hex.EncodeToString(digest[:6])
 	run := h.runAzure
-	h.runAzure = func(ctx context.Context, args ...string) ([]byte, error) {
+	h.runAzure = func(ctx context.Context, subscriptionID string, args ...string) ([]byte, error) {
 		command := strings.Join(args, " ")
 		switch {
 		case strings.HasPrefix(command, "identity list"):
@@ -712,7 +862,7 @@ func TestGantryAttachACRManagedRerunsReuseOwnedResources(t *testing.T) {
 				"roleDefinitionId": "/providers/Microsoft.Authorization/roleDefinitions/7f951dda-4ed3-4680-a7ca-43fe172d538d",
 			}})
 		default:
-			return run(ctx, args...)
+			return run(ctx, subscriptionID, args...)
 		}
 	}
 	require.NoError(t, h.execute(t.Context()))
@@ -752,19 +902,50 @@ func TestGantryAttachACRManagedRestoresRemovedUpstream(t *testing.T) {
 }
 
 func TestGantryAttachACRRejectsOldKubeletsAndCrossSubscription(t *testing.T) {
-	h, client, calls := managedAttachFixture(t)
-	node, err := client.CoreV1().Nodes().Get(t.Context(), "off-azure", metav1.GetOptions{})
-	require.NoError(t, err)
+	t.Run("old kubelet", func(t *testing.T) {
+		h, client, calls := managedAttachFixture(t)
+		node, err := client.CoreV1().Nodes().Get(t.Context(), "off-azure", metav1.GetOptions{})
+		require.NoError(t, err)
 
-	node.Status.NodeInfo.KubeletVersion = "v1.33.9"
-	_, err = client.CoreV1().Nodes().Update(t.Context(), node, metav1.UpdateOptions{})
-	require.NoError(t, err)
-	require.ErrorContains(t, h.execute(t.Context()), "1.34")
-	require.Len(t, *calls, 2)
-	*calls = nil
-	h.clusterID = strings.Replace(attachClusterID, attachSubscription, attachClientID, 1)
-	require.ErrorContains(t, h.execute(t.Context()), "same subscription")
-	require.Empty(t, *calls)
+		node.Status.NodeInfo.KubeletVersion = "v1.33.9"
+		_, err = client.CoreV1().Nodes().Update(t.Context(), node, metav1.UpdateOptions{})
+		require.NoError(t, err)
+		require.ErrorContains(t, h.execute(t.Context()), "1.34")
+		require.Len(t, *calls, 2)
+	})
+
+	for _, tc := range []struct{ name, subscriptionID, tenantID, wantErr string }{
+		{name: "cross-subscription tenant mismatch", subscriptionID: attachOtherSubscription, tenantID: attachPrincipalID, wantErr: "same tenant"},
+		{name: "missing subscription tenant", subscriptionID: attachOtherSubscription, wantErr: "invalid tenant ID"},
+		{name: "invalid subscription tenant", subscriptionID: attachOtherSubscription, tenantID: "not-a-tenant", wantErr: "invalid tenant ID"},
+		{name: "wrong subscription response", subscriptionID: attachSubscription, tenantID: attachTenantID, wantErr: "requested subscription"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, client, calls := managedAttachFixture(t)
+			h.acrID = strings.Replace(attachACRID, attachSubscription, attachOtherSubscription, 1)
+			run := h.runAzure
+			h.runAzure = func(ctx context.Context, subscriptionID string, args ...string) ([]byte, error) {
+				if args[0] == "account" && subscriptionID == attachOtherSubscription {
+					return json.Marshal(map[string]string{"id": tc.subscriptionID, "tenantId": tc.tenantID})
+				}
+
+				return run(ctx, subscriptionID, args...)
+			}
+
+			require.ErrorContains(t, h.execute(t.Context()), tc.wantErr)
+
+			for _, call := range *calls {
+				require.NotContains(t, call, "aks update")
+				require.NotContains(t, call, "identity create")
+				require.NotContains(t, call, "rest --method put")
+				require.NotContains(t, call, "role assignment create")
+			}
+
+			for _, action := range client.Actions() {
+				require.Contains(t, []string{"get", "list"}, action.GetVerb(), "tenant validation must fail before Kubernetes writes")
+			}
+		})
+	}
 }
 
 func TestGantryAttachACRRejectsMissingAdmissionAndConditionalGrants(t *testing.T) {
@@ -773,7 +954,7 @@ func TestGantryAttachACRRejectsMissingAdmissionAndConditionalGrants(t *testing.T
 			h, client, calls := managedAttachFixture(t)
 			if conditional {
 				run := h.runAzure
-				h.runAzure = func(ctx context.Context, args ...string) ([]byte, error) {
+				h.runAzure = func(ctx context.Context, subscriptionID string, args ...string) ([]byte, error) {
 					if strings.HasPrefix(strings.Join(args, " "), "role assignment list") {
 						require.Contains(t, args, "--include-inherited")
 
@@ -783,7 +964,7 @@ func TestGantryAttachACRRejectsMissingAdmissionAndConditionalGrants(t *testing.T
 						}})
 					}
 
-					return run(ctx, args...)
+					return run(ctx, subscriptionID, args...)
 				}
 				require.ErrorContains(t, h.execute(t.Context()), "conditional")
 			} else {
