@@ -1618,6 +1618,58 @@ func TestGeneratedCRDSetContainsAllCertificationResources(t *testing.T) {
 	}
 }
 
+func TestNodeCertificationGrafanaDashboard(t *testing.T) {
+	t.Parallel()
+
+	content, err := os.ReadFile("grafana/project-signal-node-certification.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var dashboard struct {
+		Refresh string `json:"refresh"`
+		UID     string `json:"uid"`
+		Panels  []struct {
+			Title   string `json:"title"`
+			Targets []struct {
+				Expression    string `json:"expr"`
+				MaxDataPoints int    `json:"maxDataPoints"`
+			} `json:"targets"`
+		} `json:"panels"`
+	}
+	if err := json.Unmarshal(content, &dashboard); err != nil {
+		t.Fatalf("decode Grafana dashboard: %v", err)
+	}
+
+	if dashboard.UID != "project-signal-fleet-certification" ||
+		dashboard.Refresh != "15s" ||
+		len(dashboard.Panels) != 3 {
+		t.Fatalf("dashboard identity = %#v", dashboard)
+	}
+
+	foundFleetMatrix := false
+
+	for _, panel := range dashboard.Panels {
+		for _, target := range panel.Targets {
+			if strings.Contains(target.Expression, "project_signal_node_certification_status") &&
+				panel.Title == "Node certification matrix" {
+				foundFleetMatrix = true
+
+				if target.MaxDataPoints < 5000 {
+					t.Fatalf(
+						"fleet matrix maxDataPoints = %d, want at least 5000",
+						target.MaxDataPoints,
+					)
+				}
+			}
+		}
+	}
+
+	if !foundFleetMatrix {
+		t.Fatal("Grafana dashboard does not contain the node certification matrix query")
+	}
+}
+
 type gpuInventoryFixture struct {
 	gpuCount       int
 	startDrivers   string

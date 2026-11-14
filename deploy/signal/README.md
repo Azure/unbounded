@@ -53,6 +53,23 @@ Suite's bound WorkflowTemplates create `MPIJob` resources, including the
 private R03 and R05 certification stages; the public native stage model does
 not otherwise require it.
 
+### Grafana fleet dashboard
+
+Import `grafana/project-signal-node-certification.json` into a Grafana instance
+that can query the controller metrics endpoint. The dashboard uses
+`project_signal_node_certification_status` to render one compact row per
+participant from its newest Run:
+
+- green: passed
+- yellow: actively certifying
+- red: failed, inconclusive, or canceled
+
+The instant fleet query is capped at 6,000 points and the table is paginated,
+so one dashboard supports clusters with up to 5,000 participants. The metric
+also exposes the current stage name, one-based stage index, and total stage
+count. Grafana or the Prometheus ingestion layer should attach a stable
+`cluster` label when a data source aggregates multiple clusters.
+
 ## First deployment
 
 Render the manifests with immutable controller, adapter, and certification
