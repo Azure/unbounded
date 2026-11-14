@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -50,6 +51,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/metrics"
 	"github.com/Azure/unbounded/internal/gantry/mirror"
 	"github.com/Azure/unbounded/internal/gantry/negcache"
+	"github.com/Azure/unbounded/internal/gantry/progress"
 	"github.com/Azure/unbounded/internal/gantry/providerprobe"
 	"github.com/Azure/unbounded/internal/gantry/rangecache"
 	"github.com/Azure/unbounded/internal/gantry/registryauth"
@@ -191,6 +193,10 @@ func runAgent(args []string) error {
 	// SecondaryBlobSource hop.
 	peerClient := transfer.NewClient(
 		transfer.WithRequestTimeout(c.PeerFetchTimeout),
+		transfer.WithClientTransferMetrics(
+			func(kind string, bytes int64) { inst.transfers.bytes.WithLabelValues("peer", kind).Add(float64(bytes)) },
+			func(kind string, delta int) { inst.transfers.active.WithLabelValues("peer", kind).Add(float64(delta)) },
+		),
 		transfer.WithClientByteMetrics(func(kind string, bytes int64) {
 			p2.peerFetchBytes.WithLabelValues(kind).Add(float64(bytes))
 		}),
@@ -818,7 +824,12 @@ func runAgent(args []string) error {
 			}
 		}
 
-		artifactStreamingSrv, err = streamingapi.NewServer(cdstore, disco, peerClient, streamingapi.NewOriginClient(urlPolicy), streamingOpts)
+		streamingOrigin := streamingapi.NewOriginClient(urlPolicy, streamingapi.WithOriginTransferMetrics(
+			func(bytes int64) { inst.transfers.bytes.WithLabelValues("origin", "layer").Add(float64(bytes)) },
+			func(delta int) { inst.transfers.active.WithLabelValues("origin", "layer").Add(float64(delta)) },
+		))
+
+		artifactStreamingSrv, err = streamingapi.NewServer(cdstore, disco, peerClient, streamingOrigin, streamingOpts)
 		if err != nil {
 			return fmt.Errorf("artifact streaming server: %w", err)
 		}
@@ -1062,7 +1073,8 @@ func runAgent(args []string) error {
 
 	// - operations HTTP listener (/metrics + probes). See
 	// agent_readiness.go for the full handler wiring.
-	metricsHTTP, metricsErr := startOpsEndpoint(c.MetricsListen, reg, readyCheck, logger)
+	metricsHTTP, metricsErr := startOpsEndpoint(c.MetricsListen, reg, readyCheck, logger,
+		progress.NewHandler(cdstore, rangeCache, reg.PrometheusRegistry(), filepath.Dir(c.Libp2pIdentityPath)))
 
 	var pprofHTTP *http.Server
 

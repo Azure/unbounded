@@ -1,0 +1,119 @@
+<!doctype html>
+<!-- Copyright (c) Microsoft Corporation. SPDX-License-Identifier: Apache-2.0 -->
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>Gantry | Image Distribution</title>
+    <link rel="stylesheet" href="/style.css">
+    <script type="module" src="/app.js"></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/"><span class="brand-mark"></span>GANTRY</a>
+      <span class="product">Image Distribution</span>
+      <details class="image-picker" id="image-picker">
+        <summary><span id="image-picker-label">Choose image</span> &#9662;</summary>
+        <div class="image-picker-panel">
+          <div class="sidebar-title"><h2>Registry images</h2><button id="refresh" class="icon-button" title="Refresh image catalog" aria-label="Refresh image catalog">&#8635;</button></div>
+          <div id="registry" class="registry-label">Loading registry...</div>
+          <label class="search"><span>Search images</span><input id="search" type="search" placeholder="Search repository or tag..." autocomplete="off"></label>
+          <div id="catalog-status" class="muted small" role="status">Reading ACR manifests...</div>
+          <nav id="images" class="image-list" aria-label="ACR images"></nav>
+        </div>
+      </details>
+      <div class="topbar-end"><button id="reclaim-show" aria-controls="reclaim-status" hidden>Show cleanup status</button><button id="reclaim-space" hidden>Reclaim disk space</button><button id="generate-image" class="generate-button" hidden>+ Generate &amp; pull</button><span id="cluster-label" class="cluster-label">Connecting to Kubernetes</span><span id="connection" class="connection">Connecting</span></div>
+    </header>
+    <main>
+      <div id="error" class="notice error-notice" role="alert" hidden></div>
+      <div id="catalog-warning" class="notice warning-notice" hidden></div>
+      <section id="build-status" class="panel build-status" aria-live="polite" hidden></section>
+      <section id="reclaim-status" class="panel build-status" aria-live="polite" hidden></section>
+      <section id="welcome" class="welcome">
+        <div class="welcome-orbit"><span class="brand-mark"></span></div>
+        <p class="eyebrow">YOUR ENTIRE CLUSTER. ONE LIVE VIEW.</p>
+        <h1>Watch images move.</h1>
+        <p>Select an ACR image to deploy one Pod per Flex worker and see distribution unfold across the cluster.</p>
+        <div class="welcome-tags"><span class="badge oci">OCI images</span><span class="badge streaming">ACR Artifact Streaming</span><span class="badge">Live Pod lifecycle</span></div>
+        <p class="small muted">Selecting a new image creates a DaemonSet. Existing deployments are resumed without creating another one. Images run their default command with a 512 MiB memory limit.</p>
+      </section>
+      <div id="workspace" hidden>
+        <section class="deployment-header">
+          <div class="image-symbol"><span class="brand-mark"></span></div>
+          <div class="deployment-title"><div class="title-row"><h1 id="image-title"></h1><span id="image-kind" class="badge"></span></div><p id="image-meta" class="muted small"></p><div class="deployment-state"><span class="badge active">DaemonSet active</span><span id="deployment-name"></span><span id="resume-note" class="muted small">Observing existing deployment</span></div></div>
+        </section>
+        <section id="stats" class="stats" aria-label="Cluster summary"></section>
+        <div class="aggregate-scope"><span>Cluster-wide traffic observed during the selected run</span><span id="activity-coverage">Collecting agent observations...</span></div>
+        <div class="cluster-overview">
+          <section id="cluster-activity" class="panel cluster-activity"></section>
+          <section class="panel bandwidth-panel"><div class="panel-heading"><div><h2>Receive bandwidth over this run</h2><span class="small muted">Cluster-wide origin and peer receive rates, not exact image traffic</span></div></div><svg id="cluster-bandwidth" viewBox="0 0 640 140" preserveAspectRatio="none" role="img" aria-label="Run history of origin and peer receive bandwidth"></svg><div class="bandwidth-legend"><span class="origin-key">Origin receive</span><span class="peer-key">Peer receive</span><span class="muted">Bytes/s · dashed baseline = unobserved</span></div></section>
+        </div>
+        <div class="history-controls" aria-label="Chart time range">
+          <label>From <input id="history-from" type="range" min="0" max="1000" value="0" aria-label="Chart range start"></label>
+          <label>To <input id="history-to" type="range" min="0" max="1000" value="1000" aria-label="Chart range end"></label>
+          <button id="history-reset" type="button">Reset to full run</button><span id="history-range" class="small muted"></span>
+        </div>
+        <div id="grid-panel" class="fleet-panels">
+        <section class="panel grid-panel" aria-labelledby="grid-title">
+          <div class="panel-heading">
+            <div><h2 id="grid-title">Cluster distribution</h2><span id="grid-description" class="muted small">One cell per worker. Overall image bytes available.</span><p id="grid-summary" class="small muted"></p></div>
+            <div class="grid-controls"><button id="fit">Fit all</button><button id="zoom-out" aria-label="Zoom out">−</button><button id="zoom-in" aria-label="Zoom in">+</button><select id="filter" aria-label="Highlight nodes"><option value="all">All workers</option><option value="active">In progress</option><option value="failed">Errors</option><option value="unknown">Unknown</option></select></div>
+          </div>
+          <div class="grid-scroll"><div id="grid" class="node-grid" data-view="distribution" aria-label="Image distribution workers" data-empty="Waiting for worker observations..."></div></div>
+          <div class="grid-footer"><div id="legend" class="legend"></div><span id="updated" class="muted small">Waiting for observations...</span></div>
+        </section>
+        <section class="panel grid-panel" aria-labelledby="lifecycle-title">
+          <div class="panel-heading"><div><h2 id="lifecycle-title">Pod lifecycle</h2><span class="small muted">Errors first · Workers grouped by Pod status</span><p id="lifecycle-summary" class="small muted"></p></div></div>
+          <div class="grid-scroll"><div id="lifecycle-grid" class="node-grid" data-view="lifecycle" aria-label="Pod lifecycle workers" data-empty="Waiting for worker observations..."></div></div>
+          <div class="grid-footer"><div id="lifecycle-legend" class="legend"></div></div>
+        </section>
+        <section class="panel readiness-panel" aria-labelledby="readiness-title">
+          <div class="panel-heading"><div><h2 id="readiness-title">Fleet readiness</h2><span class="small muted">Selected deployment · Ready Pods across workers</span><p id="readiness-summary" class="small muted"></p></div></div>
+          <div id="readiness-milestones" class="readiness-milestones"></div>
+          <svg id="readiness-chart" viewBox="0 0 640 140" preserveAspectRatio="none" role="img" aria-label="Ready workers over the selected run"></svg>
+          <p class="small muted chart-note">Workers Ready over time. Dashed baseline = unobserved. Milestones use current Pods' observed Ready timestamps, not inferred telemetry.</p>
+        </section>
+        <section class="panel grid-panel" aria-labelledby="storage-title">
+          <div class="panel-heading"><div><h2 id="storage-title">Disk usage</h2><span class="small muted">Filesystem backing Gantry · All images and workloads</span><p id="storage-summary" class="small muted"></p></div></div>
+          <div class="grid-scroll"><div id="storage-grid" class="node-grid" data-view="storage" aria-label="Disk usage workers" data-empty="Waiting for worker observations..."></div></div>
+          <div class="grid-footer"><div id="storage-legend" class="legend"></div></div>
+        </section>
+        </div>
+        <p class="small muted">Select any worker to inspect its layers, lifecycle, startup waterfall, and disk usage below. Selection is synchronized across all heatmaps.</p>
+        <div class="worker-inspector">
+          <section id="node-detail" class="panel node-detail" hidden></section>
+        </div>
+      </div>
+    </main>
+    <div id="tooltip" class="tooltip" role="tooltip" hidden></div>
+    <dialog id="reclaim-dialog" class="generate-dialog">
+      <form id="reclaim-form">
+        <div class="dialog-heading"><div><p class="eyebrow">CLUSTER-WIDE CLEANUP</p><h2>Delete demos and reclaim disk space</h2></div><button id="reclaim-close" type="button" aria-label="Close disk reclamation dialog">&#215;</button></div>
+        <p>This stops and deletes <strong>all dashboard-managed demo DaemonSets and their Pods</strong> in <span id="reclaim-namespace"></span>, then prunes unused images on every Flex worker in the configured pool.</p>
+        <p class="muted small">Gantry, snapshotters, other workloads, and registry images are preserved. Active or uncertain runtime leases remain protected; reclamation is not a full disk wipe. Workers with stuck terminating demo Pods must recover before cleanup starts.</p>
+        <label class="search">Type DELETE ALL DEMOS to confirm<input id="reclaim-confirm" autocomplete="off" placeholder="DELETE ALL DEMOS" required></label>
+        <p id="reclaim-error" class="generation-error" role="alert" hidden></p>
+        <button id="reclaim-submit" class="reclaim-submit" type="submit" disabled>Delete all demos &amp; reclaim</button>
+      </form>
+    </dialog>
+    <dialog id="generate-dialog" class="generate-dialog">
+      <form id="generate-form">
+        <div class="dialog-heading"><div><p class="eyebrow">ON-DEMAND DEMO IMAGE</p><h2>Generate. Push. Watch it pull.</h2></div><button id="generate-close" type="button" aria-label="Close generation dialog">&#215;</button></div>
+        <p class="muted small">Create unique random payload layers, push the image to ACR, then start one Pod per Flex worker.</p>
+        <p id="generate-limits" class="muted small"></p>
+        <div class="generate-fields">
+          <label>Payload layers<input id="generate-layers" type="number" min="1" step="1" value="3" required></label>
+          <label>MB per payload layer<input id="generate-layer-mb" type="number" min="1" step="1" value="50" required></label>
+        </div>
+        <label class="generate-streaming"><input id="generate-streaming" type="checkbox"> Enable ACR streaming</label>
+        <p class="muted small">When checked, convert this image to ACR Artifact Streaming before starting worker pulls. Requires a Premium ACR and streaming-enabled workers. Unchecked creates a regular OCI image.</p>
+        <div id="generate-summary" class="generate-summary"></div>
+        <p class="muted small">MB means 1,000,000 bytes. Random payloads do not compress away. A small runtime base adds another layer and keeps the Pods running. Existing workloads are not removed.</p>
+        <p class="muted small">Workers need space for both stored layers and unpacked files, roughly twice the payload for these ordinary OCI images.</p>
+        <p id="generate-error" class="generation-error" role="alert" hidden></p>
+        <button id="generate-submit" class="generate-button" type="submit">Generate, push &amp; pull</button>
+      </form>
+    </dialog>
+  </body>
+</html>

@@ -1026,6 +1026,10 @@ gantry-build: ## Build the gantry binary (no lint/test)
 
 gantry: test gantry-build ## Build gantry (implies test)
 
+.PHONY: gantry-ui-build
+gantry-ui-build: ## Build the standalone Gantry web dashboard (no cluster changes)
+	$(GOBUILD) -o bin/gantry-ui ./cmd/gantry-ui
+
 gantry-manifests: $(HELM) ## Render the Gantry operator profile into deploy/gantry/rendered
 	@mkdir -p $(GANTRY_MANIFEST_RENDERED_DIR)
 	@find $(GANTRY_MANIFEST_RENDERED_DIR) -mindepth 1 -not -name .gitignore -delete

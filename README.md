@@ -166,6 +166,29 @@ Gantry starts without ACR authentication. See the
 to enable it with a compatible plugin/operator; the script's pinned `v0.8.0`
 baseline does not include managed authentication.
 
+### Gantry dashboard: generate, push, and pull images
+
+For an existing AKS Flex cluster provisioned with a compatible custom installer,
+one script configures the
+dashboard and builder identities, ACR permissions and runtime base, publishes
+the UI image to GHCR, and installs the dashboard with image generation enabled:
+
+```bash
+bash hack/scripts/gantry-ui-deploy.sh \
+    --cluster-state tmp/aks-flex/my-flex-cluster \
+    --acr-name myregistry \
+    --image ghcr.io/myorg/gantry-ui \
+    --engine podman
+```
+
+UI build artifacts stay in GHCR; runtime bases and images generated through the
+UI stay in your ACR. The script verifies a small generate/push/Flex-pull workflow
+before printing the local dashboard URL and keeping its tunnel open. It
+exposes the cleanup button but never runs cleanup during deployment; use
+`--no-reclaimer` to omit that privileged capability. See the
+[dashboard setup guide](deploy/gantry-ui/chart/README.md#full-setup-for-an-existing-aks-flex-cluster)
+for permissions, GHCR visibility, DNS options, and rerun behavior.
+
 ## Documentation
 
 Full documentation is available at **[unbounded-cloud.io](https://unbounded-cloud.io/)**.

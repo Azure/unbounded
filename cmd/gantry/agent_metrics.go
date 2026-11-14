@@ -37,10 +37,39 @@ type phase1Metrics struct {
 	originPullFailure   *prometheus.CounterVec
 	originBytes         *prometheus.CounterVec
 	originFailureTotal  *prometheus.CounterVec
+	transfers           *liveTransferMetrics
+}
+
+type liveTransferMetrics struct {
+	bytes  *prometheus.CounterVec
+	active *prometheus.GaugeVec
+}
+
+func newLiveTransferMetrics(reg *metrics.Registry) *liveTransferMetrics {
+	result := &liveTransferMetrics{
+		bytes: reg.NewCounterVec("transfer", prometheus.CounterOpts{
+			Name: "gantry_transfer_bytes_total",
+			Help: "Bytes actually received during origin or peer GETs, updated while reading; includes partial transfers and retries.",
+		}, []string{"source", "kind"}),
+		active: reg.NewGaugeVec("transfer", prometheus.GaugeOpts{
+			Name: "gantry_active_transfers",
+			Help: "Origin or peer GET operations in progress, from request setup through terminal body read or Close; excludes queued operations and HEADs.",
+		}, []string{"source", "kind"}),
+	}
+
+	for _, source := range []string{"origin", "peer"} {
+		for _, kind := range []string{"layer", "manifest", "config"} {
+			result.bytes.WithLabelValues(source, kind).Add(0)
+			result.active.WithLabelValues(source, kind).Set(0)
+		}
+	}
+
+	return result
 }
 
 func newPhase1Metrics(reg *metrics.Registry) *phase1Metrics {
 	p := &phase1Metrics{
+		transfers: newLiveTransferMetrics(reg),
 		cacheHit: reg.NewCounter("cache", prometheus.CounterOpts{
 			Name: "p2p_cache_hit_total",
 			Help: "Local content-store hits on the containerd-facing mirror endpoint.",
