@@ -187,6 +187,10 @@ from its own origin). See
 Racer splits every object into **16 MiB pages**. A page is the unit for caching,
 transfer between nodes, placement, and origin reads.
 
+Every page is **sealed**: encrypted and authenticated with AES-GCM under a
+per-cache key, in memory, on disk, and between nodes. There is no unsealed
+mode.
+
 ### Origins
 
 An origin answers two kinds of requests:

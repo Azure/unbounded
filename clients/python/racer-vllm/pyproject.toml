@@ -32,17 +32,24 @@ Source = "https://github.com/Azure/unbounded/tree/main/clients/python/racer-vllm
 Issues = "https://github.com/Azure/unbounded/issues"
 
 [project.optional-dependencies]
+# Needed only by 'racer-vllm import' and 'prepare' uploads to Azure Blob.
+azure = ["azure-storage-blob>=12.19", "azure-identity>=1.15"]
 test = ["pytest"]
 
 [project.entry-points."vllm.general_plugins"]
 racer = "racer_vllm:register"
 
 [project.scripts]
-racer-vllm-fetch = "racer_vllm:main"
+racer-vllm = "racer_vllm:main"
+# Deprecated alias of 'racer-vllm materialize'.
+racer-vllm-fetch = "racer_vllm:fetch_main"
 
-[tool.setuptools]
-py-modules = ["racer_vllm"]
-package-dir = {"" = "src"}
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "vllm: needs a real vLLM install (CI runs these with -m vllm)",
+    "gpu: needs a GPU and a live dataplane",
+]

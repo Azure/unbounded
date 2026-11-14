@@ -127,6 +127,14 @@ spec:
 - `spec.passthrough` can be added, changed, or removed at any time. When a cache
   switches to passthrough, data previously cached for it is dropped.
 
+### Encryption
+
+Every page is sealed with AES-256-GCM under a per-cache key: in memory, on
+disk, and between nodes, including pages that come from object storage.
+Readers decrypt in the dataplane or on the GPU, and plaintext lives only as
+long as a reader needs it. There is no setting to turn this off, so plan for
+the CPU cost of sealing on the nodes that fill the cache.
+
 ### Node selector
 
 Set `spec.nodeSelector` to a label selector to choose which Racer nodes store,
@@ -824,7 +832,8 @@ Racer-Destination-Length: <length>
   dataplane did not find, including an unknown `Racer-Gpu-Uuid`. It is 400 when the size does not match the memory or
   the window does not fit in it.
 - A success has `Racer-Delivery: gpu`. A page frame means the GPU copy of that
-  page is complete.
+  page is complete. Several pages of one read can be on the GPU at once, but
+  page frames are still sent in page order.
 - When the read ends for any reason, the dataplane waits for its GPU work,
   then releases the memory. See [GPU reads](#gpu-reads).
 
@@ -1662,7 +1671,7 @@ from the GPUs the dataplane found and the active RDMA rails.
 |--------|------|---------|
 | `racer_gpu_read_requests_total{outcome}` | counter | `gpu-read` requests by how the dataplane opened them: `gpu` (imported on a GPU; the read can still fail later), `not_enabled` (501, `gpu-read` is off), `wrong_device` (501, the memory is on a GPU the dataplane cannot use, or the `Racer-Gpu-Uuid` header names a GPU it did not find), `busy` (503), `invalid` (400), or `failed`. Requests the parser rejects before it knows the mode are not counted. |
 | `racer_gpu_enabled` | gauge | 1 when `gpu-read` is on and found a usable GPU, else 0. |
-| `racer_gpu_standby` | gauge | 1 while `auto` mode waits for the first `gpu-read` before it touches a GPU, else 0. |
+| `racer_gpu_standby` | gauge | 1 while `RACER_ENABLE_GPU=auto` has no helper and would start one on a `gpu-read`, including after a failed attempt. 0 once a helper is running, or after a terminal failure (`RACER_ENABLE_GPU=true`, or a failed start thread spawn). |
 
 The rest are reported only when `racer_gpu_enabled` is 1:
 
@@ -1863,6 +1872,27 @@ the pod gets one shared volume. The webhook rejects the pod when the cache name
 is missing or invalid, when a listed container does not exist, or when a
 container already sets `RACER_SOCKET` or mounts that path.
 
+## Capabilities
+
+`GET /v1/capabilities` on the client socket returns what this dataplane can
+do, so a client can pick a delivery mode instead of trying one and handling
+the refusal. The connection closes after the response. The answer never
+starts the GPU helper and never waits for a start in flight.
+
+```json
+{"schema":1,"delivery":["gpu","host","stream"],
+ "gpu_uuids":["GPU-0123..."],"page_bytes":16777216,
+ "page_ciphers":["xaes256gcm"]}
+```
+
+- `delivery` lists the read modes this build and node can serve. `stream` is
+  always present, `host` needs nothing extra, and `gpu` appears only in a
+  CUDA build on a node whose NVIDIA driver reports at least one GPU.
+- `gpu_uuids` lists those GPUs, sorted, without loading CUDA.
+- `page_ciphers` lists the page ciphers the build decodes.
+
+The Python client exposes this as `Client.capabilities()`.
+
 ## GPU reads
 
 GPU reads let a client on the node read an object straight into its own NVIDIA
@@ -1875,15 +1905,28 @@ GPU memory. They need:
   container runtime and a CDI spec.
 - `RACER_ENABLE_GPU` in `racer-settings`. `auto`, the default, does
   not touch any GPU until a client sends the first `gpu-read`. Only then does
-  the dataplane load CUDA, look for GPUs, and turn GPU mode on, or off if it
-  finds no usable GPU. It does not try again until the pod restarts. `true`
-  sets up the GPUs at startup and makes startup fail when there is no usable
-  GPU. `false` turns it off.
+  the dataplane load CUDA, look for GPUs, and turn GPU mode on; it never
+  does this at startup. One attempt runs at a time, and `gpu-read` requests
+  that arrive while it runs wait for it. If the attempt fails, those requests
+  get 501, and so does every `gpu-read` during a backoff that starts at 5 s
+  and doubles per consecutive failure, capped at 60 s. There is no background
+  timer: the first `gpu-read` after the backoff expires starts the next
+  attempt and waits for it, within that request's own scope, instead of
+  getting 501. An idle node never retries on its own. The dataplane logs
+  `stage=gpu state=starting attempt=<n>` for each attempt,
+  `state=start-failed attempt=<n> reason=<reason> retry_in=<s>s` when one
+  fails, and `state=recovered attempt=<n>` when an attempt after a failure
+  succeeds.
+  `true` sets up the GPUs at startup and makes startup fail, instead of
+  retrying, when there is no usable GPU. `false` turns it off.
 
 When it sets up the GPUs, the dataplane logs each GPU it finds: ordinal, UUID, PCI address,
 NUMA node, compute mode, and whether it can use it. It skips GPUs in
-`EXCLUSIVE_PROCESS` or `PROHIBITED` mode. One helper thread does all GPU work
-for the process, except cuFile disk reads, which run on four reader threads. At most 256 GPU reads run at once; more get 503.
+`EXCLUSIVE_PROCESS` or `PROHIBITED` mode. One coordinator thread sets up the GPUs.
+Each usable GPU then gets its own executor thread (`racer-gpu-<ordinal>`), which
+runs that GPU's copies and decrypts on four CUDA streams. cuFile disk reads run
+on four reader threads (`racer-gpu-read`), and the cuFile driver opens on one
+more thread at startup. At most 256 GPU reads run at once; more get 503.
 
 Where the bytes come from decides who decrypts them:
 
@@ -1922,8 +1965,10 @@ Where the bytes come from decides who decrypts them:
 - With RDMA on, a page from a peer can be written by the peer's NIC straight
   into GPU memory on this node (GPUDirect RDMA). See below.
 
-If the GPU finds a damaged page, the read fails and the dataplane drops that
-copy from memory or disk, as it does when the CPU finds one.
+When the GPU's verdict on a damaged page reaches the dataplane, the read
+fails and the dataplane drops that copy from memory or disk, as it does when
+the CPU finds one. If the read fails for another reason while a page is still
+being checked, that page may keep its copy until a later read rejects it.
 
 When a shared GPU fetch finishes without putting the page in GPU memory, the
 requests waiting on it read the page through host memory rather than each
@@ -1947,7 +1992,8 @@ pods. The dataplane logs `stage=gpu-landing` lines when it registers them, and
 `racer_rdma_pages_landed_total` counts pages that landed in GPU memory.
 
 `RACER_GPU_STAGING_BYTES` is the GPU memory the dataplane keeps on each GPU for
-encrypted pages. It is split into slots of one page rounded up to whole 2 MiB pages (18 MiB). Two
+encrypted pages. It is split into slots of one sealed page (16 MiB plus a 16-byte tag) rounded
+up to whole 4 KiB blocks, so 16 MiB + 4 KiB each. Two
 slots are needed for decryption, so a smaller cap means the CPU decrypts. The
 other slots hold pages read with cuFile. When all of them are in use, the
 dataplane reads the next page through host memory instead. If the image has no

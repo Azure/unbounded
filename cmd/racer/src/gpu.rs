@@ -22,9 +22,17 @@
 //!
 //! Each executor's queue is bounded: at most `queue_depth` page jobs
 //! ([`QUEUE_DEPTH`] by default) may be queued or running on one GPU; more
-//! are refused with [`Error::Overloaded`]. A request has at most one page
-//! running at a time, so its pages land in order. [`MAX_OPEN`] bounds
-//! requests.
+//! are refused with [`Error::Overloaded`]. [`MAX_OPEN`] bounds requests.
+//!
+//! A request delivers sealed pages detached
+//! ([`DirectSink::deliver_sealed_detached`]): up to the I/O side's direct
+//! window of its pages are queued at once and may run on several lanes,
+//! each writing its own destination range. The I/O side sends page frames
+//! in page order as the oldest page is answered, so the bytes the client
+//! sees land in order. A request's extra pages (beyond its first in flight)
+//! are queued only while the queue is at most half full; otherwise they go
+//! back to the I/O side and are delivered one at a time. Plaintext pages
+//! always go one at a time.
 //!
 //! When a request ends without [`DirectSink::finish`] (for example the client
 //! disconnected), dropping its sink queues a release behind its pages. The
@@ -143,8 +151,9 @@ pub const SLOT_BYTES: u64 = (PAGE_BYTES + 16).next_multiple_of(4096);
 const STREAMS: usize = 4;
 
 /// Default bound on page jobs per GPU, queued or running. More get
-/// [`Error::Overloaded`]. Each open request has at most one page in flight,
-/// so this only trips when many requests target one GPU.
+/// [`Error::Overloaded`]. A request's pages beyond its first in flight take
+/// only the first half, so this only trips when many requests target one
+/// GPU.
 pub const QUEUE_DEPTH: usize = 128;
 
 /// Idle CUDA events each GPU keeps for fences: enough for every stream's
@@ -195,6 +204,21 @@ impl AsRef<[u8]> for HostCiphertext {
 
 /// Builds the GPU backend on the coordinator thread.
 pub type Loader = Box<dyn FnOnce() -> racer_gpu::Result<racer_gpu::Gpu> + Send>;
+
+/// Makes a [`Loader`] per GPU start attempt, so a failed lazy start can be
+/// retried.
+pub type Loaders = Box<dyn FnMut() -> Loader + Send>;
+
+/// [`Loaders`] that yields `loader` once, then loaders that fail with
+/// `Unavailable`.
+pub fn loaders_once(loader: Loader) -> Loaders {
+    let mut loader = Some(loader);
+    Box::new(move || {
+        loader
+            .take()
+            .unwrap_or_else(|| Box::new(|| Err(racer_gpu::Error::Unavailable)))
+    })
+}
 
 /// Plaintext bytes handed to the helper. The page is immutable and its
 /// storage is reference counted, so the helper reads it in place; the handle
@@ -687,15 +711,16 @@ impl Queue {
         Ok(())
     }
 
-    /// Queue a page job. [`Error::Overloaded`] when `depth` jobs are already
-    /// queued or running, [`Error::Unavailable`] once closed.
-    fn write(&self, task: WriteTask) -> Result<()> {
+    /// Queue a page job. [`Error::Overloaded`] when `limit` (at most
+    /// `depth`) jobs are already queued or running, [`Error::Unavailable`]
+    /// once closed. A refused task is handed back.
+    fn write(&self, task: WriteTask, limit: usize) -> std::result::Result<(), (Error, WriteTask)> {
         let mut state = self.lock();
         if state.closed {
-            return Err(Error::Unavailable);
+            return Err((Error::Unavailable, task));
         }
-        if self.pending.load(Ordering::Acquire) >= self.depth {
-            return Err(Error::Overloaded);
+        if self.pending.load(Ordering::Acquire) >= limit.min(self.depth) {
+            return Err((Error::Overloaded, task));
         }
         self.pending.fetch_add(1, Ordering::AcqRel);
         state.tasks.push_back(Task::Write(task));
@@ -1091,11 +1116,27 @@ impl GpuHelper {
     /// Queue a page for request `id` on GPU `ordinal`'s executor.
     fn submit(&self, ordinal: i32, task: WriteTask) -> Result<()> {
         let device = self.device(ordinal).ok_or(Error::Internal)?;
-        let result = device.queue.write(task);
-        if result == Err(Error::Overloaded) {
+        let result = device.queue.write(task, device.queue.depth);
+        if matches!(result, Err((Error::Overloaded, _))) {
             self.counters.queue_full.fetch_add(1, Ordering::Relaxed);
         }
-        result
+        result.map_err(|(error, _)| error)
+    }
+
+    /// Queue an extra page for a request that already has pages in flight,
+    /// only while the executor's queue is at most half full, so pages
+    /// that start a request keep the other half. A refused task is handed
+    /// back for the caller to deliver later, one page at a time, and is not
+    /// counted as a full queue.
+    fn submit_extra(
+        &self,
+        ordinal: i32,
+        task: WriteTask,
+    ) -> std::result::Result<(), (Error, WriteTask)> {
+        let Some(device) = self.device(ordinal) else {
+            return Err((Error::Internal, task));
+        };
+        device.queue.write(task, device.queue.depth / 2)
     }
 
     /// Release request `id`: on its executor, behind its pages, or through
@@ -1137,6 +1178,14 @@ impl GpuClient {
 }
 
 impl GpuService for GpuClient {
+    fn gpu_uuids(&self) -> Vec<String> {
+        self.helper
+            .devices()
+            .iter()
+            .map(DeviceInfo::display_id)
+            .collect()
+    }
+
     fn open(
         &self,
         descriptor: OwnedFd,
@@ -1160,6 +1209,7 @@ impl GpuService for GpuClient {
             import: None,
             ordinal: None,
             released: false,
+            detached: std::rc::Rc::new(std::cell::Cell::new(0)),
         };
         let (reply, answer) = oneshot::channel();
         sink.helper.send(Job::Import {
@@ -1185,6 +1235,24 @@ struct GpuSink {
     /// The GPU that holds the allocation, once imported.
     ordinal: Option<i32>,
     released: bool,
+    /// Detached deliveries not resolved or dropped yet.
+    detached: std::rc::Rc<std::cell::Cell<usize>>,
+}
+
+/// Counts one detached delivery in [`GpuSink::detached`] until dropped.
+struct DetachedGuard(std::rc::Rc<std::cell::Cell<usize>>);
+
+impl DetachedGuard {
+    fn new(count: &std::rc::Rc<std::cell::Cell<usize>>) -> Self {
+        count.set(count.get() + 1);
+        Self(count.clone())
+    }
+}
+
+impl Drop for DetachedGuard {
+    fn drop(&mut self) {
+        self.0.set(self.0.get().saturating_sub(1));
+    }
 }
 
 /// Wait for an answer, or stop early when the request is canceled.
@@ -1264,6 +1332,67 @@ impl DirectSink for GpuSink {
 
     fn sealed_target(&self) -> Option<SealedTarget> {
         self.helper.sealed_target(self.ordinal?)
+    }
+
+    /// Queue a sealed page on the executor now and return a future for its
+    /// answer, so several pages of this request run at once. The executor
+    /// runs them on separate streams with their own scratch pairs, and each
+    /// page's slots stay its own until its fence completes, as for
+    /// [`Self::deliver`]. The caller sends page frames in order.
+    ///
+    /// The page is handed back, for [`Self::deliver`], when the import has
+    /// not answered yet, or when this request already has pages in flight
+    /// and the executor's queue is more than half full. The first page of a
+    /// burst fails with [`Error::Overloaded`] on a full queue, as through
+    /// [`Self::deliver`].
+    fn deliver_sealed_detached(
+        &self,
+        page: Box<SealedPage>,
+        range: Range<u64>,
+        destination_offset: u64,
+        scope: &RequestScope,
+    ) -> std::result::Result<crate::client::direct::DetachedDelivery, Box<SealedPage>> {
+        let (Some(ordinal), None, false) = (self.ordinal, self.import.as_ref(), self.released)
+        else {
+            return Err(page);
+        };
+        let end = destination_offset.checked_add(range.end.saturating_sub(range.start));
+        if !end.is_some_and(|end| destination_offset >= self.window.start && end <= self.window.end)
+        {
+            return Ok(Box::pin(async { Err(Error::InvalidRange) }));
+        }
+        let (reply, mut receiver) = oneshot::channel();
+        let task = WriteTask {
+            id: self.id,
+            offset: destination_offset,
+            work: Work::Sealed(Sealed { page, range }),
+            reply,
+        };
+        let submitted = if self.detached.get() == 0 {
+            self.helper.submit(ordinal, task)
+        } else {
+            match self.helper.submit_extra(ordinal, task) {
+                Ok(()) => Ok(()),
+                Err((Error::Overloaded, task)) => {
+                    let Work::Sealed(sealed) = task.work else {
+                        unreachable!("queued a sealed page");
+                    };
+                    return Err(sealed.page);
+                }
+                Err((error, _)) => Err(error),
+            }
+        };
+        if let Err(error) = submitted {
+            return Ok(Box::pin(async move { Err(error) }));
+        }
+        let guard = DetachedGuard::new(&self.detached);
+        let scope = scope.clone();
+        Ok(Box::pin(async move {
+            let _guard = guard;
+            let (work, result) = answer(&mut receiver, &scope).await?;
+            drop(work);
+            result
+        }))
     }
 
     fn finish<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
@@ -2183,8 +2312,10 @@ impl Coordinator {
 /// A request imported on this executor's GPU.
 struct Owned {
     import: Arc<racer_gpu::ImportedAllocation>,
-    /// A page of it is running on a stream.
-    busy: bool,
+    /// Pages of it running on streams. Several may run at once when the
+    /// request delivers pages detached; each writes its own destination
+    /// range, and the caller orders the page frames.
+    running: usize,
     /// A release that waits for its pages: `Some(reply)` once asked.
     release: Option<Option<oneshot::Sender<Result<()>>>>,
 }
@@ -2294,7 +2425,7 @@ impl Executor {
                     id,
                     Owned {
                         import,
-                        busy: false,
+                        running: 0,
                         release: None,
                     },
                 );
@@ -2303,7 +2434,7 @@ impl Executor {
             Task::Release { id, reply } => {
                 let pending = self.waiting.iter().any(|task| task.id == id);
                 match self.requests.get_mut(&id) {
-                    Some(owned) if owned.busy || pending => owned.release = Some(reply),
+                    Some(owned) if owned.running > 0 || pending => owned.release = Some(reply),
                     Some(_) => self.release(id, reply),
                     None => {
                         if let Some(reply) = reply {
@@ -2456,12 +2587,13 @@ impl Executor {
         if let Some(pair) = pair {
             self.free_pairs.push(pair);
         }
-        self.answer(task, result);
+        self.answer(task, result, true);
         debug_assert!(self.lanes[index].running.is_none());
     }
 
-    /// Answer `task`, then run a release that waited for it.
-    fn answer(&mut self, task: WriteTask, result: Result<()>) {
+    /// Answer `task`, then run a release that waited for it. `started` says
+    /// the task counted as running on its request (see [`Self::begin`]).
+    fn answer(&mut self, task: WriteTask, result: Result<()>, started: bool) {
         let WriteTask {
             id, work, reply, ..
         } = task;
@@ -2473,8 +2605,13 @@ impl Executor {
         let _ = reply.send((work, result));
         let pending = self.waiting.iter().any(|task| task.id == id);
         if let Some(owned) = self.requests.get_mut(&id) {
-            owned.busy = false;
-            if !pending && let Some(reply) = owned.release.take() {
+            if started {
+                owned.running = owned.running.saturating_sub(1);
+            }
+            if owned.running == 0
+                && !pending
+                && let Some(reply) = owned.release.take()
+            {
                 self.release(id, reply);
             }
         }
@@ -2516,7 +2653,7 @@ impl Executor {
             self.engine.fence_source(fenced, &sealed.page.source);
         }
         self.engine.note_leaks();
-        self.answer(task, Err(error));
+        self.answer(task, Err(error), true);
     }
 
     /// Turn the peer path from `src` off after a failed copy.
@@ -2564,8 +2701,9 @@ impl Executor {
     }
 
     /// Start waiting pages on idle lanes, in arrival order. A page waits
-    /// while its request has another page running, or while it needs a
-    /// scratch pair and none is free; later pages may pass it.
+    /// while it needs a scratch pair and none is free; later pages may pass
+    /// it. Pages of one request may run at once: each writes its own
+    /// destination range, and the I/O side sends their frames in order.
     fn dispatch(&mut self) {
         let mut position = 0;
         while position < self.waiting.len() {
@@ -2573,15 +2711,11 @@ impl Executor {
                 return;
             };
             let task = &self.waiting[position];
-            if self.requests.get(&task.id).is_some_and(|owned| owned.busy) {
-                position += 1;
-                continue;
-            }
             let sealed = matches!(task.work, Work::Sealed(_));
             let needs = needs_scratch(task, self.device.ordinal);
             if sealed && let Err(error) = self.check_scratch() {
                 let task = self.waiting.remove(position).expect("present");
-                self.answer(task, Err(error));
+                self.answer(task, Err(error), false);
                 continue;
             }
             let pair = if needs {
@@ -2606,10 +2740,10 @@ impl Executor {
             if let Some(pair) = pair {
                 self.free_pairs.push(pair);
             }
-            self.answer(task, Err(Error::Internal));
+            self.answer(task, Err(Error::Internal), false);
             return;
         };
-        owned.busy = true;
+        owned.running += 1;
         let import = owned.import.clone();
         if self.lanes[index].stream.is_none() {
             match self.device.context.stream() {
@@ -2621,7 +2755,7 @@ impl Executor {
                     if let Some(pair) = pair {
                         self.free_pairs.push(pair);
                     }
-                    self.answer(task, Err(gpu_error(error)));
+                    self.answer(task, Err(gpu_error(error)), true);
                     return;
                 }
             }
@@ -4355,5 +4489,367 @@ mod tests {
         helper.record_joined();
         helper.record_joined();
         assert_eq!(counter(&helper.counters().joined), 2);
+    }
+
+    /// Bytes per page in the detached delivery tests.
+    const PAGE: u64 = 5000;
+
+    /// Distinct plaintext for page `n`, so misplaced pages show.
+    fn page_bytes(n: u64) -> Vec<u8> {
+        (0..PAGE).map(|i| ((i + 31 * n) % 251) as u8).collect()
+    }
+
+    /// A ready `gpu-read` sink over a fresh allocation on GPU 0.
+    fn gpu_sink(helper: &Arc<GpuHelper>) -> (Box<dyn DirectSink>, OwnedFd) {
+        let size = racer_gpu::simulation::GRANULARITY;
+        let fd = helper.run(move || simulation().allocate(0, size));
+        let client = GpuClient::new(helper.clone());
+        let mut sink = client
+            .open(
+                fd.try_clone().unwrap(),
+                Destination {
+                    offset: 0,
+                    length: size,
+                },
+                size,
+                None,
+            )
+            .unwrap();
+        futures::executor::block_on(sink.ready(&scope())).unwrap();
+        (sink, fd)
+    }
+
+    /// Wait until `count` decrypts were queued since trace position `mark`.
+    fn await_decrypts(helper: &GpuHelper, mark: usize, count: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while positions(helper, racer_gpu::simulation::Operation::Decrypt)
+            .into_iter()
+            .filter(|at| *at >= mark)
+            .count()
+            < count
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "decrypts were not queued"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    fn decrypts_since(helper: &GpuHelper, mark: usize) -> usize {
+        positions(helper, racer_gpu::simulation::Operation::Decrypt)
+            .into_iter()
+            .filter(|at| *at >= mark)
+            .count()
+    }
+
+    #[test]
+    /// One request keeps several sealed pages in flight: every decrypt is
+    /// queued before any completes, and each page lands at its own offset.
+    fn detached_pages_of_one_request_run_at_once() {
+        let helper = helper(&[None]);
+        let (mut sink, fd) = gpu_sink(&helper);
+        let scope = scope();
+        helper.run(|| simulation().set_query_delay(u32::MAX));
+        let mark = helper.run(|| simulation().trace().len());
+        let count = STREAMS as u64;
+        let writes: Vec<_> = (0..count)
+            .map(|n| {
+                let page = staged(&helper, 0, &page_bytes(n));
+                sink.deliver_sealed_detached(page, 0..PAGE, n * PAGE, &scope)
+                    .unwrap_or_else(|_| panic!("page {n} was not detached"))
+            })
+            .collect();
+        await_decrypts(&helper, mark, STREAMS);
+        assert_eq!(helper.queued(0), STREAMS);
+        helper.run(|| simulation().set_query_delay(50));
+        for write in writes {
+            futures::executor::block_on(write).unwrap();
+        }
+        for n in 0..count {
+            assert_eq!(
+                racer_gpu::simulation::read_allocation(&fd, n * PAGE, PAGE as usize),
+                page_bytes(n),
+                "page {n}"
+            );
+        }
+        futures::executor::block_on(sink.finish(&scope)).unwrap();
+        assert_eq!(counter(&helper.counters().decrypted), count);
+        assert_eq!(helper.queued(0), 0);
+        assert!(helper.run(|| simulation().take_violations()).is_empty());
+        assert_eq!(helper.leaked(), 0);
+    }
+
+    #[test]
+    /// A page that fails verification in the middle of a detached burst
+    /// answers `CorruptRecord` and writes nothing; its neighbors still land.
+    fn detached_mid_read_failure_is_reported_for_that_page() {
+        let helper = helper(&[None]);
+        let (mut sink, fd) = gpu_sink(&helper);
+        let scope = scope();
+        let writes: Vec<_> = (0..3u64)
+            .map(|n| {
+                let bytes = page_bytes(n);
+                let (sealed, page) = seal(&bytes, n == 1);
+                let staged = stage_on(&helper, 0, &slab(&sealed), 0, sealed.len() as u64).unwrap();
+                let page = page(SealedSource::Staged {
+                    staged: Arc::new(staged),
+                    token: crate::store::ReadToken::for_test(PageId {
+                        version: metadata(0).version,
+                        number: PageNumber(0),
+                    }),
+                });
+                sink.deliver_sealed_detached(page, 0..PAGE, n * PAGE, &scope)
+                    .unwrap_or_else(|_| panic!("page {n} was not detached"))
+            })
+            .collect();
+        let results: Vec<_> = writes
+            .into_iter()
+            .map(futures::executor::block_on)
+            .collect();
+        assert_eq!(results, [Ok(()), Err(Error::CorruptRecord), Ok(())]);
+        assert_eq!(
+            racer_gpu::simulation::read_allocation(&fd, 0, PAGE as usize),
+            page_bytes(0)
+        );
+        assert_eq!(
+            racer_gpu::simulation::read_allocation(&fd, PAGE, PAGE as usize),
+            vec![0; PAGE as usize],
+            "a rejected page writes nothing"
+        );
+        assert_eq!(
+            racer_gpu::simulation::read_allocation(&fd, 2 * PAGE, PAGE as usize),
+            page_bytes(2)
+        );
+        assert_eq!(counter(&helper.counters().rejected), 1);
+        futures::executor::block_on(sink.finish(&scope)).unwrap();
+        assert_eq!(helper.leaked(), 0);
+    }
+
+    #[test]
+    /// Partial pages need a scratch pair. With more detached pages than
+    /// pairs, the rest wait until a pair's page fence completes before
+    /// their decrypts are queued, and every page still lands intact.
+    fn detached_pages_wait_for_scratch_reuse() {
+        let helper = helper(&[None]);
+        let pairs = scratch_pairs(crate::config::DEFAULT_GPU_STAGING_BYTES / SLOT_BYTES) as usize;
+        let (mut sink, fd) = gpu_sink(&helper);
+        let scope = scope();
+        helper.run(|| simulation().set_query_delay(u32::MAX));
+        let mark = helper.run(|| simulation().trace().len());
+        let count = (pairs + 2) as u64;
+        let range = 100..PAGE;
+        let span = range.end - range.start;
+        let writes: Vec<_> = (0..count)
+            .map(|n| {
+                let page = staged(&helper, 0, &page_bytes(n));
+                sink.deliver_sealed_detached(page, range.clone(), n * span, &scope)
+                    .unwrap_or_else(|_| panic!("page {n} was not detached"))
+            })
+            .collect();
+        await_decrypts(&helper, mark, pairs);
+        // Give the executor time to (wrongly) start more.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(decrypts_since(&helper, mark), pairs, "scratch was reused");
+        helper.run(|| simulation().set_query_delay(50));
+        for write in writes {
+            futures::executor::block_on(write).unwrap();
+        }
+        assert_eq!(decrypts_since(&helper, mark), count as usize);
+        for n in 0..count {
+            assert_eq!(
+                racer_gpu::simulation::read_allocation(&fd, n * span, span as usize),
+                page_bytes(n)[range.start as usize..],
+                "page {n}"
+            );
+        }
+        futures::executor::block_on(sink.finish(&scope)).unwrap();
+        assert!(helper.run(|| simulation().take_violations()).is_empty());
+        assert_eq!(helper.leaked(), 0);
+    }
+
+    #[test]
+    /// A request's extra pages are not detached once the queue is half
+    /// full: the page comes back and is delivered one at a time.
+    fn detached_page_falls_back_when_the_queue_is_half_full() {
+        let options = GpuOptions {
+            queue_depth: 2,
+            ..GpuOptions::default()
+        };
+        let helper = helper_with_options(&[None], options, |_| {});
+        let (mut sink, fd) = gpu_sink(&helper);
+        let scope = scope();
+        helper.run(|| simulation().set_query_delay(u32::MAX));
+        let first = sink
+            .deliver_sealed_detached(staged(&helper, 0, &page_bytes(0)), 0..PAGE, 0, &scope)
+            .unwrap_or_else(|_| panic!("first page was not detached"));
+        let Err(second) =
+            sink.deliver_sealed_detached(staged(&helper, 0, &page_bytes(1)), 0..PAGE, PAGE, &scope)
+        else {
+            panic!("second page was detached past half the queue");
+        };
+        assert_eq!(counter(&helper.counters().queue_full), 0);
+        helper.run(|| simulation().set_query_delay(50));
+        futures::executor::block_on(first).unwrap();
+        futures::executor::block_on(sink.deliver(
+            DirectPage::Sealed {
+                page: second,
+                range: 0..PAGE,
+            },
+            PAGE,
+            &scope,
+        ))
+        .unwrap();
+        for n in 0..2 {
+            assert_eq!(
+                racer_gpu::simulation::read_allocation(&fd, n * PAGE, PAGE as usize),
+                page_bytes(n)
+            );
+        }
+        futures::executor::block_on(sink.finish(&scope)).unwrap();
+        assert_eq!(helper.leaked(), 0);
+    }
+
+    #[test]
+    /// A detached page outside the destination window fails with
+    /// `InvalidRange` without reaching the GPU, as through `deliver`.
+    fn detached_page_outside_the_window_is_refused() {
+        let helper = helper(&[None]);
+        let (mut sink, _fd) = gpu_sink(&helper);
+        let scope = scope();
+        let size = racer_gpu::simulation::GRANULARITY;
+        let page = staged(&helper, 0, &page_bytes(0));
+        let mark = helper.run(|| simulation().trace().len());
+        let decrypted = counter(&helper.counters().decrypted);
+        let write = sink
+            .deliver_sealed_detached(page, 0..PAGE, size, &scope)
+            .unwrap_or_else(|_| panic!("page was not detached"));
+        assert_eq!(futures::executor::block_on(write), Err(Error::InvalidRange));
+        // Nothing was submitted: no queued work and no decrypt.
+        assert_eq!(helper.queued(0), 0);
+        assert_eq!(decrypts_since(&helper, mark), 0);
+        assert_eq!(counter(&helper.counters().decrypted), decrypted);
+        futures::executor::block_on(sink.finish(&scope)).unwrap();
+        assert_eq!(helper.leaked(), 0);
+    }
+
+    #[test]
+    /// The page itself comes back, with nothing queued, while the import
+    /// has not answered and once the sink is released.
+    fn detached_page_is_handed_back_before_ready_and_after_release() {
+        let helper = helper(&[None]);
+        let size = racer_gpu::simulation::GRANULARITY;
+        let fd = helper.run(move || simulation().allocate(0, size));
+        let client = GpuClient::new(helper.clone());
+        let scope = scope();
+        let mut sink = client
+            .open(
+                fd.try_clone().unwrap(),
+                Destination {
+                    offset: 0,
+                    length: size,
+                },
+                size,
+                None,
+            )
+            .unwrap();
+        let mark = helper.run(|| simulation().trace().len());
+        let page = staged(&helper, 0, &page_bytes(0));
+        let Err(page) = sink.deliver_sealed_detached(page, 0..PAGE, 0, &scope) else {
+            panic!("detached before the import answered");
+        };
+        futures::executor::block_on(sink.ready(&scope)).unwrap();
+        futures::executor::block_on(sink.finish(&scope)).unwrap();
+        let Err(_page) = sink.deliver_sealed_detached(page, 0..PAGE, 0, &scope) else {
+            panic!("detached after release");
+        };
+        assert_eq!(helper.queued(0), 0);
+        assert_eq!(decrypts_since(&helper, mark), 0);
+        assert_eq!(
+            racer_gpu::simulation::read_allocation(&fd, 0, PAGE as usize),
+            vec![0; PAGE as usize]
+        );
+        drop(sink);
+        assert_eq!(helper.leaked(), 0);
+    }
+
+    #[test]
+    /// A page refused before it starts, by the scratch taint check, does
+    /// not count against a sibling page of its request that is still
+    /// running: a release waits for the sibling, keeps the import until it
+    /// completes, and then frees everything.
+    fn refused_page_does_not_end_a_running_sibling() {
+        use racer_gpu::simulation::Operation;
+        let helper = helper(&[None, None]);
+        let plaintext = page_bytes(0);
+        let _first = import(&helper, 1, 1);
+        let fd = import(&helper, 2, 1);
+        helper.run(|| simulation().set_query_delay(u32::MAX));
+        let mark = helper.run(|| simulation().trace().len());
+        let running = submit(&helper, 2, staged(&helper, 1, &plaintext), 0..PAGE).unwrap();
+        await_decrypts(&helper, mark, 1);
+        taint_gpu_one(&helper);
+        // The retried fence fails: the sibling is refused before it starts.
+        helper.run(|| simulation().fault(Operation::StreamSync, -5));
+        let before = scratch_work(&helper);
+        assert_eq!(
+            write(&helper, 2, staged(&helper, 1, &plaintext), 0..PAGE),
+            Err(Error::Unavailable)
+        );
+        assert_eq!(scratch_work(&helper), before, "refused page did no work");
+        // Release while the failed page's sibling still runs.
+        let (reply, mut released) = oneshot::channel();
+        helper.release(2, Some(reply)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(
+            released.try_recv(),
+            Ok(None),
+            "released under a running page"
+        );
+        assert_eq!(helper.run(|| simulation().live().imports), 2);
+        helper.run(|| simulation().set_query_delay(50));
+        assert_eq!(futures::executor::block_on(running).unwrap().1, Ok(()));
+        assert_eq!(futures::executor::block_on(released).unwrap(), Ok(()));
+        assert_eq!(
+            racer_gpu::simulation::read_allocation(&fd, 0, PAGE as usize),
+            plaintext
+        );
+        assert_eq!(helper.run(|| simulation().live().imports), 1);
+        assert!(helper.run(|| simulation().take_violations()).is_empty());
+        assert_eq!(helper.leaked(), 0);
+    }
+
+    #[test]
+    /// Dropping the sink and its detached deliveries mid-read, as on a
+    /// disconnect, still runs the queued pages and then frees the import.
+    fn dropped_detached_deliveries_release_after_their_pages() {
+        let helper = helper(&[None]);
+        let (sink, _fd) = gpu_sink(&helper);
+        let scope = scope();
+        helper.run(|| simulation().set_query_delay(u32::MAX));
+        let mark = helper.run(|| simulation().trace().len());
+        let writes: Vec<_> = (0..3u64)
+            .map(|n| {
+                sink.deliver_sealed_detached(
+                    staged(&helper, 0, &page_bytes(n)),
+                    0..PAGE,
+                    n * PAGE,
+                    &scope,
+                )
+                .unwrap_or_else(|_| panic!("page {n} was not detached"))
+            })
+            .collect();
+        await_decrypts(&helper, mark, 3);
+        drop(writes);
+        drop(sink);
+        helper.run(|| simulation().set_query_delay(50));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while helper.queued(0) != 0 || helper.run(|| simulation().live().imports) != 0 {
+            assert!(std::time::Instant::now() < deadline, "pages never drained");
+            std::thread::yield_now();
+        }
+        assert_eq!(counter(&helper.counters().decrypted), 3);
+        assert!(helper.run(|| simulation().take_violations()).is_empty());
+        assert_eq!(helper.leaked(), 0);
     }
 }

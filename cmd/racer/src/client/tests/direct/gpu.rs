@@ -860,7 +860,13 @@ fn slot(
 ) -> crate::error::Result<Arc<crate::gpu_slot::GpuSlot>> {
     let mut config = crate::test_support::cluster::config(links.is_some());
     config.enable_gpu = mode;
-    crate::app::gpu_slot(&config, true, telemetry, links, loader)
+    crate::app::gpu_slot(
+        &config,
+        true,
+        telemetry,
+        links,
+        crate::gpu::loaders_once(loader),
+    )
 }
 
 fn lazy_fixture(
@@ -999,9 +1005,10 @@ fn concurrent_first_gpu_reads_start_the_gpu_once() {
 }
 
 #[test]
-/// A failed start or a node with no usable GPU leaves `gpu-read` off (501)
-/// for good, so clients use host reads, and it is never retried.
-fn auto_start_failure_is_501_and_not_retried() {
+/// A failed start or a node with no usable GPU answers `gpu-read` with 501,
+/// so clients use host reads, and leaves the slot in standby; requests
+/// within the backoff do not start it again.
+fn auto_start_failure_is_501_and_backs_off() {
     let env = racer_io::Env::host();
     let failing = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counted = failing.clone();
@@ -1034,7 +1041,7 @@ fn auto_start_failure_is_501_and_not_retried() {
             settle(&fixture);
         }
         assert_eq!(calls_now(calls), 1);
-        assert!(!slot.standby());
+        assert!(slot.standby());
         assert!(slot.get().is_none());
         assert!(!links.gpu_landing_configured());
         use crate::gpu_telemetry::GpuReadOutcome;
@@ -1046,7 +1053,7 @@ fn auto_start_failure_is_501_and_not_retried() {
             3
         );
         let text = render(&telemetry);
-        assert!(text.contains("racer_gpu_standby 0\n"), "{text}");
+        assert!(text.contains("racer_gpu_standby 1\n"), "{text}");
         assert!(text.contains("racer_gpu_enabled 0\n"), "{text}");
     }
 }
@@ -1110,7 +1117,7 @@ fn required_starts_eagerly_and_off_modes_never_load() {
         false,
         Default::default(),
         None,
-        counted_loader(1, &off),
+        crate::gpu::loaders_once(counted_loader(1, &off)),
     )
     .unwrap();
     assert!(!unbuilt.standby());
@@ -1207,4 +1214,493 @@ fn stalled_gpu_start_honors_request_expiry_and_cancellation() {
             assert_eq!(calls_now(&calls), 1);
         }
     }
+}
+
+/// Send `GET /v1/capabilities` and return the status line and JSON body.
+fn capabilities(fixture: &Fixture) -> (String, serde_json::Value) {
+    let output = exchange(fixture, b"GET /v1/capabilities HTTP/1.1\r\n\r\n", &[]);
+    let (head, body) = split(&output);
+    assert!(head.contains("content-type: application/json"), "{head}");
+    let status = head.lines().next().unwrap_or_default().to_string();
+    (status, serde_json::from_slice(body).expect("json body"))
+}
+
+#[test]
+/// `GET /v1/capabilities` answers on the client socket with the delivery
+/// modes this build offers, without a GPU backend.
+fn capabilities_without_gpu() {
+    let env = racer_io::Env::host();
+    let fixture = direct_fixture_with(&env, b"hello".to_vec(), |responses| responses);
+    let (status, value) = capabilities(&fixture);
+    assert!(status.starts_with("http/1.1 200"), "{status}");
+    assert_eq!(value["schema"], 1);
+    assert_eq!(value["delivery"], serde_json::json!(["host", "stream"]));
+    assert_eq!(value["gpu_uuids"], serde_json::json!([]));
+    assert_eq!(value["page_bytes"], crate::model::PAGE_BYTES);
+    assert_eq!(value["page_ciphers"], serde_json::json!(["xaes256gcm"]));
+    settle(&fixture);
+    // A read on a fresh connection is unaffected.
+    let memfd = Memfd::new();
+    let output = exchange(
+        &fixture,
+        &direct_request("host-read", &fields("", 0, 5, GRANULE)),
+        &[memfd.file.as_raw_fd()],
+    );
+    let (head, _) = split(&output);
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+}
+
+#[test]
+/// Capabilities never start the lazy GPU helper and do not wait behind a
+/// start in flight; a started helper reports its GPUs.
+fn capabilities_do_not_start_or_wait_on_gpu() {
+    let env = racer_io::Env::host();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (open, gate) = std::sync::mpsc::channel();
+    let slot = slot(
+        GpuMode::Auto,
+        gated_loader(&calls, gate),
+        Default::default(),
+        None,
+    )
+    .unwrap();
+    let fixture = lazy_fixture(&env, b"hello".to_vec(), &slot);
+    let (status, value) = capabilities(&fixture);
+    assert!(status.starts_with("http/1.1 200"), "{status}");
+    assert!(value["delivery"].as_array().unwrap().len() >= 2);
+    settle(&fixture);
+    assert_eq!(calls_now(&calls), 0);
+    assert!(slot.standby());
+    // Hold a start in flight; capabilities still answer at once.
+    let starting = slot.clone();
+    let start = std::thread::spawn(move || futures::executor::block_on(starting.get_or_start()));
+    // Let the start thread reach the gate.
+    std::thread::sleep(Duration::from_millis(50));
+    let (status, _) = capabilities(&fixture);
+    assert!(status.starts_with("http/1.1 200"), "{status}");
+    settle(&fixture);
+    open.send(()).unwrap();
+    assert!(start.join().unwrap().is_some());
+    assert_eq!(calls_now(&calls), 1);
+    let (_, value) = capabilities(&fixture);
+    let uuids = value["gpu_uuids"].as_array().unwrap();
+    if cfg!(feature = "cuda") {
+        assert_eq!(
+            value["delivery"],
+            serde_json::json!(["gpu", "host", "stream"])
+        );
+        assert_eq!(uuids.len(), 1);
+        assert!(uuids[0].as_str().unwrap().starts_with("GPU-"));
+    } else {
+        // Without `cuda` the build cannot offer GPU delivery.
+        assert_eq!(value["delivery"], serde_json::json!(["host", "stream"]));
+        assert!(uuids.is_empty());
+    }
+}
+
+/// Completion order of the detached pages a [`GatedGpu`] sink started.
+#[derive(Default)]
+struct Gate {
+    /// Detached deliveries started so far.
+    started: usize,
+    /// Indexes of detached deliveries in the order they completed.
+    completed: Vec<usize>,
+    /// The second detached delivery has completed.
+    second_done: bool,
+    /// Wakes the first delivery once the second completes.
+    waker: Option<std::task::Waker>,
+    /// Fail the first delivery with a non-verdict error after it completes.
+    fail_first: bool,
+    /// Fail the first delivery at once, without waiting for the GPU.
+    refuse_first: bool,
+    /// Fail the second delivery at once, and hold the first until the
+    /// window is full and a moment has passed for the next page to be
+    /// fetched ahead, then let it succeed.
+    stall_first_refuse_second: bool,
+}
+
+/// A real GPU backend whose first detached page completes only after the
+/// second does, so pages complete out of order.
+struct GatedGpu(GpuClient, Rc<RefCell<Gate>>);
+
+struct GatedSink(Box<dyn DirectSink>, Rc<RefCell<Gate>>);
+
+impl crate::client::direct::GpuService for GatedGpu {
+    fn open(
+        &self,
+        descriptor: OwnedFd,
+        destination: crate::client::direct::Destination,
+        allocation_size: u64,
+        gpu_uuid: Option<[u8; 16]>,
+    ) -> Result<Box<dyn DirectSink>> {
+        let sink = self
+            .0
+            .open(descriptor, destination, allocation_size, gpu_uuid)?;
+        Ok(Box::new(GatedSink(sink, self.1.clone())))
+    }
+}
+
+impl DirectSink for GatedSink {
+    fn ready<'a>(&'a mut self, scope: &'a RequestScope) -> crate::error::Operation<'a, ()> {
+        self.0.ready(scope)
+    }
+
+    fn deliver<'a>(
+        &'a mut self,
+        page: crate::client::direct::DirectPage<'a>,
+        destination_offset: u64,
+        scope: &'a RequestScope,
+    ) -> crate::error::Operation<'a, ()> {
+        self.0.deliver(page, destination_offset, scope)
+    }
+
+    fn finish<'a>(&'a mut self, scope: &'a RequestScope) -> crate::error::Operation<'a, ()> {
+        self.0.finish(scope)
+    }
+
+    fn sealed_target(&self) -> Option<crate::read::sealed::SealedTarget> {
+        self.0.sealed_target()
+    }
+
+    fn deliver_sealed_detached(
+        &self,
+        page: Box<crate::read::sealed::SealedPage>,
+        range: std::ops::Range<u64>,
+        destination_offset: u64,
+        scope: &RequestScope,
+    ) -> std::result::Result<
+        crate::client::direct::DetachedDelivery,
+        Box<crate::read::sealed::SealedPage>,
+    > {
+        let write = self
+            .0
+            .deliver_sealed_detached(page, range, destination_offset, scope)?;
+        let gate = self.1.clone();
+        let index = {
+            let mut gate = gate.borrow_mut();
+            gate.started += 1;
+            gate.started - 1
+        };
+        if index == 0 && gate.borrow().refuse_first {
+            // The executor still answers the page; nothing waits for it.
+            drop(write);
+            return Ok(Box::pin(async { Err(Error::Overloaded) }));
+        }
+        if index == 1 && gate.borrow().stall_first_refuse_second {
+            drop(write);
+            return Ok(Box::pin(async { Err(Error::Unavailable) }));
+        }
+        if index == 0 && gate.borrow().stall_first_refuse_second {
+            return Ok(Box::pin(async move {
+                let result = write.await;
+                let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let mut timer = false;
+                std::future::poll_fn(|cx| {
+                    if released.load(std::sync::atomic::Ordering::Acquire) {
+                        return Poll::Ready(());
+                    }
+                    // Wait for a full window, then wake once from another
+                    // thread, so no poll in between lets a fetch through.
+                    if !timer && gate.borrow().started >= crate::client::DIRECT_WINDOW_PAGES {
+                        timer = true;
+                        let released = released.clone();
+                        let waker = cx.waker().clone();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(Duration::from_millis(300));
+                            released.store(true, std::sync::atomic::Ordering::Release);
+                            waker.wake();
+                        });
+                    }
+                    Poll::Pending
+                })
+                .await;
+                gate.borrow_mut().completed.push(0);
+                result
+            }));
+        }
+        Ok(Box::pin(async move {
+            let result = write.await;
+            if index == 0 {
+                std::future::poll_fn(|cx| {
+                    let mut gate = gate.borrow_mut();
+                    if gate.second_done {
+                        Poll::Ready(())
+                    } else {
+                        gate.waker = Some(cx.waker().clone());
+                        Poll::Pending
+                    }
+                })
+                .await;
+            }
+            let mut state = gate.borrow_mut();
+            state.completed.push(index);
+            if index == 1 {
+                state.second_done = true;
+                if let Some(waker) = state.waker.take() {
+                    waker.wake();
+                }
+            }
+            if index == 0 && state.fail_first {
+                return Err(Error::Unavailable);
+            }
+            result
+        }))
+    }
+}
+
+fn gated_fixture(
+    env: &racer_io::Env,
+    body: Vec<u8>,
+    helper: &Arc<GpuHelper>,
+) -> (Fixture, Rc<RefCell<Gate>>) {
+    let gate = Rc::new(RefCell::new(Gate::default()));
+    let gpu = GatedGpu(GpuClient::new(helper.clone()), gate.clone());
+    (direct_fixture(env, body, Some(Rc::new(gpu))), gate)
+}
+
+/// Pages that finish out of order still go out in page order: page 1
+/// completes first, and its frame waits until page 0 completes.
+#[test]
+fn gpu_read_frames_wait_for_the_oldest_page() {
+    let env = racer_io::Env::host();
+    let helper = start(GpuMode::Required, 1).unwrap();
+    let length = 3 * PAGE_BYTES;
+    let data = body(length as usize);
+    let (fixture, gate) = gated_fixture(&env, data.clone(), &helper);
+    arrange(&fixture, &helper, 3, length, true, false);
+    *gate.borrow_mut() = Gate::default();
+    let (head, frames, allocation, _) = gpu_read(&fixture, &helper, None, length);
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+    assert_eq!(
+        frames,
+        [
+            (1, 0, 0, PAGE_BYTES as u32),
+            (1, 1, PAGE_BYTES, PAGE_BYTES as u32),
+            (1, 2, 2 * PAGE_BYTES, PAGE_BYTES as u32),
+            (2, 3, length, 0)
+        ]
+    );
+    let completed = gate.borrow().completed.clone();
+    assert_eq!(completed.len(), 3, "{completed:?}");
+    assert_eq!(completed[0], 1, "page 1 finished first: {completed:?}");
+    assert!(read_allocation(&allocation, 64, length as usize) == data);
+    // The detached path is shared with host reads: a GPU read must not show
+    // up in the host-read in-flight metrics.
+    assert_eq!(
+        fixture
+            .listeners
+            .metrics
+            .count(Event::HostReadInflightPagesCount),
+        0
+    );
+    assert_eq!(
+        fixture
+            .listeners
+            .metrics
+            .count(Event::HostReadInflightPages),
+        0
+    );
+    assert_idle(&fixture, &helper, default_slots());
+}
+
+/// Replace the retained ciphertext of page `number` of `pages` with
+/// tampered bytes, keeping the other pages' copies.
+fn tamper_retained_page(fixture: &Fixture, number: u64, pages: u64) {
+    use crate::memory::CiphertextBytes;
+    use crate::memory::CiphertextPage;
+    let memory = worker(fixture).memory();
+    let copies: Vec<_> = (0..pages)
+        .map(|n| memory.unverified(&page_id(n)).unwrap().unwrap().copy)
+        .collect();
+    memory.remove_cache(&definition().id).unwrap();
+    for (n, mut copy) in (0..pages).zip(copies) {
+        if n == number {
+            let mut bytes = copy.ciphertext.bytes().to_vec();
+            bytes[3] ^= 0x40;
+            let envelope = copy.ciphertext.envelope().clone();
+            let crate::memory::CiphertextCopy {
+                metadata,
+                ciphertext,
+            } = copy;
+            // Return the original's admission before charging the copy.
+            drop(ciphertext);
+            copy = crate::memory::CiphertextCopy {
+                metadata,
+                ciphertext: CiphertextPage {
+                    pinned: true,
+                    provenance: None,
+                    inner: Arc::new(CiphertextBytes {
+                        pins: Default::default(),
+                        envelope,
+                        storage: crate::memory::fixture_ciphertext_storage(
+                            &fixture.listeners.admission,
+                            Some(&definition().id),
+                            &bytes,
+                        ),
+                    }),
+                },
+            };
+        }
+        memory
+            .publish_ciphertext(crate::memory::UnverifiedPage {
+                copy,
+                disk_token: None,
+            })
+            .unwrap();
+    }
+}
+
+/// A middle page fails verification while it is not the oldest in flight,
+/// and the read then fails on the oldest page. The poisoned middle page is
+/// still reported, so its owner drops the copy; the others are kept.
+#[test]
+fn gpu_read_reports_a_failed_page_behind_the_oldest() {
+    let env = racer_io::Env::host();
+    let helper = start(GpuMode::Required, 1).unwrap();
+    let length = 3 * PAGE_BYTES;
+    let (fixture, gate) = gated_fixture(&env, body(length as usize), &helper);
+    arrange(&fixture, &helper, 3, length, true, false);
+    tamper_retained_page(&fixture, 1, 3);
+    *gate.borrow_mut() = Gate {
+        fail_first: true,
+        ..Gate::default()
+    };
+    let rejected = counter(&helper.counters().rejected);
+    let (head, frames, _, _) = gpu_read(&fixture, &helper, None, length);
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+    assert!(frames.is_empty(), "{frames:?}");
+    assert_eq!(gate.borrow().completed[..2], [1, 0]);
+    assert_eq!(counter(&helper.counters().rejected), rejected + 1);
+    let memory = worker(&fixture).memory();
+    assert!(
+        memory.unverified(&page_id(1)).unwrap().is_none(),
+        "the poisoned copy was reported and dropped"
+    );
+    assert!(memory.unverified(&page_id(0)).unwrap().is_some());
+    assert_idle(&fixture, &helper, default_slots());
+}
+
+/// Once the oldest page has failed, no further page is fetched or submitted.
+#[test]
+fn gpu_read_stops_submitting_after_the_oldest_page_fails() {
+    let env = racer_io::Env::host();
+    let helper = start(GpuMode::Required, 1).unwrap();
+    let length = 3 * PAGE_BYTES;
+    let (fixture, gate) = gated_fixture(&env, body(length as usize), &helper);
+    arrange(&fixture, &helper, 3, length, true, false);
+    *gate.borrow_mut() = Gate {
+        refuse_first: true,
+        ..Gate::default()
+    };
+    let (head, frames, _, _) = gpu_read(&fixture, &helper, None, length);
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+    assert!(frames.is_empty(), "{frames:?}");
+    assert_eq!(gate.borrow().started, 1, "pages submitted after a failure");
+    assert_idle(&fixture, &helper, default_slots());
+}
+
+/// Like [`arrange`] with disk only, one page at a time, so more pages than
+/// memory holds at once end up as ciphertext records on disk.
+fn arrange_on_disk(fixture: &Fixture, helper: &GpuHelper, pages: u64) {
+    let worker = worker(fixture);
+    worker.retain(true);
+    worker.open_disk();
+    for number in 0..pages {
+        let start = number * PAGE_BYTES;
+        let (head, _, _, _) = gpu_read(
+            fixture,
+            helper,
+            Some((start, start + PAGE_BYTES - 1)),
+            PAGE_BYTES,
+        );
+        assert!(head.starts_with("http/1.1 200"), "{head}");
+        let copy = worker
+            .memory()
+            .ciphertext(&page_id(number))
+            .unwrap()
+            .unwrap();
+        worker.memory().remove_cache(&definition().id).unwrap();
+        worker.persist(copy);
+    }
+    for number in 0..pages {
+        assert!(
+            worker.disk_location(&page_id(number)).is_some(),
+            "page {number} not on disk"
+        );
+    }
+}
+
+/// Like [`gated_fixture`], with a stream fetch window of `window` pages, so
+/// the direct read may fetch pages ahead of the ones in flight.
+fn gated_fixture_with_window(
+    env: &racer_io::Env,
+    body: Vec<u8>,
+    helper: &Arc<GpuHelper>,
+    window: usize,
+) -> (Fixture, Rc<RefCell<Gate>>) {
+    let gate = Rc::new(RefCell::new(Gate::default()));
+    let gpu = GatedGpu(GpuClient::new(helper.clone()), gate.clone());
+    let mut fixture = Fixture::new(env);
+    let delivery = Rc::new(Delivery::new(
+        fixture.reactor.clone(),
+        Duration::from_secs(2),
+    ));
+    let worker = ReadWorker::new(
+        env,
+        definition(),
+        ObjectMetadata {
+            content_type: None,
+            version: ObjectVersion {
+                object: ObjectId {
+                    cache: definition().id,
+                    key: CacheKey([0; 32]),
+                },
+                etag: StrongEtag::parse(b"\"v1\"").unwrap(),
+            },
+            length: body.len() as u64,
+            expires_at: ExpiresAt::from_system_time(UNIX_EPOCH + Duration::from_millis(1234))
+                .unwrap(),
+        },
+        fixture.listeners.admission.clone(),
+        fixture.reactor.clone(),
+        delivery.clone(),
+        window,
+    );
+    let responses = Responses::new(fixture.listeners.io.clone(), delivery).with_gpu(Rc::new(gpu));
+    fixture.listeners.responses = Rc::new(responses);
+    worker.origin.set_body(body);
+    fixture.listeners.reads = worker.coordinator.clone();
+    fixture.worker = Some(worker);
+    fixture.reconcile(&[definition()]).unwrap();
+    (fixture, gate)
+}
+
+/// The oldest page succeeds only after the next page failed and the window
+/// filled, so a further page has been fetched ahead and is ready. Once the
+/// oldest page's frame is sent, the failed page is now the oldest: the read
+/// stops there instead of taking the ready page and submitting it.
+#[test]
+fn gpu_read_does_not_submit_a_ready_page_after_the_oldest_page_failed() {
+    let env = racer_io::Env::host();
+    let helper = start(GpuMode::Required, 1).unwrap();
+    let window = crate::client::DIRECT_WINDOW_PAGES as u64;
+    let pages = window + 1;
+    let length = pages * PAGE_BYTES;
+    let (fixture, gate) =
+        gated_fixture_with_window(&env, body(length as usize), &helper, 2 * window as usize);
+    arrange_on_disk(&fixture, &helper, pages);
+    *gate.borrow_mut() = Gate {
+        stall_first_refuse_second: true,
+        ..Gate::default()
+    };
+    let (head, frames, _, _) = gpu_read(&fixture, &helper, None, length);
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+    assert_eq!(frames, [(1, 0, 0, PAGE_BYTES as u32)]);
+    assert_eq!(gate.borrow().completed.first(), Some(&0));
+    assert_eq!(
+        gate.borrow().started,
+        window as usize,
+        "a page was submitted after the oldest page failed"
+    );
+    assert_idle(&fixture, &helper, default_slots());
 }

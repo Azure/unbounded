@@ -44,6 +44,7 @@ use std::task::Context;
 use std::task::Poll;
 use std::time::Duration;
 
+mod capabilities;
 pub mod direct;
 pub mod listener;
 pub mod origin_directory;
@@ -64,6 +65,26 @@ struct InFlightPage {
     slice: PageSlice,
     /// Object offset of the slice.
     offset: u64,
+}
+
+/// Report every page still in flight that has already failed its
+/// authentication check, so its owner drops the poisoned copy. Each page is
+/// polled once without blocking; pages still running are dropped unreported.
+fn report_corrupt_inflight(stream: &RangeStream, inflight: VecDeque<InFlightPage>) {
+    let waker = std::task::Waker::noop();
+    let mut cx = std::task::Context::from_waker(waker);
+    for mut page in inflight {
+        let result = match page.result.take() {
+            Some(result) => Some(result),
+            None => match page.write.as_mut().poll(&mut cx) {
+                Poll::Ready(result) => Some(result),
+                Poll::Pending => None,
+            },
+        };
+        if let Some(Err(Error::CorruptRecord)) = result {
+            stream.report_sealed(page.report, false);
+        }
+    }
 }
 
 use racer_wire::object::client::MAX_HEAD_BYTES;
@@ -779,159 +800,191 @@ impl Responses {
             let mut held: Option<(DirectItem, PageSlice, u64, u64)> = None;
             let mut fetched = 0;
             let mut ready = first.take();
-            loop {
-                if sent >= expected && inflight.is_empty() && held.is_none() && ready.is_none() {
-                    break;
-                }
-                let mut progress_scope = scope.clone();
-                progress_scope.deadline.0 = progress_scope.clock().now() + timeout;
-                if held.is_some() && inflight.is_empty() {
-                    let (item, slice, offset, target) = held.take().ok_or(Error::Internal)?;
-                    self.deliver_serial(sink, stream, item, slice, target, &progress_scope)
+            let outcome: Result<_> = async {
+                loop {
+                    if sent >= expected && inflight.is_empty() && held.is_none() && ready.is_none()
+                    {
+                        break;
+                    }
+                    let mut progress_scope = scope.clone();
+                    progress_scope.deadline.0 = progress_scope.clock().now() + timeout;
+                    if held.is_some() && inflight.is_empty() {
+                        let (item, slice, offset, target) = held.take().ok_or(Error::Internal)?;
+                        self.deliver_serial(sink, stream, item, slice, target, &progress_scope)
+                            .await?;
+                        stream.release_page(slice.page, slice.length)?;
+                        connection = send_frame(
+                            &self.io,
+                            connection,
+                            frame(1, slice.page.0, offset, slice.length),
+                            &progress_scope,
+                        )
                         .await?;
-                    stream.release_page(slice.page, slice.length)?;
-                    connection = send_frame(
-                        &self.io,
-                        connection,
-                        frame(1, slice.page.0, offset, slice.length),
-                        &progress_scope,
-                    )
-                    .await?;
-                    sent += u64::from(slice.length);
-                    pages += 1;
-                    continue;
-                }
-                let item = match ready.take() {
-                    Some(item) => Some(item),
-                    None => {
-                        let fetch = held.is_none() && fetched < expected && inflight.len() < depth;
-                        let step = std::future::poll_fn(|cx| {
-                            progress_scope.check()?;
-                            // Start the next page first, so its decrypt can
-                            // overlap the ones already running.
-                            if fetch {
-                                if let Poll::Ready(result) = stream.next_direct().as_mut().poll(cx)
-                                {
-                                    return Poll::Ready(
-                                        result.map(|item| Some(item.ok_or(Error::BadGateway))),
-                                    );
-                                }
-                            } else {
-                                // Keep the fetch window moving while writes run.
-                                stream.poll_prefetch(cx);
-                            }
-                            for page in inflight.iter_mut() {
-                                if page.result.is_none()
-                                    && let Poll::Ready(result) = page.write.as_mut().poll(cx)
-                                {
-                                    page.result = Some(result);
-                                }
-                            }
-                            if inflight.front().is_some_and(|page| page.result.is_some()) {
-                                return Poll::Ready(Ok(None));
-                            }
-                            Poll::Pending
-                        })
-                        .await
-                        .inspect_err(|&error| {
-                            self.observer.record(
-                                crate::telemetry::Failure::new(
-                                    crate::telemetry::Stage::NextSlice,
-                                    error,
-                                )
-                                .request(scope),
-                            );
-                        })?;
-                        step.transpose()?
+                        sent += u64::from(slice.length);
+                        pages += 1;
+                        continue;
                     }
-                };
-                let Some(item) = item else {
-                    // The oldest in-flight page finished.
-                    let page = inflight.pop_front().ok_or(Error::Internal)?;
-                    let result = page.result.ok_or(Error::Internal)?;
-                    let mut report = page.report;
-                    report.prefer_retained();
-                    match result {
-                        Ok(()) => stream.report_sealed(report, true),
-                        Err(Error::CorruptRecord) => stream.report_sealed(report, false),
-                        Err(_) => {}
+                    let item = match ready.take() {
+                        Some(item) => Some(item),
+                        None => {
+                            let fetch =
+                                held.is_none() && fetched < expected && inflight.len() < depth;
+                            let step = std::future::poll_fn(|cx| {
+                                progress_scope.check()?;
+                                // Settle the running pages first. Once the
+                                // oldest has failed, hand it back before
+                                // fetching more, so a failed page does not
+                                // cost further fetches and submissions.
+                                for page in inflight.iter_mut() {
+                                    if page.result.is_none()
+                                        && let Poll::Ready(result) = page.write.as_mut().poll(cx)
+                                    {
+                                        page.result = Some(result);
+                                    }
+                                }
+                                let front = inflight.front().and_then(|page| page.result.as_ref());
+                                if front.is_some_and(Result::is_err) {
+                                    return Poll::Ready(Ok(None));
+                                }
+                                // Then start the next page, so its decrypt can
+                                // overlap the ones already running. A page
+                                // that succeeded waits for a pending fetch.
+                                if fetch {
+                                    if let Poll::Ready(result) =
+                                        stream.next_direct().as_mut().poll(cx)
+                                    {
+                                        return Poll::Ready(
+                                            result.map(|item| Some(item.ok_or(Error::BadGateway))),
+                                        );
+                                    }
+                                } else {
+                                    // Keep the fetch window moving while writes run.
+                                    stream.poll_prefetch(cx);
+                                }
+                                if front.is_some() {
+                                    return Poll::Ready(Ok(None));
+                                }
+                                Poll::Pending
+                            })
+                            .await
+                            .inspect_err(|&error| {
+                                self.observer.record(
+                                    crate::telemetry::Failure::new(
+                                        crate::telemetry::Stage::NextSlice,
+                                        error,
+                                    )
+                                    .request(scope),
+                                );
+                            })?;
+                            step.transpose()?
+                        }
+                    };
+                    let Some(item) = item else {
+                        // The oldest in-flight page finished.
+                        let page = inflight.pop_front().ok_or(Error::Internal)?;
+                        let result = page.result.ok_or(Error::Internal)?;
+                        let mut report = page.report;
+                        report.prefer_retained();
+                        match result {
+                            Ok(()) => stream.report_sealed(report, true),
+                            Err(Error::CorruptRecord) => stream.report_sealed(report, false),
+                            Err(_) => {}
+                        }
+                        result?;
+                        let slice = page.slice;
+                        stream.release_page(slice.page, slice.length)?;
+                        connection = send_frame(
+                            &self.io,
+                            connection,
+                            frame(1, slice.page.0, page.offset, slice.length),
+                            &progress_scope,
+                        )
+                        .await?;
+                        sent += u64::from(slice.length);
+                        pages += 1;
+                        continue;
+                    };
+                    let slice = match &item {
+                        DirectItem::Plaintext(reader) => reader.slice(),
+                        DirectItem::Sealed(_, slice) => *slice,
+                    };
+                    if range.slice_at(slice.page)? != Some(slice)
+                        || slice.length == 0
+                        || u64::from(slice.length) > expected - fetched
+                    {
+                        return Err(Error::BadGateway);
                     }
-                    result?;
-                    let slice = page.slice;
-                    stream.release_page(slice.page, slice.length)?;
-                    connection = send_frame(
-                        &self.io,
-                        connection,
-                        frame(1, slice.page.0, page.offset, slice.length),
-                        &progress_scope,
-                    )
-                    .await?;
-                    sent += u64::from(slice.length);
-                    pages += 1;
-                    continue;
-                };
-                let slice = match &item {
-                    DirectItem::Plaintext(reader) => reader.slice(),
-                    DirectItem::Sealed(_, slice) => *slice,
-                };
-                if range.slice_at(slice.page)? != Some(slice)
-                    || slice.length == 0
-                    || u64::from(slice.length) > expected - fetched
-                {
-                    return Err(Error::BadGateway);
-                }
-                let offset = slice
-                    .page
-                    .0
-                    .checked_mul(range.page_size().get())
-                    .and_then(|n| n.checked_add(u64::from(slice.offset)))
-                    .ok_or(Error::BadGateway)?;
-                // The parser and validate bound offset + range length.
-                let target = destination
-                    .offset
-                    .checked_add(offset - range.start())
-                    .ok_or(Error::BadGateway)?;
-                fetched += u64::from(slice.length);
-                match item {
-                    DirectItem::Sealed(sealed, _) => {
-                        let report = sealed.report();
-                        let start = u64::from(slice.offset);
-                        let span = start..start + u64::from(slice.length);
-                        match sink.deliver_sealed_detached(sealed, span, target, &progress_scope) {
-                            Ok(mut write) => {
-                                // Poll once so the job is queued to a helper now.
-                                let waker = std::task::Waker::noop();
-                                let result = match write
-                                    .as_mut()
-                                    .poll(&mut std::task::Context::from_waker(waker))
-                                {
-                                    Poll::Ready(result) => Some(result),
-                                    Poll::Pending => None,
-                                };
-                                inflight.push_back(InFlightPage {
-                                    write,
-                                    result,
-                                    report,
-                                    slice,
-                                    offset,
-                                });
-                                observation
-                                    .add(Event::HostReadInflightPages, inflight.len() as u64);
-                                observation.add(Event::HostReadInflightPagesCount, 1);
-                            }
-                            Err(sealed) => {
-                                held = Some((
-                                    DirectItem::Sealed(sealed, slice),
-                                    slice,
-                                    offset,
-                                    target,
-                                ));
+                    let offset = slice
+                        .page
+                        .0
+                        .checked_mul(range.page_size().get())
+                        .and_then(|n| n.checked_add(u64::from(slice.offset)))
+                        .ok_or(Error::BadGateway)?;
+                    // The parser and validate bound offset + range length.
+                    let target = destination
+                        .offset
+                        .checked_add(offset - range.start())
+                        .ok_or(Error::BadGateway)?;
+                    fetched += u64::from(slice.length);
+                    match item {
+                        DirectItem::Sealed(sealed, _) => {
+                            let report = sealed.report();
+                            let start = u64::from(slice.offset);
+                            let span = start..start + u64::from(slice.length);
+                            match sink.deliver_sealed_detached(
+                                sealed,
+                                span,
+                                target,
+                                &progress_scope,
+                            ) {
+                                Ok(mut write) => {
+                                    // Poll once so the job is queued to a helper now.
+                                    let waker = std::task::Waker::noop();
+                                    let result = match write
+                                        .as_mut()
+                                        .poll(&mut std::task::Context::from_waker(waker))
+                                    {
+                                        Poll::Ready(result) => Some(result),
+                                        Poll::Pending => None,
+                                    };
+                                    inflight.push_back(InFlightPage {
+                                        write,
+                                        result,
+                                        report,
+                                        slice,
+                                        offset,
+                                    });
+                                    if host {
+                                        observation.add(
+                                            Event::HostReadInflightPages,
+                                            inflight.len() as u64,
+                                        );
+                                        observation.add(Event::HostReadInflightPagesCount, 1);
+                                    }
+                                }
+                                Err(sealed) => {
+                                    held = Some((
+                                        DirectItem::Sealed(sealed, slice),
+                                        slice,
+                                        offset,
+                                        target,
+                                    ));
+                                }
                             }
                         }
+                        item @ DirectItem::Plaintext(_) => {
+                            held = Some((item, slice, offset, target));
+                        }
                     }
-                    item @ DirectItem::Plaintext(_) => {
-                        held = Some((item, slice, offset, target));
-                    }
+                }
+                Ok(connection)
+            }
+            .await;
+            match outcome {
+                Ok(next) => connection = next,
+                Err(error) => {
+                    report_corrupt_inflight(stream, inflight);
+                    return Err(error);
                 }
             }
         }
@@ -1067,6 +1120,32 @@ impl Responses {
             *gpu = Some(Rc::new(crate::gpu::GpuClient::new(helper)));
         }
         Ok(())
+    }
+
+    /// The `GET /v1/capabilities` body. Never starts the GPU helper or
+    /// waits on a start: a started helper reports its usable GPUs, a slot in
+    /// standby reports the GPUs the kernel driver lists.
+    pub(crate) fn capabilities(&self) -> Vec<u8> {
+        let built = cfg!(feature = "cuda");
+        let display = |helper: &crate::gpu::GpuHelper| {
+            helper
+                .devices()
+                .iter()
+                .map(|device| device.display_id())
+                .collect::<Vec<_>>()
+        };
+        let uuids = if let Some(gpu) = self.gpu.borrow().as_ref() {
+            gpu.gpu_uuids()
+        } else if let Some(slot) = &self.lazy_gpu {
+            match slot.get() {
+                Some(helper) => display(helper),
+                None if built && slot.standby() => capabilities::driver_gpu_uuids(),
+                None => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+        capabilities::body(built, uuids)
     }
 
     /// Whether this worker serves `gpu-read`.

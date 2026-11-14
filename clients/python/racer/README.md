@@ -52,6 +52,18 @@ host's. A custom destination can provide it with a `gpu_uuid()` method.
 Set `RACER_LIBCUDA` to load a different library. torch is needed only for
 `racer.tensors`. A tensor from `as_tensor` keeps the allocation alive.
 
+## Capabilities
+
+```python
+caps = client.capabilities()
+caps["delivery"]  # for example ["gpu", "host", "stream"]
+```
+
+`capabilities` asks the dataplane (`GET /v1/capabilities`) which delivery
+modes, GPUs, page size, and page ciphers it supports, so a caller can choose a
+mode instead of trying one. It returns the decoded JSON object and uses the
+client timeout. A dataplane without the endpoint raises `NotFound`.
+
 ## Prefetching
 
 ```python

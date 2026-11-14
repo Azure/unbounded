@@ -1,0 +1,82 @@
+# Serves Qwen3-8B with weights loaded through Racer. A template for other
+# models and sites: change the cache name, the racer:// URI, the model
+# directory, and the GPU count. Replace every <placeholder>; see README.md.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qwen3-8b
+  namespace: racer-models
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: qwen3-8b
+  template:
+    metadata:
+      labels:
+        app: qwen3-8b
+        racer.unbounded-cloud.io/client-socket: enabled
+      annotations:
+        racer.unbounded-cloud.io/client-cache: models-hillsboro
+    spec:
+      initContainers:
+        # Copies the plugin packages into a volume the vLLM container
+        # puts on PYTHONPATH.
+        - name: plugin
+          image: <registry>/racer-vllm-plugin:<tag>
+          command: ["cp", "-a", "/opt/racer/python/.", "/plugin/"]
+          volumeMounts:
+            - name: plugin
+              mountPath: /plugin
+        # Copies config, tokenizer, and racer-manifest.json to local disk.
+        - name: materialize
+          image: <registry>/racer-vllm-plugin:<tag>
+          command:
+            - racer-vllm
+            - materialize
+            - racer://models-hillsboro/models/qwen/Qwen3-8B
+            - /models/Qwen3-8B
+          volumeMounts:
+            - name: models
+              mountPath: /models
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:<vllm-version>
+          env:
+            - name: PYTHONPATH
+              value: /opt/racer/python
+          args:
+            - /models/Qwen3-8B
+            - --served-model-name
+            - qwen3-8b
+            - --load-format
+            - racer
+            - --model-loader-extra-config
+            - '{"uri": "racer://models-hillsboro/models/qwen/Qwen3-8B", "delivery": "auto", "concurrency": 4}'
+          ports:
+            - name: http
+              containerPort: 8000
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+          volumeMounts:
+            - name: models
+              mountPath: /models
+            - name: plugin
+              mountPath: /opt/racer/python
+              readOnly: true
+            - name: dshm
+              mountPath: /dev/shm
+      volumes:
+        - name: models
+          emptyDir: {}
+        - name: plugin
+          emptyDir: {}
+        - name: dshm
+          emptyDir:
+            medium: Memory

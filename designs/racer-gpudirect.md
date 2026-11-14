@@ -9,8 +9,14 @@ ClusterCache through a loader plugin, with no other special code.
 Out of scope for now:
 
 - AMD GPUs. The design is NVIDIA-only.
-- A capability endpoint such as `GET /v1/gpus`. Clients find out what works by
-  trying it (see [Fallback](#fallback)).
+
+The dataplane serves `GET /v1/capabilities` on the client socket
+(`cmd/racer/src/client/capabilities.rs`). It lists the delivery modes it can
+offer, the visible GPU UUIDs, the page size and the page ciphers, and never
+starts the GPU helper. The Python client exposes it as `Client.capabilities()`.
+A client may call it before choosing a mode, but must still fall back when a
+mode is refused with 501, or with 400, 404 or 405 (see [Fallback](#fallback)).
+An older dataplane without the endpoint answers 404.
 
 ## Delivery modes
 
@@ -463,8 +469,7 @@ copies and bytes, peer copy failures, and host bounces.
   to each GPU separately. Uploading it once and fanning out to other GPUs is
   future work.
 - Each GPU runs at most four pages at once (one per stream). Whether more
-  streams, or more than one page per request in flight, pay off needs
-  measurement on hardware.
+  streams pay off needs measurement on hardware.
 
 ### Executor model
 
@@ -476,8 +481,9 @@ copies and bytes, peer copy failures, and host bounces.
   tests run them all on the simulated backend.
 - **Streams in flight.** An executor keeps up to four pages in flight
   (`STREAMS` in `src/gpu.rs`), each on its own stream. A stream has at most
-  one decrypt outstanding, as the shim requires. A request has at most one
-  page running, so its pages land in order.
+  one decrypt outstanding, as the shim requires. A request may have up to
+  four pages running, one per stream, and the client still sends its page
+  frames in order.
 - **Events and fences.** `Stream::fence_in` records an event from the GPU's
   `EventPool` (no `cuEventCreate` per fence) and moves the stream's holds
   (buffers, host sources) into a `Fence`, which releases them when
@@ -570,11 +576,17 @@ handle type, maps it, and wraps it as a torch tensor.
 ### vLLM plugin
 
 `racer-vllm` registers `--load-format racer` through the
-`vllm.general_plugins` entry point and `register_model_loader`. For each
-safetensors file it reads the header, reads each tensor's bytes into a reusable
-GPU staging buffer, and passes tensor views to `model.load_weights`. Files are
-found through `model.safetensors.index.json`. Object keys follow racer-object's
-rule (`internal/racerobject/racerobject.go`).
+`vllm.general_plugins` entry point and `register_model_loader`. It does not
+list the origin or read safetensors headers. `racer-vllm import` writes
+`racer-manifest.json` at the model prefix with every file's name, size and
+SHA-256 and each safetensors file's parsed tensor header
+(`clients/python/racer-vllm/src/racer_vllm/manifest.py`). The loader reads the
+checked-out manifest, and the planner (`planner.py`) turns the tensors this
+rank needs into merged byte ranges. Reads land in staging buffers, through
+`gpu-read` or `host-read`, and tensor views are passed to vLLM (`loader.py`).
+[Racer model weights](racer-model-weights.md) describes the manifest, planner
+and staging in detail. Object keys follow racer-object's rule
+(`internal/racerobject/racerobject.go`).
 
 ## Testing
 

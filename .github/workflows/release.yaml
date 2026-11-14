@@ -27,7 +27,7 @@ name: unbounded release
 #         -> metalman-image (stamped with the matching default netboot image)
 #     -> component-images  (matrix: machina, machine-ops-controller, unbounded-operator,
 #                           token-refresher, orca, gantry, racer,
-#                           racer-object, racer-vllm,
+#                           racer-object, racer-vllm-plugin, racer-vllm,
 #                           host-ubuntu2404,
 #                           host-azurelinux3, host-azurelinux3-nvidia,
 #                           host-azurelinux3-mshv,
@@ -753,12 +753,19 @@ jobs:
             file: images/gantry-node-config/Containerfile
             platforms: linux/amd64,linux/arm64
             trivy: true
-          # vLLM with racer-client and racer-vllm. The upstream vLLM base is
-          # not ours to patch, so it is not gated on Trivy. The base image
-          # alone is larger than a hosted runner's free disk.
+          # racer-client and racer-vllm as a pure-Python tree to inject into
+          # any vLLM image via PYTHONPATH=/opt/racer/python.
+          - name: racer-vllm-plugin
+            file: images/racer-vllm-plugin/Containerfile
+            platforms: linux/amd64,linux/arm64
+            trivy: true
+          # vLLM (VLLM_VERSION in the Containerfile) with racer-client and
+          # racer-vllm. The upstream vLLM base is not ours to patch, so it is
+          # not gated on Trivy. The base image alone is larger than a hosted
+          # runner's free disk.
           - name: racer-vllm
             file: images/racer-vllm/Containerfile
-            platforms: linux/amd64
+            platforms: linux/amd64,linux/arm64
             trivy: false
             large: true
             large-sbom: true
