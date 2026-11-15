@@ -7,6 +7,8 @@ import (
 	"bytes"
 	"flag"
 	"math"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -889,6 +891,72 @@ func TestValidate_DevModeAllEmptyOK(t *testing.T) {
 	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
 	if err := c.Validate(); err != nil {
 		t.Fatalf("validate: %v", err)
+	}
+}
+
+// An empty ConfigMap key is a legitimate "use the built-in defaults"
+// pattern: the volume projects an empty file, so the reader returns
+// io.EOF on the first Decode. That must not fail startup.
+func TestLoadYAML_EmptyDocumentKeepsDefaults(t *testing.T) {
+	c := NewDefault()
+
+	if err := c.LoadYAML(strings.NewReader("")); err != nil {
+		t.Fatalf("LoadYAML on empty document: %v", err)
+	}
+
+	if c.HRWK != 3 || c.LogLevel != "info" || c.StorageMode != StorageModeContainerd {
+		t.Errorf("defaults changed by empty overlay: hrw_k=%d log_level=%q storage_mode=%q", c.HRWK, c.LogLevel, c.StorageMode)
+	}
+}
+
+func TestLoadYAML_CommentOnlyDocumentKeepsDefaults(t *testing.T) {
+	c := NewDefault()
+
+	in := "# Gantry config placeholder. Defaults apply until the operator\n# fills this in.\n\n"
+	if err := c.LoadYAML(strings.NewReader(in)); err != nil {
+		t.Fatalf("LoadYAML on comment-only document: %v", err)
+	}
+
+	if c.HRWK != 3 || c.LogLevel != "info" {
+		t.Errorf("defaults changed by comment-only overlay: hrw_k=%d log_level=%q", c.HRWK, c.LogLevel)
+	}
+}
+
+func TestLoadYAML_InvalidYAMLErrors(t *testing.T) {
+	c := NewDefault()
+
+	in := []byte("hrw_k: [unterminated\n")
+	if err := c.LoadYAML(bytes.NewReader(in)); err == nil {
+		t.Fatal("expected error for invalid YAML")
+	}
+}
+
+// Load must read an empty config file as "defaults only", not as a
+// parse failure, because a mounted ConfigMap key can be empty.
+func TestLoad_EmptyFileUsesDefaults(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatalf("write empty config: %v", err)
+	}
+
+	c, _, err := Load(nil, func(string) string { return "" }, path)
+	if err != nil {
+		t.Fatalf("Load with empty config file: %v", err)
+	}
+
+	if c.HRWK != 3 || c.LogLevel != "info" {
+		t.Errorf("defaults not applied: hrw_k=%d log_level=%q", c.HRWK, c.LogLevel)
+	}
+}
+
+func TestLoad_InvalidFileStillErrors(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("hrw_k: [unterminated\n"), 0o600); err != nil {
+		t.Fatalf("write invalid config: %v", err)
+	}
+
+	if _, _, err := Load(nil, func(string) string { return "" }, path); err == nil {
+		t.Fatal("expected parse error for invalid config file")
 	}
 }
 

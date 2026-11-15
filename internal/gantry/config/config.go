@@ -671,7 +671,9 @@ func NewDefault() *Config {
 }
 
 // LoadYAML overlays a YAML document onto c. Unknown fields are an error so
-// typos in config files don't silently no-op.
+// typos in config files don't silently no-op. An empty document (an empty
+// file or one holding only comments) is not an error: a mounted ConfigMap
+// key can be empty and means "keep the defaults".
 func (c *Config) LoadYAML(r io.Reader) error {
 	raw, err := io.ReadAll(r)
 	if err != nil {
@@ -687,6 +689,10 @@ func (c *Config) LoadYAML(r io.Reader) error {
 	dec.KnownFields(true)
 
 	if err := dec.Decode(c); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+
 		return err
 	}
 
