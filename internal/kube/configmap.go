@@ -21,7 +21,7 @@ func ApplyConfigMap(ctx context.Context,
 		_, err := kubeCli.CoreV1().ConfigMaps(*s.Namespace).Apply(ctx, s, opts)
 		return err
 	}); retryErr != nil {
-		return fmt.Errorf("applying config map %q: %w", fmt.Sprintf("%s/%s", *s.Name, *s.Namespace), retryErr)
+		return fmt.Errorf("applying config map %q: %w", fmt.Sprintf("%s/%s", *s.Namespace, *s.Name), retryErr)
 	}
 
 	return nil
