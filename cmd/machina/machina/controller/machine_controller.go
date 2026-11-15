@@ -542,6 +542,50 @@ func (r *MachineReconciler) getBootstrapToken(ctx context.Context, secretName st
 	return fmt.Sprintf("%s.%s", string(tokenID), string(tokenSecret)), nil
 }
 
+// buildAgentConfig constructs the agent configuration for a Machine provisioned
+// over SSH. NodeName is pinned to the name that reconcileNodeJoin looks the
+// Node up by, so the Node the agent registers can be matched to the Machine and
+// daemon CSR renewal can resolve machine.spec.kubernetes.nodeRef.
+func buildAgentConfig(
+	machine *unboundedv1alpha3.Machine,
+	clusterInfo *ClusterInfo,
+	bootstrapToken string,
+	experimentalContainerIsolation bool,
+) provision.UnboundedAgentConfig {
+	k8sVersion := ""
+	apiServer := ""
+	caCertBase64 := ""
+	clusterDNS := ""
+
+	var providerLabels map[string]string
+
+	if clusterInfo != nil {
+		k8sVersion = clusterInfo.KubeVersion
+		apiServer = clusterInfo.APIServer
+		caCertBase64 = clusterInfo.CACertBase64
+		clusterDNS = clusterInfo.ClusterDNS
+
+		if clusterInfo.Provider != nil {
+			providerLabels = clusterInfo.Provider.DefaultLabels()
+		}
+	}
+
+	return provision.BuildAgentConfig(provision.BuildAgentConfigParams{
+		Machine: machine,
+		Cluster: provision.ClusterEndpoint{
+			APIServer:    apiServer,
+			CACertBase64: caCertBase64,
+			ClusterDNS:   clusterDNS,
+			KubeVersion:  k8sVersion,
+		},
+		ProviderLabels: providerLabels,
+		BootstrapToken: bootstrapToken,
+		NodeName:       machine.NodeName(),
+
+		ExperimentalContainerIsolation: experimentalContainerIsolation,
+	})
+}
+
 // provisionMachine provisions a single machine via SSH.
 func (r *MachineReconciler) provisionMachine(
 	ctx context.Context,
@@ -607,39 +651,7 @@ func (r *MachineReconciler) provisionMachine(
 	}()
 
 	// Step 3: Build the agent config and upload it as JSON.
-	k8sVersion := ""
-	if r.ClusterInfo != nil {
-		k8sVersion = r.ClusterInfo.KubeVersion
-	}
-
-	apiServer := ""
-	caCertBase64 := ""
-	clusterDNS := ""
-
-	if r.ClusterInfo != nil {
-		apiServer = r.ClusterInfo.APIServer
-		caCertBase64 = r.ClusterInfo.CACertBase64
-		clusterDNS = r.ClusterInfo.ClusterDNS
-	}
-
-	var providerLabels map[string]string
-	if r.ClusterInfo != nil && r.ClusterInfo.Provider != nil {
-		providerLabels = r.ClusterInfo.Provider.DefaultLabels()
-	}
-
-	agentConfig := provision.BuildAgentConfig(provision.BuildAgentConfigParams{
-		Machine: machine,
-		Cluster: provision.ClusterEndpoint{
-			APIServer:    apiServer,
-			CACertBase64: caCertBase64,
-			ClusterDNS:   clusterDNS,
-			KubeVersion:  k8sVersion,
-		},
-		ProviderLabels: providerLabels,
-		BootstrapToken: bootstrapToken,
-
-		ExperimentalContainerIsolation: r.ExperimentalContainerIsolation,
-	})
+	agentConfig := buildAgentConfig(machine, r.ClusterInfo, bootstrapToken, r.ExperimentalContainerIsolation)
 
 	configJSON, err := json.Marshal(agentConfig)
 	if err != nil {

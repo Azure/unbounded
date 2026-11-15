@@ -801,6 +801,35 @@ func TestMachineReconciler_Provisioning_ExperimentalContainerIsolation(t *testin
 // Helper function tests
 // ---------------------------------------------------------------------------
 
+// The SSH provisioner must tell the agent which Node name to register, and it
+// must be the same name reconcileNodeJoin and the daemon CSR renewal check look
+// up. Otherwise a Node is registered under the host hostname and the Machine
+// never leaves Joining.
+func TestBuildAgentConfigNodeName(t *testing.T) {
+	t.Parallel()
+
+	t.Run("defaults to the Machine name", func(t *testing.T) {
+		t.Parallel()
+
+		machine := newTestMachine("dc1-my-node", "10.0.0.1:22", "testuser", defaultKubernetes())
+
+		cfg := buildAgentConfig(machine, &ClusterInfo{}, "token", false)
+		require.Equal(t, "dc1-my-node", cfg.NodeName)
+		require.Equal(t, machine.NodeName(), cfg.NodeName)
+	})
+
+	t.Run("follows an explicit nodeRef", func(t *testing.T) {
+		t.Parallel()
+
+		machine := newTestMachine("dc1-my-node", "10.0.0.1:22", "testuser", defaultKubernetes())
+		machine.Spec.Kubernetes.NodeRef = &unboundedv1alpha3.LocalObjectReference{Name: "my-node"}
+
+		cfg := buildAgentConfig(machine, nil, "token", false)
+		require.Equal(t, "my-node", cfg.NodeName)
+		require.Equal(t, machine.NodeName(), cfg.NodeName)
+	})
+}
+
 func TestGetSecretValue(t *testing.T) {
 	t.Parallel()
 
