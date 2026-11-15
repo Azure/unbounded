@@ -43,6 +43,32 @@ func TestGetBootstrapTokenForSiteIgnoresExpiredTokens(t *testing.T) {
 	require.Equal(t, "new123", token.ID)
 }
 
+func TestGetBootstrapTokenForSiteIgnoresInvalidExpiration(t *testing.T) {
+	ctx := context.Background()
+
+	for name, mutate := range map[string]func(*corev1.Secret){
+		"missing": func(secret *corev1.Secret) {
+			delete(secret.Data, "expiration")
+		},
+		"unparsable": func(secret *corev1.Secret) {
+			secret.Data["expiration"] = []byte("not-a-time")
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			invalid := bootstrapSecret("bad123", "badsecret0000000", "site-a", time.Now().Add(time.Hour))
+			mutate(invalid)
+
+			_, err := GetBootstrapTokenForSite(ctx, fake.NewClientset(invalid), "site-a")
+			require.ErrorIs(t, err, ErrBootstrapTokenNotFound)
+
+			valid := bootstrapSecret("ok1234", "oksecret00000000", "site-a", time.Now().Add(time.Hour))
+			token, err := GetBootstrapTokenForSite(ctx, fake.NewClientset(invalid, valid), "site-a")
+			require.NoError(t, err)
+			require.Equal(t, "ok1234", token.ID)
+		})
+	}
+}
+
 func TestValidBootstrapTokenSecretForSite(t *testing.T) {
 	now := time.Now()
 	valid := bootstrapSecret("abc123", "0123456789abcdef", "site-a", now.Add(time.Hour))
@@ -56,6 +82,10 @@ func TestValidBootstrapTokenSecretForSite(t *testing.T) {
 	allocation.Labels["unbounded-cloud.io/allocation-uid"] = "alloc-uid"
 	allocationEmptyLabel := valid.DeepCopy()
 	allocationEmptyLabel.Labels["unbounded-cloud.io/allocation-uid"] = ""
+	missingExpiration := valid.DeepCopy()
+	delete(missingExpiration.Data, "expiration")
+	unparsableExpiration := valid.DeepCopy()
+	unparsableExpiration.Data["expiration"] = []byte("not-a-time")
 
 	tests := map[string]struct {
 		secret *corev1.Secret
@@ -74,6 +104,8 @@ func TestValidBootstrapTokenSecretForSite(t *testing.T) {
 		"nil":                          {site: "site-a"},
 		"allocation token":             {secret: allocation, site: "site-a"},
 		"allocation label empty value": {secret: allocationEmptyLabel, site: "site-a"},
+		"missing expiration":           {secret: missingExpiration, site: "site-a"},
+		"unparsable expiration":        {secret: unparsableExpiration, site: "site-a"},
 	}
 
 	for name, tt := range tests {
@@ -120,6 +152,36 @@ func TestBootstrapTokenExpirationAcceptsTimezoneLessUTC(t *testing.T) {
 	secret.Data["expiration"] = []byte("2026-08-25T15:48:24")
 
 	require.Equal(t, time.Date(2026, 8, 25, 15, 48, 24, 0, time.UTC), bootstrapTokenExpiration(secret))
+}
+
+func TestBootstrapTokenWithInvalidExpirationIsExpired(t *testing.T) {
+	for name, mutate := range map[string]func(*corev1.Secret){
+		"missing": func(secret *corev1.Secret) {
+			delete(secret.Data, "expiration")
+		},
+		"unparsable": func(secret *corev1.Secret) {
+			secret.Data["expiration"] = []byte("not-a-time")
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			secret := bootstrapSecret("abc123", "0123456789abcdef", "site-a", time.Now().Add(time.Hour))
+			mutate(secret)
+
+			require.True(t, bootstrapTokenExpiration(secret).IsZero())
+			require.True(t, isExpiredBootstrapToken(secret, time.Now()))
+		})
+	}
+}
+
+func TestBootstrapTokenExpirationFutureAndPast(t *testing.T) {
+	now := time.Now()
+	future := bootstrapSecret("fut123", "future0000000000", "site-a", now.Add(time.Hour))
+	past := bootstrapSecret("pas123", "past000000000000", "site-a", now.Add(-time.Hour))
+
+	require.False(t, isExpiredBootstrapToken(future, now))
+	require.False(t, isExpiredBootstrapToken(future, now.Add(30*time.Minute)))
+	require.True(t, isExpiredBootstrapToken(future, now.Add(time.Hour)))
+	require.True(t, isExpiredBootstrapToken(past, now))
 }
 
 func bootstrapSecret(id, secret, site string, expiresAt time.Time) *corev1.Secret {

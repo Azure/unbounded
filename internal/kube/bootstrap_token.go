@@ -162,15 +162,23 @@ func BootstrapTokenSecretName(tokenID string) string {
 }
 
 // BootstrapTokenExpiration returns the expiration encoded in a bootstrap token
-// Secret. A missing or invalid expiration returns the zero time.
+// Secret. A missing or invalid expiration returns the zero time, which callers
+// must treat as expired: these tokens are always issued with an expiration.
 func BootstrapTokenExpiration(secret *corev1.Secret) time.Time {
 	return bootstrapTokenExpiration(secret)
 }
 
+// isExpiredBootstrapToken reports whether secret is expired at now. A token
+// with a missing or unparsable expiration is treated as expired: bootstrap
+// tokens are always issued with an expiration, so honoring one without a
+// usable value would keep a malformed token valid forever.
 func isExpiredBootstrapToken(secret *corev1.Secret, now time.Time) bool {
 	expiresAt := bootstrapTokenExpiration(secret)
+	if expiresAt.IsZero() {
+		return true
+	}
 
-	return !expiresAt.IsZero() && !now.Before(expiresAt)
+	return !now.Before(expiresAt)
 }
 
 func bootstrapTokenExpiration(secret *corev1.Secret) time.Time {
