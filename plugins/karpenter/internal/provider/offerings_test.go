@@ -220,6 +220,22 @@ func TestOfferingDefaultsAndRequirements(t *testing.T) {
 			wantError: true,
 		},
 		{
+			name: "overhead for a resource not in capacity is ignored",
+			change: func(offering *capacity.Offering) {
+				offering.Overhead.EvictionThreshold[corev1.ResourceEphemeralStorage] = resource.MustParse("1Gi")
+			},
+			site: "test-site", wantZone: "test-region-1", wantOS: "linux",
+		},
+		{
+			name: "overhead exceeds a present capacity resource",
+			change: func(offering *capacity.Offering) {
+				offering.Capacity[corev1.ResourceEphemeralStorage] = resource.MustParse("1Gi")
+				offering.Overhead.EvictionThreshold[corev1.ResourceEphemeralStorage] = resource.MustParse("2Gi")
+			},
+			site:      "test-site",
+			wantError: true,
+		},
+		{
 			name:      "unknown purchase model",
 			change:    func(offering *capacity.Offering) { offering.CapacityType = "Reserved" },
 			site:      "test-site",

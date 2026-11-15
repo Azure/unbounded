@@ -248,7 +248,14 @@ func validateOverhead(offering capacity.Offering) error {
 				return fmt.Errorf("offering overhead %s is negative", name)
 			}
 
-			available := remaining[name]
+			// Overhead only reduces resources the offering reports as capacity.
+			// The shared allocator and Karpenter both subtract per capacity key,
+			// so a reserved resource that is absent from capacity is ignored.
+			available, ok := remaining[name]
+			if !ok {
+				continue
+			}
+
 			available.Sub(quantity)
 
 			if available.Sign() < 0 {
