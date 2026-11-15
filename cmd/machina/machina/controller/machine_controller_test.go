@@ -998,6 +998,41 @@ func TestBuildSSHConfig(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// hostPort tests
+// ---------------------------------------------------------------------------
+
+func TestHostPort(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		host string
+		want string
+	}{
+		{name: "hostname without port", host: "example.com", want: "example.com:22"},
+		{name: "hostname with port", host: "example.com:2222", want: "example.com:2222"},
+		{name: "IPv4 without port", host: "192.0.2.1", want: "192.0.2.1:22"},
+		{name: "IPv4 with port", host: "192.0.2.1:2222", want: "192.0.2.1:2222"},
+		{name: "bare IPv6 loopback", host: "::1", want: "[::1]:22"},
+		{name: "bare IPv6 without port", host: "2001:db8::1", want: "[2001:db8::1]:22"},
+		{name: "bracketed IPv6 without port", host: "[::1]", want: "[::1]:22"},
+		{name: "bracketed IPv6 with port", host: "[::1]:2222", want: "[::1]:2222"},
+		// A bare IPv6 literal that happens to end in :22 is still an address,
+		// not host:port, because bare IPv6 literals are accepted.
+		{name: "bare IPv6 ending in colon digits", host: "2001:db8::1:22", want: "[2001:db8::1:22]:22"},
+		{name: "empty", host: "", want: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			require.Equal(t, tt.want, hostPort(tt.host))
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
 // DefaultReachabilityChecker tests
 // ---------------------------------------------------------------------------
 

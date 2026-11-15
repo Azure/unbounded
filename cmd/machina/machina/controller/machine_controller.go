@@ -174,25 +174,38 @@ func (c *DefaultReachabilityChecker) checkReachableViaBastion(ctx context.Contex
 // hostPort ensures the host string contains a port. If no port is present,
 // ":22" is appended.
 func hostPort(host string) string {
-	// If SplitHostPort succeeds, the host already includes a port.
-	if _, _, err := net.SplitHostPort(host); err == nil {
+	if host == "" {
 		return host
-	} else {
-		var addrErr *net.AddrError
-		// For errors other than "missing port in address", return the host unchanged.
-		if !stderrs.As(err, &addrErr) || addrErr == nil || addrErr.Err != "missing port in address" {
-			return host
-		}
 	}
 
-	// At this point, the address is missing a port. Normalize bracketed IPv6
-	// literals like "[2001:db8::1]" by trimming the outer brackets before
-	// calling JoinHostPort to avoid double-bracketing.
-	if len(host) > 2 && host[0] == '[' && host[len(host)-1] == ']' {
-		host = host[1 : len(host)-1]
+	// If SplitHostPort succeeds, the host already includes a port.
+	_, _, splitErr := net.SplitHostPort(host)
+	if splitErr == nil {
+		return host
 	}
 
-	return net.JoinHostPort(host, "22")
+	// Normalize bracketed IPv6 literals like "[2001:db8::1]" by trimming the
+	// outer brackets before calling JoinHostPort to avoid double-bracketing.
+	literal := host
+	if len(literal) > 2 && literal[0] == '[' && literal[len(literal)-1] == ']' {
+		literal = literal[1 : len(literal)-1]
+	}
+
+	// A bare IP literal has no port, even when it contains colons.
+	// SplitHostPort rejects IPv6 literals such as "::1" with "too many colons
+	// in address", so detect the literal explicitly instead of relying on the
+	// error message.
+	if net.ParseIP(literal) != nil {
+		return net.JoinHostPort(literal, "22")
+	}
+
+	var addrErr *net.AddrError
+	// For errors other than "missing port in address", return the host unchanged.
+	if !stderrs.As(splitErr, &addrErr) || addrErr == nil || addrErr.Err != "missing port in address" {
+		return host
+	}
+
+	return net.JoinHostPort(literal, "22")
 }
 
 // MachineProvisioner handles the actual provisioning of a machine via SSH.
