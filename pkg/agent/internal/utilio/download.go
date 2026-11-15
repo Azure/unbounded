@@ -33,8 +33,13 @@ var remoteHTTPProbeClient = &http.Client{
 
 // CheckRedirectNoHTTPSDowngrade rejects redirects from an HTTPS source to an
 // insecure destination while allowing redirects that preserve or improve the
-// transport scheme.
+// transport scheme. It also enforces the redirect limit that net/http applies
+// when CheckRedirect is nil; setting CheckRedirect replaces that default.
 func CheckRedirectNoHTTPSDowngrade(req *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return fmt.Errorf("stopped after 10 redirects")
+	}
+
 	if len(via) > 0 && via[len(via)-1].URL.Scheme == "https" && req.URL.Scheme != "https" {
 		return fmt.Errorf("refusing redirect from HTTPS to %q", req.URL.Scheme)
 	}
