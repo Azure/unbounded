@@ -29,7 +29,9 @@ const (
 	IdentityRoleName    = "gantry-acr-pull"
 )
 
-var acrHost = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)?(?:\.[a-z0-9]+\.geo)?\.azurecr\.io$`)
+// The registry label follows ACR's rules: 5-50 lowercase alphanumeric or hyphen characters,
+// starting and ending alphanumeric, so names with several hyphens are valid.
+var acrHost = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{3,48}[a-z0-9](?:\.[a-z0-9]+\.geo)?\.azurecr\.io$`)
 
 // Config contains installation policy, never access tokens or client secrets.
 // An absent policy leaves customer authentication entirely alone.

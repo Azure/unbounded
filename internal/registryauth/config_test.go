@@ -120,11 +120,28 @@ func TestProviderConfigurationUsesSelectedIdentityAndRegistry(t *testing.T) {
 }
 
 func TestACRValidationAndImages(t *testing.T) {
-	for _, host := range []string{testRegistry, "example-hash.azurecr.io", "example.eastus2.geo.azurecr.io"} {
+	valid := []string{
+		testRegistry,
+		"example-hash.azurecr.io",
+		"example.eastus2.geo.azurecr.io",
+		"acr-prod-westus2.azurecr.io",
+		"team-alpha-prod-01.azurecr.io",
+		"acr-prod-westus2.eastus2.geo.azurecr.io",
+		"abcde.azurecr.io",
+		"a" + strings.Repeat("b", 48) + "c.azurecr.io",
+	}
+	for _, host := range valid {
 		require.True(t, IsACR(host), host)
 	}
 
-	for _, host := range []string{"example.azurecr.io.evil.test", "example.azurecr.io:443", "127.0.0.1", "user@example.azurecr.io", "https://example.azurecr.io", "example.azurecr.cn", "a/b.azurecr.io"} {
+	invalid := []string{
+		"example.azurecr.io.evil.test", "example.azurecr.io:443", "127.0.0.1", "user@example.azurecr.io",
+		"https://example.azurecr.io", "example.azurecr.cn", "a/b.azurecr.io",
+		"-example.azurecr.io", "example-.azurecr.io", "example--.azurecr.io", "example..azurecr.io",
+		"abcd.azurecr.io", "a" + strings.Repeat("b", 49) + "c.azurecr.io",
+		"Example.azurecr.io",
+	}
+	for _, host := range invalid {
 		require.False(t, IsACR(host), host)
 	}
 }
