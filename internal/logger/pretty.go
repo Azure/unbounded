@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"slices"
 	"sync"
 	"time"
 
@@ -20,8 +21,8 @@ import (
 // to stdout ensuring a deterministic ordering of selected attributes. The order
 // is defined at construction time via attrOrder. Only attributes whose keys are
 // present in attrOrder are rendered (and rendered exactly once) in the provided
-// order. Additional attributes (not listed in attrOrder) are ignored to keep
-// output stable and predictable.
+// order. Additional attributes (not listed in attrOrder) are rendered after
+// them, sorted by key, to keep output stable and predictable.
 //
 // A line is formatted as:
 //
@@ -46,14 +47,23 @@ type consoleHandler struct {
 
 // PrettyFieldHandlerOptions configures the pretty console log handler.
 type PrettyFieldHandlerOptions struct {
+	// Level filters records when the positional leveler passed to
+	// NewPrettyFieldHandler is nil. The positional leveler is authoritative
+	// when both are set.
 	Level      slog.Leveler
 	AttrOrder  []string
 	AttrColors map[string]color.Attribute
 }
 
 // NewPrettyFieldHandler creates a new slog.Handler which writes to stderr
-// and prints the provided ordered attribute keys after the log message.
+// and prints the provided ordered attribute keys after the log message. The
+// positional leveler takes precedence over opts.Level, which is used as a
+// fallback when the positional leveler is nil.
 func NewPrettyFieldHandler(lvl slog.Leveler, opts PrettyFieldHandlerOptions) slog.Handler {
+	if lvl == nil {
+		lvl = opts.Level
+	}
+
 	if lvl == nil {
 		// Default to Info level filtering if none provided.
 		lv := new(slog.LevelVar)
@@ -165,11 +175,19 @@ func (h *consoleHandler) Handle(ctx context.Context, r slog.Record) error {
 		buf.WriteString(h.colorize(r.Message, h.getLevelColor(r.Level)))
 	}
 
-	// Append any additional attributes that were not in attrOrder, to ensure all attributes are printed.
-	for k, v := range attrMap {
+	// Append any additional attributes that were not in attrOrder, sorted by
+	// key so repeated renders of the same record are byte-identical.
+	extraKeys := make([]string, 0, len(attrMap))
+	for k := range attrMap {
 		if _, alreadyAdded := attrAdded[k]; !alreadyAdded {
-			buf.WriteString(h.colorize(fmt.Sprintf(" [%s=%v]", k, v), h.getFieldColor(k)))
+			extraKeys = append(extraKeys, k)
 		}
+	}
+
+	slices.Sort(extraKeys)
+
+	for _, k := range extraKeys {
+		buf.WriteString(h.colorize(fmt.Sprintf(" [%s=%v]", k, attrMap[k]), h.getFieldColor(k)))
 	}
 
 	buf.WriteByte('\n')
