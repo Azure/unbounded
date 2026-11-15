@@ -475,6 +475,73 @@ func TestRegisterPushHandlers(t *testing.T) {
 		}
 	})
 
+	t.Run("gzip body beyond decompressed limit", func(t *testing.T) {
+		h := newHealth()
+		ws := testWebhookServerForPush(t, caPEM)
+		mux := http.NewServeMux()
+		wsSem := make(chan struct{}, maxConcurrentNodeWS)
+		registerPushHandlers(mux, h, ws, wsSem, issuer)
+
+		var body bytes.Buffer
+
+		gz := gzip.NewWriter(&body)
+		if _, err := gz.Write(bytes.Repeat([]byte("a"), maxStatusPushBodyBytes+1)); err != nil {
+			t.Fatalf("write gzip payload: %v", err)
+		}
+
+		if err := gz.Close(); err != nil {
+			t.Fatalf("close gzip payload: %v", err)
+		}
+
+		if body.Len() > 1<<20 {
+			t.Fatalf("compressed payload must stay under the 1 MiB request cap, got %d bytes", body.Len())
+		}
+
+		req := httptest.NewRequest(http.MethodPost, "/status/push", &body)
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req.Header.Set("Content-Encoding", "gzip")
+
+		resp := httptest.NewRecorder()
+		mux.ServeHTTP(resp, req)
+
+		if resp.Code != http.StatusRequestEntityTooLarge {
+			t.Fatalf("expected 413 for oversized decompressed gzip body, got %d body=%q", resp.Code, resp.Body.String())
+		}
+	})
+
+	t.Run("gzip body at decompressed limit", func(t *testing.T) {
+		h := newHealth()
+		ws := testWebhookServerForPush(t, caPEM)
+		mux := http.NewServeMux()
+		wsSem := make(chan struct{}, maxConcurrentNodeWS)
+		registerPushHandlers(mux, h, ws, wsSem, issuer)
+
+		payload := `{"mode":"full","nodeName":"node-a","status":{"nodeInfo":{"siteName":"site-a"}}}`
+		payload += strings.Repeat(" ", maxStatusPushBodyBytes-len(payload))
+
+		var body bytes.Buffer
+
+		gz := gzip.NewWriter(&body)
+		if _, err := gz.Write([]byte(payload)); err != nil {
+			t.Fatalf("write gzip payload: %v", err)
+		}
+
+		if err := gz.Close(); err != nil {
+			t.Fatalf("close gzip payload: %v", err)
+		}
+
+		req := httptest.NewRequest(http.MethodPost, "/status/push", &body)
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req.Header.Set("Content-Encoding", "gzip")
+
+		resp := httptest.NewRecorder()
+		mux.ServeHTTP(resp, req)
+
+		if resp.Code != http.StatusOK {
+			t.Fatalf("expected 200 for gzip body at the decompressed limit, got %d body=%q", resp.Code, resp.Body.String())
+		}
+	})
+
 	t.Run("full push success", func(t *testing.T) {
 		h := newHealth()
 		ws := testWebhookServerForPush(t, caPEM)

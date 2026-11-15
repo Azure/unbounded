@@ -51,6 +51,11 @@ func withConnectionContext(requestCtx, connectionCtx context.Context) (context.C
 // maxConcurrentNodeWS limits the number of simultaneous node WebSocket connections.
 const maxConcurrentNodeWS = 50000
 
+// maxStatusPushBodyBytes bounds the decoded status push body so a compressed
+// request cannot expand without limit. It matches the node WebSocket frame
+// limit so both transports accept the same payloads.
+const maxStatusPushBodyBytes = maxNodeWSFrameBytes
+
 // wsFrame carries a WebSocket message along with its frame type so the
 // handler can distinguish binary (protobuf) from text (JSON) frames.
 type wsFrame struct {
@@ -468,9 +473,16 @@ func registerPushHandlers(mux *http.ServeMux, health *healthState, webhookServer
 				bodyReader = gz
 			}
 
-			bodyBytes, err := io.ReadAll(bodyReader)
+			// Read one byte past the cap so an oversized body is detected instead of
+			// being silently truncated by io.LimitReader.
+			bodyBytes, err := io.ReadAll(io.LimitReader(bodyReader, maxStatusPushBodyBytes+1))
 			if err != nil {
 				http.Error(w, fmt.Sprintf("invalid request body: %v", err), http.StatusBadRequest)
+				return
+			}
+
+			if len(bodyBytes) > maxStatusPushBodyBytes {
+				http.Error(w, fmt.Sprintf("request body exceeds %d bytes", maxStatusPushBodyBytes), http.StatusRequestEntityTooLarge)
 				return
 			}
 
