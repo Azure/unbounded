@@ -4,6 +4,7 @@
 package commands
 
 import (
+	"errors"
 	"net"
 	"strings"
 	"testing"
@@ -88,6 +89,86 @@ func TestServePXEExperimentalContainerIsolationFlag(t *testing.T) {
 				t.Errorf("experimental-container-isolation = %t, want %t", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestResolveServerAddress(t *testing.T) {
+	detected := net.ParseIP("10.0.2.5")
+	detector := func() (net.IP, error) { return detected, nil }
+	noDetection := func() (net.IP, error) {
+		return nil, errors.New("outbound detection must not run for an explicit bind address")
+	}
+
+	for _, tt := range []struct {
+		name     string
+		bind     string
+		serveURL string
+		outbound func() (net.IP, error)
+		wantIP   string
+		wantURL  string
+		wantErr  bool
+	}{
+		{name: "unspecified bind with serve-url", bind: "0.0.0.0", serveURL: "http://pxe.example.com", outbound: detector, wantIP: "10.0.2.5", wantURL: "http://pxe.example.com"},
+		{name: "empty bind with serve-url", bind: "", serveURL: "https://pxe.example.com", outbound: detector, wantIP: "10.0.2.5", wantURL: "https://pxe.example.com"},
+		{name: "unspecified bind derives serve-url", bind: "0.0.0.0", outbound: detector, wantIP: "10.0.2.5", wantURL: "http://10.0.2.5:8880"},
+		{name: "explicit bind", bind: "192.0.2.9", outbound: noDetection, wantIP: "192.0.2.9", wantURL: "http://192.0.2.9:8880"},
+		{name: "explicit bind with serve-url", bind: "192.0.2.9", serveURL: "http://pxe.example.com", outbound: noDetection, wantIP: "192.0.2.9", wantURL: "http://pxe.example.com"},
+		{name: "detector error", bind: "0.0.0.0", outbound: func() (net.IP, error) { return nil, errors.New("no route") }, wantErr: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ip, url, err := resolveServerAddress(tt.bind, tt.serveURL, 8880, tt.outbound)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("resolveServerAddress() error = %v, wantErr %v", err, tt.wantErr)
+			}
+
+			if tt.wantErr {
+				return
+			}
+
+			if ip == nil || ip.IsUnspecified() {
+				t.Errorf("resolveServerAddress() IP = %v, must not be unspecified", ip)
+			}
+
+			if got := ip.String(); got != tt.wantIP {
+				t.Errorf("resolveServerAddress() IP = %q, want %q", got, tt.wantIP)
+			}
+
+			if url != tt.wantURL {
+				t.Errorf("resolveServerAddress() serve URL = %q, want %q", url, tt.wantURL)
+			}
+		})
+	}
+}
+
+// A serve URL plus the default bind address must still advertise the
+// provisioning interface address, and an explicit media TFTP server wins over
+// it.
+func TestResolveProvisioningMediaTFTPServer(t *testing.T) {
+	_, _, err := resolveServerAddress("0.0.0.0", "http://pxe.example.com", 8880, func() (net.IP, error) {
+		return net.ParseIP("10.0.2.5"), nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	provisioningIP := net.ParseIP("10.0.3.7")
+
+	got, err := resolveMediaTFTPServer("", provisioningIP)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got != "10.0.3.7" {
+		t.Errorf("resolveMediaTFTPServer() = %q, want %q", got, "10.0.3.7")
+	}
+
+	got, err = resolveMediaTFTPServer("10.0.9.9", provisioningIP)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got != "10.0.9.9" {
+		t.Errorf("resolveMediaTFTPServer() = %q, want %q", got, "10.0.9.9")
 	}
 }
 

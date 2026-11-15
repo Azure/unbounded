@@ -184,20 +184,36 @@ func ServePXECmd() *cobra.Command {
 
 			clusterCA := attestation.ClusterCAFromConfig(cfg)
 
-			serverIP := net.ParseIP(bindAddress)
-			if serveURL == "" {
-				ip := serverIP
-				if ip.IsUnspecified() {
-					detected, err := OutboundIP()
-					if err != nil {
-						return fmt.Errorf("detecting outbound IP for --serve-url default: %w", err)
-					}
+			serverIP, serveURL, err := resolveServerAddress(bindAddress, serveURL, httpPort, OutboundIP)
+			if err != nil {
+				return fmt.Errorf("resolving server address: %w", err)
+			}
 
-					ip = detected
-					serverIP = detected
+			if dhcpInterface != "" && dhcpAutoInterface {
+				return fmt.Errorf("--dhcp-interface and --dhcp-auto-interface are mutually exclusive")
+			}
+
+			// The provisioning address is what DHCP advertises and what BMCs
+			// use to pull virtual media, so resolve it before either consumer
+			// is built.
+			dhcpServerIP := serverIP
+
+			if dhcpAutoInterface {
+				detected, err := InterfaceForIP(serverIP)
+				if err != nil {
+					return fmt.Errorf("detecting interface for server IP %s: %w", serverIP, err)
 				}
 
-				serveURL = fmt.Sprintf("http://%s:%d", ip, httpPort)
+				dhcpInterface = detected
+			}
+
+			if dhcpInterface != "" {
+				ifIP, err := InterfaceIPv4(dhcpInterface)
+				if err != nil {
+					return fmt.Errorf("detecting IPv4 address of interface %s: %w", dhcpInterface, err)
+				}
+
+				dhcpServerIP = ifIP
 			}
 
 			defaultNetbootImage = strings.TrimSpace(defaultNetbootImage)
@@ -243,7 +259,7 @@ func ServePXECmd() *cobra.Command {
 				return fmt.Errorf("creating media API client: %w", err)
 			}
 
-			mediaTFTPServer, err = resolveMediaTFTPServer(mediaTFTPServer, serverIP)
+			mediaTFTPServer, err = resolveMediaTFTPServer(mediaTFTPServer, dhcpServerIP)
 			if err != nil {
 				return err
 			}
@@ -271,30 +287,6 @@ func ServePXECmd() *cobra.Command {
 				ExperimentalContainerIsolation: experimentalContainerIsolation,
 			}).SetupWithManager(mgr); err != nil {
 				return fmt.Errorf("setting up MachineOperation reconciler: %w", err)
-			}
-
-			if dhcpInterface != "" && dhcpAutoInterface {
-				return fmt.Errorf("--dhcp-interface and --dhcp-auto-interface are mutually exclusive")
-			}
-
-			dhcpServerIP := serverIP
-
-			if dhcpAutoInterface {
-				detected, err := InterfaceForIP(serverIP)
-				if err != nil {
-					return fmt.Errorf("detecting interface for server IP %s: %w", serverIP, err)
-				}
-
-				dhcpInterface = detected
-			}
-
-			if dhcpInterface != "" {
-				ifIP, err := InterfaceIPv4(dhcpInterface)
-				if err != nil {
-					return fmt.Errorf("detecting IPv4 address of interface %s: %w", dhcpInterface, err)
-				}
-
-				dhcpServerIP = ifIP
 			}
 
 			dhcpServer := &dhcp.Server{
@@ -408,6 +400,29 @@ func ServePXECmd() *cobra.Command {
 			"without it a Machine that declares spec.isolation container is not provisioned")
 
 	return cmd
+}
+
+// resolveServerAddress returns the IP this instance advertises and the serve
+// URL handed to clients. An unspecified bind address is resolved through
+// outbound (the address that routes off host) so DHCP option 54, siaddr, and
+// option 12 never carry 0.0.0.0. An explicit bind address or --serve-url is
+// preserved.
+func resolveServerAddress(bindAddress, serveURL string, httpPort int, outbound func() (net.IP, error)) (net.IP, string, error) {
+	ip := net.ParseIP(bindAddress)
+	if ip == nil || ip.IsUnspecified() {
+		detected, err := outbound()
+		if err != nil {
+			return nil, "", err
+		}
+
+		ip = detected
+	}
+
+	if serveURL == "" {
+		serveURL = fmt.Sprintf("http://%s:%d", ip, httpPort)
+	}
+
+	return ip, serveURL, nil
 }
 
 func resolveMediaTFTPServer(raw string, serverIP net.IP) (string, error) {
