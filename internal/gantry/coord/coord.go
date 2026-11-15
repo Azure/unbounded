@@ -662,8 +662,9 @@ func (s *Server) servePleasePull(ctx context.Context, _ peer.ID, req *coordv1.Pl
 		return nil, errors.New("please_pull: missing registry/repository")
 	}
 
+	// Rejections that return an error are counted once by handleStream's
+	// dispatch branch; do not bump here or the same RPC counts twice.
 	if err := oci.ValidateRepositoryName(req.GetRepository()); err != nil {
-		s.bumpStreamErr()
 		return nil, fmt.Errorf("please_pull: %w", err)
 	}
 
@@ -689,8 +690,8 @@ func (s *Server) servePleasePull(ctx context.Context, _ peer.ID, req *coordv1.Pl
 		// Client.PleasePull) already splits into <= max batches, so an
 		// oversized request on the wire is either a misconfiguration or a
 		// client whose max exceeds ours (version skew). Reject loudly instead
-		// of silently fanning out work the operator did not size for.
-		s.bumpStreamErr()
+		// of silently fanning out work the operator did not size for. The
+		// returned error is counted once by handleStream's dispatch branch.
 		return nil, fmt.Errorf("please_pull: too many digests: got %d, max %d", len(req.GetDigests()), s.maxDigestsPerPleasePull)
 	}
 
@@ -702,6 +703,8 @@ func (s *Server) servePleasePull(ctx context.Context, _ peer.ID, req *coordv1.Pl
 
 		d, err := digest.Parse(raw)
 		if err != nil {
+			// This path skips the digest and still replies, so handleStream's
+			// dispatch branch never sees an error; count it here instead.
 			s.bumpStreamErr()
 			s.logger.Debug("please_pull: bad digest",
 				slog.String("digest", raw),

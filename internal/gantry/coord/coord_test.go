@@ -14,12 +14,15 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/peerstore"
+	"github.com/libp2p/go-msgio"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/Azure/unbounded/internal/gantry/coord"
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/ifaces/fakes"
 	"github.com/Azure/unbounded/internal/gantry/inflight"
+	coordv1 "github.com/Azure/unbounded/internal/gantry/proto/coord/v1"
 	"github.com/Azure/unbounded/internal/gantry/registryauth"
 )
 
@@ -929,5 +932,117 @@ func TestStartLocalPull_RejectsInvalidRepository(t *testing.T) {
 
 	if got := atomic.LoadInt32(&pumpCalls); got != 0 {
 		t.Fatalf("pumpCalls = %d, want 0 (invalid repository must not reach pump)", got)
+	}
+}
+
+// rawPleasePull writes a please_pull envelope straight to the server, bypassing
+// the typed client so tests can send digests the client type cannot represent.
+// It returns the response envelope, or the wire error when the server drops
+// the stream without replying.
+func rawPleasePull(ctx context.Context, h host.Host, target peer.ID, repository string, digests []string) (*coordv1.Envelope, error) {
+	str, err := h.NewStream(ctx, target, coord.ProtocolID)
+	if err != nil {
+		return nil, err
+	}
+
+	defer func() { _ = str.Close() }() //nolint:errcheck // best-effort close
+
+	in := &coordv1.Envelope{Msg: &coordv1.Envelope_PleasePullRequest{
+		PleasePullRequest: &coordv1.PleasePullRequest{
+			UpstreamRegistry: "reg",
+			Repository:       repository,
+			Digests:          digests,
+		},
+	}}
+
+	raw, err := proto.Marshal(in)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := msgio.NewVarintWriter(str).WriteMsg(raw); err != nil {
+		return nil, err
+	}
+
+	rb, err := msgio.NewVarintReaderSize(str, coord.MaxMessageBytes).ReadMsg()
+	if err != nil {
+		return nil, err
+	}
+
+	out := &coordv1.Envelope{}
+	if err := proto.Unmarshal(rb, out); err != nil {
+		return nil, err
+	}
+
+	return out, nil
+}
+
+// TestPleasePull_StreamErrorCountedOnce asserts a rejected please_pull bumps
+// OnStreamError exactly once. The serve handlers must not bump the counter for
+// errors that propagate through dispatch, because handleStream already does;
+// a second bump double-counts gantry_coord_stream_errors_total.
+func TestPleasePull_StreamErrorCountedOnce(t *testing.T) {
+	tests := []struct {
+		name       string
+		repository string
+		digests    []string
+		maxDigests int
+		wantErr    bool
+	}{
+		{
+			name:       "invalid repository",
+			repository: "../../etc/passwd",
+			digests:    []string{"sha256:" + rep('a', 64)},
+			wantErr:    true,
+		},
+		{
+			name:       "oversized batch",
+			repository: "repo",
+			digests:    []string{"sha256:" + rep('1', 64), "sha256:" + rep('2', 64)},
+			maxDigests: 1,
+			wantErr:    true,
+		},
+		{
+			// The bad digest is skipped, not fatal, so the server still
+			// replies. That path is counted by servePleasePull itself.
+			name:       "malformed digest",
+			repository: "repo",
+			digests:    []string{"not-a-digest"},
+			wantErr:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			hClient, hServer := makeHostPair(t)
+
+			var streamErrs int32
+
+			srv := coord.NewServer(fakes.NewCache(), inflight.New(inflight.DefaultStalls(), nil),
+				coord.WithMetrics(coord.MetricsHooks{
+					OnStreamError: func() { atomic.AddInt32(&streamErrs, 1) },
+				}),
+				coord.WithMaxDigestsPerPleasePull(tt.maxDigests),
+			)
+			srv.Bind(hServer)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			_, err := rawPleasePull(ctx, hClient, hServer.ID(), tt.repository, tt.digests)
+			if tt.wantErr && err == nil {
+				t.Fatal("rawPleasePull: want wire error, got nil")
+			}
+
+			if !tt.wantErr && err != nil {
+				t.Fatalf("rawPleasePull: %v", err)
+			}
+
+			// The server bumps before closing the stream, so the counter is
+			// already settled once the client observes the reply or EOF.
+			if got := atomic.LoadInt32(&streamErrs); got != 1 {
+				t.Fatalf("OnStreamError fired %d times, want 1", got)
+			}
+		})
 	}
 }
