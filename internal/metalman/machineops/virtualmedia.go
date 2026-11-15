@@ -377,6 +377,8 @@ func (r *Reconciler) mediaSource(b *v1alpha3.MachineOperationBootMediaStatus) (b
 }
 
 func (r *Reconciler) advanceVirtualMedia(ctx context.Context, op *v1alpha3.MachineOperation, machine *v1alpha3.Machine, target v1alpha3.MachineOperationTargetStatus, now metav1.Time) targetChange {
+	expired := false
+
 	if target.BootMedia != nil {
 		b := *target.BootMedia
 
@@ -385,7 +387,11 @@ func (r *Reconciler) advanceVirtualMedia(ctx context.Context, op *v1alpha3.Machi
 			return r.advanceMediaInstalled(ctx, target, now)
 		}
 
-		if r.mediaProgressExpired(&b, now) {
+		// Preparing can wait on a first-time image pull, which is not a power
+		// action. Let that phase run once past the deadline so the download
+		// error is visible; every other phase fails here as before.
+		expired = r.mediaProgressExpired(&b, now)
+		if expired && b.Phase != "Preparing" {
 			return failTarget(target, reasonTimedOut, "virtual media progress timed out in "+b.Phase, now)
 		}
 
@@ -546,12 +552,22 @@ func (r *Reconciler) advanceVirtualMedia(ctx context.Context, op *v1alpha3.Machi
 		return failTarget(target, reasonExecutionFailed, "unknown virtual media phase "+b.Phase, now)
 	}
 
-	if err != nil {
-		if errors.Is(err, netboot.ErrNotYetDownloaded) {
-			target.Message = err.Error()
-			return targetChange{target: target}
+	if err != nil && errors.Is(err, netboot.ErrNotYetDownloaded) {
+		if expired {
+			// Waiting for a cold image pull is not a power action, so it does
+			// not consume the phase deadline. The PXE path waits the same way.
+			b.PhaseStartedAt = &now
 		}
 
+		target.Message = err.Error()
+		return targetChange{target: target}
+	}
+
+	if expired {
+		return failTarget(target, reasonTimedOut, "virtual media progress timed out in "+b.Phase, now)
+	}
+
+	if err != nil {
 		if errors.Is(err, redfish.ErrUnsupported) {
 			return failTarget(target, reasonUnsupportedTarget, err.Error(), now)
 		}

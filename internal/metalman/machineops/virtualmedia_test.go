@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -857,6 +858,37 @@ func TestVirtualMediaPhaseDeadlineWithoutReadiness(t *testing.T) {
 	current := mediaStep(t, r, op.Name)
 	require.Equal(t, v1alpha3.OperationPhaseFailed, current.Status.Phase)
 	require.Contains(t, current.Status.Targets[0].Message, "progress timed out")
+}
+
+func TestVirtualMediaImageDownloadDoesNotConsumePhaseDeadline(t *testing.T) {
+	r, d, _, op := mediaFixture(t)
+	mediaStep(t, r, op.Name)
+
+	// A first-time OCI image pull reports ErrNotYetDownloaded until it completes.
+	d.err = fmt.Errorf("resolving netboot image: %w", netboot.ErrNotYetDownloaded)
+	r.Now = func() metav1.Time { return metav1.NewTime(fixedNow().Add(2 * r.powerActionTimeout())) }
+	current := mediaStep(t, r, op.Name)
+	require.Equal(t, v1alpha3.OperationPhaseInProgress, current.Status.Phase)
+	require.Equal(t, "Preparing", current.Status.Targets[0].BootMedia.Phase)
+	require.Contains(t, current.Status.Targets[0].Message, netboot.ErrNotYetDownloaded.Error())
+
+	// The pull finishing after the power action deadline still resumes the flow.
+	d.err = nil
+	current = mediaStep(t, r, op.Name)
+	require.Equal(t, v1alpha3.OperationPhaseInProgress, current.Status.Phase)
+	require.Equal(t, "Staging", current.Status.Targets[0].BootMedia.Phase)
+}
+
+func TestVirtualMediaStuckStageStillTimesOut(t *testing.T) {
+	r, _, _, op := mediaFixture(t)
+	mediaStep(t, r, op.Name)
+	current := mediaStep(t, r, op.Name)
+	require.Equal(t, "Staging", current.Status.Targets[0].BootMedia.Phase)
+
+	r.Now = func() metav1.Time { return metav1.NewTime(fixedNow().Add(r.powerActionTimeout())) }
+	current = mediaStep(t, r, op.Name)
+	require.Equal(t, v1alpha3.OperationPhaseFailed, current.Status.Phase)
+	require.Contains(t, current.Status.Targets[0].Message, "progress timed out in Staging")
 }
 
 func TestVirtualMediaReadinessGraceSurvivesRestart(t *testing.T) {
