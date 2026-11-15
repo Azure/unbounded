@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"path"
 	"strings"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -51,6 +52,30 @@ type StatusRecorder interface {
 
 func (h *HTTPServer) NeedLeaderElection() bool { return false }
 
+const (
+	httpReadHeaderTimeout = 10 * time.Second
+	httpReadTimeout       = 30 * time.Second
+	httpIdleTimeout       = 120 * time.Second
+	httpMaxHeaderBytes    = 64 << 10
+)
+
+// newHTTPServer builds the listener configuration. The provisioning network is
+// unauthenticated, so header parsing, request reads, and idle keep-alive
+// connections are all bounded. ReadTimeout is safe because the only request
+// bodies are log reports capped at 1 MiB, and ISO downloads are responses, not
+// uploads. WriteTimeout stays unset on purpose: handlers stream multi-GB ISOs,
+// and a write deadline would truncate slow downloads.
+func newHTTPServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: httpReadHeaderTimeout,
+		ReadTimeout:       httpReadTimeout,
+		IdleTimeout:       httpIdleTimeout,
+		MaxHeaderBytes:    httpMaxHeaderBytes,
+	}
+}
+
 func (h *HTTPServer) Start(ctx context.Context) error {
 	mux := h.Mux
 	if mux == nil {
@@ -79,7 +104,7 @@ func (h *HTTPServer) Start(ctx context.Context) error {
 	mux.HandleFunc("GET /", h.handleFile)
 
 	addr := fmt.Sprintf("%s:%d", h.BindAddr, h.Port)
-	srv := &http.Server{Addr: addr, Handler: normalizePath(mux)}
+	srv := newHTTPServer(addr, normalizePath(mux))
 
 	go func() {
 		<-ctx.Done()
