@@ -170,7 +170,7 @@ func main() {
 	}, replyCh, targetIP, os.Stdout)
 
 	printStats(dstHostname, targetIP.String(), stats.sent, stats.received, stats.minRTT, stats.maxRTT, stats.totalRTT, stats.rttSamples)
-	os.Exit(0)
+	os.Exit(exitCode(stats.received))
 }
 
 // probeStats accumulates the outcome of the probes sent by runProbes.
@@ -300,6 +300,17 @@ func receiveReplies(ctx context.Context, conn *net.UDPConn, ch chan<- replyResul
 		rtt := time.Duration(now.UnixNano()-pkt.TimestampNs) * time.Nanosecond
 		ch <- replyResult{rtt: rtt, seq: pkt.SequenceNumber}
 	}
+}
+
+// exitCode returns the process exit status for a completed run. It is nonzero
+// when no replies arrived, so scripts and health probes can detect a peer that
+// is not answering.
+func exitCode(received int) int {
+	if received == 0 {
+		return 1
+	}
+
+	return 0
 }
 
 func printStats(host, ip string, sent, received int, minRTT, maxRTT, totalRTT time.Duration, samples []float64) {
