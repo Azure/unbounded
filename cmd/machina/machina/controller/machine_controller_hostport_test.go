@@ -13,7 +13,11 @@ func TestHostPortZonedIPv6AndEmpty(t *testing.T) {
 		host string
 		want string
 	}{
+		{name: "zoned bare IPv6", host: "fe80::1%eth0", want: "[fe80::1%eth0]:22"},
 		{name: "zoned bracketed IPv6", host: "[fe80::1%eth0]", want: "[fe80::1%eth0]:22"},
+		{name: "zoned bracketed IPv6 with port", host: "[fe80::1%eth0]:22", want: "[fe80::1%eth0]:22"},
+		{name: "IPv4 literal", host: "192.0.2.10", want: "192.0.2.10:22"},
+		{name: "hostname with port", host: "example.test:2222", want: "example.test:2222"},
 		{name: "empty host", host: "", want: ""},
 	}
 

@@ -10,6 +10,7 @@ import (
 	stderrs "errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"strings"
 	"time"
 
@@ -194,9 +195,11 @@ func hostPort(host string) string {
 	// A bare IP literal has no port, even when it contains colons.
 	// SplitHostPort rejects IPv6 literals such as "::1" with "too many colons
 	// in address", so detect the literal explicitly instead of relying on the
-	// error message.
-	if net.ParseIP(literal) != nil {
-		return net.JoinHostPort(literal, "22")
+	// error message. netip.ParseAddr accepts zone identifiers such as
+	// "fe80::1%eth0", which net.ParseIP rejects, and AddrPort.String renders
+	// the required brackets.
+	if addr, err := netip.ParseAddr(literal); err == nil {
+		return netip.AddrPortFrom(addr, 22).String()
 	}
 
 	var addrErr *net.AddrError
