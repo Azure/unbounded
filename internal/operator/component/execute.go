@@ -526,9 +526,15 @@ func (e *Env) execute(ctx context.Context, op Operation) error {
 // workload rolls to a hash matching nothing, and rolls again once a later pass
 // reads the real payload.
 //
-// The object is refreshed from the cluster so anything reading it back in this
-// pass sees what is actually there rather than what the operator proposed, and
-// the operation is reported stale so the pass runs again from an accurate read.
+// The object is refreshed through the live reader so anything reading it back in
+// this pass sees what is actually there rather than what the operator proposed,
+// and the operation is reported stale so the pass runs again from an accurate
+// read. The live reader matters here: the object that just won the race was
+// written moments ago, and the cache, which is populated by a watch, routinely
+// has not observed it yet. Reading through the cache would turn losing the race
+// into a hard failure, gating dependents and forcing error backoff instead of a
+// re-plan. A live read that is still NotFound is the same race seen once more,
+// so it is reported stale rather than failed.
 func (e *Env) createIfAbsent(ctx context.Context, op Operation) error {
 	err := e.Client.Create(ctx, op.Object)
 
@@ -539,7 +545,11 @@ func (e *Env) createIfAbsent(ctx context.Context, op Operation) error {
 		return fmt.Errorf("create %s: %w", op.Ref(), err)
 	}
 
-	if err := e.Client.Get(ctx, client.ObjectKeyFromObject(op.Object), op.Object); err != nil {
+	if err := e.LiveReader().Get(ctx, client.ObjectKeyFromObject(op.Object), op.Object); err != nil {
+		if apierrors.IsNotFound(err) {
+			return errStale
+		}
+
 		return fmt.Errorf("read %s after losing a create race: %w", op.Ref(), err)
 	}
 

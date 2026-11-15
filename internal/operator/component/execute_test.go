@@ -747,6 +747,93 @@ func TestCreateIfAbsentReportsLosingTheRaceAsStale(t *testing.T) {
 	}
 }
 
+// TestCreateIfAbsentReadsBackLiveAfterLosingTheRace is a regression test.
+//
+// The refresh after AlreadyExists read through the cached client, and the cache
+// is populated by a watch, so the object that just won the race was routinely
+// not in it yet. The refresh then failed, the operation became OpFailed,
+// dependents were gated, and the pass went into error backoff, all for a race a
+// re-plan resolves. The live reader answers from the apiserver instead, and a
+// live read that is still NotFound is the same race seen once more and must
+// also defer rather than fail.
+func TestCreateIfAbsentReadsBackLiveAfterLosingTheRace(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		liveHas     bool
+		wantPayload string
+	}{
+		{name: "live read succeeds", liveHas: true, wantPayload: "the winner's"},
+		{name: "live read is still NotFound", liveHas: false, wantPayload: "the operator's"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := testScheme(t)
+
+			var liveObjects []client.Object
+			if tc.liveHas {
+				liveObjects = append(liveObjects, &corev1.ConfigMap{
+					ObjectMeta: metav1.ObjectMeta{Namespace: DefaultNamespace, Name: "config"},
+					Data:       map[string]string{"payload": "the winner's"},
+				})
+			}
+
+			live := fake.NewClientBuilder().WithScheme(scheme).WithObjects(liveObjects...).Build()
+
+			// The cache has not observed the winner: its reads report the object
+			// absent, which is exactly the lag the live reader exists for.
+			cached := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithInterceptorFuncs(interceptor.Funcs{
+					Create: func(context.Context, client.WithWatch, client.Object, ...client.CreateOption) error {
+						return apierrors.NewAlreadyExists(schema.GroupResource{Resource: "configmaps"}, "config")
+					},
+					Get: func(context.Context, client.WithWatch, client.ObjectKey, client.Object, ...client.GetOption) error {
+						return apierrors.NewNotFound(schema.GroupResource{Resource: "configmaps"}, "config")
+					},
+				}).
+				Build()
+
+			env := &Env{Client: cached, APIReader: live, Scheme: scheme, Namespace: DefaultNamespace}
+
+			desired := configMapObject("config")
+			if err := unstructured.SetNestedStringMap(desired.Object,
+				map[string]string{"payload": "the operator's"}, "data"); err != nil {
+				t.Fatalf("build desired ConfigMap: %v", err)
+			}
+
+			plan := NewPlan()
+			plan.Add(Operation{Kind: OpCreateIfAbsent, Object: desired, Component: "a"})
+
+			result, err := env.Execute(t.Context(), plan)
+			if err != nil {
+				t.Fatalf("Execute: %v", err)
+			}
+
+			if err := result.Err(); err != nil {
+				t.Fatalf("losing the create race must not be a failure: %v", err)
+			}
+
+			if len(result.Stale) != 1 || result.Stale[0].Name != "config" {
+				t.Fatalf("stale = %v, want the ConfigMap the create raced on", result.Stale)
+			}
+
+			for _, op := range result.Results {
+				if op.Status == OpFailed {
+					t.Fatalf("result = %+v, want no failed operation", op)
+				}
+			}
+
+			payload, _, err := unstructured.NestedString(desired.Object, "data", "payload")
+			if err != nil {
+				t.Fatalf("read back payload: %v", err)
+			}
+
+			if payload != tc.wantPayload {
+				t.Fatalf("payload = %q, want %q", payload, tc.wantPayload)
+			}
+		})
+	}
+}
+
 // TestCreateIfAbsentIsNotStaleWhenItWins confirms the ordinary path is quiet:
 // creating the object is not a reason to re-plan.
 func TestCreateIfAbsentIsNotStaleWhenItWins(t *testing.T) {
