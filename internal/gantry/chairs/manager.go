@@ -62,6 +62,10 @@ type Manager struct {
 	holderTarget      int
 	observationRounds uint64
 	duplicateChairs   []ID
+	// rotationDue is the epoch at which an accepted successor takes over. It
+	// outlives the renewal that follows a failed rotation, because renewals
+	// advance AssignmentEpoch past that epoch.
+	rotationDue int64
 }
 
 const claimStageRounds uint64 = 8
@@ -524,30 +528,51 @@ func (m *Manager) maintain(ctx context.Context) {
 	}
 
 	held := *m.held
+	rotationDue := m.rotationDue
 	m.mu.Unlock()
 
 	epoch := m.CurrentEpoch()
+
+	// A successor accepts the epoch after the one the holder observes while
+	// preparing the rotation, so that is the epoch the handoff is due.
+	if !HolderEmpty(held.NextHolder) && rotationDue == 0 {
+		rotationDue = held.AssignmentEpoch + 1
+	}
+
+	rotating := !HolderEmpty(held.NextHolder) && epoch >= rotationDue
 
 	var (
 		updated Chair
 		err     error
 	)
 
-	if epoch > held.AssignmentEpoch && !HolderEmpty(held.NextHolder) {
+	if rotating {
 		apiCtx, cancel := m.apiContext(ctx)
-		updated, err = m.opts.Store.Rotate(apiCtx, held.ID, m.opts.Self.PeerID, held.Generation, epoch, m.opts.LeaseDuration, m.opts.Now())
+		// Rotate stamps the epoch the successor accepted, so a retry after the
+		// boundary still lets the successor adopt the chair.
+		updated, err = m.opts.Store.Rotate(apiCtx, held.ID, m.opts.Self.PeerID, held.Generation, rotationDue, m.opts.LeaseDuration, m.opts.Now())
 
 		cancel()
 
 		if err == nil {
 			m.mu.Lock()
 			m.held = nil
+			m.rotationDue = 0
 			m.mu.Unlock()
 			m.opts.Cache.Invalidate()
 
 			return
 		}
-	} else {
+
+		m.mu.Lock()
+		m.rotationDue = rotationDue
+		m.mu.Unlock()
+	}
+
+	// A rotation that fails for any reason other than a lost claim must not
+	// cost the lease. Renew so chair-aware work keeps validating this chair,
+	// and retry the handoff on a later tick.
+	if !rotating || !errors.Is(err, ErrNotClaimable) {
 		apiCtx, cancel := m.apiContext(ctx)
 		updated, err = m.opts.Store.Renew(apiCtx, held.ID, m.opts.Self, epoch, m.opts.LeaseDuration, m.opts.Now())
 
@@ -558,6 +583,7 @@ func (m *Manager) maintain(ctx context.Context) {
 		if errors.Is(err, ErrNotClaimable) {
 			m.mu.Lock()
 			m.held = nil
+			m.rotationDue = 0
 			m.mu.Unlock()
 		}
 
@@ -905,6 +931,10 @@ func (m *Manager) expiredChairs(snapshot Snapshot, holderTarget int, now time.Ti
 func (m *Manager) setHeld(chair Chair) {
 	m.mu.Lock()
 	chairCopy := chair
+	if m.held == nil || m.held.ID != chair.ID || m.held.Generation != chair.Generation {
+		m.rotationDue = 0
+	}
+
 	m.held = &chairCopy
 	m.reserved = nil
 	m.knownFull = false

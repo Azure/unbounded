@@ -404,6 +404,108 @@ func TestManagerPlansAndCompletesRotation(t *testing.T) {
 	}
 }
 
+func TestPendingRotationRenewsLeaseAndRetriesHandoff(t *testing.T) {
+	clock := time.Unix(0, int64(55*time.Minute))
+	holderID := "holder"
+	durationSeconds := int32(60)
+	generation := int32(3)
+	renewTime := metav1.NewMicroTime(clock)
+	lease := &coordinationv1.Lease{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        ID(4).Name(),
+			Namespace:   "gantry-system",
+			Labels:      map[string]string{LabelChair: "true"},
+			Annotations: map[string]string{AnnotationEpoch: "0"},
+		},
+		Spec: coordinationv1.LeaseSpec{
+			HolderIdentity:       &holderID,
+			LeaseDurationSeconds: &durationSeconds,
+			LeaseTransitions:     &generation,
+			RenewTime:            &renewTime,
+		},
+	}
+	client := fake.NewClientset(lease)
+	failRotate := false
+
+	client.PrependReactor("update", "leases", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		update := action.(k8stesting.UpdateAction).GetObject().(*coordinationv1.Lease)
+		if failRotate && update.Spec.HolderIdentity != nil && *update.Spec.HolderIdentity == "next" {
+			return true, nil, fmt.Errorf("transient rotate failure")
+		}
+
+		return false, nil, nil
+	})
+
+	store := NewStore(client.CoordinationV1().Leases("gantry-system"))
+	next := Holder{PeerID: "next", P2PAddrs: []string{"/ip4/10.0.0.2/tcp/4001/p2p/next"}, TransferAddr: "10.0.0.2:5001"}
+	manager := NewManager(ManagerOptions{
+		Store:          store,
+		Self:           Holder{PeerID: "holder"},
+		Rotation:       &rotationStub{endpoint: next},
+		Candidates:     func() []Holder { return []Holder{next} },
+		Now:            func() time.Time { return clock },
+		LeaseDuration:  time.Minute,
+		RotationPeriod: time.Hour,
+		RotationLead:   10 * time.Minute,
+	})
+
+	held, err := store.Get(context.Background(), 4)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	manager.setHeld(held)
+	manager.prepareRotation(context.Background(), held)
+
+	failRotate = true
+	clock = time.Unix(0, int64(time.Hour))
+
+	// The lease already lapsed at the boundary; the failed rotation must renew
+	// it instead of leaving the chair expired.
+	manager.maintain(context.Background())
+
+	renewed, err := store.Get(context.Background(), 4)
+	if err != nil {
+		t.Fatalf("Get renewed: %v", err)
+	}
+
+	if !renewed.RenewTime.Equal(clock) || renewed.Expired(clock) {
+		t.Fatalf("renewed chair renew time = %s, expired = %t; want renewal at %s", renewed.RenewTime, renewed.Expired(clock), clock)
+	}
+
+	if renewed.Holder.PeerID != "holder" || renewed.NextHolder.PeerID != "next" {
+		t.Fatalf("renewed chair = %+v; want holder with pending successor", renewed)
+	}
+
+	epoch := CurrentEpoch(clock, time.Hour)
+	if !manager.ValidateChair(context.Background(), ifaces.ChairAssignment{ChairID: 4, Generation: 3, AssignmentEpoch: epoch}) {
+		t.Fatal("chair is not valid after a failed rotation")
+	}
+
+	clock = clock.Add(45 * time.Second)
+
+	if !manager.ValidateChair(context.Background(), ifaces.ChairAssignment{ChairID: 4, Generation: 3, AssignmentEpoch: epoch}) {
+		t.Fatal("chair is not valid past the original renewal window")
+	}
+
+	failRotate = false
+
+	manager.maintain(context.Background())
+
+	rotated, err := store.Get(context.Background(), 4)
+	if err != nil {
+		t.Fatalf("Get rotated: %v", err)
+	}
+
+	if rotated.Holder.PeerID != "next" || rotated.Generation != 4 || rotated.AssignmentEpoch != epoch {
+		t.Fatalf("rotated chair = %+v", rotated)
+	}
+
+	if _, ok := manager.Held(); ok {
+		t.Fatal("old holder still considers itself active after rotation")
+	}
+}
+
 func TestSuccessorWaitsForHolderRotation(t *testing.T) {
 	clock := time.Unix(0, int64(55*time.Minute))
 	holderID := "holder"
