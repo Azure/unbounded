@@ -88,7 +88,7 @@ func collectDiskInfo(ctx context.Context, hostID string, debug bool) ([]DeviceRe
 		disk.Type = detectDiskType(name, base)
 		disk.BlockSize = readSysfsField(filepath.Join(base, "queue", "physical_block_size"))
 		disk.Speed = readLinkSpeed(name, base)
-		disk.SerialNumber = readDiskSerial(name)
+		disk.SerialNumber = readDiskSerial(ctx, name)
 		disk.Firmware = readDiskFirmware(name)
 		disk.Driver, disk.DriverVersion = readDiskDriver(ctx, name, base)
 
@@ -201,8 +201,8 @@ func readLinkSpeed(name, base string) string {
 // invokes ata_id or scsi_id as needed (issuing ATA IDENTIFY DEVICE or
 // SCSI INQUIRY VPD page commands) and also reads sysfs attributes for
 // NVMe and virtio devices, so it covers all device types in one call.
-func readDiskSerial(name string) string {
-	out, err := exec.Command("udevadm", "info", "--query=property", "--name="+name).Output()
+func readDiskSerial(ctx context.Context, name string) string {
+	out, err := exec.CommandContext(ctx, "udevadm", "info", "--query=property", "--name="+name).Output()
 	if err != nil {
 		return ""
 	}
