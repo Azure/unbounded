@@ -158,6 +158,12 @@ func (p *puller) rangeRotation(size int64) int64 {
 	_, _ = h.Write([]byte(name)) //nolint:errcheck // hash.Hash never fails.
 
 	ranges := (size + p.opts.RangeBytes - 1) / p.opts.RangeBytes
+	// A zero-size object has no range count to rotate across, and a single
+	// range always starts at 0; return before the modulo by zero.
+	if ranges <= 1 {
+		return 0
+	}
+
 	if p.opts.RangeCohorts > 1 {
 		// Nodes in one cohort start together; cohorts start evenly apart.
 		cohort := int64(h.Sum64() % uint64(p.opts.RangeCohorts))
