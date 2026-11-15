@@ -48,7 +48,7 @@ func applyBootstrapToken(ctx context.Context, logger *slog.Logger, kubeCli kuber
 		return nil, fmt.Errorf("create directory for bootstrap token manifest: %w", err)
 	}
 
-	if err := os.WriteFile(bootstrapTokenPath, []byte(bootstrapTokenManifest), 0o644); err != nil {
+	if err := writeBootstrapTokenManifest(bootstrapTokenPath, []byte(bootstrapTokenManifest)); err != nil {
 		return nil, fmt.Errorf("write bootstrap token manifest: %w", err)
 	}
 
@@ -59,6 +59,18 @@ func applyBootstrapToken(ctx context.Context, logger *slog.Logger, kubeCli kuber
 	}
 
 	return &kube.BootstrapToken{ID: id, Secret: token}, nil
+}
+
+// writeBootstrapTokenManifest writes the bootstrap token manifest with
+// owner-only permissions. The manifest holds a cluster-join credential, and
+// os.WriteFile does not tighten the mode of a file that already exists, so the
+// mode is also applied explicitly.
+func writeBootstrapTokenManifest(path string, data []byte) error {
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return err
+	}
+
+	return os.Chmod(path, 0o600)
 }
 
 type DataDir struct {
