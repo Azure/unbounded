@@ -8,6 +8,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"os"
@@ -151,79 +152,94 @@ func main() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	// Stats
-	var (
-		sent, received           int
-		minRTT, maxRTT, totalRTT time.Duration
-		rttSamples               []float64
-	)
-
-	minRTT = time.Duration(math.MaxInt64)
-
 	// Reply receiver goroutine
 	replyCh := make(chan replyResult, 16)
 	go receiveReplies(ctx, conn, replyCh)
 
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	// Send first probe immediately
-	sendAndPrint := func(seq uint64) {
-		sent++
-
-		sendProbe(conn, remoteAddr, srcHostname, dstHostname, seq)
-
-		select {
-		case reply := <-replyCh:
-			if reply.err != nil {
-				fmt.Printf("From %s: seq=%d error: %v\n", targetIP, seq, reply.err)
-			} else {
-				received++
-
-				rtt := reply.rtt
-				if rtt < minRTT {
-					minRTT = rtt
-				}
-
-				if rtt > maxRTT {
-					maxRTT = rtt
-				}
-
-				totalRTT += rtt
-				rttSamples = append(rttSamples, float64(rtt.Microseconds()))
-				fmt.Printf("Reply from %s: seq=%d time=%.3f ms\n",
-					targetIP, seq, float64(rtt.Microseconds())/1000.0)
-			}
-		case <-time.After(timeout):
-			fmt.Printf("Request timeout for seq %d\n", seq)
-		case <-ctx.Done():
-			return
-		}
-	}
-
-	var seq uint64
-
-	seq++
-	sendAndPrint(seq)
-
-	for {
+	// Stop probing as soon as the user asks us to.
+	go func() {
 		select {
 		case <-sigCh:
 			cancel()
-			printStats(dstHostname, targetIP.String(), sent, received, minRTT, maxRTT, totalRTT, rttSamples)
-			os.Exit(0)
-		case <-ticker.C:
-			seq++
-			sendAndPrint(seq)
-
-			if count > 0 && int(seq) >= count {
-				printStats(dstHostname, targetIP.String(), sent, received, minRTT, maxRTT, totalRTT, rttSamples)
-				os.Exit(0)
-			}
 		case <-ctx.Done():
-			return
+		}
+	}()
+
+	stats := runProbes(ctx, count, interval, timeout, func(seq uint64) {
+		sendProbe(conn, remoteAddr, srcHostname, dstHostname, seq)
+	}, replyCh, targetIP, os.Stdout)
+
+	printStats(dstHostname, targetIP.String(), stats.sent, stats.received, stats.minRTT, stats.maxRTT, stats.totalRTT, stats.rttSamples)
+	os.Exit(0)
+}
+
+// probeStats accumulates the outcome of the probes sent by runProbes.
+type probeStats struct {
+	sent, received           int
+	minRTT, maxRTT, totalRTT time.Duration
+	rttSamples               []float64
+}
+
+func (s *probeStats) record(rtt time.Duration) {
+	s.received++
+
+	if rtt < s.minRTT {
+		s.minRTT = rtt
+	}
+
+	if rtt > s.maxRTT {
+		s.maxRTT = rtt
+	}
+
+	s.totalRTT += rtt
+	s.rttSamples = append(s.rttSamples, float64(rtt.Microseconds()))
+}
+
+// runProbes sends exactly count probes spaced by interval, waiting up to timeout
+// for each reply, and returns once the last one has been answered or has timed
+// out. A count of zero or less keeps probing until ctx is canceled. Sequence
+// numbers start at 1, so the last sequence number always equals the number of
+// probes transmitted.
+func runProbes(ctx context.Context, count int, interval, timeout time.Duration, send func(seq uint64), replies <-chan replyResult, targetIP net.IP, out io.Writer) probeStats {
+	stats := probeStats{minRTT: time.Duration(math.MaxInt64)}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	var seq uint64
+
+	for count <= 0 || seq < uint64(count) {
+		// The first probe goes out immediately, the rest on each tick.
+		if seq > 0 {
+			select {
+			case <-ctx.Done():
+				return stats
+			case <-ticker.C:
+			}
+		}
+
+		seq++
+		stats.sent++
+
+		send(seq)
+
+		select {
+		case reply := <-replies:
+			if reply.err != nil {
+				fmt.Fprintf(out, "From %s: seq=%d error: %v\n", targetIP, seq, reply.err)
+			} else {
+				stats.record(reply.rtt)
+				fmt.Fprintf(out, "Reply from %s: seq=%d time=%.3f ms\n",
+					targetIP, seq, float64(reply.rtt.Microseconds())/1000.0)
+			}
+		case <-time.After(timeout):
+			fmt.Fprintf(out, "Request timeout for seq %d\n", seq)
+		case <-ctx.Done():
+			return stats
 		}
 	}
+
+	return stats
 }
 
 type replyResult struct {
