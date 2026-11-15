@@ -298,6 +298,96 @@ func TestCrictlArchive(t *testing.T) {
 	}
 }
 
+func TestDownloadSourceURLIsNotAFormatString(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		got  func() string
+		want string
+	}{
+		{
+			name: "percent encoding is preserved around placeholders",
+			got: func() string {
+				return KubernetesBinary(
+					&goalstates.DownloadSource{URL: "https://mirror.example.com/pre%20fix/k8s/%s/%s/%s?token=a%2Fb%25c"},
+					"1.33.5", "amd64", "kubelet",
+				)
+			},
+			want: "https://mirror.example.com/pre%20fix/k8s/1.33.5/amd64/kubelet?token=a%2Fb%25c",
+		},
+		{
+			name: "template without placeholders is returned verbatim",
+			got: func() string {
+				return ContainerdArchive(
+					&goalstates.DownloadSource{URL: "https://mirror.example.com/containerd%202.0.4-linux-amd64.tar.gz"},
+					"2.0.4", "amd64",
+				)
+			},
+			want: "https://mirror.example.com/containerd%202.0.4-linux-amd64.tar.gz",
+		},
+		{
+			name: "double percent is preserved and not scanned for a placeholder",
+			got: func() string {
+				return RuncBinary(
+					&goalstates.DownloadSource{URL: "https://mirror.example.com/100%%/%s/runc.%s"},
+					"1.1.12", "amd64",
+				)
+			},
+			want: "https://mirror.example.com/100%%/1.1.12/runc.amd64",
+		},
+		{
+			name: "template with fewer placeholders than arguments ignores extra arguments",
+			got: func() string {
+				return CNIPluginsArchive(
+					&goalstates.DownloadSource{URL: "https://mirror.example.com/cni/%s.tgz"},
+					"1.5.1", "amd64",
+				)
+			},
+			want: "https://mirror.example.com/cni/1.5.1.tgz",
+		},
+		{
+			name: "template with more placeholders than arguments leaves the rest literal",
+			got: func() string {
+				return CrictlArchive(
+					&goalstates.DownloadSource{URL: "https://mirror.example.com/crictl/%s/%s/%s/%s/%s/%s"},
+					"1.30.4", "linux", "amd64",
+				)
+			},
+			want: "https://mirror.example.com/crictl/1.30.4/1.30.4/linux/amd64/%s/%s",
+		},
+		{
+			name: "truncated percent sequence is preserved",
+			got: func() string {
+				return CoreDNSArchive(
+					&goalstates.DownloadSource{URL: "https://mirror.example.com/coredns/%s/100%"},
+					"1.12.3", "amd64",
+				)
+			},
+			want: "https://mirror.example.com/coredns/1.12.3/100%",
+		},
+		{
+			name: "base url percent encoding is preserved",
+			got: func() string {
+				return KubernetesBinary(
+					&goalstates.DownloadSource{BaseURL: "https://mirror.example.com/k8s%20mirror/"},
+					"1.33.5", "amd64", "kubelet",
+				)
+			},
+			want: "https://mirror.example.com/k8s%20mirror/v1.33.5/bin/linux/amd64/kubelet",
+		},
+	}
+
+	for i := range tests {
+		testCase := tests[i]
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			require.Equal(t, testCase.want, testCase.got())
+		})
+	}
+}
+
 func TestCrictlVersionForKubernetesVersion(t *testing.T) {
 	t.Parallel()
 

@@ -47,11 +47,56 @@ func DefaultContainerImages(kubernetesVersion string) []string {
 	})
 }
 
+// expandURLTemplate substitutes each "%s" in an operator supplied URL template
+// with the next argument, in order. The template is data, not a format string:
+// all other percent sequences, such as "%20" or a literal "%%", pass through
+// unchanged. A "%%" pair is treated as literal text and is never scanned for a
+// placeholder. Placeholders without a matching argument are left as literal
+// "%s" text, and extra arguments are ignored, so a malformed template yields a
+// predictable URL instead of formatting error markers like "%!s(MISSING)".
+func expandURLTemplate(template string, args ...string) string {
+	var builder strings.Builder
+
+	builder.Grow(len(template))
+
+	next := 0
+
+	for i := 0; i < len(template); i++ {
+		if template[i] != '%' {
+			builder.WriteByte(template[i])
+
+			continue
+		}
+
+		if i+1 < len(template) && template[i+1] == '%' {
+			builder.WriteString("%%")
+
+			i++
+
+			continue
+		}
+
+		if i+1 < len(template) && template[i+1] == 's' && next < len(args) {
+			builder.WriteString(args[next])
+
+			next++
+
+			i++
+
+			continue
+		}
+
+		builder.WriteByte(template[i])
+	}
+
+	return builder.String()
+}
+
 // KubernetesBinary resolves the download URL for a Kubernetes binary
 // (kubelet, kubectl, kube-proxy) honoring the optional override.
 func KubernetesBinary(override *goalstates.DownloadSource, version, arch, binary string) string {
 	if override != nil && override.URL != "" {
-		return fmt.Sprintf(override.URL, version, arch, binary)
+		return expandURLTemplate(override.URL, version, arch, binary)
 	}
 
 	base := KubernetesDefaultBaseURL
@@ -68,7 +113,7 @@ func KubernetesBinary(override *goalstates.DownloadSource, version, arch, binary
 // under the same structure.
 func ContainerdArchive(override *goalstates.DownloadSource, version, arch string) string {
 	if override != nil && override.URL != "" {
-		return fmt.Sprintf(override.URL, version, version, arch)
+		return expandURLTemplate(override.URL, version, version, arch)
 	}
 
 	version = bootstrapartifacts.StripLeadingV(version)
@@ -85,7 +130,7 @@ func ContainerdArchive(override *goalstates.DownloadSource, version, arch string
 // The upstream filename (runc.<arch>) is preserved.
 func RuncBinary(override *goalstates.DownloadSource, version, arch string) string {
 	if override != nil && override.URL != "" {
-		return fmt.Sprintf(override.URL, version, arch)
+		return expandURLTemplate(override.URL, version, arch)
 	}
 
 	version = bootstrapartifacts.StripLeadingV(version)
@@ -102,7 +147,7 @@ func RuncBinary(override *goalstates.DownloadSource, version, arch string) strin
 // override. Mirrors must publish under <base>/v<ver>/<asset>.
 func CNIPluginsArchive(override *goalstates.DownloadSource, version, arch string) string {
 	if override != nil && override.URL != "" {
-		return fmt.Sprintf(override.URL, version, arch, version)
+		return expandURLTemplate(override.URL, version, arch, version)
 	}
 
 	version = bootstrapartifacts.StripLeadingV(version)
@@ -120,7 +165,7 @@ func CNIPluginsArchive(override *goalstates.DownloadSource, version, arch string
 // <base>/v<ver>/<asset> layout as GitHub releases.
 func CrictlArchive(override *goalstates.DownloadSource, version, hostOS, hostArch string) string {
 	if override != nil && override.URL != "" {
-		return fmt.Sprintf(override.URL, version, version, hostOS, hostArch)
+		return expandURLTemplate(override.URL, version, version, hostOS, hostArch)
 	}
 
 	version = bootstrapartifacts.StripLeadingV(version)
@@ -136,7 +181,7 @@ func CrictlArchive(override *goalstates.DownloadSource, version, hostOS, hostArc
 // CoreDNSArchive resolves the CoreDNS release archive URL.
 func CoreDNSArchive(override *goalstates.DownloadSource, version, arch string) string {
 	if override != nil && override.URL != "" {
-		return fmt.Sprintf(override.URL, version, arch)
+		return expandURLTemplate(override.URL, version, arch)
 	}
 
 	version = bootstrapartifacts.StripLeadingV(version)
