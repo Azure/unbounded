@@ -9,6 +9,7 @@ package orca
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -53,6 +54,12 @@ func newServeCmd() *cobra.Command {
 	return cmd
 }
 
+// startApp is a test seam for app.Start. Production leaves it as
+// app.Start; tests replace it to inject fake drivers and pre-bound
+// listeners so serve can be exercised without a live origin or
+// cachestore.
+var startApp = app.Start
+
 func serve(parent context.Context, configPath string) error {
 	cfg, err := config.Load(configPath)
 	if err != nil {
@@ -89,12 +96,13 @@ func serve(parent context.Context, configPath string) error {
 	ctx, cancel := signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	a, err := app.Start(ctx, cfg, app.WithLogger(log))
+	a, err := startApp(ctx, cfg, app.WithLogger(log))
 	if err != nil {
 		return err
 	}
 
-	if waitErr := a.Wait(ctx); waitErr != nil {
+	waitErr := a.Wait(ctx)
+	if waitErr != nil {
 		log.Error("listener exited with error", "err", waitErr)
 		cancel()
 	} else {
@@ -104,15 +112,20 @@ func serve(parent context.Context, configPath string) error {
 	shutdownCtx, shCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shCancel()
 
-	// Propagate Shutdown errors to the process exit code so that
-	// failed-shutdown signals (kubelet probes, init systems) match
-	// reality. App.Shutdown also logs each individual error
-	// internally, so this only governs the exit-code semantics.
+	// Propagate listener and Shutdown errors to the process exit code
+	// so that failed-shutdown signals (kubelet probes, init systems)
+	// match reality. A listener that died on its own (for example
+	// after fd exhaustion) must not be masked by a clean Shutdown:
+	// without waitErr the process would exit 0 and a Deployment would
+	// record a successful exit for a crashed server. App.Shutdown also
+	// logs each individual error internally, so this only governs the
+	// exit-code semantics. errors.Join keeps a plain cancellation
+	// with a clean shutdown returning nil.
 	shutdownErr := a.Shutdown(shutdownCtx)
 
 	log.Info("orca stopped")
 
-	return shutdownErr
+	return errors.Join(waitErr, shutdownErr)
 }
 
 // resolveLogLevel determines the effective slog.Level by consulting
