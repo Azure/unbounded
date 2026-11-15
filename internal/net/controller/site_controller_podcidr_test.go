@@ -738,6 +738,102 @@ func TestSeedAllocatorsMarksPendingPodCIDRs(t *testing.T) {
 	}
 }
 
+func TestAssignmentPoolChangesRebuildAllocator(t *testing.T) {
+	siteWithBlocks := func(blocks ...string) *unboundedv1alpha3.Site {
+		site := &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "site-a"}}
+		for _, block := range blocks {
+			site.Spec.PodCidrAssignments = append(site.Spec.PodCidrAssignments, unboundednetv1alpha1.PodCidrAssignment{
+				CidrBlocks: []string{block},
+			})
+		}
+
+		return site
+	}
+
+	t.Run("changed-cidr-blocks", func(t *testing.T) {
+		h := newPodCIDRTestHarness(t, liveNodeWithRV("4"))
+		previous := h.state
+		previous.allocator.MarkAllocated("10.244.0.0/24")
+
+		h.sc.updateAssignmentAllocators([]unboundedv1alpha3.Site{*siteWithBlocks("10.250.0.0/16")})
+
+		state := h.sc.getAssignmentAllocator("site-a", 0)
+		if state == nil {
+			t.Fatal("changed cidrBlocks retired the allocator")
+		}
+		if state == previous {
+			t.Fatal("changed cidrBlocks kept the allocator bound to the old pool")
+		}
+		if !state.allocator.IsAllocated("10.244.0.0/24") {
+			t.Fatal("existing allocation was not re-marked on the rebuilt allocator")
+		}
+
+		cidr, _, err := h.sc.computePodCIDRsForNode(state)
+		if err != nil {
+			t.Fatalf("computePodCIDRsForNode: %v", err)
+		}
+		if cidr != "10.250.0.0/24" {
+			t.Fatalf("allocated %s, want a CIDR inside the new block 10.250.0.0/16", cidr)
+		}
+	})
+
+	t.Run("reordered-cidr-blocks", func(t *testing.T) {
+		h := newPodCIDRTestHarness(t, liveNodeWithRV("4"))
+
+		h.sc.updateAssignmentAllocators([]unboundedv1alpha3.Site{*siteWithBlocks("10.244.0.0/16", "10.250.0.0/16")})
+		h.sc.updateAssignmentAllocators([]unboundedv1alpha3.Site{*siteWithBlocks("10.250.0.0/16", "10.244.0.0/16")})
+
+		for _, tc := range []struct {
+			index int
+			want  string
+		}{
+			{index: 0, want: "10.250.0.0/24"},
+			{index: 1, want: "10.244.0.0/24"},
+		} {
+			state := h.sc.getAssignmentAllocator("site-a", tc.index)
+			if state == nil {
+				t.Fatalf("assignment %d has no allocator after reorder", tc.index)
+			}
+
+			cidr, _, err := h.sc.computePodCIDRsForNode(state)
+			if err != nil {
+				t.Fatalf("computePodCIDRsForNode for assignment %d: %v", tc.index, err)
+			}
+			if cidr != tc.want {
+				t.Fatalf("assignment %d allocated %s, want %s from its reordered block", tc.index, cidr, tc.want)
+			}
+		}
+	})
+
+	t.Run("removed-cidr-block", func(t *testing.T) {
+		h := newPodCIDRTestHarness(t, liveNodeWithRV("4"))
+
+		h.sc.updateAssignmentAllocators([]unboundedv1alpha3.Site{*siteWithBlocks("10.244.0.0/16", "10.250.0.0/16")})
+		if h.sc.getAssignmentAllocator("site-a", 1) == nil {
+			t.Fatal("second assignment allocator was not created")
+		}
+
+		h.sc.updateAssignmentAllocators([]unboundedv1alpha3.Site{*siteWithBlocks("10.244.0.0/16")})
+
+		if h.sc.getAssignmentAllocator("site-a", 1) != nil {
+			t.Fatal("allocator for the removed assignment is still served")
+		}
+
+		state := h.sc.getAssignmentAllocator("site-a", 0)
+		if state == nil {
+			t.Fatal("surviving assignment lost its allocator")
+		}
+
+		cidr, _, err := h.sc.computePodCIDRsForNode(state)
+		if err != nil {
+			t.Fatalf("computePodCIDRsForNode: %v", err)
+		}
+		if cidr != "10.244.0.0/24" {
+			t.Fatalf("allocated %s, want a CIDR inside the surviving block 10.244.0.0/16", cidr)
+		}
+	})
+}
+
 type inspectingNodeLister struct {
 	corev1listers.NodeLister
 	beforeList func()

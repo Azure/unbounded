@@ -570,6 +570,21 @@ func assignmentMatchConfigEqual(a, b unboundednetv1alpha1.PodCidrAssignment) boo
 	return assignmentPriority(a.Priority) == assignmentPriority(b.Priority)
 }
 
+// assignmentPoolConfigEqual reports whether two assignments define the same
+// allocation pools. An allocator's pools and block sizes are fixed at
+// construction, so a difference here requires a replacement allocator.
+func assignmentPoolConfigEqual(a, b unboundednetv1alpha1.PodCidrAssignment) bool {
+	if !stringSlicesEqual(a.CidrBlocks, b.CidrBlocks) {
+		return false
+	}
+
+	if a.NodeBlockSizes == nil || b.NodeBlockSizes == nil {
+		return a.NodeBlockSizes == nil && b.NodeBlockSizes == nil
+	}
+
+	return *a.NodeBlockSizes == *b.NodeBlockSizes
+}
+
 func (sc *SiteController) collectEnabledAssignments(sites []unboundedv1alpha3.Site) []assignmentRef {
 	enabled := make([]assignmentRef, 0)
 
@@ -636,8 +651,25 @@ func (sc *SiteController) updateAssignmentAllocatorsLocked(sites []unboundedv1al
 			continue
 		}
 
+		// An allocator's pools and block sizes are fixed at construction, so a
+		// change to the pool-defining fields requires a replacement allocator.
+		// The replacement is seeded like a new allocator, which re-marks the
+		// CIDRs already held by Nodes and pending reservations.
+		if !assignmentPoolConfigEqual(existing.assignment, ref.assignment) {
+			state, err := sc.buildAssignmentAllocator(ref)
+			if err != nil {
+				klog.Errorf("Failed to rebuild allocator for site %s assignment %d: %v", ref.site.Name, ref.index, err)
+				continue
+			}
+
+			newAllocators[key] = state
+
+			continue
+		}
+
 		// Allocator exists -- update match config (regex/priority) in place.
-		// Never replace the allocator; its allocated map is the source of truth.
+		// Never replace the allocator for match-only changes; its allocated map
+		// is the source of truth.
 		if !assignmentMatchConfigEqual(existing.assignment, ref.assignment) {
 			nodeRegexes, err := compileNodeRegexes(ref.assignment.NodeRegex)
 			if err != nil {
@@ -663,7 +695,7 @@ func (sc *SiteController) updateAssignmentAllocatorsLocked(sites []unboundedv1al
 
 	for key, state := range newAllocators {
 		sc.assignmentAllocators[key] = state
-		klog.Infof("Assignment allocator %s: created and seeded", key)
+		klog.Infof("Assignment allocator %s: created or rebuilt and seeded", key)
 	}
 }
 
