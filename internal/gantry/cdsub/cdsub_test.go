@@ -304,6 +304,72 @@ func TestRun_ChannelCloseTriggersReconnect(t *testing.T) {
 	}
 }
 
+func TestRun_CleanCloseIsBackedOff(t *testing.T) {
+	src := &fakeSource{}
+	dht := fakes.NewDHT()
+
+	var (
+		mu    sync.Mutex
+		calls []time.Time
+	)
+
+	src.subscribeFn = func(_ context.Context) (<-chan ImageEvent, error) {
+		mu.Lock()
+		calls = append(calls, time.Now())
+		mu.Unlock()
+
+		c := make(chan ImageEvent)
+		close(c) // clean close, no error: the fast-reconnect path
+
+		return c, nil
+	}
+
+	sub := New(src, dht, WithBackoff(20*time.Millisecond, 80*time.Millisecond))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	done := make(chan error, 1)
+
+	go func() { done <- sub.Run(ctx) }()
+
+	// Four attempts are enough to observe two backoff steps: back to back
+	// reconnects finish in microseconds, backoff spacing needs >= 100ms.
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		n := len(calls)
+		mu.Unlock()
+
+		if n >= 4 {
+			break
+		}
+
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	cancel()
+
+	if err := <-done; err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Run returned %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(calls) < 4 {
+		t.Fatalf("subscribe calls = %d, want >= 4", len(calls))
+	}
+
+	// Lower bounds track the 20ms -> 40ms -> 80ms progression, allowing
+	// for the -25% jitter floor.
+	for i, min := range []time.Duration{14 * time.Millisecond, 29 * time.Millisecond, 58 * time.Millisecond} {
+		if gap := calls[i+1].Sub(calls[i]); gap < min {
+			t.Errorf("gap %d = %v, want >= %v (backoff not applied)", i, gap, min)
+		}
+	}
+}
+
 func TestRun_ListErrorIsBackedOff(t *testing.T) {
 	listErr := errors.New("containerd unreachable")
 	src := &fakeSource{

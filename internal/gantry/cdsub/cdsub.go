@@ -187,19 +187,31 @@ func (s *Subscriber) Run(ctx context.Context) error {
 			return err
 		}
 
-		if err := s.runOnce(ctx); err != nil {
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return err
-			}
+		start := time.Now()
 
+		err := s.runOnce(ctx)
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return err
+		}
+
+		if err != nil {
 			s.logger.Warn("cdsub: stream lost, backing off",
 				slog.Duration("backoff", backoff),
 				slog.Any("err", err),
 			)
 		} else {
-			// Channel closed without error -> just reconnect with reset backoff.
+			// A clean channel close is a disconnect too: ContainerdSource
+			// closes the stream on any events-stream error, so back off
+			// instead of reconnecting in a tight List+Subscribe loop.
+			s.logger.Debug("cdsub: stream closed, backing off",
+				slog.Duration("backoff", backoff),
+			)
+		}
+
+		// A stream that outlived the maximum backoff was healthy, so give
+		// the next reconnect a fresh budget. Immediate closes keep growing.
+		if time.Since(start) >= s.backoffMax {
 			backoff = s.backoffInitial
-			continue
 		}
 
 		// Jittered sleep.
