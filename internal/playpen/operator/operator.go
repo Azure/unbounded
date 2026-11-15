@@ -743,7 +743,7 @@ func (o *Operator) reconcileRunnerPool(ctx context.Context, pods []corev1.Pod) e
 			usedHostPorts[hostPort] = struct{}{}
 		}
 
-		if pod.DeletionTimestamp.IsZero() && pod.Annotations[AnnotationIdempotencyKeyHash] == "" && hostPort != 0 {
+		if hostPort != 0 && idlePoolPod(pod) {
 			idleCounts[podArchitecture(pod)]++
 		}
 	}
@@ -809,7 +809,7 @@ func (o *Operator) reconcileControlPlanePool(ctx context.Context, pods []corev1.
 			usedHostPorts[hostPort] = struct{}{}
 		}
 
-		if pod.DeletionTimestamp.IsZero() && pod.Annotations[AnnotationIdempotencyKeyHash] == "" && hostPort != 0 {
+		if hostPort != 0 && idlePoolPod(pod) {
 			idleCounts[podKubernetesVersion(pod)]++
 		}
 	}
@@ -1450,6 +1450,21 @@ func isManagedPlaypenPod(pod *corev1.Pod) bool {
 	default:
 		return false
 	}
+}
+
+// idlePoolPod reports whether Alloc could hand this pod out right now. Reconcile counts
+// only these pods toward the target, so a pod that is still starting or failing is
+// replaced instead of being treated as idle capacity.
+func idlePoolPod(pod *corev1.Pod) bool {
+	if !pod.DeletionTimestamp.IsZero() {
+		return false
+	}
+
+	if pod.Annotations[AnnotationIdempotencyKeyHash] != "" {
+		return false
+	}
+
+	return runnerPodUnavailableReason(pod) == ""
 }
 
 func runnerPodUnavailableReason(pod *corev1.Pod) string {

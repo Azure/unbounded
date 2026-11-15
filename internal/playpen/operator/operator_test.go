@@ -956,6 +956,84 @@ func TestReconcileReportsNoFreeRunnerHostPorts(t *testing.T) {
 	}
 }
 
+func TestReconcileCountsOnlyAllocatableRunnerPods(t *testing.T) {
+	pending := testPodWithHostPort("pending-runner", "node-1", 52000)
+	pending.Status = corev1.PodStatus{Phase: corev1.PodPending}
+
+	crashLooping := testPodWithHostPort("crash-looping-runner", "node-1", 52000)
+	crashLooping.Status.ContainerStatuses[0].Ready = false
+	crashLooping.Status.ContainerStatuses[0].State = corev1.ContainerState{
+		Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"},
+	}
+
+	ready := testPodWithHostPort("ready-runner", "node-1", 52000)
+
+	claimed := testPodWithHostPort("claimed-runner", "node-1", 52000)
+	claimed.Annotations[AnnotationIdempotencyKeyHash] = hashString("claim")
+	claimed.Annotations[AnnotationRequestHash] = hashString("request")
+	claimed.Annotations[AnnotationClaimedAt] = time.Now().UTC().Format(time.RFC3339)
+
+	tests := []struct {
+		name     string
+		pod      *corev1.Pod
+		wantPods int
+	}{
+		{name: "pending", pod: pending, wantPods: 2},
+		{name: "crash looping", pod: crashLooping, wantPods: 2},
+		{name: "ready", pod: ready, wantPods: 1},
+		{name: "claimed", pod: claimed, wantPods: 2},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			op := testOperator(t, test.pod)
+			op.Config.RunnerAMD64Count = 1
+			op.Config.RunnerARM64Count = 0
+			op.Config.RunnerWireGuardHostPortStart = 52000
+			op.Config.RunnerWireGuardHostPortEnd = 52001
+
+			if err := op.ReconcileRunners(t.Context()); err != nil {
+				t.Fatalf("reconcile: %v", err)
+			}
+
+			pods := &corev1.PodList{}
+			if err := op.Client.List(t.Context(), pods, client.InNamespace("playpen"), client.MatchingLabels{"app.kubernetes.io/name": runnerAppName}); err != nil {
+				t.Fatal(err)
+			}
+
+			if len(pods.Items) != test.wantPods {
+				t.Fatalf("pods = %d, want %d", len(pods.Items), test.wantPods)
+			}
+		})
+	}
+}
+
+func TestReconcileReplacesPendingIdleControlPlanePod(t *testing.T) {
+	pending := testControlPlanePod("pending-control-plane", "node-1", "v1.33.0", 16443)
+	pending.Status = corev1.PodStatus{Phase: corev1.PodPending}
+
+	op := testOperator(t, pending)
+	op.Config.RunnerAMD64Count = 0
+	op.Config.RunnerARM64Count = 0
+	op.Config.ControlPlaneCount = 1
+	op.Config.ControlPlaneVersions = []string{"v1.33.0"}
+	op.Config.ControlPlaneAPIServerHostPortStart = 16443
+	op.Config.ControlPlaneAPIServerHostPortEnd = 16444
+
+	if err := op.ReconcileRunners(t.Context()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	pods := &corev1.PodList{}
+	if err := op.Client.List(t.Context(), pods, client.InNamespace("playpen"), client.MatchingLabels{"app.kubernetes.io/name": controlPlaneAppName}); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(pods.Items) != 2 {
+		t.Fatalf("pods = %d, want 2", len(pods.Items))
+	}
+}
+
 func TestReconcileCreatesIdleControlPlanePodsPerVersion(t *testing.T) {
 	op := testOperator(t)
 	op.Config.RunnerAMD64Count = 0
