@@ -164,6 +164,7 @@ func TestMachineConfigurationBindingReconciler_SetsPendingWhenNoMatch(t *testing
 	var updated unboundedv1alpha3.Machine
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "machine-a"}, &updated))
 	require.Nil(t, updated.Spec.ConfigurationRef)
+	require.Equal(t, unboundedv1alpha3.MachinePhasePending, updated.Status.Phase)
 
 	cond := apimeta.FindStatusCondition(
 		updated.Status.Conditions,
@@ -171,6 +172,52 @@ func TestMachineConfigurationBindingReconciler_SetsPendingWhenNoMatch(t *testing
 	)
 	require.NotNil(t, cond)
 	require.Equal(t, metav1.ConditionTrue, cond.Status)
+
+	// The condition and phase are already settled, so a second reconcile must
+	// not write status again.
+	resourceVersion := updated.ResourceVersion
+
+	_, err = r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKey{Name: "machine-a"}})
+	require.NoError(t, err)
+
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "machine-a"}, &updated))
+	require.Equal(t, resourceVersion, updated.ResourceVersion)
+}
+
+func TestMachineConfigurationBindingReconciler_ReadyMachineStaysReadyWhenNoMatch(t *testing.T) {
+	t.Parallel()
+
+	machine := newTestMachine("machine-a", "10.0.0.1:22", "testuser", defaultKubernetes())
+	machine.Status.Phase = unboundedv1alpha3.MachinePhaseReady
+	machine.Status.Message = "Machine is reachable"
+	c := newConfigurationTestClient(t, machine)
+
+	r := &MachineConfigurationBindingReconciler{Client: c, Scheme: newTestScheme(t)}
+	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKey{Name: "machine-a"}})
+	require.NoError(t, err)
+
+	var updated unboundedv1alpha3.Machine
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "machine-a"}, &updated))
+	require.Equal(t, unboundedv1alpha3.MachinePhaseReady, updated.Status.Phase)
+	require.Equal(t, "Machine is reachable", updated.Status.Message)
+
+	cond := apimeta.FindStatusCondition(
+		updated.Status.Conditions,
+		unboundedv1alpha3.MachineConditionConfigurationPending,
+	)
+	require.NotNil(t, cond)
+	require.Equal(t, metav1.ConditionTrue, cond.Status)
+
+	// A Ready Machine must not be written back into the provisionable Pending
+	// phase, and a settled condition must not produce status writes.
+	resourceVersion := updated.ResourceVersion
+
+	_, err = r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKey{Name: "machine-a"}})
+	require.NoError(t, err)
+
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "machine-a"}, &updated))
+	require.Equal(t, unboundedv1alpha3.MachinePhaseReady, updated.Status.Phase)
+	require.Equal(t, resourceVersion, updated.ResourceVersion)
 }
 
 func TestMachineConfigurationBindingReconciler_PinsExplicitLatestVersion(t *testing.T) {

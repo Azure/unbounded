@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"sort"
 
+	"k8s.io/apimachinery/pkg/api/equality"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -215,6 +216,8 @@ func (r *MachineConfigurationBindingReconciler) setConfigurationPending(
 	reason string,
 	message string,
 ) error {
+	originalStatus := machine.Status.DeepCopy()
+
 	apimeta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
 		Type:               unboundedv1alpha3.MachineConditionConfigurationPending,
 		Status:             status,
@@ -223,9 +226,18 @@ func (r *MachineConfigurationBindingReconciler) setConfigurationPending(
 		ObservedGeneration: machine.Generation,
 	})
 
-	if status == metav1.ConditionTrue {
+	// Status.Phase follows the state machine rather than driving it. Only a
+	// Machine that has not started its lifecycle is moved to Pending: writing
+	// Pending over a Provisioning, Joining, Ready, or Failed Machine would put
+	// it back on the provisionable path and re-provision a healthy machine on
+	// every reconcile.
+	if status == metav1.ConditionTrue && machine.Status.Phase == "" {
 		machine.Status.Phase = unboundedv1alpha3.MachinePhasePending
 		machine.Status.Message = message
+	}
+
+	if equality.Semantic.DeepEqual(originalStatus, &machine.Status) {
+		return nil
 	}
 
 	return r.Status().Update(ctx, machine)
