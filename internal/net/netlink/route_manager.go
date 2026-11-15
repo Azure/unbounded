@@ -194,6 +194,70 @@ func (m *UnifiedRouteManager) SetPreferredSourceIPs(ipv4, ipv6 net.IP) {
 	}
 }
 
+// buildDesiredSet builds the desired route set keyed by table:prefix.
+// Multiple DesiredRoute entries with the same prefix are merged into a single
+// route with combined nexthops (ECMP). For Metric and MTU, the minimum value
+// across contributors is used. Encap, Flags, and ScopeGlobal are taken from
+// the first contributor that sets them, so a zero value keeps its meaning of
+// "not set".
+func (m *UnifiedRouteManager) buildDesiredSet(desired []DesiredRoute) map[string]DesiredRoute {
+	desiredSet := make(map[string]DesiredRoute, len(desired))
+
+	for _, dr := range desired {
+		normalized := normalizePrefix(dr.Prefix)
+		key := m.routeKey(dr.Table, normalized)
+
+		if existing, ok := desiredSet[key]; ok {
+			// Merge nexthops from duplicate prefix entries (ECMP).
+			// Only nexthops at the best (lowest) metric are kept. If a new
+			// entry has a lower metric, it replaces all previous nexthops.
+			if dr.Metric > 0 && existing.Metric > 0 && dr.Metric < existing.Metric {
+				// New route has better metric -- replace nexthops entirely
+				existing.Nexthops = dr.Nexthops
+				existing.Metric = dr.Metric
+			} else if dr.Metric == existing.Metric || existing.Metric == 0 || dr.Metric == 0 {
+				// Same metric (or one is unset) -- merge nexthops
+				existing.Nexthops = append(existing.Nexthops, dr.Nexthops...)
+				if dr.Metric > 0 && existing.Metric == 0 {
+					existing.Metric = dr.Metric
+				}
+			}
+			// else: new route has worse metric, skip its nexthops
+			if dr.MTU > 0 && (existing.MTU == 0 || dr.MTU < existing.MTU) {
+				existing.MTU = dr.MTU
+			}
+			// Preserve encap if the new route has one and the existing does not.
+			if dr.Encap != nil && existing.Encap == nil {
+				existing.Encap = dr.Encap
+			}
+			// Carry route flags and scope from the first contributor that
+			// sets them; they describe the whole prefix, not one nexthop.
+			if dr.Flags != 0 && existing.Flags == 0 {
+				existing.Flags = dr.Flags
+			}
+
+			if dr.ScopeGlobal && !existing.ScopeGlobal {
+				existing.ScopeGlobal = dr.ScopeGlobal
+			}
+
+			desiredSet[key] = existing
+		} else {
+			desiredSet[key] = DesiredRoute{
+				Prefix:      normalized,
+				Nexthops:    dr.Nexthops,
+				Metric:      dr.Metric,
+				MTU:         dr.MTU,
+				Table:       dr.Table,
+				Encap:       dr.Encap,
+				Flags:       dr.Flags,
+				ScopeGlobal: dr.ScopeGlobal,
+			}
+		}
+	}
+
+	return desiredSet
+}
+
 // SyncRoutes performs a differential sync of all routes. It ensures nexthop
 // objects are tracked for all referenced peers, then adds/updates/removes
 // kernel routes as needed.
@@ -220,55 +284,13 @@ func (m *UnifiedRouteManager) SyncRoutes(desired []DesiredRoute) error {
 		RoutesInstalled.WithLabelValues(m.linkName).Set(float64(len(m.installedRoutes)))
 	}()
 
-	// Build desired route set keyed by table:prefix.
-	// Multiple DesiredRoute entries with the same prefix are merged into a single
-	// route with combined nexthops (ECMP). For metric and MTU, the minimum
-	// value across contributors is used.
-	desiredSet := make(map[string]DesiredRoute, len(desired))
 	for _, dr := range desired {
-		normalized := normalizePrefix(dr.Prefix)
-
 		for _, nh := range dr.Nexthops {
 			m.ensureNexthop(nh)
 		}
-
-		key := m.routeKey(dr.Table, normalized)
-		if existing, ok := desiredSet[key]; ok {
-			// Merge nexthops from duplicate prefix entries (ECMP).
-			// Only nexthops at the best (lowest) metric are kept. If a new
-			// entry has a lower metric, it replaces all previous nexthops.
-			if dr.Metric > 0 && existing.Metric > 0 && dr.Metric < existing.Metric {
-				// New route has better metric -- replace nexthops entirely
-				existing.Nexthops = dr.Nexthops
-				existing.Metric = dr.Metric
-			} else if dr.Metric == existing.Metric || existing.Metric == 0 || dr.Metric == 0 {
-				// Same metric (or one is unset) -- merge nexthops
-				existing.Nexthops = append(existing.Nexthops, dr.Nexthops...)
-				if dr.Metric > 0 && existing.Metric == 0 {
-					existing.Metric = dr.Metric
-				}
-			}
-			// else: new route has worse metric, skip its nexthops
-			if dr.MTU > 0 && (existing.MTU == 0 || dr.MTU < existing.MTU) {
-				existing.MTU = dr.MTU
-			}
-			// Preserve encap if the new route has one and the existing does not.
-			if dr.Encap != nil && existing.Encap == nil {
-				existing.Encap = dr.Encap
-			}
-
-			desiredSet[key] = existing
-		} else {
-			desiredSet[key] = DesiredRoute{
-				Prefix:   normalized,
-				Nexthops: dr.Nexthops,
-				Metric:   dr.Metric,
-				MTU:      dr.MTU,
-				Table:    dr.Table,
-				Encap:    dr.Encap,
-			}
-		}
 	}
+
+	desiredSet := m.buildDesiredSet(desired)
 
 	// Add or update routes.
 	m.desiredRoutes = m.desiredRoutes[:0]

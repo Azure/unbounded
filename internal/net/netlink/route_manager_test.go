@@ -7,6 +7,9 @@ import (
 	"net"
 	"sort"
 	"testing"
+
+	vishnetlink "github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 )
 
 // ---------------------------------------------------------------------------
@@ -1031,5 +1034,107 @@ func TestBuildInstalledState_DedicatedTable(t *testing.T) {
 	key := m.routeKey(dr.Table, *prefix)
 	if key != "252:10.50.0.0/24" {
 		t.Errorf("routeKey = %s, want 252:10.50.0.0/24", key)
+	}
+}
+
+// TestBuildDesiredSet_CarriesFlagsAndScopeGlobal verifies that the desired-set
+// builder used by SyncRoutes keeps Flags and ScopeGlobal, both when a route is
+// constructed fresh and when duplicate prefix entries are merged, and that
+// buildKernelRoute turns ScopeGlobal into SCOPE_UNIVERSE.
+func TestBuildDesiredSet_CarriesFlagsAndScopeGlobal(t *testing.T) {
+	m := NewUnifiedRouteManager("test", 0, "wg", "unbounded0")
+
+	_, freshPrefix, _ := net.ParseCIDR("10.244.0.0/16")
+	_, mergedPrefix, _ := net.ParseCIDR("10.245.0.0/16")
+	_, plainPrefix, _ := net.ParseCIDR("10.246.0.0/16")
+
+	desired := []DesiredRoute{
+		// Fresh construction path: the first entry for a prefix keeps its
+		// flags and scope.
+		{
+			Prefix:      *freshPrefix,
+			Nexthops:    []DesiredNexthop{{PeerID: "unbounded0", LinkIndex: 41}},
+			Metric:      100,
+			MTU:         1400,
+			Flags:       unix.RTNH_F_ONLINK,
+			ScopeGlobal: true,
+		},
+		// Worse metric, so only its MTU contributes.
+		{
+			Prefix:   *freshPrefix,
+			Nexthops: []DesiredNexthop{{PeerID: "unbounded0", LinkIndex: 42}},
+			Metric:   200,
+			MTU:      1300,
+		},
+		// Merge path: the first entry has no flags or scope, the second
+		// supplies them.
+		{
+			Prefix:   *mergedPrefix,
+			Nexthops: []DesiredNexthop{{PeerID: "unbounded0", LinkIndex: 51}},
+			Metric:   100,
+		},
+		{
+			Prefix:      *mergedPrefix,
+			Nexthops:    []DesiredNexthop{{PeerID: "unbounded0", LinkIndex: 52}},
+			Metric:      200,
+			Flags:       unix.RTNH_F_ONLINK,
+			ScopeGlobal: true,
+		},
+		// A route without flags or scope keeps the zero values.
+		{
+			Prefix:   *plainPrefix,
+			Nexthops: []DesiredNexthop{{PeerID: "unbounded0", LinkIndex: 61}},
+		},
+	}
+
+	desiredSet := m.buildDesiredSet(desired)
+
+	for _, tc := range []struct {
+		name            string
+		prefix          net.IPNet
+		wantScope       vishnetlink.Scope
+		wantFlags       int
+		wantNexthopLink int
+	}{
+		{"fresh", *freshPrefix, vishnetlink.SCOPE_UNIVERSE, unix.RTNH_F_ONLINK, 41},
+		{"merged", *mergedPrefix, vishnetlink.SCOPE_UNIVERSE, unix.RTNH_F_ONLINK, 51},
+		{"plain", *plainPrefix, vishnetlink.SCOPE_LINK, 0, 61},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dr, ok := desiredSet[m.routeKey(0, tc.prefix)]
+			if !ok {
+				t.Fatalf("prefix %s missing from desired set", tc.prefix.String())
+			}
+
+			if len(dr.Nexthops) != 1 {
+				t.Fatalf("nexthops = %d, want 1", len(dr.Nexthops))
+			}
+
+			if dr.Nexthops[0].LinkIndex != tc.wantNexthopLink {
+				t.Errorf("nexthop LinkIndex = %d, want %d", dr.Nexthops[0].LinkIndex, tc.wantNexthopLink)
+			}
+
+			if dr.Flags != tc.wantFlags {
+				t.Errorf("desired Flags = %d, want %d", dr.Flags, tc.wantFlags)
+			}
+
+			route := m.buildKernelRoute(dr, dr.Nexthops)
+			if route == nil {
+				t.Fatal("expected non-nil route")
+			}
+
+			if route.Scope != tc.wantScope {
+				t.Errorf("kernel route scope = %v, want %v", route.Scope, tc.wantScope)
+			}
+
+			if route.Flags != tc.wantFlags {
+				t.Errorf("kernel route Flags = %d, want %d", route.Flags, tc.wantFlags)
+			}
+		})
+	}
+
+	// The merged route keeps the minimum MTU across contributors.
+	if got := desiredSet[m.routeKey(0, *freshPrefix)].MTU; got != 1300 {
+		t.Errorf("merged MTU = %d, want 1300", got)
 	}
 }
