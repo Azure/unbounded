@@ -570,6 +570,14 @@ func (p *MediaProvider) ensureISO(ctx context.Context, o *mediaOwner) (string, e
 		return "", err
 	}
 
+	// A stale entry, such as one whose bootstrap.iso was lost, leaves a
+	// non-empty directory that os.Rename cannot replace. Remove it so the
+	// rename publishes the new ISO and its identity together. The media lock
+	// keeps other callers out, so the entry never looks complete before it is.
+	if err := os.RemoveAll(dir); err != nil {
+		return "", err
+	}
+
 	if err := os.Rename(stage, dir); err != nil {
 		return "", err
 	}

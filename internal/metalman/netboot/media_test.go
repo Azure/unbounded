@@ -1303,6 +1303,67 @@ func TestMediaIdentityAndOldImage(t *testing.T) {
 	})
 }
 
+func TestMediaRebuildAfterISODeleted(t *testing.T) {
+	t.Run("rebuild", func(t *testing.T) {
+		p, m, op := mediaFixture(t, "amd64")
+
+		var calls []string
+
+		p.Run = mockMediaRunner(t, &calls)
+		id := op.Status.Targets[0].BootMedia.ID
+		dir := filepath.Join(p.CacheDir, "bootmedia", id)
+		iso := filepath.Join(dir, "bootstrap.iso")
+
+		_, err := p.Prepare(t.Context(), m, op, id)
+		require.NoError(t, err)
+
+		// The identity file survives a lost ISO, so the cached entry is a
+		// non-empty directory that a publisher must be able to replace.
+		require.NoError(t, os.Remove(iso))
+
+		count := len(calls)
+
+		_, err = p.Prepare(t.Context(), m, op, id)
+		require.NoError(t, err)
+		require.Greater(t, len(calls), count, "a missing ISO must be rebuilt")
+
+		data, err := os.ReadFile(iso)
+		require.NoError(t, err)
+		require.Equal(t, "immutable ISO", string(data))
+
+		identity, err := os.ReadFile(filepath.Join(dir, "identity"))
+		require.NoError(t, err)
+		require.NotEmpty(t, identity)
+
+		builds, err := os.ReadDir(filepath.Join(p.CacheDir, "bootmedia"))
+		require.NoError(t, err)
+		require.Len(t, builds, 1, "the rebuild leaves no staging directories")
+	})
+	t.Run("failed build publishes nothing", func(t *testing.T) {
+		p, m, op := mediaFixture(t, "amd64")
+		p.Run = func(context.Context, string, ...string) error { return fmt.Errorf("build failed") }
+		id := op.Status.Targets[0].BootMedia.ID
+		dir := filepath.Join(p.CacheDir, "bootmedia", id)
+
+		_, err := p.Prepare(t.Context(), m, op, id)
+		require.ErrorContains(t, err, "build failed")
+
+		// Incomplete media must not carry an identity, which marks it complete.
+		_, err = os.Stat(filepath.Join(dir, "identity"))
+		require.ErrorIs(t, err, os.ErrNotExist)
+		_, err = os.Stat(filepath.Join(dir, "bootstrap.iso"))
+		require.ErrorIs(t, err, os.ErrNotExist)
+
+		var calls []string
+
+		p.Run = mockMediaRunner(t, &calls)
+		_, err = p.Prepare(t.Context(), m, op, id)
+		require.NoError(t, err)
+		_, err = os.Stat(filepath.Join(dir, "identity"))
+		require.NoError(t, err)
+	})
+}
+
 func TestMediaNoInstallHalts(t *testing.T) {
 	p, _, op := mediaFixture(t, "amd64")
 	id := op.Status.Targets[0].BootMedia.ID
