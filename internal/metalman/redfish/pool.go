@@ -17,9 +17,10 @@ type Pool struct {
 }
 
 type entry struct {
-	client *Client
-	user   string
-	pass   string
+	client      *Client
+	fingerprint string
+	user        string
+	pass        string
 }
 
 // NewPool returns a new empty client pool.
@@ -27,14 +28,30 @@ func NewPool() *Pool {
 	return &Pool{clients: make(map[string]*entry)}
 }
 
+// matches reports whether e can serve a request with the given certificate pin,
+// credentials, and device ID. Rack slots are addressed by the URL, so the
+// configured device ID does not apply to them.
+func (e *entry) matches(certSHA256, user, pass, deviceID string) bool {
+	if e.fingerprint != certSHA256 || e.user != user || e.pass != pass {
+		return false
+	}
+
+	if e.client.rack != nil {
+		return true
+	}
+
+	return deviceID == "" || e.client.deviceID == deviceID
+}
+
 // Get returns a Client for the given BMC. If a cached Client exists with
-// matching credentials, it is returned. If credentials have changed or no
-// cached Client exists, a new one is created (closing the old one).
+// matching certificate pin, credentials, and device ID, it is returned. If any
+// of those have changed or no cached Client exists, a new one is created
+// (closing the old one).
 func (p *Pool) Get(ctx context.Context, url, certSHA256, user, pass, deviceID string) (*Client, error) {
 	p.mu.Lock()
 
 	if e, ok := p.clients[url]; ok {
-		if e.user == user && e.pass == pass {
+		if e.matches(certSHA256, user, pass, deviceID) {
 			p.mu.Unlock()
 			return e.client, nil
 		}
@@ -54,7 +71,7 @@ func (p *Pool) Get(ctx context.Context, url, certSHA256, user, pass, deviceID st
 
 	// Another goroutine may have created an entry while we were dialing.
 	if e, ok := p.clients[url]; ok {
-		if e.user == user && e.pass == pass {
+		if e.matches(certSHA256, user, pass, deviceID) {
 			// Use the existing entry; close our redundant connection.
 			p.mu.Unlock()
 			c.Close()
@@ -62,11 +79,11 @@ func (p *Pool) Get(ctx context.Context, url, certSHA256, user, pass, deviceID st
 			return e.client, nil
 		}
 
-		// Credentials changed; close the stale entry.
+		// The cached entry no longer matches; close the stale entry.
 		e.client.Close()
 	}
 
-	p.clients[url] = &entry{client: c, user: user, pass: pass}
+	p.clients[url] = &entry{client: c, fingerprint: certSHA256, user: user, pass: pass}
 	p.mu.Unlock()
 
 	return c, nil
