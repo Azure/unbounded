@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -96,7 +97,7 @@ type PeeringAggregationController struct {
 	retryMu    sync.Mutex
 	retryCount map[string]int
 
-	hasSynced bool
+	hasSynced atomic.Bool
 }
 
 // NewPeeringAggregationController creates a new peering aggregation controller.
@@ -184,7 +185,7 @@ func (pc *PeeringAggregationController) Run(ctx context.Context, workers int) er
 		return fmt.Errorf("failed to wait for caches to sync")
 	}
 
-	pc.hasSynced = true
+	pc.hasSynced.Store(true)
 	pc.enqueueAllPools()
 
 	for i := 0; i < workers; i++ {
@@ -270,7 +271,7 @@ func (pc *PeeringAggregationController) enqueuePool(obj interface{}) {
 }
 
 func (pc *PeeringAggregationController) enqueueAllPools() {
-	if !pc.hasSynced {
+	if !pc.hasSynced.Load() {
 		return
 	}
 

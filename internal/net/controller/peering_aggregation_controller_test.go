@@ -5,7 +5,12 @@ package controller
 
 import (
 	"reflect"
+	"sync"
 	"testing"
+
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/workqueue"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
@@ -133,5 +138,59 @@ func TestComputeReachableRoutesAndRouteSelectionPriority(t *testing.T) {
 
 	if !equalStringSlices([]string{"a", "b"}, []string{"a", "b"}) || equalStringSlices([]string{"a"}, []string{"b"}) {
 		t.Fatalf("unexpected equalStringSlices behavior")
+	}
+}
+
+// TestEnqueueAllPoolsHasSyncedConcurrency runs the informer event enqueue path
+// concurrently with the hasSynced flip that Run performs after cache sync.
+func TestEnqueueAllPoolsHasSyncedConcurrency(t *testing.T) {
+	q := workqueue.NewTypedRateLimitingQueueWithConfig(workqueue.DefaultTypedControllerRateLimiter[string](), workqueue.TypedRateLimitingQueueConfig[string]{Name: "peerings-test"})
+	defer q.ShutDown()
+
+	informer := cache.NewSharedIndexInformer(&cache.ListWatch{}, &unstructured.Unstructured{}, 0, cache.Indexers{})
+
+	pool := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "net.unbounded-cloud.io/v1alpha1",
+		"kind":       "GatewayPool",
+		"metadata":   map[string]interface{}{"name": "pool-a"},
+	}}
+	if err := informer.GetStore().Add(pool); err != nil {
+		t.Fatalf("add gateway pool to store: %v", err)
+	}
+
+	pc := &PeeringAggregationController{workqueue: q, gatewayPoolInformer: informer}
+
+	const iterations = 100
+
+	var wg sync.WaitGroup
+
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+
+		for range iterations {
+			pc.enqueueAllPools()
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+
+		for range iterations {
+			pc.hasSynced.Store(true)
+		}
+	}()
+
+	wg.Wait()
+
+	if !pc.hasSynced.Load() {
+		t.Fatalf("expected hasSynced to be true after concurrent stores")
+	}
+
+	pc.enqueueAllPools()
+
+	if got := q.Len(); got != 1 {
+		t.Fatalf("queued pools = %d, want 1", got)
 	}
 }
