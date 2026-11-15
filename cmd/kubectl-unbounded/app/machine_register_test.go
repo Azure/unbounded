@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
@@ -378,6 +379,7 @@ func newBootstrapTokenSecret(siteName string) *corev1.Secret {
 		Data: map[string][]byte{
 			"token-id":                       []byte("abc123"),
 			"token-secret":                   []byte("0123456789abcdef"),
+			"expiration":                     []byte(time.Now().UTC().Add(time.Hour).Format(time.RFC3339)),
 			"usage-bootstrap-authentication": []byte("true"),
 			"usage-bootstrap-signing":        []byte("true"),
 		},

@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
@@ -19,6 +20,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/rest"
 
+	"github.com/Azure/unbounded/internal/kube"
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/config"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
@@ -504,6 +506,58 @@ func TestManualBootstrapHandler_BuildAgentConfig_NoBootstrapToken(t *testing.T) 
 	_, err := h.buildAgentConfig(context.Background())
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "bootstrap token")
+}
+
+func newBootstrapTokenForSite(siteName, tokenID string, expiresAt time.Time) *corev1.Secret {
+	return &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "bootstrap-token-" + tokenID,
+			Namespace: metav1.NamespaceSystem,
+			Labels:    map[string]string{"unbounded-cloud.io/site": siteName},
+		},
+		Type: corev1.SecretTypeBootstrapToken,
+		Data: map[string][]byte{
+			"token-id":     []byte(tokenID),
+			"token-secret": []byte("0123456789abcdef"),
+			"expiration":   []byte(expiresAt.UTC().Format(time.RFC3339)),
+		},
+	}
+}
+
+// TestResolveBootstrapTokenRejectsTokensInvalidForSite: a token minted for
+// another site, or an expired token, must never be embedded in generated
+// bootstrap output, even when it is the only bootstrap token in the cluster.
+func TestResolveBootstrapTokenRejectsTokensInvalidForSite(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+
+	t.Run("returns the valid token for the requested site", func(t *testing.T) {
+		t.Parallel()
+
+		kubeCli := fake.NewClientset(
+			newBootstrapTokenForSite("site-b", "aaa111", now.Add(time.Hour)),
+			newBootstrapTokenForSite("dc1", "bbb222", now.Add(-time.Hour)),
+			newBootstrapTokenForSite("dc1", "ccc333", now.Add(time.Hour)),
+		)
+
+		tok, err := resolveBootstrapToken(context.Background(), kubeCli, "dc1")
+		require.NoError(t, err)
+		require.Equal(t, "ccc333", tok.ID)
+	})
+
+	t.Run("propagates not found when only invalid tokens exist", func(t *testing.T) {
+		t.Parallel()
+
+		kubeCli := fake.NewClientset(
+			newBootstrapTokenForSite("site-b", "aaa111", now.Add(time.Hour)),
+			newBootstrapTokenForSite("dc1", "bbb222", now.Add(-time.Hour)),
+		)
+
+		tok, err := resolveBootstrapToken(context.Background(), kubeCli, "dc1")
+		require.Nil(t, tok)
+		require.ErrorIs(t, err, kube.ErrBootstrapTokenNotFound)
+	})
 }
 
 // ---------------------------------------------------------------------------

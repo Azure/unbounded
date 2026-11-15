@@ -482,7 +482,7 @@ func withSiteNodeLabel(labels map[string]string, siteName string) map[string]str
 // buildAgentConfig resolves cluster information and assembles the provision.AgentConfig
 // that the unbounded-agent expects.
 func (h *manualBootstrapHandler) buildAgentConfig(ctx context.Context) (*provision.UnboundedAgentConfig, error) {
-	tok, err := resolveBootstrapToken(ctx, h.logger, h.kubeCli, h.siteName)
+	tok, err := resolveBootstrapToken(ctx, h.kubeCli, h.siteName)
 	if err != nil {
 		return nil, err
 	}
@@ -872,45 +872,9 @@ func machineManualBootstrapCommand() *cobra.Command {
 	return newMachineManualBootstrapCommand(handler)
 }
 
-// resolveBootstrapToken tries to find a bootstrap token for the given site.
-// It first looks for a site-scoped token. If that fails, it logs a warning
-// and falls back to the first valid bootstrap token secret in kube-system.
-func resolveBootstrapToken(ctx context.Context, logger *slog.Logger, kubeCli kubernetes.Interface, siteName string) (*kube.BootstrapToken, error) {
-	tok, err := kube.GetBootstrapTokenForSite(ctx, kubeCli, siteName)
-	if err == nil {
-		return tok, nil
-	}
-
-	logger.Warn("site-scoped bootstrap token not found, falling back to first available token", "site", siteName, "error", err)
-
-	l, err := kubeCli.CoreV1().Secrets(metav1.NamespaceSystem).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("listing secrets in kube-system: %w", err)
-	}
-
-	for i := range l.Items {
-		secret := &l.Items[i]
-
-		if secret.Type != "bootstrap.kubernetes.io/token" {
-			continue
-		}
-
-		tokenID, ok := secret.Data["token-id"]
-		if !ok {
-			continue
-		}
-
-		tokenSecret, ok := secret.Data["token-secret"]
-		if !ok {
-			continue
-		}
-
-		return &kube.BootstrapToken{
-			ID:     string(tokenID),
-			Secret: string(tokenSecret),
-			Labels: secret.Labels,
-		}, nil
-	}
-
-	return nil, fmt.Errorf("no bootstrap token found for site %q and no tokens available in the cluster (run 'kubectl unbounded site init' first)", siteName)
+// resolveBootstrapToken returns the newest bootstrap token scoped to siteName.
+// A token for another site, or an expired token, is never usable: embedding one
+// would join the Machine with credentials meant for a different site.
+func resolveBootstrapToken(ctx context.Context, kubeCli kubernetes.Interface, siteName string) (*kube.BootstrapToken, error) {
+	return kube.GetBootstrapTokenForSite(ctx, kubeCli, siteName)
 }
