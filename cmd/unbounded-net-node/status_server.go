@@ -916,6 +916,20 @@ const (
 	nodeErrorTypeFallbackWS      = "fallbackWebsocket"
 )
 
+// statusPushErrorType maps a status push target label to the node error type
+// reported when that target fails. The aggregated API server endpoint is the
+// fallback for the direct endpoint.
+func statusPushErrorType(targetLabel string) string {
+	switch targetLabel {
+	case "direct":
+		return nodeErrorTypeDirectPush
+	case "apiserver":
+		return nodeErrorTypeFallbackPush
+	default:
+		return ""
+	}
+}
+
 func appendNodeError(healthState *nodeHealthState, errorType, message string) {
 	trimmedType := strings.TrimSpace(errorType)
 
@@ -2316,14 +2330,9 @@ func startStatusPusher(
 								directPushDownSince = time.Now()
 							}
 							pushStateMu.Unlock()
-
-							errorType := nodeErrorTypeDirectPush
-							if targetLabel == "apiserver" {
-								errorType = nodeErrorTypeFallbackPush
-							}
-
-							appendNodeError(healthState, errorType, fmt.Sprintf("request build failed: %v", err))
 						}
+
+						appendNodeError(healthState, statusPushErrorType(targetLabel), fmt.Sprintf("request build failed: %v", err))
 
 						return false, false
 					}
@@ -2360,14 +2369,9 @@ func startStatusPusher(
 									apiPushEnabled.Store(true)
 								}
 							}
-
-							errorType := nodeErrorTypeDirectPush
-							if targetLabel == "apiserver" {
-								errorType = nodeErrorTypeFallbackPush
-							}
-
-							appendNodeError(healthState, errorType, fmt.Sprintf("request failed: %v", err))
 						}
+
+						appendNodeError(healthState, statusPushErrorType(targetLabel), fmt.Sprintf("request failed: %v", err))
 
 						return false, false
 					}
@@ -2422,14 +2426,9 @@ func startStatusPusher(
 									apiPushEnabled.Store(true)
 								}
 							}
-
-							errorType := nodeErrorTypeDirectPush
-							if targetLabel == "apiserver" {
-								errorType = nodeErrorTypeFallbackPush
-							}
-
-							appendNodeError(healthState, errorType, fmt.Sprintf("unexpected HTTP status: %d", resp.StatusCode))
 						}
+
+						appendNodeError(healthState, statusPushErrorType(targetLabel), fmt.Sprintf("unexpected HTTP status: %d", resp.StatusCode))
 
 						return false, false
 					}

@@ -713,6 +713,41 @@ func TestGetNodeStatusIncludesNodeErrors(t *testing.T) {
 	}
 }
 
+func TestStatusPushErrorTypeSelectedForTarget(t *testing.T) {
+	tests := []struct {
+		targetLabel string
+		want        string
+	}{
+		{targetLabel: "direct", want: nodeErrorTypeDirectPush},
+		{targetLabel: "apiserver", want: nodeErrorTypeFallbackPush},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.targetLabel, func(t *testing.T) {
+			if got := statusPushErrorType(tt.targetLabel); got != tt.want {
+				t.Fatalf("statusPushErrorType(%q) = %q, want %q", tt.targetLabel, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestAPIServerPushFailureReportsFallbackPush(t *testing.T) {
+	health := &nodeHealthState{}
+
+	appendNodeError(health, statusPushErrorType("apiserver"), "unexpected HTTP status: 503")
+
+	health.mu.RLock()
+	defer health.mu.RUnlock()
+
+	if len(health.transientErrors) != 1 {
+		t.Fatalf("expected one node error, got %#v", health.transientErrors)
+	}
+
+	if got := health.transientErrors[0].Type; got != nodeErrorTypeFallbackPush {
+		t.Fatalf("expected %q error type, got %q", nodeErrorTypeFallbackPush, got)
+	}
+}
+
 func TestLinkStatsWarningsSuppressHealthyWireGuardRxErrors(t *testing.T) {
 	warnings := []string{"interface /wg51820: rx_errors +24"}
 	peers := []WireGuardPeerStatus{
