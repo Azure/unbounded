@@ -88,6 +88,12 @@ const (
 	controlPlaneKubeconfig    = "/etc/rancher/k3s/k3s.yaml"
 	controlPlaneDataMountPath = "/var/lib/rancher/k3s"
 	controlPlaneKubeMountPath = "/etc/rancher/k3s"
+
+	// poolStartupGrace is how long an unclaimed pool pod may stay unavailable before
+	// reconcile deletes it and starts a replacement. It has to cover an image pull
+	// plus a VM boot, which regularly takes several minutes on a cold node. Replacing
+	// a pod sooner restarts that work from scratch, so the slot never becomes ready.
+	poolStartupGrace = 10 * time.Minute
 )
 
 type Operator struct {
@@ -709,7 +715,7 @@ func (o *Operator) ReconcileRunners(ctx context.Context) error {
 
 	// Both pools reconcile even when one fails. A runner pool that cannot allocate a
 	// hostPort must not stop the control-plane pool from filling its own target.
-	return errors.Join(o.reconcileRunnerPool(ctx, remaining), o.reconcileControlPlanePool(ctx, remaining))
+	return errors.Join(o.reconcileRunnerPool(ctx, remaining, now), o.reconcileControlPlanePool(ctx, remaining, now))
 }
 
 type runnerPoolTarget struct {
@@ -717,7 +723,7 @@ type runnerPoolTarget struct {
 	count        int
 }
 
-func (o *Operator) reconcileRunnerPool(ctx context.Context, pods []corev1.Pod) error {
+func (o *Operator) reconcileRunnerPool(ctx context.Context, pods []corev1.Pod, now time.Time) error {
 	targets := []runnerPoolTarget{
 		{architecture: ArchitectureAMD64, count: o.Config.RunnerAMD64Count},
 		{architecture: ArchitectureARM64, count: o.Config.RunnerARM64Count},
@@ -743,6 +749,15 @@ func (o *Operator) reconcileRunnerPool(ctx context.Context, pods []corev1.Pod) e
 			usedHostPorts[hostPort] = struct{}{}
 		}
 
+		// A pod that is still inside its startup grace window holds the slot it is
+		// starting in. Counting it toward the target keeps reconcile from creating a
+		// second pod for the same slot while the image pull or VM boot is running.
+		if poolPodStarting(pod, now) {
+			idleCounts[podArchitecture(pod)]++
+
+			continue
+		}
+
 		if !idlePoolPod(pod) {
 			unavailable = append(unavailable, *pod)
 
@@ -756,8 +771,9 @@ func (o *Operator) reconcileRunnerPool(ctx context.Context, pods []corev1.Pod) e
 
 	// Replace pods that Alloc cannot hand out before filling the target. Without this,
 	// a Pending or crash-looping pod is never counted as idle, so every tick adds a new
-	// pod for the same slot until the hostPort range runs out.
-	o.deleteUnavailablePoolPods(ctx, unavailable)
+	// pod for the same slot until the hostPort range runs out. Pods still inside their
+	// startup grace window are counted above and are not in this list.
+	o.deleteUnavailablePoolPods(ctx, unavailable, now)
 
 	for _, target := range targets {
 		if target.count < 0 {
@@ -791,7 +807,7 @@ type controlPlanePoolTarget struct {
 	count             int
 }
 
-func (o *Operator) reconcileControlPlanePool(ctx context.Context, pods []corev1.Pod) error {
+func (o *Operator) reconcileControlPlanePool(ctx context.Context, pods []corev1.Pod, now time.Time) error {
 	targets := make([]controlPlanePoolTarget, 0, len(o.Config.ControlPlaneVersions))
 	for _, version := range o.Config.ControlPlaneVersions {
 		normalized, err := normalizeKubernetesVersionValue(version)
@@ -822,6 +838,13 @@ func (o *Operator) reconcileControlPlanePool(ctx context.Context, pods []corev1.
 			usedHostPorts[hostPort] = struct{}{}
 		}
 
+		// See reconcileRunnerPool: a pod inside its startup grace window holds its slot.
+		if poolPodStarting(pod, now) {
+			idleCounts[podKubernetesVersion(pod)]++
+
+			continue
+		}
+
 		if !idlePoolPod(pod) {
 			unavailable = append(unavailable, *pod)
 
@@ -834,8 +857,9 @@ func (o *Operator) reconcileControlPlanePool(ctx context.Context, pods []corev1.
 	}
 
 	// See reconcileRunnerPool: a pod that Alloc cannot hand out is replaced instead of
-	// being left in place while another pod is created for the same target slot.
-	o.deleteUnavailablePoolPods(ctx, unavailable)
+	// being left in place while another pod is created for the same target slot, but
+	// only once its startup grace window has expired.
+	o.deleteUnavailablePoolPods(ctx, unavailable, now)
 
 	for _, target := range targets {
 		if target.count < 0 {
@@ -865,15 +889,16 @@ func (o *Operator) reconcileControlPlanePool(ctx context.Context, pods []corev1.
 }
 
 // deleteUnavailablePoolPods deletes unclaimed, non-terminating pool pods that Alloc
-// cannot hand out. Pods that are still becoming ready are included: they do not count
-// toward the idle target, so leaving them in place would make every reconcile add
-// another pod for the same slot. The caller fills the target after these deletions, so
-// repeated passes keep the pool at its target instead of growing it.
+// cannot hand out and that are past their startup grace window. Younger unavailable
+// pods may still be pulling an image or booting a VM, so replacing them would restart
+// that work from scratch; the caller counts them as occupying their slot instead.
+// The caller fills the target after these deletions, so repeated passes keep the pool
+// at its target instead of growing it.
 //
-// Each pod is re-read before deletion so a pod that became ready after the list call is
-// kept. A failed re-read or delete is logged and skipped; one stuck pod must not stop
-// the rest of the reconcile.
-func (o *Operator) deleteUnavailablePoolPods(ctx context.Context, pods []corev1.Pod) {
+// Each pod is re-read before deletion so a pod that became ready, was claimed, or was
+// replaced by a fresh pod after the list call is kept. A failed re-read or delete is
+// logged and skipped; one stuck pod must not stop the rest of the reconcile.
+func (o *Operator) deleteUnavailablePoolPods(ctx context.Context, pods []corev1.Pod, now time.Time) {
 	for i := range pods {
 		pod := &pods[i]
 		if pod.Annotations[AnnotationIdempotencyKeyHash] != "" || !pod.DeletionTimestamp.IsZero() {
@@ -897,7 +922,7 @@ func (o *Operator) deleteUnavailablePoolPods(ctx context.Context, pods []corev1.
 			continue
 		}
 
-		if runnerPodUnavailableReason(current) == "" {
+		if runnerPodUnavailableReason(current) == "" || poolPodStarting(current, now) {
 			continue
 		}
 
@@ -1519,8 +1544,8 @@ func isManagedPlaypenPod(pod *corev1.Pod) bool {
 }
 
 // idlePoolPod reports whether Alloc could hand this pod out right now. Reconcile counts
-// only these pods toward the target, so a pod that is still starting or failing is
-// replaced instead of being treated as idle capacity.
+// these pods toward the target, along with pods that are still inside their startup
+// grace window (see poolPodStarting).
 func idlePoolPod(pod *corev1.Pod) bool {
 	if !pod.DeletionTimestamp.IsZero() {
 		return false
@@ -1531,6 +1556,27 @@ func idlePoolPod(pod *corev1.Pod) bool {
 	}
 
 	return runnerPodUnavailableReason(pod) == ""
+}
+
+// poolPodStarting reports whether an unclaimed pool pod is unavailable but still inside
+// its startup grace window. Such a pod occupies its slot: it is not allocatable yet, but
+// it may still be pulling its image or booting its VM, so replacing it would restart that
+// work from scratch. A zero CreationTimestamp is treated as starting because the age of
+// a pod that has not been observed with a timestamp is unknown.
+func poolPodStarting(pod *corev1.Pod, now time.Time) bool {
+	if pod.Annotations[AnnotationIdempotencyKeyHash] != "" || !pod.DeletionTimestamp.IsZero() {
+		return false
+	}
+
+	if runnerPodUnavailableReason(pod) == "" {
+		return false
+	}
+
+	if pod.CreationTimestamp.IsZero() {
+		return true
+	}
+
+	return now.Sub(pod.CreationTimestamp.Time) < poolStartupGrace
 }
 
 func runnerPodUnavailableReason(pod *corev1.Pod) string {

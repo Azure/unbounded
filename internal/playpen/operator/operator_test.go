@@ -962,12 +962,14 @@ func TestReconcileReportsNoFreeRunnerHostPorts(t *testing.T) {
 func TestReconcileCountsOnlyAllocatableRunnerPods(t *testing.T) {
 	pending := testPodWithHostPort("pending-runner", "node-1", 52000)
 	pending.Status = corev1.PodStatus{Phase: corev1.PodPending}
+	setPodAge(pending, poolStartupGrace+time.Minute)
 
 	crashLooping := testPodWithHostPort("crash-looping-runner", "node-1", 52000)
 	crashLooping.Status.ContainerStatuses[0].Ready = false
 	crashLooping.Status.ContainerStatuses[0].State = corev1.ContainerState{
 		Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"},
 	}
+	setPodAge(crashLooping, poolStartupGrace+time.Minute)
 
 	ready := testPodWithHostPort("ready-runner", "node-1", 52000)
 
@@ -976,8 +978,9 @@ func TestReconcileCountsOnlyAllocatableRunnerPods(t *testing.T) {
 	claimed.Annotations[AnnotationRequestHash] = hashString("request")
 	claimed.Annotations[AnnotationClaimedAt] = time.Now().UTC().Format(time.RFC3339)
 
-	// An unclaimed unavailable pod is replaced rather than left in place, so the pool
-	// still holds exactly the target count after reconcile.
+	// An unclaimed unavailable pod past its startup grace window is replaced rather
+	// than left in place, so the pool still holds exactly the target count after
+	// reconcile.
 	tests := []struct {
 		name     string
 		pod      *corev1.Pod
@@ -1016,6 +1019,7 @@ func TestReconcileCountsOnlyAllocatableRunnerPods(t *testing.T) {
 func TestReconcileReplacesPendingIdleRunnerWithoutAccumulating(t *testing.T) {
 	pending := testPodWithHostPort("pending-runner", "node-1", 52000)
 	pending.Status = corev1.PodStatus{Phase: corev1.PodPending}
+	setPodAge(pending, poolStartupGrace+time.Minute)
 
 	op := testOperator(t, pending)
 	op.Config.RunnerAMD64Count = 1
@@ -1040,6 +1044,150 @@ func TestReconcileReplacesPendingIdleRunnerWithoutAccumulating(t *testing.T) {
 
 	if pods.Items[0].Name == pending.Name {
 		t.Fatal("unavailable idle runner pod was not replaced")
+	}
+}
+
+func TestReconcileKeepsStartingRunnerPodWithoutDuplicating(t *testing.T) {
+	pending := testPodWithHostPort("pending-runner", "node-1", 52000)
+	pending.Status = corev1.PodStatus{Phase: corev1.PodPending}
+	setPodAge(pending, poolStartupGrace-time.Minute)
+
+	op := testOperator(t, pending)
+	op.Config.RunnerAMD64Count = 1
+	op.Config.RunnerARM64Count = 0
+	op.Config.RunnerWireGuardHostPortStart = 52000
+	op.Config.RunnerWireGuardHostPortEnd = 52005
+
+	for range 3 {
+		if err := op.ReconcileRunners(t.Context()); err != nil {
+			t.Fatalf("reconcile: %v", err)
+		}
+	}
+
+	pods := &corev1.PodList{}
+	if err := op.Client.List(t.Context(), pods, client.InNamespace("playpen"), client.MatchingLabels{"app.kubernetes.io/name": runnerAppName}); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(pods.Items) != 1 {
+		t.Fatalf("pods = %d, want 1 while the pending pod is inside its startup grace window", len(pods.Items))
+	}
+
+	if pods.Items[0].Name != pending.Name {
+		t.Fatalf("pod = %q, want the starting pod %q", pods.Items[0].Name, pending.Name)
+	}
+}
+
+func TestReconcileReplacesRunnerPodPastStartupGrace(t *testing.T) {
+	pending := testPodWithHostPort("pending-runner", "node-1", 52000)
+	pending.Status = corev1.PodStatus{Phase: corev1.PodPending}
+	setPodAge(pending, poolStartupGrace+time.Minute)
+
+	op := testOperator(t, pending)
+	op.Config.RunnerAMD64Count = 1
+	op.Config.RunnerARM64Count = 0
+	op.Config.RunnerWireGuardHostPortStart = 52000
+	op.Config.RunnerWireGuardHostPortEnd = 52005
+
+	if err := op.ReconcileRunners(t.Context()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	pods := &corev1.PodList{}
+	if err := op.Client.List(t.Context(), pods, client.InNamespace("playpen"), client.MatchingLabels{"app.kubernetes.io/name": runnerAppName}); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(pods.Items) != 1 {
+		t.Fatalf("pods = %d, want 1", len(pods.Items))
+	}
+
+	if pods.Items[0].Name == pending.Name {
+		t.Fatal("pending pod past its startup grace window was not replaced")
+	}
+}
+
+func TestReconcileKeepsFreshReplacementRunnerPod(t *testing.T) {
+	pending := testPodWithHostPort("pending-runner", "node-1", 52000)
+	pending.Status = corev1.PodStatus{Phase: corev1.PodPending}
+	setPodAge(pending, poolStartupGrace+time.Minute)
+
+	op := testOperator(t, pending)
+	op.Config.RunnerAMD64Count = 1
+	op.Config.RunnerARM64Count = 0
+	op.Config.RunnerWireGuardHostPortStart = 52000
+	op.Config.RunnerWireGuardHostPortEnd = 52005
+
+	if err := op.ReconcileRunners(t.Context()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	listPods := func() *corev1.PodList {
+		t.Helper()
+
+		pods := &corev1.PodList{}
+		if err := op.Client.List(t.Context(), pods, client.InNamespace("playpen"), client.MatchingLabels{"app.kubernetes.io/name": runnerAppName}); err != nil {
+			t.Fatal(err)
+		}
+
+		return pods
+	}
+
+	pods := listPods()
+	if len(pods.Items) != 1 {
+		t.Fatalf("pods = %d, want 1 replacement pod", len(pods.Items))
+	}
+
+	replacement := pods.Items[0].Name
+	if replacement == pending.Name {
+		t.Fatal("pending pod past its startup grace window was not replaced")
+	}
+
+	for range 2 {
+		if err := op.ReconcileRunners(t.Context()); err != nil {
+			t.Fatalf("reconcile: %v", err)
+		}
+	}
+
+	pods = listPods()
+	if len(pods.Items) != 1 {
+		t.Fatalf("pods = %d, want 1 after repeated reconciles", len(pods.Items))
+	}
+
+	if pods.Items[0].Name != replacement {
+		t.Fatalf("pod = %q, want the fresh replacement %q to keep its own grace window", pods.Items[0].Name, replacement)
+	}
+}
+
+func TestReconcileReplacesCrashLoopingRunnerPodPastStartupGrace(t *testing.T) {
+	crashLooping := testPodWithHostPort("crash-looping-runner", "node-1", 52000)
+	crashLooping.Status.ContainerStatuses[0].Ready = false
+	crashLooping.Status.ContainerStatuses[0].State = corev1.ContainerState{
+		Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"},
+	}
+	setPodAge(crashLooping, poolStartupGrace+time.Minute)
+
+	op := testOperator(t, crashLooping)
+	op.Config.RunnerAMD64Count = 1
+	op.Config.RunnerARM64Count = 0
+	op.Config.RunnerWireGuardHostPortStart = 52000
+	op.Config.RunnerWireGuardHostPortEnd = 52005
+
+	if err := op.ReconcileRunners(t.Context()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	pods := &corev1.PodList{}
+	if err := op.Client.List(t.Context(), pods, client.InNamespace("playpen"), client.MatchingLabels{"app.kubernetes.io/name": runnerAppName}); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(pods.Items) != 1 {
+		t.Fatalf("pods = %d, want 1", len(pods.Items))
+	}
+
+	if pods.Items[0].Name == crashLooping.Name {
+		t.Fatal("crash-looping pod past its startup grace window was not replaced")
 	}
 }
 
@@ -1122,6 +1270,7 @@ func TestReconcileControlPlanePoolDespiteRunnerHostPortError(t *testing.T) {
 func TestReconcileToleratesUnavailablePodDeleteFailure(t *testing.T) {
 	pending := testPodWithHostPort("pending-runner", "node-1", 52000)
 	pending.Status = corev1.PodStatus{Phase: corev1.PodPending}
+	setPodAge(pending, poolStartupGrace+time.Minute)
 
 	op := testOperator(t, pending)
 	op.Client = interceptor.NewClient(op.Client.(client.WithWatch), interceptor.Funcs{
@@ -1147,6 +1296,7 @@ func TestReconcileToleratesUnavailablePodDeleteFailure(t *testing.T) {
 func TestReconcileReplacesPendingIdleControlPlanePod(t *testing.T) {
 	pending := testControlPlanePod("pending-control-plane", "node-1", "v1.33.0", 16443)
 	pending.Status = corev1.PodStatus{Phase: corev1.PodPending}
+	setPodAge(pending, poolStartupGrace+time.Minute)
 
 	op := testOperator(t, pending)
 	op.Config.RunnerAMD64Count = 0
@@ -1172,6 +1322,77 @@ func TestReconcileReplacesPendingIdleControlPlanePod(t *testing.T) {
 	if pods.Items[0].Name == pending.Name {
 		t.Fatal("unavailable control-plane pod was not replaced")
 	}
+}
+
+func TestReconcileControlPlanePoolHonorsStartupGrace(t *testing.T) {
+	newOperator := func(t *testing.T, pod *corev1.Pod) *Operator {
+		t.Helper()
+
+		op := testOperator(t, pod)
+		op.Config.RunnerAMD64Count = 0
+		op.Config.RunnerARM64Count = 0
+		op.Config.ControlPlaneCount = 1
+		op.Config.ControlPlaneVersions = []string{"v1.33.0"}
+		op.Config.ControlPlaneAPIServerHostPortStart = 16443
+		op.Config.ControlPlaneAPIServerHostPortEnd = 16444
+
+		return op
+	}
+
+	listPods := func(t *testing.T, op *Operator) *corev1.PodList {
+		t.Helper()
+
+		pods := &corev1.PodList{}
+		if err := op.Client.List(t.Context(), pods, client.InNamespace("playpen"), client.MatchingLabels{"app.kubernetes.io/name": controlPlaneAppName}); err != nil {
+			t.Fatal(err)
+		}
+
+		return pods
+	}
+
+	t.Run("starting", func(t *testing.T) {
+		pending := testControlPlanePod("pending-control-plane", "node-1", "v1.33.0", 16443)
+		pending.Status = corev1.PodStatus{Phase: corev1.PodPending}
+		setPodAge(pending, poolStartupGrace-time.Minute)
+
+		op := newOperator(t, pending)
+
+		for range 3 {
+			if err := op.ReconcileRunners(t.Context()); err != nil {
+				t.Fatalf("reconcile: %v", err)
+			}
+		}
+
+		pods := listPods(t, op)
+		if len(pods.Items) != 1 {
+			t.Fatalf("control-plane pods = %d, want 1 while the pending pod is inside its startup grace window", len(pods.Items))
+		}
+
+		if pods.Items[0].Name != pending.Name {
+			t.Fatalf("control-plane pod = %q, want the starting pod %q", pods.Items[0].Name, pending.Name)
+		}
+	})
+
+	t.Run("past grace", func(t *testing.T) {
+		pending := testControlPlanePod("pending-control-plane", "node-1", "v1.33.0", 16443)
+		pending.Status = corev1.PodStatus{Phase: corev1.PodPending}
+		setPodAge(pending, poolStartupGrace+time.Minute)
+
+		op := newOperator(t, pending)
+
+		if err := op.ReconcileRunners(t.Context()); err != nil {
+			t.Fatalf("reconcile: %v", err)
+		}
+
+		pods := listPods(t, op)
+		if len(pods.Items) != 1 {
+			t.Fatalf("control-plane pods = %d, want 1", len(pods.Items))
+		}
+
+		if pods.Items[0].Name == pending.Name {
+			t.Fatal("pending control-plane pod past its startup grace window was not replaced")
+		}
+	})
 }
 
 func TestReconcileCreatesIdleControlPlanePodsPerVersion(t *testing.T) {
@@ -1440,6 +1661,12 @@ func testPodWithHostPort(name, nodeName string, hostPort int32) *corev1.Pod {
 	setPodWireGuardHostPort(pod, hostPort)
 
 	return pod
+}
+
+// setPodAge backdates a pod's CreationTimestamp so startup grace comparisons are
+// testable without sleeping.
+func setPodAge(pod *corev1.Pod, age time.Duration) {
+	pod.CreationTimestamp = metav1.NewTime(time.Now().Add(-age))
 }
 
 func testControlPlanePod(name, nodeName, kubernetesVersion string, hostPort int32) *corev1.Pod {
