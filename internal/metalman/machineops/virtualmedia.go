@@ -388,8 +388,9 @@ func (r *Reconciler) advanceVirtualMedia(ctx context.Context, op *v1alpha3.Machi
 		}
 
 		// Preparing can wait on a first-time image pull, which is not a power
-		// action. Let that phase run once past the deadline so the download
-		// error is visible; every other phase fails here as before.
+		// action. That phase is never failed here so a Prepare that succeeds
+		// at the deadline can advance; its download wait is bounded after the
+		// Prepare result is known. Every other phase fails here as before.
 		expired = r.mediaProgressExpired(&b, now)
 		if expired && b.Phase != "Preparing" {
 			return failTarget(target, reasonTimedOut, "virtual media progress timed out in "+b.Phase, now)
@@ -552,11 +553,27 @@ func (r *Reconciler) advanceVirtualMedia(ctx context.Context, op *v1alpha3.Machi
 		return failTarget(target, reasonExecutionFailed, "unknown virtual media phase "+b.Phase, now)
 	}
 
-	if err != nil && errors.Is(err, netboot.ErrNotYetDownloaded) {
-		if expired {
-			// Waiting for a cold image pull is not a power action, so it does
-			// not consume the phase deadline. The PXE path waits the same way.
+	if err == nil {
+		// A successful Prepare always advances, even when the phase deadline
+		// passed on this reconcile, because the image is ready now.
+		if next != b.Phase {
+			b.Phase = next
 			b.PhaseStartedAt = &now
+			b.ReadinessStartedAt = nil
+		}
+
+		target.Message = "virtual media: " + b.Phase
+
+		return targetChange{target: target}
+	}
+
+	if errors.Is(err, netboot.ErrNotYetDownloaded) {
+		// Waiting for a cold image pull is not a power action, so it may run
+		// past the phase deadline. Bound the extra wait from the start of the
+		// phase so an image that can never be pulled fails instead of
+		// retrying forever.
+		if r.mediaDownloadExpired(b, now) {
+			return failTarget(target, reasonTimedOut, "virtual media image was not available before the download timeout", now)
 		}
 
 		target.Message = err.Error()
@@ -567,23 +584,11 @@ func (r *Reconciler) advanceVirtualMedia(ctx context.Context, op *v1alpha3.Machi
 		return failTarget(target, reasonTimedOut, "virtual media progress timed out in "+b.Phase, now)
 	}
 
-	if err != nil {
-		if errors.Is(err, redfish.ErrUnsupported) {
-			return failTarget(target, reasonUnsupportedTarget, err.Error(), now)
-		}
-
-		return r.retryMediaTarget(target, err, now)
+	if errors.Is(err, redfish.ErrUnsupported) {
+		return failTarget(target, reasonUnsupportedTarget, err.Error(), now)
 	}
 
-	if next != b.Phase {
-		b.Phase = next
-		b.PhaseStartedAt = &now
-		b.ReadinessStartedAt = nil
-	}
-
-	target.Message = "virtual media: " + b.Phase
-
-	return targetChange{target: target}
+	return r.retryMediaTarget(target, err, now)
 }
 
 // newMediaID returns 128 random bits as an unguessable capability. The
@@ -614,6 +619,17 @@ func (r *Reconciler) mediaProgressExpired(b *v1alpha3.MachineOperationBootMediaS
 	}
 
 	return !now.Time.Before(deadline)
+}
+
+// mediaDownloadExpired bounds the extra time Preparing may spend waiting on a
+// cold image pull. A pull is not a power action, so it may run past the phase
+// deadline, but an image that can never be pulled must still fail.
+func (r *Reconciler) mediaDownloadExpired(b *v1alpha3.MachineOperationBootMediaStatus, now metav1.Time) bool {
+	if b.PhaseStartedAt == nil {
+		return false
+	}
+
+	return !now.Time.Before(b.PhaseStartedAt.Add(r.mediaInstallTimeout()))
 }
 
 func (r *Reconciler) retryMediaTarget(target v1alpha3.MachineOperationTargetStatus, err error, now metav1.Time) targetChange {

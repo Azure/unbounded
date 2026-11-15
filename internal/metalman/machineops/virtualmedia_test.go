@@ -852,31 +852,70 @@ func TestVirtualMediaReleaseFailureDoesNotRepeatBMCCleanup(t *testing.T) {
 }
 
 func TestVirtualMediaPhaseDeadlineWithoutReadiness(t *testing.T) {
-	r, _, _, op := mediaFixture(t)
+	r, d, _, op := mediaFixture(t)
 	mediaStep(t, r, op.Name)
+
+	// A Prepare failure that is not an image download still hits the deadline.
+	d.err = errors.New("invalid image")
 	r.Now = func() metav1.Time { return metav1.NewTime(fixedNow().Add(r.powerActionTimeout())) }
 	current := mediaStep(t, r, op.Name)
 	require.Equal(t, v1alpha3.OperationPhaseFailed, current.Status.Phase)
 	require.Contains(t, current.Status.Targets[0].Message, "progress timed out")
 }
 
+func TestVirtualMediaReadyAtPhaseDeadlineAdvances(t *testing.T) {
+	r, _, _, op := mediaFixture(t)
+	current := mediaStep(t, r, op.Name)
+	require.Equal(t, "Preparing", current.Status.Targets[0].BootMedia.Phase)
+
+	// The image becomes ready on the first reconcile past the deadline. A
+	// successful Prepare must advance instead of failing the target.
+	r.Now = func() metav1.Time { return metav1.NewTime(fixedNow().Add(r.powerActionTimeout())) }
+	current = mediaStep(t, r, op.Name)
+	require.Equal(t, v1alpha3.OperationPhaseInProgress, current.Status.Phase)
+	require.Equal(t, "Staging", current.Status.Targets[0].BootMedia.Phase)
+}
+
 func TestVirtualMediaImageDownloadDoesNotConsumePhaseDeadline(t *testing.T) {
 	r, d, _, op := mediaFixture(t)
-	mediaStep(t, r, op.Name)
+	current := mediaStep(t, r, op.Name)
+	started := current.Status.Targets[0].BootMedia.PhaseStartedAt
 
 	// A first-time OCI image pull reports ErrNotYetDownloaded until it completes.
 	d.err = fmt.Errorf("resolving netboot image: %w", netboot.ErrNotYetDownloaded)
-	r.Now = func() metav1.Time { return metav1.NewTime(fixedNow().Add(2 * r.powerActionTimeout())) }
-	current := mediaStep(t, r, op.Name)
+	r.Now = func() metav1.Time { return metav1.NewTime(fixedNow().Add(r.mediaInstallTimeout() / 2)) }
+	current = mediaStep(t, r, op.Name)
 	require.Equal(t, v1alpha3.OperationPhaseInProgress, current.Status.Phase)
 	require.Equal(t, "Preparing", current.Status.Targets[0].BootMedia.Phase)
 	require.Contains(t, current.Status.Targets[0].Message, netboot.ErrNotYetDownloaded.Error())
+	// The wait stays bounded from the start of the phase.
+	require.Equal(t, started, current.Status.Targets[0].BootMedia.PhaseStartedAt)
 
 	// The pull finishing after the power action deadline still resumes the flow.
 	d.err = nil
 	current = mediaStep(t, r, op.Name)
 	require.Equal(t, v1alpha3.OperationPhaseInProgress, current.Status.Phase)
 	require.Equal(t, "Staging", current.Status.Targets[0].BootMedia.Phase)
+}
+
+func TestVirtualMediaUnpullableImageTimesOut(t *testing.T) {
+	r, d, _, op := mediaFixture(t)
+	current := mediaStep(t, r, op.Name)
+	started := current.Status.Targets[0].BootMedia.PhaseStartedAt
+
+	d.err = fmt.Errorf("resolving netboot image: %w", netboot.ErrNotYetDownloaded)
+	r.Now = func() metav1.Time { return metav1.NewTime(fixedNow().Add(r.powerActionTimeout())) }
+	current = mediaStep(t, r, op.Name)
+	require.Equal(t, v1alpha3.OperationPhaseInProgress, current.Status.Phase)
+	require.Equal(t, started, current.Status.Targets[0].BootMedia.PhaseStartedAt)
+
+	// A pull that never completes fails at the download cap instead of
+	// refreshing the phase deadline forever.
+	r.Now = func() metav1.Time { return metav1.NewTime(fixedNow().Add(r.mediaInstallTimeout())) }
+	current = mediaStep(t, r, op.Name)
+	require.Equal(t, v1alpha3.OperationPhaseFailed, current.Status.Phase)
+	require.Contains(t, current.Status.Targets[0].Message, reasonTimedOut)
+	require.Contains(t, current.Status.Targets[0].Message, "download timeout")
 }
 
 func TestVirtualMediaStuckStageStillTimesOut(t *testing.T) {
