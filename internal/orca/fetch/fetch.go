@@ -393,6 +393,14 @@ func (c *Coordinator) runFill(k chunk.Key, objectSize int64, f *fill) {
 	// objectSize == 0 case at their boundaries, so the validation
 	// below is always exercised.
 	expectedLen := k.ExpectedLen(objectSize)
+	if expectedLen > k.ChunkSize {
+		// Defense in depth: DecodeChunkKey now pins chunk_size to the
+		// configured ladder and rejects an offset past object_size, so
+		// ExpectedLen cannot exceed ChunkSize for a wire-sourced key.
+		// In-process callers get the same per-fill memory ceiling.
+		expectedLen = k.ChunkSize
+	}
+
 	off := k.Index * k.ChunkSize
 
 	body, err := c.fetchWithRetry(ctx, k, off, expectedLen)

@@ -32,6 +32,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -670,7 +671,15 @@ func encodeChunkKey(k chunk.Key, objectSize int64) string {
 
 // DecodeChunkKey parses query params into a Key plus the authoritative
 // object size. Used by the internal listener (server/internal/fill).
-func DecodeChunkKey(values url.Values) (chunk.Key, int64, error) {
+//
+// chunking is this replica's configured chunk-size ladder. A decoded
+// chunk_size must be one the ladder can actually issue (Chunking.Size
+// or a tier's ChunkSize); this bounds the fill buffer to a configured
+// chunk size instead of trusting a peer-supplied size. The key's
+// offset (index * chunk_size) must not overflow int64 and must lie
+// within the object, so a forged key cannot describe a chunk past the
+// object end.
+func DecodeChunkKey(values url.Values, chunking config.Chunking) (chunk.Key, int64, error) {
 	chunkSize, err := strconv.ParseInt(values.Get("chunk_size"), 10, 64)
 	if err != nil {
 		return chunk.Key{}, 0, fmt.Errorf("invalid chunk_size: %w", err)
@@ -678,6 +687,10 @@ func DecodeChunkKey(values url.Values) (chunk.Key, int64, error) {
 
 	if chunkSize <= 0 {
 		return chunk.Key{}, 0, fmt.Errorf("invalid chunk_size: must be > 0, got %d", chunkSize)
+	}
+
+	if !chunking.AllowsChunkSize(chunkSize) {
+		return chunk.Key{}, 0, fmt.Errorf("invalid chunk_size: %d is not a configured chunk size", chunkSize)
 	}
 
 	idx, err := strconv.ParseInt(values.Get("index"), 10, 64)
@@ -696,6 +709,14 @@ func DecodeChunkKey(values url.Values) (chunk.Key, int64, error) {
 
 	if objectSize <= 0 {
 		return chunk.Key{}, 0, fmt.Errorf("invalid object_size: must be > 0, got %d", objectSize)
+	}
+
+	if idx > math.MaxInt64/chunkSize {
+		return chunk.Key{}, 0, fmt.Errorf("invalid index: %d * chunk_size %d overflows int64", idx, chunkSize)
+	}
+
+	if off := idx * chunkSize; off >= objectSize {
+		return chunk.Key{}, 0, fmt.Errorf("invalid index: offset %d is not within object_size %d", off, objectSize)
 	}
 
 	originID := values.Get("origin_id")

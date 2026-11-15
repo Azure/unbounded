@@ -681,7 +681,8 @@ func TestInternalHandler_SetsContentLength(t *testing.T) {
 
 			t.Cleanup(func() { _ = c.Close(context.Background()) })
 
-			h := NewInternalHandler(&fakeInternalFetchAPI{body: make([]byte, tt.chunkSize)}, c, discardLogger())
+			h := NewInternalHandler(&fakeInternalFetchAPI{body: make([]byte, tt.chunkSize)}, c,
+				config.Chunking{Size: config.ByteSize(tt.chunkSize)}, discardLogger())
 
 			req := httptest.NewRequest(http.MethodGet, "/internal/fill?"+func() string {
 				k := chunk.Key{

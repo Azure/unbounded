@@ -246,6 +246,29 @@ func (c Chunking) AsChunkTiers() []chunk.Tier {
 	return out
 }
 
+// AllowsChunkSize reports whether size is one of the chunk sizes this
+// ladder can issue: the base Size or any tier's ChunkSize. The
+// internal-fill wire boundary uses it to reject peer-supplied keys
+// that do not correspond to a configured chunk, bounding the fill
+// buffer to a value the operator actually chose.
+func (c Chunking) AllowsChunkSize(size int64) bool {
+	if size <= 0 {
+		return false
+	}
+
+	if c.Size.Int64() == size {
+		return true
+	}
+
+	for _, t := range c.Tiers {
+		if t.ChunkSize.Int64() == size {
+			return true
+		}
+	}
+
+	return false
+}
+
 // ReadaheadDepth returns the configured read-ahead depth. A nil
 // pointer (YAML omitted) returns 0; applyDefaults populates the
 // default-on value so configurations that loaded through Load

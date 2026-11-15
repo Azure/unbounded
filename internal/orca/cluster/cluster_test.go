@@ -744,7 +744,7 @@ func TestDecodeChunkKey_RejectsZeroObjectSize(t *testing.T) {
 			v.Set("index", "0")
 			v.Set("object_size", tt.objectSize)
 
-			_, _, err := DecodeChunkKey(v)
+			_, _, err := DecodeChunkKey(v, config.Chunking{Size: 1024})
 			if tt.wantErr {
 				if err == nil {
 					t.Errorf("DecodeChunkKey(object_size=%s) returned nil; want error", tt.objectSize)
@@ -757,6 +757,71 @@ func TestDecodeChunkKey_RejectsZeroObjectSize(t *testing.T) {
 
 			if err != nil {
 				t.Errorf("DecodeChunkKey(object_size=%s) unexpected error: %v", tt.objectSize, err)
+			}
+		})
+	}
+}
+
+// TestDecodeChunkKey_BoundsChunkSizeAndOffset verifies the internal-fill
+// wire boundary only accepts a chunk_size the configured ladder can
+// issue, with an offset that fits int64 and lies inside the object.
+// Without these checks a forged key (for example chunk_size=2^62) would
+// size the fill buffer from the peer-supplied value instead of from the
+// configured chunk-size ladder.
+func TestDecodeChunkKey_BoundsChunkSizeAndOffset(t *testing.T) {
+	t.Parallel()
+
+	chunking := config.Chunking{
+		Size:  1024,
+		Tiers: []config.ChunkTier{{MinObjectSize: 1 << 20, ChunkSize: 4096}},
+	}
+
+	tests := []struct {
+		name       string
+		chunkSize  string
+		index      string
+		objectSize string
+		wantLen    int64
+		wantErr    string
+	}{
+		{"base size accepted", "1024", "1", "2048", 1024, ""},
+		{"tier size accepted", "4096", "0", "1048576", 4096, ""},
+		{"oversized chunk_size rejected", "4611686018427387904", "0", "9223372036854775807", 0, "chunk_size"},
+		{"unconfigured chunk_size rejected", "2048", "0", "4096", 0, "chunk_size"},
+		{"overflowing offset rejected", "1024", "9223372036854775807", "9223372036854775807", 0, "index"},
+		{"index past object end rejected", "1024", "5", "2048", 0, "index"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := url.Values{}
+			v.Set("origin_id", "ox")
+			v.Set("bucket", "b")
+			v.Set("key", "o")
+			v.Set("etag", "e1")
+			v.Set("chunk_size", tt.chunkSize)
+			v.Set("index", tt.index)
+			v.Set("object_size", tt.objectSize)
+
+			k, objectSize, err := DecodeChunkKey(v, chunking)
+			if tt.wantErr != "" {
+				if err == nil {
+					t.Fatalf("DecodeChunkKey(%s) returned nil; want error", tt.name)
+				}
+
+				if !strings.Contains(err.Error(), tt.wantErr) {
+					t.Errorf("error does not mention %q: %v", tt.wantErr, err)
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("DecodeChunkKey(%s) unexpected error: %v", tt.name, err)
+			}
+
+			if got := k.ExpectedLen(objectSize); got != tt.wantLen {
+				t.Errorf("ExpectedLen = %d, want %d", got, tt.wantLen)
 			}
 		})
 	}

@@ -839,9 +839,10 @@ func parseSimpleByteRange(h string, size int64) (start, end int64, ok bool) {
 // InternalHandler implements GET /internal/fill on the internal
 // listener. Plain HTTP/2 (no mTLS) in dev.
 type InternalHandler struct {
-	fc  internalFetchAPI
-	cl  *cluster.Cluster
-	log *slog.Logger
+	fc       internalFetchAPI
+	cl       *cluster.Cluster
+	chunking config.Chunking
+	log      *slog.Logger
 }
 
 // internalFetchAPI is the surface area InternalHandler depends on. The
@@ -851,8 +852,13 @@ type internalFetchAPI interface {
 }
 
 // NewInternalHandler wires the internal handler.
-func NewInternalHandler(fc internalFetchAPI, cl *cluster.Cluster, log *slog.Logger) *InternalHandler {
-	return &InternalHandler{fc: fc, cl: cl, log: log}
+func NewInternalHandler(
+	fc internalFetchAPI,
+	cl *cluster.Cluster,
+	chunking config.Chunking,
+	log *slog.Logger,
+) *InternalHandler {
+	return &InternalHandler{fc: fc, cl: cl, chunking: chunking, log: log}
 }
 
 // ServeHTTP handles GET /internal/fill?<chunk-key-params>.
@@ -872,7 +878,7 @@ func (h *InternalHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	k, objectSize, err := cluster.DecodeChunkKey(r.URL.Query())
+	k, objectSize, err := cluster.DecodeChunkKey(r.URL.Query(), h.chunking)
 	if err != nil {
 		http.Error(w, "invalid chunk key: "+err.Error(), http.StatusBadRequest)
 		return

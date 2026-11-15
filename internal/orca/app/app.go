@@ -224,7 +224,7 @@ func Start(ctx context.Context, cfg *config.Config, opts ...Option) (*App, error
 
 	edgeHandler := server.NewEdgeHandler(fc, cfg, log)
 
-	var internalHandler http.Handler = server.NewInternalHandler(fc, cl, log)
+	var internalHandler http.Handler = server.NewInternalHandler(fc, cl, cfg.Chunking, log)
 	if o.internalHandlerWrap != nil {
 		internalHandler = o.internalHandlerWrap(internalHandler)
 	}
