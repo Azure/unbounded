@@ -214,7 +214,7 @@ func isManagedIdentityResourceID(s string) bool {
 
 func debugLog(msg string, args ...interface{}) {
 	if v := os.Getenv(envDebugLog); v == "1" {
-		msg = fmt.Sprintf(msg, args)
+		msg = fmt.Sprintf(msg, args...)
 		log.Printf("[DEBUG] %s\n", msg)
 	}
 }
