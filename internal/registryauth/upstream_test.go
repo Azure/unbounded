@@ -95,15 +95,19 @@ func TestRegistryAttachmentResolvesMergedAndAliasedNames(t *testing.T) {
 }
 
 func TestRegistryAttachmentRejectsUpstreamAliasCollisions(t *testing.T) {
+	target := "- name: " + testRegistry + "\n  endpoint: https://" + testRegistry + "\n"
+
 	for _, mode := range []string{ExternalMode, IdentityBindingMode} {
 		t.Run(mode, func(t *testing.T) {
-			for _, entry := range []string{
+			for _, conflict := range []string{
 				"- name: other.example\n  endpoint: https://other.example\n  ns_alias: " + testRegistry + "\n",
 				"- <<: &upstream\n    name: other.example\n    endpoint: https://other.example\n    ns_alias: " + testRegistry + "\n",
 			} {
-				_, changed, err := EnsureUpstream("upstream_registries:\n"+entry, "mode: "+mode+"\nregistry: "+testRegistry)
-				require.ErrorContains(t, err, "ns_alias")
-				require.False(t, changed)
+				for _, upstreams := range []string{conflict, target + conflict} {
+					_, changed, err := EnsureUpstream("upstream_registries:\n"+upstreams, "mode: "+mode+"\nregistry: "+testRegistry)
+					require.ErrorContains(t, err, "ns_alias", upstreams)
+					require.False(t, changed)
+				}
 			}
 		})
 	}

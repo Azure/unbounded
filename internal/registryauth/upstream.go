@@ -70,33 +70,41 @@ func EnsureUpstream(runtimeConfig, policy string) (string, bool, error) {
 		return "", false, errors.New("gantry upstream_registries must be a sequence")
 	}
 
-	for _, entry := range upstreams.Content {
+	entries := upstreams.Content
+	fields := make([]map[string]string, len(entries))
+
+	for index, entry := range entries {
 		if entry.Kind != yaml.MappingNode && entry.Kind != yaml.AliasNode {
 			return "", false, errors.New("gantry upstream registry must be a mapping")
 		}
 
-		var fields map[string]string
-		if err := entry.Decode(&fields); err != nil {
+		if err := entry.Decode(&fields[index]); err != nil {
 			return "", false, fmt.Errorf("decode Gantry upstream registry: %w", err)
 		}
+	}
 
-		if fields["name"] != cfg.Registry {
-			if fields["ns_alias"] == cfg.Registry {
-				return "", false, fmt.Errorf("registry %q collides with upstream %q ns_alias; resolve the alias before attachment", cfg.Registry, fields["name"])
-			}
+	// Validate every entry before returning unchanged, so an ns_alias that shadows
+	// the registry is rejected no matter where it appears in the sequence.
+	for _, entry := range fields {
+		if entry["name"] != cfg.Registry && entry["ns_alias"] == cfg.Registry {
+			return "", false, fmt.Errorf("registry %q collides with upstream %q ns_alias; resolve the alias before attachment", cfg.Registry, entry["name"])
+		}
+	}
 
-			if len(upstreams.Content) == 1 && len(fields) == 2 && fields["name"] == "registry.example.com" && fields["endpoint"] == "https://registry.example.com" {
+	for _, entry := range fields {
+		if entry["name"] != cfg.Registry {
+			if len(entries) == 1 && len(entry) == 2 && entry["name"] == "registry.example.com" && entry["endpoint"] == "https://registry.example.com" {
 				upstreams.Content = nil
 			}
 
 			continue
 		}
 
-		if cfg.Mode == IdentityBindingMode && fields["credentials_path"] != "" {
+		if cfg.Mode == IdentityBindingMode && entry["credentials_path"] != "" {
 			return "", false, errors.New("managed authentication conflicts with shared Gantry credentials_path; use external authentication")
 		}
 
-		if cfg.Mode == IdentityBindingMode && !matchingRegistryEndpoint(fields["endpoint"], cfg.Registry) {
+		if cfg.Mode == IdentityBindingMode && !matchingRegistryEndpoint(entry["endpoint"], cfg.Registry) {
 			return "", false, errors.New("managed ACR authentication requires the registry's matching HTTPS endpoint")
 		}
 
