@@ -4,8 +4,10 @@
 package executil
 
 import (
+	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -211,6 +213,93 @@ func TestRunCmdBuildsOneCommandPerAttempt(t *testing.T) {
 	if built != 1 {
 		t.Fatalf("factory was called %d times for a command that succeeded first time, want 1", built)
 	}
+}
+
+// runOutputCmd runs OutputCmd and fails the test if it does not return within
+// the given bound, so a blocked pipe fails the test instead of hanging it.
+func runOutputCmd(t *testing.T, within time.Duration, name string, args ...string) (string, error) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(t.Context(), within)
+	defer cancel()
+
+	type result struct {
+		output string
+		err    error
+	}
+
+	done := make(chan result, 1)
+
+	go func() {
+		output, err := OutputCmd(ctx, discardLogger(), name, args...)
+
+		done <- result{output: output, err: err}
+	}()
+
+	select {
+	case res := <-done:
+		return res.output, res.err
+	case <-time.After(within):
+		t.Fatalf("%s did not return within %s", name, within)
+		return "", nil
+	}
+}
+
+// TestOutputCmdHandlesLineLongerThanScannerDefault is the regression test for
+// a single output line longer than bufio.Scanner's 64 KiB default token.
+//
+// The scanner used to stop at that line, leave the rest of the pipe unread and
+// return without an error. The caller waits for the reading goroutine before
+// calling cmd.Wait, so a child still writing a line into a full pipe never
+// exited and the call hung; the lines after the long one were dropped even
+// when it did not.
+func TestOutputCmdHandlesLineLongerThanScannerDefault(t *testing.T) {
+	const (
+		lineLen = 96 * 1024
+		after   = "after the long line"
+	)
+
+	output, err := runOutputCmd(t, 5*time.Second,
+		"sh", "-c", fmt.Sprintf(`printf '%%*s\n%s\n' %d ''`, after, lineLen))
+	if err != nil {
+		t.Fatalf("OutputCmd: %v", err)
+	}
+
+	want := strings.Repeat(" ", lineLen) + "\n" + after
+	if output != want {
+		t.Fatalf("output = %d bytes ending %q, want %d bytes", len(output), tail(output), len(want))
+	}
+}
+
+// TestOutputCmdReportsOverlongLine covers the other half of the fix: a line
+// past the raised buffer bound is reported rather than dropped. The child has
+// to be able to finish writing for the call to return at all.
+func TestOutputCmdReportsOverlongLine(t *testing.T) {
+	output, err := runOutputCmd(t, 5*time.Second,
+		"sh", "-c", fmt.Sprintf(`printf '%%*s\n%s\n' %d ''`, "unreachable", maxLogLine+1024))
+	if err == nil {
+		t.Fatal("a line longer than maxLogLine must be reported rather than silently truncated")
+	}
+
+	if !errors.Is(err, bufio.ErrTooLong) {
+		t.Fatalf("err = %v, want it to carry bufio.ErrTooLong", err)
+	}
+
+	if output != "" {
+		t.Fatalf("output = %d bytes, want nothing alongside a read failure", len(output))
+	}
+}
+
+// tail returns at most the last few bytes of s, so a failure message about a
+// long line stays readable.
+func tail(s string) string {
+	const keep = 32
+
+	if len(s) <= keep {
+		return s
+	}
+
+	return s[len(s)-keep:]
 }
 
 // TestRetryWhileTextFileBusyHonorsContext confirms a canceled pass stops

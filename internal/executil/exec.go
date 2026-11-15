@@ -158,29 +158,34 @@ func runCmdOnce(ctx context.Context, logger *slog.Logger, stderrLevel slog.Level
 		return fmt.Errorf("failed to start %s: %w", cmd.Path, err)
 	}
 
-	var wg sync.WaitGroup
+	var (
+		wg                   sync.WaitGroup
+		stdoutErr, stderrErr error
+	)
 
 	wg.Add(2)
 
 	go func() {
 		defer wg.Done()
 
-		streamLogs(ctx, logger, stdout, slog.LevelDebug)
+		stdoutErr = streamLogs(ctx, logger, stdout, slog.LevelDebug)
 	}()
 
 	go func() {
 		defer wg.Done()
 
-		streamLogs(ctx, logger, stderr, stderrLevel)
+		stderrErr = streamLogs(ctx, logger, stderr, stderrLevel)
 	}()
 
 	wg.Wait()
 
+	// cmd.Wait runs even when a stream failed, so the child is reaped.
+	var waitErr error
 	if err := cmd.Wait(); err != nil {
-		return fmt.Errorf("%s failed: %w", cmd.Path, err)
+		waitErr = fmt.Errorf("%s failed: %w", cmd.Path, err)
 	}
 
-	return nil
+	return errors.Join(waitErr, stdoutErr, stderrErr)
 }
 
 // OutputCmd runs the command specified by name and args, streams stdout at
@@ -230,32 +235,40 @@ func outputCmdOnce(ctx context.Context, logger *slog.Logger, stderrLevel slog.Le
 
 	var buf bytes.Buffer
 
-	var wg sync.WaitGroup
+	var (
+		wg                   sync.WaitGroup
+		stdoutErr, stderrErr error
+	)
 
 	wg.Add(2)
 
 	go func() {
 		defer wg.Done()
 
-		streamLogs(ctx, logger, io.TeeReader(stdout, &buf), slog.LevelDebug)
+		stdoutErr = streamLogs(ctx, logger, io.TeeReader(stdout, &buf), slog.LevelDebug)
 	}()
 
 	go func() {
 		defer wg.Done()
 
-		streamLogs(ctx, logger, stderr, stderrLevel)
+		stderrErr = streamLogs(ctx, logger, stderr, stderrLevel)
 	}()
 
 	wg.Wait()
 
+	// cmd.Wait runs even when a stream failed, so the child is reaped.
+	var waitErr error
 	if err := cmd.Wait(); err != nil {
-		return "", fmt.Errorf("%s failed: %w", cmd.Path, err)
+		waitErr = fmt.Errorf("%s failed: %w", cmd.Path, err)
+	}
+
+	if err := errors.Join(waitErr, stdoutErr, stderrErr); err != nil {
+		return "", err
 	}
 
 	return strings.TrimRight(buf.String(), "\n"), nil
 }
 
-// streamLogs reads lines from reader and logs each one at the given level.
 // closeAll releases pipes belonging to a command that never started.
 func closeAll(closers ...io.Closer) {
 	for _, closer := range closers {
@@ -263,16 +276,39 @@ func closeAll(closers ...io.Closer) {
 	}
 }
 
-func streamLogs(ctx context.Context, logger *slog.Logger, reader io.Reader, level slog.Level) {
+// maxLogLine bounds how much of a single line streamLogs will buffer. The
+// default bufio.Scanner limit is 64 KiB, which a command emitting one long,
+// machine-generated line can exceed: the scanner then stops at that line and
+// the caller, which waits for this to finish before cmd.Wait, would otherwise
+// leave a child blocked writing into a full pipe.
+const maxLogLine = 4 << 20
+
+// streamLogs reads lines from reader and logs each one at the given level.
+//
+// A line longer than maxLogLine ends the stream with an error. The rest of the
+// reader is consumed first so the child can finish writing and exit instead of
+// blocking on a pipe nobody reads.
+func streamLogs(ctx context.Context, logger *slog.Logger, reader io.Reader, level slog.Level) error {
 	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 64*1024), maxLogLine)
+
 	for scanner.Scan() {
 		select {
 		case <-ctx.Done():
-			return
+			return nil
 		default:
 			logger.Log(ctx, level, scanner.Text())
 		}
 	}
+
+	err := scanner.Err()
+	if err == nil {
+		return nil
+	}
+
+	_, _ = io.Copy(io.Discard, reader) //nolint:errcheck // the read error that ended the scan is the one worth reporting
+
+	return fmt.Errorf("failed to read command output: %w", err)
 }
 
 // ---------------------------------------------------------------------------
