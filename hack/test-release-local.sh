@@ -212,8 +212,16 @@ if [[ "$SKIP_NET" != "1" || "$INCLUDE_HOST" == "1" || -n "${FORCE_IMAGES:-}" ]];
     )
     # --load only supports single-platform. Drop it for multi-arch builds
     # and just verify the build succeeds without importing into the daemon.
+    # Rebuild the array instead of using "${common_args[@]/--load/}", which
+    # leaves an empty element behind and passes it to docker as an argument.
     if [[ "$MULTI_ARCH" == "1" ]]; then
-        common_args=("${common_args[@]/--load/}")
+        loadless_args=()
+        for arg in "${common_args[@]}"; do
+            if [[ "$arg" != "--load" ]]; then
+                loadless_args+=("$arg")
+            fi
+        done
+        common_args=("${loadless_args[@]}")
     fi
 
     echo ""
