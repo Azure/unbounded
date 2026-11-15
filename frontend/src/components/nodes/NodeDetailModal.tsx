@@ -16,6 +16,7 @@ import { NodeStatus, NodeSummary } from '../../types';
 import {
   CloseXIcon,
   TableFilterButton,
+  clampPageIndex,
   firstUsableIpFromCidr,
   formatBytes,
   formatDateAndAge,
@@ -1194,6 +1195,13 @@ function NodeDetailModal({
   useEffect(() => {
     peerTable.setPageIndex(0);
   }, [peerFilter, filteredPeerRows.length, selectedPeerTypes, selectedHealthCheckStatuses, peerTable]);
+
+  useEffect(() => {
+    setPeerPagination((prev) => {
+      const nextPageIndex = clampPageIndex(prev.pageIndex, peerPageCount);
+      return nextPageIndex === prev.pageIndex ? prev : { ...prev, pageIndex: nextPageIndex };
+    });
+  }, [peerPageCount]);
 
   useEffect(() => {
     setRoutePagination((prev) => (prev.pageIndex === 0 ? prev : { ...prev, pageIndex: 0 }));

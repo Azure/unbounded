@@ -3,6 +3,7 @@
 
 export { uiDiag } from './uiDiag';
 export { CloseXIcon, MagnifyPlusIcon, TableFilterButton, useDismissOnOutside } from './tableUi';
+export { clampPageIndex } from './pagination';
 export {
   assessAksNode,
   expandedIpv6DestinationForSort,
