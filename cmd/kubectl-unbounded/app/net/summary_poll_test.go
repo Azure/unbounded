@@ -128,6 +128,62 @@ func TestMergeClusterSummaryDelta(t *testing.T) {
 	}
 }
 
+func TestNodeListWarningsStayOffJSONStdout(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		suppress bool
+	}{
+		{name: "shown"},
+		{name: "suppressed", suppress: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet || r.URL.Path != "/apis/status.net.unbounded-cloud.io/v1alpha1/status/json" {
+					t.Errorf("list requested non-overview endpoint: %s %s", r.Method, r.URL)
+					http.Error(w, "unexpected request", http.StatusBadRequest)
+
+					return
+				}
+
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, legacyOverviewFixture)
+			}))
+			defer server.Close()
+
+			cmd := newNodeRootCommand(newDetailTestRuntime(t, server.URL))
+
+			var out, errOut bytes.Buffer
+			cmd.SetOut(&out)
+			cmd.SetErr(&errOut)
+
+			args := []string{"list", "-o", "json", "--color=never"}
+			if tc.suppress {
+				args = append(args, "--suppress-warnings")
+			}
+
+			cmd.SetArgs(args)
+
+			if err := cmd.Execute(); err != nil {
+				t.Fatal(err)
+			}
+
+			var rows []nodeListRow
+			if err := json.Unmarshal(out.Bytes(), &rows); err != nil {
+				t.Fatalf("list JSON corrupted by warnings: %v\n%s", err, out.String())
+			}
+
+			if len(rows) != 1 || rows[0].Name != "node-a" {
+				t.Fatalf("list JSON rows changed: %+v", rows)
+			}
+
+			gotWarning := strings.Contains(errOut.String(), "WARNING: ")
+			if gotWarning == tc.suppress {
+				t.Fatalf("warnings shown = %t with --suppress-warnings=%t; stderr=%q", gotWarning, tc.suppress, errOut.String())
+			}
+		})
+	}
+}
+
 func TestNodeListUsesOnlyOverview(t *testing.T) {
 	for _, fixture := range []string{
 		legacyOverviewFixture,

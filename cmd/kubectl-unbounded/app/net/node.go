@@ -189,7 +189,8 @@ func runNodeList(rt *pluginRuntime, cmd *cobra.Command, baseFetch nodeStatusFetc
 	useColor := shouldUseColor(cmd.OutOrStdout(), color)
 
 	if !suppressWarnings {
-		printWarnings(cmd.OutOrStdout(), collectWarningsFromSummary(status), useColor)
+		// Warnings go to stderr so they never corrupt machine-readable output.
+		printWarnings(cmd.ErrOrStderr(), collectWarningsFromSummary(status), useColor)
 	}
 
 	switch output {
