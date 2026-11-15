@@ -75,7 +75,8 @@ func EnsureSchema(db *sql.DB, expectedDB string) error {
 
 // UpsertDevices inserts or updates device records into the PostgreSQL
 // inventory table. Conflicts on serial_number trigger an update when any
-// mutable column differs.
+// mutable column differs. It returns the number of rows actually inserted or
+// updated.
 func UpsertDevices(ctx context.Context, db *sql.DB, records []*inventoryv1.DeviceRecord) (int, error) {
 	const upsertSQL = `
 INSERT INTO inventory (device_type, device_name, host_identifier, serial_number, attributes)
@@ -105,11 +106,17 @@ WHERE inventory.device_name     != EXCLUDED.device_name
 	saved := 0
 
 	for _, r := range records {
-		if _, err := stmt.ExecContext(ctx, r.DeviceType, r.DeviceName, r.HostIdentifier, r.SerialNumber, string(r.Attributes)); err != nil {
+		res, err := stmt.ExecContext(ctx, r.DeviceType, r.DeviceName, r.HostIdentifier, r.SerialNumber, string(r.Attributes))
+		if err != nil {
 			return saved, fmt.Errorf("upserting device %q: %w", r.SerialNumber, err)
 		}
 
-		saved++
+		affected, err := res.RowsAffected()
+		if err != nil {
+			return saved, fmt.Errorf("counting rows affected for device %q: %w", r.SerialNumber, err)
+		}
+
+		saved += int(affected)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -121,7 +128,8 @@ WHERE inventory.device_name     != EXCLUDED.device_name
 
 // UpsertNeighbors inserts or updates neighbor records into the PostgreSQL
 // neighbors table. Conflicts on (host_identifier, local_interface) trigger an
-// update when attributes differ.
+// update when attributes differ. It returns the number of rows actually
+// inserted or updated.
 func UpsertNeighbors(ctx context.Context, db *sql.DB, records []*inventoryv1.NeighborRecord) (int, error) {
 	const upsertSQL = `
 INSERT INTO neighbors (host_identifier, local_interface, attributes)
@@ -146,11 +154,17 @@ WHERE neighbors.attributes != EXCLUDED.attributes;`
 	saved := 0
 
 	for _, r := range records {
-		if _, err := stmt.ExecContext(ctx, r.HostIdentifier, r.LocalInterface, string(r.Attributes)); err != nil {
+		res, err := stmt.ExecContext(ctx, r.HostIdentifier, r.LocalInterface, string(r.Attributes))
+		if err != nil {
 			return saved, fmt.Errorf("upserting neighbor %q on %q: %w", r.HostIdentifier, r.LocalInterface, err)
 		}
 
-		saved++
+		affected, err := res.RowsAffected()
+		if err != nil {
+			return saved, fmt.Errorf("counting rows affected for neighbor %q on %q: %w", r.HostIdentifier, r.LocalInterface, err)
+		}
+
+		saved += int(affected)
 	}
 
 	if err := tx.Commit(); err != nil {
