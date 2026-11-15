@@ -311,10 +311,16 @@ func (mm *MasqueradeManager) ruleArgsToListFormat(args []string) string {
 	return result
 }
 
-// normalizeRuleString trims and collapses whitespace in an iptables rule string
-// so that minor spacing differences do not cause false mismatches.
+// normalizeRuleString trims, collapses whitespace, and strips the double quotes
+// that iptables -S puts around values containing spaces (comments, for example),
+// so that a locally rendered rule matches the same rule as printed.
 func normalizeRuleString(rule string) string {
-	return strings.Join(strings.Fields(strings.TrimSpace(rule)), " ")
+	fields := strings.Fields(strings.TrimSpace(rule))
+	for i, field := range fields {
+		fields[i] = strings.Trim(field, `"`)
+	}
+
+	return strings.Join(fields, " ")
 }
 
 // parseRuleFromListFormat extracts rule arguments from the iptables list format
