@@ -5,12 +5,14 @@ package operator
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/json"
+	"errors"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -29,6 +31,7 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 func TestAllocAllocatesRunnerWithHostPortEndpoint(t *testing.T) {
@@ -973,13 +976,15 @@ func TestReconcileCountsOnlyAllocatableRunnerPods(t *testing.T) {
 	claimed.Annotations[AnnotationRequestHash] = hashString("request")
 	claimed.Annotations[AnnotationClaimedAt] = time.Now().UTC().Format(time.RFC3339)
 
+	// An unclaimed unavailable pod is replaced rather than left in place, so the pool
+	// still holds exactly the target count after reconcile.
 	tests := []struct {
 		name     string
 		pod      *corev1.Pod
 		wantPods int
 	}{
-		{name: "pending", pod: pending, wantPods: 2},
-		{name: "crash looping", pod: crashLooping, wantPods: 2},
+		{name: "pending", pod: pending, wantPods: 1},
+		{name: "crash looping", pod: crashLooping, wantPods: 1},
 		{name: "ready", pod: ready, wantPods: 1},
 		{name: "claimed", pod: claimed, wantPods: 2},
 	}
@@ -1008,6 +1013,137 @@ func TestReconcileCountsOnlyAllocatableRunnerPods(t *testing.T) {
 	}
 }
 
+func TestReconcileReplacesPendingIdleRunnerWithoutAccumulating(t *testing.T) {
+	pending := testPodWithHostPort("pending-runner", "node-1", 52000)
+	pending.Status = corev1.PodStatus{Phase: corev1.PodPending}
+
+	op := testOperator(t, pending)
+	op.Config.RunnerAMD64Count = 1
+	op.Config.RunnerARM64Count = 0
+	op.Config.RunnerWireGuardHostPortStart = 52000
+	op.Config.RunnerWireGuardHostPortEnd = 52005
+
+	for range 3 {
+		if err := op.ReconcileRunners(t.Context()); err != nil {
+			t.Fatalf("reconcile: %v", err)
+		}
+	}
+
+	pods := &corev1.PodList{}
+	if err := op.Client.List(t.Context(), pods, client.InNamespace("playpen"), client.MatchingLabels{"app.kubernetes.io/name": runnerAppName}); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(pods.Items) != 1 {
+		t.Fatalf("pods = %d, want 1 after repeated reconciles", len(pods.Items))
+	}
+
+	if pods.Items[0].Name == pending.Name {
+		t.Fatal("unavailable idle runner pod was not replaced")
+	}
+}
+
+func TestReconcileKeepsReadyRunnerPod(t *testing.T) {
+	ready := testPodWithHostPort("ready-runner", "node-1", 52000)
+
+	op := testOperator(t, ready)
+	op.Config.RunnerAMD64Count = 1
+	op.Config.RunnerARM64Count = 0
+	op.Config.RunnerWireGuardHostPortStart = 52000
+	op.Config.RunnerWireGuardHostPortEnd = 52005
+
+	if err := op.ReconcileRunners(t.Context()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	pods := &corev1.PodList{}
+	if err := op.Client.List(t.Context(), pods, client.InNamespace("playpen"), client.MatchingLabels{"app.kubernetes.io/name": runnerAppName}); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(pods.Items) != 1 {
+		t.Fatalf("pods = %d, want 1", len(pods.Items))
+	}
+
+	if pods.Items[0].Name != ready.Name {
+		t.Fatalf("pod = %q, want the ready pod %q", pods.Items[0].Name, ready.Name)
+	}
+}
+
+func TestReconcileKeepsClaimedUnavailableRunnerPod(t *testing.T) {
+	claimed := testPodWithHostPort("claimed-runner", "node-1", 52000)
+	claimed.Status = corev1.PodStatus{Phase: corev1.PodPending}
+	claimed.Annotations[AnnotationIdempotencyKeyHash] = hashString("claim")
+	claimed.Annotations[AnnotationRequestHash] = hashString("request")
+	claimed.Annotations[AnnotationClaimedAt] = time.Now().UTC().Format(time.RFC3339)
+
+	op := testOperator(t, claimed)
+	op.Config.PlaypenTTL = time.Hour
+	op.Config.RunnerAMD64Count = 0
+	op.Config.RunnerARM64Count = 0
+
+	if err := op.ReconcileRunners(t.Context()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	pod := &corev1.Pod{}
+	if err := op.Client.Get(t.Context(), client.ObjectKey{Namespace: "playpen", Name: claimed.Name}, pod); err != nil {
+		t.Fatalf("claimed pod was deleted: %v", err)
+	}
+}
+
+func TestReconcileControlPlanePoolDespiteRunnerHostPortError(t *testing.T) {
+	ready := testPodWithHostPort("ready-runner", "node-1", 52000)
+
+	op := testOperator(t, ready)
+	op.Config.RunnerAMD64Count = 2
+	op.Config.RunnerARM64Count = 0
+	op.Config.RunnerWireGuardHostPortStart = 52000
+	op.Config.RunnerWireGuardHostPortEnd = 52000
+	op.Config.ControlPlaneCount = 1
+	op.Config.ControlPlaneVersions = []string{"v1.33.0"}
+	op.Config.ControlPlaneAPIServerHostPortStart = 16443
+	op.Config.ControlPlaneAPIServerHostPortEnd = 16444
+
+	if err := op.ReconcileRunners(t.Context()); err == nil {
+		t.Fatal("reconcile succeeded without a free runner hostPort")
+	}
+
+	pods := &corev1.PodList{}
+	if err := op.Client.List(t.Context(), pods, client.InNamespace("playpen"), client.MatchingLabels{"app.kubernetes.io/name": controlPlaneAppName}); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(pods.Items) != 1 {
+		t.Fatalf("control-plane pods = %d, want 1 despite runner pool error", len(pods.Items))
+	}
+}
+
+func TestReconcileToleratesUnavailablePodDeleteFailure(t *testing.T) {
+	pending := testPodWithHostPort("pending-runner", "node-1", 52000)
+	pending.Status = corev1.PodStatus{Phase: corev1.PodPending}
+
+	op := testOperator(t, pending)
+	op.Client = interceptor.NewClient(op.Client.(client.WithWatch), interceptor.Funcs{
+		Delete: func(context.Context, client.WithWatch, client.Object, ...client.DeleteOption) error {
+			return errors.New("delete failed")
+		},
+	})
+	op.Config.RunnerAMD64Count = 1
+	op.Config.RunnerARM64Count = 0
+	op.Config.RunnerWireGuardHostPortStart = 52000
+	op.Config.RunnerWireGuardHostPortEnd = 52005
+
+	if err := op.ReconcileRunners(t.Context()); err != nil {
+		t.Fatalf("reconcile returned an error for a failed pod delete: %v", err)
+	}
+
+	pod := &corev1.Pod{}
+	if err := op.Client.Get(t.Context(), client.ObjectKey{Namespace: "playpen", Name: pending.Name}, pod); err != nil {
+		t.Fatalf("pending pod was deleted despite the delete failure: %v", err)
+	}
+}
+
 func TestReconcileReplacesPendingIdleControlPlanePod(t *testing.T) {
 	pending := testControlPlanePod("pending-control-plane", "node-1", "v1.33.0", 16443)
 	pending.Status = corev1.PodStatus{Phase: corev1.PodPending}
@@ -1029,8 +1165,12 @@ func TestReconcileReplacesPendingIdleControlPlanePod(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if len(pods.Items) != 2 {
-		t.Fatalf("pods = %d, want 2", len(pods.Items))
+	if len(pods.Items) != 1 {
+		t.Fatalf("pods = %d, want 1", len(pods.Items))
+	}
+
+	if pods.Items[0].Name == pending.Name {
+		t.Fatal("unavailable control-plane pod was not replaced")
 	}
 }
 

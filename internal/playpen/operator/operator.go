@@ -707,11 +707,9 @@ func (o *Operator) ReconcileRunners(ctx context.Context) error {
 		remaining = append(remaining, *pod)
 	}
 
-	if err := o.reconcileRunnerPool(ctx, remaining); err != nil {
-		return err
-	}
-
-	return o.reconcileControlPlanePool(ctx, remaining)
+	// Both pools reconcile even when one fails. A runner pool that cannot allocate a
+	// hostPort must not stop the control-plane pool from filling its own target.
+	return errors.Join(o.reconcileRunnerPool(ctx, remaining), o.reconcileControlPlanePool(ctx, remaining))
 }
 
 type runnerPoolTarget struct {
@@ -732,6 +730,8 @@ func (o *Operator) reconcileRunnerPool(ctx context.Context, pods []corev1.Pod) e
 	usedHostPorts := map[int32]struct{}{}
 	idleCounts := map[string]int{}
 
+	unavailable := make([]corev1.Pod, 0)
+
 	for i := range pods {
 		pod := &pods[i]
 		if podResourceType(pod) != ResourceTypeRunner {
@@ -743,10 +743,21 @@ func (o *Operator) reconcileRunnerPool(ctx context.Context, pods []corev1.Pod) e
 			usedHostPorts[hostPort] = struct{}{}
 		}
 
-		if hostPort != 0 && idlePoolPod(pod) {
+		if !idlePoolPod(pod) {
+			unavailable = append(unavailable, *pod)
+
+			continue
+		}
+
+		if hostPort != 0 {
 			idleCounts[podArchitecture(pod)]++
 		}
 	}
+
+	// Replace pods that Alloc cannot hand out before filling the target. Without this,
+	// a Pending or crash-looping pod is never counted as idle, so every tick adds a new
+	// pod for the same slot until the hostPort range runs out.
+	o.deleteUnavailablePoolPods(ctx, unavailable)
 
 	for _, target := range targets {
 		if target.count < 0 {
@@ -798,6 +809,8 @@ func (o *Operator) reconcileControlPlanePool(ctx context.Context, pods []corev1.
 	usedHostPorts := map[int32]struct{}{}
 	idleCounts := map[string]int{}
 
+	unavailable := make([]corev1.Pod, 0)
+
 	for i := range pods {
 		pod := &pods[i]
 		if podResourceType(pod) != ResourceTypeControlPlane {
@@ -809,10 +822,20 @@ func (o *Operator) reconcileControlPlanePool(ctx context.Context, pods []corev1.
 			usedHostPorts[hostPort] = struct{}{}
 		}
 
-		if hostPort != 0 && idlePoolPod(pod) {
+		if !idlePoolPod(pod) {
+			unavailable = append(unavailable, *pod)
+
+			continue
+		}
+
+		if hostPort != 0 {
 			idleCounts[podKubernetesVersion(pod)]++
 		}
 	}
+
+	// See reconcileRunnerPool: a pod that Alloc cannot hand out is replaced instead of
+	// being left in place while another pod is created for the same target slot.
+	o.deleteUnavailablePoolPods(ctx, unavailable)
 
 	for _, target := range targets {
 		if target.count < 0 {
@@ -839,6 +862,49 @@ func (o *Operator) reconcileControlPlanePool(ctx context.Context, pods []corev1.
 	}
 
 	return nil
+}
+
+// deleteUnavailablePoolPods deletes unclaimed, non-terminating pool pods that Alloc
+// cannot hand out. Pods that are still becoming ready are included: they do not count
+// toward the idle target, so leaving them in place would make every reconcile add
+// another pod for the same slot. The caller fills the target after these deletions, so
+// repeated passes keep the pool at its target instead of growing it.
+//
+// Each pod is re-read before deletion so a pod that became ready after the list call is
+// kept. A failed re-read or delete is logged and skipped; one stuck pod must not stop
+// the rest of the reconcile.
+func (o *Operator) deleteUnavailablePoolPods(ctx context.Context, pods []corev1.Pod) {
+	for i := range pods {
+		pod := &pods[i]
+		if pod.Annotations[AnnotationIdempotencyKeyHash] != "" || !pod.DeletionTimestamp.IsZero() {
+			continue
+		}
+
+		current := &corev1.Pod{}
+
+		err := o.Client.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}, current)
+		if apierrors.IsNotFound(err) {
+			continue
+		}
+
+		if err != nil {
+			klog.Warningf("Failed to re-read playpen pod %s/%s before replacing it: %v", pod.Namespace, pod.Name, err)
+
+			continue
+		}
+
+		if current.Annotations[AnnotationIdempotencyKeyHash] != "" || !current.DeletionTimestamp.IsZero() {
+			continue
+		}
+
+		if runnerPodUnavailableReason(current) == "" {
+			continue
+		}
+
+		if err := o.deleteRunnerPod(ctx, current); err != nil {
+			klog.Warningf("Failed to delete unavailable playpen pod %s/%s: %v", current.Namespace, current.Name, err)
+		}
+	}
 }
 
 func (o *Operator) nextRunnerHostPort(used map[int32]struct{}) (int32, bool) {
