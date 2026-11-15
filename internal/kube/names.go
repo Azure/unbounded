@@ -10,10 +10,7 @@ import (
 	"strings"
 )
 
-const (
-	maxK8sNameLength  = 253
-	maxK8sLabelLength = 63
-)
+const maxK8sNameLength = 253
 
 // nonK8sNameChars matches any character that is not a lowercase alphanumeric,
 // dash, or dot - i.e. characters not allowed in a Kubernetes object name.
@@ -22,8 +19,11 @@ var nonK8sNameChars = regexp.MustCompile(`[^a-z0-9\-.]`)
 // SanitizeK8sName converts a raw string into a valid Kubernetes object name.
 // Each dot-separated label is lowercased, characters outside [a-z0-9-] are
 // replaced with '-', runs of '-' are collapsed, and leading/trailing '-'
-// characters are trimmed. Empty labels are dropped, each label is limited to
-// 63 bytes, and the whole name is limited to 253 bytes. If the input has no
+// characters are trimmed. Empty labels are dropped and the whole name is
+// limited to 253 bytes. Individual labels are not length-limited: Kubernetes
+// validates object names with IsDNS1123Subdomain, which caps the total length
+// but imposes no per-label limit, so preserving a long label keeps names that
+// the API server already accepts unchanged. If the input has no
 // usable characters, the result is a stable name derived from a hash of the
 // input. The returned string is always a non-empty RFC-1123 subdomain.
 func SanitizeK8sName(raw string) string {
@@ -38,10 +38,6 @@ func SanitizeK8sName(raw string) string {
 	for _, label := range labels {
 		label = collapseDashes(label)
 		label = strings.Trim(label, "-")
-
-		if len(label) > maxK8sLabelLength {
-			label = strings.TrimRight(label[:maxK8sLabelLength], "-")
-		}
 
 		if label != "" {
 			sanitized = append(sanitized, label)
