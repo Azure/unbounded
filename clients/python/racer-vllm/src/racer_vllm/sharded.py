@@ -131,6 +131,8 @@ def parallel_info(parallel_config=None) -> dict:
             if not ep_known:
                 out["enable_expert_parallel"] = out["ep"] > 1
         except Exception:
+            # The expert parallel group cannot be queried, so keep the defaults
+            # set above: ep stays 1 and enable_expert_parallel stays as configured.
             pass
     return out
 

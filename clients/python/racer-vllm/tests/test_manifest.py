@@ -12,9 +12,8 @@ import pytest
 from conftest import make_safetensors
 from modelfix import checkpoint, manifest_for
 
-import racer_vllm
 from racer_vllm import manifest as mf
-from racer_vllm import settings
+from racer_vllm import parse_uri, settings
 
 HERE = os.path.dirname(__file__)
 
@@ -23,20 +22,20 @@ HERE = os.path.dirname(__file__)
 
 
 def test_parse_uri():
-    u = racer_vllm.parse_uri("racer://c/b/a/b/c/")
+    u = parse_uri("racer://c/b/a/b/c/")
     assert (u.cache, u.bucket, u.prefix) == ("c", "b", "a/b/c")
     assert u.key("x.json") == "a/b/c/x.json"
     assert str(u) == "racer://c/b/a/b/c"
     assert u.child("/sharded/fp/").prefix == "a/b/c/sharded/fp"
-    bare = racer_vllm.parse_uri("racer://c/b")
+    bare = parse_uri("racer://c/b")
     assert bare.prefix == "" and bare.key("x") == "x" and str(bare) == "racer://c/b"
-    assert u.request("x").hex == racer_vllm.parse_uri("racer://other/b/a/b/c").request("x").hex
+    assert u.request("x").hex == parse_uri("racer://other/b/a/b/c").request("x").hex
 
 
 @pytest.mark.parametrize("bad", ["s3://c/b/p", "racer://c", "racer:///b/p", "racer://c//p", "racer://c/b/../x", None])
 def test_parse_uri_rejects(bad):
     with pytest.raises(ValueError):
-        racer_vllm.parse_uri(bad)
+        parse_uri(bad)
 
 
 # Model manifests

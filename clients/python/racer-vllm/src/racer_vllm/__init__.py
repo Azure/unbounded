@@ -13,6 +13,7 @@ from .uri import ModelURI, parse_uri
 
 __all__ = ["LOAD_FORMAT", "CaptureComplete", "ModelURI", "fetch_main", "main", "parse_uri", "register"]
 
+# Set by register() so a second call is a no-op.
 _registered = False
 
 

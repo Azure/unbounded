@@ -60,6 +60,7 @@ def _allocator_factory(mode: str):
         if torch.cuda.is_available():
             device = torch.cuda.current_device()
     except ImportError:
+        # torch is optional: without it, keep device 0 and the allocators run CPU-only.
         pass
     return reader.GpuAllocator(device) if mode == reader.GPU else reader.HostAllocator(device)
 

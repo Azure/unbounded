@@ -39,27 +39,27 @@ def run(capsys, *argv):
     ],
 )
 def test_usage_errors_exit_2(capsys, argv, match):
-    rc, out, err = run(capsys, *argv)
+    rc, _, err = run(capsys, *argv)
     assert rc == 2 and match in err
 
 
 @pytest.mark.parametrize("cmd", [[], ["materialize"], ["import"], ["prepare"], ["warm"], ["inspect"]])
 def test_help_everywhere(capsys, cmd):
-    rc, out, err = run(capsys, *cmd, "--help")
+    rc, out, _ = run(capsys, *cmd, "--help")
     assert rc == 0 and "usage: racer-vllm" in out
 
 
 def test_fetch_alias(capsys, server, tmp_path):
-    u, files, m = publish(server)
+    _u, _files, _m = publish(server)
     rc = fetch_main([URI, str(tmp_path / "d"), "--socket", server.path])
-    out, err = capsys.readouterr()
+    _, err = capsys.readouterr()
     assert rc == 0 and "deprecated" in err
     assert (tmp_path / "d" / mf.SOURCE_NAME).is_file()
     assert fetch_main(["--help"]) == 0
 
 
 def test_prepare_rejects_loader_flags(capsys):
-    rc, out, err = run(capsys, "prepare", URI, "--dest", "file:///x", "--", "--load-format=auto")
+    rc, _, err = run(capsys, "prepare", URI, "--dest", "file:///x", "--", "--load-format=auto")
     assert rc == 1 and "--load-format is set by racer-vllm prepare" in err
 
 
@@ -67,7 +67,7 @@ def test_prepare_rejects_loader_flags(capsys):
 
 
 def test_materialize_copies_aux_files_and_pins(capsys, server, tmp_path):
-    u, files, m = publish(server)
+    _, files, m = publish(server)
     d = tmp_path / "model"
     rc, out, err = run(capsys, "materialize", URI, str(d), "--socket", server.path)
     assert rc == 0, err
@@ -83,23 +83,23 @@ def test_materialize_copies_aux_files_and_pins(capsys, server, tmp_path):
 
 
 def test_materialize_rejects_a_corrupt_file(capsys, server, tmp_path):
-    u, files, m = publish(server)
+    u, _files, _m = publish(server)
     put(server, u, "config.json", b'{"model_type":"llamb"}')
     d = tmp_path / "model"
-    rc, out, err = run(capsys, "materialize", URI, str(d), "--socket", server.path)
+    rc, _, err = run(capsys, "materialize", URI, str(d), "--socket", server.path)
     assert rc == 1 and "config.json: sha256 mismatch" in err
     assert not (d / mf.SOURCE_NAME).exists()
 
 
 def test_materialize_needs_a_manifest(capsys, server, tmp_path):
-    rc, out, err = run(capsys, "materialize", URI, str(tmp_path / "d"), "--socket", server.path)
+    rc, _, err = run(capsys, "materialize", URI, str(tmp_path / "d"), "--socket", server.path)
     assert rc == 1 and "racer-vllm import" in err
 
 
 def test_materialize_reports_a_size_mismatch(capsys, server, tmp_path):
-    u, files, m = publish(server)
+    u, files, _ = publish(server)
     put(server, u, "a.safetensors", files["a.safetensors"][:-1])
-    rc, out, err = run(capsys, "materialize", URI, str(tmp_path / "d"), "--socket", server.path)
+    rc, _, err = run(capsys, "materialize", URI, str(tmp_path / "d"), "--socket", server.path)
     assert rc == 1 and "a.safetensors" in err and "import the model again" in err
 
 
@@ -181,13 +181,13 @@ def test_import_rejects_links_out_of_the_cache(capsys, tmp_path):
     secret = tmp_path / "secret"
     secret.write_text("x")
     os.symlink(secret, snap / "leak.json")
-    rc, out, err = run(capsys, "import", "--source", str(snap), "--dest", f"file://{tmp_path}/d")
+    rc, _, err = run(capsys, "import", "--source", str(snap), "--dest", f"file://{tmp_path}/d")
     assert rc == 1 and "links outside the model cache directory" in err
 
 
 def test_import_rejects_a_bad_safetensors_file(capsys, tmp_path):
     snap = hf_snapshot(tmp_path, {"model.safetensors": b"\xff" * 16})
-    rc, out, err = run(capsys, "import", "--source", str(snap), "--dest", f"file://{tmp_path}/d")
+    rc, _, err = run(capsys, "import", "--source", str(snap), "--dest", f"file://{tmp_path}/d")
     assert rc == 1 and "model.safetensors" in err
 
 
@@ -220,7 +220,7 @@ def test_azure_destination_without_the_extra(monkeypatch):
 
 
 def test_warm_prefetches_every_weight_file(capsys, server):
-    u, files, m = publish(server)
+    u, _files, _m = publish(server)
     rc, out, err = run(capsys, "warm", URI, "--socket", server.path, "--poll", "0.01")
     assert rc == 0, err
     put_bodies = [json.loads(s.body) for s in server.seen if s.method == "PUT"]
@@ -240,7 +240,7 @@ def test_warm_fails_when_a_ref_fails(capsys, server):
 def test_warm_times_out(capsys, server):
     publish(server)
     server.prefetches.outcome = lambda tid, ref: Outcome(pending=True)
-    rc, out, err = run(capsys, "warm", URI, "--socket", server.path, "--poll", "0.01", "--timeout", "0.05")
+    rc, out, _ = run(capsys, "warm", URI, "--socket", server.path, "--poll", "0.01", "--timeout", "0.05")
     assert rc == 1 and "timed out" in out
 
 
@@ -248,7 +248,7 @@ def test_warm_times_out(capsys, server):
 
 
 def test_inspect(capsys, server):
-    u, files, m = publish(server)
+    u, files, _ = publish(server)
     rc, out, err = run(capsys, "inspect", URI, "--socket", server.path)
     assert rc == 0, err
     assert "org/llama @ r1" in out and "sharded   none" in out
@@ -263,7 +263,7 @@ def test_inspect(capsys, server):
 
 def test_prepare_captures_and_publishes(capsys, monkeypatch, server, torch, tmp_path):
     install_fake_vllm(monkeypatch)
-    u, files, m = publish(server)
+    u, _, m = publish(server)
     dest = tmp_path / "origin"
     state = {"layer.a": b"\1" * 16}
     seen = {}
@@ -292,7 +292,7 @@ def test_prepare_captures_and_publishes(capsys, monkeypatch, server, torch, tmp_
 
 def test_prepare_does_not_publish_an_incomplete_capture(monkeypatch, server, torch, tmp_path):
     install_fake_vllm(monkeypatch)
-    u, files, m = publish(server)
+    u, _, m = publish(server)
     dest = tmp_path / "origin"
 
     def runner(model_dir, extra, args):
@@ -311,14 +311,14 @@ def test_prepare_without_vllm(capsys, monkeypatch, server, tmp_path):
     for mod in ("vllm", "vllm.engine", "vllm.engine.arg_utils"):
         monkeypatch.setitem(sys.modules, mod, None)
     monkeypatch.setattr("racer_vllm._registered", True)
-    rc, out, err = run(capsys, "prepare", URI, "--dest", f"file://{tmp_path}/o", "--workdir", str(tmp_path / "w"),
+    rc, _, err = run(capsys, "prepare", URI, "--dest", f"file://{tmp_path}/o", "--workdir", str(tmp_path / "w"),
                        "--socket", server.path)
     assert rc == 1 and "needs vLLM" in err
 
 
 def test_inspect_lists_sharded_artifacts(capsys, monkeypatch, server, torch, tmp_path):
     install_fake_vllm(monkeypatch)
-    u, files, m = publish(server)
+    u, _, m = publish(server)
     out_dir = str(tmp_path / "cap")
     sharded.capture(Model(model_state({"x": b"\0" * 4})), "target", out_dir, fingerprint="e" * 32, rank=0,
                     world_size=1, source_manifest_sha256=mf.digest(m))
@@ -327,7 +327,7 @@ def test_inspect_lists_sharded_artifacts(capsys, monkeypatch, server, torch, tmp
     from modelfix import serve_dir
 
     serve_dir(server, u, str(root))
-    rc, out, err = run(capsys, "inspect", URI, "--socket", server.path)
+    rc, out, _ = run(capsys, "inspect", URI, "--socket", server.path)
     assert rc == 0 and f"sharded   {'e' * 32} role=target ranks 1/1 vllm=0.33.0" in out
     assert W  # the checkpoint fixtures stay importable
 

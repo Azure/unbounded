@@ -10,8 +10,7 @@ import inspect
 
 import pytest
 
-import racer_vllm
-from racer_vllm import compat, loader
+from racer_vllm import compat, loader, register
 
 pytestmark = pytest.mark.vllm
 
@@ -23,8 +22,8 @@ def base():
 
 
 def test_loader_subclass_registers(base):
-    racer_vllm.register()
-    racer_vllm.register()
+    register()
+    register()
     cls = loader.loader_class()
     assert issubclass(cls, base) and issubclass(cls, loader.RacerLoaderMixin)
     from vllm.model_executor import model_loader as ml

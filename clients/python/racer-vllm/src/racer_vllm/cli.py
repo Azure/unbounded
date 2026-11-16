@@ -319,6 +319,7 @@ def inspect(client, uri: ModelURI, out=print) -> dict:
                 client.stat(uri.child(artifact_prefix(a["fingerprint"], a["role"], rank)).request(mf.SHARDED_NAME))
                 have += 1
             except racer.NotFound:
+                # inspect reports what exists; a missing rank just lowers the count.
                 pass
         out(
             f"sharded   {a['fingerprint']} role={a['role']} ranks {have}/{a['world_size']}"
