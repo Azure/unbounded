@@ -775,3 +775,66 @@ def test_sharded_verify_full_refuses_entries_without_digest(monkeypatch, server,
     with pytest.raises(sharded.ShardedMismatch, match="re-run racer-vllm prepare"):
         ld.load_weights(target, model_config(d))
     assert target.state["layer.a"].bytes() == b"\0" * len(STATE["layer.a"])
+def _rank_dir(out, fp="f" * 32):
+    import os
+    return os.path.join(out, sharded.artifact_prefix(fp, "target", 0))
+def test_capture_round_trips_through_the_safetensors_parser(monkeypatch, torch, tmp_path):
+    install_fake_vllm(monkeypatch)
+    import os
+    out = capture_to(tmp_path, STATE)
+    d = _rank_dir(out)
+    data = open(os.path.join(d, sharded.DATA_NAME), "rb").read()
+    n = mf.header_length(data[:8])
+    tensors = mf.parse_header(data[8 : 8 + n], len(data))
+    assert {t.name: data[t.start : t.end] for t in tensors} == STATE
+    doc = mf.load_sharded(os.path.join(d, mf.SHARDED_NAME))
+    import hashlib
+    for name, e in doc["files"][0]["tensors"].items():
+        raw = data[e["offset"] : e["offset"] + e["size"]]
+        assert raw == STATE[name] and e["sha256"] == hashlib.sha256(raw).hexdigest()
+    assert doc["files"][0]["size"] == len(data)
+    assert sorted(os.listdir(d)) == [sharded.DATA_NAME, mf.SHARDED_NAME]
+class _Live(bytes):
+    """Serialized bytes that count how many are alive at once."""
+    live = peak = 0
+    def __new__(cls, raw):
+        obj = super().__new__(cls, raw)
+        _Live.live += 1
+        _Live.peak = max(_Live.peak, _Live.live)
+        return obj
+    def __del__(self):
+        _Live.live -= 1
+def test_capture_holds_one_serialized_tensor_at_a_time(monkeypatch, torch, tmp_path):
+    install_fake_vllm(monkeypatch)
+    real = sharded.tensor_bytes
+    monkeypatch.setattr(sharded, "tensor_bytes", lambda t: _Live(real(t)))
+    _Live.live = _Live.peak = 0
+    state = {f"layer.{i}": bytes([i]) * 16 for i in range(5)}
+    capture_to(tmp_path, state)
+    assert _Live.peak == 1 and _Live.live == 0
+def test_capture_write_failure_leaves_no_artifact(monkeypatch, torch, tmp_path):
+    install_fake_vllm(monkeypatch)
+    import os
+    calls = []
+    def boom(t):
+        calls.append(t)
+        if len(calls) == 2:
+            raise OSError("disk full")
+        return t.bytes()
+    monkeypatch.setattr(sharded, "tensor_bytes", boom)
+    with pytest.raises(OSError, match="disk full"):
+        capture_to(tmp_path, STATE)
+    assert os.listdir(_rank_dir(str(tmp_path / "capture"))) == []
+def test_capture_dedupes_shared_storage(monkeypatch, torch, tmp_path):
+    import os
+    from conftest import FakeTensor
+    buf = bytearray(b"\x01" * 16 + b"\x02" * 16)
+    whole = FakeTensor(buf)
+    state = {"w": whole, "w.alias": whole, "w.half": whole[slice(0, 16)], "b": FakeTensor(bytearray(b"\x03" * 8))}
+    # Fake tensors have no storage pointers; check that capture keeps exactly what the filter keeps.
+    monkeypatch.setattr(sharded, "filter_subtensors", lambda s: {k: s[k] for k in ("b", "w")})
+    out = str(tmp_path / "capture")
+    sharded.capture(Model(state), "target", out, fingerprint="f" * 32, rank=0, world_size=1,
+                    source_manifest_sha256="0" * 64)
+    doc = mf.load_sharded(os.path.join(_rank_dir(out), mf.SHARDED_NAME))
+    assert sorted(doc["files"][0]["tensors"]) == ["b", "w"]

@@ -18,6 +18,7 @@ import collections
 import hashlib
 import json
 import logging
+import math
 import os
 import struct
 
@@ -225,29 +226,42 @@ def capture(
     state = filter_subtensors(model.state_dict())
     d = os.path.join(out_dir, artifact_prefix(fingerprint, role, rank))
     os.makedirs(d, exist_ok=True)
-    header, blobs, entries, pos = {}, [], {}, 0
-    for name in sorted(state):
+    # Build the header from dtype and shape alone, then stream one tensor at a
+    # time, so peak host memory is a single serialized tensor, not the rank.
+    header, entries, names, pos = {}, {}, sorted(state), 0
+    for name in names:
         t = state[name]
         dtype = mf.TORCH_TO_SAFETENSORS.get(_dtype_name(t.dtype))
         if dtype is None:
             raise ValueError(f"racer: cannot capture {name!r}: dtype {t.dtype} has no safetensors code")
-        raw = tensor_bytes(t)
         shape = [int(x) for x in t.shape]
-        header[name] = {"dtype": dtype, "shape": shape, "data_offsets": [pos, pos + len(raw)]}
-        entries[name] = {"dtype": dtype, "shape": shape, "size": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
-        blobs.append(raw)
-        pos += len(raw)
+        size = math.prod(shape) * mf.DTYPES[dtype][0]
+        header[name] = {"dtype": dtype, "shape": shape, "data_offsets": [pos, pos + size]}
+        entries[name] = {"dtype": dtype, "shape": shape, "size": size}
+        pos += size
     h = json.dumps(header, separators=(",", ":")).encode()
     h += b" " * (-len(h) % 8)
     base = 8 + len(h)
-    for name, e in entries.items():
-        e["offset"] = base + header[name]["data_offsets"][0]
     tmp = os.path.join(d, DATA_NAME + ".tmp")
-    with open(tmp, "wb") as f:
-        f.write(struct.pack("<Q", len(h)))
-        f.write(h)
-        for raw in blobs:
-            f.write(raw)
+    try:
+        with open(tmp, "wb") as f:
+            f.write(struct.pack("<Q", len(h)))
+            f.write(h)
+            for name in names:
+                raw = tensor_bytes(state[name])
+                e = entries[name]
+                if len(raw) != e["size"]:
+                    raise ValueError(f"racer: cannot capture {name!r}: {len(raw)} bytes, expected {e['size']}")
+                e["sha256"] = hashlib.sha256(raw).hexdigest()
+                e["offset"] = base + header[name]["data_offsets"][0]
+                f.write(raw)
+                del raw
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
     os.replace(tmp, os.path.join(d, DATA_NAME))
     doc = {
         "schema": mf.SHARDED_SCHEMA,
