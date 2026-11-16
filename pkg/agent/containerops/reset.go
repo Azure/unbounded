@@ -129,8 +129,7 @@ func (t *Teardown) RemoveConfig() phases.Task {
 // bundle and rootfs through the backend, then the shared data the node left on
 // the host (pod mounts, kubelet state and CNI binaries), the layout directory
 // and the host runtime. CNI configuration, IPAM state and containerd data are
-// private to each slot and disappear with its rootfs; their host copies are
-// not owned by this teardown.
+// private to each slot; their same-path host copies are not owned by reset.
 //
 // The shared data goes only once every slot is destroyed, which the backend
 // reports only after the runtime confirmed its container gone: a container

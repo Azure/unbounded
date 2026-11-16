@@ -57,11 +57,6 @@ type Params struct {
 	Log *slog.Logger
 	// Config is the agent configuration goal states are resolved from.
 	Config *config.AgentConfig
-	// ArtifactVersion identifies application artifacts added by Install.
-	// Empty preserves the version identity of standalone installations.
-	ArtifactVersion string
-	// Install adds application artifacts after the standard installers finish.
-	Install func(context.Context, *goalstates.MachineGoalState) error
 	// Downloads optionally overrides artifact download sources.
 	Downloads *goalstates.DownloadOverrides
 	// GoalState, when set, is used instead of resolving one. Bootstrap passes
@@ -165,7 +160,7 @@ func (n *Node) resolve() error {
 			return
 		}
 
-		n.version = VersionForArtifacts(n.gs.RootFS, n.p.ArtifactVersion)
+		n.version = VersionFor(n.gs.RootFS)
 
 		n.backend, n.err = n.newBackend()
 		if n.err != nil {
@@ -214,18 +209,11 @@ func (n *Node) root() none.Root {
 // architecture or a download override yields a new directory while an unchanged
 // configuration reuses the installed one.
 func VersionFor(r *goalstates.RootFS) string {
-	return VersionForArtifacts(r, "")
-}
-
-// VersionForArtifacts includes application artifacts in the version identity.
-// An empty artifactVersion produces the same directory name as VersionFor.
-func VersionForArtifacts(r *goalstates.RootFS, artifactVersion string) string {
 	inputs := struct {
 		Containerd, RunC, CNI, CoreDNS, Arch string
 		CoreDNSEnabled                       bool
 		Downloads                            *goalstates.DownloadOverrides
-		Application                          string `json:",omitempty"`
-	}{r.ContainerdVersion, r.RunCVersion, r.CNIPluginVersion, r.LocalDNS.CoreDNSVersion, r.HostArch, r.LocalDNS.Enabled, r.Downloads, artifactVersion}
+	}{r.ContainerdVersion, r.RunCVersion, r.CNIPluginVersion, r.LocalDNS.CoreDNSVersion, r.HostArch, r.LocalDNS.Enabled, r.Downloads}
 
 	data, _ := json.Marshal(inputs) //nolint:errcheck // plain data always marshals
 	sum := sha256.Sum256(data)
@@ -343,7 +331,7 @@ func (n *Node) install(ctx context.Context, _ isolation.NodeRoot) error {
 			return err
 		}
 
-		return n.finishInstall(ctx)
+		return n.writeSupervisor()
 	}
 
 	tasks := []phases.Task{
@@ -356,16 +344,6 @@ func (n *Node) install(ctx context.Context, _ isolation.NodeRoot) error {
 
 	if err := phases.Parallel(n.p.Log, tasks...).Do(ctx); err != nil {
 		return err
-	}
-
-	return n.finishInstall(ctx)
-}
-
-func (n *Node) finishInstall(ctx context.Context) error {
-	if n.p.Install != nil {
-		if err := n.p.Install(ctx, n.gs); err != nil {
-			return err
-		}
 	}
 
 	return n.writeSupervisor()

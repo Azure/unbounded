@@ -16,8 +16,8 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/noneops"
 )
 
-// teardownFixture has both slots prepared and kube1 running, plus shared node
-// data and pre-existing host CNI configuration.
+// teardownFixture has both slots prepared and kube1 running, plus the shared
+// host state a node leaves behind.
 func teardownFixture(t *testing.T) (*fixture, *Teardown, string) {
 	t.Helper()
 
@@ -116,8 +116,8 @@ func TestTeardownDestroyRemovesEverythingTheNodeLeft(t *testing.T) {
 		require.ErrorIs(t, err, os.ErrNotExist, p)
 	}
 
+	require.FileExists(t, f.hostPath("/etc/cni/net.d/10.conf"), "same-path host CNI configuration is not slot-owned")
 	require.False(t, td.Present())
-	require.FileExists(t, f.hostPath("/etc/cni/net.d/10.conf"), "host CNI configuration is not owned by container slots")
 
 	// Repeating a finished teardown succeeds.
 	require.NoError(t, td.Stop().Do(t.Context()))
@@ -199,6 +199,6 @@ func TestTeardownDestroyKeepsSharedDataWhenAPodMountCannotBeUnmounted(t *testing
 
 	require.FileExists(t, f.hostPath("/var/lib/kubelet/config.yaml"), "kubelet state may sit on the mounted volume")
 	require.NoFileExists(t, f.hostPath("/opt/cni/bin/bridge"), "nothing is mounted below the CNI directories")
-	require.FileExists(t, f.hostPath("/etc/cni/net.d/10.conf"), "host CNI configuration is not owned by container slots")
+	require.FileExists(t, f.hostPath("/etc/cni/net.d/10.conf"), "same-path host CNI configuration is not slot-owned")
 	require.NoDirExists(t, td.Layout.RootfsDir("kube2"), "the slots are unaffected by the mount")
 }
