@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 	"time"
 
@@ -19,6 +20,58 @@ import (
 	"github.com/Azure/unbounded/internal/net/healthcheck"
 	unboundednetnetlink "github.com/Azure/unbounded/internal/net/netlink"
 )
+
+func TestExternalCNIPeerHealthUsesNodeIPs(t *testing.T) {
+	for _, tc := range []struct {
+		unmanaged   bool
+		internalIPs []string
+		wantPeers   int
+	}{
+		{false, []string{"10.232.0.4"}, 2},
+		{true, []string{"10.232.0.4"}, 2},
+		{true, nil, 0},
+	} {
+		manager, err := healthcheck.NewManager("local", 0, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		t.Cleanup(manager.Stop)
+		state := &wireGuardState{
+			healthCheckManager:            manager,
+			meshPeerHealthCheckEnabled:    make(map[string]bool),
+			gatewayPeerHealthCheckEnabled: make(map[string]bool),
+		}
+		pods := []string{"10.232.16.6/31", "10.232.16.20/32"}
+		mesh := []meshPeerInfo{{
+			Name: "mesh", SiteName: "remote", WireGuardPublicKey: "key",
+			PodCIDRs: pods, InternalIPs: tc.internalIPs, UnmanagedCNISite: tc.unmanaged,
+		}}
+		gateways := []gatewayPeerInfo{{
+			Name: "gateway", PodCIDRs: pods, InternalIPs: tc.internalIPs, UnmanagedCNISite: tc.unmanaged,
+		}}
+		profiles := map[string]healthcheck.HealthCheckSettings{"profile": healthcheck.DefaultSettings()}
+
+		desired, err := registerPeersWithHealthCheck(mesh, gateways, "local", false,
+			map[string]string{"local": "profile", "remote": "profile"}, nil, nil, nil, nil,
+			profiles, state, func(gatewayPeerInfo) string { return "iface" }, true)
+		if err != nil || len(desired) != tc.wantPeers || len(manager.GetAllPeerStatuses()) != tc.wantPeers {
+			t.Fatalf("health registration: %v, %v", desired, err)
+		}
+	}
+
+	if got := peerHealthIPs([]string{"10.232.16.6/31"}, []string{"10.232.0.4"}, true); !slices.Equal(got, []string{"10.232.0.4"}) {
+		t.Fatalf("external CNI health targeted a pod address: %v", got)
+	}
+
+	if got := peerHealthIPs([]string{"10.232.16.20/32"}, []string{"bad", "fd00::4", "fd00::4"}, true); !slices.Equal(got, []string{"fd00::4"}) {
+		t.Fatalf("external CNI health candidates: %v", got)
+	}
+
+	if got := peerHealthIPs([]string{"10.232.16.20/32"}, nil, true); len(got) != 0 {
+		t.Fatalf("missing node IP fell back to a pod address: %v", got)
+	}
+}
 
 func TestRegisterHealthProfilesAllTunnelModes(t *testing.T) {
 	for _, protocol := range []string{"WireGuard", "GENEVE", "VXLAN", "IPIP", "None"} {

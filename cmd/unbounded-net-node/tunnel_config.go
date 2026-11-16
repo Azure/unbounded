@@ -106,33 +106,11 @@ func ensureTunnelMap(cfg *config, state *wireGuardState) (*ebpfpkg.TunnelMap, er
 		}
 	}
 
-	// Assign podCIDR gateway IPs to unbounded0 as /32 addresses.
-	// These serve as source IPs for overlay-destined traffic.
-	// This runs on every reconcile (not just first attach) so that
-	// transient address sync failures are retried.
-	{
-		devLM := unboundednetnetlink.NewLinkManager(unbounded0DeviceName)
-
-		var devAddrs []string
-
-		for _, cidr := range state.nodePodCIDRs {
-			gwIP := getGatewayIPFromCIDR(cidr)
-			if gwIP == nil {
-				continue
-			}
-
-			if gwIP.To4() != nil {
-				devAddrs = append(devAddrs, gwIP.String()+"/32")
-			} else {
-				devAddrs = append(devAddrs, gwIP.String()+"/128")
-			}
-		}
-
-		if len(devAddrs) > 0 {
-			if _, _, err := devLM.SyncAddresses(devAddrs, false); err != nil {
-				klog.Warningf("eBPF: failed to sync addresses on %s: %v", unbounded0DeviceName, err)
-			}
-		}
+	// Only managed CNI ranges reserve gateway addresses for Unbounded.
+	// Sync an empty set for external CNI ranges to remove stale addresses.
+	devLM := unboundednetnetlink.NewLinkManager(unbounded0DeviceName)
+	if err := syncPodCIDRAddresses(devLM, state.nodePodCIDRs, state.manageCniPlugin); err != nil {
+		klog.Warningf("eBPF: failed to sync addresses on %s: %v", unbounded0DeviceName, err)
 	}
 
 	return tm, nil

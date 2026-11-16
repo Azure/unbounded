@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -24,6 +25,29 @@ import (
 	netstatus "github.com/Azure/unbounded/internal/net/status"
 	statusproto "github.com/Azure/unbounded/internal/net/status/proto"
 )
+
+func TestExternalCNIStatusUsesNodeHealthIPs(t *testing.T) {
+	server := summaryRouteFixture()
+	server.state.peers = []meshPeerInfo{{
+		Name: "mesh", TunnelProtocol: "GENEVE", InternalIPs: []string{"192.0.2.2"},
+		PodCIDRs: []string{"10.232.16.6/31"}, UnmanagedCNISite: true,
+	}}
+	server.state.gatewayPeers = []gatewayPeerInfo{{
+		Name: "gateway", TunnelProtocol: "VXLAN", InternalIPs: []string{"192.0.2.3"},
+		PodCIDRs: []string{"10.232.16.20/32"}, UnmanagedCNISite: true,
+	}}
+	got := make(map[string][]string)
+
+	server.inspectNodePeers(func(peer WireGuardPeerStatus) {
+		got[peer.Name] = peer.PodCIDRGateways
+	})
+
+	for name, ip := range map[string]string{"mesh": "192.0.2.2", "gateway": "192.0.2.3"} {
+		if !slices.Equal(got[name], []string{ip}) {
+			t.Fatalf("peer %s reported a synthetic pod health address: %v", name, got[name])
+		}
+	}
+}
 
 func TestSummaryPeerHealthy(t *testing.T) {
 	now := time.Now()

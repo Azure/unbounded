@@ -20,22 +20,23 @@ import (
 
 	"github.com/Azure/unbounded/internal/net/ipam"
 	ipamproto "github.com/Azure/unbounded/internal/net/ipam/proto"
-	unboundednetnetlink "github.com/Azure/unbounded/internal/net/netlink"
 )
 
-func setPodCIDRPreferredSources(manager *unboundednetnetlink.UnifiedRouteManager, cidrs []string) {
+func setPodCIDRPreferredSources(manager interface{ SetPreferredSourceIPs(net.IP, net.IP) }, cidrs []string, manageCniPlugin bool) {
 	var ipv4, ipv6 net.IP
 
-	for _, cidr := range cidrs {
-		gateway := getGatewayIPFromCIDR(cidr)
-		if gateway == nil {
-			continue
-		}
+	if manageCniPlugin {
+		for _, cidr := range cidrs {
+			gateway := getGatewayIPFromCIDR(cidr)
+			if gateway == nil {
+				continue
+			}
 
-		if gateway.To4() != nil {
-			ipv4 = gateway
-		} else {
-			ipv6 = gateway
+			if gateway.To4() != nil {
+				ipv4 = gateway
+			} else {
+				ipv6 = gateway
+			}
 		}
 	}
 

@@ -2711,6 +2711,7 @@ func (s *nodeStatusServer) inspectNodePeers(visit func(WireGuardPeerStatus)) *no
 	peerHealthCheckEnabledMap := make(map[string]bool, len(s.state.meshPeerHealthCheckEnabled))
 	peerSkipPodCIDRMap := make(map[string]bool, len(s.state.peers))
 	gatewaySkipPodCIDRByName := make(map[string]bool, len(s.state.gatewayPeers))
+	gatewayHealthIPsByName := make(map[string][]string, len(s.state.gatewayPeers))
 
 	gatewayTunnelProtoByName := make(map[string]string, len(s.state.gatewayPeers))
 	for _, p := range s.state.peers {
@@ -2718,7 +2719,7 @@ func (s *nodeStatusServer) inspectNodePeers(visit func(WireGuardPeerStatus)) *no
 		peerSiteNameMap[p.WireGuardPublicKey] = p.SiteName
 		peerTunnelProtoMap[p.WireGuardPublicKey] = p.TunnelProtocol
 
-		overlayIPs := getHealthIPsFromPodCIDRs(p.PodCIDRs)
+		overlayIPs := peerHealthIPs(p.PodCIDRs, p.InternalIPs, p.UnmanagedCNISite)
 		if len(overlayIPs) > 0 {
 			peerOverlayIPsMap[p.WireGuardPublicKey] = overlayIPs
 		}
@@ -2733,6 +2734,7 @@ func (s *nodeStatusServer) inspectNodePeers(visit func(WireGuardPeerStatus)) *no
 	for _, p := range s.state.gatewayPeers {
 		gatewaySkipPodCIDRByName[p.Name] = p.SkipPodCIDRRoutes
 		gatewayTunnelProtoByName[p.Name] = p.TunnelProtocol
+		gatewayHealthIPsByName[p.Name] = peerHealthIPs(p.PodCIDRs, p.InternalIPs, p.UnmanagedCNISite)
 	}
 
 	// Snapshot gateway state: copy maps so we can iterate outside the lock
@@ -2751,7 +2753,10 @@ func (s *nodeStatusServer) inspectNodePeers(visit func(WireGuardPeerStatus)) *no
 
 	gwSnapshots := make([]gwSnapshot, 0, len(s.state.gatewayHealthEndpoints))
 	for ifaceName, overlayIP := range s.state.gatewayHealthEndpoints {
-		overlayIPs := getHealthIPsFromPodCIDRs(s.state.gatewayPodCIDRs[ifaceName])
+		overlayIPs, known := gatewayHealthIPsByName[s.state.gatewayNames[ifaceName]]
+		if !known {
+			overlayIPs = getHealthIPsFromPodCIDRs(s.state.gatewayPodCIDRs[ifaceName])
+		}
 
 		if overlayIP != "" {
 			present := false
@@ -2981,14 +2986,8 @@ func (s *nodeStatusServer) inspectNodePeers(visit func(WireGuardPeerStatus)) *no
 				Endpoint:  p.InternalIPs[0],
 			},
 		}
-		for _, cidr := range p.PodCIDRs {
-			gwIP := getGatewayIPFromCIDR(cidr)
-			if gwIP != nil {
-				peer.PodCIDRGateways = append(peer.PodCIDRGateways, gwIP.String())
-			}
-
-			peer.Tunnel.AllowedIPs = append(peer.Tunnel.AllowedIPs, cidr)
-		}
+		peer.PodCIDRGateways = peerHealthIPs(p.PodCIDRs, p.InternalIPs, p.UnmanagedCNISite)
+		peer.Tunnel.AllowedIPs = append(peer.Tunnel.AllowedIPs, p.PodCIDRs...)
 
 		if hcEnabled && healthCheckMgr != nil {
 			if ps, err := healthCheckMgr.GetPeerStatus(p.Name); err == nil && ps != nil {
@@ -3037,12 +3036,7 @@ func (s *nodeStatusServer) inspectNodePeers(visit func(WireGuardPeerStatus)) *no
 				Endpoint:  gp.InternalIPs[0],
 			},
 		}
-		for _, cidr := range gp.PodCIDRs {
-			gwIP := getGatewayIPFromCIDR(cidr)
-			if gwIP != nil {
-				peer.PodCIDRGateways = append(peer.PodCIDRGateways, gwIP.String())
-			}
-		}
+		peer.PodCIDRGateways = peerHealthIPs(gp.PodCIDRs, gp.InternalIPs, gp.UnmanagedCNISite)
 
 		peer.Tunnel.AllowedIPs = append(peer.Tunnel.AllowedIPs, gp.RoutedCidrs...)
 		if hcEnabled && healthCheckMgr != nil {

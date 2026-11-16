@@ -81,6 +81,12 @@ spec:
 Set to `false` when using an external CNI plugin (e.g., Cilium, Calico) for
 intra-site networking while unbounded-net handles only cross-site routing.
 
+With an external CNI, Unbounded leaves `unbounded0` and its WireGuard interfaces
+unnumbered instead of assigning gateway addresses from the node's pod CIDRs.
+It does not set pod-derived preferred route sources, and peer health checks use
+the node's existing InternalIPs. Pod CIDRs remain route advertisements; they do
+not grant Unbounded ownership of any addresses within those ranges.
+
 With `manageCniPlugin: false`, omitted `assignmentEnabled` values resolve to
 `false`. Set `podCidrAssignments[].assignmentEnabled: true` to allocate Node
 PodCIDRs without managing the external CNI. Explicit `false` always disables a

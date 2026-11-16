@@ -812,6 +812,7 @@ func meshPeersEqual(a, b []meshPeerInfo) bool {
 			!strSliceEqual(a[i].InternalIPs, b[i].InternalIPs) ||
 			!strSliceEqual(a[i].PodCIDRs, b[i].PodCIDRs) ||
 			a[i].SkipPodCIDRRoutes != b[i].SkipPodCIDRRoutes ||
+			a[i].UnmanagedCNISite != b[i].UnmanagedCNISite ||
 			a[i].TunnelProtocol != b[i].TunnelProtocol ||
 			a[i].TunnelMTU != b[i].TunnelMTU {
 			return false

@@ -75,11 +75,12 @@ func registerPeersWithHealthCheck(
 
 	// Mesh peers.
 	for _, peer := range meshPeers {
-		overlayIP := getHealthIPFromPodCIDRs(peer.PodCIDRs)
-		if overlayIP == "" {
+		healthIPs := peerHealthIPs(peer.PodCIDRs, peer.InternalIPs, peer.UnmanagedCNISite)
+		if len(healthIPs) == 0 {
 			continue
 		}
 
+		overlayIP := healthIPs[0]
 		hcProfileName := resolveMeshPeerHealthCheckProfileName(isGatewayNode, peer, mySiteName,
 			siteHCProfileNames, peeringHCProfileNames, assignmentSiteHCProfileNames)
 
@@ -111,10 +112,12 @@ func registerPeersWithHealthCheck(
 
 	// Gateway peers.
 	for _, gwPeer := range gatewayPeers {
-		overlayIP := getHealthIPFromPodCIDRs(gwPeer.PodCIDRs)
-		if overlayIP == "" {
+		healthIPs := peerHealthIPs(gwPeer.PodCIDRs, gwPeer.InternalIPs, gwPeer.UnmanagedCNISite)
+		if len(healthIPs) == 0 {
 			continue
 		}
+
+		overlayIP := healthIPs[0]
 
 		ifName := peerIfaceNameFn(gwPeer)
 		if ifName == "" {

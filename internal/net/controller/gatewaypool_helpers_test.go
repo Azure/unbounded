@@ -52,6 +52,100 @@ func (l orderedNodeLister) List(selector labels.Selector) ([]*corev1.Node, error
 func (f *fakeInformer) GetStore() cache.Store { return f.store }
 func (f *fakeInformer) HasSynced() bool       { return true }
 
+func TestGatewayHealthEndpointsRespectCNIOwnership(t *testing.T) {
+	node := makeGatewayNode("gateway", map[string]string{canonicalSiteLabelKey: "site"}, false, "key")
+	node.Spec.PodCIDRs = []string{"10.232.16.6/31", "10.232.16.20/32"}
+	node.Status.Addresses = []corev1.NodeAddress{
+		{Type: corev1.NodeInternalIP, Address: "10.232.0.4"},
+		{Type: corev1.NodeInternalIP, Address: "fd00::4"},
+	}
+	store := cache.NewStore(cache.MetaNamespaceKeyFunc)
+	gc := &GatewayPoolController{siteInformer: &fakeInformer{store: store}}
+
+	site := &unstructured.Unstructured{Object: map[string]interface{}{
+		"metadata": map[string]interface{}{"name": "site"},
+		"spec":     map[string]interface{}{"manageCniPlugin": false},
+	}}
+	if err := store.Add(site); err != nil {
+		t.Fatal(err)
+	}
+
+	ips, err := gc.healthEndpointsForNode(node)
+	if err != nil || !slices.Equal(ips, []string{"10.232.0.4", "fd00::4"}) {
+		t.Fatalf("external CNI health endpoints: %v, %v", ips, err)
+	}
+
+	if err := unstructured.SetNestedField(site.Object, true, "spec", "manageCniPlugin"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.Update(site); err != nil {
+		t.Fatal(err)
+	}
+
+	ips, err = gc.healthEndpointsForNode(node)
+	if err != nil || !slices.Equal(ips, getHealthIPsFromPodCIDRs(node.Spec.PodCIDRs)) {
+		t.Fatalf("managed CNI health endpoints: %v, %v", ips, err)
+	}
+
+	if err := store.Delete(site); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := gc.healthEndpointsForNode(node); err == nil {
+		t.Fatal("missing Site silently assumed ownership of pod addresses")
+	}
+}
+
+func TestGatewayPoolWatchesSiteCNIOwnership(t *testing.T) {
+	site := &unstructured.Unstructured{Object: map[string]interface{}{
+		"metadata": map[string]interface{}{"name": "site"},
+		"spec":     map[string]interface{}{"manageCniPlugin": false},
+	}}
+
+	queue := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]())
+	defer queue.ShutDown()
+
+	gc := &GatewayPoolController{
+		workqueue: queue,
+		gatewayPoolInformer: &fakeInformer{store: gatewayPoolStore(t, &unboundednetv1alpha1.GatewayPool{
+			ObjectMeta: metav1.ObjectMeta{Name: "pool"},
+		})},
+	}
+	handler := gc.siteEventHandler()
+	statusOnly := site.DeepCopy()
+	statusOnly.Object["status"] = map[string]interface{}{"nodeCount": int64(2)}
+	handler.UpdateFunc(site, statusOnly)
+
+	if queue.Len() != 0 {
+		t.Fatal("status-only Site change queued gateway pool reconciliation")
+	}
+
+	updated := site.DeepCopy()
+	if err := unstructured.SetNestedField(updated.Object, true, "spec", "manageCniPlugin"); err != nil {
+		t.Fatal(err)
+	}
+
+	handler.UpdateFunc(site, updated)
+
+	if queue.Len() != 1 {
+		t.Fatal("Site CNI ownership edit did not enqueue gateway pool reconciliation")
+	}
+
+	key, _ := queue.Get()
+	queue.Done(key)
+
+	if key != "pool" {
+		t.Fatalf("queued %q instead of the affected gateway pool", key)
+	}
+
+	handler.DeleteFunc(cache.DeletedFinalStateUnknown{Key: "site", Obj: updated})
+
+	if queue.Len() != 1 {
+		t.Fatal("Site deletion did not refresh gateway health endpoints")
+	}
+}
+
 type recordingRateLimitingQueue struct {
 	workqueue.TypedRateLimitingInterface[string]
 	delayed map[string]time.Duration
