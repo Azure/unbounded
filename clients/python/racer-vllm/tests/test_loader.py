@@ -3,6 +3,7 @@
 """The loader, its filters, fingerprints and sharded artifacts, on a fake vLLM."""
 
 import logging
+import os
 import types
 
 import pytest
@@ -693,3 +694,84 @@ def test_verify_full_reads_gaps_in_bounded_chunks(monkeypatch, server):
     assert all(etag == '"v1"' for _, _, etag in calls)
     assert rd.stats["reads"][reader.HOST] == len(calls) == 5
     assert rd.stats["bytes"][reader.HOST] == len(data)
+
+
+def publish_sharded(monkeypatch, server, tmp_path, state=STATE, mutate=None, **extra):
+    u, files, m, d = materialized(server, tmp_path)
+    ld = make_loader(monkeypatch, server, **extra)
+    fp, _, _ = ld._fingerprint(Model(), model_config(d))
+    out = capture_to(tmp_path, state, fp)
+    if mutate is not None:
+        mutate(out, fp)
+    root = tmp_path / "origin"
+    cli.publish_captured(LocalStore(str(root)), out, out=lambda *_: None)
+    serve_dir(server, u, str(root))
+    return ld, d
+
+
+def flip_byte(name):
+    def mutate(out, fp):
+        p = os.path.join(out, sharded.artifact_prefix(fp, "target", 0))
+        doc = mf.load_sharded(os.path.join(p, mf.SHARDED_NAME))
+        off = next(f["tensors"][name]["offset"] for f in doc["files"] if name in f["tensors"])
+        with open(os.path.join(p, sharded.DATA_NAME), "r+b") as f:
+            f.seek(off)
+            b = f.read(1)
+            f.seek(off)
+            f.write(bytes([b[0] ^ 0xFF]))
+    return mutate
+
+
+def test_sharded_verify_full_checks_every_tensor(monkeypatch, server, torch, tmp_path, caplog):
+    ld, d = publish_sharded(monkeypatch, server, tmp_path, sharded="require", verify="full")
+    target = Model(model_state({n: b"\0" * len(v) for n, v in STATE.items()}))
+    with caplog.at_level(logging.INFO, logger="vllm.racer_vllm.sharded"):
+        ld.load_weights(target, model_config(d))
+    assert {n: t.bytes() for n, t in target.state.items()} == STATE
+    assert target.got == {}
+    assert any(f"checked sha256 of {len(STATE)} tensors" in r.getMessage() for r in caplog.records)
+
+
+def test_sharded_verify_full_rejects_a_flipped_byte(monkeypatch, server, torch, tmp_path):
+    ld, d = publish_sharded(monkeypatch, server, tmp_path, mutate=flip_byte("layer.b"),
+                            sharded="require", verify="full")
+    target = Model(model_state({n: b"\0" * len(v) for n, v in STATE.items()}))
+    with pytest.raises(sharded.ShardedMismatch, match="'layer.b'.*sha256 mismatch"):
+        ld.load_weights(target, model_config(d))
+    assert target.state["layer.b"].bytes() == b"\0" * len(STATE["layer.b"])
+
+
+def test_sharded_verify_full_auto_falls_back(monkeypatch, server, torch, tmp_path):
+    ld, d = publish_sharded(monkeypatch, server, tmp_path, mutate=flip_byte("layer.a"),
+                            sharded="auto", verify="full")
+    model = Model(model_state(STATE))
+    ld.load_weights(model, model_config(d))
+    assert model.got == W  # the checkpoint was read instead
+
+
+def test_sharded_verify_size_does_not_hash(monkeypatch, server, torch, tmp_path):
+    ld, d = publish_sharded(monkeypatch, server, tmp_path, mutate=flip_byte("layer.a"),
+                            sharded="require", verify="size")
+    calls = []
+    monkeypatch.setattr(sharded, "_digest", lambda data: calls.append(1) or "0" * 64)
+    target = Model(model_state({n: b"\0" * len(v) for n, v in STATE.items()}))
+    ld.load_weights(target, model_config(d))
+    assert calls == [] and target.got == {}
+
+
+def test_sharded_verify_full_refuses_entries_without_digest(monkeypatch, server, torch, tmp_path):
+    ld, d = publish_sharded(monkeypatch, server, tmp_path, sharded="require", verify="full")
+    real = mf.loads_sharded
+
+    def strip(data):
+        doc = real(data)
+        for f in doc["files"]:
+            for t in f["tensors"].values():
+                t.pop("sha256", None)
+        return doc
+
+    monkeypatch.setattr(mf, "loads_sharded", strip)
+    target = Model(model_state({n: b"\0" * len(v) for n, v in STATE.items()}))
+    with pytest.raises(sharded.ShardedMismatch, match="re-run racer-vllm prepare"):
+        ld.load_weights(target, model_config(d))
+    assert target.state["layer.a"].bytes() == b"\0" * len(STATE["layer.a"])

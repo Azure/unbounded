@@ -289,10 +289,20 @@ def _mismatch(doc: dict, state: dict, fp: str, rank: int, role: str):
     return None
 
 
-def load_sharded(client, uri, model, rank: int, role: str, fp: str, make_reader, *, require: bool = False) -> bool:
+def _digest(data) -> str:
+    """sha256 hex of one tensor's bytes (a seam for tests)."""
+    return hashlib.sha256(data).hexdigest()
+
+
+def load_sharded(
+    client, uri, model, rank: int, role: str, fp: str, make_reader, *, require: bool = False, verify: str = "size"
+) -> bool:
     """Copy a matching artifact into the model. Returns False to fall back.
 
     make_reader() returns a reader.WeightReader. With require, any problem raises ShardedMismatch.
+    With verify="full", each tensor's bytes are hashed in the staging buffer and
+    checked against the sharded manifest before any of that read's tensors are
+    copied into the model.
     """
     import racer
 
@@ -316,6 +326,14 @@ def load_sharded(client, uri, model, rank: int, role: str, fp: str, make_reader,
     if why is not None:
         log.warning("racer: sharded artifact mismatch: %s", why)
         return fail(why)
+    full = verify == "full"
+    digests = {}
+    if full:
+        for f in doc["files"]:
+            for n, t in f["tensors"].items():
+                if not isinstance(t.get("sha256"), str):
+                    return fail(f"tensor {n!r} has no sha256, so verify=full cannot check it; re-run racer-vllm prepare")
+                digests[n] = t["sha256"]
     reader = make_reader()
     jobs = []
     try:
@@ -335,8 +353,30 @@ def load_sharded(client, uri, model, rank: int, role: str, fp: str, make_reader,
         return fail(f"data file missing: {exc}")
     except (mf.ManifestError, ValueError) as exc:
         return fail(str(exc))
-    for name, tensor in reader.iter(jobs):
-        state[name].data.copy_(tensor)
+    verified = set()
+
+    def on_data(read, mv):
+        for t in read.tensors:
+            got = _digest(mv[t.rva : t.rva + t.nbytes])
+            if got != digests[t.name]:
+                raise ShardedMismatch(
+                    f"tensor {t.name!r} in {read.file}: sha256 mismatch: manifest has {digests[t.name]}, data has {got}"
+                )
+            verified.add(t.name)
+
+    try:
+        for name, tensor in reader.iter(jobs, on_data if full else None):
+            if full and name not in verified:
+                # Only empty tensors skip on_data; anything else means the bytes were never hashed.
+                if digests[name] != _digest(b""):
+                    raise ShardedMismatch(f"tensor {name!r} was not hashed, so verify=full cannot check it")
+                verified.add(name)
+            state[name].data.copy_(tensor)
+    except ShardedMismatch as exc:
+        log.warning("racer: sharded artifact failed verification: %s", exc)
+        return fail(str(exc))
+    if full:
+        log.info("racer: verify=full checked sha256 of %d tensors in sharded artifact %s", len(verified), prefix)
     return True
 
 

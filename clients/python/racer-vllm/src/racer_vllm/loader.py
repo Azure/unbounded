@@ -416,6 +416,7 @@ class RacerLoaderMixin:
                         fp,
                         lambda: self._reader(client),
                         require=self.racer.sharded == "require",
+                        verify=self.racer.verify,
                     )
                 elif self.racer.sharded == "require":
                     raise sh.ShardedMismatch(f"racer: cannot pick a sharded artifact: {why}")
