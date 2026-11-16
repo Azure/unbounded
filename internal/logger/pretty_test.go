@@ -146,6 +146,7 @@ func TestPrettyFieldHandlerDeterministicExtraAttrs(t *testing.T) {
 	wantOrder := []string{"[ordered]", "[alpha=1]", "[bravo=3]", "[charlie=5]", "[mike=2]", "[yankee=4]"}
 
 	prev := -1
+
 	for _, want := range wantOrder {
 		idx := strings.Index(first, want)
 		if idx < 0 {

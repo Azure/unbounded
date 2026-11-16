@@ -63,6 +63,7 @@ func newProbeHarness(t *testing.T) *probeHarness {
 			}
 
 			mu.Lock()
+
 			seen = append(seen, pkt.SequenceNumber)
 			mu.Unlock()
 

@@ -761,9 +761,11 @@ func TestAssignmentPoolChangesRebuildAllocator(t *testing.T) {
 		if state == nil {
 			t.Fatal("changed cidrBlocks retired the allocator")
 		}
+
 		if state == previous {
 			t.Fatal("changed cidrBlocks kept the allocator bound to the old pool")
 		}
+
 		if !state.allocator.IsAllocated("10.244.0.0/24") {
 			t.Fatal("existing allocation was not re-marked on the rebuilt allocator")
 		}
@@ -772,6 +774,7 @@ func TestAssignmentPoolChangesRebuildAllocator(t *testing.T) {
 		if err != nil {
 			t.Fatalf("computePodCIDRsForNode: %v", err)
 		}
+
 		if cidr != "10.250.0.0/24" {
 			t.Fatalf("allocated %s, want a CIDR inside the new block 10.250.0.0/16", cidr)
 		}
@@ -799,6 +802,7 @@ func TestAssignmentPoolChangesRebuildAllocator(t *testing.T) {
 			if err != nil {
 				t.Fatalf("computePodCIDRsForNode for assignment %d: %v", tc.index, err)
 			}
+
 			if cidr != tc.want {
 				t.Fatalf("assignment %d allocated %s, want %s from its reordered block", tc.index, cidr, tc.want)
 			}
@@ -809,6 +813,7 @@ func TestAssignmentPoolChangesRebuildAllocator(t *testing.T) {
 		h := newPodCIDRTestHarness(t, liveNodeWithRV("4"))
 
 		h.sc.updateAssignmentAllocators([]unboundedv1alpha3.Site{*siteWithBlocks("10.244.0.0/16", "10.250.0.0/16")})
+
 		if h.sc.getAssignmentAllocator("site-a", 1) == nil {
 			t.Fatal("second assignment allocator was not created")
 		}
@@ -828,6 +833,7 @@ func TestAssignmentPoolChangesRebuildAllocator(t *testing.T) {
 		if err != nil {
 			t.Fatalf("computePodCIDRsForNode: %v", err)
 		}
+
 		if cidr != "10.244.0.0/24" {
 			t.Fatalf("allocated %s, want a CIDR inside the surviving block 10.244.0.0/16", cidr)
 		}

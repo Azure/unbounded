@@ -577,6 +577,7 @@ func (r *Reconciler) advanceVirtualMedia(ctx context.Context, op *v1alpha3.Machi
 		}
 
 		target.Message = err.Error()
+
 		return targetChange{target: target}
 	}
 

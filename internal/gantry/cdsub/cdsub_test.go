@@ -315,6 +315,7 @@ func TestRun_CleanCloseIsBackedOff(t *testing.T) {
 
 	src.subscribeFn = func(_ context.Context) (<-chan ImageEvent, error) {
 		mu.Lock()
+
 		calls = append(calls, time.Now())
 		mu.Unlock()
 

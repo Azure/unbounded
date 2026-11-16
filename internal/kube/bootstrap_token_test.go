@@ -84,6 +84,7 @@ func TestValidBootstrapTokenSecretForSite(t *testing.T) {
 	allocationEmptyLabel.Labels["unbounded-cloud.io/allocation-uid"] = ""
 	missingExpiration := valid.DeepCopy()
 	delete(missingExpiration.Data, "expiration")
+
 	unparsableExpiration := valid.DeepCopy()
 	unparsableExpiration.Data["expiration"] = []byte("not-a-time")
 

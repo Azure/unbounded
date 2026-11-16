@@ -930,7 +930,9 @@ func (m *Manager) expiredChairs(snapshot Snapshot, holderTarget int, now time.Ti
 
 func (m *Manager) setHeld(chair Chair) {
 	m.mu.Lock()
+
 	chairCopy := chair
+
 	if m.held == nil || m.held.ID != chair.ID || m.held.Generation != chair.Generation {
 		m.rotationDue = 0
 	}

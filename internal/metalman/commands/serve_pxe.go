@@ -184,10 +184,12 @@ func ServePXECmd() *cobra.Command {
 
 			clusterCA := attestation.ClusterCAFromConfig(cfg)
 
-			serverIP, serveURL, err := resolveServerAddress(bindAddress, serveURL, httpPort, OutboundIP)
+			serverIP, resolvedServeURL, err := resolveServerAddress(bindAddress, serveURL, httpPort, OutboundIP)
 			if err != nil {
 				return fmt.Errorf("resolving server address: %w", err)
 			}
+
+			serveURL = resolvedServeURL
 
 			if dhcpInterface != "" && dhcpAutoInterface {
 				return fmt.Errorf("--dhcp-interface and --dhcp-auto-interface are mutually exclusive")
