@@ -1,0 +1,14 @@
+unbounded-operator {{ .Chart.AppVersion }} is installed in namespace {{ .Release.Namespace }}.
+
+Verify the rollout; the operator installs the Unbounded CRDs at startup:
+  kubectl -n {{ .Release.Namespace }} rollout status deployment/unbounded-operator
+
+Then create Sites, for example:
+  kubectl unbounded site init --name <site> ...
+
+Manage this operator with Helm (or the AKS extension) from now on;
+`kubectl unbounded install` refuses to apply over it.
+
+Uninstall removes the operator, its RBAC and ConfigMap. The release doesn't own
+the namespace, so the CRDs, Sites and the components the operator reconciled
+into it, including unbounded-net, are left in place.

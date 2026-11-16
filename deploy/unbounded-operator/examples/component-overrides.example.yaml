@@ -3,9 +3,9 @@
 
 # Example component workload overrides.
 #
-# This file is an example, not something the operator installs. It is a plain
-# .yaml rather than a .yaml.tmpl so neither render-manifests nor go:embed picks
-# it up. Copy what you need; do not apply it as-is.
+# This file is an example, not something the operator installs. It lives
+# outside chart/ so neither the operator manifests nor go:embed pick it up.
+# Copy what you need; do not apply it as-is.
 #
 # SECURITY: write access to this ConfigMap is equivalent to root on every node
 # in every affected Site, and therefore to cluster-admin. The workloads it

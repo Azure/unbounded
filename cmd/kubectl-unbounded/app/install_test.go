@@ -14,6 +14,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -64,6 +65,70 @@ func TestInstallRejectsLegacyNamespace(t *testing.T) {
 		require.Contains(t, err.Error(), "legacy namespace")
 		require.Contains(t, err.Error(), ns)
 	}
+}
+
+func TestInstallRefusesHelmManagedOperator(t *testing.T) {
+	helmAnnotations := map[string]string{
+		"meta.helm.sh/release-name":      "flex-operator",
+		"meta.helm.sh/release-namespace": "flex-system",
+	}
+
+	for name, existing := range map[string]client.Object{
+		// Same namespace: install would overwrite the Helm release's Deployment.
+		"deployment in target namespace": &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{
+			Name: "unbounded-operator", Namespace: "unbounded-system", Annotations: helmAnnotations,
+		}},
+		// Different namespace: install would repoint the shared ClusterRoleBinding
+		// and strip the Helm-managed operator of its RBAC.
+		"cluster role binding": &rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{
+			Name: "unbounded-operator", Annotations: helmAnnotations,
+		}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			applied := 0
+			cli := fakeclient.NewClientBuilder().
+				WithObjects(existing).
+				WithInterceptorFuncs(interceptor.Funcs{
+					Apply: func(context.Context, client.WithWatch, runtime.ApplyConfiguration, ...client.ApplyOption) error {
+						applied++
+						return nil
+					},
+				}).
+				Build()
+
+			h := installHandler{
+				namespace:        "unbounded-system",
+				operatorImage:    "unbounded-operator:test",
+				imageRegistry:    "registry.example.com",
+				kubeResourcesCli: cli,
+				logger:           discardLogger(),
+			}
+
+			err := h.execute(context.Background())
+			require.ErrorContains(t, err, `managed by Helm release "flex-operator"`)
+			require.Zero(t, applied, "install must not apply anything over a Helm-managed operator")
+		})
+	}
+}
+
+func TestInstallReappliesOwnInstall(t *testing.T) {
+	// A previous `kubectl unbounded install` has no Helm annotations, so a
+	// reinstall still goes through.
+	cli, captured := newCapturingInstallClient(
+		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "unbounded-operator", Namespace: "unbounded-system"}},
+		&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: "unbounded-operator"}},
+	)
+
+	h := installHandler{
+		namespace:        "unbounded-system",
+		operatorImage:    "unbounded-operator:test",
+		imageRegistry:    "registry.example.com",
+		kubeResourcesCli: cli,
+		logger:           discardLogger(),
+	}
+
+	require.NoError(t, h.execute(context.Background()))
+	require.NotNil(t, captured.deployment)
 }
 
 func TestInstallHandlerApplyBootstrapManifests(t *testing.T) {
