@@ -15,14 +15,17 @@ import (
 func TestConfiguratorAppliesAndRestoresOnChange(t *testing.T) {
 	fixture := newConfiguratorFixture(t)
 	fixture.run(t, "apply", "changed")
+
 	if calls := readLines(t, fixture.systemctlLog); len(calls) != 2 || calls[0] != "restart containerd" {
 		t.Fatalf("apply systemctl calls = %v", calls)
 	}
+
 	if calls := readLines(t, fixture.modprobeLog); len(calls) != 1 || calls[0] != "nbd nbds_max=1024" {
 		t.Fatalf("modprobe calls = %v", calls)
 	}
 
 	fixture.run(t, "restore", "changed")
+
 	if calls := readLines(t, fixture.systemctlLog); len(calls) != 4 || calls[2] != "restart containerd" {
 		t.Fatalf("restore systemctl calls = %v", calls)
 	}
@@ -31,8 +34,29 @@ func TestConfiguratorAppliesAndRestoresOnChange(t *testing.T) {
 func TestConfiguratorDoesNotRestartForUnchangedConfig(t *testing.T) {
 	fixture := newConfiguratorFixture(t)
 	fixture.run(t, "apply", "unchanged")
+
 	if calls := readLines(t, fixture.systemctlLog); len(calls) != 1 || calls[0] != "is-active --quiet containerd" {
 		t.Fatalf("systemctl calls = %v, want only health verification", calls)
+	}
+}
+
+func TestConfiguratorPassesHostVisibleSnapshotterRoot(t *testing.T) {
+	for _, root := range []string{"", "/mnt/image-disk/gantry"} {
+		t.Run(root, func(t *testing.T) {
+			fixture := newConfiguratorFixture(t)
+			fixture.env = append(fixture.env, "GANTRY_SNAPSHOTTER_ROOT="+root)
+			fixture.run(t, "apply", "unchanged")
+
+			expected := root
+			if expected == "" {
+				expected = "/var/lib/gantry/snapshotter"
+			}
+
+			calls := readLines(t, fixture.configToolLog)
+			if len(calls) != 1 || !strings.Contains(calls[0], "--snapshotter-root "+expected) {
+				t.Fatalf("config tool must receive the host-visible data root, got %v", calls)
+			}
+		})
 	}
 }
 
@@ -43,13 +67,25 @@ type configuratorFixture struct {
 	listener          net.Listener
 	readyMarker       string
 	pendingActivation string
+	configToolLog     string
 }
 
 func newConfiguratorFixture(t *testing.T) configuratorFixture {
 	t.Helper()
 
-	root := t.TempDir()
+	root, err := os.MkdirTemp(os.TempDir(), "gnc-")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() {
+		if err := os.RemoveAll(root); err != nil {
+			t.Errorf("remove configurator fixture: %v", err)
+		}
+	})
+
 	hostRoot := filepath.Join(root, "host")
+
 	binDir := filepath.Join(root, "bin")
 	for _, directory := range []string{binDir, hostRoot, filepath.Join(hostRoot, "etc", "containerd")} {
 		if err := os.MkdirAll(directory, 0o755); err != nil {
@@ -61,17 +97,25 @@ func newConfiguratorFixture(t *testing.T) configuratorFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	t.Cleanup(func() { _ = listener.Close() })
 
 	systemctlLog := filepath.Join(root, "systemctl.log")
 	modprobeLog := filepath.Join(root, "modprobe.log")
 	configToolLog := filepath.Join(root, "config-tool.log")
+
 	writeExecutable(t, binDir, "nsenter", `#!/bin/sh
 while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done
 shift
 exec "$@"
 `)
 	writeExecutable(t, binDir, "curl", "#!/bin/sh\nexit 0\n")
+	writeExecutable(t, binDir, "flock", `#!/bin/sh
+case "$*" in
+"-x 9"|"-u 9") exit 0 ;;
+*) echo "unexpected lock arguments: $*" >&2; exit 1 ;;
+esac
+`)
 	writeExecutable(t, binDir, "modprobe", "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$TEST_MODPROBE_LOG\"\n")
 	writeExecutable(t, binDir, "systemctl", `#!/bin/sh
 printf '%s\n' "$*" >> "$TEST_SYSTEMCTL_LOG"
@@ -93,6 +137,7 @@ printf '%s\n' "$TEST_CONFIG_RESULT"
 		listener:          listener,
 		readyMarker:       filepath.Join(root, "configured"),
 		pendingActivation: filepath.Join(hostRoot, "var/lib/gantry/snapshotter-config/pending-activation"),
+		configToolLog:     configToolLog,
 		env: append(os.Environ(),
 			"HOST_ROOT="+hostRoot,
 			"CONFIG_TOOL="+configTool,
@@ -113,6 +158,7 @@ func (f configuratorFixture) run(t *testing.T, action, result string) {
 	t.Helper()
 
 	command := exec.Command("/bin/sh", "configure-overlaybd.sh", action)
+
 	command.Env = append(f.env, "TEST_CONFIG_RESULT="+result)
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("configure %s: %v\n%s", action, err, output)
@@ -137,9 +183,11 @@ func readLines(t *testing.T, path string) []string {
 	if os.IsNotExist(err) {
 		return nil
 	}
+
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	trimmed := strings.TrimSpace(string(data))
 	if trimmed == "" {
 		return nil

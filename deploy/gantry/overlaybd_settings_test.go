@@ -23,6 +23,7 @@ func TestOverlayBDContainersShareConfiguredEndpoint(t *testing.T) {
 				"--set-string", "overlaybdConfig.nodeSelector.pool=streaming",
 				"--set-string", "overlaybdConfig.gantryEndpoint="+endpoint,
 				"--set-string", "overlaybdConfig.address=/run/gantry-overlaybd/custom.sock",
+				"--set-string", "overlaybdConfig.snapshotterRoot=/mnt/image-disk/gantry",
 			)
 
 			raw, err := os.ReadFile(filepath.Join(directory, "overlaybd-config.yaml"))
@@ -47,12 +48,13 @@ func TestOverlayBDContainersShareConfiguredEndpoint(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			var snapshotter, readiness, socket bool
+			var snapshotter, readiness, socket, storageRoot bool
 
 			for _, container := range daemonSet.Spec.Template.Spec.Containers {
 				if container.Name == "snapshotter" {
 					snapshotter = slices.Contains(container.Args, "--gantry-endpoint="+endpoint) &&
-						slices.Contains(container.Args, "--address=/run/gantry-overlaybd/custom.sock")
+						slices.Contains(container.Args, "--address=/run/gantry-overlaybd/custom.sock") &&
+						slices.Contains(container.Args, "--root=/mnt/image-disk/gantry")
 				}
 
 				if container.Name != "configure" {
@@ -67,11 +69,15 @@ func TestOverlayBDContainersShareConfiguredEndpoint(t *testing.T) {
 					if env.Name == "GANTRY_SNAPSHOTTER_ADDRESS" {
 						socket = env.Value == "/run/gantry-overlaybd/custom.sock"
 					}
+
+					if env.Name == "GANTRY_SNAPSHOTTER_ROOT" {
+						storageRoot = env.Value == "/mnt/image-disk/gantry"
+					}
 				}
 			}
 
-			if !snapshotter || !readiness || !socket {
-				t.Fatalf("snapshotter/readiness/socket agree = %v/%v/%v\n%s", snapshotter, readiness, socket, raw)
+			if !snapshotter || !readiness || !socket || !storageRoot {
+				t.Fatalf("snapshotter/readiness/socket/root agree = %v/%v/%v/%v\n%s", snapshotter, readiness, socket, storageRoot, raw)
 			}
 		})
 	}

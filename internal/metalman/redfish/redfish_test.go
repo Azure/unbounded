@@ -536,6 +536,36 @@ func TestRedfishPathFromODataIDResolvesRelativeReferences(t *testing.T) {
 	require.Equal(t, "/redfish/v1/Chassis/1?expand=.", path)
 }
 
+func TestResourcePathPreservesLinkBase(t *testing.T) {
+	for _, tc := range []struct {
+		name, id, base, want string
+	}{
+		{"child", "2/", "/redfish/v1/Managers/1/VirtualMedia/", "/redfish/v1/Managers/1/VirtualMedia/2/"},
+		{"sibling", "2/", "/redfish/v1/Managers/1/VirtualMedia/1", "/redfish/v1/Managers/1/VirtualMedia/2/"},
+		{"metadata", "InsertMediaActionInfo/", "/redfish/v1/Managers/1/VirtualMedia/2/", "/redfish/v1/Managers/1/VirtualMedia/2/InsertMediaActionInfo/"},
+		{"absolute path", "/redfish/v1/Systems/1/", "/unused/", "/redfish/v1/Systems/1/"},
+		{"absolute URL", "https://bmc.example/redfish/v1/Systems/1/", "/unused/", "/redfish/v1/Systems/1/"},
+		{"query", "2/?expand=/", "/redfish/v1/Managers/1/VirtualMedia/", "/redfish/v1/Managers/1/VirtualMedia/2/?expand=/"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path, err := resourcePath(tc.id, tc.base)
+			require.NoError(t, err)
+			require.Equal(t, tc.want, path)
+		})
+	}
+
+	_, err := resourcePath("", "/redfish/v1/Systems/1/")
+	require.Error(t, err)
+	_, err = resourcePath("%invalid", "/redfish/v1/Systems/1/")
+	require.Error(t, err)
+}
+
+func TestResourceRequestPath(t *testing.T) {
+	require.Equal(t, "/redfish/v1/Systems/1", resourceRequestPath("/redfish/v1/Systems/1/"))
+	require.Equal(t, "/redfish/v1/Systems/1?expand=/", resourceRequestPath("/redfish/v1/Systems/1/?expand=/"))
+	require.Equal(t, "/", resourceRequestPath("/"))
+}
+
 func TestValidateStaticIPv4ConfigAllowsIPv6DNS(t *testing.T) {
 	require.NoError(t, ValidateStaticIPv4Config(StaticIPv4Config{
 		Address:    "10.0.0.20",

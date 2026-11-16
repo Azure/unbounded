@@ -1378,6 +1378,11 @@ operator creates it only for a new installation; it does not generate keys or
 reconcile the runtime's state back to an empty manifest. Back it up securely.
 Never log its data: it contains cache encryption keys.
 
+When a new installation uses a new cluster ID, nodes automatically re-enroll
+and delete their old managed enrollment state. This happens only after cluster
+control checks that the live DaemonSet and ServiceAccount record the new ID.
+Replacing the Secret alone does not pass this check.
+
 Each cache has one active page key. Key rotation keeps the replaced page key as
 a decrypt-only key, so cached pages stay readable for six more rotations (seven
 readable page keys in total) before their key is dropped. Origin credential keys

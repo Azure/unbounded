@@ -436,6 +436,17 @@ spec:
                                   - namespace
                                   type: object
                               type: object
+                            cloudInitTimeout:
+                              description: |-
+                                CloudInitTimeout bounds how long a HostReplace target may wait from the
+                                installer reboot handoff until first-boot cloud-init completes and the
+                                Node registers. It covers firmware POST. When omitted, metalman allows
+                                20 minutes. Large GPU servers can spend most of the default budget in
+                                POST alone.
+                              type: string
+                              x-kubernetes-validations:
+                              - message: cloudInitTimeout must be positive
+                                rule: duration(self) > duration('0s')
                             dhcpLeases:
                               description: |-
                                 DHCPLeases defines static IPv4 provisioning network settings. PXE boot

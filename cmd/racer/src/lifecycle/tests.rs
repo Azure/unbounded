@@ -897,3 +897,100 @@ fn repeated_failure_does_not_rewake_subscribers() {
     assert_eq!(counter.count(), 3);
     assert_eq!(control.result(), Err(Error::DeadlineExceeded));
 }
+
+/// Idle lanes and helper shards sleep until woken instead of polling on a
+/// fixed cadence. Release v0.23.0 polled each helper shard 64 times per
+/// millisecond, which kept a 144-CPU node about 15 cores busy while idle.
+#[test]
+fn idle_group_sleeps_until_woken() {
+    use std::sync::atomic::AtomicUsize;
+
+    /// Poll counters shared by every service of the group.
+    #[derive(Default)]
+    struct Polls {
+        lanes: AtomicUsize,
+
+        helpers: AtomicUsize,
+    }
+
+    /// Factory for services that never have work.
+    struct Idle(Arc<Polls>);
+
+    /// Service without work that counts its steady-state polls.
+    struct Counting {
+        polls: Arc<Polls>,
+
+        helper: bool,
+    }
+
+    impl Factory<TestScope> for Idle {
+        /// Construct an idle lane.
+        fn build_lane(&self, _: usize) -> Result<Box<dyn Service<TestScope>>> {
+            Ok(Box::new(Counting {
+                polls: self.0.clone(),
+                helper: false,
+            }))
+        }
+
+        /// Construct an idle helper shard.
+        fn build_helper(&self, _: usize) -> Result<Box<dyn Service<TestScope>>> {
+            Ok(Box::new(Counting {
+                polls: self.0.clone(),
+                helper: true,
+            }))
+        }
+    }
+
+    impl Service<TestScope> for Counting {
+        /// Complete startup without external resources.
+        fn start<'a>(&'a mut self, _: &'a TestScope) -> Operation<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        /// Count the poll without finding work or waking anything.
+        fn poll_budgeted(&mut self, _: &mut Context<'_>, _: usize) -> Result<()> {
+            let polls = if self.helper {
+                &self.polls.helpers
+            } else {
+                &self.polls.lanes
+            };
+            polls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        /// Complete drain without retaining any resources.
+        fn drain<'a>(&'a mut self, _: &'a TestScope) -> Operation<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        /// Complete shutdown without additional work.
+        fn shutdown<'a>(&'a mut self, _: &'a TestScope) -> Operation<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+    // Two lanes share one helper thread, as on production nodes.
+    let mut plan = plan(4);
+    plan.lanes.push(plan.lanes[0].clone());
+    plan.helpers.push(Helper {
+        name: "idle-helpers".into(),
+        cpu: plan.lanes[0].cpu,
+        lanes: vec![0, 1],
+    });
+    let polls = Arc::new(Polls::default());
+    let mut group = Group::new(plan);
+    group
+        .start(Arc::new(Idle(polls.clone())), &TestScope)
+        .unwrap();
+    // Let startup wakes settle before measuring.
+    thread::sleep(Duration::from_millis(50));
+    let lanes = polls.lanes.load(Ordering::SeqCst);
+    let helpers = polls.helpers.load(Ordering::SeqCst);
+    thread::sleep(Duration::from_millis(500));
+    let lanes = polls.lanes.load(Ordering::SeqCst) - lanes;
+    let helpers = polls.helpers.load(Ordering::SeqCst) - helpers;
+    // A 1ms polling cadence would show hundreds of polls per service here.
+    assert!(lanes <= 4, "idle lanes polled {lanes} times");
+    assert!(helpers <= 4, "idle helper shards polled {helpers} times");
+    group.drain(&TestScope).unwrap();
+    assert_eq!(group.join(), Ok(()));
+}

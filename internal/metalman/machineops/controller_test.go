@@ -1526,7 +1526,7 @@ func TestReconcilerTimesOutHostReplaceCloudInitCondition(t *testing.T) {
 		Status:             metav1.ConditionFalse,
 		Reason:             "Running",
 		Message:            "stage \"modules-config\" started",
-		LastTransitionTime: metav1.NewTime(fixedNow().Add(-cloudInitTimeout)),
+		LastTransitionTime: metav1.NewTime(fixedNow().Add(-20 * time.Minute)),
 	})
 	op.Status.Targets = []v1alpha3.MachineOperationTargetStatus{{
 		MachineRef:         machine.Name,
@@ -1545,7 +1545,274 @@ func TestReconcilerTimesOutHostReplaceCloudInitCondition(t *testing.T) {
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &updated))
 	require.Equal(t, v1alpha3.OperationPhaseFailed, updated.Status.Phase)
 	require.Equal(t, v1alpha3.OperationPhaseFailed, updated.Status.Targets[0].Phase)
-	require.Contains(t, updated.Status.Targets[0].Message, "cloud-init did not complete within 5m0s")
+	require.Contains(t, updated.Status.Targets[0].Message, "cloud-init did not complete within 20m0s")
+}
+
+func TestCloudInitReplaceStatusUsesTimeout(t *testing.T) {
+	t.Parallel()
+
+	target := v1alpha3.MachineOperationTargetStatus{Phase: v1alpha3.OperationPhaseInProgress}
+	conditions := []metav1.Condition{{
+		Type:               v1alpha3.MachineOperationConditionCloudInitDone,
+		Status:             metav1.ConditionFalse,
+		Reason:             "Running",
+		LastTransitionTime: metav1.NewTime(fixedNow().Add(-20 * time.Minute)),
+	}}
+
+	change, done := cloudInitReplaceStatus(conditions, target, 30*time.Minute, fixedNow())
+	require.True(t, done)
+	require.Equal(t, v1alpha3.OperationPhaseInProgress, change.target.Phase)
+	require.Equal(t, v1alpha3.OperationStageWaitingCloudInit, change.target.Stage)
+
+	conditions[0].LastTransitionTime = metav1.NewTime(fixedNow().Add(-30 * time.Minute))
+	change, done = cloudInitReplaceStatus(conditions, target, 30*time.Minute, fixedNow())
+	require.True(t, done)
+	require.Equal(t, v1alpha3.OperationPhaseFailed, change.target.Phase)
+	require.Equal(t, "TimedOut: cloud-init did not complete within 30m0s", change.target.Message)
+}
+
+func TestReconcilerUsesMachineCloudInitTimeout(t *testing.T) {
+	t.Parallel()
+
+	s := testScheme(t)
+	machine := testBareMetalMachine("machine-1", "rack-a")
+	machine.Spec.PXE.CloudInitTimeout = &metav1.Duration{Duration: 30 * time.Minute}
+	op := testOperation("op-replace-machine-cloudinit-timeout", v1alpha3.OperationHostReplace)
+	op.Spec.MachineRef = machine.Name
+	op.Status.Phase = v1alpha3.OperationPhaseInProgress
+	op.Status.Conditions = hostReplaceConditions(metav1.ConditionTrue, metav1.ConditionUnknown)
+	apimeta.SetStatusCondition(&op.Status.Conditions, metav1.Condition{
+		Type:               v1alpha3.MachineOperationConditionCloudInitDone,
+		Status:             metav1.ConditionFalse,
+		Reason:             "Running",
+		Message:            "stage \"modules-config\" started",
+		LastTransitionTime: metav1.NewTime(fixedNow().Add(-20 * time.Minute)),
+	})
+	op.Status.Targets = []v1alpha3.MachineOperationTargetStatus{{
+		MachineRef:         machine.Name,
+		Phase:              v1alpha3.OperationPhaseInProgress,
+		Stage:              v1alpha3.OperationStageWaitingCloudInit,
+		ObservedGeneration: machine.Generation,
+	}}
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, testRedfishSecret(), &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: machine.Name}}).WithStatusSubresource(op, machine).Build()
+	reconciler := testReconciler(c, &recordingPowerClient{}, "rack-a")
+
+	_, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+	require.NoError(t, err)
+
+	var updated v1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &updated))
+	require.Equal(t, v1alpha3.OperationPhaseInProgress, updated.Status.Phase)
+
+	for i := range updated.Status.Conditions {
+		if updated.Status.Conditions[i].Type == v1alpha3.MachineOperationConditionCloudInitDone {
+			updated.Status.Conditions[i].LastTransitionTime = metav1.NewTime(fixedNow().Add(-30 * time.Minute))
+		}
+	}
+
+	require.NoError(t, c.Status().Update(context.Background(), &updated))
+
+	_, err = reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+	require.NoError(t, err)
+
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &updated))
+	require.Equal(t, v1alpha3.OperationPhaseFailed, updated.Status.Phase)
+	require.Equal(t, v1alpha3.OperationPhaseFailed, updated.Status.Targets[0].Phase)
+	require.Contains(t, updated.Status.Targets[0].Message, "cloud-init did not complete within 30m0s")
+}
+
+func TestReconcilerTimesOutPXECloudInitFromRebootHandoff(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name         string
+		cloudInit    metav1.ConditionStatus
+		reason       string
+		transitioned metav1.Time
+	}{
+		{
+			name:         "cloud-init still running",
+			cloudInit:    metav1.ConditionFalse,
+			reason:       "Running",
+			transitioned: metav1.NewTime(fixedNow().Add(-5 * time.Minute)),
+		},
+		{
+			name:      "cloud-init never reported",
+			cloudInit: metav1.ConditionUnknown,
+			reason:    "Pending",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			s := testScheme(t)
+			machine := testBareMetalMachine("machine-1", "rack-a")
+			machine.Spec.PXE.CloudInitTimeout = &metav1.Duration{Duration: 30 * time.Minute}
+
+			op := testOperation("op-replace-pxe-cloudinit-timeout", v1alpha3.OperationHostReplace)
+			op.Spec.MachineRef = machine.Name
+			op.Status.Phase = v1alpha3.OperationPhaseInProgress
+			op.Status.Conditions = []metav1.Condition{
+				{Type: v1alpha3.MachineOperationConditionBootLoaderDownloaded, Status: metav1.ConditionUnknown, Reason: "Pending"},
+				{
+					Type:               v1alpha3.MachineOperationConditionBootImageWritten,
+					Status:             metav1.ConditionTrue,
+					Reason:             "Succeeded",
+					LastTransitionTime: metav1.NewTime(fixedNow().Add(-45 * time.Minute)),
+				},
+				{
+					Type:               v1alpha3.MachineOperationConditionCloudInitDone,
+					Status:             tc.cloudInit,
+					Reason:             tc.reason,
+					LastTransitionTime: tc.transitioned,
+				},
+			}
+			op.Status.Targets = []v1alpha3.MachineOperationTargetStatus{{
+				MachineRef:         machine.Name,
+				Phase:              v1alpha3.OperationPhaseInProgress,
+				Stage:              v1alpha3.OperationStageWaitingRepave,
+				ObservedGeneration: machine.Generation,
+			}}
+
+			c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, testRedfishSecret()).WithStatusSubresource(op, machine).Build()
+			reconciler := testReconciler(c, &recordingPowerClient{}, "rack-a")
+
+			_, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+			require.NoError(t, err)
+
+			var updated v1alpha3.MachineOperation
+			require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &updated))
+			require.Equal(t, v1alpha3.OperationPhaseFailed, updated.Status.Phase)
+			require.Equal(t, v1alpha3.OperationPhaseFailed, updated.Status.Targets[0].Phase)
+			require.Equal(t, "TimedOut: cloud-init did not complete within 30m0s", updated.Status.Targets[0].Message)
+		})
+	}
+}
+
+func TestReconcilerTimesOutPXEWaitingForNodeFromRebootHandoff(t *testing.T) {
+	t.Parallel()
+
+	s := testScheme(t)
+	machine := testBareMetalMachine("machine-1", "rack-a")
+	machine.Spec.PXE.CloudInitTimeout = &metav1.Duration{Duration: 30 * time.Minute}
+
+	op := testOperation("op-replace-pxe-node-timeout", v1alpha3.OperationHostReplace)
+	op.Spec.MachineRef = machine.Name
+	op.Status.Phase = v1alpha3.OperationPhaseInProgress
+	op.Status.Conditions = []metav1.Condition{
+		{Type: v1alpha3.MachineOperationConditionBootLoaderDownloaded, Status: metav1.ConditionUnknown, Reason: "Pending"},
+		{
+			Type:               v1alpha3.MachineOperationConditionBootImageWritten,
+			Status:             metav1.ConditionTrue,
+			Reason:             "Succeeded",
+			LastTransitionTime: metav1.NewTime(fixedNow().Add(-45 * time.Minute)),
+		},
+		{
+			Type:               v1alpha3.MachineOperationConditionCloudInitDone,
+			Status:             metav1.ConditionTrue,
+			Reason:             "Succeeded",
+			LastTransitionTime: metav1.NewTime(fixedNow().Add(-35 * time.Minute)),
+		},
+	}
+	op.Status.Targets = []v1alpha3.MachineOperationTargetStatus{{
+		MachineRef:         machine.Name,
+		Phase:              v1alpha3.OperationPhaseInProgress,
+		Stage:              v1alpha3.OperationStageWaitingNode,
+		ObservedGeneration: machine.Generation,
+	}}
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, testRedfishSecret()).WithStatusSubresource(op, machine).Build()
+	reconciler := testReconciler(c, &recordingPowerClient{}, "rack-a")
+
+	_, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+	require.NoError(t, err)
+
+	var updated v1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &updated))
+	require.Equal(t, v1alpha3.OperationPhaseFailed, updated.Status.Phase)
+	require.Equal(t, v1alpha3.OperationPhaseFailed, updated.Status.Targets[0].Phase)
+	require.Equal(t, "TimedOut: Node machine-1 did not register within 30m0s", updated.Status.Targets[0].Message)
+}
+
+func TestReconcilerWaitsForPXEWithinRebootHandoffBudget(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name      string
+		cloudInit metav1.ConditionStatus
+		reason    string
+		node      bool
+		stage     v1alpha3.OperationStage
+		message   string
+	}{
+		{
+			name:      "cloud-init within budget",
+			cloudInit: metav1.ConditionFalse,
+			reason:    "Running",
+			stage:     v1alpha3.OperationStageWaitingCloudInit,
+			message:   "waiting for first-boot cloud-init to complete",
+		},
+		{
+			name:      "Node registration within budget",
+			cloudInit: metav1.ConditionTrue,
+			reason:    "Succeeded",
+			stage:     v1alpha3.OperationStageWaitingNode,
+			message:   "waiting for Node machine-1 to exist",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			s := testScheme(t)
+			machine := testBareMetalMachine("machine-1", "rack-a")
+			machine.Spec.PXE.CloudInitTimeout = &metav1.Duration{Duration: 30 * time.Minute}
+
+			op := testOperation("op-replace-pxe-within-budget", v1alpha3.OperationHostReplace)
+			op.Spec.MachineRef = machine.Name
+			op.Status.Phase = v1alpha3.OperationPhaseInProgress
+			op.Status.Conditions = []metav1.Condition{
+				{Type: v1alpha3.MachineOperationConditionBootLoaderDownloaded, Status: metav1.ConditionUnknown, Reason: "Pending"},
+				{
+					Type:               v1alpha3.MachineOperationConditionBootImageWritten,
+					Status:             metav1.ConditionTrue,
+					Reason:             "Succeeded",
+					LastTransitionTime: metav1.NewTime(fixedNow().Add(-5 * time.Minute)),
+				},
+				{
+					Type:               v1alpha3.MachineOperationConditionCloudInitDone,
+					Status:             tc.cloudInit,
+					Reason:             tc.reason,
+					LastTransitionTime: metav1.NewTime(fixedNow().Add(-2 * time.Minute)),
+				},
+			}
+			op.Status.Targets = []v1alpha3.MachineOperationTargetStatus{{
+				MachineRef:         machine.Name,
+				Phase:              v1alpha3.OperationPhaseInProgress,
+				Stage:              v1alpha3.OperationStageWaitingRepave,
+				ObservedGeneration: machine.Generation,
+			}}
+
+			objects := []client.Object{machine, op, testRedfishSecret()}
+			if tc.node {
+				objects = append(objects, &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: machine.Name}})
+			}
+
+			c := fake.NewClientBuilder().WithScheme(s).WithObjects(objects...).WithStatusSubresource(op, machine).Build()
+			reconciler := testReconciler(c, &recordingPowerClient{}, "rack-a")
+
+			_, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+			require.NoError(t, err)
+
+			var updated v1alpha3.MachineOperation
+			require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &updated))
+			require.Equal(t, v1alpha3.OperationPhaseInProgress, updated.Status.Phase)
+			require.Nil(t, updated.Status.CompletedAt)
+			require.Equal(t, v1alpha3.OperationPhaseInProgress, updated.Status.Targets[0].Phase)
+			require.Equal(t, tc.stage, updated.Status.Targets[0].Stage)
+			require.Equal(t, tc.message, updated.Status.Targets[0].Message)
+		})
+	}
 }
 
 func TestReconcilerUsesKubernetesNodeRefForHostReplaceCompletion(t *testing.T) {

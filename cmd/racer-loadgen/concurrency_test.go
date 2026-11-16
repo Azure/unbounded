@@ -170,8 +170,10 @@ func TestLiveConcurrencyUpdatesDrainAndShutdown(t *testing.T) {
 		release <- struct{}{}
 	}
 
-	require.Eventually(t, func() bool { return testutil.ToFloat64(metrics.inFlight) == 0 }, time.Second, time.Millisecond)
-	require.Equal(t, float64(3), testutil.ToFloat64(metrics.pulls.WithLabelValues("success")))
+	require.Eventually(t, func() bool {
+		return testutil.ToFloat64(metrics.inFlight) == 0 &&
+			testutil.ToFloat64(metrics.pulls.WithLabelValues("success")) == 3
+	}, time.Second, time.Millisecond)
 	require.Positive(t, testutil.ToFloat64(metrics.verifiedBytes))
 	require.Never(t, func() bool { return requests.Load() != 3 }, 30*time.Millisecond, time.Millisecond)
 	replaceConcurrency(t, opts.ConcurrencyFile, "2")

@@ -1,0 +1,20 @@
+[
+  {
+    "status": {
+      "capacity": {
+        "cpu": "4",
+        "ephemeral-storage": "62259Mi",
+        "memory": "15155Mi",
+        "pods": "110"
+      },
+      "allocatable": {
+        "cpu": "3650m",
+        "ephemeral-storage": "58901232748",
+        "hugepages-1Gi": "0",
+        "hugepages-2Mi": "0",
+        "memory": "15478692Ki",
+        "pods": "110"
+      }
+    }
+  }
+]

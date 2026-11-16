@@ -107,6 +107,7 @@ top-level `spec.pxe` remains a deprecated fallback for existing Machines.
 | `host.netboot.cloudInit.userDataConfigMapRef.name` | string | Yes | - | ConfigMap name. |
 | `host.netboot.cloudInit.userDataConfigMapRef.namespace` | string | Yes | - | ConfigMap namespace. |
 | `host.netboot.cloudInit.userDataConfigMapRef.key` | string | No | `"user-data"` | Key within the ConfigMap. |
+| `host.netboot.cloudInitTimeout` | string | No | `20m` | Time allowed from installer reboot handoff for first-boot cloud-init to complete and the Node to register, including firmware POST. Must be a positive duration. |
 
 > **Migration note:** `redfish.passwordRef.key` used to default to
 > `"ssh-privatekey"`. It now defaults to `"password"`. Existing Machines keep

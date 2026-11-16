@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"testing"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -67,6 +68,24 @@ func TestBootProtocolDefaultsAndVirtualMedia(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := tc.spec.TargetBootProtocol(); got != tc.want {
 				t.Fatalf("protocol = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCloudInitTimeoutDefaultsAndCustom(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		spec *PXESpec
+		want time.Duration
+	}{
+		{"nil", nil, DefaultCloudInitTimeout},
+		{"default", &PXESpec{}, DefaultCloudInitTimeout},
+		{"custom", &PXESpec{CloudInitTimeout: &metav1.Duration{Duration: 30 * time.Minute}}, 30 * time.Minute},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.spec.TargetCloudInitTimeout(); got != tc.want {
+				t.Fatalf("timeout = %s, want %s", got, tc.want)
 			}
 		})
 	}

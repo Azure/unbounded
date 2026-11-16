@@ -79,28 +79,40 @@ func createSession(ctx context.Context, httpClient *http.Client, baseURL, user, 
 }
 
 func (s *bmcSession) do(ctx context.Context, method, path string, body any) ([]byte, int, error) {
-	data, status, err := s.doOnce(ctx, method, path, body)
+	resp, err := s.send(ctx, method, path, body, nil)
+
+	return resp.data, resp.status, err
+}
+
+type sessionResponse struct {
+	data   []byte
+	status int
+	header http.Header
+}
+
+func (s *bmcSession) send(ctx context.Context, method, path string, body any, header http.Header) (sessionResponse, error) {
+	resp, err := s.sendOnce(ctx, method, path, body, header)
 	if err != nil {
-		return data, status, err
+		return resp, err
 	}
 
 	// If the session token expired, re-authenticate and retry once.
-	if status == http.StatusUnauthorized && s.token != "" {
+	if resp.status == http.StatusUnauthorized && s.token != "" {
 		token, location, authErr := createSession(ctx, s.httpClient, s.baseURL, s.user, s.pass)
 		if authErr != nil {
-			return data, status, nil
+			return resp, nil
 		}
 
 		s.token = token
 		s.location = location
 
-		return s.doOnce(ctx, method, path, body)
+		return s.sendOnce(ctx, method, path, body, header)
 	}
 
-	return data, status, nil
+	return resp, nil
 }
 
-func (s *bmcSession) doOnce(ctx context.Context, method, path string, body any) ([]byte, int, error) {
+func (s *bmcSession) sendOnce(ctx context.Context, method, path string, body any, header http.Header) (sessionResponse, error) {
 	url := strings.TrimRight(s.baseURL, "/") + path
 
 	var bodyReader io.Reader
@@ -108,7 +120,7 @@ func (s *bmcSession) doOnce(ctx context.Context, method, path string, body any) 
 	if body != nil {
 		payload, err := json.Marshal(body)
 		if err != nil {
-			return nil, 0, err
+			return sessionResponse{}, err
 		}
 
 		bodyReader = bytes.NewReader(payload)
@@ -116,7 +128,13 @@ func (s *bmcSession) doOnce(ctx context.Context, method, path string, body any) 
 
 	req, err := http.NewRequestWithContext(ctx, method, url, bodyReader)
 	if err != nil {
-		return nil, 0, err
+		return sessionResponse{}, err
+	}
+
+	for key, values := range header {
+		for _, value := range values {
+			req.Header.Add(key, value)
+		}
 	}
 
 	if body != nil {
@@ -131,22 +149,24 @@ func (s *bmcSession) doOnce(ctx context.Context, method, path string, body any) 
 
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
-		return nil, 0, fmt.Errorf("redfish %s %s failed: %w", method, path, err)
+		return sessionResponse{}, fmt.Errorf("redfish %s %s failed: %w", method, path, err)
 	}
 	defer resp.Body.Close() //nolint:errcheck // Best-effort close of HTTP response body.
 
-	data, err := io.ReadAll(resp.Body)
+	result := sessionResponse{status: resp.StatusCode, header: resp.Header}
+
+	result.data, err = io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, resp.StatusCode, fmt.Errorf("reading Redfish %s %s response body: %w", method, path, err)
+		return result, fmt.Errorf("reading Redfish %s %s response body: %w", method, path, err)
 	}
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		if err := checkCompletion(data); err != nil {
-			return data, resp.StatusCode, redfishResponseError(method, path, resp.StatusCode, data, err)
+		if err := checkCompletion(result.data); err != nil {
+			return result, redfishResponseError(method, path, resp.StatusCode, result.data, err)
 		}
 	}
 
-	return data, resp.StatusCode, nil
+	return result, nil
 }
 
 // close removes the session from the BMC (best-effort).

@@ -21,9 +21,14 @@ import (
 // both gated by readyCheck. Kubernetes conventions vary on whether
 // readiness goes through healthz or readyz; we expose all three so a
 // hand-rolled probe block does not need to learn Gantry's preferences.
-func startOpsEndpoint(addr string, reg *metrics.Registry, readyCheck func() (string, bool), logger *slog.Logger) (*http.Server, <-chan error) {
+func startOpsEndpoint(addr string, reg *metrics.Registry, readyCheck func() (string, bool), logger *slog.Logger, progressHandler http.Handler) (*http.Server, <-chan error) {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", reg.Handler())
+
+	if progressHandler != nil {
+		mux.Handle("GET /v1/progress", progressHandler)
+	}
+
 	mux.HandleFunc("/livez", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok")) //nolint:errcheck // best-effort write

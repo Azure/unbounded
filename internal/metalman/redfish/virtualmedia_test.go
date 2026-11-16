@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -68,6 +67,7 @@ func TestVirtualMediaRequests(t *testing.T) {
 	})
 	c := dialRack(t, srv, "7")
 	require.True(t, c.SupportsVirtualMedia())
+	require.False(t, c.VirtualMediaStagingReadOnly())
 	require.NoError(t, c.StageVirtualMedia(t.Context(), testMedia))
 	require.NoError(t, c.MountVirtualMedia(t.Context(), testMedia))
 	require.NoError(t, c.SetVirtualMediaBoot(t.Context()))
@@ -96,18 +96,18 @@ func TestVirtualMediaPrimerMountFailureStops(t *testing.T) {
 }
 
 func TestVirtualMediaUnsupported(t *testing.T) {
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Errorf("unexpected request %s", r.URL.Path)
-	}))
-	defer srv.Close()
-
-	c := &Client{session: &bmcSession{httpClient: srv.Client(), baseURL: srv.URL}}
-	require.False(t, c.SupportsVirtualMedia())
-	require.ErrorIs(t, c.StageVirtualMedia(t.Context(), testMedia), ErrUnsupported)
-	require.ErrorIs(t, c.MountVirtualMedia(t.Context(), testMedia), ErrUnsupported)
+	f, c := newFakeILO(t)
+	f.noManager = true
+	f.allowed = []string{"Pxe", "Hdd"}
+	// Standard clients validate the BMC's capabilities during staging.
+	require.True(t, c.SupportsVirtualMedia())
+	require.True(t, c.VirtualMediaStagingReadOnly())
+	require.ErrorIs(t, c.StageVirtualMedia(t.Context(), standardMedia), ErrUnsupported)
+	require.ErrorIs(t, c.MountVirtualMedia(t.Context(), standardMedia), ErrUnsupported)
 	require.ErrorIs(t, c.SetVirtualMediaBoot(t.Context()), ErrUnsupported)
-	require.ErrorIs(t, c.CleanupVirtualMedia(t.Context(), testMedia), ErrUnsupported)
-	require.ErrorIs(t, c.DeleteVirtualMedia(t.Context(), testMedia), ErrUnsupported)
+	require.NoError(t, c.CleanupVirtualMedia(t.Context(), standardMedia))
+	require.NoError(t, c.DeleteVirtualMedia(t.Context(), standardMedia))
+	require.Empty(t, f.mutations)
 }
 
 func TestVirtualMediaValidation(t *testing.T) {

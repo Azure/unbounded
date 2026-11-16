@@ -149,6 +149,7 @@ type overrideQuarantine struct {
 // quarantineTarget is one component's workloads put in doubt by one problem.
 type quarantineTarget struct {
 	component string
+	name      string
 
 	// kind is empty when the offending entry named no usable kind, in which
 	// case every kind the component emits is in doubt.
@@ -185,6 +186,7 @@ func quarantineFor(problems []override.Problem) overrideQuarantine {
 		q.targets = append(q.targets, quarantineTarget{
 			component: problem.Component,
 			kind:      problem.Kind,
+			name:      problem.Name,
 			sites:     siteSet(problem.Sites),
 			problem:   problem,
 		})
@@ -230,6 +232,10 @@ func (q overrideQuarantine) covers(op component.Operation) (error, bool) {
 		}
 
 		if target.kind != "" && target.kind != op.Object.GetKind() {
+			continue
+		}
+
+		if target.name != "" && target.name != op.Object.GetName() {
 			continue
 		}
 

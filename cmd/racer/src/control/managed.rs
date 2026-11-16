@@ -3,7 +3,8 @@
 //! The first managed start records the cluster UID in a sentinel and moves
 //! enrollment into a cluster-scoped subdirectory. Legacy standalone identity
 //! files in the root are never read, rewritten, or removed. A later start that
-//! reports a different cluster UID fails closed instead of rebinding the node.
+//! reports a different cluster UID re-enrolls the node after cluster control has
+//! checked the installation binding, removing stale managed enrollment state.
 
 use super::Managed;
 use crate::config::Config;
@@ -17,7 +18,7 @@ use std::time::Duration;
 /// Subdirectory of the identity root reserved for managed enrollment.
 const MANAGED_DIRECTORY: &str = "managed";
 
-/// Sentinel recording the one cluster UID this node identity may join.
+/// Sentinel recording the current managed enrollment cluster UID.
 const CLUSTER_SENTINEL: &str = "cluster";
 
 /// Embedded authority service as seen by dataplane startup.
@@ -156,46 +157,40 @@ pub fn bind_cluster(root: &Path, cluster: &ClusterId) -> Result<PathBuf> {
         Some(recorded) if recorded == cluster.0 => {}
         Some(recorded) => {
             eprintln!(
-                "racer: stage=cluster-binding fatal error=cluster UID changed from {recorded} to {}; \
-                 this node identity stays bound to {recorded}. If the racer-state Secret was \
-                 intentionally recreated, stop the dataplane and remove {} to re-enroll",
-                cluster.0,
-                managed.display()
+                "racer: stage=cluster-binding state=rebinding from={recorded} to={}",
+                cluster.0
             );
-            return Err(Error::Unauthorized);
+            write_sentinel(&managed, &sentinel, &cluster.0)?;
         }
-        None => {
-            refuse_orphans(&managed, cluster)?;
-            write_sentinel(&managed, &sentinel, &cluster.0)?
-        }
+        None => write_sentinel(&managed, &sentinel, &cluster.0)?,
     }
+    remove_stale_enrollment(&managed, cluster)?;
     let directory = managed.join(&cluster.0);
     create_private(&directory)?;
     Ok(directory)
 }
 
-/// Refuse to record a sentinel beside state from another cluster.
+/// Remove stale enrollment only after the current sentinel is durable.
 ///
-/// The cluster directory is created only after the sentinel is durable, so any
-/// other cluster directory means the sentinel was lost or removed by hand.
-/// Writing a new sentinel then would silently rebind the node.
-fn refuse_orphans(managed: &Path, cluster: &ClusterId) -> Result<()> {
+/// Run on every bind so a restart finishes cleanup interrupted by a crash.
+/// Symlinks are removed themselves, without touching their targets.
+fn remove_stale_enrollment(managed: &Path, cluster: &ClusterId) -> Result<()> {
     let temporary = format!("{CLUSTER_SENTINEL}.tmp");
     for entry in std::fs::read_dir(managed).map_err(|_| Error::Io)? {
-        let name = entry.map_err(|_| Error::Io)?.file_name();
-        if name == cluster.0.as_str() || name == temporary.as_str() {
+        let entry = entry.map_err(|_| Error::Io)?;
+        let name = entry.file_name();
+        if name == cluster.0.as_str() || name == CLUSTER_SENTINEL || name == temporary.as_str() {
             continue;
         }
-        eprintln!(
-            "racer: stage=cluster-binding fatal error=missing sentinel beside {}; \
-             refusing to bind {} without operator action. Remove {} to re-enroll",
-            name.to_string_lossy(),
-            cluster.0,
-            managed.display()
-        );
-        return Err(Error::CorruptRecord);
+        if entry.file_type().map_err(|_| Error::Io)?.is_dir() {
+            std::fs::remove_dir_all(entry.path()).map_err(|_| Error::Io)?;
+        } else {
+            std::fs::remove_file(entry.path()).map_err(|_| Error::Io)?;
+        }
     }
-    Ok(())
+    std::fs::File::open(managed)
+        .and_then(|d| d.sync_all())
+        .map_err(|_| Error::Io)
 }
 
 /// Create a node-private directory, accepting an existing real directory only.
@@ -327,19 +322,23 @@ mod tests {
     }
 
     #[test]
-    fn restart_with_same_cluster_reuses_and_changed_cluster_fails_closed() {
+    fn restart_with_same_cluster_reuses_and_changed_cluster_reenrolls() {
         let d = Directory::new("restart");
         let first = bind_cluster(&d.0, &ClusterId(FIRST.into())).unwrap();
         std::fs::write(first.join("identity.json"), b"managed").unwrap();
         assert_eq!(bind_cluster(&d.0, &ClusterId(FIRST.into())).unwrap(), first);
         assert_eq!(
-            bind_cluster(&d.0, &ClusterId(SECOND.into())),
-            Err(Error::Unauthorized)
-        );
-        assert!(!d.0.join("managed").join(SECOND).exists());
-        assert_eq!(
             std::fs::read(first.join("identity.json")).unwrap(),
             b"managed"
+        );
+        let second = bind_cluster(&d.0, &ClusterId(SECOND.into())).unwrap();
+        assert_eq!(second, d.0.join("managed").join(SECOND));
+        assert!(second.is_dir());
+        assert!(!second.join("identity.json").exists());
+        assert!(!first.exists());
+        assert_eq!(
+            std::fs::read_to_string(d.0.join("managed/cluster")).unwrap(),
+            format!("{SECOND}\n")
         );
     }
 
@@ -359,22 +358,125 @@ mod tests {
     }
 
     #[test]
-    fn lost_sentinel_beside_other_cluster_fails_closed() {
+    fn lost_sentinel_beside_other_cluster_reenrolls() {
         let d = Directory::new("lost");
         let first = bind_cluster(&d.0, &ClusterId(FIRST.into())).unwrap();
         std::fs::write(first.join("identity.json"), b"managed").unwrap();
         std::fs::remove_file(d.0.join("managed/cluster")).unwrap();
+        let second = bind_cluster(&d.0, &ClusterId(SECOND.into())).unwrap();
+        assert!(second.is_dir());
+        assert!(!first.exists());
+        assert_eq!(
+            std::fs::read_to_string(d.0.join("managed/cluster")).unwrap(),
+            format!("{SECOND}\n")
+        );
+        // The same cluster may restore its own lost sentinel.
+        std::fs::write(second.join("identity.json"), b"new-managed").unwrap();
+        std::fs::remove_file(d.0.join("managed/cluster")).unwrap();
+        assert_eq!(
+            bind_cluster(&d.0, &ClusterId(SECOND.into())).unwrap(),
+            second
+        );
+        assert_eq!(
+            std::fs::read(second.join("identity.json")).unwrap(),
+            b"new-managed"
+        );
+    }
+
+    #[test]
+    fn failed_sentinel_update_preserves_old_enrollment() {
+        let d = Directory::new("sentinel-write-failure");
+        let first = bind_cluster(&d.0, &ClusterId(FIRST.into())).unwrap();
+        std::fs::write(first.join("identity.json"), b"managed").unwrap();
+        let target = d.0.join("untouched");
+        std::fs::write(&target, b"untouched").unwrap();
+        std::os::unix::fs::symlink(&target, d.0.join("managed/cluster.tmp")).unwrap();
+
         assert_eq!(
             bind_cluster(&d.0, &ClusterId(SECOND.into())),
-            Err(Error::CorruptRecord)
+            Err(Error::Io)
         );
-        assert!(!d.0.join("managed/cluster").exists());
-        assert!(!d.0.join("managed").join(SECOND).exists());
-        // The same cluster may restore its own lost sentinel.
-        assert_eq!(bind_cluster(&d.0, &ClusterId(FIRST.into())).unwrap(), first);
+        assert_eq!(
+            std::fs::read_to_string(d.0.join("managed/cluster")).unwrap(),
+            format!("{FIRST}\n")
+        );
         assert_eq!(
             std::fs::read(first.join("identity.json")).unwrap(),
             b"managed"
+        );
+        assert_eq!(std::fs::read(target).unwrap(), b"untouched");
+        assert!(!d.0.join("managed").join(SECOND).exists());
+    }
+
+    #[test]
+    fn restart_finishes_cleanup_after_sentinel_was_updated() {
+        let d = Directory::new("interrupted-cleanup");
+        let first = bind_cluster(&d.0, &ClusterId(FIRST.into())).unwrap();
+        std::fs::write(first.join("identity.json"), b"old-managed").unwrap();
+        std::fs::write(d.0.join("identity.json"), b"legacy").unwrap();
+        let managed = d.0.join("managed");
+        write_sentinel(&managed, &managed.join(CLUSTER_SENTINEL), SECOND).unwrap();
+        std::fs::write(managed.join("stale-file"), b"stale").unwrap();
+        let second = managed.join(SECOND);
+        create_private(&second).unwrap();
+        std::fs::write(second.join("identity.json"), b"new-managed").unwrap();
+
+        assert_eq!(
+            bind_cluster(&d.0, &ClusterId(SECOND.into())).unwrap(),
+            second
+        );
+        assert!(!first.exists());
+        assert!(!managed.join("stale-file").exists());
+        assert_eq!(std::fs::read(d.0.join("identity.json")).unwrap(), b"legacy");
+        assert_eq!(
+            std::fs::read(second.join("identity.json")).unwrap(),
+            b"new-managed"
+        );
+        assert_eq!(
+            bind_cluster(&d.0, &ClusterId(SECOND.into())).unwrap(),
+            second
+        );
+    }
+
+    #[test]
+    fn stale_symlinks_are_removed_without_following_targets() {
+        let d = Directory::new("stale-symlinks");
+        let first = bind_cluster(&d.0, &ClusterId(FIRST.into())).unwrap();
+        let target = d.0.join("untouched");
+        create_private(&target).unwrap();
+        std::fs::write(target.join("identity.json"), b"untouched").unwrap();
+        let managed = d.0.join("managed");
+        std::os::unix::fs::symlink(&target, managed.join("stale-link")).unwrap();
+        std::os::unix::fs::symlink(&target, first.join("nested-link")).unwrap();
+        std::os::unix::fs::symlink(d.0.join("absent"), managed.join("dangling-link")).unwrap();
+
+        bind_cluster(&d.0, &ClusterId(SECOND.into())).unwrap();
+        assert!(!first.exists());
+        assert!(std::fs::symlink_metadata(managed.join("stale-link")).is_err());
+        assert!(std::fs::symlink_metadata(managed.join("dangling-link")).is_err());
+        assert_eq!(
+            std::fs::read(target.join("identity.json")).unwrap(),
+            b"untouched"
+        );
+    }
+
+    #[test]
+    fn symlinked_current_enrollment_is_rejected_without_following_target() {
+        let d = Directory::new("current-symlink");
+        let first = bind_cluster(&d.0, &ClusterId(FIRST.into())).unwrap();
+        let target = d.0.join("untouched");
+        create_private(&target).unwrap();
+        std::fs::write(target.join("identity.json"), b"untouched").unwrap();
+        std::os::unix::fs::symlink(&target, d.0.join("managed").join(SECOND)).unwrap();
+
+        assert_eq!(
+            bind_cluster(&d.0, &ClusterId(SECOND.into())),
+            Err(Error::InvalidConfiguration)
+        );
+        assert!(!first.exists());
+        assert_eq!(
+            std::fs::read(target.join("identity.json")).unwrap(),
+            b"untouched"
         );
     }
 
@@ -480,7 +582,7 @@ mod tests {
     }
 
     #[test]
-    fn start_fails_on_fatal_stop_budget_and_changed_cluster() {
+    fn start_fails_on_fatal_stop_and_budget_but_recovers_changed_cluster() {
         let d = Directory::new("start-fail");
         let mut config = managed_config(&d.0);
         let fatal = std::sync::Arc::new(Scripted::new(vec![Err(BootstrapError::Fatal)]));
@@ -508,15 +610,18 @@ mod tests {
         )
         .unwrap();
         let mut config = managed_config(&d.0);
+        start(
+            &mut config,
+            std::sync::Arc::new(Scripted::new(vec![bootstrapped(SECOND)])),
+            &|| false,
+        )
+        .unwrap();
+        assert_eq!(config.cluster.0, SECOND);
         assert_eq!(
-            start(
-                &mut config,
-                std::sync::Arc::new(Scripted::new(vec![bootstrapped(SECOND)])),
-                &|| false
-            ),
-            Err(Error::Unauthorized)
+            config.enrollment_directory,
+            Some(config.identity_directory.join("managed").join(SECOND))
         );
-        assert!(config.managed_control.is_none());
+        assert!(config.managed_control.is_some());
     }
 
     #[test]

@@ -1,0 +1,67 @@
+{
+  "apiVersion": "unbounded-cloud.io/v1alpha3",
+  "kind": "MachineClass",
+  "metadata": {
+    "generation": 1,
+    "name": "azure-poc",
+    "uid": "a30a4e8c-1803-4c3d-b8c4-303c4243922d"
+  },
+  "status": {
+    "conditions": [
+      {
+        "lastTransitionTime": "2026-10-22T01:38:23Z",
+        "observedGeneration": 1,
+        "reason": "Resolved",
+        "status": "True",
+        "type": "Ready"
+      }
+    ],
+    "observedGeneration": 1,
+    "resolvedRevision": "sha256:58d6fd86374390be65b5a7cbf0c39f5187e44a029616052408204b9da636b744",
+    "offerings": [
+      {
+        "availability": "Available",
+        "capacity": {
+          "cpu": "4",
+          "ephemeral-storage": "62259Mi",
+          "memory": "15155Mi",
+          "pods": "110"
+        },
+        "capacityType": "OnDemand",
+        "instanceType": "Standard_D4s_v3",
+        "labels": {
+          "kubernetes.io/arch": "amd64",
+          "kubernetes.io/os": "linux",
+          "node.kubernetes.io/instance-type": "Standard_D4s_v3",
+          "topology.kubernetes.io/region": "eastus2",
+          "topology.kubernetes.io/zone": "eastus2-1",
+          "unbounded-cloud.io/capacity-type": "OnDemand"
+        },
+        "name": "standard_d4s_v3-eastus2-1-on-demand",
+        "observedAt": "2026-10-22T01:38:20Z",
+        "overhead": {
+          "evictionThreshold": {
+            "ephemeral-storage": "6225Mi",
+            "memory": "100Mi"
+          },
+          "kubeReserved": {
+            "cpu": "100m",
+            "memory": "256Mi"
+          },
+          "systemReserved": {
+            "cpu": "250m",
+            "memory": "512Mi"
+          }
+        },
+        "price": {
+          "currency": "USD",
+          "observedAt": "2026-10-22T01:03:58Z",
+          "perHour": "0.192",
+          "source": "azure-retail-prices-api Linux on-demand hourly list price; excludes disks, discounts, and other charges"
+        },
+        "validUntil": "2026-10-22T01:53:20Z",
+        "zone": "eastus2-1"
+      }
+    ]
+  }
+}

@@ -379,7 +379,13 @@ kubectl unbounded gantry attach-acr \
   --cluster-resource-id "$AKS_ID"
 ```
 
-`ACR_ID` and `AKS_ID` are full Azure resource IDs in the same subscription.
+`ACR_ID` and `AKS_ID` are full Azure resource IDs. They may be in different
+subscriptions within the same Microsoft Entra tenant. The command creates or
+reuses the Gantry-owned pull identity and identity binding in the AKS subscription,
+and uses the caller's Azure CLI permissions to create the pull-role assignment at
+the ACR scope in the registry's subscription. Existing sufficient grants are
+reused; conditional grants are not broadened.
+
 Use `--kubeconfig /path/to/kubeconfig` to select a cluster; otherwise the current
 context is used. This requires a compatible plugin/operator release, not the
 Azure deployment script's pinned `v0.8.0` baseline.
@@ -400,8 +406,12 @@ Requirements:
   `KubeletServiceAccountTokenForCredentialProviders` enabled.
 - AKS identity bindings available and their token proxy reachable from every
   worker. API-server VNet integration is unsupported.
-- Administrative Azure/Kubernetes permissions for attachment, and installation
-  images accessible before private ACR authentication is configured.
+- Administrative Kubernetes permissions and Azure read access to both resources,
+  permissions to enable AKS workload identity and manage the pull identity and
+  identity binding in the AKS subscription, and permission to read ACR role
+  assignments. If a sufficient pull grant does not already exist, the caller also
+  needs `Microsoft.Authorization/roleAssignments/write` at the ACR scope.
+- Installation images accessible before private ACR authentication is configured.
 
 The command waits for installation, not proof of a successful private-image pull.
 Verify a private pull and Gantry peer distribution separately. Removing the

@@ -17,6 +17,7 @@ import (
 
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/httprange"
+	"github.com/Azure/unbounded/internal/gantry/streamcopy"
 )
 
 const (
@@ -42,14 +43,23 @@ func (e *OriginStatusError) Error() string {
 
 // OriginClient fetches exact ranges from validated signed origin URLs.
 type OriginClient struct {
-	hc  *http.Client
-	sem chan struct{}
+	hc          *http.Client
+	sem         chan struct{}
+	onLiveBytes func(int64)
+	onActivity  func(int)
+}
+
+type OriginOption func(*OriginClient)
+
+// WithOriginTransferMetrics observes actual range bytes and active origin reads.
+func WithOriginTransferMetrics(bytes func(int64), activity func(int)) OriginOption {
+	return func(client *OriginClient) { client.onLiveBytes, client.onActivity = bytes, activity }
 }
 
 type redirectDigestContextKey struct{}
 
 // NewOriginClient constructs a client with independent origin concurrency.
-func NewOriginClient(policy URLPolicy) *OriginClient {
+func NewOriginClient(policy URLPolicy, options ...OriginOption) *OriginClient {
 	transport := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
 		DialContext:           (&net.Dialer{Timeout: defaultOriginDialTimeout, KeepAlive: 30 * time.Second}).DialContext,
@@ -87,7 +97,12 @@ func NewOriginClient(policy URLPolicy) *OriginClient {
 		},
 	}
 
-	return &OriginClient{hc: hc, sem: make(chan struct{}, maxConcurrentOriginReads)}
+	client := &OriginClient{hc: hc, sem: make(chan struct{}, maxConcurrentOriginReads)}
+	for _, option := range options {
+		option(client)
+	}
+
+	return client
 }
 
 // FetchRange fetches exactly requested from origin and returns the complete
@@ -103,7 +118,8 @@ func (c *OriginClient) FetchRange(ctx context.Context, origin OriginURL, request
 		return nil, 0, "", ctx.Err()
 	}
 
-	release := func() { <-c.sem }
+	finish := streamcopy.BeginActivity(c.onActivity)
+	release := func() { <-c.sem; finish() }
 
 	ctx = context.WithValue(ctx, redirectDigestContextKey{}, origin.Digest)
 
@@ -154,7 +170,9 @@ func (c *OriginClient) FetchRange(ctx context.Context, origin OriginURL, request
 		return nil, 0, "", fmt.Errorf("streaming origin range response: %w", err)
 	}
 
-	return &releaseReadCloser{ReadCloser: resp.Body, release: release}, total, resp.Header.Get("Content-Type"), nil
+	body := streamcopy.Observe(&releaseReadCloser{ReadCloser: resp.Body, release: release}, c.onLiveBytes, finish)
+
+	return body, total, resp.Header.Get("Content-Type"), nil
 }
 
 func parseRetryAfter(value string, now time.Time) time.Duration {

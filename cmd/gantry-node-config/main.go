@@ -26,6 +26,8 @@ func run(args []string) error {
 	stateDir := fs.String("state", "/host/var/lib/gantry/snapshotter-config", "configuration state directory")
 
 	address := fs.String("address", "/run/gantry-overlaybd/gantry-overlaybd.sock", "host snapshotter socket")
+
+	snapshotterRoot := fs.String("snapshotter-root", containerdconfig.DefaultSnapshotterRoot, "host-visible snapshotter data root for image filesystem statistics")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -40,6 +42,7 @@ func run(args []string) error {
 		StateDir:        *stateDir,
 		Address:         *address,
 		SnapshotterName: "gantry-overlaybd",
+		SnapshotterRoot: *snapshotterRoot,
 	}
 
 	var (

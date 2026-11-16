@@ -22,6 +22,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/oci"
 	"github.com/Azure/unbounded/internal/gantry/registryauth"
+	"github.com/Azure/unbounded/internal/gantry/streamcopy"
 	"github.com/Azure/unbounded/internal/gantry/tracing"
 )
 
@@ -41,6 +42,8 @@ type Client struct {
 	// for the same flow-control window and share its idle-ping fate.
 	rangeHC     *http.Client
 	onBytesRead func(kind string, bytes int64)
+	onLiveBytes func(kind string, bytes int64)
+	onActivity  func(kind string, delta int)
 }
 
 // peerMaxReadFrameSize pairs with streamcopy.BufferSize. Large peer response
@@ -59,6 +62,8 @@ type clientOptions struct {
 	requestTimeout  time.Duration
 	readIdleTimeout time.Duration
 	onBytesRead     func(kind string, bytes int64)
+	onLiveBytes     func(kind string, bytes int64)
+	onActivity      func(kind string, delta int)
 }
 
 // WithDialTimeout sets the TCP dial timeout per peer.
@@ -81,6 +86,11 @@ func WithReadIdleTimeout(d time.Duration) ClientOption {
 // response bodies, including partial failed transfers and retries.
 func WithClientByteMetrics(onBytesRead func(kind string, bytes int64)) ClientOption {
 	return func(o *clientOptions) { o.onBytesRead = onBytesRead }
+}
+
+// WithClientTransferMetrics observes live received bytes and active peer GETs.
+func WithClientTransferMetrics(bytes func(string, int64), activity func(string, int)) ClientOption {
+	return func(o *clientOptions) { o.onLiveBytes, o.onActivity = bytes, activity }
 }
 
 // NewClient builds a Client tuned for peer fetches.
@@ -116,6 +126,7 @@ func NewClient(opts ...ClientOption) *Client {
 			Timeout: defaultRangeRequestTimeout,
 		},
 		onBytesRead: o.onBytesRead,
+		onLiveBytes: o.onLiveBytes, onActivity: o.onActivity,
 	}
 }
 
@@ -193,6 +204,19 @@ func (c *Client) HeadFromPeer(ctx context.Context, peerAddr string, ref ifaces.O
 
 // FetchFromPeer implements ifaces.PeerDialer.
 func (c *Client) FetchFromPeer(ctx context.Context, peerAddr string, ref ifaces.OriginRef) (io.ReadCloser, int64, string, error) {
+	finish := streamcopy.BeginActivity(func(delta int) {
+		if c.onActivity != nil {
+			c.onActivity(ref.Kind.MetricLabel(), delta)
+		}
+	})
+
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			finish()
+		}
+	}()
+
 	if ref.Offset < 0 {
 		return nil, 0, "", fmt.Errorf("peer fetch offset %d is negative", ref.Offset)
 	}
@@ -227,7 +251,8 @@ func (c *Client) FetchFromPeer(ctx context.Context, peerAddr string, ref ifaces.
 
 	switch {
 	case resp.StatusCode == http.StatusOK && ref.Offset == 0:
-		return c.responseBody(resp, ref.Kind), resp.ContentLength, resp.Header.Get("Content-Type"), nil
+		handedOff = true
+		return c.observedBody(resp, ref.Kind, finish), resp.ContentLength, resp.Header.Get("Content-Type"), nil
 	case resp.StatusCode == http.StatusPartialContent && ref.Offset > 0:
 		start, end, size, ok := parseContentRange(resp.Header.Get("Content-Range"))
 		if !ok || start != ref.Offset || end < start || size <= end ||
@@ -237,7 +262,9 @@ func (c *Client) FetchFromPeer(ctx context.Context, peerAddr string, ref ifaces.
 			return nil, 0, "", fmt.Errorf("peer %s returned invalid Content-Range %q for offset %d", peerAddr, resp.Header.Get("Content-Range"), ref.Offset)
 		}
 
-		return c.responseBody(resp, ref.Kind), size, resp.Header.Get("Content-Type"), nil
+		handedOff = true
+
+		return c.observedBody(resp, ref.Kind, finish), size, resp.Header.Get("Content-Type"), nil
 	case resp.StatusCode == http.StatusNotFound:
 		_ = resp.Body.Close() //nolint:errcheck // best-effort body close
 		return nil, 0, "", &ifaces.ErrNotFound{Digest: ref.Digest}
@@ -253,6 +280,19 @@ func (c *Client) FetchFromPeer(ctx context.Context, peerAddr string, ref ifaces.
 // complete, committed blob. Registry authorization is deliberately not
 // forwarded: digest and range are sufficient at the peer boundary.
 func (c *Client) FetchRangeFromPeer(ctx context.Context, peerAddr string, d digest.Digest, requested httprange.Range) (io.ReadCloser, int64, string, error) {
+	finish := streamcopy.BeginActivity(func(delta int) {
+		if c.onActivity != nil {
+			c.onActivity(ifaces.KindBlob.MetricLabel(), delta)
+		}
+	})
+
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			finish()
+		}
+	}()
+
 	if _, err := httprange.New(requested.Start, requested.End); err != nil {
 		return nil, 0, "", err
 	}
@@ -286,7 +326,9 @@ func (c *Client) FetchRangeFromPeer(ctx context.Context, peerAddr string, d dige
 			return nil, 0, "", &ifaces.ErrPeerProtocol{PeerAddr: peerAddr, Err: err}
 		}
 
-		return c.responseBody(resp, ifaces.KindBlob), size, resp.Header.Get("Content-Type"), nil
+		handedOff = true
+
+		return c.observedBody(resp, ifaces.KindBlob, finish), size, resp.Header.Get("Content-Type"), nil
 	case http.StatusNotFound:
 		_ = resp.Body.Close() //nolint:errcheck // best-effort body close
 
@@ -312,7 +354,7 @@ func parseRetryAfter(value string, now time.Time) time.Duration {
 	return when.Sub(now)
 }
 
-func (c *Client) responseBody(resp *http.Response, kind ifaces.OriginRefKind) io.ReadCloser {
+func (c *Client) observedBody(resp *http.Response, kind ifaces.OriginRefKind, finish func()) io.ReadCloser {
 	body := resp.Body
 
 	if c.onBytesRead != nil {
@@ -325,7 +367,11 @@ func (c *Client) responseBody(resp *http.Response, kind ifaces.OriginRefKind) io
 		}
 	}
 
-	return body
+	return streamcopy.Observe(body, func(n int64) {
+		if c.onLiveBytes != nil {
+			c.onLiveBytes(kind.MetricLabel(), n)
+		}
+	}, finish)
 }
 
 func parseContentRange(value string) (start, end, size int64, ok bool) {

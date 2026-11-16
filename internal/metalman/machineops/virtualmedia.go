@@ -347,12 +347,33 @@ func (r *Reconciler) cleanupMedia(ctx context.Context, target v1alpha3.MachineOp
 		return fmt.Errorf("virtual media cleanup is unsupported")
 	}
 
-	b := target.BootMedia
-	if deleteStaged {
-		return vm.DeleteVirtualMedia(ctx, bootmedia.Source{Name: b.SourceName, Server: b.SourceServer})
+	if !deleteStaged && (target.BootMedia.Phase == "Staging" || target.BootMedia.Phase == "PoweringOff") {
+		// Mounting is persisted before any mount or boot override can change.
+		// Only skip boot/media cleanup when staging also had no BMC effects.
+		if staging, ok := vm.(bootmedia.ReadOnlyStagingClient); ok && staging.VirtualMediaStagingReadOnly() {
+			return nil
+		}
 	}
 
-	return vm.CleanupVirtualMedia(ctx, bootmedia.Source{Name: b.SourceName, Server: b.SourceServer})
+	source, err := r.mediaSource(target.BootMedia)
+	if err != nil {
+		return err
+	}
+
+	if deleteStaged {
+		return vm.DeleteVirtualMedia(ctx, source)
+	}
+
+	return vm.CleanupVirtualMedia(ctx, source)
+}
+
+func (r *Reconciler) mediaSource(b *v1alpha3.MachineOperationBootMediaStatus) (bootmedia.Source, error) {
+	u, err := r.BootMedia.SourceURL(b.ID)
+	if err != nil {
+		return bootmedia.Source{}, err
+	}
+
+	return bootmedia.Source{Name: b.SourceName, Server: b.SourceServer, URL: u}, nil
 }
 
 func (r *Reconciler) advanceVirtualMedia(ctx context.Context, op *v1alpha3.MachineOperation, machine *v1alpha3.Machine, target v1alpha3.MachineOperationTargetStatus, now metav1.Time) targetChange {
@@ -449,14 +470,18 @@ func (r *Reconciler) advanceVirtualMedia(ctx context.Context, op *v1alpha3.Machi
 	}
 
 	b := target.BootMedia
-	source := bootmedia.Source{Name: b.SourceName, Server: b.SourceServer}
+
+	source, err := r.mediaSource(b)
+	if err != nil {
+		return r.retryMediaTarget(target, err, now)
+	}
 
 	next := b.Phase
 	switch b.Phase {
 	case "Preparing":
 		source, err = r.BootMedia.Prepare(ctx, machine, op, b.ID)
 		if err == nil {
-			if source.Name == "" || source.Server == "" {
+			if source.Name == "" || source.URL == "" {
 				err = fmt.Errorf("virtual media provider returned an empty source")
 			} else {
 				b.SourceName, b.SourceServer = source.Name, source.Server
@@ -525,6 +550,10 @@ func (r *Reconciler) advanceVirtualMedia(ctx context.Context, op *v1alpha3.Machi
 		if errors.Is(err, netboot.ErrNotYetDownloaded) {
 			target.Message = err.Error()
 			return targetChange{target: target}
+		}
+
+		if errors.Is(err, redfish.ErrUnsupported) {
+			return failTarget(target, reasonUnsupportedTarget, err.Error(), now)
 		}
 
 		return r.retryMediaTarget(target, err, now)
@@ -602,8 +631,9 @@ func (r *Reconciler) advanceMediaInstalled(ctx context.Context, target v1alpha3.
 	}
 
 	// Virtual media callbacks are per target, never operation-wide.
-	if change, done := cloudInitReplaceStatus(target.Conditions, target, now); done {
-		if target.BootMedia.PhaseStartedAt != nil && now.Sub(target.BootMedia.PhaseStartedAt.Time) >= cloudInitTimeout {
+	timeout := target.BootMedia.Netboot.TargetCloudInitTimeout()
+	if change, done := cloudInitReplaceStatus(target.Conditions, target, timeout, now); done {
+		if target.BootMedia.PhaseStartedAt != nil && now.Sub(target.BootMedia.PhaseStartedAt.Time) >= timeout {
 			return failTarget(target, reasonTimedOut, "waiting for cloud-init timed out", now)
 		}
 
@@ -616,7 +646,7 @@ func (r *Reconciler) advanceMediaInstalled(ctx context.Context, target v1alpha3.
 			return targetChange{target: target, err: err}
 		}
 
-		if target.BootMedia.PhaseStartedAt != nil && now.Sub(target.BootMedia.PhaseStartedAt.Time) >= cloudInitTimeout {
+		if target.BootMedia.PhaseStartedAt != nil && now.Sub(target.BootMedia.PhaseStartedAt.Time) >= timeout {
 			return failTarget(target, reasonTimedOut, "waiting for Node timed out", now)
 		}
 

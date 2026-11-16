@@ -1,0 +1,48 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+# The Unbounded Karpenter plugin: upstream Karpenter's controllers compiled
+# with the Unbounded cloud provider. Build from the repository root:
+#   docker build -f images/karpenter/Containerfile .
+
+# Pin the builder to BUILDPLATFORM so the Go toolchain runs natively even when
+# targeting a foreign TARGETPLATFORM.
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.27.4-trixie AS build
+
+ENV CGO_ENABLED=0 GOTOOLCHAIN=auto
+WORKDIR /src
+
+# The plugin is its own Go module under plugins/karpenter.
+COPY plugins/karpenter/go.mod plugins/karpenter/go.sum ./
+RUN go mod download
+
+COPY plugins/karpenter/ ./
+
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+ARG VERSION=dev
+
+RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath \
+    -ldflags "-s -w -X sigs.k8s.io/karpenter/pkg/operator.Version=${VERSION}" \
+    -o /unbounded-karpenter ./cmd/unbounded-karpenter
+
+# Ship the license and notice files of the modules the binary is built
+# around, whatever versions go.mod pins.
+RUN set -eu; \
+    for module in sigs.k8s.io/karpenter github.com/awslabs/operatorpkg; do \
+        directory="$(go list -m -f '{{.Dir}}' "${module}")"; \
+        target="/licenses/$(basename "${module}")"; \
+        mkdir -p "${target}"; \
+        for file in LICENSE NOTICE; do \
+            if [ -f "${directory}/${file}" ]; then cp "${directory}/${file}" "${target}/"; fi; \
+        done; \
+    done
+
+FROM gcr.io/distroless/static-debian13:nonroot
+
+COPY --from=build /unbounded-karpenter /unbounded-karpenter
+COPY --from=build /licenses/ /unbounded/licenses/
+COPY LICENSE NOTICE /unbounded/licenses/
+
+USER 65532:65532
+ENTRYPOINT ["/unbounded-karpenter"]
