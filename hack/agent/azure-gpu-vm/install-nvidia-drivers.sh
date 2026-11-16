@@ -23,7 +23,7 @@
 # Fabric Manager:
 #   NVSwitch-based multi-GPU systems (H100, H200, ND A100) require the NVIDIA
 #   Fabric Manager service. Without it, CUDA initialization fails with error
-#   802 (SYSTEM_DRIVER_MISMATCH). The script installs and enables it when the
+#   802 (SYSTEM_NOT_READY). The script installs and enables it when the
 #   SKU map indicates it is needed.
 #
 # Persistence Mode:

@@ -75,6 +75,9 @@ jobs:
           elif [[ "$name" == host-azurelinux3-mshv ]]; then
             # The Microsoft Hypervisor packages are x86_64 only.
             platforms="linux/amd64"
+          elif [[ "$name" == host-ubuntu2404-nvidia ]]; then
+            # The NVIDIA HGX image targets x86_64 servers only.
+            platforms="linux/amd64"
           else
             platforms="linux/amd64,linux/arm64"
           fi

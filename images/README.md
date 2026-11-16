@@ -18,8 +18,9 @@ produces `ghcr.io/<owner>/agent-ubuntu2404`.
 ## Building Images
 
 Images are built automatically by the **Build Container Images** GitHub Actions workflow
-(`.github/workflows/images.yaml`). All builds produce multi-arch images for `linux/amd64` and
-`linux/arm64`.
+(`.github/workflows/images.yaml`). Builds produce multi-arch images for `linux/amd64` and
+`linux/arm64`, except `host-azurelinux3-mshv` and `host-ubuntu2404-nvidia`, which are
+`linux/amd64` only.
 
 ### Metalman Netboot Image
 
