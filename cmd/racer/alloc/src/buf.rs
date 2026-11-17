@@ -76,7 +76,8 @@ use std::time::{Duration, Instant};
 
 /// Number of distinct capacities a pool keeps at once. When every class is
 /// in use, a new size takes over the least recently used class with no idle
-/// storage; if every class holds idle storage, the new size is unpooled.
+/// or checked-out storage; if every class holds storage, the new size is
+/// unpooled.
 pub const MAX_CLASSES: usize = 16;
 
 /// Capacity granule. Capacities round up to this or the alignment, whichever
@@ -428,9 +429,10 @@ impl Shared {
         if class.idle.fetch_add(1, Ordering::AcqRel) >= self.max_idle
             || class.capacity.load(Ordering::Acquire) != region.capacity
         {
-            // Full, or the owner reassigned this class to another size while
-            // the buffer was out. The owner also drops mismatched regions on
-            // drain, which covers a reassignment racing this check.
+            // Full, or the owner reassigned this class to another size once
+            // the decrement above left it with nothing out. The owner also
+            // drops mismatched regions on drain, which covers a reassignment
+            // racing this check.
             class.idle.fetch_sub(1, Ordering::AcqRel);
             self.rejects.fetch_add(1, Ordering::Relaxed);
             return Some(region);
@@ -506,7 +508,7 @@ pub struct Pool {
     // Idle regions cooled or freed by sizing.
     trimmed: u64,
 
-    // Checkouts unpooled because every class held idle storage.
+    // Checkouts unpooled because every class held storage.
     unpooled: u64,
 
     // Value of `takes` at each class's last checkout, to reassign the least
@@ -536,7 +538,8 @@ pub struct PoolCounters {
     /// target.
     pub trimmed: u64,
     /// Checkouts that could not be pooled because every size class held idle
-    /// storage of another size. Each one also counts as a miss.
+    /// or checked-out storage of another size. Each one also counts as a
+    /// miss.
     pub unpooled: u64,
 }
 
@@ -732,12 +735,19 @@ impl Pool {
                 _ => {}
             }
         }
-        // Reassign the least recently used class without idle storage, so
-        // arrival order cannot pin the classes to stale sizes. Buffers of the
-        // old size still out are freed when they return.
+        // Reassign the least recently used class without idle or checked-out
+        // storage, so arrival order cannot pin the classes to stale sizes.
+        // Only the owner increments `out`, so a class seen with nothing out
+        // stays that way here, and its counts and demand start clean for the
+        // new size. A return that already decremented `out` may still be
+        // pooling its region; it is refused or dropped on drain.
         let free = free.or_else(|| {
             (0..MAX_CLASSES)
-                .filter(|&index| self.shared.classes[index].idle.load(Ordering::Acquire) == 0)
+                .filter(|&index| {
+                    let class = &self.shared.classes[index];
+                    class.out.load(Ordering::Acquire) == 0
+                        && class.idle.load(Ordering::Acquire) == 0
+                })
                 .min_by_key(|&index| self.last_take[index])
         });
         let Some(index) = free else {
@@ -1418,24 +1428,65 @@ mod tests {
     #[test]
     fn reclaim_takes_least_recently_used_class() {
         let mut pool = plain_pool();
-        let held: Vec<_> = (0..MAX_CLASSES)
-            .map(|i| pool.take(1000 + i * GRANULE, (), false).unwrap())
-            .collect();
-        // All classes are empty while buffers are out; class 0 is oldest.
-        let keep = pool
-            .take(1000 + (MAX_CLASSES - 1) * GRANULE, (), false)
-            .unwrap();
+        for i in 0..MAX_CLASSES {
+            drop(pool.take(1000 + i * GRANULE, (), false).unwrap());
+        }
+        // Use class 0 again, so class 1 is the oldest; then empty them all.
+        drop(pool.take(1000, (), false).unwrap());
+        pool.clear();
         let fresh = pool.take(100 * GRANULE, (), false).unwrap();
-        assert_eq!(fresh.region().class, 0);
-        // The buffer of the old size returns to a reassigned class and is freed.
-        let rejects = pool.counters().rejects;
-        drop(held);
-        assert_eq!(pool.counters().rejects, rejects + 1);
-        drop((keep, fresh));
+        assert_eq!(fresh.region().class, 1);
+        drop(fresh);
         // The reassigned class serves its new size.
         let before = pool.counters().misses;
         drop(pool.take(100 * GRANULE, (), false).unwrap());
         assert_eq!(pool.counters().misses, before);
+        assert_eq!(pool.counters().unpooled, 0);
+    }
+
+    #[test]
+    fn checked_out_class_is_not_reassigned() {
+        let mut pool = plain_pool();
+        let mut held: Vec<_> = (0..MAX_CLASSES)
+            .map(|i| pool.take(1000 + i * GRANULE, (), false).unwrap())
+            .collect();
+        let held_bytes: usize = held.iter().map(|buf| buf.capacity()).sum();
+        // Every class has a buffer out and nothing idle: a new size is unpooled.
+        let big = 100 * GRANULE;
+        let fresh = pool.take(big, (), false).unwrap();
+        assert!(!fresh.is_pooled());
+        assert_eq!(pool.counters().unpooled, 1);
+        assert_eq!(pool.stats().in_use, held_bytes);
+        drop(fresh);
+        // The old buffer returns to its own class, unchanged.
+        let first = held.remove(0);
+        let first_bytes = first.capacity();
+        drop(first);
+        assert_eq!(pool.counters().rejects, 0);
+        assert_eq!(pool.stats().in_use, held_bytes - first_bytes);
+        // Still idle storage there: the new size remains unpooled.
+        let fresh = pool.take(big, (), false).unwrap();
+        assert!(!fresh.is_pooled());
+        drop(fresh);
+        // Once class 0 holds nothing, the new size takes it over.
+        pool.clear();
+        let fresh = pool.take(big, (), false).unwrap();
+        assert!(fresh.is_pooled());
+        assert_eq!(fresh.region().class, 0);
+        assert_eq!(pool.counters().unpooled, 2);
+        assert_eq!(pool.stats().in_use, held_bytes - first_bytes + big);
+        // The other classes keep their sizes: their buffers pool on return.
+        drop(held);
+        assert_eq!(pool.counters().rejects, 0);
+        assert_eq!(pool.stats().in_use, big);
+        drop(fresh);
+        assert_eq!(pool.stats().in_use, 0);
+        assert!(
+            pool.shared
+                .classes
+                .iter()
+                .all(|class| class.out.load(Ordering::Acquire) == 0)
+        );
     }
 
     #[test]
@@ -1920,6 +1971,34 @@ mod loom_tests {
             drop(pool);
             t.join().unwrap();
             assert_eq!(limit.used(), 0);
+        });
+    }
+
+    #[test]
+    fn return_races_reassignment() {
+        // Scanning every class takes more branches than the default allows.
+        let mut builder = loom::model::Builder::new();
+        builder.max_branches = 20_000;
+        builder.check(|| {
+            let limit = std::sync::Arc::new(IdleLimit::new(1 << 30));
+            let mut pool = pool(&limit, 1);
+            // Class 0 has one buffer out; every other class holds idle storage.
+            let a = pool.take(GRANULE, (), false).unwrap();
+            for class in 1..MAX_CLASSES {
+                drop(pool.take((class + 1) * GRANULE, (), false).unwrap());
+            }
+            let t = loom::thread::spawn(move || drop(a));
+            let big = (MAX_CLASSES + 1) * GRANULE;
+            let fresh = pool.take(big, (), false).unwrap();
+            t.join().unwrap();
+            let in_use = if fresh.is_pooled() { big } else { 0 };
+            assert_eq!(pool.stats().in_use, in_use);
+            drop(fresh);
+            assert_eq!(pool.stats().in_use, 0);
+            pool.clear();
+            assert_eq!(pool.stats().entries, 0);
+            assert_eq!(limit.used(), 0);
+            assert_eq!(pool.idle_bytes(), 0);
         });
     }
 }
