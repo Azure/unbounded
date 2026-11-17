@@ -9,6 +9,7 @@ command. See README.md for the options.
 from __future__ import annotations
 
 import collections
+import hashlib
 import json
 import logging
 import math
@@ -31,6 +32,9 @@ INDEX = "model.safetensors.index.json"
 SINGLE = "model.safetensors"
 DEFAULT_STAGING_BYTES = 256 * 1024 * 1024
 DEFAULT_CONCURRENCY = 4
+DEFAULT_PREFETCH = True
+DEFAULT_PREFETCH_TTL_SECONDS = 3600
+PREFETCH_ID_PREFIX = "racer-vllm-"
 MAX_HEADER_BYTES = 100 * 1024 * 1024
 MAX_PARTS = 100_000
 TP_ONLY_PATTERN = "model-rank-{rank}-part-{part}.safetensors"
@@ -522,6 +526,33 @@ def iter_weights(
             wait(buf)
 
 
+def prefetch_id(uri: ModelURI, pinned: list) -> str:
+    """A stable ticket id for this model version and set of files."""
+    digest = hashlib.sha256(str(uri).encode())
+    for name, meta in pinned:
+        digest.update(b"\0")
+        digest.update(name.encode())
+        digest.update(b"\0")
+        digest.update(meta.etag.encode())
+    return PREFETCH_ID_PREFIX + digest.hexdigest()[:32]
+
+
+def prefetch_weights(client, uri: ModelURI, pinned: list, ttl_seconds: int):
+    """Ask the dataplane to fill the weight pages in the background.
+
+    A read that needs a page a prefetch is filling joins that fill, so this
+    raises the number of origin requests in flight without more staging
+    memory. The loader still reads every page. The ticket is best effort: a
+    dataplane without prefetch, or a passthrough cache, rejects it.
+    """
+    refs = []
+    for name, meta in pinned:
+        req = uri.request(name)
+        refs.append(racer.PrefetchRef(key=req.hex, etag=meta.etag, metadata=req.metadata))
+    spec = racer.PrefetchSpec(refs=refs, priority="high", ttl_seconds=ttl_seconds)
+    return client.prefetch(prefetch_id(uri, pinned), spec)
+
+
 def summary(stats: dict, seconds: float, uri) -> str:
     """The one-line load summary."""
     total = sum(stats["bytes"].values()) / (1 << 30)
@@ -656,6 +687,9 @@ def load_state(state_dict: dict, weights) -> None:
 def settings(extra: dict) -> dict:
     """Loader options from model_loader_extra_config, with defaults."""
     retry = extra.get("mode_retry_seconds", racer.DEFAULT_MODE_RETRY_SECONDS)
+    prefetch_ttl = int(extra.get("prefetch_ttl_seconds", DEFAULT_PREFETCH_TTL_SECONDS))
+    if prefetch_ttl < 0:
+        raise ValueError("prefetch_ttl_seconds must be at least 0")
     return {
         "uri": extra.get("uri"),
         "staging_bytes": int(extra.get("staging_bytes", DEFAULT_STAGING_BYTES)),
@@ -666,6 +700,8 @@ def settings(extra: dict) -> dict:
         "mode_retry_seconds": None if retry is None else float(retry),
         "sharded_state": bool(extra.get("sharded_state", False)),
         "pattern": extra.get("pattern"),
+        "prefetch": bool(extra.get("prefetch", DEFAULT_PREFETCH)),
+        "prefetch_ttl_seconds": prefetch_ttl,
     }
 
 
@@ -725,6 +761,12 @@ def register() -> None:
             with client:
                 # Stat every file before any data read, so the model is read at one version.
                 pinned = [(name, stat_pinned(client, uri, name, pins.get(name))) for name in files]
+                if o["prefetch"]:
+                    try:
+                        queued = prefetch_weights(client, uri, pinned, o["prefetch_ttl_seconds"])
+                        log.info("racer: prefetch %s queued %d files (%s)", queued.id, len(pinned), queued.state)
+                    except racer.RacerError as exc:
+                        log.info("racer: prefetch unavailable (%s); loading without it", exc)
                 chunks = read_chunks(client, uri, pinned, o["staging_bytes"])
                 weights = iter_weights(
                     client, uri, chunks, o["staging_bytes"], o["concurrency"], o["clone"], o["use_vmm"], stats

@@ -73,6 +73,14 @@ def range_reads(server):
     return out
 
 
+def prefetch_puts(server):
+    out = []
+    for s in server.seen:
+        if s.method == "PUT" and s.target.startswith("/v1/prefetches/"):
+            out.append((s, json.loads(s.body)))
+    return out
+
+
 # URIs and racer-model.json
 
 
@@ -551,7 +559,9 @@ def test_loader_loads_logs_and_uses_pins(server, uri, torch, monkeypatch, tmp_pa
         inst.load_weights(m, mc)
     assert m.got == ALL
     msgs = [r.getMessage() for r in caplog.records if r.name == "vllm.racer_vllm.loader"]
-    assert len(msgs) == 1 and "loaded 2 files" in msgs[0] and "host=" in msgs[0] and str(uri) in msgs[0]
+    loaded = [m for m in msgs if "loaded 2 files" in m]
+    assert len(loaded) == 1 and "host=" in loaded[0] and str(uri) in loaded[0]
+    assert any(m.startswith("racer: prefetch ") for m in msgs)
 
     with pytest.raises(ValueError, match="w5"):
         inst.load_weights(Model(tuple(ALL) + ("w5",)), mc)
@@ -575,6 +585,51 @@ def test_loader_stats_every_file_before_data_reads(server, uri, torch, monkeypat
     posts = [i for i, s in enumerate(server.seen) if s.method == "POST" and (a in s.target or b in s.target)]
     assert len(heads) == 2 and max(heads) < min(posts)
     assert all(server.seen[i].headers.get("if-match") == '"v1"' for i in posts)
+
+
+def test_loader_prefetches_weight_pages(server, uri, torch, monkeypatch):
+    setup_model(server, uri)
+    inst = make_loader(monkeypatch, server, uri=str(uri))
+    inst.load_weights(Model(), types.SimpleNamespace(model="/unused", quantization=None))
+    puts = prefetch_puts(server)
+    assert len(puts) == 1
+    seen, body = puts[0]
+    assert seen.target.startswith("/v1/prefetches/racer-vllm-")
+    assert body["priority"] == "high" and body["ttl_seconds"] == 3600
+    refs = {r["key"]: r for r in body["refs"]}
+    assert set(refs) == {uri.request("a.safetensors").hex, uri.request("b.safetensors").hex}
+    for name in ("a.safetensors", "b.safetensors"):
+        req = uri.request(name)
+        assert refs[req.hex]["etag"] == '"v1"'
+        assert refs[req.hex]["metadata"] == req.metadata
+        assert "offset" not in refs[req.hex] and "length" not in refs[req.hex]
+    # The ticket is accepted before the loader reads any weight data.
+    first_read = min(i for i, s in enumerate(server.seen) if s.method == "POST" and "range" in s.headers)
+    assert server.seen.index(seen) < first_read
+
+
+def test_loader_prefetch_is_best_effort(server, uri, torch, monkeypatch, caplog):
+    setup_model(server, uri)
+    server.prefetches.passthrough = True
+    inst = make_loader(monkeypatch, server, uri=str(uri))
+    m = Model()
+    with caplog.at_level(logging.INFO, logger="vllm.racer_vllm.loader"):
+        inst.load_weights(m, types.SimpleNamespace(model="/unused", quantization=None))
+    assert m.got == ALL
+    assert any("prefetch unavailable" in r.getMessage() for r in caplog.records)
+
+
+def test_loader_prefetch_can_be_disabled(server, uri, torch, monkeypatch):
+    setup_model(server, uri)
+    inst = make_loader(monkeypatch, server, uri=str(uri), prefetch=False)
+    inst.load_weights(Model(), types.SimpleNamespace(model="/unused", quantization=None))
+    assert not prefetch_puts(server)
+
+
+def test_prefetch_id_is_stable_per_version(uri):
+    a = types.SimpleNamespace(etag='"v1"')
+    assert rv.prefetch_id(uri, [("a", a)]) == rv.prefetch_id(uri, [("a", a)])
+    assert rv.prefetch_id(uri, [("a", a)]) != rv.prefetch_id(uri, [("a", types.SimpleNamespace(etag='"v2"'))])
 
 
 @pytest.mark.parametrize("fail", [True, False])
@@ -651,9 +706,13 @@ def test_settings():
         True,
         False,
     )
+    assert s["prefetch"] is True and s["prefetch_ttl_seconds"] == 3600
     assert s["mode_retry_seconds"] == racer.DEFAULT_MODE_RETRY_SECONDS
     assert rv.settings({"mode_retry_seconds": None})["mode_retry_seconds"] is None
     assert rv.settings({"mode_retry_seconds": "30"})["mode_retry_seconds"] == 30.0
+    assert rv.settings({"prefetch": False, "prefetch_ttl_seconds": 0})["prefetch"] is False
+    with pytest.raises(ValueError, match="prefetch_ttl_seconds"):
+        rv.settings({"prefetch_ttl_seconds": -1})
 
 
 # Packaging
