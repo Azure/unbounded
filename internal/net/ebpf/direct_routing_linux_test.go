@@ -261,6 +261,46 @@ func TestNoneProtocolNativeNeighborResolution(t *testing.T) {
 				}
 			}
 
+			if tc.name == "routed IPv6" {
+				withFallback := tunnelMap.lastReconciled[tc.prefix]
+
+				withFallback.Nexthops = append(withFallback.Nexthops, TunnelNexthop{
+					RemoteIP: net.ParseIP("2001:db8::99"), IfIndex: uint32(overlay.Index),
+					Protocol: TunnelProtoWireGuard, Healthy: true, PeerName: "fallback",
+				})
+				if err := tunnelMap.Reconcile(map[string]TunnelEndpoint{tc.prefix: withFallback}); err != nil {
+					t.Fatal(err)
+				}
+
+				if err := netlink.LinkDel(fabric); err != nil {
+					t.Fatal(err)
+				}
+
+				if tunnelMap.SetPeerHealth(tc.name, false) != 1 {
+					t.Fatal("underlay route loss prevented native peer health withdrawal")
+				}
+
+				if err := tunnelMap.RefreshNativeNexthops(); err == nil {
+					t.Fatal("missing underlay interface was not reported")
+				}
+
+				if tunnelMap.SetPeerHealth(tc.name, true) != 0 {
+					t.Fatal("unresolved underlay restored a withdrawn native path")
+				}
+
+				key, err := cidrToKey(prefix)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				var endpoint tunnelEndpointC
+				if err := tunnelMap.endpoints.Lookup(key, &endpoint); err != nil || endpoint.Count != 2 ||
+					endpoint.Nexthops[0].Protocol != TunnelProtoWireGuard || endpoint.Nexthops[0].Healthy != 1 ||
+					endpoint.Nexthops[1].Protocol != TunnelProtoNone || endpoint.Nexthops[1].Healthy != 0 {
+					t.Fatalf("underlay loss retained a withdrawn native path or lost its healthy fallback: %v, %+v", err, endpoint)
+				}
+			}
+
 			if err := tunnelMap.DeleteEndpoint(prefix); err != nil {
 				t.Fatal(err)
 			}

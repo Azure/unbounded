@@ -113,6 +113,8 @@ type TunnelMap struct {
 	// lastReconciled is a snapshot of the last Reconcile() desired state,
 	// used by SetPeerHealth to find and update entries for a given peer.
 	lastReconciled map[string]TunnelEndpoint
+	// Preserve applied routers so lookup failures cannot prevent withdrawal.
+	lastResolved map[string]TunnelEndpoint
 }
 
 // TunnelMapOptions configures TunnelMap creation.
@@ -251,7 +253,13 @@ func (tm *TunnelMap) UpdateEndpoint(cidr *net.IPNet, ep TunnelEndpoint) error {
 	}
 
 	ep.Nexthops = slices.Clone(ep.Nexthops)
+
 	tm.lastReconciled[cidr.String()] = ep
+	if tm.lastResolved == nil {
+		tm.lastResolved = make(map[string]TunnelEndpoint)
+	}
+
+	tm.lastResolved[cidr.String()] = resolved
 
 	return nil
 }
@@ -270,6 +278,8 @@ func (tm *TunnelMap) DeleteEndpoint(cidr *net.IPNet) error {
 	err = tm.endpoints.Delete(key)
 	if err == nil || errors.Is(err, ebpf.ErrKeyNotExist) {
 		delete(tm.lastReconciled, cidr.String())
+		delete(tm.lastResolved, cidr.String())
+
 		return nil
 	}
 
@@ -286,6 +296,8 @@ func (tm *TunnelMap) Reconcile(desired map[string]TunnelEndpoint) error {
 	desiredByKey := make(map[lpmKey]TunnelEndpoint, len(desired))
 
 	originalDesired := make(map[string]TunnelEndpoint, len(desired))
+
+	resolvedDesired := make(map[string]TunnelEndpoint, len(desired))
 	for cidrStr, ep := range desired {
 		_, cidr, err := net.ParseCIDR(cidrStr)
 		if err != nil {
@@ -305,6 +317,7 @@ func (tm *TunnelMap) Reconcile(desired map[string]TunnelEndpoint) error {
 		desiredByKey[key] = resolved
 		ep.Nexthops = slices.Clone(ep.Nexthops)
 		originalDesired[cidrStr] = ep
+		resolvedDesired[cidrStr] = resolved
 	}
 
 	var (
@@ -340,6 +353,7 @@ func (tm *TunnelMap) Reconcile(desired map[string]TunnelEndpoint) error {
 		len(desiredByKey), len(stale))
 
 	tm.lastReconciled = originalDesired
+	tm.lastResolved = resolvedDesired
 
 	return nil
 }
@@ -377,7 +391,10 @@ func (tm *TunnelMap) RefreshNativeNexthops() error {
 
 		if err := tm.endpoints.Update(key, endpointToC(resolved), ebpf.UpdateAny); err != nil {
 			failures = append(failures, fmt.Errorf("refresh native endpoint %s: %w", cidrStr, err))
+			continue
 		}
+
+		tm.lastResolved[cidrStr] = resolved
 	}
 
 	return errors.Join(failures...)
@@ -424,7 +441,18 @@ func (tm *TunnelMap) SetPeerHealth(peerName string, healthy bool) int {
 		resolved, err := resolveNativeNexthops(ep, netlink.RouteGetWithOptions)
 		if err != nil {
 			klog.Warningf("eBPF SetPeerHealth %s: %v", cidrStr, err)
-			continue
+
+			cached, exists := tm.lastResolved[cidrStr]
+			if healthy || !exists {
+				continue
+			}
+
+			resolved.Nexthops = slices.Clone(cached.Nexthops)
+			for i := range resolved.Nexthops {
+				if resolved.Nexthops[i].PeerName == peerName {
+					resolved.Nexthops[i].Healthy = false
+				}
+			}
 		}
 
 		if err := tm.endpoints.Update(key, endpointToC(resolved), ebpf.UpdateAny); err != nil {
@@ -433,6 +461,7 @@ func (tm *TunnelMap) SetPeerHealth(peerName string, healthy bool) int {
 		}
 
 		updated++
+		tm.lastResolved[cidrStr] = resolved
 	}
 
 	return updated
