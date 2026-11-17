@@ -1059,7 +1059,7 @@ func cleanupUnusedTunnelDevices(cfg *config, meshPeers []meshPeerInfo, gatewayPe
 // reapplyRPFilterOnActiveTunnels restores filtering and forwarding rules on
 // active tunnel and native interfaces. Call it after cleanupUnusedTunnelDevices
 // because deleting interfaces can reset rp_filter on remaining interfaces.
-func reapplyRPFilterOnActiveTunnels(cfg *config, meshPeers []meshPeerInfo, gatewayPeers, wgGatewayPeers []gatewayPeerInfo, fwdMgr *unboundednetnetlink.ForwardManager, isGateway bool, notrackMgr *unboundednetnetlink.NotrackManager, nlCache *unboundednetnetlink.NetlinkCache) {
+func reapplyRPFilterOnActiveTunnels(cfg *config, meshPeers []meshPeerInfo, gatewayPeers, wgGatewayPeers []gatewayPeerInfo, fwdMgr *unboundednetnetlink.ForwardManager, isGateway bool, notrackMgr *unboundednetnetlink.NotrackManager, nlCache *unboundednetnetlink.NetlinkCache) error {
 	usesGeneve := false
 	usesVXLAN := false
 	usesIPIP := false
@@ -1127,12 +1127,16 @@ func reapplyRPFilterOnActiveTunnels(cfg *config, meshPeers []meshPeerInfo, gatew
 	}
 
 	if fwdMgr == nil && notrackMgr == nil {
-		return
+		return nil
 	}
 
 	native, _, err := unboundednetnetlink.DetectDefaultRouteInterfaceFromCache(nlCache)
 	if err != nil {
-		return
+		if usesNative {
+			return fmt.Errorf("detect native forwarding interface: %w", err)
+		}
+
+		return nil
 	}
 
 	if usesNative {
@@ -1156,7 +1160,7 @@ func reapplyRPFilterOnActiveTunnels(cfg *config, meshPeers []meshPeerInfo, gatew
 		}
 
 		if err := fwdMgr.ReconcileNativeInterface(native, dedupeStrings(prefixes)); err != nil {
-			klog.Errorf("Reconcile native forwarding: %v", err)
+			return fmt.Errorf("reconcile native forwarding: %w", err)
 		}
 	}
 
@@ -1169,6 +1173,8 @@ func reapplyRPFilterOnActiveTunnels(cfg *config, meshPeers []meshPeerInfo, gatew
 			notrackMgr.RemoveInterface(native)
 		}
 	}
+
+	return nil
 }
 
 // filterPeersByTunnelProtocol partitions mesh and gateway peer lists into

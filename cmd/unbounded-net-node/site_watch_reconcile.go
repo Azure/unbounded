@@ -2368,7 +2368,10 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 
 	reconcilePendingBPFEntries(state)
 	cleanupUnusedTunnelDevices(cfg, peers, gatewayPeers, wgGatewayPeers, state.forwardManager, state.notrackManager)
-	reapplyRPFilterOnActiveTunnels(cfg, peers, gatewayPeers, wgGatewayPeers, state.forwardManager, state.isGatewayNode, state.notrackManager, state.netlinkCache)
+
+	if err := reapplyRPFilterOnActiveTunnels(cfg, peers, gatewayPeers, wgGatewayPeers, state.forwardManager, state.isGatewayNode, state.notrackManager, state.netlinkCache); err != nil {
+		return err
+	}
 
 	// Reconcile notrack rules for conntrack bypass on gateway nodes.
 	if state.notrackManager != nil {

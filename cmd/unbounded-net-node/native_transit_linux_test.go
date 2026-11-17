@@ -110,7 +110,9 @@ func TestNativeTransitInterfaceRules(t *testing.T) {
 		{"native mesh gateway", []meshPeerInfo{{TunnelProtocol: "None", PodCIDRs: []string{"10.246.1.0/24", "fd46:0:0:1::/64"}}}, nil, true, true, true},
 		{"native withdrawal", nil, nil, true, false, false},
 	} {
-		reapplyRPFilterOnActiveTunnels(&config{}, tc.mesh, tc.assignment, nil, forward, tc.gateway, notrack, nil)
+		if err := reapplyRPFilterOnActiveTunnels(&config{}, tc.mesh, tc.assignment, nil, forward, tc.gateway, notrack, nil); err != nil {
+			t.Fatal(err)
+		}
 
 		for _, protocol := range []iptables.Protocol{iptables.ProtocolIPv4, iptables.ProtocolIPv6} {
 			ipt, err := iptables.NewWithProtocol(protocol)
