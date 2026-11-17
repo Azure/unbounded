@@ -79,11 +79,16 @@ Extra config keys, all optional:
 | `mode_retry_seconds` | 300 | Retry a delivery mode the dataplane refused after this many seconds. `null` retries only after a dataplane restart. |
 | `sharded_state` | false | Read a vLLM `sharded_state` checkpoint; each rank reads only its files. |
 | `pattern` | as vLLM | File name pattern for `sharded_state`, such as `model-rank-{rank}-part-{part}.safetensors`. |
+| `prefetch` | true | Ask the dataplane to fill the weight pages in the background before the loader reads them. |
+| `prefetch_ttl_seconds` | 3600 | Ticket lifetime. `0` uses the dataplane's default. Each load renews the ticket. |
 
-On fast local disks, more reads in flight help only when the dataplane also
-fetches further ahead. Set `concurrency` to 8 together with a larger
-`RACER_RANGE_WINDOW_PAGES` and `RACER_GPU_STAGING_BYTES` on the dataplane. See
-the GPU reads section of the Racer reference.
+With `prefetch` on, the loader submits a ticket for every weight file once it
+has stat'ed them. A read that needs a page being prefetched joins that fill,
+so a cold load uses the dataplane's prefetch concurrency as well as the
+loader's `concurrency`. A dataplane without prefetch, or a passthrough cache,
+rejects the ticket and the load continues. More reads in flight can also help
+on a cold cache, but each one costs a staging buffer. On a fast local disk
+they may not help at all.
 
 ## How it loads
 
@@ -92,7 +97,9 @@ the GPU reads section of the Racer reference.
 2. Stat every file before reading any, at the ETag from `racer-model.json`
    when there is one. Every later read sends `If-Match` with that ETag, so the
    whole model is read at one version. A file that changes during the load
-   fails it with `ModelChangedError`.
+   fails it with `ModelChangedError`. Unless `prefetch` is off, submit a
+   prefetch ticket for every file at those ETags, so the dataplane starts
+   filling the cache while the loader runs.
 3. For each file, read the 8-byte header length and the JSON header. All
    headers are read before any tensor data.
 4. Group tensors into ranges that fit a staging buffer. Each range ends on a

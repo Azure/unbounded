@@ -9,6 +9,7 @@ command. See README.md for the options.
 from __future__ import annotations
 
 import collections
+import hashlib
 import json
 import logging
 import math
@@ -31,6 +32,10 @@ INDEX = "model.safetensors.index.json"
 SINGLE = "model.safetensors"
 DEFAULT_STAGING_BYTES = 256 * 1024 * 1024
 DEFAULT_CONCURRENCY = 4
+DEFAULT_PREFETCH = True
+DEFAULT_PREFETCH_TTL_SECONDS = 3600
+PREFETCH_ID_PREFIX = "racer-vllm-"
+MAX_PREFETCH_COUNTER = (1 << 53) - 1
 MAX_HEADER_BYTES = 100 * 1024 * 1024
 MAX_PARTS = 100_000
 TP_ONLY_PATTERN = "model-rank-{rank}-part-{part}.safetensors"
@@ -522,6 +527,72 @@ def iter_weights(
             wait(buf)
 
 
+def prefetch_id(uri: ModelURI, pinned: list) -> str:
+    """A stable ticket id for this model version and set of files.
+
+    The entries are sorted first, so the id depends only on the set of
+    files, not the order they were collected in.
+    """
+    digest = hashlib.sha256(str(uri).encode())
+    for name, meta in sorted(pinned, key=lambda entry: (entry[0], entry[1].etag)):
+        digest.update(b"\0")
+        digest.update(name.encode())
+        digest.update(b"\0")
+        digest.update(meta.etag.encode())
+    return PREFETCH_ID_PREFIX + digest.hexdigest()[:32]
+
+
+def next_prefetch_position(status) -> tuple:
+    """The (generation, sequence) that restarts or updates an existing ticket.
+
+    Racer replays a retained status, including a terminal one, for the same
+    (generation, sequence) and payload; only a higher position restarts it.
+    Roll over at the counter maximum, and fail when both counters are spent.
+    """
+    generation, sequence = status.generation, status.sequence
+    if sequence < MAX_PREFETCH_COUNTER:
+        return generation, sequence + 1
+    if generation < MAX_PREFETCH_COUNTER:
+        return generation + 1, 0
+    raise racer.RacerError("racer: prefetch ticket counters exhausted")
+
+
+def prefetch_weights(client, uri: ModelURI, pinned: list, ttl_seconds: int):
+    """Ask the dataplane to fill the weight pages in the background.
+
+    A read that needs a page a prefetch is filling joins that fill, so this
+    raises the number of origin requests in flight without more staging
+    memory. The loader still reads every page. The ticket is best effort: a
+    dataplane without prefetch, or a passthrough cache, rejects it.
+
+    An existing ticket is resubmitted one position higher, so a repeated load
+    restarts a terminal ticket and revalidates any pages evicted since. An
+    absent ticket (404) starts at (0, 0). The id stays stable for the model
+    version, so the status read and the PUT always address the same ticket.
+    """
+    refs = []
+    for name, meta in pinned:
+        req = uri.request(name)
+        refs.append(racer.PrefetchRef(key=req.hex, etag=meta.etag, metadata=req.metadata))
+    ticket = prefetch_id(uri, pinned)
+    try:
+        status = client.prefetch_status(ticket)
+    except racer.PrefetchError as exc:
+        if exc.status != 404:
+            raise
+        generation, sequence = 0, 0
+    else:
+        generation, sequence = next_prefetch_position(status)
+    spec = racer.PrefetchSpec(
+        refs=refs,
+        priority="high",
+        ttl_seconds=ttl_seconds,
+        generation=generation,
+        sequence=sequence,
+    )
+    return client.prefetch(ticket, spec)
+
+
 def summary(stats: dict, seconds: float, uri) -> str:
     """The one-line load summary."""
     total = sum(stats["bytes"].values()) / (1 << 30)
@@ -653,9 +724,33 @@ def load_state(state_dict: dict, weights) -> None:
         raise ValueError(f"racer loader: missing keys {tuple(sorted(remaining))[:10]} in the sharded checkpoint")
 
 
+def _bool_option(extra: dict, key: str, default: bool) -> bool:
+    """A boolean option, also accepting the strings "true" and "false"."""
+    value = extra.get(key, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+        return value.strip().lower() == "true"
+    raise ValueError(f"{key} must be a boolean or 'true' or 'false', not {value!r}")
+
+
+def _int_option(extra: dict, key: str, default: int) -> int:
+    """An integer option, also accepting numeric strings."""
+    value = extra.get(key, default)
+    if isinstance(value, bool):
+        raise ValueError(f"{key} must be an integer, not {value!r}")
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{key} must be an integer, not {value!r}") from None
+
+
 def settings(extra: dict) -> dict:
     """Loader options from model_loader_extra_config, with defaults."""
     retry = extra.get("mode_retry_seconds", racer.DEFAULT_MODE_RETRY_SECONDS)
+    prefetch_ttl = _int_option(extra, "prefetch_ttl_seconds", DEFAULT_PREFETCH_TTL_SECONDS)
+    if prefetch_ttl < 0:
+        raise ValueError("prefetch_ttl_seconds must be at least 0")
     return {
         "uri": extra.get("uri"),
         "staging_bytes": int(extra.get("staging_bytes", DEFAULT_STAGING_BYTES)),
@@ -666,6 +761,8 @@ def settings(extra: dict) -> dict:
         "mode_retry_seconds": None if retry is None else float(retry),
         "sharded_state": bool(extra.get("sharded_state", False)),
         "pattern": extra.get("pattern"),
+        "prefetch": _bool_option(extra, "prefetch", DEFAULT_PREFETCH),
+        "prefetch_ttl_seconds": prefetch_ttl,
     }
 
 
@@ -725,6 +822,14 @@ def register() -> None:
             with client:
                 # Stat every file before any data read, so the model is read at one version.
                 pinned = [(name, stat_pinned(client, uri, name, pins.get(name))) for name in files]
+                if o["prefetch"]:
+                    try:
+                        queued = prefetch_weights(client, uri, pinned, o["prefetch_ttl_seconds"])
+                        log.debug("racer: prefetch %s queued %d files (%s)", queued.id, len(pinned), queued.state)
+                    except (racer.RacerError, OSError) as exc:
+                        # A socket timeout or reset is not a RacerError; prefetch
+                        # is best effort, so load without it either way.
+                        log.debug("racer: prefetch unavailable (%s); loading without it", exc)
                 chunks = read_chunks(client, uri, pinned, o["staging_bytes"])
                 weights = iter_weights(
                     client, uri, chunks, o["staging_bytes"], o["concurrency"], o["clone"], o["use_vmm"], stats

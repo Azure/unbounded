@@ -179,4 +179,8 @@ file name pattern.
 See the `racer-vllm` README for loader options such as `staging_bytes`.
 
 The first load fills the cache from the origin. Later loads on any node read
-from the cache.
+from the cache. On a cold cache the loader also submits a prefetch ticket for
+the weight files, so the dataplane fills pages in the background while vLLM
+reads them. This uses the dataplane's prefetch concurrency and needs no extra
+GPU memory. To turn it off, set `prefetch` to false in
+`--model-loader-extra-config`.
