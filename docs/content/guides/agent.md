@@ -1,604 +1,418 @@
 ---
 title: "Agent"
 weight: 3
-description: "How the unbounded-agent bootstraps a host into a Kubernetes worker node."
+description: "Install the Unbounded agent on a host, generate and inspect a bootstrap payload, run it with sudo, and verify that the host joins its site as a worker node."
 ---
 
-The unbounded-agent is a single binary that turns a Linux host into a
-Kubernetes worker node. It is the final convergence point for every
-provisioning path: regardless of how the host was delivered (SSH, cloud-init,
-PXE), the agent runs the same bootstrap sequence. Typically the agent is
-invoked by a controller (machina, metalman, or Karpenter), but it can also be
-run manually to bootstrap a machine and join it as a worker node.
+The Unbounded agent turns a freshly provisioned Linux host into a Kubernetes worker node and then keeps that node reconciled with its `Machine` resource. This guide is the task-oriented path: it shows you how to generate a bootstrap payload with `kubectl unbounded machine manual-bootstrap`, inspect what the payload will do, run it on the host, verify the join, and recover when a step fails. It focuses on the default `nspawn` isolation mode and calls out the `none` and `container` alternatives where the commands differ.
+
+The mental model is simple. A bootstrap payload carries a JSON agent configuration that describes the cluster and the node identity, plus a delivery mechanism that installs the agent binary and runs it. In the default script form those are a configuration heredoc and an install script in one file; the cloud-init and Ignition forms deliver the same configuration and binary in the format their host expects. The agent then runs three phases in order, installs itself as a host daemon, and keeps working after the first boot. Everything you debug later comes back to that sequence and to the small set of files the agent owns on the host.
 
 ## How It Works
 
-When `unbounded-agent start` is invoked, the agent runs through three phases
-in sequence:
+The `unbounded-agent start` command runs the phases that bootstrap a worker node. It runs them in a fixed order, and every phase decides from the host what still needs to be done rather than trusting a progress marker from an earlier attempt. That property is what makes a retry safe and what makes an interrupted install recoverable.
 
-1. **Host preparation** (`host`) -- installs required packages, configures
-   kernel parameters for Kubernetes networking, and disables services that
-   conflict with kubelet (Docker, swap).
-2. **Rootfs preparation** (`rootfs`) -- detects host settings such as CPU
-   architecture and GPU devices, creates a
-   [systemd-nspawn]({{< relref "reference/agent/nspawn" >}}) machine rootfs
-   (from an OCI image), and downloads containerd, runc, CNI
-   plugins, and Kubernetes binaries.
-3. **Node start** (`node-start`) -- boots the nspawn machine and starts
-   containerd and kubelet inside it. Kubelet performs TLS bootstrapping against
-   the API server using the configured bootstrap token.
+The **host** phase prepares the operating system. It installs or verifies host packages, sets kernel parameters and modules, prepares the container runtime's host-side prerequisites, configures swap, and takes ownership of the installation. It also leaves an existing nftables ruleset alone, so a retry does not disturb firewall state that is already correct.
 
-This describes the default `nspawn` [isolation mode]({{< relref "reference/agent/isolation" >}}).
-The agent always runs on the host, and the isolation mode decides only where the
-node stack runs, so phases 2 and 3 differ by mode. The mode pages describe how
-each one bootstraps: [nspawn]({{< relref "reference/agent/nspawn" >}}),
-[none]({{< relref "reference/agent/isolation-none" >}}) and
-[container]({{< relref "reference/agent/isolation-container" >}}) (experimental). To choose and
-select one, see [Isolation Modes]({{< relref "reference/agent/isolation" >}}).
+The **rootfs** phase resolves the node goal state. It detects the CPU architecture, the host kernel and distribution, and any GPUs, then chooses an OCI root filesystem image and the downloads that go with it. It acquires the rootfs, spawns the `nspawn` machine, and stages the node binaries, including containerd, runc, the CNI plugins, crictl, and the Kubernetes components. On a retry it reuses a rootfs that is already registered to a machine instead of rebuilding it.
+
+The **node-start** phase configures and starts the node stack. It writes the containerd, kubelet, CNI, and local DNS configuration, starts the services in dependency order, and performs TLS bootstrapping with the configured bootstrap token. Kubelet requests a client certificate, and the agent waits for the generated kubeconfig. A rejected or expired token, a CA mismatch, or an unreachable API server fails this wait with a specific error instead of surfacing much later.
+
+When the node is up, the agent installs the daemon unit `unbounded-agent-daemon.service` and records the installation as complete. The daemon is the only long-lived process. It watches the `Machine` object and the `MachineOperation` objects that request host-local work, and it regenerates node configuration when the desired state changes. The agent and daemon always run on the host; the isolation mode changes only where containerd, kubelet, and the rest of the node stack run.
+
+The agent supports three isolation modes. `nspawn` is the default and the most managed option. The node stack runs inside a systemd-nspawn machine whose root filesystem lives under `/var/lib/machines/<machine>`, and the agent provisions most node packages and configuration for you. `none` runs the node stack as agent-owned systemd units directly on the host, which suits hosts that already carry the packages a node needs. `container` runs the node stack in a privileged OCI container and is experimental: the agent refuses it unless the configuration opts in with `--experimental-container-isolation` or the matching `Experimental.ContainerIsolation` field. The differences are covered in [Isolation]({{< relref "reference/agent/isolation" >}}).
+
+| Mode | Where the node stack runs | When to use it |
+| --- | --- | --- |
+| `nspawn` | Inside a systemd-nspawn machine under `/var/lib/machines` | Default; the agent manages the rootfs and most node packages |
+| `none` | Agent-owned systemd units on the host | Hosts that already have the node packages, or where a machine is undesirable |
+| `container` | A privileged OCI container supervised by a systemd unit | Evaluation only; requires the experimental opt-in |
 
 ## Retrying bootstrap and repairing the daemon
 
-Initial bootstrap records installation ownership before changing the host. If a
-stage fails or the process is interrupted, rerun the same saved bootstrap script
-or invoke `unbounded-agent start` with the same original configuration.
+The agent takes installation ownership before it changes the host. That decision is recorded in `/var/lib/unbounded/agent/install-state.json`, together with the machine name, an installation ID, a phase, and a fingerprint of the bootstrap identity. The record deliberately stores no progress. It records only whether an installation is in progress, complete, or being reset, because a claim that a particular stage finished can stop being true without anyone noticing.
 
-Every stage runs again on every attempt, and each decides what it still has to
-do by looking at the host. Packages already present are not reinstalled. A
-rootfs a machine is already registered from is left in place rather than
-rebuilt. A running nspawn machine is left running. Node service configuration is
-rewritten, and the service is restarted only if that configuration actually
-changed. The nftables ruleset a running node depends on is not flushed.
+A retry with the same identity is admitted. If the record says `installing`, `start` runs the phases again. If the record says `complete`, `start` verifies the installed daemon and its files, repairs them when the check fails, and then reports that the installation was already complete. This is why rerunning the saved payload is the first repair to try for a node whose daemon is missing, disabled, or pointing at a binary that no longer exists.
 
-This is why a retry is safe to run repeatedly, and why a host that was modified
-between attempts is repaired rather than skipped past: nothing is assumed from
-how far a previous attempt got.
+The fingerprint covers the parts of the request that determine which node stack gets built: the Kubernetes version, the OCI image, the API server endpoint, and any non-default isolation mode. Credentials and artifact locations are not part of it, so you can refresh an expired bootstrap token or move a download mirror and retry the same installation. A change to the machine name, the Kubernetes version, the rootfs image, the API server, or the recorded non-default isolation mode is refused with an error that says an explicit reset is required.
 
-The ownership record is `/var/lib/unbounded/agent/install-state.json`. It is an
-internal file, not a configuration input. Keep it intact when retrying. It
-records which phase the installation is in, never how much of it has been done,
-so it cannot fall out of step with the host. A different machine name,
-Kubernetes version, rootfs image, or API server endpoint is rejected and
-requires an explicit reset before a new initial installation. Credentials and
-artifact locations can be refreshed for a retry.
+That refusal is a safety property, not an inconvenience. Building a second node stack beside the first is not a valid repair. When you genuinely need to change one of those values, run `unbounded-agent reset`, then bootstrap again. A reset stops and removes both possible nspawn machines, cleans up network interfaces, removes configuration and units, and removes the agent's own files. The reset itself records a `resetting` phase first, so a reset that is interrupted must be finished with `unbounded-agent reset` rather than bypassed with a fresh install.
 
-A retry that finds the node already running does not rewrite
-`<machine>-applied-config.json`, because that file records what the running node
-was built from and this attempt did not build it. Configuration that is allowed
-to change between attempts but only takes effect at node registration, node
-labels in particular, therefore reaches the node through the daemon's ordinary
-drift repave rather than through the retry itself.
+### What a retry reuses
 
-After completion, the same `start` invocation checks required daemon files,
-executable permissions, and enabled/active service state, and repairs the daemon
-when they are missing or stopped. It does not compare unit contents or overwrite
-working local unit customizations. This path uses the current applied
-configuration, including after an ordinary repave has switched from kube1 to
-kube2. It does not resolve the original node image or binary-download sources.
-The bootstrap shell still needs its agent download; to repair without that
-download, run an available agent executable directly with the original config:
+Each stage inspects the host before it acts. Host preparation skips packages that are already installed, preserves a live nftables ruleset, and leaves swap configuration alone when it already matches. The rootfs phase reuses a machine that is registered from the existing rootfs, and node start does not restart a machine that is already running. Node services are restarted only when their configuration actually changed. This is why a retry after a transient download failure or a network timeout is usually quick rather than a full rebuild.
+
+The applied configuration lives under `/etc/unbounded/agent`, with a file per slot and isolation mode such as `kube1-applied-config.json` and `none-kube1-applied-config.json`. The daemon compares the desired configuration with that record to decide whether the node has drifted. Repairs use the applied configuration rather than the original bootstrap input, because after an ordinary repave the bootstrap input may name a slot that has been retired.
+
+A change that kubelet reads only at registration is a special case. Node labels and taints are passed to kubelet when the node first registers, so changing them on a running node generally requires a repave or a manual node patch, not a daemon restart. The agent can detect the difference, but it cannot make kubelet re-register a node that already exists.
+
+### When ownership blocks a retry
+
+The installation lock is a file under `/run`, and the kernel releases it when the process exits. A leftover lock file therefore does not mean the lock is held, and you should not delete it. A second lifecycle operation waits for up to 30 seconds for the holder to finish and then fails with a message that another operation holds the installation lock. If you see that message while nothing appears to be running, check for a stuck `unbounded-agent start` or `unbounded-agent reset` process before trying again.
+
+If a bootstrap is interrupted, the daemon declines to start rather than fighting the unfinished installation for ownership. It exits with status 69, which the unit treats as success and as a reason not to restart, so the service is inactive until the installation finishes. The correct response is to rerun the saved payload or the same `start` command. Do not mask the condition by editing the unit or by deleting the record.
+
+An ownership record that cannot be read is treated as an error, not as a missing record. The agent will not guess whether a host is fresh when the file exists but is malformed. Inspect `/var/lib/unbounded/agent/install-state.json`, correct the file if you are certain of its contents, or run `reset` and bootstrap again. The record is local to the host disk: a reimaged host comes up with no record and is admitted as a fresh installation, which is exactly what makes a reusable autoscaling payload work.
+
+### Repairing the daemon directly
+
+The normal repair path is to rerun the bootstrap payload. If you no longer have the payload, or you need to repair the host with a different configuration file, run the agent directly as root:
 
 ```bash
-sudo env UNBOUNDED_AGENT_CONFIG_FILE=/path/to/original-agent-config.json \
-    /path/to/unbounded-agent start
+sudo UNBOUNDED_AGENT_CONFIG_FILE=/root/agent-config.json /opt/unbounded/agent/bin/unbounded-agent start
 ```
 
-The agent daemon does not run while an installation is unfinished. If it starts
-in that state, on a reboot or because an interrupted bootstrap had already
-enabled it, it logs a warning and exits with status 69. The unit reports
-`inactive`, not `failed`, and is not restarted; `systemctl status
-unbounded-agent-daemon` showing `inactive (dead)` together with that warning
-means the install still has to be completed, not that the daemon is broken. Run
-the bootstrap again and the daemon starts with it. Do not reset the host to
-clear this state.
-
-Reset also completes on a host where bootstrap never got far enough to install
-the packages it inspects with, and on one whose ownership record cannot be
-parsed. Both are cases where refusing would leave nothing able to clear the
-record, so reset proceeds and removes it.
-
-Bootstrap, reset, node lifecycle operations, and binary activation share an
-installation lock. Last-resort daemon rollback does not wait on these locks;
-reset stops the recovery unit before teardown. A busy lock is retryable, and
-MachineOperation handlers requeue instead of starting concurrent host mutations.
-Reset retains a `resetting` record when cleanup fails; correct the reported error
-and run reset again. Ownership is removed only after teardown and its filesystem
-synchronization barriers succeed. The lock file in `/run` remains and must not be
-deleted to force an operation through.
-
-Recovery applies to initial installations that carry an ownership record.
-Existing installations without one retain ordinary daemon operations and reset
-support; `start` requires a clean host before creating new ownership. Interrupted
-ordinary repaves still use the existing repave model, without a persistent repave
-recovery operation.
+The path in that command is an example. The file must be the JSON configuration for this host, and the machine name and cluster identity in it must produce the same installation fingerprint as the original bootstrap. The agent binary is installed by absolute path and is not expected to be on `PATH`; `/opt/unbounded/agent/bin/unbounded-agent` is the usual location on a current host. Running the binary from a login shell is only for repair and diagnosis. Normal lifecycle work goes through systemd or the saved payload, so the installation lock and the daemon unit stay consistent.
 
 ## Configuration
 
-The agent reads a JSON config file whose path is set through the
-`UNBOUNDED_AGENT_CONFIG_FILE` environment variable. The `manual-bootstrap`
-command generates this config automatically, but it can also be authored by
-hand. A minimal example:
+The agent never guesses which configuration to use. It reads the JSON file named by the `UNBOUNDED_AGENT_CONFIG_FILE` environment variable. When that variable is empty, it falls back to a set of legacy per-field environment variables. The cloud-init payload writes `/etc/unbounded/agent/config.json` and exports the variable in `runcmd`. The Ignition payload writes the same file and sets the variable on the first-boot unit. The script variant writes the same JSON to a temporary file under `/tmp` and exports that path instead.
+
+The file describes a desired worker node, not a sequence of commands. It names the Machine, the cluster endpoints and CA, the kubelet identity, the labels and taints to register with, and optionally the isolation mode, OCI image, local DNS cache, and download mirrors. The agent resolves that description into a goal state alongside what it discovers on the host.
+
+| Field | Required | Purpose |
+| --- | --- | --- |
+| `MachineName` | Yes, after resolution | Name of the `Machine` resource and the installation identity |
+| `NodeName` | No | Kubernetes Node name; defaults to the host hostname, then `MachineName` |
+| `Cluster.CaCertBase64` | Yes in practice | Base64 PEM of the cluster CA used to verify the API server |
+| `Cluster.ClusterDNS` | Yes | ClusterIP of the `kube-dns` service |
+| `Cluster.Version` | Yes | Kubernetes version used for node binaries and artifact resolution |
+| `Kubelet.ApiServer` | Yes unless a kubeconfig is supplied | API server endpoint kubelet talks to |
+| `Kubelet.Auth.BootstrapToken` | Yes unless attestation, exec credentials, or a kubeconfig is used | Bootstrap token in `<token-id>.<token-secret>` form |
+| `Kubelet.Labels` | No | Labels applied at node registration, including the site label |
+| `Kubelet.RegisterWithTaints` | No | Taints applied at node registration |
+| `Kubelet.Configuration` | No | Overlay merged over the agent's baseline kubelet configuration |
+| `Isolation` | No | `nspawn` (default), `none`, or `container` |
+| `OCIImage` | No | Rootfs image reference or archive; empty uses the built-in image |
+| `LocalDNS.Enabled` | No | Enables the nspawn-local CoreDNS cache |
+| `Downloads` | No | Per-artifact mirror settings for rootfs binaries |
+
+A generated configuration for a normal token join looks like this. The token and CA are redacted here; a real payload contains both, which is why the file must be readable only by root.
 
 ```json
 {
-  "MachineName": "mysite-worker-01",
+  "MachineName": "node-01",
   "Cluster": {
-    "CaCertBase64": "<base64-encoded CA certificate>",
-    "ClusterDNS": "10.0.0.10",
-    "Version": "1.33.1"
+    "CaCertBase64": "<base64-encoded cluster CA>",
+    "ClusterDNS": "10.96.0.10",
+    "Version": "v1.34.0"
   },
   "Kubelet": {
     "ApiServer": "https://api.example.com:6443",
-    "BootstrapToken": "abc123.0123456789abcdef",
+    "Auth": {
+      "BootstrapToken": "<token-id>.<token-secret>"
+    },
     "Labels": {
-      "unbounded-cloud.io/site": "mysite"
+      "unbounded-cloud.io/site": "my-site"
     },
     "RegisterWithTaints": []
   }
 }
 ```
 
-See the
-[Configuration reference]({{< relref "reference/agent/configuration" >}}) for
-the full field specification.
+`MachineName` becomes the `Machine` resource name, so it must be a valid Kubernetes DNS subdomain. `Cluster.CaCertBase64` is the base64 PEM of the cluster CA, not the path to a file. `Cluster.ClusterDNS` is the `kube-dns` ClusterIP and becomes kubelet's cluster DNS setting. `Cluster.Version` may be written with or without a leading `v`; the agent strips the prefix during loading.
+
+`Kubelet.ApiServer` may omit the scheme, in which case the agent prefixes `https://`. `Kubelet.Auth.BootstrapToken` is used for TLS bootstrap only; after the node obtains its client certificate, the daemon uses its own controller credentials. `Kubelet.Labels` is where the site label lives. `manual-bootstrap` adds `unbounded-cloud.io/site` automatically unless you already set that key or the deprecated `net.unbounded-cloud.io/site` key in `--node-label`.
+
+{{< callout type="warning" >}}
+The configuration contains the cluster CA, a bootstrap token, and any registry credentials you put in kubelet configuration. A saved bootstrap script or cloud-init file contains the same secrets. Keep it readable only by root, and delete it when you no longer need it.
+{{< /callout >}}
+
+When `MachineName` is absent, the agent resolves it from `AGENT_MACHINE_NAME` and then from the host hostname. Values from those sources are trimmed and lowercased before validation. An explicitly configured name is used as written and must already be valid, because the agent will not silently rewrite a name an operator set. A derived name that is not a valid DNS subdomain fails the load with the rejected value in the error.
+
+The complete field list, defaults, loading order, and environment variable fallback are in [Configuration]({{< relref "reference/agent/configuration" >}}). Read that page before you hand-edit a file, because JSON decoding ignores unknown fields: a misspelled key does not fail the load, it silently has no effect.
 
 ## Running the Agent
 
+The rest of this guide follows one concrete installation: an Ubuntu virtual machine with a public IP address joins an existing site as a worker node. The same steps work for a bare-metal host. The only differences are how you reach the host and how you deliver the payload.
+
 ### What You'll Do
 
-Join an existing Ubuntu VM to your Kubernetes cluster as a worker node by
-manually running the unbounded-agent on the target host.
+You will confirm that the site exists, generate a bootstrap payload named for the host, inspect the configuration and the download settings inside it, run it with `sudo`, and verify that the node and its `Machine` resource appear. You will then see how to reuse the same payload for an autoscaling group, where the machine name is resolved on each instance rather than baked into the payload.
+
+The result is a host that runs the agent daemon, has joined the cluster with TLS bootstrap, and carries the site label that scheduling and networking expect. The node stack runs in an nspawn machine by default. Nothing in the normal flow requires you to edit a file on the host by hand.
 
 ### Prerequisites
 
-- The [`kubectl-unbounded` plugin]({{< relref "reference/cli" >}}) installed
-  and on your `PATH`.
-- A site already created in the cluster. See the
-  [Getting Started]({{< relref "guides/getting-started" >}}) guide.
+Before you generate a payload, make sure the following are true.
+
+- Your workstation has a working kubeconfig for the cluster and the `kubectl-unbounded` plugin on `PATH`. The plugin provides `kubectl unbounded`, including `kubectl unbounded machine manual-bootstrap`.
+- The target site exists and has a usable bootstrap token. `manual-bootstrap` fails if it cannot find an unexpired token for the site. Check the site with `kubectl get sites` and `kubectl get site my-site -o yaml`. If you have not created a site yet, start with [Getting Started]({{< relref "guides/getting-started" >}}) or [Existing Cluster]({{< relref "guides/existing-cluster" >}}).
+- The host is a Linux system with systemd and a writable root filesystem, and you can run commands as root through `sudo` or a root login. The install script refuses to run as a non-root user.
+- The host architecture is `amd64` or `arm64`. The install script maps `x86_64` to `amd64` and `aarch64` to `arm64`, and refuses anything else.
+- `/var/lib` has at least 8 GiB free. Preflight checks this because the rootfs, container images, and staged artifacts all live there.
+- The host can reach the API server on the address the kubeconfig uses, and can resolve the cluster DNS address that will be written into kubelet configuration.
+- The host can reach the agent release endpoint, or a mirror you name with `--agent-base-url` or `--agent-url`.
+- The host is not already running a node stack the agent does not own. Preflight reports active Docker, containerd, and kubelet units, and a bootstrap may disable services that conflict with the node it is about to build. Use a clean host for a first install.
+
+The default `nspawn` mode also needs the systemd-nspawn runtime tools, including `systemctl`, `machinectl`, and `systemd-nspawn`. Preflight warns when they are missing, and the host phase can install them when the host has a package manager. On an immutable image, install them in the image; an offline artifact source covers rootfs binaries, not host packages.
 
 ### Steps
 
-1. Generate and run the bootstrap script on the target VM:
+First, confirm that the site exists. `manual-bootstrap` selects the site's newest usable bootstrap token itself; you do not need to copy the token by hand. The command only reads cluster state, so it is safe to run at any time.
 
 ```bash
-kubectl unbounded machine manual-bootstrap my-node --site mysite | ssh user@host sudo bash
+kubectl get site my-site -o yaml
 ```
 
-{{< callout type="note" >}}
-To inspect the script before running it, save it to a file first:
+Next, generate the payload and save it to a file. Saving it is better than piping it straight into `ssh`, because you can inspect it, rerun it after a transient failure, and keep it for the life of the host.
 
 ```bash
-kubectl unbounded machine manual-bootstrap my-node --site mysite > bootstrap.sh
+kubectl unbounded machine manual-bootstrap node-01 --site my-site > bootstrap-node-01.sh
+chmod 600 bootstrap-node-01.sh
 ```
-{{< /callout >}}
 
-{{< callout type="note" >}}
-`manual-bootstrap` adds `unbounded-cloud.io/site=<--site>` to the node labels
-unless you set a site label yourself with `--node-label`. The agent copies it
-onto the Machine it creates, which site-scoped Machine operations require.
-Machines bootstrapped by an earlier version of the CLI have no site label. Add
-it with:
+The first positional argument is the machine name. It must be a valid Kubernetes DNS subdomain because it becomes the `Machine` resource name. Omit it when you are building a reusable payload for many instances, or when you intentionally want the host to resolve its own name. The `--site` flag is required: it selects the site's bootstrap token and adds the site label unless you override the site label with `--node-label`.
+
+Now inspect the payload. The script variant embeds the agent configuration as a JSON heredoc, and you can extract and pretty-print it if `jq` is available:
 
 ```bash
-kubectl label machine <name> unbounded-cloud.io/site=<site>
+sed -n '/^{/,/^}$/p' bootstrap-node-01.sh | jq .
 ```
-{{< /callout >}}
 
-### Reusable bootstrap payloads (VMSS / Auto Scaling)
+Check that `MachineName` is the name you expect, that `Cluster.ClusterDNS` and `Cluster.Version` match the cluster, that `Kubelet.ApiServer` is reachable from the host, and that `Kubelet.Labels` contains `unbounded-cloud.io/site: my-site`. The bootstrap token appears in `Kubelet.Auth.BootstrapToken`; do not paste the file or its output into a ticket. If the token is expired, generate a new payload rather than editing the token by hand.
 
-The `NAME` argument is optional. When you omit it, the generated payload leaves
-the machine name unset and the `unbounded-agent` resolves it on the host at
-startup. This lets a single payload be reused across many instances, such as an
-Azure VMSS or an AWS Auto Scaling group, where each instance derives its own
-name.
+Run the payload on the host. The script requires root, and it exits with a clear message before changing anything if it is not run as root. Piping it over SSH keeps the file off the host, apart from the temporary configuration file the script itself creates.
 
 ```bash
-# Generate a reusable cloud-init document with no hard-coded machine name:
-kubectl unbounded machine manual-bootstrap --site mysite --variant cloud-init > user-data.yaml
+ssh azureuser@203.0.113.10 'sudo bash -s' < bootstrap-node-01.sh
 ```
 
-At startup the agent resolves the machine name in this order:
+If you log in as root directly, the form is `ssh root@203.0.113.10 'bash -s' < bootstrap-node-01.sh`. If you prefer to copy the file first, copy it with `scp`, then run `sudo bash /tmp/bootstrap-node-01.sh` on the host. The agent logs each stage as it runs, and the installed script runs `preflight` before `start` unless `AGENT_PREFLIGHT` is set to a false value.
 
-1. The `AGENT_MACHINE_NAME` environment variable, if set on the host.
-2. The host hostname.
-
-The resolved value is lowercased and validated as a Kubernetes node name (it
-becomes the `Machine` CR name), and the agent logs which source it used:
-
-```bash
-journalctl -u unbounded-agent | grep "resolved unbounded MachineName"
-```
-
-To pin a specific name on a host without editing the payload, export the
-environment variable before the agent runs, for example via cloud-init:
-
-```yaml
-runcmd:
-  - export AGENT_MACHINE_NAME=my-custom-node
-```
-
-### Where the agent installs
-
-The agent keeps its own host-side files under `/opt/unbounded/agent`: the
-daemon binaries and helper scripts in `/opt/unbounded/agent/bin`, and the
-LocalDNS network helper in `/opt/unbounded/agent/libexec`. Paths inside the
-nspawn machine are always relative to the machine directory, and
-`/etc/unbounded/agent` and `/var/lib/unbounded` are separate.
-`/opt/unbounded/agent/bin` is not on the default `PATH`, so run the agent on the
-host as `/opt/unbounded/agent/bin/unbounded-agent`.
-
-`/opt/unbounded/agent` is reserved for the agent. The rest of `/opt/unbounded`
-is yours, for example for offline artifacts or a local OCI layout: the agent
-creates `/opt/unbounded` if it is missing, and otherwise never changes or
-removes it or anything else in it. Mount a volume at a subdirectory such as
-`/opt/unbounded/artifacts` rather than over `/opt/unbounded`, so it does not
-hide the agent.
-
-The filesystem that holds `/opt/unbounded/agent` must allow running programs,
-so `/opt` must not be mounted `noexec`. Preflight fails where it is.
-
-Releases before `/opt/unbounded/agent` installed these files under
-`/usr/local`. A host installed by one of them moves to `/opt/unbounded/agent` in
-two stages:
-
-1. **Linked.** The first command of a newer agent that changes the host links
-   `/opt/unbounded/agent` to `/usr/local`, creating `/opt/unbounded` if needed.
-   That happens when the daemon starts after an AgentUpgrade, when `start` or
-   `agent-upgrade` runs, or when the nspawn pre-start hook runs. The files stay
-   where they are, and every path the units name is unchanged. The older
-   release is still the last-good binary, so the daemon can roll back to it, and
-   an AgentUpgrade back to it works. If the link cannot be made, the pre-start
-   hook leaves the machine's config as it is and the machine still starts; the
-   daemon refuses to start, and its journal says why.
-2. **Moved.** Once neither the current nor the last-good binary is from a
-   release before `/opt/unbounded/agent`, the daemon copies the files into a
-   real `/opt/unbounded/agent`, rewrites the units to use them, and restarts
-   itself from there. The restarted daemon then removes the files from
-   `/usr/local`. That is at the first daemon start after the AgentUpgrade that
-   follows the older release out of the last-good slot. To move a host that is
-   not due another upgrade, apply the release it already runs as an
-   AgentUpgrade. A move that is interrupted is finished or started over at the
-   next daemon start.
-
-   Before any unit names the copy, the daemon runs it. A host whose `/opt` is
-   mounted `noexec`, or where the copy does not run for another reason, stays
-   linked: the daemon logs why, removes any copy it made, points the units back
-   at `/usr/local` if a move that was interrupted had already pointed them at
-   the copy, and tries again at its next start.
-
-`unbounded-agent reset` removes the agent's files from both locations at any
-stage, then `/opt/unbounded/agent` itself: the link the agent made, or the
-directory once nothing else is left in it.
-
-Releases before `/opt/unbounded/agent` cannot run on a host whose agent is in a
-real `/opt/unbounded/agent`, whether it was installed there or moved there, and
-an AgentUpgrade to one is not supported. Nothing refuses it, and what happens
-depends on `/usr/local`:
-
-- Where it is read-only, that release's daemon fails at startup, because it
-  writes its nspawn lifecycle helper there. The agent rolls back to the
-  last-good binary and the operation fails.
-- Where it is writable, the operation reports success, and the next
-  AgentUpgrade fails, because that release looks for its binaries under
-  `/usr/local`.
-
-To recover, copy a newer release's `unbounded-agent` binary to the host and run
-`sudo ./unbounded-agent agent-upgrade` with it. That leaves the older release
-as the last-good binary, so apply the newer release as an AgentUpgrade once
-more to replace it there. Alternatively, run `sudo ./unbounded-agent reset`
-with the newer binary and bootstrap the host again.
-
-The agent refuses to run on a host that has an installation under both
-locations, or an installation under `/usr/local` beside an existing
-`/opt/unbounded/agent` directory, except while a move between them is under way.
-Run `unbounded-agent reset` first.
-
-The install script also places the agent binary at
-`/usr/local/bin/unbounded-agent` where it can, because releases before
-`/opt/unbounded/agent` look for it there. Newer releases do not use it, and the daemon removes it once
-nothing it runs is under `/usr/local`: once the host is installed in a real
-`/opt/unbounded/agent`, or in a directory outside `/usr/local` that you linked
-`/opt/unbounded/agent` to.
-
-### Immutable hosts (read-only /usr)
-
-Some images mount `/usr` read-only and provide no package manager, so there is
-no shell-based provisioning path at first boot. Azure Container Linux is one
-such image. `/opt`, and with it the agent's files under `/opt/unbounded/agent`,
-is on the writable root filesystem there.
-
-For these hosts, generate an Ignition config. The agent has to be a release
-that installs under `/opt/unbounded/agent`: earlier releases install under
-`/usr/local`, which is read-only on these hosts. Set `VERSION` to that release's
-tag:
-
-```bash
-VERSION=vX.Y.Z
-curl -fsSLO "https://github.com/Azure/unbounded/releases/download/${VERSION}/checksums.txt"
-kubectl unbounded machine manual-bootstrap my-node --site mysite \
-    --variant ignition \
-    --agent-url "https://github.com/Azure/unbounded/releases/download/${VERSION}/unbounded-agent-linux-amd64" \
-    --agent-sha256 "$(grep ' unbounded-agent-linux-amd64$' checksums.txt)" \
-    > config.ign
-```
-
-Ignition declares state rather than running commands, so this variant cannot
-resolve a version, detect an architecture, or extract an archive at boot. It
-therefore requires `--agent-url` pointing at the *bare agent binary* rather
-than the release tarball, and `--agent-sha256` to verify it. The digest for
-each release binary is published in `checksums.txt`.
-
-The config writes the agent config and the binary, and enables
-`unbounded-agent-bootstrap.service`, which runs `preflight` and then `start` on
-every boot. On an installed host that does nothing unless the daemon needs
-repair. It retries a failed bootstrap with a delay that grows to five minutes
-on systemd 254 and later, and every 10 seconds on older versions. Follow it on
-the host with `journalctl -u unbounded-agent-bootstrap.service`.
-`unbounded-agent reset` stops, disables, and removes it.
-
-`config.ign` carries the agent config, including the bootstrap token. Treat it
-as a secret, and deliver it only to the host it is for.
-
-### Customizing the agent download
-
-By default the bootstrap script downloads the latest published
-`unbounded-agent` release directly from GitHub. This means new releases are
-picked up automatically without editing scripts or docs. The download can be
-customized when generating the bootstrap payload or at runtime via
-environment variables:
-
-- `--agent-version` / `AGENT_VERSION`: pin to a specific release tag instead
-  of tracking latest. Example: `--agent-version v0.0.10`.
-- `--agent-base-url` / `AGENT_BASE_URL`: point at a self-hosted mirror of the
-  release assets. The layout under the base URL must match the GitHub
-  releases layout (`<base>/latest/download/<asset>` and
-  `<base>/download/<tag>/<asset>`). Useful for air-gapped environments.
-- `--agent-url` / `AGENT_URL`: fully qualified download URL for the agent
-  tarball. Overrides the version / base URL resolution entirely.
-
-Examples:
-
-```bash
-# Pin the agent to a specific release:
-kubectl unbounded machine manual-bootstrap my-node --site mysite \
-    --agent-version v0.0.10 | ssh user@host sudo bash
-
-# Self-host the release assets under an internal mirror:
-kubectl unbounded machine manual-bootstrap my-node --site mysite \
-    --agent-base-url https://releases.internal.example.com/unbounded \
-    | ssh user@host sudo bash
-```
-
-The same overrides can also be exported on the target host before running a
-previously generated bootstrap script:
-
-```bash
-export AGENT_BASE_URL=https://releases.internal.example.com/unbounded
-bash bootstrap.sh
-```
-
-The same agent-download flags are also accepted by `kubectl unbounded
-machine register`, which creates a `Machine` CRD. The machina controller
-then SSH's into the host and exports the same `AGENT_*` environment
-variables when running the install script, so pinning an agent version or
-pointing at a mirror works uniformly across all three provisioning paths
-(`manual-bootstrap`, `register`, and the machina reconciler):
-
-```bash
-kubectl unbounded machine register \
-    --site mysite \
-    --host 10.0.0.5 \
-    --ssh-username azureuser \
-    --ssh-private-key ~/.ssh/id_ed25519 \
-    --agent-version v0.0.10 \
-    --agent-base-url https://releases.internal.example.com/unbounded
-```
-
-These values are persisted on the `Machine` object under
-`spec.agent.{version,baseURL,url}` so the controller reproduces the same
-override on every reconcile:
-
-```yaml
-apiVersion: unbounded-kube.io/v1alpha3
-kind: Machine
-metadata:
-  name: mysite-worker-01
-spec:
-  agent:
-    version: v0.0.10
-    baseURL: https://releases.internal.example.com/unbounded
-  ssh:
-    host: 10.0.0.5
-    # ...
-```
-
-### Mirroring the rootfs downloads (air-gapped deployments)
-
-After installing the `unbounded-agent`, the agent downloads five additional
-binaries into the nspawn machine rootfs (in `none` mode, into a versioned
-directory under `/opt/unbounded/node`):
-
-| Artifact | Upstream default |
-|---|---|
-| kubelet / kubectl / kube-proxy | `https://dl.k8s.io` |
-| containerd | `https://github.com/containerd/containerd/releases/download` |
-| runc | `https://github.com/opencontainers/runc/releases/download` |
-| CNI plugins | `https://github.com/containernetworking/plugins/releases/download` |
-| crictl (cri-tools) | `https://github.com/kubernetes-sigs/cri-tools/releases/download` |
-
-Each default can be overridden at registration time. Every artifact
-exposes three flags, mirroring the `--agent-*` flags above:
-
-- `--<artifact>-base-url`: replaces the upstream host + path prefix.
-  Mirrors must preserve the same file layout as the upstream project
-  (e.g. `<base>/v<version>/<asset>`).
-- `--<artifact>-url`: full URL template; `%s` fmt placeholders are
-  substituted with version / arch fields in the same order as the
-  upstream default.
-- `--<artifact>-version` (or `--kubernetes-binary-version`): pin the
-  artifact to a specific version independently of the cluster
-  Kubernetes version. The default crictl minor-alignment behavior
-  (Kubernetes vX.Y.Z -> cri-tools vX.Y.0) is preserved when no crictl
-  version is set.
-
-The flags are available on both `manual-bootstrap` and `register`, and
-the machina controller forwards them through the agent JSON config
-(`Downloads` block) so an air-gapped operator can register a node
-against an internal mirror without touching source:
-
-```bash
-kubectl unbounded machine register \
-    --site mysite \
-    --host 10.0.0.5 \
-    --ssh-username azureuser \
-    --ssh-private-key ~/.ssh/id_ed25519 \
-    --agent-base-url      https://mirror.internal/unbounded \
-    --kubernetes-base-url https://mirror.internal/k8s \
-    --containerd-base-url https://mirror.internal/containerd/releases/download \
-    --runc-base-url       https://mirror.internal/runc/releases/download \
-    --cni-base-url        https://mirror.internal/plugins/releases/download \
-    --crictl-base-url     https://mirror.internal/cri-tools/releases/download
-```
-
-The resulting `Machine` persists the overrides under
-`spec.agent.downloads` so the controller reproduces them on every
-reconcile:
-
-```yaml
-apiVersion: unbounded-kube.io/v1alpha3
-kind: Machine
-metadata:
-  name: mysite-worker-01
-spec:
-  agent:
-    baseURL: https://mirror.internal/unbounded
-    downloads:
-      kubernetes:
-        baseURL: https://mirror.internal/k8s
-      containerd:
-        baseURL: https://mirror.internal/containerd/releases/download
-      runc:
-        baseURL: https://mirror.internal/runc/releases/download
-      cni:
-        baseURL: https://mirror.internal/plugins/releases/download
-      crictl:
-        baseURL: https://mirror.internal/cri-tools/releases/download
-  ssh:
-    host: 10.0.0.5
-    # ...
-```
-
-Leaving any artifact unset preserves the upstream default, so you can
-mirror a subset of the artifacts and let the rest fall back to the
-public CDN.
-
-A successful run looks like this (timestamps shortened for readability):
-
-```
-[I] starting unbounded-agent version=dev commit=unknown
-[I] [install-packages] started
-[I] [install-packages] completed duration=7.35s status=ok
-[I] [parallel(configure-os, configure-nftables, disable-docker, disable-swap)] started
-[I] [disable-swap] started
-[I] [configure-os] started
-[I] [configure-nftables] started
-[I] [disable-docker] started
-[I] [disable-swap] completed status=ok duration=3.86ms
-[I] [configure-os] completed duration=18.04ms status=ok
-[I] [configure-nftables] completed duration=1.07s status=ok
-[I] [disable-docker] completed status=ok duration=1.09s
-[I] [parallel(configure-os, configure-nftables, disable-docker, disable-swap)] completed duration=1.09s status=ok
-[I] [apply-attestation] started
-[I] attestation not configured, skipping
-[I] [apply-attestation] completed duration=12.81µs status=ok
-[I] [ensure-nspawn-workspace] started
-[I] [oci-download-rootfs] started
-[I] pulling OCI image image=ghcr.io/azure/agent-ubuntu2404:... dest=/var/lib/machines/my-node
-[I] OCI image extraction complete dest=/var/lib/machines/my-node
-[I] [oci-download-rootfs] completed duration=2.10s status=ok
-[I] [ensure-nspawn-workspace] completed duration=2.23s status=ok
-[I] [parallel(download-kube-binaries, download-cri-binaries, download-cni-binaries, configure-os, disable-resolved)] started
-[I] [download-kube-binaries] started
-[I] [download-cri-binaries] started
-[I] [download-cni-binaries] started
-[I] [download-kube-binaries] completed status=ok duration=2.06s
-[I] [download-cni-binaries] completed duration=3.21s status=ok
-[I] [download-cri-binaries] completed duration=3.32s status=ok
-[I] [parallel(download-kube-binaries, download-cri-binaries, download-cni-binaries, configure-os, disable-resolved)] completed duration=3.33s status=ok
-[I] [parallel(configure-containerd, configure-kubelet)] started
-[I] [configure-containerd] completed duration=5.57ms status=ok
-[I] [configure-kubelet] completed duration=13.31ms status=ok
-[I] [parallel(configure-containerd, configure-kubelet)] completed duration=13.46ms status=ok
-[I] [start-nspawn-machine] started
-[I] [start-nspawn-machine] completed duration=654.85ms status=ok
-[I] [setup-nvidia] started
-[I] NVIDIA runtime not enabled or no host libraries found, skipping
-[I] [setup-nvidia] completed status=ok duration=18.40µs
-[I] [start-containerd] started
-[I] [start-containerd] completed status=ok duration=319.89ms
-[I] [start-kubelet] started
-[I] [start-kubelet] completed duration=180.11ms status=ok
-```
-
-2. Verify the node has joined:
+After the command returns, verify the join from your workstation:
 
 ```bash
 kubectl get nodes -o wide
+kubectl get machines
+kubectl get machine node-01 -o yaml
 ```
 
+The node should be present, and it should become `Ready` once the CNI and other node components are up. The `Machine` should carry the site label, and its status should report the `AgentBootstrapped` condition. If the agent created the `Machine` itself, the object appears as soon as the bootstrap reports status; if a controller created it first, the agent only updates status. Check the labels on both objects because the site label is registered on the Node and copied onto the `Machine`:
+
+```bash
+kubectl get node node-01 --show-labels
+kubectl get machine node-01 --show-labels
 ```
-NAME       STATUS   ROLES    AGE   VERSION   INTERNAL-IP      EXTERNAL-IP   OS-IMAGE               KERNEL-VERSION      CONTAINER-RUNTIME
-my-node    Ready    <none>   20s   v1.33.1   192.168.100.10   <none>        Ubuntu 24.04.4 LTS     6.8.0-106-generic   containerd://2.0.4
+
+You can add ordinary node labels at generation time. Repeat `--node-label` for each key, or set the site label yourself to override the value derived from `--site`:
+
+```bash
+kubectl unbounded machine manual-bootstrap node-01 --site my-site \
+  --node-label workload=general \
+  --node-label unbounded-cloud.io/site=my-site
 ```
+
+If you need to repair a missing site label on the `Machine` after the fact, label the object directly. Labeling the `Machine` does not relabel the Node; kubelet applies node labels at registration, so repair the Node separately or repave the host.
+
+```bash
+kubectl label machine node-01 unbounded-cloud.io/site=my-site --overwrite
+kubectl label node node-01 unbounded-cloud.io/site=my-site --overwrite
+```
+
+### Reusable bootstrap payloads (VMSS / Auto Scaling)
+
+The machine name argument is optional. When you omit it, the payload does not name a machine. The agent resolves the name on the host at startup, in this order: an explicit `MachineName` in the configuration, then the `AGENT_MACHINE_NAME` environment variable, then the host hostname. Values from the environment and the hostname are trimmed and lowercased before they are validated, and the result must be a valid Kubernetes DNS subdomain because it becomes the `Machine` object name.
+
+That resolution order is what lets one payload serve an entire Azure VMSS or AWS Auto Scaling group. Every instance boots with the same user data, derives a different name, creates or updates its own `Machine`, and records its own installation state on its own disk. Generate the reusable cloud-init payload without a positional name:
+
+```bash
+kubectl unbounded machine manual-bootstrap --site my-site --variant cloud-init > user-data.yaml
+```
+
+Attach `user-data.yaml` to the scale set or launch template as cloud-init user data. On first boot, cloud-init writes `/etc/unbounded/agent/config.json` with mode `0600`, writes the install script to `/usr/local/bin/unbounded-agent-install.sh`, exports `UNBOUNDED_AGENT_CONFIG_FILE`, and runs the script. The script runs preflight and then `start`.
+
+The host hostname is a good default only when your platform gives every instance a unique one. Some autoscaling services reuse a name, and some image configurations set a fixed hostname. If two instances resolve the same name, they will contend for the same `Machine` resource. Inject `AGENT_MACHINE_NAME` into the first-boot environment when you need a name that is not the hostname, or set the hostname in the image. The agent logs the resolved name and its source at information level, so you can confirm which rule won. On a cloud-init host, look for that line in the first-boot output, usually `/var/log/cloud-init-output.log` or the cloud-init journal. After the daemon starts, use the agent's own log commands for node stack logs.
+
+Keep token lifetime in mind for long-lived groups. A payload embeds the bootstrap token that existed when you generated it, and bootstrap tokens expire. A payload that sits in a launch template for weeks can be stale by the time a scale-out uses it. Regenerate the payload on a schedule, or use the controller-managed provisioning path in [Automation]({{< relref "guides/operations/automation" >}}) when hosts are created continuously.
+
+### Where the agent installs
+
+The agent owns a small, fixed part of the host filesystem. Current installations put their binaries and helper programs under `/opt/unbounded/agent`, with `bin` and `libexec` subdirectories. Configuration lives in `/etc/unbounded/agent`, and installation ownership is recorded in `/var/lib/unbounded/agent/install-state.json`. The node rootfs and the runtime data are larger and live under `/var/lib`.
+
+| Path | Contents |
+| --- | --- |
+| `/opt/unbounded/agent/bin` | `unbounded-agent`, the blue/green binary links, the lifecycle helper, and the recovery script |
+| `/opt/unbounded/agent/libexec` | Host-side helper programs such as the local DNS network helper |
+| `/etc/unbounded/agent` | Agent configuration, including `<machine>-applied-config.json` and its checksum |
+| `/var/lib/unbounded/agent/install-state.json` | Installation ownership: machine, install ID, phase, and config fingerprint |
+| `/var/lib/unbounded` | Staging for the agent archive, offline artifacts, and container images |
+| `/var/lib/machines/<machine>` | The nspawn root filesystem for `kube1` or `kube2` |
+
+A script-based bootstrap does not use `/etc/unbounded/agent` for its input. It writes the JSON to a temporary file under `/tmp` and points `UNBOUNDED_AGENT_CONFIG_FILE` at that path. The cloud-init and Ignition variants use the `/etc` path, and `reset` removes temporary configuration files that earlier script runs left behind.
+
+The binary is not expected to be on `PATH`. Units and generated scripts invoke it by absolute path, and the install script downloads the release archive, stages it under `/var/lib/unbounded`, and runs admission from the staged executable. Paths are versioned and can be a link or a moved directory, so do not build them by hand in your own automation. Use the agent's commands or the paths the installation prints.
+
+Treat `/opt/unbounded/agent` as reserved for the agent. Its parent `/opt/unbounded` is shared with staged artifacts and OCI layouts, so the agent creates the parent when it is missing, never changes one that already exists, and never removes it. If you pre-create `/opt/unbounded` as a mount point, the agent uses it and leaves the mount alone. That is useful when `/opt` is a separate volume, but the volume must allow programs to run from it. Preflight fails when the agent install directory is on a filesystem mounted `noexec`, because systemd could not start the daemon from it.
+
+Hosts installed by older releases kept their files under `/usr/local`. On such a host the agent links `/opt/unbounded/agent` at the legacy layout, and later moves the files when no older release is left to roll back to. A move takes more than one daemon start: the first pass copies, verifies, and restarts from the copy, and the second removes the legacy files. An interrupted move finishes on the next start, and a failed verification puts the link back so the host keeps running from the legacy path. If the new root's filesystem is `noexec`, the host stays on the legacy layout rather than moving to a root it cannot run from.
+
+An agent release older than the `/opt` layout only knows `/usr/local`. The install script seeds `/usr/local/bin/unbounded-agent` for such a release, and newer agents remove that lone seed once nothing runs from the legacy root. If `/usr/local/bin` is read-only, the script warns that it cannot seed the binary, and only the older agents are affected. Pin a release that understands `/opt` if you need a read-only `/usr`.
+
+Do not install the agent under both roots yourself. The agent refuses a host that appears to have an installation under both `/usr/local` and `/opt/unbounded/agent`, and it tells you to run `reset` or remove the directory that is in the way. A file at `/opt/unbounded/agent` instead of a directory is also refused. In `nspawn` mode a reset stops and removes both possible machines. In every mode it cleans up network interfaces and removes the agent's files under both roots, the configuration directory, the daemon units, and leftover temporary configuration files. That is why it is the correct starting point when the layout is inconsistent.
+
+### Immutable hosts (read-only /usr)
+
+Image-based hosts such as Azure Container Linux often mount `/usr` read-only and ship no cloud-init. The agent still needs a writable place for its binaries, which is why current releases install under `/opt/unbounded/agent` on a writable root filesystem. If `/usr` is read-only, the host cannot use the legacy `/usr/local` layout and must run a release that understands `/opt`.
+
+The `ignition` variant exists for these hosts. Ignition runs from the initramfs, before any service starts, and it can write the agent configuration, the agent binary, and a first-boot unit without a shell or an operator on the machine. Because Ignition cannot extract an archive, cannot resolve a version, and cannot detect an architecture, every input to this variant is required and must be exact.
+
+```bash
+kubectl unbounded machine manual-bootstrap acr-node-01 --site my-site \
+  --variant ignition \
+  --agent-url https://artifacts.example.com/unbounded-agent-linux-amd64 \
+  --agent-sha256 <64-hex-sha256-of-the-binary> > config.ign
+```
+
+`--agent-url` must point at the bare `unbounded-agent` binary, not at the release tarball. It must use a scheme Ignition can fetch: `http`, `https`, `tftp`, `s3`, `arn`, or `gs`. `--agent-sha256` is the SHA-256 digest of that binary and must be 64 hexadecimal characters. The release publishes a `checksums.txt` file for each release, so copy the line for the binary rather than computing a digest from a different build.
+
+The generated config writes `/etc/unbounded/agent/config.json` with mode `0600` and the binary at `/opt/unbounded/agent/bin/unbounded-agent` with mode `0755`. It also installs `unbounded-agent-bootstrap.service`, which runs `unbounded-agent preflight` and then `unbounded-agent start`. The unit runs on every boot rather than once, because the installation record already says whether the installation is complete. On a complete host the commands return immediately or repair a daemon that is not running, so a stopped or damaged daemon comes back after a reboot.
+
+The bootstrap unit retries a failed bootstrap instead of giving up. It restarts after 10 seconds, backs off to a five-minute delay, and has no start limit because bootstrap has no later chance to run. On systemd versions with the newer restart settings, the delay steps up to the maximum. Follow the first boot with `journalctl` on the host; the unit name is the one above. `reset` disables and removes the first-boot unit as well as the agent files, so a reset host does not bootstrap itself again from Ignition.
+
+Treat `config.ign` as a secret. It contains the agent configuration, including the bootstrap token and the cluster CA, and the file is often stored in an image definition or a provisioning system. Restrict who can read it, and rotate the token if the file leaks.
+
+### Customizing the agent download
+
+By default the install script tracks the latest published release of `unbounded-agent`. That is convenient for a lab, and it means a new release is picked up without editing a payload. Production installations usually pin a version, and disconnected installations always need a mirror.
+
+| Flag on `manual-bootstrap` | Related variable | Effect |
+| --- | --- | --- |
+| `--agent-version` | `AGENT_VERSION` | Pin a release tag such as `v0.0.10`; unset tracks the latest release |
+| `--agent-base-url` | `AGENT_BASE_URL` | Base URL for release assets; the layout under it must match the release layout |
+| `--agent-url` | `AGENT_URL` | Fully qualified tarball URL; overrides the version and base URL. With `--variant ignition` it must name the bare binary |
+| `--agent-sha256` | `AGENT_SHA256`, when set externally | Required with `--variant ignition`; verifies the binary digest. Script and cloud-init do not export it from this flag |
+
+The base URL must preserve the release layout: `<base>/latest/download/<asset>` when tracking the latest release, and `<base>/download/<tag>/<asset>` when a version is pinned. Mirroring only the asset files at a flat path will not work. Use `--agent-url` when your mirror has a different layout and you can name the exact tarball.
+
+The install script also honors `AGENT_SHA256` when it is present in the environment, in which case it downloads the tarball to a file, verifies the digest, and fails on a mismatch before extraction. `AGENT_DEBUG` set to `1`, `true`, or `yes` adds `--debug` to the agent invocation. `AGENT_PREFLIGHT` defaults to enabled; set it to `0`, `false`, or `no` to skip the automatic preflight run. These variables control the download and the invocation, not the node configuration.
+
+The same choices can be persisted on the `Machine` resource as `spec.agent.version`, `spec.agent.baseURL`, and `spec.agent.url`. Controllers export them to the host before running the install script, and `kubectl unbounded machine register` exposes equivalent flags. Persisting them on the resource is better than editing a payload by hand when the same host may be reprovisioned later.
+
+### Mirroring the rootfs downloads (air-gapped deployments)
+
+The agent installs five groups of binaries into the rootfs: the Kubernetes components (`kubelet`, `kubectl`, and `kube-proxy`), containerd, runc, the CNI plugins, and crictl. Each group has a base URL, a full URL template, and an optional version override. If you set none of them, the agent uses its compiled-in defaults and downloads from each project's upstream release host. The Kubernetes binaries default to `https://dl.k8s.io`.
+
+| Artifact | Base URL flag | URL template placeholders | Version flag |
+| --- | --- | --- | --- |
+| Kubernetes | `--kubernetes-base-url` | `version`, `arch`, `binary` | `--kubernetes-binary-version` |
+| containerd | `--containerd-base-url` | `version`, `version`, `arch` | `--containerd-version` |
+| runc | `--runc-base-url` | `version`, `arch` | `--runc-version` |
+| CNI plugins | `--cni-base-url` | `version`, `arch`, `version` | `--cni-version` |
+| crictl | `--crictl-base-url` | `version`, `version`, `os`, `arch` | `--crictl-version` |
+
+A Kubernetes mirror must preserve the `<base>/v<ver>/bin/linux/<arch>/` layout, because the default URL builder appends those path elements. The other mirrors must preserve the tag and asset names that their release host uses. A mirror that renames files needs the corresponding `--<artifact>-url` template instead of a base URL.
+
+```bash
+kubectl unbounded machine manual-bootstrap node-01 --site my-site \
+  --kubernetes-base-url https://mirror.example.com/kubernetes \
+  --containerd-base-url https://mirror.example.com/containerd \
+  --runc-base-url https://mirror.example.com/runc \
+  --cni-base-url https://mirror.example.com/cni \
+  --crictl-base-url https://mirror.example.com/cri-tools
+```
+
+The version flags are optional. The Kubernetes binary version defaults to the cluster's Kubernetes version, and crictl defaults to the cluster's Kubernetes minor with patch zero. containerd, runc, and CNI default to the versions compiled into the agent. Pin them when your mirror holds a single version and you do not want a later agent release to look for a different one.
+
+These overrides become the `Downloads` block in the agent configuration, with a `Kubernetes`, `Containerd`, `Runc`, `CNI`, or `Crictl` entry, each holding `BaseURL`, `URL`, and `Version`. On the `Machine` resource the same values live under `spec.agent.downloads`. An entry you do not set falls back to the agent's default for that artifact; the entries are independent, so you can mirror only containerd while the Kubernetes binaries come from upstream.
+
+For a fully disconnected installation, `--offline-artifacts-source` points at a complete bundle instead of individual mirrors:
+
+```bash
+kubectl unbounded machine manual-bootstrap node-01 --site my-site \
+  --offline-artifacts-source /srv/unbounded/artifacts
+```
+
+The source may be an absolute path, a `file://` URL, an HTTPS archive, or an `oci://` artifact reference. It is embedded as `OfflineArtifacts.Source`, and it takes precedence over per-artifact download overrides. The string is a strict Go template, so a bundle organized by Kubernetes version can use the cluster version in its path. When offline artifacts are configured, missing host packages are reported as preflight errors because bootstrap cannot rely on a package manager to fetch them.
+
+A successful run logs the host, rootfs, and node-start stages, then reports the daemon installation. A failure names the stage that failed and returns the underlying error, so the first useful line is usually the stage name followed by the specific cause. If a run finishes suspiciously quickly, check the log for a reused rootfs or an already complete installation before you assume that a new binary was downloaded.
 
 ## GPU Support
 
-When GPUs are detected on the host, the agent automatically exposes the host
-paths needed by Kubernetes device plugins:
+GPU support is part of goal-state resolution, not a separate install step. During the rootfs phase the agent probes the host for NVIDIA and AMD hardware and turns what it finds into device, library, and sysfs grants for the node stack. If the host has no GPU, the checks are a no-op and the node is built for CPU only.
 
-- For NVIDIA GPUs, bind-mounts GPU devices and driver libraries into the nspawn
-  machine, generates a CDI spec, and registers the NVIDIA container runtime with
-  containerd.
-- For AMD GPUs, bind-mounts `/dev/kfd` and DRM device nodes and exposes AMD
-  sysfs paths read-only so the AMD Kubernetes device plugin can detect GPUs
-  inside nspawn.
+For NVIDIA, the agent discovers the device nodes under `/dev`, the driver libraries, and the helper binaries. In `nspawn` mode it binds the devices into the machine, exposes the driver libraries read-only under `/run/host-nvidia/<index>`, and makes the helper binaries available under `/run/host-nvidia-bin`. The node-start phase then builds a driver root, generates a CDI specification with `nvidia-ctk cdi generate`, writes it to `/etc/cdi/nvidia.yaml`, and configures the containerd NVIDIA runtime handler in CDI mode. Workloads request GPUs through the CDI device names rather than through a hand-written device mount.
 
-This describes `nspawn` mode. In `none` mode the node stack sees the host's
-devices natively. See the per-mode sections in the
-[NVIDIA]({{< relref "reference/gpu/nvidia#gpu-support-by-isolation-mode" >}}) and
-[AMD]({{< relref "reference/gpu/amd#gpu-support-by-isolation-mode" >}}) references.
+For AMD, the agent discovers `/dev/kfd` and the DRM card and render nodes under `/dev/dri`. It exposes those devices to the nspawn machine and mounts the sysfs paths the AMD device plugin reads read-only, so the plugin can discover KFD topology and GPU properties inside the machine. The agent does not install the vendor device plugin. Install the NVIDIA device plugin or GPU operator, or the AMD device plugin, after the node joins, using the method your platform supports.
 
-The agent does not deploy GPU device plugins. Install the vendor device plugin
-for Kubernetes resource advertisement. See the [GPU reference]({{< relref "reference/gpu" >}})
-for details.
+Hosts in `none` mode use the host's devices directly. The NVIDIA toolkit paths are the host paths by default, and you can override them with `NvidiaToolkit` when the toolkit is installed somewhere unusual. Hosts in `container` mode use the same discovery and CDI flow as `nspawn`, but the mode itself is experimental and gated. The GPU reference pages cover the device and library details for each vendor:
+
+- [GPU]({{< relref "reference/gpu" >}}) for the shared model and scheduling expectations.
+- [NVIDIA GPUs]({{< relref "reference/gpu/nvidia" >}}) for the driver stack, CDI, and container runtime behavior.
+- [AMD GPUs]({{< relref "reference/gpu/amd" >}}) for KFD, DRM nodes, and sysfs exposure.
+
+If the GPU is not one of the automatically discovered devices, expose it explicitly. `--additional-host-device` accepts an absolute path under `/dev` or a systemd device group such as `char-input`, and `--additional-host-mount` accepts `source[:target][:ro]` for a host path. Prefer discovery for standard GPUs; use the explicit flags for accelerators, fabric devices, or device directories that the agent does not know about.
 
 ## Troubleshooting
 
-**Agent fails to start** -- Verify that the config file path is correct and
-contains valid JSON. Check that all required fields are present.
+Start with the first error, not the last line. The agent returns early from the phase that failed, and the last line is often a wrapper that adds context to an earlier, more specific message. A message that begins with `read agent config file` is a path problem, `decode agent config file` is a JSON syntax problem, and `validate agent config` is a rule failure in the file.
 
-**Node not joining the cluster** -- Ensure the host has HTTPS connectivity to
-the API server and that the bootstrap token has not expired. Inspect the
-kubelet logs in the node stack:
+### The payload stops before changing the host
+
+Run preflight directly as root with the same configuration the payload uses. The command is non-mutating and prints one line per check, or a JSON report when you ask for one.
 
 ```bash
-sudo unbounded-agent logs --unit kubelet --lines 200
-sudo unbounded-agent exec -- journalctl -u kubelet --no-pager -n 100
+sudo UNBOUNDED_AGENT_CONFIG_FILE=/etc/unbounded/agent/config.json \
+  /opt/unbounded/agent/bin/unbounded-agent preflight --output json
 ```
 
-`exec` and `logs` work in every isolation mode; see
-[Isolation Modes]({{< relref "reference/agent/isolation" >}}#running-commands-and-reading-logs).
+The report calls out a non-root user, an agent install directory that cannot be written or is on a `noexec` filesystem, an API server that is not reachable, and an NVIDIA driver stack that is missing pieces. Some of those are errors and some are warnings, so read the severity rather than assuming the run will continue. `--ignore-preflight-errors=<check-name>` turns a named error into a warning, and `--fail-on-warnings` turns warnings into a failure. Use the ignore flag only when you understand the check; a `noexec` install root, for example, will still fail later when systemd cannot start the daemon.
 
-**GPU not detected** -- Confirm that the vendor driver is installed and loaded
-on the host. For NVIDIA, check `/dev/nvidia*`. For AMD, check `/dev/kfd`,
-`/dev/dri/card*`, and `/dev/dri/renderD*`.
+If preflight passes and `start` still fails immediately, check the config path and the JSON itself. A exported variable pointing at a file that does not exist, or a file with a trailing comma, fails before any host work begins. The generated payload handles both correctly, so a failure here usually means the payload was edited or the environment was overridden after generation.
+
+### The node does not join
+
+Kubelet joins with TLS bootstrap, so a join failure is usually one of four things: the API server is unreachable from the host, the token is rejected or expired, the token belongs to a different site, or the cluster CA does not match the API server certificate. The agent waits for the generated client kubeconfig, so the failure appears in the node-start stage with the wait named in the error.
+
+Check connectivity from the host to the `Kubelet.ApiServer` address and port. A private API server that is reachable from your workstation is not necessarily reachable from the edge site. Check that the token in the payload is still valid, that it was issued for the site you named, and that the site has not been recreated since the payload was generated. If the CA is wrong, kubelet cannot verify the API server and the error points at certificate verification rather than at the token.
+
+For a node that has started but is not behaving, read the node stack journal and inspect the running containers. The agent resolves the active node from the applied configuration, so these commands work in every isolation mode without you naming a machine.
+
+```bash
+sudo /opt/unbounded/agent/bin/unbounded-agent logs --unit kubelet --lines 200
+sudo /opt/unbounded/agent/bin/unbounded-agent logs --unit containerd --follow
+sudo /opt/unbounded/agent/bin/unbounded-agent exec -- crictl ps
+```
+
+If the node object exists but stays `NotReady`, check the CNI plugin and the pod network before you reinstall the agent. A node with a working kubelet but no working pod network reports `NotReady` with a network-related condition, and reinstalling the agent is not a CNI repair.
+
+### The daemon is not running
+
+Check the unit and its journal before you touch the installation record:
+
+```bash
+systemctl status unbounded-agent-daemon.service
+journalctl -u unbounded-agent-daemon.service -n 200
+```
+
+If the unit is inactive and the journal shows exit status 69, an installation is unfinished. Rerun the saved payload or the same `start` command with the configuration file. Do not reset the failure state and force a start; the daemon is deliberately standing down so it does not fight the bootstrap for ownership.
+
+If the unit is enabled but failing for another reason, rerun `start` first. It verifies the installed daemon and its files and repairs a missing or damaged daemon when the installation record says `complete`. If the repair fails, read the error before running `reset`; a reset destroys the node stack and is a much larger action than reinstalling a unit.
+
+### The host joined with the wrong name
+
+The machine name is the `Machine` resource name and the installation identity. If a reusable payload produced a name you did not expect, the host hostname probably won. Check the agent's information-level log line for the resolved name and its source: `config`, `env`, or `hostname`. Inject `AGENT_MACHINE_NAME` when the hostname is not suitable, or set the hostname before the payload runs.
+
+A name that is not a valid Kubernetes DNS subdomain fails at startup. Uppercase letters in a derived name are lowercased for you, but underscores, spaces, and names longer than the DNS limit are not repaired. Set a valid name explicitly rather than relying on a hostname that violates the rule.
+
+### A GPU is missing from the node
+
+Check the host first. For NVIDIA, `nvidia-smi` should list the GPUs and the `/dev/nvidia*` device nodes should exist. For AMD, `/dev/kfd` and the `/dev/dri` card or render nodes should exist and the `amdgpu` driver should be loaded. Preflight reports an incomplete driver stack when it finds hardware but cannot find the libraries, device nodes, or services it needs.
+
+Inside the node, confirm that the device plugin is installed and that it can see the devices the agent exposed. The agent prepares the devices, the library paths, and the CDI specification; it does not install the vendor plugin or create GPU resource names for you. If the plugin is running but reports no devices, compare its logs with the grants the agent recorded in the applied configuration and the machine unit.
+
+### Configuration changes seem to do nothing
+
+JSON decoding ignores unknown fields, so a misspelled key is accepted and has no effect. Compare a hand-edited file with the field table in [Configuration]({{< relref "reference/agent/configuration" >}}), and check the applied configuration under `/etc/unbounded/agent` to see what the agent actually recorded. A change that kubelet applies only at registration, such as node labels or taints, also will not take effect on a restart. Repave the host or patch the node object when that is the behavior you need.
 
 ## See Also
 
-- **[Project Overview]({{< relref "concepts/overview" >}})** -- How the agent
-  fits into the broader system.
-- **[Architecture Reference]({{< relref "reference/architecture" >}})** -- Deep
-  dive into component internals.
-- **[Isolation Modes]({{< relref "reference/agent/isolation" >}})** -- Where the
-  node stack runs, and how to choose between modes.
-- **[nspawn Mode]({{< relref "reference/agent/nspawn" >}})** -- How the
-  default mode uses systemd-nspawn to isolate worker node components.
+- [Getting Started]({{< relref "guides/getting-started" >}}) for a first cluster and the controller-managed path to a node.
+- [Existing Cluster]({{< relref "guides/existing-cluster" >}}) for connecting Unbounded to a control plane you already run.
+- [Agent Reference]({{< relref "reference/agent" >}}) for the agent's files, units, bootstrap phases, and daemon behavior.
+- [Configuration]({{< relref "reference/agent/configuration" >}}) for every field, default, and environment variable.
+- [Preflight]({{< relref "reference/agent/preflight" >}}) for the checks and how to read their reports.
+- [Isolation]({{< relref "reference/agent/isolation" >}}) for choosing between `nspawn`, `none`, and `container`.
+- [nspawn]({{< relref "reference/agent/nspawn" >}}) for the default rootfs layout, grants, and lifecycle.
+- [Agent Operations]({{< relref "guides/operations/agent-operations" >}}) for upgrades, reboots, resets, and day-two recovery.
+- [CLI Reference]({{< relref "reference/cli" >}}) for the complete command surface, including the agent subcommands.
