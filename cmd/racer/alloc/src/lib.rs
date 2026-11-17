@@ -739,7 +739,8 @@ pub struct AlignedBuffer<C: Charge> {
 /// Entries are kept oldest first so maintenance trims the longest-idle storage.
 /// A [`Provision`] controller sizes the pool in 64 KiB granules from the bytes
 /// checked out of it; returns are accepted up to the idle byte budget, and
-/// maintenance frees whatever the controller releases.
+/// maintenance frees whole buffers the controller releases without dropping
+/// below its target.
 pub(crate) struct BufferPool<C: Charge> {
     entries: VecDeque<AlignedBuffer<C>>,
     demand: Provision,
@@ -848,18 +849,28 @@ impl<C: Charge> BufferPool<C> {
         true
     }
 
-    /// Remove the entries chosen by demand maintenance, oldest first.
+    /// Remove the entries chosen by demand maintenance, oldest first. Only
+    /// whole buffers are released, skipping any whose removal would leave
+    /// less than the target, so the release may fall short of the plan.
     pub(crate) fn maintain(&mut self, now: std::time::Instant) -> Vec<AlignedBuffer<C>> {
-        let capacity = Self::granules(self.in_use.saturating_add(self.bytes()));
+        let mut provisioned = self.in_use.saturating_add(self.bytes());
+        let capacity = Self::granules(provisioned);
         let Plan::Release(units) = self.demand.tick(now, capacity, 0, self.pressure) else {
             return Vec::new();
         };
+        let target = self.demand.target();
         let mut wanted = units.saturating_mul(STAGING_GRANULE);
         let mut released = Vec::new();
-        while wanted > 0
-            && let Some(buffer) = self.remove(0)
-        {
-            wanted = wanted.saturating_sub(buffer.allocation().layout.size());
+        let mut index = 0;
+        while wanted > 0 && index < self.entries.len() {
+            let size = self.entries[index].allocation().layout.size();
+            if Self::granules(provisioned.saturating_sub(size)) < target {
+                index += 1;
+                continue;
+            }
+            let buffer = self.remove(index).expect("indexed idle entry");
+            provisioned = provisioned.saturating_sub(size);
+            wanted = wanted.saturating_sub(size);
             released.push(buffer);
         }
         self.counters.trimmed = self.counters.trimmed.saturating_add(released.len() as u64);
@@ -1114,6 +1125,28 @@ mod buffer_tests {
         let all = pool.borrow_mut().take_all();
         assert!(!all.is_empty());
         assert_eq!(tallied(&pool), 0);
+    }
+
+    #[test]
+    fn trimming_mixed_sizes_keeps_the_target() {
+        const MIB: usize = 1024 * 1024;
+        let alignment = Alignment::new(4096, 1, 1).unwrap();
+        let pool = Rc::new(RefCell::new(BufferPool::default()));
+        drop(alignment.allocate(16 * MIB, ()).unwrap().pooled(&pool));
+        drop(alignment.allocate(MIB, ()).unwrap().pooled(&pool));
+        let now = std::time::Instant::now();
+        let released = pool.borrow_mut().maintain(now);
+        let stats = pool.borrow().stats();
+        assert_eq!(stats.target, 16 * MIB);
+        let sizes: Vec<_> = released
+            .iter()
+            .map(|b| b.allocation().layout.size())
+            .collect();
+        assert_eq!(sizes, [MIB], "the oldest 16 MiB buffer is kept");
+        assert_eq!((stats.entries, tallied(&pool)), (1, 16 * MIB));
+        assert!(pool.borrow_mut().maintain(now).is_empty());
+        assert!(pool.borrow_mut().take_for(16 * MIB, &()).is_some());
+        assert_eq!(pool.borrow().stats().misses, 0);
     }
 
     #[test]
