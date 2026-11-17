@@ -2052,6 +2052,49 @@ fn growing_pool_under_pressure_and_refused_charges() {
 }
 
 #[test]
+/// The room counted as free follows pressure at once: up to the ceiling
+/// under `Normal`, one block above use under `Elevated`, none under
+/// `Critical`, and back to the ceiling once pressure clears.
+fn growing_pool_room_follows_pressure() {
+    profiles(|| {
+        let (mut w, _charges) = growing_world();
+        let (ea, eb) = link_up(&mut w);
+        let free = |w: &World| w.a.clients[0].free_buffers(7);
+        assert_eq!(free(&w), Some((GROWN, GROWN)));
+
+        w.a.clients[0].set_pool_pressure(page_alloc::Pressure::Critical);
+        pump(&mut w);
+        assert_eq!(free(&w), Some((BLOCK, BLOCK)), "critical never grows");
+        let held = hold_grants(&mut w, ea, BLOCK, 0);
+        assert_eq!(sizing(&w).capacity, BLOCK);
+        assert_eq!(free(&w), Some((0, BLOCK)));
+
+        w.a.clients[0].set_pool_pressure(page_alloc::Pressure::Elevated);
+        pump(&mut w);
+        let elevated = sizing(&w);
+        assert!(elevated.capacity <= 2 * BLOCK, "{elevated:?}");
+        assert_eq!(free(&w), Some((BLOCK, 2 * BLOCK)), "one block above use");
+
+        w.a.clients[0].set_pool_pressure(page_alloc::Pressure::Normal);
+        pump(&mut w);
+        assert_eq!(free(&w), Some((GROWN - BLOCK, GROWN)));
+
+        w.a.clients[0].set_pool_pressure(page_alloc::Pressure::Critical);
+        pump(&mut w);
+        let critical = sizing(&w);
+        assert_eq!(
+            free(&w),
+            Some((critical.capacity - BLOCK, critical.capacity)),
+            "{critical:?}"
+        );
+        w.a.clients[0].set_pool_pressure(page_alloc::Pressure::Normal);
+        release_grants(&mut w, eb, held);
+        assert_eq!(free(&w), Some((GROWN, GROWN)));
+        shutdown(w);
+    });
+}
+
+#[test]
 /// A block registers off the owner thread: grants keep flowing while it is
 /// in flight, and closing waits for it, then drains with nothing charged.
 fn block_registration_does_not_block_and_shutdown_waits() {

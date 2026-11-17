@@ -123,7 +123,9 @@ pub(crate) struct Tally {
     total: AtomicUsize,
 
     /// Buffers the owner may still register: the room left under the
-    /// ceiling, or zero while growth is refused or disabled.
+    /// ceiling, at most one block above use under elevated pressure, and
+    /// zero while growth is refused, disabled, or stopped by critical
+    /// pressure.
     room: AtomicUsize,
 }
 
@@ -840,7 +842,8 @@ impl RegisteredPage {
 
     /// The free and total buffer counts of the rail this page came from, a
     /// snapshot that may be stale by the time it is used. Both count the
-    /// buffers the owner may still register (see the module docs).
+    /// buffers the owner may still register under the current pressure (see
+    /// [`Tally::free_and_total`]).
     pub fn pool_free(&self) -> (usize, usize) {
         self.shared.tally.free_and_total()
     }

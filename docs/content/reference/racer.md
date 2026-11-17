@@ -752,7 +752,12 @@ Racer-Destination-Length: <length>
   an eighth of the buffers of that rail's pool are free. These pages count
   as `pool_low`, and that copy costs an extra pass over the page in memory,
   so a `pool_low` count that keeps growing means the grant reserve is not
-  keeping up. If ciphertext admission also refuses
+  keeping up. Both checks count the buffers the pool may still register as
+  free and part of the pool: up to the rail's share of
+  `RACER_REGISTERED_BYTES` without memory pressure, at most one block above
+  the buffers in use under `Elevated` pressure, and none under `Critical`
+  pressure, when the pool does not grow, or while a refused or failed block
+  registration waits to retry. If ciphertext admission also refuses
   that copy, the page is dropped, which frees its buffer, and the window
   fetches it again later; `racer_host_read_ahead_registered_dropped_total`
   counts these drops.
@@ -2098,8 +2103,9 @@ Native activation registers the page-buffer pool within 5 s plus 1 s per GiB of
 `stage=rdma-activation state=failed`, counts `racer_rdma_activation_failures_total`,
 reports no RDMA rails (so peers stop planning RDMA to it), and retries; it
 advertises its rails again once activation succeeds. `racer_rdma_active` is 1
-while rails are active, and `racer_rdma_free_buffers` counts free page buffers,
-including those the pool may still register.
+while rails are active, and `racer_rdma_free_buffers` counts free page buffers
+registered now, in blocks that still hand out buffers; it does not count the
+buffers the pool may still register.
 
 Activation registers only the first block of each rail's pool (an eighth of the
 rail's share of `RACER_REGISTERED_BYTES`, 2 to 32 buffers). The native thread

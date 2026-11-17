@@ -181,9 +181,18 @@ region and quarantines its charge, as before. Shutdown waits for block
 registrations in flight.
 
 `Client::free_buffers` counts the buffers a rail may still register as free,
-so the read path's ahead-grant reserve sees the ceiling rather than the
-current registration and does not hold back requests that growth would serve.
-Grants per link are still sized from the ceiling.
+so the read path's ahead-grant reserve sees the room growth would fill
+rather than only the current registration, and does not hold back requests
+that growth would serve. The room is published with the sizing on every
+owner pass, and follows what `Provision::tick` may still grow to: up to the
+ceiling under `Normal`; under `Elevated`, which caps the target one block
+above the observed demand, a block already registering plus the blocks up to
+that cap; and none under `Critical`, which never grows, while growth waits to
+retry, or once the rail is closing or lost. Otherwise ahead pages could
+take the buffers the reserve keeps for window heads, counting on growth that
+pressure has disabled. `Client::set_pool_pressure` wakes the owner, so the
+room follows a pressure change on the next pass. Grants per link are still
+sized from the ceiling.
 
 ## Pressure
 

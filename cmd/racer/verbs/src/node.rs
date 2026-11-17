@@ -1045,8 +1045,10 @@ impl Client {
 
     /// Free and total page buffers of `rail`'s host pool, a snapshot that may
     /// be stale by the time it is used. Both include the buffers a pool sized
-    /// to demand may still register. `None` without that pool, or while the
-    /// pool table is being changed.
+    /// to demand may still register: up to its ceiling without pressure, at
+    /// most one block above use under [`Pressure::Elevated`], and none under
+    /// [`Pressure::Critical`] or while growth waits to retry. `None` without
+    /// that pool, or while the pool table is being changed.
     pub fn free_buffers(&self, rail: u16) -> Option<(usize, usize)> {
         let pools = self.shared.pools.try_read().ok()?;
         Some(pools.get(&rail)?.tally.free_and_total())
@@ -1060,7 +1062,8 @@ impl Client {
     }
 
     /// Memory pressure for pools sized to demand: under pressure they keep
-    /// less spare capacity and release it sooner.
+    /// less spare capacity, release it sooner, and report less room to grow
+    /// in [`Self::free_buffers`]; the owner republishes it on its next pass.
     pub fn set_pool_pressure(&self, pressure: Pressure) {
         let code = pressure_code(pressure);
         if self.shared.pool_pressure.swap(code, Ordering::Relaxed) != code {
@@ -2022,6 +2025,7 @@ impl Owner {
                 now,
             );
             if lost {
+                sizing.publish(&device.pool, pressure, true);
                 continue;
             }
             if changes.drained {
@@ -2042,7 +2046,7 @@ impl Owner {
                     *entry = RailPool::of(&device.pool, Some(sizing));
                 }
             }
-            sizing.publish(&device.pool);
+            sizing.publish(&device.pool, pressure, self.closing);
             grew |= device.pool.capacity() > capacity;
         }
         grew
@@ -2179,9 +2183,10 @@ impl Owner {
             );
         }
 
+        let pressure = pressure_of(self.shared.pool_pressure.load(Ordering::Relaxed));
         for (rail, rail_sizing) in &sizing {
             if let Some(device) = built.get(rail) {
-                rail_sizing.publish(&device.pool);
+                rail_sizing.publish(&device.pool, pressure, false);
             }
         }
         self.devices = built;

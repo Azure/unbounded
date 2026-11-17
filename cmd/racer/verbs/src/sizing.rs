@@ -342,14 +342,33 @@ impl RailSizing {
         }
     }
 
-    /// Publish the pool's sizing and the room it may still grow into.
-    pub(crate) fn publish(&self, pool: &Pool) {
-        let room = if self.retry.is_some() {
-            0
-        } else {
-            self.demand.config().ceiling.saturating_sub(pool.capacity())
+    /// Buffers the pool may still grow by under `pressure`. None while
+    /// `stopped` (closing or lost), while growth waits to retry, or under
+    /// critical pressure, where [`Provision::tick`] never grows. Under
+    /// elevated pressure the target is capped one block above the demand
+    /// last observed, so the room covers a block already registering and the
+    /// blocks up to that cap. Otherwise it reaches the ceiling.
+    fn room(&self, pool: &Pool, pressure: Pressure, stopped: bool) -> usize {
+        if stopped || self.retry.is_some() {
+            return 0;
+        }
+        let ceiling = self.demand.config().ceiling;
+        let reach = match pressure {
+            Pressure::Normal => ceiling,
+            Pressure::Elevated => {
+                let have = pool.capacity() + if self.registering() { self.block } else { 0 };
+                let cap = (self.demand.in_use() + self.block).min(ceiling);
+                have + cap.saturating_sub(have).div_ceil(self.block) * self.block
+            }
+            Pressure::Critical => return 0,
         };
-        pool.set_room(room);
+        reach.min(ceiling).saturating_sub(pool.capacity())
+    }
+
+    /// Publish the pool's sizing and the room it may still grow into under
+    /// `pressure` (see [`Self::room`]).
+    pub(crate) fn publish(&self, pool: &Pool, pressure: Pressure, stopped: bool) {
+        pool.set_room(self.room(pool, pressure, stopped));
         let store = |v: &AtomicU64, n: u64| v.store(n, Ordering::Relaxed);
         let nanos = |d: Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
         store(&self.stats.capacity, pool.capacity() as u64);

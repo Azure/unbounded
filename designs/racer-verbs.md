@@ -217,8 +217,11 @@ demand marks the newest block draining, so it hands out no more buffers, and
 no window holds its region. A later demand rise reactivates a draining block
 before registering a new one. Takes prefer the oldest active block, so the
 newest drains first. `Client::free_buffers` counts the buffers the owner may
-still register as free, so callers that ration buffers see the ceiling, not
-the current registration.
+still register as free, so callers that ration buffers see the room growth
+would fill, not only the current registration. That room shrinks under memory
+pressure, to one block above use under `Elevated` and to none under
+`Critical`, and is none while growth waits to retry (see
+`designs/racer-pool-control.md`).
 
 Only `RegisteredPage` exposes receive memory. Its drop can run on another
 thread and returns the buffer to the pool. Dropping a pool with held,
