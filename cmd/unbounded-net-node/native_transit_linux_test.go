@@ -66,9 +66,18 @@ func TestNativeTransitInterfaceRules(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer forward.Cleanup()
 
 	forward.EnsureInterface("fabric0")
+	forward.EnsureInterface("oldfabric0")
+	forward.EnsureInterface("tunnel0")
+
+	forward, err = unboundednetnetlink.NewForwardManager()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer forward.Cleanup()
+
+	forward.EnsureInterface("tunnel0")
 
 	if err := forward.ReconcileNativeInterface("fabric0", []string{"invalid"}); err == nil {
 		t.Fatal("invalid native prefix accepted")
@@ -125,6 +134,14 @@ func TestNativeTransitInterfaceRules(t *testing.T) {
 				"-i", "fabric0", "-m", "comment", "--comment", "unbounded-net: forward between managed tunnels", "-j", "UNBOUNDED-FORWARD")
 			checkRule(ipt, false, "filter", "UNBOUNDED-FORWARD",
 				"-o", "fabric0", "-m", "comment", "--comment", "unbounded-net: forward between managed tunnels", "-j", "ACCEPT")
+			checkRule(ipt, false, "filter", "FORWARD",
+				"-i", "oldfabric0", "-m", "comment", "--comment", "unbounded-net: forward between managed tunnels", "-j", "UNBOUNDED-FORWARD")
+			checkRule(ipt, false, "filter", "UNBOUNDED-FORWARD",
+				"-o", "oldfabric0", "-m", "comment", "--comment", "unbounded-net: forward between managed tunnels", "-j", "ACCEPT")
+			checkRule(ipt, true, "filter", "FORWARD",
+				"-i", "tunnel0", "-m", "comment", "--comment", "unbounded-net: forward between managed tunnels", "-j", "UNBOUNDED-FORWARD")
+			checkRule(ipt, true, "filter", "UNBOUNDED-FORWARD",
+				"-o", "tunnel0", "-m", "comment", "--comment", "unbounded-net: forward between managed tunnels", "-j", "ACCEPT")
 			checkRule(ipt, tc.notrack, "raw", "PREROUTING",
 				"-i", "fabric0", "-m", "comment", "--comment", "unbounded-net: skip conntrack for tunnel transit", "-j", "UNBOUNDED-NOTRACK")
 			checkRule(ipt, true, "raw", "UNBOUNDED-NOTRACK",

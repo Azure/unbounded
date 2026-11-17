@@ -35,9 +35,10 @@ const (
 // This gives 2*N rules instead of N^2 and ensures only traffic between
 // managed tunnel interfaces bypasses KUBE-FORWARD's conntrack checks.
 type ForwardManager struct {
-	ipt4 *iptables.IPTables
-	ipt6 *iptables.IPTables
-	mu   sync.Mutex
+	ipt4       *iptables.IPTables
+	ipt6       *iptables.IPTables
+	mu         sync.Mutex
+	interfaces map[string]bool
 }
 
 // NewForwardManager creates a ForwardManager, ensures the UNBOUNDED-FORWARD
@@ -56,7 +57,7 @@ func NewForwardManager() (*ForwardManager, error) {
 		ipt6 = nil
 	}
 
-	m := &ForwardManager{ipt4: ipt4, ipt6: ipt6}
+	m := &ForwardManager{ipt4: ipt4, ipt6: ipt6, interfaces: make(map[string]bool)}
 
 	if err := m.ensureChain(ipt4, "IPv4"); err != nil {
 		return nil, fmt.Errorf("failed to create IPv4 forward chain: %w", err)
@@ -140,6 +141,8 @@ func (m *ForwardManager) ReconcileNativeInterface(ifName string, prefixes []stri
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	delete(m.interfaces, ifName)
+
 	for _, family := range []struct {
 		ipt    *iptables.IPTables
 		number int
@@ -149,15 +152,6 @@ func (m *ForwardManager) ReconcileNativeInterface(ifName string, prefixes []stri
 		}
 
 		if err := m.ensureChain(family.ipt, fmt.Sprint(family.number)); err != nil {
-			return err
-		}
-
-		// Remove broad rules installed by earlier native forwarding versions.
-		if err := family.ipt.DeleteIfExists("filter", "FORWARD", jumpRule(ifName)...); err != nil {
-			return err
-		}
-
-		if err := family.ipt.DeleteIfExists("filter", forwardChain, acceptRule(ifName)...); err != nil {
 			return err
 		}
 
@@ -173,11 +167,29 @@ func (m *ForwardManager) ReconcileNativeInterface(ifName string, prefixes []stri
 			}
 
 			for _, rule := range rules {
-				if !strings.Contains(rule, nativeForwardComment) {
+				existingName := parseInterfaceFromRule(rule, ifaceFlag)
+				if strings.Contains(rule, forwardComment) {
+					// Only current tunnel registrations can retain broad rules.
+					// This also removes a previous default NIC after a restart.
+					if m.interfaces[existingName] {
+						continue
+					}
+
+					spec := acceptRule(existingName)
+					if ingress {
+						spec = jumpRule(existingName)
+					}
+
+					if err := family.ipt.DeleteIfExists("filter", chain, spec...); err != nil {
+						return err
+					}
+
 					continue
 				}
 
-				existingName := parseInterfaceFromRule(rule, ifaceFlag)
+				if !strings.Contains(rule, nativeForwardComment) {
+					continue
+				}
 
 				prefix := parseInterfaceFromRule(rule, prefixFlag)
 				if prefix == "" {
@@ -238,6 +250,7 @@ func (m *ForwardManager) EnsureInterface(ifName string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	m.interfaces[ifName] = true
 	m.ensureInterfaceForFamily(m.ipt4, "IPv4", ifName)
 
 	if m.ipt6 != nil {
@@ -288,6 +301,7 @@ func (m *ForwardManager) RemoveInterface(ifName string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	delete(m.interfaces, ifName)
 	m.removeInterfaceForFamily(m.ipt4, "IPv4", ifName)
 
 	if m.ipt6 != nil {
