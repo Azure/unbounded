@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -48,6 +49,147 @@ func TestSummaryPeerHealthy(t *testing.T) {
 			peer := WireGuardPeerStatus{HealthCheck: tc.health, Tunnel: PeerTunnelStatus{LastHandshake: tc.handshake}}
 			if got := netstatus.PeerHealthyForOverview(&peer, now); got != tc.want {
 				t.Fatalf("healthy=%v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRelationshipPeerDiagnostics(t *testing.T) {
+	for _, protocol := range []string{"WireGuard", "GENEVE", "VXLAN", "IPIP", "None"} {
+		t.Run(protocol, func(t *testing.T) {
+			server := summaryRouteFixture()
+			server.cfg.GeneveInterfaceName = "geneve0"
+			server.cfg.VXLANInterfaceName = "vxlan0"
+			server.cfg.IPIPInterfaceName = "ipip0"
+
+			manager, err := healthcheck.NewManager("local", 0, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer manager.Stop()
+
+			workerKey, otherKey, gatewayKey := wgtypes.Key{1}, wgtypes.Key{2}, wgtypes.Key{3}
+			server.state.healthCheckManager = manager
+			server.state.meshPeerHealthCheckEnabled = map[string]bool{
+				"worker/assignment/pool": true, "other/assignment/pool": true,
+			}
+			server.state.peers = []meshPeerInfo{
+				{Name: "worker", SiteName: "remote", TunnelProtocol: protocol, WireGuardPublicKey: workerKey.String(), InternalIPs: []string{"192.0.2.2"}, PodCIDRs: []string{"10.42.1.0/24"}},
+				{Name: "worker/assignment/pool", SiteName: "remote", TransitPoolName: "pool", TransitWireguardPort: 51830, TunnelProtocol: protocol, WireGuardPublicKey: workerKey.String(), InternalIPs: []string{"192.0.2.2"}, PodCIDRs: []string{"10.42.1.0/24"}},
+				{Name: "other/assignment/pool", SiteName: "remote", TransitPoolName: "pool", TransitWireguardPort: 51830, TunnelProtocol: protocol, WireGuardPublicKey: otherKey.String(), InternalIPs: []string{"192.0.2.3"}, PodCIDRs: []string{"10.42.2.0/24"}},
+			}
+			server.state.gatewayPeers = []gatewayPeerInfo{{
+				Name: "gateway/transit/pool", SiteName: "hub", TunnelProtocol: protocol,
+				InternalIPs: []string{"192.0.2.4"}, PodCIDRs: []string{"10.42.3.0/24"},
+			}}
+
+			for index, name := range []string{"worker/assignment/pool", "other/assignment/pool", "gateway/transit/pool"} {
+				hostname, _, _ := strings.Cut(name, "/")
+				if err := manager.AddScopedPeer(name, hostname, net.ParseIP(fmt.Sprintf("10.42.%d.1", index+1)), healthcheck.DefaultSettings()); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			ifaceName := tunnelInterfaceName(server.cfg, protocol)
+			if protocol == "None" {
+				if name, _, err := unboundednetnetlink.DetectDefaultRouteInterfaceFromCache(server.state.netlinkCache); err == nil {
+					ifaceName = name
+				}
+			}
+
+			mesh, assignment, gateway := &unboundednetnetlink.WireGuardManager{}, &unboundednetnetlink.WireGuardManager{}, &unboundednetnetlink.WireGuardManager{}
+			if protocol == "WireGuard" {
+				server.state.wireguardManager = mesh
+				server.state.gatewayWireguardManagers = map[string]*unboundednetnetlink.WireGuardManager{"wg51830": assignment, "wg51840": gateway}
+				server.state.gatewayNames = map[string]string{"wg51840": "gateway/transit/pool"}
+				server.state.gatewaySiteNames = map[string]string{"wg51840": "hub"}
+				server.state.gatewayPodCIDRs = map[string][]string{"wg51840": {"10.42.3.0/24"}}
+				server.state.gatewayPeerHealthCheckEnabled = map[string]bool{"wg51840": true}
+			} else {
+				server.state.gatewayPeerHealthCheckEnabled = map[string]bool{ifaceName: true}
+			}
+
+			handshake := testStatusTime
+			server.wireGuardDevice = func(current *unboundednetnetlink.WireGuardManager) (*wgtypes.Device, error) {
+				var peers []wgtypes.Peer
+
+				switch current {
+				case mesh:
+					peers = []wgtypes.Peer{{PublicKey: workerKey, ReceiveBytes: 101}}
+				case assignment:
+					peers = []wgtypes.Peer{
+						{PublicKey: otherKey, ReceiveBytes: 202},
+						{PublicKey: wgtypes.Key{9}, ReceiveBytes: 999},
+						{
+							PublicKey: workerKey, ReceiveBytes: 303, TransmitBytes: 404, LastHandshakeTime: handshake,
+							Endpoint:   &net.UDPAddr{IP: net.ParseIP("192.0.2.2"), Port: 51830},
+							AllowedIPs: []net.IPNet{{IP: net.ParseIP("10.42.1.0"), Mask: net.CIDRMask(24, 32)}},
+						},
+					}
+				case gateway:
+					peers = []wgtypes.Peer{{PublicKey: gatewayKey, ReceiveBytes: 505}}
+				default:
+					t.Fatal("queried an unexpected WireGuard device")
+				}
+
+				return &wgtypes.Device{Peers: peers}, nil
+			}
+
+			var peers []WireGuardPeerStatus
+
+			facts := server.inspectNodePeers(func(peer WireGuardPeerStatus) { peers = append(peers, peer) })
+			if len(peers) != 4 || facts.HealthCheck == nil || facts.HealthCheck.PeerCount != 3 {
+				t.Fatalf("relationships missing from diagnostics: peers=%+v, health=%+v", peers, facts.HealthCheck)
+			}
+
+			ordinary, assigned, other, transit := 0, 0, 0, 0
+
+			for _, peer := range peers {
+				if strings.Contains(peer.Name, "/") {
+					t.Fatalf("relationship identifier exposed as node name: %q", peer.Name)
+				}
+
+				if peer.Tunnel.Protocol != protocol {
+					t.Fatalf("protocol lost: %+v", peer)
+				}
+
+				switch peer.Name {
+				case "worker":
+					if peer.HealthCheck == nil {
+						ordinary++
+
+						if protocol == "WireGuard" && (peer.Tunnel.Interface != "wg51820" || peer.Tunnel.RxBytes != 101) {
+							t.Fatalf("assignment replaced ordinary mesh diagnostics: %+v", peer)
+						}
+					} else {
+						assigned++
+
+						if protocol == "WireGuard" && (peer.Tunnel.Interface != "wg51830" || peer.Tunnel.RxBytes != 303 || peer.Tunnel.TxBytes != 404 ||
+							peer.Tunnel.LastHandshake != handshake || peer.Tunnel.Endpoint != "192.0.2.2:51830" || !reflect.DeepEqual(peer.Tunnel.AllowedIPs, []string{"10.42.1.0/24"})) {
+							t.Fatalf("assignment metrics came from the wrong link or key: %+v", peer)
+						}
+					}
+				case "other":
+					other++
+				case "gateway":
+					transit++
+
+					if peer.SiteName != "hub" || peer.PeerType != "gateway" {
+						t.Fatalf("gateway metadata lost: %+v", peer)
+					}
+				default:
+					t.Fatalf("unknown WireGuard peer leaked into assignment diagnostics: %+v", peer)
+				}
+
+				if peer.Name != "worker" || peer.HealthCheck != nil {
+					if peer.HealthCheck == nil || !peer.HealthCheck.Enabled || peer.HealthCheck.Uptime == "" {
+						t.Fatalf("scoped health lookup failed for public node identity: %+v", peer)
+					}
+				}
+			}
+
+			if ordinary != 1 || assigned != 1 || other != 1 || transit != 1 {
+				t.Fatalf("ordinary and relationship entries were merged: %+v", peers)
 			}
 		})
 	}

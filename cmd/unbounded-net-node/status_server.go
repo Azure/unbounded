@@ -2713,8 +2713,34 @@ func (s *nodeStatusServer) inspectNodePeers(visit func(WireGuardPeerStatus)) *no
 	gatewaySkipPodCIDRByName := make(map[string]bool, len(s.state.gatewayPeers))
 
 	gatewayTunnelProtoByName := make(map[string]string, len(s.state.gatewayPeers))
+
+	type assignmentSnapshot struct {
+		manager       *unboundednetnetlink.WireGuardManager
+		peers         map[string]meshPeerInfo
+		healthEnabled map[string]bool
+	}
+
+	assignments := make(map[string]*assignmentSnapshot)
+
 	for _, p := range s.state.peers {
 		if p.TransitPoolName != "" {
+			if p.TunnelProtocol == "WireGuard" {
+				ifaceName := wireGuardInterfaceName(s.cfg, int(p.TransitWireguardPort))
+
+				snapshot := assignments[ifaceName]
+				if snapshot == nil {
+					snapshot = &assignmentSnapshot{
+						manager:       s.state.gatewayWireguardManagers[ifaceName],
+						peers:         make(map[string]meshPeerInfo),
+						healthEnabled: make(map[string]bool),
+					}
+					assignments[ifaceName] = snapshot
+				}
+
+				snapshot.peers[p.WireGuardPublicKey] = p
+				snapshot.healthEnabled[p.Name] = s.state.meshPeerHealthCheckEnabled[p.Name]
+			}
+
 			continue
 		}
 
@@ -2757,8 +2783,9 @@ func (s *nodeStatusServer) inspectNodePeers(visit func(WireGuardPeerStatus)) *no
 		wgManager          *unboundednetnetlink.WireGuardManager
 	}
 
-	gwSnapshots := make([]gwSnapshot, 0, len(s.state.gatewayHealthEndpoints))
-	for ifaceName, overlayIP := range s.state.gatewayHealthEndpoints {
+	gwSnapshots := make([]gwSnapshot, 0, len(s.state.gatewayNames))
+	for ifaceName := range s.state.gatewayNames {
+		overlayIP := s.state.gatewayHealthEndpoints[ifaceName]
 		overlayIPs := getHealthIPsFromPodCIDRs(s.state.gatewayPodCIDRs[ifaceName])
 
 		if overlayIP != "" {
@@ -2896,6 +2923,56 @@ func (s *nodeStatusServer) inspectNodePeers(visit func(WireGuardPeerStatus)) *no
 		}
 	}
 
+	for ifaceName, assignment := range assignments {
+		if assignment.manager == nil {
+			continue
+		}
+
+		device, err := s.getWireGuardDevice(assignment.manager)
+		if err != nil {
+			continue
+		}
+
+		for _, wgPeer := range device.Peers {
+			info, exists := assignment.peers[wgPeer.PublicKey.String()]
+			if !exists {
+				continue
+			}
+
+			name, _, _ := strings.Cut(info.Name, "/")
+
+			peer := WireGuardPeerStatus{
+				Name: name, PeerType: "site", SiteName: info.SiteName,
+				SkipPodCIDRRoutes: info.SkipPodCIDRRoutes,
+				PodCIDRGateways:   getHealthIPsFromPodCIDRs(info.PodCIDRs),
+				Tunnel: PeerTunnelStatus{
+					Protocol: "WireGuard", Interface: ifaceName, PublicKey: wgPeer.PublicKey.String(),
+					LastHandshake: wgPeer.LastHandshakeTime, RxBytes: wgPeer.ReceiveBytes, TxBytes: wgPeer.TransmitBytes,
+				},
+			}
+			if wgPeer.Endpoint != nil {
+				peer.Tunnel.Endpoint = wgPeer.Endpoint.String()
+			}
+
+			for _, prefix := range wgPeer.AllowedIPs {
+				peer.Tunnel.AllowedIPs = append(peer.Tunnel.AllowedIPs, prefix.String())
+			}
+
+			if assignment.healthEnabled[info.Name] && healthCheckMgr != nil {
+				if ps, err := healthCheckMgr.GetPeerStatus(info.Name); err == nil && ps != nil {
+					peer.HealthCheck = &HealthCheckPeerStatus{
+						Enabled: true, Status: ps.State.String(),
+						Uptime: formatDuration(time.Since(ps.Since)), RTT: formatRTTMillis(ps.LastRTT),
+					}
+				} else {
+					peer.HealthCheck = &HealthCheckPeerStatus{Enabled: true, Status: "down"}
+				}
+			}
+
+			visit(peer)
+		}
+	}
+
 	// Collect gateway peer status (WireGuard GetDevice calls outside lock)
 	addedPeerNames := make(map[string]bool)
 
@@ -2905,8 +2982,10 @@ func (s *nodeStatusServer) inspectNodePeers(visit func(WireGuardPeerStatus)) *no
 			if device, err := s.getWireGuardDevice(gw.wgManager); err == nil && len(device.Peers) > 0 {
 				wgPeer := device.Peers[0] // Each gateway interface has one peer
 
+				name, _, _ := strings.Cut(gw.gatewayName, "/")
+
 				peer := WireGuardPeerStatus{
-					Name:              gw.gatewayName,
+					Name:              name,
 					PeerType:          "gateway",
 					SiteName:          gw.siteName,
 					SkipPodCIDRRoutes: gw.skipPodCIDR,
@@ -2978,8 +3057,10 @@ func (s *nodeStatusServer) inspectNodePeers(visit func(WireGuardPeerStatus)) *no
 
 		hcEnabled := s.state.meshPeerHealthCheckEnabled[p.Name]
 
+		name, _, _ := strings.Cut(p.Name, "/")
+
 		peer := WireGuardPeerStatus{
-			Name:              p.Name,
+			Name:              name,
 			PeerType:          "site",
 			SiteName:          p.SiteName,
 			SkipPodCIDRRoutes: p.SkipPodCIDRRoutes,
@@ -3033,8 +3114,10 @@ func (s *nodeStatusServer) inspectNodePeers(visit func(WireGuardPeerStatus)) *no
 
 		hcEnabled := s.state.gatewayPeerHealthCheckEnabled[ifName]
 
+		name, _, _ := strings.Cut(gp.Name, "/")
+
 		peer := WireGuardPeerStatus{
-			Name:              gp.Name,
+			Name:              name,
 			PeerType:          "gateway",
 			SiteName:          gp.SiteName,
 			SkipPodCIDRRoutes: gp.SkipPodCIDRRoutes,
