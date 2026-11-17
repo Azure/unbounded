@@ -159,9 +159,11 @@ pub struct Config {
     /// Per-GPU GPU memory that peers' NICs write `gpu-read` ciphertext into
     /// over RDMA (GPUDirect RDMA landing). 0 turns landing off.
     pub gpu_landing_bytes: u64,
-    /// Ask cuFile to read local NVMe into GPU memory over PCI P2PDMA
-    /// (`use_pci_p2pdma`) instead of nvidia-fs. Defaults off.
-    pub gpu_pci_p2pdma: bool,
+    /// `RACER_GPU_PCI_P2PDMA`: ask cuFile to read local NVMe into GPU memory
+    /// over PCI P2PDMA (`use_pci_p2pdma`) instead of nvidia-fs. `None` is
+    /// `auto`, the default: on when the device directory has no
+    /// `nvidia-fs*` device ([`crate::gpu::pci_p2pdma`]).
+    pub gpu_pci_p2pdma: Option<bool>,
     /// `RACER_GPU_PEER`: `auto` (default) lets one GPU copy another GPU's
     /// sealed ciphertext over NVLink or PCIe peer-to-peer when the driver
     /// allows it; `off` never enables peer access and moves such ciphertext
@@ -504,7 +506,11 @@ impl Config {
             enable_gpu,
             gpu_staging_bytes: u("RACER_GPU_STAGING_BYTES"),
             gpu_landing_bytes: u("RACER_GPU_LANDING_BYTES"),
-            gpu_pci_p2pdma: flag("RACER_GPU_PCI_P2PDMA"),
+            gpu_pci_p2pdma: match word("RACER_GPU_PCI_P2PDMA") {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => None,
+            },
             gpu_peer: word("RACER_GPU_PEER") == "auto",
             opaque_relay: flag("RACER_OPAQUE_RELAY"),
             peer_tcp_nodelay: flag("RACER_PEER_TCP_NODELAY"),
@@ -1944,16 +1950,16 @@ mod tests {
 
     #[test]
     fn gpu_pci_p2pdma_parses_and_validates() {
-        assert!(!parse(&[]).unwrap().gpu_pci_p2pdma);
-        for (value, enabled) in [("true", true), ("false", false)] {
+        assert_eq!(parse(&[]).unwrap().gpu_pci_p2pdma, None);
+        for (value, setting) in [("auto", None), ("true", Some(true)), ("false", Some(false))] {
             assert_eq!(
                 parse(&[("RACER_GPU_PCI_P2PDMA", value)])
                     .unwrap()
                     .gpu_pci_p2pdma,
-                enabled
+                setting
             );
         }
-        for value in ["TRUE", "1", "yes", "", " true"] {
+        for value in ["TRUE", "AUTO", "1", "yes", "", " true"] {
             assert!(
                 parse(&[("RACER_GPU_PCI_P2PDMA", value)]).is_err(),
                 "{value:?}"

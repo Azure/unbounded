@@ -427,9 +427,9 @@ const BASE: &[Var] = &[
     var(
         "RACER_GPU_PCI_P2PDMA",
         Group::Gpu,
-        Kind::Bool,
-        Value("false"),
-        "`true` asks cuFile to read local NVMe into GPU memory over PCI P2PDMA instead of `nvidia-fs`. Needs cuFile 1.13 (CUDA 12.8) or later.",
+        Kind::Enum(&["auto", "true", "false"]),
+        Value("auto"),
+        "`true` asks cuFile to read local NVMe into GPU memory over PCI P2PDMA instead of `nvidia-fs`; `auto` does so when `RACER_DEVICE_DIRECTORY` has no `nvidia-fs*` device. Needs cuFile 1.13 (CUDA 12.8) or later.",
     ),
     var(
         "RACER_GPU_PEER",

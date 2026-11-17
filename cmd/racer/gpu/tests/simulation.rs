@@ -409,6 +409,26 @@ fn pci_p2pdma_open_failure_is_reported() {
 }
 
 #[test]
+/// A failed driver open is final and keeps its cuFile status, so every
+/// later open, from any thread or through any call that opens the driver,
+/// reports the same cause.
+fn failed_driver_open_reports_its_status_everywhere() {
+    let sim = simulation();
+    let _env = sim.enter();
+    let gpu = Gpu::load().unwrap();
+    sim.fail_file_open(5001);
+    let driver = Some(Error::Driver(5001));
+    assert_eq!(gpu.open_cufile().err(), driver);
+    let reader = gpu.file_reader();
+    let other = std::thread::spawn(move || reader.open_driver());
+    assert_eq!(other.join().unwrap().err(), driver);
+    let staging = gpu.context(0).unwrap().staging(4096).unwrap();
+    assert_eq!(staging.register_cufile().err(), driver);
+    assert_eq!(gpu.open_file(file_with(&[1; 16])).err(), driver);
+    assert_eq!(sim.pci_p2pdma(), None);
+}
+
+#[test]
 /// cuFile reads land in staging, respect bounds, and wait for streams.
 fn cufile_reads_into_staging() {
     let sim = simulation();

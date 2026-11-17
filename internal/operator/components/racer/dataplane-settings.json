@@ -19,7 +19,7 @@
   {"name": "RACER_ENABLE_GPU", "owner": "dataplane", "scope": "node", "kind": "enum", "values": ["auto", "true", "false"], "default": "auto", "empty_unset": false},
   {"name": "RACER_GPU_STAGING_BYTES", "owner": "dataplane", "scope": "node", "kind": "unsigned", "min": "2097152", "max": "18446744073709551615", "step": "2097152", "default": "268435456", "empty_unset": false},
   {"name": "RACER_GPU_LANDING_BYTES", "owner": "dataplane", "scope": "node", "kind": "unsigned", "min": "0", "max": "18446744073709551615", "step": "2097152", "default": "268435456", "empty_unset": false},
-  {"name": "RACER_GPU_PCI_P2PDMA", "owner": "dataplane", "scope": "node", "kind": "bool", "default": "false", "empty_unset": false},
+  {"name": "RACER_GPU_PCI_P2PDMA", "owner": "dataplane", "scope": "node", "kind": "enum", "values": ["auto", "true", "false"], "default": "auto", "empty_unset": false},
   {"name": "RACER_GPU_PEER", "owner": "dataplane", "scope": "node", "kind": "enum", "values": ["auto", "off"], "default": "auto", "empty_unset": false},
   {"name": "RACER_SLAB_DIRECTORY", "owner": "dataplane", "scope": "node", "kind": "text", "default": "/var/lib/racer/slabs", "empty_unset": false},
   {"name": "RACER_DEVICE_DIRECTORY", "owner": "dataplane", "scope": "node", "kind": "text", "default": "/host/dev", "empty_unset": false},

@@ -204,6 +204,13 @@ fn gpu_read_spans_pages() {
     assert!(read_allocation(&allocation, 10, length) == body);
     settle(&fixture);
     assert_released(&helper);
+    // The read timed its first page and the whole request, as a gpu-read only.
+    let metrics = &fixture.listeners.metrics;
+    assert_eq!(metrics.count(Event::GpuReadRequestCount), 1);
+    assert_eq!(metrics.count(Event::GpuReadFirstPageCount), 1);
+    assert!(metrics.count(Event::GpuReadRequestNs) >= metrics.count(Event::GpuReadFirstPageNs));
+    assert_eq!(metrics.count(Event::HostReadRequestCount), 0);
+    assert_eq!(metrics.count(Event::HostReadFirstPageCount), 0);
 }
 
 #[test]
@@ -266,6 +273,10 @@ fn gpu_read_errors_before_the_head_release_everything() {
             .gpu_requests(GpuReadOutcome::WrongDevice),
         1
     );
+    // None of them started delivery, so none is timed.
+    let metrics = &fixture.listeners.metrics;
+    assert_eq!(metrics.count(Event::GpuReadFirstPageCount), 0);
+    assert_eq!(metrics.count(Event::GpuReadRequestCount), 0);
 }
 
 #[test]
@@ -291,6 +302,11 @@ fn gpu_read_driver_fault_fails_the_read_and_releases_the_import() {
     settle(&fixture);
     assert_released(&helper);
     assert_no_body_leases(&fixture);
+    // The first page was ready, but only a successful read times the request.
+    let metrics = &fixture.listeners.metrics;
+    assert_eq!(metrics.count(Event::GpuReadFirstPageCount), 1);
+    assert_eq!(metrics.count(Event::GpuReadRequestCount), 0);
+    assert_eq!(metrics.count(Event::GpuReadRequestNs), 0);
 }
 
 #[test]

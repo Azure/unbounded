@@ -38,6 +38,11 @@ data:
   # auto (default) uses them where the driver allows; off moves such pages
   # through host memory instead.
   # RACER_GPU_PEER: "auto"
+  # cuFile reads from local NVMe into GPU memory over PCI P2PDMA instead of
+  # nvidia-fs: auto (default) asks for P2PDMA when the node has no
+  # /dev/nvidia-fs* device, as on GB200 hosts without nvidia-fs; true always
+  # asks; false leaves cuFile's own setting.
+  # RACER_GPU_PCI_P2PDMA: "auto"
   # No thread cap by default: eligible physical cores, CPU quota, and resource budgets apply.
   # I/O shards share NUMA-local crypto threads at approximately 2:1, using leftovers:
   # without an explicit cap, eight eligible cores on one NUMA node give five I/O

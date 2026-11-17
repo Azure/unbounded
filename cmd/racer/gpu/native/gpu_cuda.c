@@ -917,21 +917,39 @@ static int file_error(CUfileError_t e) {
 }
 
 /* Set once cuFile fails to load or open. Opening the driver probes every GPU
- * for P2PDMA, which can take most of a second, so a failure is not retried. */
+ * for P2PDMA, which can take most of a second, so a failure is not retried.
+ * cf_status keeps the cuFile status of the failure, or 0 when the library or
+ * a symbol is missing, so every later call on any thread reports the same
+ * cause. Both are guarded by load_lock. */
 static int cf_failed;
+static int32_t cf_status;
+
+/* The result of a failed load or open, for this thread. */
+static int cf_failure(void) {
+    if (!cf_status) return RACER_GPU_EUNAVAILABLE;
+    last_error = cf_status;
+    return RACER_GPU_EDRIVER;
+}
+
+/* Remember a failed load or open with its cuFile status, or 0. */
+static int cf_fail(void *lib, int32_t status) {
+    if (lib) dlclose(lib);
+    cf_failed = 1;
+    cf_status = status;
+    return cf_failure();
+}
 
 int racer_gpu_file_open(uint32_t flags) {
     int rc = RACER_GPU_OK;
     pthread_mutex_lock(&load_lock);
     if (cf_failed) {
-        rc = RACER_GPU_EUNAVAILABLE;
+        rc = cf_failure();
     } else if (!cf.opened) {
         struct cufile_table table;
         memset(&table, 0, sizeof(table));
         table.lib = dlopen("libcufile.so.0", RTLD_NOW | RTLD_LOCAL);
         if (!table.lib) {
-            cf_failed = 1;
-            rc = RACER_GPU_EUNAVAILABLE;
+            rc = cf_fail(NULL, 0);
             goto out;
         }
         RACER_CUFILE_FUNCTIONS(X_LOAD)
@@ -958,22 +976,16 @@ int racer_gpu_file_open(uint32_t flags) {
          * rather than run without the path the operator asked for. */
         if (flags & RACER_GPU_FILE_PCI_P2PDMA) {
             if (!set_bool) {
-                dlclose(table.lib);
-                cf_failed = 1;
-                rc = RACER_GPU_EUNAVAILABLE;
+                rc = cf_fail(table.lib, 0);
                 goto out;
             }
             if (file_error(set_bool(CUFILE_PARAM_USE_PCIP2PDMA, true))) {
-                dlclose(table.lib);
-                cf_failed = 1;
-                rc = RACER_GPU_EUNAVAILABLE;
+                rc = cf_fail(table.lib, last_error);
                 goto out;
             }
         }
         if (file_error(table.cuFileDriverOpen())) {
-            dlclose(table.lib);
-            cf_failed = 1;
-            rc = RACER_GPU_EUNAVAILABLE;
+            rc = cf_fail(table.lib, last_error);
             goto out;
         }
         /* Left open for the life of the process. */
@@ -981,9 +993,7 @@ int racer_gpu_file_open(uint32_t flags) {
         cf = table;
         goto out;
     missing:
-        dlclose(table.lib);
-        cf_failed = 1;
-        rc = RACER_GPU_EUNAVAILABLE;
+        rc = cf_fail(table.lib, 0);
     }
 out:
     pthread_mutex_unlock(&load_lock);

@@ -17,7 +17,7 @@ pub(crate) use crate::gcm::RawVerdict;
 
 /// `RACER_GPU_ABI_VERSION`.
 #[cfg(all(feature = "native", target_os = "linux"))]
-pub(crate) const ABI_VERSION: u32 = 3;
+pub(crate) const ABI_VERSION: u32 = 4;
 
 /// Result codes from `gpu_cuda.h`.
 pub(crate) mod code {

@@ -409,6 +409,10 @@ struct World {
     /// Whether the open that set `file_driver` asked for PCI P2PDMA.
     pci_p2pdma: bool,
 
+    /// The cuFile status every driver open fails with, as the shim reports
+    /// a failed open on every later call.
+    file_open_status: Option<i32>,
+
     no_kernels: bool,
 
     last_error: i32,
@@ -524,6 +528,13 @@ impl Simulation {
     /// `-5` is a driver error). Nothing changes.
     pub fn fault(&self, operation: Operation, code: c_int) {
         self.world().faults.push_back((operation, code));
+    }
+
+    /// Make every cuFile driver open fail with cuFile `status`, as the shim
+    /// does once a real open fails: a driver error on every call, from any
+    /// thread. Call it before the driver opens.
+    pub fn fail_file_open(&self, status: i32) {
+        self.world().file_open_status = Some(status);
     }
 
     /// Make calls to `operation` wait (`true`) until [`Simulation::admit`]
@@ -1410,6 +1421,12 @@ unsafe extern "C" fn verdict(stream: *mut c_void, out: *mut RawVerdict) -> c_int
 
 unsafe extern "C" fn file_open(flags: u32) -> c_int {
     with(Operation::FileOpen, |w| {
+        if !w.file_driver
+            && let Some(status) = w.file_open_status
+        {
+            w.last_error = status;
+            return (code::EDRIVER, 0);
+        }
         // As in the shim, flags apply only to the open that loads cuFile.
         if !w.file_driver {
             w.pci_p2pdma = flags & ffi::file_flag::PCI_P2PDMA != 0;
