@@ -19,6 +19,7 @@ func sortStatusPeers(peers []WireGuardPeerStatus) {
 	slices.SortFunc(peers, func(a, b WireGuardPeerStatus) int {
 		return cmp.Or(
 			cmp.Compare(a.Name, b.Name),
+			cmp.Compare(a.PeerID, b.PeerID),
 			cmp.Compare(a.Tunnel.Protocol, b.Tunnel.Protocol),
 			cmp.Compare(a.Tunnel.Interface, b.Tunnel.Interface),
 			cmp.Compare(a.Tunnel.PublicKey, b.Tunnel.PublicKey),

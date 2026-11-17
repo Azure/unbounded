@@ -178,6 +178,7 @@ type WireGuardPeerLinkStatus = PeerTunnelStatus
 
 // PeerStatus contains information about a tunnel peer.
 type PeerStatus struct {
+	PeerID            string                 `json:"peerId,omitempty"`
 	Name              string                 `json:"name"`
 	PeerType          string                 `json:"peerType"`
 	SiteName          string                 `json:"siteName,omitempty"`

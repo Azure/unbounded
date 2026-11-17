@@ -2942,7 +2942,8 @@ func (s *nodeStatusServer) inspectNodePeers(visit func(WireGuardPeerStatus)) *no
 			name, _, _ := strings.Cut(info.Name, "/")
 
 			peer := WireGuardPeerStatus{
-				Name: name, PeerType: "site", SiteName: info.SiteName,
+				PeerID: info.Name,
+				Name:   name, PeerType: "site", SiteName: info.SiteName,
 				SkipPodCIDRRoutes: info.SkipPodCIDRRoutes,
 				PodCIDRGateways:   getHealthIPsFromPodCIDRs(info.PodCIDRs),
 				Tunnel: PeerTunnelStatus{
@@ -2985,6 +2986,7 @@ func (s *nodeStatusServer) inspectNodePeers(visit func(WireGuardPeerStatus)) *no
 				name, _, _ := strings.Cut(gw.gatewayName, "/")
 
 				peer := WireGuardPeerStatus{
+					PeerID:            gw.gatewayName,
 					Name:              name,
 					PeerType:          "gateway",
 					SiteName:          gw.siteName,
@@ -3060,6 +3062,7 @@ func (s *nodeStatusServer) inspectNodePeers(visit func(WireGuardPeerStatus)) *no
 		name, _, _ := strings.Cut(p.Name, "/")
 
 		peer := WireGuardPeerStatus{
+			PeerID:            p.Name,
 			Name:              name,
 			PeerType:          "site",
 			SiteName:          p.SiteName,
@@ -3117,6 +3120,7 @@ func (s *nodeStatusServer) inspectNodePeers(visit func(WireGuardPeerStatus)) *no
 		name, _, _ := strings.Cut(gp.Name, "/")
 
 		peer := WireGuardPeerStatus{
+			PeerID:            gp.Name,
 			Name:              name,
 			PeerType:          "gateway",
 			SiteName:          gp.SiteName,

@@ -142,6 +142,10 @@ func TestRelationshipPeerDiagnostics(t *testing.T) {
 				t.Fatalf("relationships missing from diagnostics: peers=%+v, health=%+v", peers, facts.HealthCheck)
 			}
 
+			if _, err := netstatus.PeerIdentityDigest(peers); err != nil {
+				t.Fatalf("relationship metadata is ambiguous for status deltas: %v", err)
+			}
+
 			ordinary, assigned, other, transit := 0, 0, 0, 0
 
 			for _, peer := range peers {
