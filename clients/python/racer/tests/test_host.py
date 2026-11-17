@@ -6,8 +6,7 @@ import os
 
 import pytest
 
-import racer
-from racer import HostBuffer, cuda
+from racer import HostBuffer, RacerError, cuda
 
 
 def memfds(name):
@@ -44,7 +43,7 @@ def test_close_twice():
     b.close()
     assert memfds("racer-test-close") == []
     assert b._map.closed
-    with pytest.raises(racer.RacerError, match="closed"):
+    with pytest.raises(RacerError, match="closed"):
         b.fileno()
     with HostBuffer(4096, "racer-test-close") as b:
         pass
