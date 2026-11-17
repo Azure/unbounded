@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net"
 	"reflect"
+	"slices"
 	"testing"
 
 	"github.com/vishvananda/netlink"
@@ -295,6 +296,63 @@ func TestGatewayHealthWithoutOwnSiteAdvertisement(t *testing.T) {
 
 		if _, exists := entries["10.245.0.0/16"]; !exists {
 			t.Fatal("health-only reachability removed other transit advertisements")
+		}
+	}
+}
+
+func TestAssignedGatewayPodsRequireLocalPoolAssignment(t *testing.T) {
+	f := newPoolPeeringProtocolFixture(t, true)
+	f.putPeering(t, "connect", "local-a", nil, true)
+
+	object, exists, err := f.pools.GetStore().GetByKey("remote-pool")
+	if err != nil || !exists {
+		t.Fatalf("remote pool exists=%v err=%v", exists, err)
+	}
+
+	pool := object.(*unstructured.Unstructured).DeepCopy()
+
+	nodes, _, err := unstructured.NestedSlice(pool.Object, "status", "nodes")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	prefixes := []string{"10.244.3.0/24", "fd46:3::/64"}
+
+	nodes[0].(map[string]any)["podCIDRs"] = []any{prefixes[0], prefixes[1]}
+	if err := unstructured.SetNestedSlice(pool.Object, nodes, "status", "nodes"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := f.pools.GetStore().Update(pool); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, assigned := range []bool{false, true, false} {
+		localPool := "unrelated-pool"
+		if assigned {
+			localPool = "local-a"
+		}
+
+		assignment := &netv1.SiteGatewayPoolAssignment{
+			ObjectMeta: metav1.ObjectMeta{Name: "assigned-gateway-site"},
+			Spec:       netv1.SiteGatewayPoolAssignmentSpec{Sites: []string{"local"}, GatewayPools: []string{localPool}},
+		}
+		if err := f.assignments.GetStore().Update(toUnstructured(t, assignment)); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := f.update(); err != nil {
+			t.Fatal(err)
+		}
+
+		if len(f.gateways) != 1 {
+			t.Fatalf("gateway peers: %+v", f.gateways)
+		}
+
+		for _, prefix := range prefixes {
+			if got := slices.Contains(gatewayBPFPrefixes(f.gateways[0], nil), prefix); got != assigned {
+				t.Fatalf("assigned=%v: gateway prefix %s authorized=%v", assigned, prefix, got)
+			}
 		}
 	}
 }

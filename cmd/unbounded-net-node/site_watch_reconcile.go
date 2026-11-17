@@ -1858,6 +1858,11 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 				// Never install NodeCidr routes from network-peered sites via gateways.
 				excludedNodeCIDRSites := networkPeeredSites
 				routedCidrs, routeDistances, learnedRoutes := routedCIDRsForGatewayPeer(peerGatewayNode, fallbackRoutedCIDRs, mySiteName, localGatewayPools, excludedNodeCIDRSites, now, staleAfter)
+				// Assigned gateway pods use the gateway mesh instead of a worker downlink.
+				if assignedSiteSet[gwNode.SiteName] {
+					routedCidrs = dedupeStrings(slices.Concat(routedCidrs, gwNode.PodCIDRs))
+				}
+
 				filteredRoutes := excludeLocalGatewayRoutes(gatewayPeerInfo{
 					RoutedCidrs: routedCidrs, RouteDistances: routeDistances, LearnedRoutes: learnedRoutes,
 				}, siteRouting.localCIDRs)
