@@ -801,7 +801,9 @@ def register() -> None:
                     try:
                         queued = prefetch_weights(client, uri, pinned, o["prefetch_ttl_seconds"])
                         log.info("racer: prefetch %s queued %d files (%s)", queued.id, len(pinned), queued.state)
-                    except racer.RacerError as exc:
+                    except (racer.RacerError, OSError) as exc:
+                        # A socket timeout or reset is not a RacerError; prefetch
+                        # is best effort, so load without it either way.
                         log.info("racer: prefetch unavailable (%s); loading without it", exc)
                 chunks = read_chunks(client, uri, pinned, o["staging_bytes"])
                 weights = iter_weights(

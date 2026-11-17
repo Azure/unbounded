@@ -666,6 +666,22 @@ def test_loader_prefetch_is_best_effort(server, uri, torch, monkeypatch, caplog)
     assert any("prefetch unavailable" in r.getMessage() for r in caplog.records)
 
 
+@pytest.mark.parametrize("error", [ConnectionResetError, TimeoutError])
+def test_loader_prefetch_transport_error_is_best_effort(server, uri, torch, monkeypatch, caplog, error):
+    setup_model(server, uri)
+    inst = make_loader(monkeypatch, server, uri=str(uri))
+
+    def fails(*a, **kw):
+        raise error("prefetch transport failed")
+
+    monkeypatch.setattr(rv, "prefetch_weights", fails)
+    m = Model()
+    with caplog.at_level(logging.INFO, logger="vllm.racer_vllm.loader"):
+        inst.load_weights(m, types.SimpleNamespace(model="/unused", quantization=None))
+    assert m.got == ALL
+    assert any("prefetch unavailable" in r.getMessage() for r in caplog.records)
+
+
 def test_loader_prefetch_can_be_disabled(server, uri, torch, monkeypatch):
     setup_model(server, uri)
     inst = make_loader(monkeypatch, server, uri=str(uri), prefetch=False)
