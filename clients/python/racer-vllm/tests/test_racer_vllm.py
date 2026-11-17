@@ -779,6 +779,14 @@ def test_settings():
     assert rv.settings({"mode_retry_seconds": None})["mode_retry_seconds"] is None
     assert rv.settings({"mode_retry_seconds": "30"})["mode_retry_seconds"] == 30.0
     assert rv.settings({"prefetch": False, "prefetch_ttl_seconds": 0})["prefetch"] is False
+    assert rv.settings({"prefetch": "false"})["prefetch"] is False
+    assert rv.settings({"prefetch": " TRUE "})["prefetch"] is True
+    with pytest.raises(ValueError, match="prefetch"):
+        rv.settings({"prefetch": "yes"})
+    assert rv.settings({"prefetch_ttl_seconds": "60"})["prefetch_ttl_seconds"] == 60
+    for bad in (None, "abc", True):
+        with pytest.raises(ValueError, match="prefetch_ttl_seconds"):
+            rv.settings({"prefetch_ttl_seconds": bad})
     with pytest.raises(ValueError, match="prefetch_ttl_seconds"):
         rv.settings({"prefetch_ttl_seconds": -1})
 

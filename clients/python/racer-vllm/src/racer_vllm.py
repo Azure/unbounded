@@ -724,10 +724,31 @@ def load_state(state_dict: dict, weights) -> None:
         raise ValueError(f"racer loader: missing keys {tuple(sorted(remaining))[:10]} in the sharded checkpoint")
 
 
+def _bool_option(extra: dict, key: str, default: bool) -> bool:
+    """A boolean option, also accepting the strings "true" and "false"."""
+    value = extra.get(key, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+        return value.strip().lower() == "true"
+    raise ValueError(f"{key} must be a boolean or 'true' or 'false', not {value!r}")
+
+
+def _int_option(extra: dict, key: str, default: int) -> int:
+    """An integer option, also accepting numeric strings."""
+    value = extra.get(key, default)
+    if isinstance(value, bool):
+        raise ValueError(f"{key} must be an integer, not {value!r}")
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{key} must be an integer, not {value!r}") from None
+
+
 def settings(extra: dict) -> dict:
     """Loader options from model_loader_extra_config, with defaults."""
     retry = extra.get("mode_retry_seconds", racer.DEFAULT_MODE_RETRY_SECONDS)
-    prefetch_ttl = int(extra.get("prefetch_ttl_seconds", DEFAULT_PREFETCH_TTL_SECONDS))
+    prefetch_ttl = _int_option(extra, "prefetch_ttl_seconds", DEFAULT_PREFETCH_TTL_SECONDS)
     if prefetch_ttl < 0:
         raise ValueError("prefetch_ttl_seconds must be at least 0")
     return {
@@ -740,7 +761,7 @@ def settings(extra: dict) -> dict:
         "mode_retry_seconds": None if retry is None else float(retry),
         "sharded_state": bool(extra.get("sharded_state", False)),
         "pattern": extra.get("pattern"),
-        "prefetch": bool(extra.get("prefetch", DEFAULT_PREFETCH)),
+        "prefetch": _bool_option(extra, "prefetch", DEFAULT_PREFETCH),
         "prefetch_ttl_seconds": prefetch_ttl,
     }
 
