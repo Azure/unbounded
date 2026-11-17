@@ -68,6 +68,12 @@ func TestNativeTransitInterfaceRules(t *testing.T) {
 	}
 	defer forward.Cleanup()
 
+	forward.EnsureInterface("fabric0")
+
+	if err := forward.ReconcileNativeInterface("fabric0", []string{"invalid"}); err == nil {
+		t.Fatal("invalid native prefix accepted")
+	}
+
 	notrack, err := unboundednetnetlink.NewNotrackManager()
 	if err != nil {
 		t.Fatal(err)
@@ -99,9 +105,9 @@ func TestNativeTransitInterfaceRules(t *testing.T) {
 		forward    bool
 		notrack    bool
 	}{
-		{"native assignment gateway", nil, []gatewayPeerInfo{{TunnelProtocol: "None"}}, true, true, true},
-		{"gateway demotion", nil, []gatewayPeerInfo{{TunnelProtocol: "None"}}, false, true, false},
-		{"native mesh gateway", []meshPeerInfo{{TunnelProtocol: "None"}}, nil, true, true, true},
+		{"native assignment gateway", nil, []gatewayPeerInfo{{TunnelProtocol: "None", RoutedCidrs: []string{"10.246.1.0/24", "fd46:0:0:1::/64"}}}, true, true, true},
+		{"gateway demotion", nil, []gatewayPeerInfo{{TunnelProtocol: "None", RoutedCidrs: []string{"10.246.1.0/24", "fd46:0:0:1::/64"}}}, false, true, false},
+		{"native mesh gateway", []meshPeerInfo{{TunnelProtocol: "None", PodCIDRs: []string{"10.246.1.0/24", "fd46:0:0:1::/64"}}}, nil, true, true, true},
 		{"native withdrawal", nil, nil, true, false, false},
 	} {
 		reapplyRPFilterOnActiveTunnels(&config{}, tc.mesh, tc.assignment, nil, forward, tc.gateway, notrack, nil)
@@ -113,9 +119,9 @@ func TestNativeTransitInterfaceRules(t *testing.T) {
 			}
 
 			t.Log(tc.name, protocol)
-			checkRule(ipt, tc.forward, "filter", "FORWARD",
+			checkRule(ipt, false, "filter", "FORWARD",
 				"-i", "fabric0", "-m", "comment", "--comment", "unbounded-net: forward between managed tunnels", "-j", "UNBOUNDED-FORWARD")
-			checkRule(ipt, tc.forward, "filter", "UNBOUNDED-FORWARD",
+			checkRule(ipt, false, "filter", "UNBOUNDED-FORWARD",
 				"-o", "fabric0", "-m", "comment", "--comment", "unbounded-net: forward between managed tunnels", "-j", "ACCEPT")
 			checkRule(ipt, tc.notrack, "raw", "PREROUTING",
 				"-i", "fabric0", "-m", "comment", "--comment", "unbounded-net: skip conntrack for tunnel transit", "-j", "UNBOUNDED-NOTRACK")
@@ -126,6 +132,11 @@ func TestNativeTransitInterfaceRules(t *testing.T) {
 			if protocol == iptables.ProtocolIPv6 {
 				pod, node, supernet = "fd46:0:0:1::/64", "2001:db8::/64", "fd46::/48"
 			}
+
+			checkRule(ipt, tc.forward, "filter", "FORWARD", "-i", "fabric0", "-s", pod,
+				"-m", "comment", "--comment", "unbounded-net: forward native cluster traffic", "-j", "UNBOUNDED-FORWARD")
+			checkRule(ipt, tc.forward, "filter", "UNBOUNDED-FORWARD", "-o", "fabric0", "-d", pod,
+				"-m", "comment", "--comment", "unbounded-net: forward native cluster traffic", "-j", "ACCEPT")
 
 			for _, cidr := range []string{pod, node} {
 				checkRule(ipt, true, "raw", "UNBOUNDED-NOTRACK", "-d", cidr,

@@ -1122,10 +1122,23 @@ func reapplyRPFilterOnActiveTunnels(cfg *config, meshPeers []meshPeerInfo, gatew
 	}
 
 	if fwdMgr != nil {
-		if usesNative {
-			fwdMgr.EnsureInterface(native)
-		} else {
-			fwdMgr.RemoveInterface(native)
+		var prefixes []string
+
+		for _, peer := range meshPeers {
+			if peer.TunnelProtocol == "None" {
+				prefixes = append(prefixes, peer.PodCIDRs...)
+				prefixes = append(prefixes, ipsToHostCIDRs(peer.InternalIPs)...)
+			}
+		}
+
+		for _, peer := range append(append([]gatewayPeerInfo(nil), gatewayPeers...), wgGatewayPeers...) {
+			if peer.TunnelProtocol == "None" {
+				prefixes = append(prefixes, gatewayBPFPrefixes(peer, nil)...)
+			}
+		}
+
+		if err := fwdMgr.ReconcileNativeInterface(native, dedupeStrings(prefixes)); err != nil {
+			klog.Errorf("Reconcile native forwarding: %v", err)
 		}
 	}
 
