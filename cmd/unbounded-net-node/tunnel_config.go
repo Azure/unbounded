@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/vishvananda/netlink"
@@ -610,6 +611,8 @@ func addMeshPeerBPFEntries(entries, directEntries, assignmentEntries map[string]
 }
 
 func addGatewayBPFEntries(entries map[string]ebpfpkg.TunnelEndpoint, cidrs []string, peer gatewayPeerInfo, underlayIP net.IP, vni, ifindex, protocol uint32) {
+	healthPrefixes := gatewayHealthPrefixes(peer)
+
 	for _, cidr := range cidrs {
 		prefix, err := parseRoutingPrefix(cidr)
 		if err != nil {
@@ -628,8 +631,17 @@ func addGatewayBPFEntries(entries map[string]ebpfpkg.TunnelEndpoint, cidrs []str
 		}
 
 		key := prefix.String()
+		peerName := peer.Name
+
+		if slices.Contains(healthPrefixes, key) {
+			// A failed session must not withdraw its own recovery probe.
+			delete(entries, key)
+
+			peerName = ""
+		}
+
 		before := len(entries[key].Nexthops)
-		addPeerBPFEntries(entries, []string{key}, underlayIP, vni, ifindex, protocol, peer.Name, peer.InternalIPs)
+		addPeerBPFEntries(entries, []string{key}, underlayIP, vni, ifindex, protocol, peerName, peer.InternalIPs)
 
 		endpoint := entries[key]
 		if len(endpoint.Nexthops) == before {
@@ -757,6 +769,12 @@ func collectSupernets(state *wireGuardState, meshPeers []meshPeerInfo, gatewayPe
 
 		for _, cidr := range peer.PodCIDRs {
 			addIfUncovered(cidr)
+		}
+	}
+
+	for _, peer := range allGatewayPeers {
+		for _, prefix := range gatewayHealthPrefixes(peer) {
+			addIfUncovered(prefix)
 		}
 	}
 

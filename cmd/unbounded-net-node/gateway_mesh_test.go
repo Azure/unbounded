@@ -231,8 +231,70 @@ func TestGatewayHostPinRequiresTransitAdvertisement(t *testing.T) {
 	}
 
 	got := gatewayBPFPrefixes(peer, nil)
-	if !reflect.DeepEqual(got, []string{"10.0.0.0/24", "10.0.0.10/32"}) {
+	if !reflect.DeepEqual(got, []string{"10.0.0.0/24", "10.0.0.10/32", "10.244.0.1/32"}) {
 		t.Fatalf("gateway identity created unadvertised reachability: %v", got)
+	}
+}
+
+func TestGatewayHealthWithoutOwnSiteAdvertisement(t *testing.T) {
+	t.Parallel()
+
+	peer := gatewayPeerInfo{
+		Name: "gateway/transit/pool", InternalIPs: []string{"192.0.2.10", "2001:db8::10"},
+		PodCIDRs: []string{"10.244.0.0/24", "fd44::/64"},
+	}
+
+	for _, advertised := range [][]string{{"10.245.0.0/16"}, {"10.244.0.0/24", "10.245.0.0/16"}, {"10.245.0.0/16"}} {
+		peer.RoutedCidrs = advertised
+		prefixes := gatewayBPFPrefixes(peer, nil)
+		allowed := pruneCoveredAllowedCIDRs(prefixes)
+		routes := collectSupernets(&wireGuardState{}, nil, []gatewayPeerInfo{peer}, []gatewayPeerInfo{peer}, nil, false)
+		entries := make(map[string]ebpfpkg.TunnelEndpoint)
+		addGatewayBPFEntries(entries, prefixes, peer, net.ParseIP("192.0.2.10"), 0, 7, ebpfpkg.TunnelProtoWireGuard)
+
+		for _, cidr := range []string{"10.244.0.1/32", "fd44::1/128"} {
+			endpoint := entries[cidr]
+			if len(endpoint.Nexthops) != 1 || endpoint.Nexthops[0].PeerName != "" || !endpoint.Nexthops[0].Healthy {
+				t.Fatalf("health probe depends on transit session health: %s: %+v", cidr, endpoint)
+			}
+
+			healthIP, _, _ := net.ParseCIDR(cidr)
+			authorized := false
+
+			for _, value := range allowed {
+				_, prefix, err := net.ParseCIDR(value)
+				if err == nil && prefix.Contains(healthIP) {
+					authorized = true
+				}
+			}
+
+			if !authorized {
+				t.Fatalf("health endpoint %s missing from WireGuard AllowedIPs: %v", cidr, allowed)
+			}
+
+			covered := false
+
+			for value := range routes {
+				_, prefix, err := net.ParseCIDR(value)
+				if err == nil && prefix.Contains(healthIP) {
+					covered = true
+				}
+			}
+
+			if !covered {
+				t.Fatalf("health endpoint %s has no attraction route: %v", cidr, routes)
+			}
+		}
+
+		if len(advertised) == 1 {
+			if _, exists := entries["10.244.0.0/24"]; exists || routes["10.244.0.0/24"] {
+				t.Fatal("health reachability restored the gateway's whole PodCIDR")
+			}
+		}
+
+		if _, exists := entries["10.245.0.0/16"]; !exists {
+			t.Fatal("health-only reachability removed other transit advertisements")
+		}
 	}
 }
 

@@ -213,7 +213,14 @@ func gatewayBPFPrefixes(peer gatewayPeerInfo, localCIDRs []netip.Prefix) []strin
 		}
 	}
 
+	// Health endpoints are host-only control paths, not pod transit ownership.
+	prefixes = append(prefixes, gatewayHealthPrefixes(peer)...)
+
 	return excludeLocalCIDRs(prefixes, localCIDRs)
+}
+
+func gatewayHealthPrefixes(peer gatewayPeerInfo) []string {
+	return ipsToHostCIDRs(getHealthIPsFromPodCIDRs(peer.PodCIDRs))
 }
 
 func subtractLocalPrefix(prefix, local netip.Prefix) []netip.Prefix {
