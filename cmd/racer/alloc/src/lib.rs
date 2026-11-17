@@ -804,8 +804,9 @@ impl Drop for Checkout {
 /// Entries are kept oldest first so maintenance trims the longest-idle storage.
 /// A [`Provision`] controller sizes the pool in 64 KiB granules from the bytes
 /// checked out of it; returns are accepted up to the idle byte budget, and
-/// maintenance frees whole buffers the controller releases without dropping
-/// below its target, or every idle buffer under critical pressure.
+/// maintenance frees whole buffers the controller releases, without dropping
+/// below its target unless pressure is elevated, or every idle buffer under
+/// critical pressure.
 pub(crate) struct BufferPool<C: Charge> {
     entries: VecDeque<AlignedBuffer<C>>,
     demand: Provision,
@@ -913,10 +914,14 @@ impl<C: Charge> BufferPool<C> {
     }
 
     /// Remove the entries chosen by demand maintenance, oldest first. Only
-    /// whole buffers are released, skipping any whose removal would leave
-    /// less than the target, so the release may fall short of the plan.
-    /// Critical pressure releases every idle entry regardless of the plan,
-    /// since idle storage can share a rounded granule with a live checkout.
+    /// whole buffers are released. Without pressure, any buffer whose removal
+    /// would leave less than the target is skipped, so the release may fall
+    /// short of the plan; returns of other sizes then back the target and let
+    /// it go later. Elevated pressure refuses those returns while the idle
+    /// bytes exceed the spare target, so it releases whole buffers even below
+    /// the target, which is at most one granule above in-use. Critical
+    /// pressure releases every idle entry regardless of the plan, since idle
+    /// storage can share a rounded granule with a live checkout.
     pub(crate) fn maintain(&mut self, now: std::time::Instant) -> Vec<AlignedBuffer<C>> {
         // Checkouts and returns made while the list was borrowed were counted
         // but not observed.
@@ -931,12 +936,13 @@ impl<C: Charge> BufferPool<C> {
             return Vec::new();
         };
         let target = self.demand.target();
+        let keep_target = self.pressure == Pressure::Normal;
         let mut wanted = units.saturating_mul(STAGING_GRANULE);
         let mut released = Vec::new();
         let mut index = 0;
         while wanted > 0 && index < self.entries.len() {
             let size = self.entries[index].allocation().layout.size();
-            if Self::granules(provisioned.saturating_sub(size)) < target {
+            if keep_target && Self::granules(provisioned.saturating_sub(size)) < target {
                 index += 1;
                 continue;
             }
@@ -1224,6 +1230,39 @@ mod buffer_tests {
         assert!(pool.borrow_mut().maintain(now).is_empty());
         assert!(pool.borrow_mut().take_for(16 * MIB, &()).is_some());
         assert_eq!(pool.borrow().stats().misses, 0);
+    }
+
+    /// A 64 KiB trickle cannot reuse an idle 16 MiB buffer. Under normal
+    /// pressure its returns back the target, so the large buffer can go
+    /// without undershooting. Under elevated pressure those returns are
+    /// refused while the large buffer exceeds the spare target, so it must
+    /// go even though that undershoots.
+    #[test]
+    fn a_small_trickle_does_not_pin_a_large_idle_buffer() {
+        const MIB: usize = 1024 * 1024;
+        let alignment = Alignment::new(4096, 1, 1).unwrap();
+        for pressure in [Pressure::Normal, Pressure::Elevated] {
+            let pool = Rc::new(StagingPool::default());
+            drop(alignment.allocate(16 * MIB, ()).unwrap().pooled(&pool));
+            pool.borrow_mut().set_pressure(pressure);
+            let start = std::time::Instant::now();
+            let mut released = Vec::new();
+            for tick in 1..=100 {
+                let reused = pool.borrow_mut().take_for(STAGING_GRANULE, &());
+                drop(
+                    reused
+                        .unwrap_or_else(|| alignment.allocate(STAGING_GRANULE, ()).unwrap())
+                        .pooled(&pool),
+                );
+                let now = start + SAMPLE_PERIOD * tick;
+                let trimmed = pool.borrow_mut().maintain(now);
+                released.extend(trimmed.iter().map(|b| b.allocation().layout.size()));
+            }
+            assert!(released.contains(&(16 * MIB)), "{pressure:?}: {released:?}");
+            let stats = pool.borrow().stats();
+            assert!(stats.bytes <= STAGING_GRANULE, "{pressure:?}: {stats:?}");
+            assert!(stats.hits > 0, "{pressure:?}: trickle returns are kept");
+        }
     }
 
     #[test]

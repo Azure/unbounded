@@ -75,7 +75,9 @@ The pool is sized by a `Provision` controller (`alloc/src/demand.rs`, see
 `designs/racer-pool-control.md`) over 64 KiB granules of checked-out plus idle
 storage. Returns are kept while idle storage fits the 128 MiB budget.
 `Slab::maintain_idle` ticks the controller and frees surplus idle buffers,
-oldest first, once demand has stayed below them for the hold time.
+oldest first, once demand has stayed below them for the hold time. Only whole
+buffers are freed; without pressure a buffer stays while freeing it would leave
+less than the target, and under pressure it goes anyway.
 `Slab::set_idle_pressure` caps idle storage under memory pressure: at
 `Elevated` one granule above what is in use, at `Critical` none, and then
 returns are refused. Workers drive it from `poll_services`. Idle slab buffers

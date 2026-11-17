@@ -252,9 +252,10 @@ impl<C: Charge> Slab<C> {
         idle.iter().map(|b| b.allocation().layout.size()).sum()
     }
 
-    /// Run demand maintenance at `now`, freeing idle entries the controller
-    /// releases, oldest first, or every idle entry under critical pressure.
-    /// Returns released bytes.
+    /// Run demand maintenance at `now`, freeing whole idle entries the
+    /// controller releases, oldest first, or every idle entry under critical
+    /// pressure. Without pressure an entry stays while freeing it would leave
+    /// less than the target. Returns released bytes.
     pub fn maintain_idle(&self, now: std::time::Instant) -> usize {
         let Ok(mut pool) = self.idle_buffer.try_borrow_mut() else {
             return 0;

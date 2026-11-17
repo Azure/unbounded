@@ -142,8 +142,14 @@ anything to top up.
 The slab pool has one `Provision` in 64 KiB granules over checked-out plus
 idle storage, floor 0, with acquire cost of 20 us. It keeps every return that
 fits the 128 MiB budget and frees surplus oldest first on
-`Slab::maintain_idle`. Idle slab buffers keep their primary charge, so there
-is no cold stage.
+`Slab::maintain_idle`, in whole buffers. Without pressure it skips a buffer
+whose removal would leave less than the target, so a large buffer stays while
+it backs the target and goes once returns of other sizes do. `Elevated`
+refuses returns beyond the spare target, so it frees whole buffers even below
+the target, which is at most one granule above in-use; otherwise an idle
+buffer no current request can reuse would stay. `Critical` frees every idle
+buffer. Idle slab buffers keep their primary charge, so there is no cold
+stage.
 
 ## RDMA registered pool
 
