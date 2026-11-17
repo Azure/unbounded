@@ -596,6 +596,8 @@ def test_loader_prefetches_weight_pages(server, uri, torch, monkeypatch):
     seen, body = puts[0]
     assert seen.target.startswith("/v1/prefetches/racer-vllm-")
     assert body["priority"] == "high" and body["ttl_seconds"] == 3600
+    # A new ticket starts at (0, 0).
+    assert (body["generation"], body["sequence"]) == (0, 0)
     refs = {r["key"]: r for r in body["refs"]}
     assert set(refs) == {uri.request("a.safetensors").hex, uri.request("b.safetensors").hex}
     for name in ("a.safetensors", "b.safetensors"):
@@ -606,6 +608,51 @@ def test_loader_prefetches_weight_pages(server, uri, torch, monkeypatch):
     # The ticket is accepted before the loader reads any weight data.
     first_read = min(i for i, s in enumerate(server.seen) if s.method == "POST" and "range" in s.headers)
     assert server.seen.index(seen) < first_read
+
+
+def test_loader_prefetch_restarts_completed_ticket(server, uri, torch, monkeypatch):
+    setup_model(server, uri)
+    inst = make_loader(monkeypatch, server, uri=str(uri))
+    mc = types.SimpleNamespace(model="/unused", quantization=None)
+    inst.load_weights(Model(), mc)
+    first, _ = prefetch_puts(server)[0]
+    ticket = first.target.rsplit("/", 1)[1]
+    # Make the retained ticket terminal, so a replay would show up as CANCELLED.
+    c = client(server)
+    assert c.cancel_prefetch(ticket).state == "CANCELLED"
+    inst.load_weights(Model(), mc)
+    puts = prefetch_puts(server)
+    assert len(puts) == 2
+    second, body = puts[1]
+    assert second.target == first.target
+    assert (body["generation"], body["sequence"]) == (0, 1)
+    status = c.prefetch_status(ticket)
+    assert status.state == "SUCCEEDED" and status.sequence == 1 and status.reason is None
+    c.close()
+
+
+def test_loader_prefetch_ttl_change_updates_ticket(server, uri, torch, monkeypatch):
+    setup_model(server, uri)
+    mc = types.SimpleNamespace(model="/unused", quantization=None)
+    make_loader(monkeypatch, server, uri=str(uri)).load_weights(Model(), mc)
+    inst = make_loader(monkeypatch, server, uri=str(uri), prefetch_ttl_seconds=60)
+    inst.load_weights(Model(), mc)
+    puts = prefetch_puts(server)
+    assert len(puts) == 2
+    assert puts[0][0].target == puts[1][0].target
+    assert [(b["generation"], b["sequence"]) for _, b in puts] == [(0, 0), (0, 1)]
+    assert [b["ttl_seconds"] for _, b in puts] == [3600, 60]
+    assert server.prefetches.tickets[puts[1][0].target.rsplit("/", 1)[1]].ttl == 60
+
+
+def test_next_prefetch_position_rolls_over_at_the_maximum():
+    def status(generation, sequence):
+        return racer.PrefetchStatus(id="t", state="SUCCEEDED", generation=generation, sequence=sequence)
+
+    assert rv.next_prefetch_position(status(0, 0)) == (0, 1)
+    assert rv.next_prefetch_position(status(3, rv.MAX_PREFETCH_COUNTER)) == (4, 0)
+    with pytest.raises(racer.RacerError, match="exhausted"):
+        rv.next_prefetch_position(status(rv.MAX_PREFETCH_COUNTER, rv.MAX_PREFETCH_COUNTER))
 
 
 def test_loader_prefetch_is_best_effort(server, uri, torch, monkeypatch, caplog):

@@ -35,6 +35,7 @@ DEFAULT_CONCURRENCY = 4
 DEFAULT_PREFETCH = True
 DEFAULT_PREFETCH_TTL_SECONDS = 3600
 PREFETCH_ID_PREFIX = "racer-vllm-"
+MAX_PREFETCH_COUNTER = (1 << 53) - 1
 MAX_HEADER_BYTES = 100 * 1024 * 1024
 MAX_PARTS = 100_000
 TP_ONLY_PATTERN = "model-rank-{rank}-part-{part}.safetensors"
@@ -537,6 +538,21 @@ def prefetch_id(uri: ModelURI, pinned: list) -> str:
     return PREFETCH_ID_PREFIX + digest.hexdigest()[:32]
 
 
+def next_prefetch_position(status) -> tuple:
+    """The (generation, sequence) that restarts or updates an existing ticket.
+
+    Racer replays a retained status, including a terminal one, for the same
+    (generation, sequence) and payload; only a higher position restarts it.
+    Roll over at the counter maximum, and fail when both counters are spent.
+    """
+    generation, sequence = status.generation, status.sequence
+    if sequence < MAX_PREFETCH_COUNTER:
+        return generation, sequence + 1
+    if generation < MAX_PREFETCH_COUNTER:
+        return generation + 1, 0
+    raise racer.RacerError("racer: prefetch ticket counters exhausted")
+
+
 def prefetch_weights(client, uri: ModelURI, pinned: list, ttl_seconds: int):
     """Ask the dataplane to fill the weight pages in the background.
 
@@ -544,13 +560,33 @@ def prefetch_weights(client, uri: ModelURI, pinned: list, ttl_seconds: int):
     raises the number of origin requests in flight without more staging
     memory. The loader still reads every page. The ticket is best effort: a
     dataplane without prefetch, or a passthrough cache, rejects it.
+
+    An existing ticket is resubmitted one position higher, so a repeated load
+    restarts a terminal ticket and revalidates any pages evicted since. An
+    absent ticket (404) starts at (0, 0). The id stays stable for the model
+    version, so the status read and the PUT always address the same ticket.
     """
     refs = []
     for name, meta in pinned:
         req = uri.request(name)
         refs.append(racer.PrefetchRef(key=req.hex, etag=meta.etag, metadata=req.metadata))
-    spec = racer.PrefetchSpec(refs=refs, priority="high", ttl_seconds=ttl_seconds)
-    return client.prefetch(prefetch_id(uri, pinned), spec)
+    ticket = prefetch_id(uri, pinned)
+    try:
+        status = client.prefetch_status(ticket)
+    except racer.PrefetchError as exc:
+        if exc.status != 404:
+            raise
+        generation, sequence = 0, 0
+    else:
+        generation, sequence = next_prefetch_position(status)
+    spec = racer.PrefetchSpec(
+        refs=refs,
+        priority="high",
+        ttl_seconds=ttl_seconds,
+        generation=generation,
+        sequence=sequence,
+    )
+    return client.prefetch(ticket, spec)
 
 
 def summary(stats: dict, seconds: float, uri) -> str:
