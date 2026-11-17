@@ -2422,10 +2422,15 @@ impl WorkerApplication {
         metrics.observe_memory(memory);
     }
 
-    /// Set the memory pressure every idle pool sizes for.
+    /// Set the memory pressure every idle pool sizes for. The registered RDMA
+    /// pools are node-wide; every worker sees the same level, so setting it
+    /// from each is idempotent.
     pub(crate) fn set_pool_pressure(&self, pressure: page_alloc::Pressure) {
         self.store.writer.set_staging_pressure(pressure);
         self.memory.buffers().set_idle_pressure(pressure);
+        if let Some(links) = &self.links {
+            links.set_pool_pressure(pressure);
+        }
     }
 
     /// Idle statistics of the staging slab pool.

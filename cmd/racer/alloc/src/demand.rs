@@ -143,7 +143,7 @@ pub struct Provision {
     acquire: u64,
     in_use: usize,
     sample_peak: usize,
-    next_sample: Instant,
+    next_sample: Option<Instant>,
     previous: usize,
     rises: [usize; 2],
     mean: i128,
@@ -151,7 +151,7 @@ pub struct Provision {
     correction: i128,
     windows: [usize; HISTORY],
     window: usize,
-    window_start: Instant,
+    window_start: Option<Instant>,
     last_change: Option<Instant>,
     last_release: Option<Instant>,
     target: usize,
@@ -159,8 +159,10 @@ pub struct Provision {
 
 impl Provision {
     /// Controller with no observed demand; its target starts at the floor.
+    /// Its clock starts at the first [`Provision::tick`], so it follows
+    /// whatever clock the owner passes in.
     #[must_use]
-    pub fn new(config: ProvisionConfig, now: Instant) -> Self {
+    pub fn new(config: ProvisionConfig) -> Self {
         let config = ProvisionConfig {
             unit: config.unit.max(1),
             floor: config.floor.min(config.ceiling),
@@ -173,7 +175,7 @@ impl Provision {
             acquire: nanos(config.acquire),
             in_use: 0,
             sample_peak: 0,
-            next_sample: now + SAMPLE_PERIOD,
+            next_sample: None,
             previous: 0,
             rises: [0; 2],
             mean: 0,
@@ -181,7 +183,7 @@ impl Provision {
             correction: 0,
             windows: [0; HISTORY],
             window: 0,
-            window_start: now,
+            window_start: None,
             last_change: None,
             last_release: None,
             target: config.floor,
@@ -323,22 +325,24 @@ impl Provision {
     }
 
     fn advance(&mut self, now: Instant) {
-        if now >= self.next_sample {
-            let missed = nanos(now.saturating_duration_since(self.next_sample));
+        let next_sample = *self.next_sample.get_or_insert(now + SAMPLE_PERIOD);
+        let window_start = *self.window_start.get_or_insert(now);
+        if now >= next_sample {
+            let missed = nanos(now.saturating_duration_since(next_sample));
             let samples = (missed / nanos(SAMPLE_PERIOD)).saturating_add(1);
             self.sample(self.sample_peak);
             for _ in 1..samples.min(CATCH_UP) {
                 self.sample(self.in_use);
             }
             self.sample_peak = self.in_use;
-            self.next_sample = if samples > CATCH_UP {
+            self.next_sample = Some(if samples > CATCH_UP {
                 now + SAMPLE_PERIOD
             } else {
-                self.next_sample + SAMPLE_PERIOD * samples as u32
-            };
+                next_sample + SAMPLE_PERIOD * samples as u32
+            });
         }
         let width = (self.effective_hold() / WINDOWS as u32).max(Duration::from_millis(1));
-        let elapsed = now.saturating_duration_since(self.window_start);
+        let elapsed = now.saturating_duration_since(window_start);
         if elapsed < width {
             return;
         }
@@ -356,11 +360,11 @@ impl Provision {
         if steps >= HISTORY as u64 {
             self.windows = [self.in_use; HISTORY];
         }
-        self.window_start = if steps > CATCH_UP {
+        self.window_start = Some(if steps > CATCH_UP {
             now
         } else {
-            self.window_start + width * steps as u32
-        };
+            window_start + width * steps as u32
+        });
     }
 
     /// Fold one closed window's peak into the typical level.
@@ -452,7 +456,7 @@ mod tests {
         fn new(config: ProvisionConfig) -> Self {
             let start = Instant::now();
             Self {
-                provision: Provision::new(config, start),
+                provision: Provision::new(config),
                 start,
                 now: start,
                 capacity: config.floor,
@@ -616,7 +620,7 @@ mod tests {
 
     #[test]
     fn saturation_and_pressure_freeze_the_correction() {
-        let mut provision = Provision::new(HOST, Instant::now());
+        let mut provision = Provision::new(HOST);
         provision.set_saturated(true);
         provision.shortfall(Instant::now(), 8);
         assert_eq!(provision.target(), 0);
@@ -635,7 +639,7 @@ mod tests {
             acquire: Duration::from_millis(100),
         };
         let now = Instant::now();
-        let mut provision = Provision::new(config, now);
+        let mut provision = Provision::new(config);
         provision.shortfall(now, 9);
         assert_eq!(provision.tick(now, 0, 0, Pressure::Normal), Plan::Grow(2));
         assert_eq!(provision.tick(now, 8, 0, Pressure::Normal), Plan::Hold);
@@ -683,13 +687,10 @@ mod tests {
     #[test]
     fn hold_time_follows_measured_acquire_time_within_bounds() {
         let now = Instant::now();
-        let mut provision = Provision::new(
-            ProvisionConfig {
-                acquire: Duration::ZERO,
-                ..HOST
-            },
-            now,
-        );
+        let mut provision = Provision::new(ProvisionConfig {
+            acquire: Duration::ZERO,
+            ..HOST
+        });
         assert_eq!(provision.hold(), MIN_HOLD);
         for _ in 0..64 {
             provision.acquired(now, 2, Duration::from_millis(40));
@@ -707,7 +708,11 @@ mod tests {
     #[test]
     fn time_may_stall_or_jump() {
         let now = Instant::now();
-        let mut provision = Provision::new(HOST, now + Duration::from_secs(5));
+        let mut provision = Provision::new(HOST);
+        assert_eq!(
+            provision.tick(now + Duration::from_secs(5), 0, 0, Pressure::Normal),
+            Plan::Hold
+        );
         provision.observe(3);
         assert_eq!(provision.tick(now, 0, 0, Pressure::Normal), Plan::Grow(3));
         let later = now + Duration::from_secs(86_400);

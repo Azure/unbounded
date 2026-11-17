@@ -486,6 +486,10 @@ pub struct Pool {
 
     pressure: Pressure,
 
+    // Time of the latest `maintain`. Sizing runs on the owner's clock only, so
+    // a virtual clock keeps it deterministic.
+    clock: Option<Instant>,
+
     alignment: usize,
 
     granule: usize,
@@ -573,6 +577,7 @@ impl Pool {
             trimmed: 0,
             unpooled: 0,
             last_take: [0; MAX_CLASSES],
+            clock: None,
             bind_refused: false,
         })
     }
@@ -637,6 +642,7 @@ impl Pool {
     /// unmap cold storage unused for [`COLD_HOLDS`] hold times. Cheap between
     /// controller samples. Returns resident bytes released.
     pub fn maintain(&mut self, now: Instant) -> usize {
+        self.clock = Some(now);
         let mut released = 0;
         for index in 0..MAX_CLASSES {
             if self.demand[index].is_none() {
@@ -652,7 +658,7 @@ impl Pool {
             let plan = demand.tick(now, out + warm, 0, self.pressure);
             let expiry = demand.effective_hold().saturating_mul(COLD_HOLDS);
             if let Plan::Release(count) = plan {
-                released += self.cool(index, count, now);
+                released += self.cool(index, count);
             }
             self.expire_cold(index, now, expiry);
         }
@@ -661,14 +667,14 @@ impl Pool {
 
     /// Cool up to `count` of class `index`'s least recently returned warm
     /// regions. Returns resident bytes released.
-    fn cool(&mut self, index: usize, count: usize, now: Instant) -> usize {
+    fn cool(&mut self, index: usize, count: usize) -> usize {
         let count = count.min(self.local[index].len());
         let mut released = 0;
         for mut region in self.local[index].drain(..count) {
             released += region.capacity;
             self.shared.uncharge(&mut region);
             if region.discard() {
-                region.cooled = Some(now);
+                region.cooled = self.clock;
                 self.cold[index].push(region);
             } else {
                 self.shared.classes[index]
@@ -681,12 +687,12 @@ impl Pool {
     }
 
     /// Unmap class `index`'s cold regions cooled at least `expiry` ago.
+    /// Regions cooled before the first `maintain` start their wait now.
     fn expire_cold(&mut self, index: usize, now: Instant, expiry: Duration) {
         let class = &self.shared.classes[index];
-        self.cold[index].retain(|region| {
-            let fresh = region
-                .cooled
-                .is_none_or(|cooled| now.saturating_duration_since(cooled) < expiry);
+        self.cold[index].retain_mut(|region| {
+            let cooled = *region.cooled.get_or_insert(now);
+            let fresh = now.saturating_duration_since(cooled) < expiry;
             if !fresh {
                 class.idle.fetch_sub(1, Ordering::AcqRel);
             }
@@ -741,15 +747,12 @@ impl Pool {
         self.shared.classes[index]
             .capacity
             .store(capacity, Ordering::Release);
-        self.demand[index] = Some(Provision::new(
-            ProvisionConfig {
-                unit: 1,
-                floor: 0,
-                ceiling: usize::MAX / capacity,
-                acquire: acquire_cost(capacity),
-            },
-            Instant::now(),
-        ));
+        self.demand[index] = Some(Provision::new(ProvisionConfig {
+            unit: 1,
+            floor: 0,
+            ceiling: usize::MAX / capacity,
+            acquire: acquire_cost(capacity),
+        }));
         index as u8
     }
 
@@ -791,8 +794,8 @@ impl Pool {
                 region.cooled = None;
                 self.cold_hits = self.cold_hits.wrapping_add(1);
                 // Sizing gave up storage that was needed after all: keep more.
-                if let Some(demand) = self.demand[index].as_mut() {
-                    demand.shortfall(Instant::now(), 1);
+                if let (Some(demand), Some(now)) = (self.demand[index].as_mut(), self.clock) {
+                    demand.shortfall(now, 1);
                 }
                 region
             }
@@ -903,7 +906,6 @@ impl Pool {
     /// Returns bytes released.
     pub fn shed(&mut self, bytes: usize) -> usize {
         self.drain_returns();
-        let now = Instant::now();
         let mut shed = 0;
         for index in 0..MAX_CLASSES {
             let mut count = 0;
@@ -914,7 +916,7 @@ impl Pool {
                 shed += region.capacity;
                 count += 1;
             }
-            self.cool(index, count, now);
+            self.cool(index, count);
         }
         shed
     }

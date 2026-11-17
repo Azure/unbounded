@@ -295,6 +295,13 @@ fn constants_and_keys() {
     assert_eq!(grants_per_link(buffer_count(32 << 30) / 8), 227);
     assert_eq!(grants_per_link(usize::MAX), GRANTS_PER_LINK_CAP);
     const { assert!(GRANTS_PER_LINK_CAP <= crate::rdma::link_setup::MAX_GRANTS_PER_LINK) };
+    // Blocks are an eighth of the rail, within 2..=32 buffers and the rail.
+    assert_eq!(block_buffers(1), 1);
+    assert_eq!(block_buffers(2), 2);
+    assert_eq!(block_buffers(7), 2);
+    assert_eq!(block_buffers(56), 7);
+    assert_eq!(block_buffers(227), 28);
+    assert_eq!(block_buffers(1000), 32);
 
     let key = link_key(&node_id(1), RAIL);
     assert_eq!(key, link_key(&node_id(1), RAIL));

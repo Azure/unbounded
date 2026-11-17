@@ -2094,7 +2094,6 @@ impl Owner {
         let quota = self.quota.clone().ok_or(Error::Unavailable)?;
         let mut built = BTreeMap::new();
         let mut sizing = BTreeMap::new();
-        let now = self.ctx.now();
 
         for pending in devices {
             let region = pending.region.ok_or(Error::Unavailable)??;
@@ -2103,7 +2102,7 @@ impl Owner {
             if self.growth.is_some() {
                 sizing.insert(
                     pending.tag,
-                    RailSizing::new(pool.capacity(), self.pool_buffers, now),
+                    RailSizing::new(pool.capacity(), self.pool_buffers),
                 );
             }
             built.insert(

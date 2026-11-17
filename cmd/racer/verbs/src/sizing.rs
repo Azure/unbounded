@@ -154,19 +154,16 @@ pub(crate) struct Changes {
 impl RailSizing {
     /// Sizing for a pool whose first block holds `block` buffers, growing
     /// to at most `ceiling` buffers in whole blocks.
-    pub(crate) fn new(block: usize, ceiling: usize, now: Instant) -> Self {
+    pub(crate) fn new(block: usize, ceiling: usize) -> Self {
         let block = block.max(1);
         let ceiling = (ceiling / block).max(1) * block;
         Self {
-            demand: Provision::new(
-                ProvisionConfig {
-                    unit: block,
-                    floor: block,
-                    ceiling,
-                    acquire: REGISTER_PRIOR,
-                },
-                now,
-            ),
+            demand: Provision::new(ProvisionConfig {
+                unit: block,
+                floor: block,
+                ceiling,
+                acquire: REGISTER_PRIOR,
+            }),
             block,
             registering: None,
             retry: None,

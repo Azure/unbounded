@@ -1797,8 +1797,12 @@ mod tests {
             racer_io::WorkerCtx::host(),
         );
         let admission = flow_control::Quotas::new(AdmissionPolicy::new(limits.clone()));
+        // Activation registers only the first block of each rail, so hold
+        // enough that even that block does not fit.
+        let first = crate::rdma::block_buffers(4) * crate::rdma::BUFFER_LEN;
+        let held_bytes = limits.registered_bytes.get() - first + 1;
         let held = admission
-            .reserve(None, ResourceClass::Registered, 1)
+            .reserve(None, ResourceClass::Registered, held_bytes)
             .unwrap();
         let startup = scope(&racer_io::Clock::host(), Duration::from_secs(10)).unwrap();
         let publication = vec![racer_wire::control::RailMapping {
@@ -1817,7 +1821,7 @@ mod tests {
             )),
             Err(Error::Overloaded)
         ));
-        assert_eq!(admission.used(ResourceClass::Registered), 1);
+        assert_eq!(admission.used(ResourceClass::Registered), held_bytes);
         assert!(!links.rail_ready(RailId(0)));
         assert!(links.node().settled());
         drop(held);

@@ -765,7 +765,7 @@ const STAGING_ACQUIRE: std::time::Duration = std::time::Duration::from_micros(20
 
 impl<C: Charge> Default for BufferPool<C> {
     fn default() -> Self {
-        Self::with_budget(128 * 1024 * 1024, std::time::Instant::now())
+        Self::with_budget(128 * 1024 * 1024)
     }
 }
 
@@ -777,7 +777,7 @@ pub fn buffer_capacity(length: usize) -> Option<usize> {
 }
 
 impl<C: Charge> BufferPool<C> {
-    fn with_budget(budget: usize, now: std::time::Instant) -> Self {
+    fn with_budget(budget: usize) -> Self {
         let config = ProvisionConfig {
             unit: 1,
             floor: 0,
@@ -786,7 +786,7 @@ impl<C: Charge> BufferPool<C> {
         };
         Self {
             entries: VecDeque::new(),
-            demand: Provision::new(config, now),
+            demand: Provision::new(config),
             pressure: Pressure::Normal,
             budget,
             in_use: 0,
