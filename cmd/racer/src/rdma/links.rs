@@ -56,6 +56,20 @@ pub fn buffer_count(registered_bytes: usize) -> usize {
     registered_bytes / BUFFER_LEN
 }
 
+/// Fewest and most page buffers in one registered block. Each rail registers
+/// one block at activation and adds or drops blocks as its demand changes
+/// (see `designs/racer-pool-control.md`), so a block trades registration
+/// churn against memory held above demand.
+const BLOCK_BUFFERS: std::ops::RangeInclusive<usize> = 2..=32;
+
+/// Page buffers in one registered block of a rail funding `buffers_per_rail`:
+/// an eighth of the rail, within [`BLOCK_BUFFERS`] and never above the rail.
+pub fn block_buffers(buffers_per_rail: usize) -> usize {
+    (buffers_per_rail / 8)
+        .clamp(*BLOCK_BUFFERS.start(), *BLOCK_BUFFERS.end())
+        .min(buffers_per_rail)
+}
+
 /// RDMA devices a node-wide registered budget funds out of `devices`.
 /// Page buffers only receive (sends read pages in place), so each device
 /// needs one buffer at least.
@@ -400,6 +414,15 @@ pub enum SetupOutcome {
     Failed,
 }
 
+/// Pool block counts already recorded for one activation round (see
+/// [`rdma_verbs::PoolSizings::round`]).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PoolSeen {
+    round: u64,
+    registrations: u64,
+    deregistrations: u64,
+}
+
 /// Per-worker facade over the node owner.
 pub struct Links {
     client: Client,
@@ -421,6 +444,10 @@ pub struct Links {
     /// Owner loop counters last recorded, so [`Self::sync_link_metrics`]
     /// records only the growth.
     loop_seen: Cell<rdma_verbs::OwnerLoop>,
+
+    /// Block registrations and deregistrations last recorded, summed over
+    /// rails, so [`Self::sync_link_metrics`] records only the growth.
+    pool_seen: Cell<PoolSeen>,
 
     /// [`OWNER_STALL`], shorter in tests.
     owner_stall: Duration,
@@ -456,6 +483,7 @@ impl Links {
             draining: Cell::new(false),
             breaks_seen: Cell::new([0; rdma_verbs::BreakReason::ALL.len()]),
             loop_seen: Cell::new(rdma_verbs::OwnerLoop::default()),
+            pool_seen: Cell::new(PoolSeen::default()),
             owner_stall: OWNER_STALL,
             metrics: None,
             ctx,
@@ -733,6 +761,105 @@ impl Links {
         ] {
             metrics.set_gauge(gauge, value as u64);
         }
+        self.sync_pool_metrics(metrics);
+    }
+
+    /// Publish how the registered pools are sized, summed over active rails.
+    fn sync_pool_metrics(&self, metrics: &crate::telemetry::Metrics) {
+        self.publish_pool_sizing(metrics, self.pool_sizing());
+    }
+
+    /// Publish `sample`, an activation round and its pools' sizing summed
+    /// over active rails. Without one (the owner was changing the pool
+    /// table), keep the last sample: a partial sum would read as a drop.
+    fn publish_pool_sizing(
+        &self,
+        metrics: &crate::telemetry::Metrics,
+        sample: Option<(u64, rdma_verbs::PoolSizing)>,
+    ) {
+        use crate::telemetry::{Event, Gauge};
+        let Some((round, sizing)) = sample else {
+            return;
+        };
+        let bytes = |buffers: usize| (buffers * BUFFER_LEN) as u64;
+        for (gauge, value) in [
+            (Gauge::RdmaPoolCapacityBytes, bytes(sizing.capacity)),
+            (Gauge::RdmaPoolRegisteredBytes, bytes(sizing.registered)),
+            (Gauge::RdmaPoolTargetBytes, bytes(sizing.target)),
+            (Gauge::RdmaPoolInUseBytes, bytes(sizing.in_use)),
+            (Gauge::RdmaPoolBlocks, sizing.blocks as u64),
+            (Gauge::RdmaPoolDrainingBlocks, sizing.draining as u64),
+            (
+                Gauge::RdmaPoolRegisterNanoseconds,
+                u64::try_from(sizing.register.as_nanos()).unwrap_or(u64::MAX),
+            ),
+            (Gauge::RdmaPoolHoldSeconds, sizing.hold.as_secs()),
+        ] {
+            metrics.set_gauge(gauge, value);
+        }
+        // Counts restart only with a new round. Within one they only grow,
+        // so a lower sum (rails leaving the active set) is not a reset.
+        let seen = self.pool_seen.get();
+        let before = if seen.round == round {
+            seen
+        } else {
+            PoolSeen {
+                round,
+                ..PoolSeen::default()
+            }
+        };
+        self.pool_seen.set(PoolSeen {
+            round,
+            registrations: before.registrations.max(sizing.registrations),
+            deregistrations: before.deregistrations.max(sizing.deregistrations),
+        });
+        for (event, now, before) in [
+            (
+                Event::RdmaPoolRegistrations,
+                sizing.registrations,
+                before.registrations,
+            ),
+            (
+                Event::RdmaPoolDeregistrations,
+                sizing.deregistrations,
+                before.deregistrations,
+            ),
+        ] {
+            let grown = now.saturating_sub(before);
+            if grown > 0 {
+                metrics.record(event, grown);
+            }
+        }
+    }
+
+    /// How the registered pools are sized, summed over active rails, and
+    /// the activation round they belong to; the register and hold times are
+    /// the slowest rail's. `None` while the owner is changing the pool
+    /// table, rather than a sum that misses some rails.
+    pub fn pool_sizing(&self) -> Option<(u64, rdma_verbs::PoolSizing)> {
+        let sizings = self.client.pool_sizings()?;
+        let mut total = rdma_verbs::PoolSizing::default();
+        for rail in self.active() {
+            let Some(sizing) = sizings.rails.get(&rail.rail.0) else {
+                continue;
+            };
+            total.capacity += sizing.capacity;
+            total.registered += sizing.registered;
+            total.target += sizing.target;
+            total.in_use += sizing.in_use;
+            total.blocks += sizing.blocks;
+            total.draining += sizing.draining;
+            total.registrations += sizing.registrations;
+            total.deregistrations += sizing.deregistrations;
+            total.register = total.register.max(sizing.register);
+            total.hold = total.hold.max(sizing.hold);
+        }
+        Some((sizings.round, total))
+    }
+
+    /// Memory pressure the registered pools size for.
+    pub fn set_pool_pressure(&self, pressure: page_alloc::Pressure) {
+        self.client.set_pool_pressure(pressure);
     }
 
     /// As [`Self::record_http_fallback`], because no ready link to the peer existed.
@@ -929,14 +1056,26 @@ impl Links {
                 publication.len()
             );
         }
-        let pool_bytes = buffer_count(registered_bytes / publication.len()) * BUFFER_LEN;
+        let buffers = buffer_count(registered_bytes / publication.len());
+        let pool_bytes = buffers * BUFFER_LEN;
+        let block_bytes = block_buffers(buffers) * BUFFER_LEN;
+        // Activation registers one block per rail; later blocks reserve their
+        // own charge as the owner registers them, so the registered budget is
+        // a ceiling rather than memory pinned up front.
         let guard = admission
             .reserve(
                 None,
                 ResourceClass::Registered,
-                pool_bytes * publication.len(),
+                block_bytes * publication.len(),
             )
             .map(|q| Arc::new(q) as rdma_verbs::Guard)?;
+        let shared = admission.shared();
+        let charge = move |bytes| {
+            shared
+                .reserve(ResourceClass::Registered, bytes)
+                .ok()
+                .map(|q| Arc::new(q) as rdma_verbs::Guard)
+        };
         let requested = publication.clone();
         let selected = self
             .wait(
@@ -957,9 +1096,13 @@ impl Links {
                     pool_bytes,
                     buffer_len: BUFFER_LEN,
                     max_links: crate::topology::RDMA_PEERS,
-                    grants_per_link: grants_per_link(pool_bytes / BUFFER_LEN),
+                    grants_per_link: grants_per_link(buffers),
                     idle: LINK_IDLE,
                     guard,
+                    growth: Some(rdma_verbs::Growth {
+                        block_bytes,
+                        charge: Box::new(charge),
+                    }),
                 }),
                 scope,
             )

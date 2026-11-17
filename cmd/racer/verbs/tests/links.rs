@@ -113,6 +113,7 @@ fn config_with(charge: &Arc<AtomicUsize>, grants_per_link: u32) -> NodeConfig {
         grants_per_link,
         idle: Duration::from_secs(120),
         guard: Arc::new(Charge(charge.clone())),
+        growth: None,
     }
 }
 
@@ -1774,5 +1775,439 @@ fn parked_grants_cancel_expire_and_fail_with_the_link() {
         assert_eq!(w.a.clients[0].grant_waiters(), 0);
         drop(fill);
         shutdown(w);
+    });
+}
+
+/// Blocks a growing pool has charged and not yet released.
+struct BlockCharges {
+    live: Arc<AtomicUsize>,
+
+    /// Charges refused while false.
+    open: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// A world whose rail-7 pools start with one block of `BLOCK` buffers and
+/// may grow to `GROWN` buffers, charging each later block to `charges`.
+const BLOCK: usize = 2;
+const GROWN: usize = 8;
+
+fn growing_world() -> (World, BlockCharges) {
+    growing_world_with(GROWN as u32)
+}
+
+/// A [`growing_world`] whose links advertise `grants_per_link` grants.
+fn growing_world_with(grants_per_link: u32) -> (World, BlockCharges) {
+    let sim = Simulation::new();
+    let clock = SimClock::new(7);
+    let mut a = node(&sim, 1, clock.ctx(1));
+    let mut b = node(&sim, 2, clock.ctx(1));
+    let charges = BlockCharges {
+        live: Arc::new(AtomicUsize::new(0)),
+        open: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+    };
+    for (n, node) in [&mut a, &mut b].into_iter().enumerate() {
+        let config = if n == 0 {
+            growing_config(&node.charge, grants_per_link, &charges)
+        } else {
+            let mut config = config_with(&node.charge, grants_per_link);
+            config.pool_bytes = GROWN * len();
+            config
+        };
+        let activation = node.clients[0].activate(config);
+        node.owner().poll_budgeted(4).unwrap();
+        ready(&activation).unwrap();
+    }
+    (World { sim, clock, a, b }, charges)
+}
+
+/// A pool of up to `GROWN` buffers that starts with one block of `BLOCK`
+/// and charges each later block to `charges`.
+fn growing_config(
+    charge: &Arc<AtomicUsize>,
+    grants_per_link: u32,
+    charges: &BlockCharges,
+) -> NodeConfig {
+    let mut config = config_with(charge, grants_per_link);
+    config.pool_bytes = GROWN * len();
+    let live = charges.live.clone();
+    let open = charges.open.clone();
+    config.growth = Some(rdma_verbs::Growth {
+        block_bytes: BLOCK * len(),
+        charge: Box::new(move |bytes| {
+            assert_eq!(bytes, BLOCK * len());
+            if !open.load(Ordering::Acquire) {
+                return None;
+            }
+            live.fetch_add(1, Ordering::AcqRel);
+            Some(Arc::new(Charge(live.clone())) as rdma_verbs::Guard)
+        }),
+    });
+    config
+}
+
+/// Hold `count` grants into `a`, each parked so that it may wait for growth.
+fn hold_grants(w: &mut World, ea: Epoch, count: usize, first: u8) -> Vec<Granted> {
+    let deadline = w.now() + 600 * SECOND;
+    let until = w.now() + SECOND;
+    (0..count)
+        .map(|i| {
+            let op =
+                w.a.clients[0].grant_parked(TO_B, ea, [first + i as u8; 16], 10, deadline, until);
+            wait(w, &op).unwrap()
+        })
+        .collect()
+}
+
+fn release_grants(w: &mut World, eb: Epoch, held: Vec<Granted>) {
+    for granted in held {
+        let released = w.b.clients[0].release(TO_A, eb, granted.tag);
+        assert_eq!(wait(w, &released), Ok(()));
+    }
+}
+
+/// Advance time in `step`s, pumping, until `done` or `limit` passes.
+fn settle(w: &mut World, step: Duration, limit: Duration, done: impl Fn(&World) -> bool) -> bool {
+    let end = w.now() + limit;
+    while w.now() < end {
+        if done(w) {
+            return true;
+        }
+        w.clock.advance(step);
+        pump(w);
+    }
+    done(w)
+}
+
+fn sizing(w: &World) -> rdma_verbs::PoolSizing {
+    w.a.clients[0].pool_sizing(7).unwrap()
+}
+
+#[test]
+/// A pool sized to demand registers one block at activation, adds blocks
+/// when grants find it empty, and drains back to its first block once the
+/// demand has been gone for the hold time, deregistering what it added and
+/// releasing its charge. Counts include the room it may still grow into.
+fn growing_pool_follows_demand() {
+    profiles(|| {
+        let (mut w, charges) = growing_world();
+        assert_eq!(w.a.clients[0].buffers(7, BufferState::Free), Some(BLOCK));
+        assert_eq!(w.a.clients[0].free_buffers(7), Some((GROWN, GROWN)));
+        assert_eq!(w.b.clients[0].pool_sizing(7), None, "b registers at once");
+        let initial = sizing(&w);
+        assert_eq!((initial.capacity, initial.blocks), (BLOCK, 1));
+        assert_eq!(initial.registered, BLOCK);
+        let (ea, eb) = link_up(&mut w);
+
+        let held = hold_grants(&mut w, ea, 2 * BLOCK, 0);
+        let grown = sizing(&w);
+        assert!(grown.capacity >= 2 * BLOCK, "{grown:?}");
+        assert_eq!(grown.registered, grown.capacity, "nothing drains");
+        assert_eq!(grown.registered, grown.blocks * BLOCK);
+        assert!(grown.registrations >= 1);
+        assert_eq!(charges.live.load(Ordering::Acquire), grown.blocks - 1);
+        assert_eq!(
+            w.a.clients[0].free_buffers(7),
+            Some((GROWN - 2 * BLOCK, GROWN))
+        );
+
+        // Demand stays: capacity is kept well past one sample.
+        w.clock.advance(5 * SECOND);
+        pump(&mut w);
+        assert_eq!(sizing(&w).capacity, grown.capacity);
+
+        release_grants(&mut w, eb, held);
+        let hold = sizing(&w).hold;
+        assert!(hold >= Duration::from_secs(1), "{hold:?}");
+        assert!(settle(&mut w, SECOND, hold * 4, |w| {
+            let s = sizing(w);
+            s.capacity == BLOCK && s.blocks == 1
+        }));
+        let drained = sizing(&w);
+        assert_eq!(drained.registered, BLOCK);
+        assert_eq!(drained.deregistrations, grown.registrations);
+        assert_eq!(charges.live.load(Ordering::Acquire), 0);
+        assert_eq!(w.a.clients[0].free_buffers(7), Some((GROWN, GROWN)));
+        assert_eq!(w.a.clients[0].buffers(7, BufferState::Free), Some(BLOCK));
+        shutdown(w);
+    });
+}
+
+#[test]
+/// One read of the pool table gives every rail's sizing with the round that
+/// installed it, and a new activation starts a new round whose counts
+/// restart, so a caller can tell a reset from a partial view.
+fn pool_sizings_restart_with_each_round() {
+    profiles(|| {
+        let (mut w, charges) = growing_world();
+        let (ea, eb) = link_up(&mut w);
+        let held = hold_grants(&mut w, ea, 2 * BLOCK, 0);
+        let first = w.a.clients[0].pool_sizings().unwrap();
+        assert_eq!(first.round, 1);
+        assert_eq!(first.rails.get(&7), Some(&sizing(&w)));
+        assert!(first.rails[&7].registrations >= 1, "{first:?}");
+        let b = w.b.clients[0].pool_sizings().unwrap();
+        assert!(b.rails.is_empty(), "b is not sized to demand");
+        release_grants(&mut w, eb, held);
+
+        w.a.clients[0].close();
+        pump(&mut w);
+        assert!(w.a.clients[0].drained());
+        let closed = w.a.clients[0].pool_sizings().unwrap();
+        assert_eq!((closed.round, closed.rails.len()), (1, 0));
+
+        w.a.clients[0].reopen().unwrap();
+        let activation =
+            w.a.clients[0].activate(growing_config(&w.a.charge, GROWN as u32, &charges));
+        assert!(wait(&mut w, &activation).is_ok());
+        let second = w.a.clients[0].pool_sizings().unwrap();
+        assert_eq!(second.round, 2);
+        assert_eq!(second.rails[&7].registrations, 0, "{second:?}");
+        shutdown(w);
+    });
+}
+
+#[test]
+/// Requests parked behind their link's grant cap are not buffer demand: a
+/// link capped at one grant, with many requests parked on it, keeps the pool
+/// at its first block, and its waiters are still served as the slot frees.
+fn slot_capped_waiters_do_not_grow_the_pool() {
+    profiles(|| {
+        let (mut w, charges) = growing_world_with(1);
+        let (ea, eb) = link_up(&mut w);
+        let held = hold_grants(&mut w, ea, 1, 0);
+        let deadline = w.now() + 600 * SECOND;
+        let until = w.now() + 60 * SECOND;
+        let parked: Vec<_> = (0..GROWN - 1)
+            .map(|i| {
+                let op =
+                    w.a.clients[0].grant_parked(TO_B, ea, [10 + i as u8; 16], 10, deadline, until);
+                pump(&mut w);
+                op
+            })
+            .collect();
+        assert!(parked.iter().all(pending));
+        assert_eq!(w.a.clients[0].grant_waiters(), GROWN - 1);
+
+        for _ in 0..50 {
+            w.clock.advance(page_alloc::SAMPLE_PERIOD);
+            pump(&mut w);
+        }
+        let capped = sizing(&w);
+        assert_eq!(
+            (capped.capacity, capped.blocks, capped.registrations),
+            (BLOCK, 1, 0),
+            "{capped:?}"
+        );
+        assert_eq!(charges.live.load(Ordering::Acquire), 0);
+
+        release_grants(&mut w, eb, held);
+        let first = ready(&parked[0]).unwrap();
+        assert!(first.waited);
+        assert!(parked[1..].iter().all(pending));
+        drop(parked);
+        release_grants(&mut w, eb, vec![first]);
+        pump(&mut w);
+        assert_eq!(w.a.clients[0].grant_waiters(), 0);
+        assert_eq!(sizing(&w).registrations, 0);
+        shutdown(w);
+    });
+}
+
+#[test]
+/// A block that drains while its buffers are out deregisters only after the
+/// last one comes back. Demand that returns first reactivates it instead of
+/// registering a new block.
+fn draining_block_waits_for_its_buffers() {
+    profiles(|| {
+        let (mut w, charges) = growing_world();
+        let (ea, eb) = link_up(&mut w);
+        let mut held = hold_grants(&mut w, ea, 2 * BLOCK, 0);
+        let grown = sizing(&w);
+        assert!(grown.blocks >= 2, "{grown:?}");
+        // Return the first block's buffers and keep the second block's.
+        let late = held.split_off(BLOCK);
+        release_grants(&mut w, eb, held);
+        w.a.clients[0].set_pool_pressure(page_alloc::Pressure::Critical);
+        for _ in 0..5 {
+            w.clock.advance(page_alloc::SAMPLE_PERIOD);
+            pump(&mut w);
+            let draining = sizing(&w);
+            assert_eq!((draining.capacity, draining.draining), (BLOCK, 1));
+            // The draining block is still registered and charged.
+            assert_eq!(draining.registered, 2 * BLOCK, "{draining:?}");
+            assert_eq!(charges.live.load(Ordering::Acquire), 1);
+            // Added blocks with nothing out deregister at once.
+            assert_eq!(draining.deregistrations as usize, grown.blocks - 2);
+        }
+        assert_eq!(w.a.clients[0].buffers(7, BufferState::Free), Some(BLOCK));
+
+        w.a.clients[0].set_pool_pressure(page_alloc::Pressure::Normal);
+        w.clock.advance(page_alloc::SAMPLE_PERIOD);
+        pump(&mut w);
+        let reactivated = sizing(&w);
+        assert_eq!(reactivated.draining, 0, "{reactivated:?}");
+        assert!(reactivated.capacity >= 2 * BLOCK, "{reactivated:?}");
+        assert_eq!(reactivated.registered, reactivated.capacity);
+        assert_eq!(reactivated.deregistrations as usize, grown.blocks - 2);
+
+        w.a.clients[0].set_pool_pressure(page_alloc::Pressure::Critical);
+        w.clock.advance(page_alloc::SAMPLE_PERIOD);
+        pump(&mut w);
+        let draining = sizing(&w);
+        assert_eq!(draining.draining, 1);
+        assert!(draining.registered > draining.capacity, "{draining:?}");
+        release_grants(&mut w, eb, late);
+        pump(&mut w);
+        let done = sizing(&w);
+        assert_eq!((done.blocks, done.draining), (1, 0), "{done:?}");
+        assert_eq!((done.capacity, done.registered), (BLOCK, BLOCK));
+        assert_eq!(done.deregistrations, done.registrations);
+        assert_eq!(charges.live.load(Ordering::Acquire), 0);
+        shutdown(w);
+    });
+}
+
+#[test]
+/// Critical pressure drops every added block at once; a refused charge
+/// keeps the pool at its size, reports no room, and lets parked grants
+/// fail `Overloaded` at their wait limit.
+fn growing_pool_under_pressure_and_refused_charges() {
+    profiles(|| {
+        let (mut w, charges) = growing_world();
+        let (ea, eb) = link_up(&mut w);
+        let held = hold_grants(&mut w, ea, 2 * BLOCK, 0);
+        release_grants(&mut w, eb, held);
+        w.a.clients[0].set_pool_pressure(page_alloc::Pressure::Critical);
+        w.clock.advance(page_alloc::SAMPLE_PERIOD);
+        pump(&mut w);
+        assert_eq!(sizing(&w).capacity, BLOCK);
+        assert_eq!(charges.live.load(Ordering::Acquire), 0);
+        w.a.clients[0].set_pool_pressure(page_alloc::Pressure::Normal);
+
+        charges.open.store(false, Ordering::Release);
+        let held = hold_grants(&mut w, ea, BLOCK, 0);
+        let deadline = w.now() + 5 * SECOND;
+        let until = w.now() + SECOND;
+        let refused = w.a.clients[0].grant_parked(TO_B, ea, [9; 16], 10, deadline, until);
+        pump(&mut w);
+        assert!(pending(&refused));
+        assert_eq!(sizing(&w).capacity, BLOCK);
+        assert_eq!(w.a.clients[0].free_buffers(7), Some((0, BLOCK)));
+        w.clock.advance(SECOND);
+        assert_eq!(wait(&mut w, &refused).err(), Some(Error::Overloaded));
+        release_grants(&mut w, eb, held);
+        shutdown(w);
+    });
+}
+
+#[test]
+/// The room counted as free follows pressure at once: up to the ceiling
+/// under `Normal`, one block above use under `Elevated`, none under
+/// `Critical`, and back to the ceiling once pressure clears.
+fn growing_pool_room_follows_pressure() {
+    profiles(|| {
+        let (mut w, _charges) = growing_world();
+        let (ea, eb) = link_up(&mut w);
+        let free = |w: &World| w.a.clients[0].free_buffers(7);
+        assert_eq!(free(&w), Some((GROWN, GROWN)));
+
+        w.a.clients[0].set_pool_pressure(page_alloc::Pressure::Critical);
+        pump(&mut w);
+        assert_eq!(free(&w), Some((BLOCK, BLOCK)), "critical never grows");
+        let held = hold_grants(&mut w, ea, BLOCK, 0);
+        assert_eq!(sizing(&w).capacity, BLOCK);
+        assert_eq!(free(&w), Some((0, BLOCK)));
+
+        w.a.clients[0].set_pool_pressure(page_alloc::Pressure::Elevated);
+        pump(&mut w);
+        let elevated = sizing(&w);
+        assert!(elevated.capacity <= 2 * BLOCK, "{elevated:?}");
+        assert_eq!(free(&w), Some((BLOCK, 2 * BLOCK)), "one block above use");
+
+        w.a.clients[0].set_pool_pressure(page_alloc::Pressure::Normal);
+        pump(&mut w);
+        assert_eq!(free(&w), Some((GROWN - BLOCK, GROWN)));
+
+        w.a.clients[0].set_pool_pressure(page_alloc::Pressure::Critical);
+        pump(&mut w);
+        let critical = sizing(&w);
+        assert_eq!(
+            free(&w),
+            Some((critical.capacity - BLOCK, critical.capacity)),
+            "{critical:?}"
+        );
+        w.a.clients[0].set_pool_pressure(page_alloc::Pressure::Normal);
+        release_grants(&mut w, eb, held);
+        assert_eq!(free(&w), Some((GROWN, GROWN)));
+        shutdown(w);
+    });
+}
+
+#[test]
+/// A block registers off the owner thread: grants keep flowing while it is
+/// in flight, and closing waits for it, then drains with nothing charged.
+fn block_registration_does_not_block_and_shutdown_waits() {
+    profiles(|| {
+        let (mut w, charges) = growing_world();
+        let (ea, eb) = link_up(&mut w);
+        let held = hold_grants(&mut w, ea, BLOCK, 0);
+        w.sim.hold_registrations(true);
+        let deadline = w.now() + 5 * SECOND;
+        let until = w.now() + 10 * SECOND;
+        let parked = w.a.clients[0].grant_parked(TO_B, ea, [9; 16], 10, deadline, until);
+        pump(&mut w);
+        assert!(pending(&parked));
+        assert_eq!(charges.live.load(Ordering::Acquire), 1, "registering");
+        // The owner keeps serving: a release lands while the block registers.
+        release_grants(&mut w, eb, held);
+        let granted = ready(&parked).unwrap();
+        assert!(granted.waited);
+        w.a.clients[0].close();
+        pump(&mut w);
+        assert!(!w.a.clients[0].drained());
+        w.sim.hold_registrations(false);
+        pump(&mut w);
+        assert!(w.a.clients[0].drained());
+        assert_eq!(charges.live.load(Ordering::Acquire), 0);
+        w.b.clients[0].close();
+        pump(&mut w);
+        assert!(w.b.clients[0].drained());
+        assert_eq!(w.sim.live_resources(), 0);
+    });
+}
+
+#[test]
+/// A block registration in flight when its rail is lost still finishes: the
+/// lost rail drops the block instead of growing, releasing its charge, and
+/// the round then drains.
+fn block_registration_finishes_on_lost_rail() {
+    profiles(|| {
+        let (mut w, charges) = growing_world();
+        let (ea, _) = link_up(&mut w);
+        let _held = hold_grants(&mut w, ea, BLOCK, 0);
+        w.sim.hold_registrations(true);
+        let deadline = w.now() + 5 * SECOND;
+        let until = w.now() + 10 * SECOND;
+        let parked = w.a.clients[0].grant_parked(TO_B, ea, [9; 16], 10, deadline, until);
+        pump(&mut w);
+        assert!(pending(&parked));
+        assert_eq!(charges.live.load(Ordering::Acquire), 1, "registering");
+        w.a.clients[0].report_lost(7);
+        pump(&mut w);
+        assert_eq!(w.a.clients[0].lost_rails(), vec![7]);
+        assert_eq!(charges.live.load(Ordering::Acquire), 1, "still registering");
+        w.sim.hold_registrations(false);
+        pump(&mut w);
+        assert_eq!(charges.live.load(Ordering::Acquire), 0, "block dropped");
+        let lost = sizing(&w);
+        assert_eq!((lost.capacity, lost.blocks), (BLOCK, 1), "{lost:?}");
+        assert_eq!(lost.registrations, 0);
+        w.a.clients[0].close();
+        pump(&mut w);
+        assert!(w.a.clients[0].drained());
+        assert_eq!(w.a.clients[0].drain_blocker(), None);
+        w.b.clients[0].close();
+        pump(&mut w);
+        assert!(w.b.clients[0].drained());
     });
 }

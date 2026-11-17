@@ -14,5 +14,6 @@ simulation = []
 [dependencies]
 futures = "0.3"
 libc = "0.2"
+page-alloc = { path = "../alloc" }
 racer-io = { path = "../io" }
 

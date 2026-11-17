@@ -120,7 +120,7 @@ without waiting on the fds still works.
 `OwnerRole::new` wraps it as a `racer_io::exec::Role` for a dedicated thread;
 `OwnerStop::stop` closes it, and the role finishes once the owner drained.
 
-Activation and `attach_device` pin and register large buffers, which can
+Activation, block growth, and `attach_device` pin and register large buffers, which can
 block for a long time. The owner runs only that native call (`ibv_reg_mr` of
 a page pool, `ibv_reg_dmabuf_mr` of a device pool) on a short-lived helper
 thread (`Registering` in `src/ffi.rs`) and keeps serving commands and
@@ -162,8 +162,8 @@ polls even when no worker command is pending.
 
 ## Page buffer pool
 
-Each selected device owns one page region, split into fixed-size receive
-buffers. In window mode the region is registered `LOCAL_WRITE | MW_BIND`, not
+Each selected device owns page regions (blocks, see below), each split into
+fixed-size receive buffers. In window mode a region is registered `LOCAL_WRITE | MW_BIND`, not
 with broad remote-write access, and a bound memory window grants remote write
 only to its selected range. In registration mode it is registered
 `LOCAL_WRITE`, and each grant registers its buffer for remote write. Control
@@ -205,6 +205,24 @@ access. An unexposed grant can be canceled after its bind completes. An
 exposed grant cannot be reclaimed merely by dropping its arrival operation;
 it needs an ordered receive and invalidate, or a link break.
 
+A rail's host pool is a list of blocks, each its own registered region with
+its own free list. Without `NodeConfig::growth`, activation registers the
+whole pool as one block. With it, activation registers only the first block,
+which stays for the round, and the owner sizes the rail to demand in whole
+blocks (`src/sizing.rs`, see `designs/racer-pool-control.md`): a grant that
+finds the rail empty, or rising demand, starts registering one more block on a
+helper thread, charged through `Growth::charge` when it starts; a falling
+demand marks the newest block draining, so it hands out no more buffers, and
+`Pool::reap` deregisters it on the owner thread once every buffer is free and
+no window holds its region. A later demand rise reactivates a draining block
+before registering a new one. Takes prefer the oldest active block, so the
+newest drains first. `Client::free_buffers` counts the buffers the owner may
+still register as free, so callers that ration buffers see the room growth
+would fill, not only the current registration. That room shrinks under memory
+pressure, to one block above use under `Elevated` and to none under
+`Critical`, and is none while growth waits to retry (see
+`designs/racer-pool-control.md`).
+
 Only `RegisteredPage` exposes receive memory. Its drop can run on another
 thread and returns the buffer to the pool. Dropping a pool with held,
 quarantined, or leaked buffers keeps the region and charge alive rather than
@@ -230,7 +248,9 @@ holds the buffer until it is dropped. A device grant fails with `Unavailable`
 when the rail has no device pool and `Overloaded` when no device buffer is
 free; it never falls back to host memory. A window stays tied to the region
 it first binds, so a link makes device windows on first use and keeps them
-apart from host windows, at most one per concurrent grant.
+apart from host windows, at most one per concurrent grant. Host blocks after
+the first get their own window lists the same way, and a link frees a draining
+block's windows so they release its region.
 
 The CPU never maps or copies device memory. `DevicePage` has no byte API, the
 region reports a null pointer, and sends, writes, and receives that name a

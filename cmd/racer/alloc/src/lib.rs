@@ -174,8 +174,7 @@ mod slab;
 pub mod stream;
 
 pub use demand::{
-    DEFAULT_DECAY_WINDOWS, DEFAULT_INITIAL_TARGET, DEFAULT_MAX_DEPTH, DEFAULT_MIN_DEPTH,
-    DEFAULT_WINDOW, PoolDemand, PoolStats,
+    MAX_HOLD, MIN_HOLD, Plan, PoolStats, Pressure, Provision, ProvisionConfig, SAMPLE_PERIOD,
 };
 use racer_io::ring::IoBuffer;
 pub use segments::{
@@ -184,7 +183,7 @@ pub use segments::{
 pub use slab::{DevicePlacement, Slab};
 use std::{
     alloc::{Layout, alloc_zeroed, dealloc},
-    cell::RefCell,
+    cell::{BorrowMutError, Cell, Ref, RefCell, RefMut},
     collections::VecDeque,
     fmt,
     ptr::NonNull,
@@ -486,6 +485,7 @@ impl Alignment {
                 wipes: WipeCount::default(),
             }),
             pool: Weak::new(),
+            checkout: None,
             length,
         })
     }
@@ -730,69 +730,260 @@ pub struct AlignedBuffer<C: Charge> {
     // Always Some while publicly accessible; taken only by Drop for pool transfer.
     allocation: Option<Allocation<C>>,
 
-    pool: Weak<RefCell<BufferPool<C>>>,
+    pool: Weak<StagingPool<C>>,
+
+    /// Bytes counted as checked out of `pool`, returned when this is dropped.
+    checkout: Option<Checkout>,
 
     length: usize,
 }
 
-/// Small demand-sized free lists, grouped in 64 KiB size classes without locks.
+/// A staging pool's idle list and the bytes checked out of it. The tally sits
+/// outside the list's borrow, so checkouts and returns are counted even while
+/// the list is borrowed.
+pub(crate) struct StagingPool<C: Charge> {
+    idle: RefCell<BufferPool<C>>,
+    in_use: Rc<Cell<usize>>,
+}
+
+impl<C: Charge> Default for StagingPool<C> {
+    fn default() -> Self {
+        Self::new(BufferPool::default())
+    }
+}
+
+impl<C: Charge> StagingPool<C> {
+    pub(crate) fn new(pool: BufferPool<C>) -> Self {
+        Self {
+            in_use: pool.in_use.clone(),
+            idle: RefCell::new(pool),
+        }
+    }
+
+    pub(crate) fn borrow(&self) -> Ref<'_, BufferPool<C>> {
+        self.idle.borrow()
+    }
+
+    pub(crate) fn borrow_mut(&self) -> RefMut<'_, BufferPool<C>> {
+        self.idle.borrow_mut()
+    }
+
+    pub(crate) fn try_borrow_mut(
+        &self,
+    ) -> std::result::Result<RefMut<'_, BufferPool<C>>, BorrowMutError> {
+        self.idle.try_borrow_mut()
+    }
+}
+
+/// Bytes one buffer holds out of a staging pool. Dropping the checkout
+/// returns them exactly once on every path, including unwinding.
+struct Checkout {
+    in_use: Rc<Cell<usize>>,
+    bytes: usize,
+}
+
+impl Checkout {
+    fn new(in_use: &Rc<Cell<usize>>, bytes: usize) -> Self {
+        in_use.set(in_use.get().saturating_add(bytes));
+        Self {
+            in_use: in_use.clone(),
+            bytes,
+        }
+    }
+}
+
+impl Drop for Checkout {
+    fn drop(&mut self) {
+        self.in_use
+            .set(self.in_use.get().saturating_sub(self.bytes));
+    }
+}
+
+/// Demand-sized free lists, grouped in 64 KiB size classes without locks.
 ///
 /// Entries are kept oldest first so maintenance trims the longest-idle storage.
+/// A [`Provision`] controller sizes the pool in 64 KiB granules from the bytes
+/// checked out of it; returns are accepted up to the idle byte budget, and
+/// maintenance frees whole buffers the controller releases, without dropping
+/// below its target unless pressure is elevated, or every idle buffer under
+/// critical pressure.
 pub(crate) struct BufferPool<C: Charge> {
     entries: VecDeque<AlignedBuffer<C>>,
-    demand: PoolDemand,
+    demand: Provision,
+    pressure: Pressure,
     budget: usize,
+    in_use: Rc<Cell<usize>>,
+    idle: usize,
+    counters: StagingCounters,
 }
+
+#[derive(Default)]
+struct StagingCounters {
+    hits: u64,
+    misses: u64,
+    rejects: u64,
+    trimmed: u64,
+}
+
+/// Size class granule of the staging pool, and its controller's unit.
+const STAGING_GRANULE: usize = 64 * 1024;
+
+/// Expected time to allocate and fault in one staging granule.
+const STAGING_ACQUIRE: std::time::Duration = std::time::Duration::from_micros(20);
 
 impl<C: Charge> Default for BufferPool<C> {
     fn default() -> Self {
-        Self {
-            entries: VecDeque::new(),
-            demand: PoolDemand::new(),
-            budget: 128 * 1024 * 1024,
-        }
+        Self::with_budget(128 * 1024 * 1024)
     }
 }
 
 /// Round backing capacity without changing the length of an I/O transfer.
 pub fn buffer_capacity(length: usize) -> Option<usize> {
-    const UNIT: usize = 64 * 1024;
-    length.checked_add(UNIT - 1).map(|n| n / UNIT * UNIT)
+    length
+        .checked_add(STAGING_GRANULE - 1)
+        .map(|n| n / STAGING_GRANULE * STAGING_GRANULE)
 }
 
 impl<C: Charge> BufferPool<C> {
+    fn with_budget(budget: usize) -> Self {
+        let config = ProvisionConfig {
+            unit: 1,
+            floor: 0,
+            ceiling: usize::MAX / STAGING_GRANULE,
+            acquire: STAGING_ACQUIRE,
+        };
+        Self {
+            entries: VecDeque::new(),
+            demand: Provision::new(config),
+            pressure: Pressure::Normal,
+            budget,
+            in_use: Rc::new(Cell::new(0)),
+            idle: 0,
+            counters: StagingCounters::default(),
+        }
+    }
+
     fn bytes(&self) -> usize {
-        self.entries
-            .iter()
-            .map(|b| b.allocation().layout.size())
-            .sum()
+        self.idle
     }
 
+    /// Keep a returned buffer as the newest idle entry.
+    fn push(&mut self, buffer: AlignedBuffer<C>) {
+        self.idle = self.idle.saturating_add(buffer.allocation().layout.size());
+        self.entries.push_back(buffer);
+    }
+
+    /// Remove the idle entry at `index`.
+    fn remove(&mut self, index: usize) -> Option<AlignedBuffer<C>> {
+        let buffer = self.entries.remove(index)?;
+        self.idle = self.idle.saturating_sub(buffer.allocation().layout.size());
+        Some(buffer)
+    }
+
+    fn granules(bytes: usize) -> usize {
+        bytes.div_ceil(STAGING_GRANULE)
+    }
+
+    /// Report the bytes checked out of this pool to the controller.
+    fn observe(&mut self) {
+        self.demand.observe(Self::granules(self.in_use.get()));
+    }
+
+    /// Decide whether to keep a returned buffer of `capacity` bytes whose
+    /// checkout has already been returned. Elevated pressure keeps only the
+    /// controller's remaining target, and critical pressure keeps nothing.
     fn accepts(&mut self, capacity: usize) -> bool {
-        let bytes = self.bytes();
-        self.demand
-            .admit(self.entries.len(), bytes, capacity, self.budget)
+        self.observe();
+        let idle = self.bytes().saturating_add(capacity);
+        let room = match self.pressure {
+            Pressure::Normal => self.budget,
+            Pressure::Elevated => self
+                .demand
+                .target()
+                .saturating_mul(STAGING_GRANULE)
+                .saturating_sub(self.in_use.get())
+                .min(self.budget),
+            // The last target may still count buffers being returned now.
+            Pressure::Critical => 0,
+        };
+        if idle > room {
+            self.counters.rejects = self.counters.rejects.saturating_add(1);
+            return false;
+        }
+        true
     }
 
-    /// Remove the entries chosen by demand maintenance, oldest first.
+    /// Remove the entries chosen by demand maintenance, oldest first. Only
+    /// whole buffers are released. Without pressure, any buffer whose removal
+    /// would leave less than the target is skipped, so the release may fall
+    /// short of the plan; returns of other sizes then back the target and let
+    /// it go later. Elevated pressure refuses those returns while the idle
+    /// bytes exceed the spare target, so it releases whole buffers even below
+    /// the target, which is at most one granule above in-use. Critical
+    /// pressure releases every idle entry regardless of the plan, since idle
+    /// storage can share a rounded granule with a live checkout.
     pub(crate) fn maintain(&mut self, now: std::time::Instant) -> Vec<AlignedBuffer<C>> {
-        let release = self.demand.tick(now, self.entries.len());
-        self.entries.drain(..release).collect()
+        // Checkouts and returns made while the list was borrowed were counted
+        // but not observed.
+        self.observe();
+        let mut provisioned = self.in_use.get().saturating_add(self.bytes());
+        let capacity = Self::granules(provisioned);
+        let plan = self.demand.tick(now, capacity, 0, self.pressure);
+        if self.pressure == Pressure::Critical {
+            return self.take_all().into();
+        }
+        let Plan::Release(units) = plan else {
+            return Vec::new();
+        };
+        let target = self.demand.target();
+        let keep_target = self.pressure == Pressure::Normal;
+        let mut wanted = units.saturating_mul(STAGING_GRANULE);
+        let mut released = Vec::new();
+        let mut index = 0;
+        while wanted > 0 && index < self.entries.len() {
+            let size = self.entries[index].allocation().layout.size();
+            if keep_target && Self::granules(provisioned.saturating_sub(size)) < target {
+                index += 1;
+                continue;
+            }
+            let buffer = self.remove(index).expect("indexed idle entry");
+            provisioned = provisioned.saturating_sub(size);
+            wanted = wanted.saturating_sub(size);
+            released.push(buffer);
+        }
+        self.counters.trimmed = self.counters.trimmed.saturating_add(released.len() as u64);
+        released
     }
 
     /// Remove every idle entry and count it as trimmed.
     pub(crate) fn take_all(&mut self) -> VecDeque<AlignedBuffer<C>> {
         let idle = std::mem::take(&mut self.entries);
-        self.demand.record_trim(idle.len(), 0);
+        self.idle = 0;
+        self.counters.trimmed = self.counters.trimmed.saturating_add(idle.len() as u64);
         idle
     }
 
-    pub(crate) fn set_constrained(&mut self, constrained: bool) {
-        self.demand.set_constrained(constrained);
+    /// Apply memory pressure; [`Self::maintain`] releases the surplus.
+    pub(crate) fn set_pressure(&mut self, pressure: Pressure) {
+        self.pressure = pressure;
     }
 
     pub(crate) fn stats(&self) -> PoolStats {
-        self.demand.stats(self.entries.len(), self.bytes())
+        PoolStats {
+            entries: self.entries.len(),
+            bytes: self.bytes(),
+            in_use: self.in_use.get(),
+            target: self.demand.target().saturating_mul(STAGING_GRANULE),
+            cold: 0,
+            hold: self.demand.effective_hold(),
+            hits: self.counters.hits,
+            misses: self.counters.misses,
+            cold_hits: 0,
+            rejects: self.counters.rejects,
+            trimmed: self.counters.trimmed,
+            constrained: self.pressure != Pressure::Normal,
+            unpooled: 0,
+        }
     }
 
     fn take_for(&mut self, length: usize, charge: &C) -> Option<AlignedBuffer<C>> {
@@ -804,12 +995,11 @@ impl<C: Charge> BufferPool<C> {
                 && charge.covers(capacity)
         });
         let Some(index) = index else {
-            self.demand.record_miss();
+            self.counters.misses = self.counters.misses.saturating_add(1);
             return None;
         };
-        let buffer = self.entries.remove(index);
-        self.demand.record_hit(self.entries.len());
-        buffer
+        self.counters.hits = self.counters.hits.saturating_add(1);
+        self.remove(index)
     }
 }
 
@@ -836,7 +1026,11 @@ impl<C: Charge> AlignedBuffer<C> {
     }
 
     /// Attach a weak return destination without extending the pool's lifetime.
-    pub(crate) fn pooled(mut self, pool: &Rc<RefCell<BufferPool<C>>>) -> Self {
+    pub(crate) fn pooled(mut self, pool: &Rc<StagingPool<C>>) -> Self {
+        self.checkout = Some(Checkout::new(&pool.in_use, self.allocation().layout.size()));
+        if let Ok(mut pool) = pool.try_borrow_mut() {
+            pool.observe();
+        }
         self.pool = Rc::downgrade(pool);
         self
     }
@@ -895,6 +1089,9 @@ impl<C: Charge> AlignedBuffer<C> {
 impl<C: Charge> Drop for AlignedBuffer<C> {
     /// Zeroize and return storage if possible, otherwise let its owner free it.
     fn drop(&mut self) {
+        // Return the checkout before anything that can fail or unwind, so a
+        // borrowed pool or a panicking guard cannot leave these bytes counted.
+        self.checkout = None;
         if self.allocation.is_none() {
             return;
         }
@@ -910,9 +1107,10 @@ impl<C: Charge> Drop for AlignedBuffer<C> {
                 && idle.accepts(self.allocation().layout.size())
             {
                 self.allocation_mut().prepare_pool();
-                idle.entries.push_back(Self {
+                idle.push(Self {
                     allocation: self.allocation.take(),
                     pool: Weak::new(),
+                    checkout: None,
                     length: self.length,
                 });
             }
@@ -949,10 +1147,180 @@ mod buffer_tests {
             const { RefCell::new(Vec::new()) };
     }
 
+    /// Take the newest idle entry through the tallied removal path.
+    fn newest<C: Charge>(pool: &Rc<StagingPool<C>>) -> AlignedBuffer<C> {
+        let mut pool = pool.borrow_mut();
+        let index = pool.entries.len() - 1;
+        pool.remove(index).unwrap()
+    }
+
+    /// Idle bytes, checked against a full scan of the entries.
+    fn tallied<C: Charge>(pool: &Rc<StagingPool<C>>) -> usize {
+        let pool = pool.borrow();
+        let scanned: usize = pool
+            .entries
+            .iter()
+            .map(|b| b.allocation().layout.size())
+            .sum();
+        assert_eq!(pool.bytes(), scanned);
+        scanned
+    }
+
+    #[test]
+    fn idle_tally_follows_returns_reuse_trims_and_reclaim() {
+        let alignment = Alignment::new(64, 1, 1).unwrap();
+        let pool = Rc::new(StagingPool::default());
+        let sizes = [STAGING_GRANULE, 2 * STAGING_GRANULE, 3 * STAGING_GRANULE];
+        let held: Vec<_> = sizes
+            .iter()
+            .map(|&size| alignment.allocate(size, ()).unwrap().pooled(&pool))
+            .collect();
+        assert_eq!(tallied(&pool), 0);
+        drop(held);
+        assert_eq!(tallied(&pool), 6 * STAGING_GRANULE);
+        let reused = pool
+            .borrow_mut()
+            .take_for(2 * STAGING_GRANULE, &())
+            .unwrap();
+        assert_eq!(tallied(&pool), 4 * STAGING_GRANULE);
+        assert!(
+            pool.borrow_mut()
+                .take_for(5 * STAGING_GRANULE, &())
+                .is_none()
+        );
+        assert_eq!(tallied(&pool), 4 * STAGING_GRANULE);
+        drop(reused.pooled(&pool));
+        assert_eq!(tallied(&pool), 6 * STAGING_GRANULE);
+        pool.borrow_mut().set_pressure(Pressure::Critical);
+        let released = pool.borrow_mut().maintain(std::time::Instant::now());
+        assert!(!released.is_empty());
+        assert_eq!(tallied(&pool), pool.borrow().stats().bytes);
+        drop(released);
+        pool.borrow_mut().set_pressure(Pressure::Normal);
+        drop(
+            alignment
+                .allocate(STAGING_GRANULE, ())
+                .unwrap()
+                .pooled(&pool),
+        );
+        assert_eq!(tallied(&pool), pool.borrow().stats().bytes);
+        assert!(tallied(&pool) > 0);
+        let all = pool.borrow_mut().take_all();
+        assert!(!all.is_empty());
+        assert_eq!(tallied(&pool), 0);
+    }
+
+    #[test]
+    fn trimming_mixed_sizes_keeps_the_target() {
+        const MIB: usize = 1024 * 1024;
+        let alignment = Alignment::new(4096, 1, 1).unwrap();
+        let pool = Rc::new(StagingPool::default());
+        drop(alignment.allocate(16 * MIB, ()).unwrap().pooled(&pool));
+        drop(alignment.allocate(MIB, ()).unwrap().pooled(&pool));
+        let now = std::time::Instant::now();
+        let released = pool.borrow_mut().maintain(now);
+        let stats = pool.borrow().stats();
+        assert_eq!(stats.target, 16 * MIB);
+        let sizes: Vec<_> = released
+            .iter()
+            .map(|b| b.allocation().layout.size())
+            .collect();
+        assert_eq!(sizes, [MIB], "the oldest 16 MiB buffer is kept");
+        assert_eq!((stats.entries, tallied(&pool)), (1, 16 * MIB));
+        assert!(pool.borrow_mut().maintain(now).is_empty());
+        assert!(pool.borrow_mut().take_for(16 * MIB, &()).is_some());
+        assert_eq!(pool.borrow().stats().misses, 0);
+    }
+
+    /// A 64 KiB trickle cannot reuse an idle 16 MiB buffer. Under normal
+    /// pressure its returns back the target, so the large buffer can go
+    /// without undershooting. Under elevated pressure those returns are
+    /// refused while the large buffer exceeds the spare target, so it must
+    /// go even though that undershoots.
+    #[test]
+    fn a_small_trickle_does_not_pin_a_large_idle_buffer() {
+        const MIB: usize = 1024 * 1024;
+        let alignment = Alignment::new(4096, 1, 1).unwrap();
+        for pressure in [Pressure::Normal, Pressure::Elevated] {
+            let pool = Rc::new(StagingPool::default());
+            drop(alignment.allocate(16 * MIB, ()).unwrap().pooled(&pool));
+            pool.borrow_mut().set_pressure(pressure);
+            let start = std::time::Instant::now();
+            let mut released = Vec::new();
+            for tick in 1..=100 {
+                let reused = pool.borrow_mut().take_for(STAGING_GRANULE, &());
+                drop(
+                    reused
+                        .unwrap_or_else(|| alignment.allocate(STAGING_GRANULE, ()).unwrap())
+                        .pooled(&pool),
+                );
+                let now = start + SAMPLE_PERIOD * tick;
+                let trimmed = pool.borrow_mut().maintain(now);
+                released.extend(trimmed.iter().map(|b| b.allocation().layout.size()));
+            }
+            assert!(released.contains(&(16 * MIB)), "{pressure:?}: {released:?}");
+            let stats = pool.borrow().stats();
+            assert!(stats.bytes <= STAGING_GRANULE, "{pressure:?}: {stats:?}");
+            assert!(stats.hits > 0, "{pressure:?}: trickle returns are kept");
+        }
+    }
+
+    #[test]
+    fn critical_pressure_refuses_returns_counted_in_the_target() {
+        let live = Rc::new(Cell::new(0));
+        let alignment = Alignment::new(64, 1, 1).unwrap();
+        let pool = Rc::new(StagingPool::default());
+        let buffer = alignment
+            .allocate(STAGING_GRANULE, TrackedCharge::new(&live, STAGING_GRANULE))
+            .unwrap()
+            .pooled(&pool);
+        pool.borrow_mut().set_pressure(Pressure::Critical);
+        assert!(
+            pool.borrow_mut()
+                .maintain(std::time::Instant::now())
+                .is_empty()
+        );
+        assert_eq!(pool.borrow().stats().target, STAGING_GRANULE);
+        drop(buffer);
+        assert_eq!(live.get(), 0);
+        let stats = pool.borrow().stats();
+        assert_eq!((stats.entries, stats.bytes, stats.rejects), (0, 0, 1));
+    }
+
+    /// Idle storage sharing a granule with a live checkout is still released.
+    #[test]
+    fn critical_pressure_drains_idle_within_a_checked_out_granule() {
+        let live = Rc::new(Cell::new(0));
+        let alignment = Alignment::new(4096, 1, 1).unwrap();
+        let pool = Rc::new(StagingPool::default());
+        let held = alignment
+            .allocate(4096, TrackedCharge::new(&live, 4096))
+            .unwrap()
+            .pooled(&pool);
+        drop(
+            alignment
+                .allocate(4096, TrackedCharge::new(&live, 4096))
+                .unwrap()
+                .pooled(&pool),
+        );
+        assert_eq!(tallied(&pool), 4096);
+        assert_eq!(live.get(), 2 * 4096);
+        pool.borrow_mut().set_pressure(Pressure::Critical);
+        let released = pool.borrow_mut().maintain(std::time::Instant::now());
+        assert_eq!(released.len(), 1);
+        drop(released);
+        assert_eq!(live.get(), 4096);
+        let stats = pool.borrow().stats();
+        assert_eq!((stats.entries, stats.bytes, stats.trimmed), (0, 0, 1));
+        assert_eq!(stats.target, STAGING_GRANULE);
+        drop(held);
+        assert_eq!(live.get(), 0);
+    }
+
     #[test]
     fn size_class_reuse_keeps_mismatches_and_full_capacity_charged() {
         let alignment = Alignment::new(4096, 1, 1).unwrap();
-        let pool = Rc::new(RefCell::new(BufferPool::default()));
+        let pool = Rc::new(StagingPool::default());
         let capacity = buffer_capacity(100_001).unwrap();
         let mut buffer = alignment.allocate(capacity, ()).unwrap().pooled(&pool);
         let pointer = buffer.as_slice().as_ptr();
@@ -960,7 +1328,7 @@ mod buffer_tests {
         drop(buffer);
         assert!(pool.borrow_mut().take_for(capacity + 1, &()).is_none());
         let live = Rc::new(Cell::new(0));
-        let charged = Rc::new(RefCell::new(BufferPool::default()));
+        let charged = Rc::new(StagingPool::default());
         drop(
             alignment
                 .allocate(capacity, TrackedCharge::new(&live, capacity))
@@ -980,13 +1348,12 @@ mod buffer_tests {
     }
 
     #[test]
-    fn free_lists_bound_depth_and_bytes_under_size_flood() {
+    fn free_lists_bound_bytes_under_size_flood() {
         let alignment = Alignment::new(64, 1, 1).unwrap();
         for budget in [128 * 1024, 128 * 1024 * 1024] {
             let live = Rc::new(Cell::new(0));
-            let pool = Rc::new(RefCell::new(BufferPool {
+            let pool = Rc::new(StagingPool::new(BufferPool {
                 budget,
-                demand: PoolDemand::new().with_target(8),
                 ..BufferPool::default()
             }));
             for length in (1..=32).map(|n| n * 8192) {
@@ -996,11 +1363,14 @@ mod buffer_tests {
                         .unwrap()
                         .pooled(&pool),
                 );
-                assert!(pool.borrow().entries.len() <= 8);
+                assert!(tallied(&pool) <= budget);
                 assert!(live.get() <= budget);
+                assert_eq!(pool.in_use.get(), 0);
             }
             if budget > 128 * 1024 {
-                assert_eq!(pool.borrow().entries.len(), 8);
+                assert_eq!(pool.borrow().entries.len(), 32);
+            } else {
+                assert!(pool.borrow().stats().rejects > 0);
             }
             drop(pool);
             assert_eq!(live.get(), 0);
@@ -1056,7 +1426,7 @@ mod buffer_tests {
                 false
             }
         }
-        let pool = Rc::new(RefCell::new(BufferPool::default()));
+        let pool = Rc::new(StagingPool::default());
         let mut buffer = Alignment::new(4096, 1, 1)
             .unwrap()
             .allocate(HUGE_PAGE_BYTES, Public)
@@ -1122,19 +1492,19 @@ mod buffer_tests {
     fn secure_wipe_covers_padding_and_skips_clean_pool_lifetimes() {
         let alignment = Alignment::new(4096, 512, 512).unwrap();
         let length = alignment.extent(0, 513).unwrap().length();
-        let pool = Rc::new(RefCell::new(BufferPool::default()));
+        let pool = Rc::new(StagingPool::default());
         let mut buffer = alignment.allocate(length, ()).unwrap().pooled(&pool);
         let wipes = buffer.allocation().wipes.clone();
         assert!(buffer.allocation().clean);
         assert_eq!(buffer.as_slice(), vec![0; 1024]);
         drop(buffer);
         assert_eq!(wipes.get(), 0);
-        buffer = pool.borrow_mut().entries.pop_back().unwrap().pooled(&pool);
+        buffer = newest(&pool).pooled(&pool);
         buffer.as_mut_slice().fill(0xa5);
         assert!(!buffer.allocation().clean);
         drop(buffer);
         assert_eq!(wipes.get(), 1);
-        buffer = pool.borrow_mut().entries.pop_back().unwrap().pooled(&pool);
+        buffer = newest(&pool).pooled(&pool);
         assert_eq!(buffer.as_slice(), vec![0; 1024]);
         assert!(buffer.allocation().clean);
         drop(buffer);
@@ -1145,7 +1515,7 @@ mod buffer_tests {
     /// Runtime pointer writes dirty storage before submission, including padding.
     #[test]
     fn kernel_write_borrow_dirties_clean_reused_storage() {
-        let pool = Rc::new(RefCell::new(BufferPool::default()));
+        let pool = Rc::new(StagingPool::default());
         let alignment = Alignment::new(64, 1, 1).unwrap();
         let mut buffer = alignment.allocate(128, ()).unwrap().pooled(&pool);
         let wipes = buffer.allocation().wipes.clone();
@@ -1159,7 +1529,7 @@ mod buffer_tests {
             assert_eq!(buffer.as_slice()[127], 0x5a);
             drop(buffer);
             assert_eq!(wipes.get(), expected);
-            buffer = pool.borrow_mut().entries.pop_back().unwrap().pooled(&pool);
+            buffer = newest(&pool).pooled(&pool);
             assert_eq!(IoBuffer::bytes(&buffer).unwrap(), &[0; 128]);
         }
         // Even an unused mutable borrow must conservatively require a wipe.
@@ -1324,7 +1694,7 @@ mod buffer_tests {
     #[test]
     fn pool_transfers_allocation_and_primary_charge_but_not_retained_guards() {
         let live = Rc::new(Cell::new(0));
-        let pool = Rc::new(RefCell::new(BufferPool::default()));
+        let pool = Rc::new(StagingPool::default());
         let alignment = Alignment::new(64, 3, 5).unwrap();
         let mut buffer = alignment
             .allocate(15, TrackedCharge::new(&live, 15))
@@ -1339,7 +1709,7 @@ mod buffer_tests {
         drop(buffer);
         assert_eq!(live.get(), 15);
         assert!(weak.upgrade().is_none());
-        let mut reused = pool.borrow_mut().entries.pop_back().unwrap();
+        let mut reused = newest(&pool);
         assert_eq!(reused.as_slice().as_ptr(), pointer);
         assert_eq!(reused.as_slice(), &[0; 15]);
         reused.rebind(TrackedCharge::new(&live, 20)).unwrap();
@@ -1355,8 +1725,8 @@ mod buffer_tests {
         let alignment = Alignment::new(8, 1, 1).unwrap();
         for scenario in 0..4 {
             let live = Rc::new(Cell::new(0));
-            let pool = Rc::new(RefCell::new(BufferPool {
-                demand: PoolDemand::new().with_bounds(0, 1).with_target(1),
+            let pool = Rc::new(StagingPool::new(BufferPool {
+                budget: 8,
                 ..BufferPool::default()
             }));
             let mut buffer = alignment
@@ -1386,7 +1756,7 @@ mod buffer_tests {
                 _ => {
                     let idle = alignment.allocate(8, TrackedCharge::new(&live, 8)).unwrap();
                     let pointer = idle.as_slice().as_ptr();
-                    pool.borrow_mut().entries.push_back(idle);
+                    pool.borrow_mut().push(idle);
                     drop(buffer);
                     assert_eq!(live.get(), 8);
                     assert_eq!(pool.borrow().entries[0].as_slice().as_ptr(), pointer);
@@ -1419,7 +1789,7 @@ mod buffer_tests {
                 }
             }
         }
-        let pool = Rc::new(RefCell::new(BufferPool::default()));
+        let pool = Rc::new(StagingPool::default());
         let called = Rc::new(Cell::new(false));
         let mut buffer = Alignment::new(8, 1, 1)
             .unwrap()
@@ -1468,7 +1838,7 @@ mod buffer_tests {
             }
         }
         let live = Rc::new(Cell::new(2));
-        let pool = Rc::new(RefCell::new(BufferPool::default()));
+        let pool = Rc::new(StagingPool::default());
         let mut buffer = Alignment::new(8, 1, 1)
             .unwrap()
             .allocate(
@@ -1486,10 +1856,89 @@ mod buffer_tests {
             live: live.clone(),
             panic: true,
         }));
+        assert_eq!(pool.in_use.get(), 8);
         assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(buffer))).is_err());
         assert_eq!(live.get(), 0);
         assert!(pool.borrow().entries.is_empty());
+        assert_eq!(pool.in_use.get(), 0);
+        assert_eq!(pool.borrow().stats().in_use, 0);
         assert_eq!(wipes.get(), 1);
+    }
+
+    /// A return while the idle list is borrowed is still counted as returned.
+    #[test]
+    fn return_during_a_borrow_conflict_leaves_no_bytes_in_use() {
+        let alignment = Alignment::new(64, 1, 1).unwrap();
+        let pool = Rc::new(StagingPool::default());
+        let kept = alignment
+            .allocate(STAGING_GRANULE, ())
+            .unwrap()
+            .pooled(&pool);
+        let returned = alignment
+            .allocate(2 * STAGING_GRANULE, ())
+            .unwrap()
+            .pooled(&pool);
+        assert_eq!(pool.borrow().stats().in_use, 3 * STAGING_GRANULE);
+        let borrow = pool.borrow_mut();
+        drop(returned);
+        assert!(borrow.entries.is_empty());
+        drop(borrow);
+        assert_eq!(pool.borrow().stats().in_use, STAGING_GRANULE);
+        assert_eq!(tallied(&pool), 0);
+        assert!(
+            pool.borrow_mut()
+                .maintain(std::time::Instant::now())
+                .is_empty()
+        );
+        assert_eq!(pool.borrow().demand.in_use(), 1);
+        drop(kept);
+        assert_eq!(pool.borrow().stats().in_use, 0);
+        assert_eq!(tallied(&pool), STAGING_GRANULE);
+    }
+
+    /// A checkout while the idle list is borrowed is counted, so its later
+    /// return cannot erase bytes held by other buffers.
+    #[test]
+    fn checkout_during_a_borrow_conflict_is_returned_exactly_once() {
+        let alignment = Alignment::new(64, 1, 1).unwrap();
+        let pool = Rc::new(StagingPool::default());
+        let held = alignment
+            .allocate(STAGING_GRANULE, ())
+            .unwrap()
+            .pooled(&pool);
+        let borrow = pool.borrow_mut();
+        let conflicted = alignment
+            .allocate(2 * STAGING_GRANULE, ())
+            .unwrap()
+            .pooled(&pool);
+        drop(borrow);
+        assert_eq!(pool.borrow().stats().in_use, 3 * STAGING_GRANULE);
+        assert!(
+            pool.borrow_mut()
+                .maintain(std::time::Instant::now())
+                .is_empty()
+        );
+        assert_eq!(pool.borrow().demand.in_use(), 3);
+        drop(conflicted);
+        assert_eq!(pool.borrow().stats().in_use, STAGING_GRANULE);
+        drop(held);
+        assert_eq!(pool.borrow().stats().in_use, 0);
+        assert_eq!(tallied(&pool), 3 * STAGING_GRANULE);
+    }
+
+    /// Repooling a buffer replaces its checkout instead of counting it twice.
+    #[test]
+    fn repooling_counts_a_buffer_once() {
+        let pool = Rc::new(StagingPool::default());
+        let buffer = Alignment::new(64, 1, 1)
+            .unwrap()
+            .allocate(STAGING_GRANULE, ())
+            .unwrap()
+            .pooled(&pool)
+            .pooled(&pool);
+        assert_eq!(pool.in_use.get(), STAGING_GRANULE);
+        drop(buffer);
+        assert_eq!(pool.in_use.get(), 0);
     }
 }
 

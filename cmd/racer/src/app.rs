@@ -2122,7 +2122,9 @@ impl WorkerApplication {
         })
     }
 
-    /// Reclaim idle ciphertext owners before returning unused pool buffers.
+    /// Reclaim idle ciphertext owners to make room for a reservation. Idle
+    /// pooled buffers are charged to the Pool class, not Ciphertext, so they
+    /// are left to the pool's own sizing.
     fn ciphertext_reclaimer(
         admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
         memory: Rc<MemoryCache>,
@@ -2143,7 +2145,6 @@ impl WorkerApplication {
                     |page, ciphertext| writer.discard_idle_copy(page, ciphertext),
                     |cache, bytes| writer.reclaim_ciphertext(cache, bytes),
                 );
-                memory.buffers().reclaim_idle_buffers();
             }
         }
     }
@@ -2349,15 +2350,16 @@ impl WorkerApplication {
         }
     }
 
-    /// Apply one worker-local level change: constrain or release both idle
-    /// pools and, when severity rose, drop retained idle buffers and connections.
+    /// Apply one worker-local level change: set the pressure both idle pools
+    /// size for and, when severity rose, drop retained idle buffers and
+    /// connections.
     fn apply_pressure(&self, transition: crate::pressure::Transition, now: std::time::Instant) {
         let actions = transition.actions;
-        self.constrain_pools(actions.constrain_pools);
+        self.set_pool_pressure(actions.pool_pressure);
         if transition.reclaim {
             if actions.reclaim_idle_buffers {
                 self.memory.buffers().reclaim_idle_buffers();
-                // Constrained maintenance releases idle staging immediately.
+                self.store.writer.reclaim_idle_buffer();
                 self.maintain_pools(now);
             }
             if actions.clear_idle_connections {
@@ -2420,10 +2422,15 @@ impl WorkerApplication {
         metrics.observe_memory(memory);
     }
 
-    /// Hold every idle pool at its minimum while memory is constrained.
-    pub(crate) fn constrain_pools(&self, constrained: bool) {
-        self.store.writer.constrain_staging(constrained);
-        self.memory.buffers().constrain_idle_buffers(constrained);
+    /// Set the memory pressure every idle pool sizes for. The registered RDMA
+    /// pools are node-wide; every worker sees the same level, so setting it
+    /// from each is idempotent.
+    pub(crate) fn set_pool_pressure(&self, pressure: page_alloc::Pressure) {
+        self.store.writer.set_staging_pressure(pressure);
+        self.memory.buffers().set_idle_pressure(pressure);
+        if let Some(links) = &self.links {
+            links.set_pool_pressure(pressure);
+        }
     }
 
     /// Idle statistics of the staging slab pool.

@@ -23,19 +23,28 @@
 //! Page buffers only receive. Writes read caller memory in place through the
 //! device's implicit on-demand paging region, which every pool holds.
 //!
-//! Lifetime: [`RegisteredPage`] holds an `Arc<PoolShared>`. [`Pool`] owns
-//! the regions. When the pool is dropped while any page is still alive, or
-//! while any buffer is `Leaked` or `Quarantined`,
-//! the region is leaked on purpose (never deregistered) and the charge is
+//! Host buffers come in blocks, each its own registered region. The first
+//! block is registered at activation and kept; the owner adds blocks while
+//! demand grows and drains them when it falls (see `designs/racer-pool-control.md`).
+//! Takes use the lowest active block with a free buffer, so the newest
+//! blocks empty first. A draining block hands out nothing; once every buffer
+//! is back and no window holds its region, [`Pool::reap`] deregisters it and
+//! drops its charge. Rails without growth keep a single block.
+//!
+//! Lifetime: [`RegisteredPage`] holds an `Arc<PoolShared>` of its block.
+//! [`Pool`] owns the regions. When the pool is dropped while any page is
+//! still alive, or while any buffer is `Leaked` or `Quarantined`, the regions
+//! are leaked on purpose (never deregistered) and the charges are
 //! quarantined, so the memory stays valid and counted for as long as anything
 //! may use it.
 
 use std::{
+    cell::{Cell, RefCell},
     collections::BTreeMap,
     rc::Rc,
     sync::{
         Arc, Mutex, MutexGuard, PoisonError,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
     },
     task::Waker,
 };
@@ -102,7 +111,38 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// State shared by the owner and every received page.
+/// Buffer counts of a rail's active host blocks, shared by the owner, its
+/// clients, and every received page. A snapshot may be stale by the time it
+/// is used.
+#[derive(Debug, Default)]
+pub(crate) struct Tally {
+    /// Free buffers in active blocks.
+    free: AtomicUsize,
+
+    /// Buffers in active blocks.
+    total: AtomicUsize,
+
+    /// Buffers the owner may still register: the room left under the
+    /// ceiling, at most one block above use under elevated pressure, and
+    /// zero while growth is refused, disabled, or stopped by critical
+    /// pressure.
+    room: AtomicUsize,
+}
+
+impl Tally {
+    /// Free and total buffers, counting [`Self::room`] as free buffers that
+    /// a short wait would register.
+    pub(crate) fn free_and_total(&self) -> (usize, usize) {
+        let room = self.room.load(Ordering::Relaxed);
+        (
+            self.free.load(Ordering::Relaxed) + room,
+            self.total.load(Ordering::Relaxed) + room,
+        )
+    }
+}
+
+/// State shared by the owner and every received page of one block or device
+/// pool.
 pub(crate) struct PoolShared {
     /// Start of the registered memory. Valid while any `Arc` exists (see the
     /// module docs). Null for a device pool.
@@ -119,6 +159,13 @@ pub(crate) struct PoolShared {
 
     /// The owner, woken when a buffer returns.
     owner: AtomicWaker,
+
+    /// Counts of the rail's active blocks, kept with `free`.
+    tally: Arc<Tally>,
+
+    /// Draining: hands out nothing, and its buffers no longer count in
+    /// `tally`. Changed only with `free` locked.
+    draining: AtomicBool,
 }
 
 // SAFETY: `base` is only dereferenced through `RegisteredPage`, which
@@ -128,9 +175,39 @@ unsafe impl Send for PoolShared {}
 unsafe impl Sync for PoolShared {}
 
 impl PoolShared {
+    /// `count` free buffers of `buffer_len` at `base`, counted in `tally`.
+    fn new(
+        base: *mut u8,
+        memory: Option<DeviceMemory>,
+        buffer_len: usize,
+        count: usize,
+        tally: Arc<Tally>,
+    ) -> Self {
+        tally.free.fetch_add(count, Ordering::Relaxed);
+        tally.total.fetch_add(count, Ordering::Relaxed);
+        Self {
+            base,
+            memory,
+            buffer_len,
+            states: (0..count)
+                .map(|_| AtomicU8::new(BufferState::Free.code()))
+                .collect(),
+            // Pop from the end, so reverse to hand out low indices first.
+            free: Mutex::new((0..count as u32).rev().collect()),
+            owner: AtomicWaker::new(),
+            tally,
+            draining: AtomicBool::new(false),
+        }
+    }
+
     /// Number of page buffers.
     pub(crate) fn count(&self) -> usize {
         self.states.len()
+    }
+
+    /// Number of free buffers.
+    fn free_count(&self) -> usize {
+        lock(&self.free).len()
     }
 
     /// Current state of buffer `index`.
@@ -149,9 +226,15 @@ impl PoolShared {
         self.states[index as usize].store(state.code(), Ordering::Release);
     }
 
-    /// Take a free buffer and move it to `state`.
+    /// Take a free buffer and move it to `state`. `None` while draining.
     fn pop(&self, state: BufferState) -> Option<u32> {
-        let index = lock(&self.free).pop()?;
+        let mut free = lock(&self.free);
+        if self.draining.load(Ordering::Relaxed) {
+            return None;
+        }
+        let index = free.pop()?;
+        self.tally.free.fetch_sub(1, Ordering::Relaxed);
+        drop(free);
         debug_assert_eq!(self.state(index), BufferState::Free);
         self.set(index, state);
         Some(index)
@@ -160,8 +243,35 @@ impl PoolShared {
     /// Return buffer `index` to the free list and wake the owner.
     fn push(&self, index: u32) {
         self.set(index, BufferState::Free);
-        lock(&self.free).push(index);
+        let mut free = lock(&self.free);
+        free.push(index);
+        if !self.draining.load(Ordering::Relaxed) {
+            self.tally.free.fetch_add(1, Ordering::Relaxed);
+        }
+        drop(free);
         self.owner.wake();
+    }
+
+    /// Start or stop draining, moving this block's buffers out of or back
+    /// into the tally. False if already in that state.
+    fn set_draining(&self, draining: bool) -> bool {
+        let free = lock(&self.free);
+        if self.draining.swap(draining, Ordering::Relaxed) == draining {
+            return false;
+        }
+        let (free, count) = (free.len(), self.count());
+        if draining {
+            self.tally.free.fetch_sub(free, Ordering::Relaxed);
+            self.tally.total.fetch_sub(count, Ordering::Relaxed);
+        } else {
+            self.tally.free.fetch_add(free, Ordering::Relaxed);
+            self.tally.total.fetch_add(count, Ordering::Relaxed);
+        }
+        true
+    }
+
+    pub(crate) fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::Relaxed)
     }
 
     /// Register the owner's waker for returned buffers.
@@ -185,6 +295,9 @@ impl PoolShared {
 pub(crate) struct Buffer {
     index: u32,
 
+    /// The host block it is in. Zero for a device buffer.
+    block: u32,
+
     /// The device pool it is in, if any.
     device: Option<u32>,
 }
@@ -199,6 +312,11 @@ impl Buffer {
     pub(crate) fn device(&self) -> Option<u32> {
         self.device
     }
+
+    /// The host block it is in. Zero for a device buffer.
+    pub(crate) fn block(&self) -> u32 {
+        self.block
+    }
 }
 
 /// A rail's device pool. See the module docs.
@@ -209,12 +327,52 @@ struct DevicePool {
     region: Option<Rc<NativeRegion>>,
 }
 
-/// The owner's side of one device's page buffers. Not `Send`.
-pub(crate) struct Pool {
+/// One registered region of host page buffers. See the module docs.
+struct Block {
     shared: Arc<PoolShared>,
 
     /// `None` only during drop.
     region: Option<Rc<NativeRegion>>,
+
+    /// The block's own charge, released when it deregisters. `None` for the
+    /// first block, which the pool's charge covers.
+    quota: Option<Arc<GuardOwner>>,
+}
+
+impl Block {
+    /// No buffer is outside `Free` and nothing else holds the block.
+    fn idle(&self) -> bool {
+        Arc::strong_count(&self.shared) == 1 && self.shared.free_count() == self.shared.count()
+    }
+
+    /// The NIC can no longer touch any buffer: each one is free or held by
+    /// a received page, which only the CPU reads.
+    fn nic_quiet(&self) -> bool {
+        quiet(&self.shared)
+    }
+
+    /// Buffers not free.
+    fn in_use(&self) -> usize {
+        self.shared.count() - self.shared.free_count()
+    }
+}
+
+fn quiet(shared: &PoolShared) -> bool {
+    (0..shared.count() as u32)
+        .all(|i| matches!(shared.state(i), BufferState::Free | BufferState::Owned))
+}
+
+/// The owner's side of one device's page buffers. Not `Send`.
+pub(crate) struct Pool {
+    /// Host blocks by id, the first (id 0) from [`Pool::new`].
+    blocks: BTreeMap<u32, Block>,
+
+    next_block: u32,
+
+    buffer_len: usize,
+
+    /// Counts of the active host blocks.
+    tally: Arc<Tally>,
 
     /// The device's implicit on-demand paging region: the local key for
     /// every write source. `None` only during drop.
@@ -224,12 +382,19 @@ pub(crate) struct Pool {
     device: BTreeMap<u32, DevicePool>,
 
     quota: Arc<GuardOwner>,
+
+    /// Host takes refused since [`Pool::take_missed`]: demand the active
+    /// blocks could not meet.
+    missed: Cell<u64>,
+
+    /// The owner's waker, registered on blocks added later.
+    waker: RefCell<Option<Waker>>,
 }
 
 impl Pool {
     /// Split `region` into `region.length() / buffer_len` receive buffers,
-    /// and write from caller memory through `implicit` (from
-    /// [`NativeRegion::implicit`]).
+    /// the first block, and write from caller memory through `implicit`
+    /// (from [`NativeRegion::implicit`]).
     ///
     /// `buffer_len` must be nonzero and at most `u32::MAX`, the region must
     /// hold at least one buffer, and `implicit` must be implicit.
@@ -243,8 +408,38 @@ impl Pool {
             return Err(Error::InvalidConfiguration);
         }
 
-        let count = region.length() / buffer_len;
-        if count == 0 || count > u32::MAX as usize {
+        let mut pool = Self {
+            blocks: BTreeMap::new(),
+            next_block: 0,
+            buffer_len,
+            tally: Arc::default(),
+            implicit: Some(implicit),
+            device: BTreeMap::new(),
+            quota,
+            missed: Cell::new(0),
+            waker: RefCell::new(None),
+        };
+        pool.insert_block(region, None)?;
+        Ok(pool)
+    }
+
+    /// Add `region` as the next host block, charged to `quota`, and return
+    /// its id. Its buffers are taken after those of older blocks.
+    pub(crate) fn add_block(
+        &mut self,
+        region: Rc<NativeRegion>,
+        quota: Arc<GuardOwner>,
+    ) -> Result<u32> {
+        self.insert_block(region, Some(quota))
+    }
+
+    fn insert_block(
+        &mut self,
+        region: Rc<NativeRegion>,
+        quota: Option<Arc<GuardOwner>>,
+    ) -> Result<u32> {
+        let count = region.length() / self.buffer_len;
+        if count == 0 || count > u32::MAX as usize || region.is_device() {
             return Err(Error::InvalidConfiguration);
         }
 
@@ -253,23 +448,21 @@ impl Pool {
             return Err(Error::Io);
         }
 
-        Ok(Self {
-            shared: Arc::new(PoolShared {
-                base,
-                memory: None,
-                buffer_len,
-                states: (0..count)
-                    .map(|_| AtomicU8::new(BufferState::Free.code()))
-                    .collect(),
-                // Pop from the end, so reverse to hand out low indices first.
-                free: Mutex::new((0..count as u32).rev().collect()),
-                owner: AtomicWaker::new(),
-            }),
-            region: Some(region),
-            implicit: Some(implicit),
-            device: BTreeMap::new(),
-            quota,
-        })
+        let shared = PoolShared::new(base, None, self.buffer_len, count, self.tally.clone());
+        if let Some(waker) = self.waker.borrow().as_ref() {
+            shared.register_owner(waker);
+        }
+        let id = self.next_block;
+        self.next_block += 1;
+        self.blocks.insert(
+            id,
+            Block {
+                shared: Arc::new(shared),
+                region: Some(region),
+                quota,
+            },
+        );
+        Ok(id)
     }
 
     /// Split the dma-buf `region` (from [`NativeRegion::dmabuf`]) into
@@ -285,25 +478,25 @@ impl Pool {
             return Err(Error::InvalidConfiguration);
         };
 
-        let buffer_len = self.shared.buffer_len;
-        let count = region.length() / buffer_len;
+        let count = region.length() / self.buffer_len;
         if count == 0 || count > u32::MAX as usize {
             return Err(Error::InvalidConfiguration);
         }
 
+        let shared = PoolShared::new(
+            std::ptr::null_mut(),
+            Some(memory),
+            self.buffer_len,
+            count,
+            Arc::default(),
+        );
+        if let Some(waker) = self.waker.borrow().as_ref() {
+            shared.register_owner(waker);
+        }
         self.device.insert(
             id,
             DevicePool {
-                shared: Arc::new(PoolShared {
-                    base: std::ptr::null_mut(),
-                    memory: Some(memory),
-                    buffer_len,
-                    states: (0..count)
-                        .map(|_| AtomicU8::new(BufferState::Free.code()))
-                        .collect(),
-                    free: Mutex::new((0..count as u32).rev().collect()),
-                    owner: AtomicWaker::new(),
-                }),
+                shared: Arc::new(shared),
                 region: Some(region),
             },
         );
@@ -315,12 +508,20 @@ impl Pool {
         self.device.get(&id).map(|d| &d.shared)
     }
 
-    /// Register the owner's waker for buffers returned to either pool.
+    /// Register the owner's waker for buffers returned to any block or
+    /// device pool, including those added later.
     pub(crate) fn register_owner(&self, waker: &Waker) {
-        self.shared.register_owner(waker);
+        for block in self.blocks.values() {
+            block.shared.register_owner(waker);
+        }
         for device in self.device.values() {
             device.shared.register_owner(waker);
         }
+        *self.waker.borrow_mut() = Some(waker.clone());
+    }
+
+    fn block(&self, id: u32) -> &Block {
+        self.blocks.get(&id).expect("host buffer without block")
     }
 
     /// State shared by `buffer`'s pool.
@@ -332,7 +533,7 @@ impl Pool {
                 .expect("device buffer without pool")
                 .shared
         } else {
-            &self.shared
+            &self.block(buffer.block).shared
         }
     }
 
@@ -342,7 +543,7 @@ impl Pool {
             let device = self.device.get(&id).expect("device buffer without pool");
             device.region.as_ref().unwrap()
         } else {
-            self.region()
+            self.block(buffer.block).region.as_ref().unwrap()
         }
     }
 
@@ -353,6 +554,7 @@ impl Pool {
         let device = self.device.get(&id)?;
         device.shared.pop(state).map(|index| Buffer {
             index,
+            block: 0,
             device: Some(id),
         })
     }
@@ -364,7 +566,7 @@ impl Pool {
         buffer: Buffer,
         len: usize,
     ) -> std::result::Result<DevicePage, Buffer> {
-        if buffer.device.is_none() || len == 0 || len > self.shared.buffer_len {
+        if buffer.device.is_none() || len == 0 || len > self.buffer_len {
             return Err(buffer);
         }
 
@@ -378,14 +580,31 @@ impl Pool {
         })
     }
 
-    /// State shared with received pages.
+    /// State shared with pages of the first block.
+    #[cfg(test)]
     pub(crate) fn shared(&self) -> &Arc<PoolShared> {
-        &self.shared
+        &self.block(0).shared
     }
 
-    /// The registered region.
+    /// The first block's registered region.
+    #[cfg(test)]
     pub(crate) fn region(&self) -> &Rc<NativeRegion> {
-        self.region.as_ref().unwrap()
+        self.block(0).region.as_ref().unwrap()
+    }
+
+    /// Counts of the active host blocks.
+    pub(crate) fn tally(&self) -> &Arc<Tally> {
+        &self.tally
+    }
+
+    /// Length of each page buffer.
+    pub(crate) fn buffer_len(&self) -> usize {
+        self.buffer_len
+    }
+
+    /// State shared by every host block, oldest first.
+    pub(crate) fn blocks(&self) -> impl Iterator<Item = &Arc<PoolShared>> {
+        self.blocks.values().map(|b| &b.shared)
     }
 
     /// The implicit on-demand paging region that write sources go through.
@@ -393,18 +612,114 @@ impl Pool {
         self.implicit.as_ref().unwrap()
     }
 
-    /// Byte offset of `buffer` in the region.
+    /// Byte offset of `buffer` in its region.
     pub(crate) fn offset(&self, buffer: &Buffer) -> u64 {
-        buffer.index as u64 * self.shared.buffer_len as u64
+        buffer.index as u64 * self.buffer_len as u64
     }
 
-    /// Take a free buffer straight into an owner `state`.
+    /// Take a free host buffer straight into an owner `state`, from the
+    /// oldest active block that has one. A refusal counts as missed demand.
     pub(crate) fn take(&self, state: BufferState) -> Option<Buffer> {
         assert!(state.owner_held() && state != BufferState::Quarantined);
-        self.shared.pop(state).map(|index| Buffer {
-            index,
-            device: None,
-        })
+        let taken = self.blocks.iter().find_map(|(&block, b)| {
+            b.shared.pop(state).map(|index| Buffer {
+                index,
+                block,
+                device: None,
+            })
+        });
+        if taken.is_none() {
+            self.missed.set(self.missed.get() + 1);
+        }
+        taken
+    }
+
+    /// Host takes refused since the last call.
+    pub(crate) fn take_missed(&self) -> u64 {
+        self.missed.replace(0)
+    }
+
+    /// Buffers in active host blocks.
+    pub(crate) fn capacity(&self) -> usize {
+        self.tally.total.load(Ordering::Relaxed)
+    }
+
+    /// Buffers in registered host blocks, active and draining: a draining
+    /// block stays registered and charged until it is reaped.
+    pub(crate) fn registered(&self) -> usize {
+        self.blocks.values().map(|b| b.shared.count()).sum()
+    }
+
+    /// Host buffers not free, draining blocks included: the demand the
+    /// blocks are sized to.
+    pub(crate) fn in_use(&self) -> usize {
+        self.blocks.values().map(Block::in_use).sum()
+    }
+
+    /// Set the room the owner may still register, in buffers. See
+    /// [`Tally::free_and_total`].
+    pub(crate) fn set_room(&self, buffers: usize) {
+        self.tally.room.store(buffers, Ordering::Relaxed);
+    }
+
+    /// Host blocks, active and draining.
+    pub(crate) fn block_count(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// Draining host blocks.
+    pub(crate) fn draining_blocks(&self) -> usize {
+        self.blocks
+            .values()
+            .filter(|b| b.shared.is_draining())
+            .count()
+    }
+
+    /// True if host block `id` exists and is not draining.
+    pub(crate) fn block_active(&self, id: u32) -> bool {
+        self.blocks
+            .get(&id)
+            .is_some_and(|b| !b.shared.is_draining())
+    }
+
+    /// Stop handing out the newest active block other than the first.
+    /// Returns its buffer count, or `None` if only the first is active.
+    pub(crate) fn drain_newest(&self) -> Option<usize> {
+        let block = self
+            .blocks
+            .iter()
+            .rev()
+            .find(|(id, b)| **id != 0 && !b.shared.is_draining())?
+            .1;
+        block.shared.set_draining(true);
+        Some(block.shared.count())
+    }
+
+    /// Hand out the oldest draining block again, the cheapest way to grow.
+    /// Returns its buffer count, or `None` if no block is draining.
+    pub(crate) fn reactivate(&self) -> Option<usize> {
+        let block = self.blocks.values().find(|b| b.shared.is_draining())?;
+        block.shared.set_draining(false);
+        Some(block.shared.count())
+    }
+
+    /// Deregister every draining block that is idle and no longer bound to
+    /// a window, dropping its charge. Returns the number of buffers freed.
+    pub(crate) fn reap(&mut self) -> usize {
+        let done: Vec<u32> = self
+            .blocks
+            .iter()
+            .filter(|(_, b)| {
+                b.shared.is_draining()
+                    && b.idle()
+                    && b.region.as_ref().is_some_and(|r| Rc::strong_count(r) == 1)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        done.iter()
+            .filter_map(|id| self.blocks.remove(id))
+            .map(|b| b.shared.count())
+            .sum()
     }
 
     /// Move an owner-held buffer to another owner `state`.
@@ -424,14 +739,15 @@ impl Pool {
         buffer: Buffer,
         len: usize,
     ) -> std::result::Result<RegisteredPage, Buffer> {
-        if buffer.device.is_some() || len == 0 || len > self.shared.buffer_len {
+        if buffer.device.is_some() || len == 0 || len > self.buffer_len {
             return Err(buffer);
         }
 
-        self.shared.set(buffer.index, BufferState::Owned);
+        let shared = self.block(buffer.block).shared.clone();
+        shared.set(buffer.index, BufferState::Owned);
 
         Ok(RegisteredPage {
-            shared: self.shared.clone(),
+            shared,
             index: buffer.index,
             len,
         })
@@ -446,42 +762,47 @@ impl Pool {
     /// True if the NIC can no longer touch any buffer: each one is free or
     /// held by a received page, which only the CPU reads.
     pub(crate) fn nic_quiet(&self) -> bool {
-        let quiet = |shared: &PoolShared| {
-            (0..shared.count() as u32)
-                .all(|i| matches!(shared.state(i), BufferState::Free | BufferState::Owned))
-        };
-        quiet(&self.shared) && self.device.values().all(|d| quiet(&d.shared))
+        self.blocks.values().all(Block::nic_quiet) && self.device.values().all(|d| quiet(&d.shared))
     }
 
     /// Received pages still alive outside the owner.
     pub(crate) fn outstanding(&self) -> usize {
-        Arc::strong_count(&self.shared) - 1
-            + self
-                .device
-                .values()
-                .map(|d| Arc::strong_count(&d.shared) - 1)
-                .sum::<usize>()
+        self.blocks
+            .values()
+            .map(|b| Arc::strong_count(&b.shared) - 1)
+            .chain(
+                self.device
+                    .values()
+                    .map(|d| Arc::strong_count(&d.shared) - 1),
+            )
+            .sum()
     }
 
-    /// True if dropping now would deregister the region: no buffer is
+    /// True if dropping now would deregister every region: no buffer is
     /// outside `Free`.
     pub(crate) fn idle(&self) -> bool {
         let free = |shared: &PoolShared| shared.count_in(BufferState::Free) == shared.count();
         self.outstanding() == 0
-            && free(&self.shared)
+            && self.blocks.values().all(|b| free(&b.shared))
             && self.device.values().all(|d| free(&d.shared))
     }
 }
 
 impl Drop for Pool {
-    /// Deregister when idle. Otherwise leak the region and its charge: the
-    /// NIC or a page may still use the memory.
+    /// Deregister when idle. Otherwise leak the regions and their charges:
+    /// the NIC or a page may still use the memory.
     fn drop(&mut self) {
         if !self.idle() {
             self.quota.quarantine();
             std::mem::forget(self.quota.clone());
-            std::mem::forget(self.region.take());
             std::mem::forget(self.implicit.take());
+            for block in self.blocks.values_mut() {
+                if let Some(quota) = block.quota.take() {
+                    quota.quarantine();
+                    std::mem::forget(quota);
+                }
+                std::mem::forget(block.region.take());
+            }
             for device in self.device.values_mut() {
                 std::mem::forget(device.region.take());
             }
@@ -519,11 +840,12 @@ impl RegisteredPage {
         self.len == 0
     }
 
-    /// The free and total buffer counts of the pool this page came from, a
-    /// snapshot that may be stale by the time it is used. This page is not
-    /// free, so `free < total`.
+    /// The free and total buffer counts of the rail this page came from, a
+    /// snapshot that may be stale by the time it is used. Both count the
+    /// buffers the owner may still register under the current pressure (see
+    /// [`Tally::free_and_total`]).
     pub fn pool_free(&self) -> (usize, usize) {
-        (lock(&self.shared.free).len(), self.shared.count())
+        self.shared.tally.free_and_total()
     }
 }
 

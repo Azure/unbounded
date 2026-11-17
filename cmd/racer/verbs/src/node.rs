@@ -22,13 +22,15 @@ use std::{
 };
 
 use futures::task::AtomicWaker;
+use page_alloc::{Pressure, SAMPLE_PERIOD};
 
 use crate::{
     DeviceMemory, Endpoint, Error, Guard, GuardOwner, PortInfo, Result, Selection,
     channel::{self, Completer, Op, op},
     ffi::{self, Access, NativeDevice, NativeRegion, RegisterWake, Registering},
     link::{self, Break, Epoch, Granted, Limits, Link, Phase, Role, Source},
-    pool::{BufferState, Pool, PoolShared},
+    pool::{BufferState, Pool, PoolShared, Tally},
+    sizing::{Growth, PoolSizing, PoolSizings, RailSizing, SizingStats},
 };
 
 /// Commands each worker may queue before [`Error::Overloaded`].
@@ -213,8 +215,14 @@ pub struct NodeConfig {
     pub idle: Duration,
 
     /// Charged for every native object of this activation; leaks with any
-    /// leaked object.
+    /// leaked object. With [`NodeConfig::growth`] it covers only the first
+    /// block of each pool; later blocks carry their own charge.
     pub guard: Guard,
+
+    /// Size each device's pool to demand: register one block at activation
+    /// and add or drop blocks up to `pool_bytes` as demand changes. `None`
+    /// registers `pool_bytes` at activation and keeps it.
+    pub growth: Option<Growth>,
 }
 
 /// How a command names its link.
@@ -340,11 +348,63 @@ struct Cached {
     links: Arc<LinkMap>,
 }
 
+fn pressure_code(pressure: Pressure) -> u8 {
+    match pressure {
+        Pressure::Normal => 0,
+        Pressure::Elevated => 1,
+        Pressure::Critical => 2,
+    }
+}
+
+fn pressure_of(code: u8) -> Pressure {
+    match code {
+        0 => Pressure::Normal,
+        1 => Pressure::Elevated,
+        _ => Pressure::Critical,
+    }
+}
+
+/// A rail's host page pool as clients see it.
+struct RailPool {
+    /// Free and total buffers of the active blocks, and the room to grow.
+    tally: Arc<Tally>,
+
+    /// Active blocks only: a draining block deregisters once nothing else
+    /// holds it.
+    blocks: Vec<Arc<PoolShared>>,
+
+    /// Set when the pool is sized to demand.
+    sizing: Option<Arc<SizingStats>>,
+}
+
+impl RailPool {
+    fn of(pool: &Pool, sizing: Option<&RailSizing>) -> Self {
+        Self {
+            tally: pool.tally().clone(),
+            blocks: pool
+                .blocks()
+                .filter(|shared| !shared.is_draining())
+                .cloned()
+                .collect(),
+            sizing: sizing.map(|s| s.stats().clone()),
+        }
+    }
+}
+
 /// State shared by the owner and every client.
 struct NodeShared {
     links: Snapshot,
 
-    pools: RwLock<BTreeMap<u16, Arc<PoolShared>>>,
+    /// Host page pools by rail, republished when blocks change.
+    pools: RwLock<BTreeMap<u16, RailPool>>,
+
+    /// Activations whose [`Self::pools`] were installed, bumped under its
+    /// write lock, so a reader holding the read lock sees the round of the
+    /// table it reads.
+    pools_round: AtomicU64,
+
+    /// [`Client::set_pool_pressure`] as `Pressure as u8`.
+    pool_pressure: AtomicU8,
 
     /// Device pools by rail and pool id, once attached.
     device_pools: RwLock<BTreeMap<(u16, u32), Arc<PoolShared>>>,
@@ -566,6 +626,8 @@ pub fn node(workers: usize) -> Result<(Vec<Client>, OwnerPort)> {
     let shared = Arc::new(NodeShared {
         links: Snapshot::new(),
         pools: RwLock::new(BTreeMap::new()),
+        pools_round: AtomicU64::new(0),
+        pool_pressure: AtomicU8::new(0),
         device_pools: RwLock::new(BTreeMap::new()),
         prefetch: RwLock::new(BTreeMap::new()),
         breaks: Mutex::new(Vec::new()),
@@ -983,16 +1045,51 @@ impl Client {
     /// Page buffers of `rail` in `state`, for diagnostics.
     pub fn buffers(&self, rail: u16, state: BufferState) -> Option<usize> {
         let pools = self.shared.pools.try_read().ok()?;
-        Some(pools.get(&rail)?.count_in(state))
+        let pool = pools.get(&rail)?;
+        Some(pool.blocks.iter().map(|block| block.count_in(state)).sum())
     }
 
     /// Free and total page buffers of `rail`'s host pool, a snapshot that may
-    /// be stale by the time it is used. `None` without that pool, or while
-    /// the pool table is being changed.
+    /// be stale by the time it is used. Both include the buffers a pool sized
+    /// to demand may still register: up to its ceiling without pressure, at
+    /// most one block above use under [`Pressure::Elevated`], and none under
+    /// [`Pressure::Critical`] or while growth waits to retry. `None` without
+    /// that pool, or while the pool table is being changed.
     pub fn free_buffers(&self, rail: u16) -> Option<(usize, usize)> {
         let pools = self.shared.pools.try_read().ok()?;
-        let pool = pools.get(&rail)?;
-        Some((pool.count_in(BufferState::Free), pool.count()))
+        Some(pools.get(&rail)?.tally.free_and_total())
+    }
+
+    /// How `rail`'s host pool is sized to demand. `None` without that pool,
+    /// or when it was activated without [`NodeConfig::growth`].
+    pub fn pool_sizing(&self, rail: u16) -> Option<PoolSizing> {
+        let pools = self.shared.pools.try_read().ok()?;
+        Some(pools.get(&rail)?.sizing.as_ref()?.snapshot())
+    }
+
+    /// How every rail's host pool is sized to demand, from one read of the
+    /// pool table, so the rails and their round always belong together.
+    /// Rails activated without [`NodeConfig::growth`] are left out. `None`
+    /// while the pool table is being changed.
+    pub fn pool_sizings(&self) -> Option<PoolSizings> {
+        let pools = self.shared.pools.try_read().ok()?;
+        Some(PoolSizings {
+            round: self.shared.pools_round.load(Ordering::Relaxed),
+            rails: pools
+                .iter()
+                .filter_map(|(rail, pool)| Some((*rail, pool.sizing.as_ref()?.snapshot())))
+                .collect(),
+        })
+    }
+
+    /// Memory pressure for pools sized to demand: under pressure they keep
+    /// less spare capacity, release it sooner, and report less room to grow
+    /// in [`Self::free_buffers`]; the owner republishes it on its next pass.
+    pub fn set_pool_pressure(&self, pressure: Pressure) {
+        let code = pressure_code(pressure);
+        if self.shared.pool_pressure.swap(code, Ordering::Relaxed) != code {
+            self.shared.owner.wake();
+        }
     }
 
     /// Page buffers of `rail`'s device pool `id` in `state`, for
@@ -1230,6 +1327,15 @@ pub struct Owner {
 
     /// No parked request expires before this; `None` with none parked.
     park_expiry: Option<Instant>,
+
+    /// Block size and charge of the round's pools when sized to demand.
+    growth: Option<Growth>,
+
+    /// Demand sizing of each rail's host pool, with [`Self::growth`].
+    sizing: BTreeMap<u16, RailSizing>,
+
+    /// Most buffers a pool sized to demand may hold.
+    pool_buffers: usize,
 }
 
 /// A grant request parked until a grant slot or page buffer frees.
@@ -1248,6 +1354,36 @@ struct Waiter {
     until: Instant,
 
     done: Completer<Granted>,
+}
+
+/// Parked requests in `queue` that a free buffer would let through: each
+/// ready link's live waiters, up to its free grant slots. A request blocked
+/// by its link's grant cap, or whose link is gone, would take no buffer.
+fn buffer_waiters(
+    queue: &VecDeque<Waiter>,
+    links: &BTreeMap<LinkKey, Link>,
+    now: Instant,
+) -> usize {
+    let mut slots: BTreeMap<LinkKey, usize> = BTreeMap::new();
+
+    queue
+        .iter()
+        .filter(|waiter| now < waiter.until && !waiter.done.is_abandoned())
+        .filter(|waiter| {
+            let Some(link) = links
+                .get(&waiter.key)
+                .filter(|link| link.epoch() == waiter.epoch && link.phase() == Phase::Ready)
+            else {
+                return false;
+            };
+            let free = slots
+                .entry(waiter.key)
+                .or_insert_with(|| link.free_grant_slots());
+            let counted = *free > 0;
+            *free = free.saturating_sub(1);
+            counted
+        })
+        .count()
 }
 
 impl Owner {
@@ -1285,6 +1421,9 @@ impl Owner {
             commands: Vec::new(),
             waiters: BTreeMap::new(),
             park_expiry: None,
+            growth: None,
+            sizing: BTreeMap::new(),
+            pool_buffers: 0,
         }
     }
 
@@ -1360,6 +1499,16 @@ impl Owner {
         }
         if let Some(t) = self.park_expiry {
             at(t);
+        }
+        // Sizing samples demand while pools are in use or hold surplus.
+        // Finished registrations wake the owner; the sample timer backs
+        // that up.
+        if self.sizing.iter().any(|(rail, sizing)| {
+            self.devices
+                .get(rail)
+                .is_some_and(|device| sizing.busy(&device.pool))
+        }) {
+            at(now + SAMPLE_PERIOD);
         }
         next
     }
@@ -1442,6 +1591,10 @@ impl Owner {
         self.progress(now);
         self.reap();
         self.serve_waiters(now);
+        if self.size_pools(now) {
+            // Blocks added or reactivated: serve who waits for them now.
+            self.serve_waiters(now);
+        }
         self.reap_retired();
 
         if self.closing {
@@ -1470,7 +1623,9 @@ impl Owner {
             || (self.closing && !self.leaked && !self.drained())
             || self.expiry.is_some()
             || !self.waiters.is_empty();
-        let external = self.activating.is_some() || !self.attaching.is_empty();
+        let external = self.activating.is_some()
+            || !self.attaching.is_empty()
+            || self.sizing.values().any(RailSizing::registering);
         assert!(
             !missing_wake(pending, self.next_wake(), external),
             "rdma owner has pending work and no armed wake source"
@@ -1752,6 +1907,7 @@ impl Owner {
             return;
         }
 
+        self.growth = None;
         if self
             .quota
             .take()
@@ -1844,6 +2000,79 @@ impl Owner {
         }
     }
 
+    /// Size each rail's host pool to its demand (see [`RailSizing`]): finish
+    /// block registrations, add or drain blocks, and deregister drained ones.
+    /// True if a rail gained buffers.
+    fn size_pools(&mut self, now: Instant) -> bool {
+        let Some(growth) = self.growth.as_mut() else {
+            return false;
+        };
+        if self.sizing.is_empty() {
+            return false;
+        }
+
+        #[cfg(any(test, feature = "simulation"))]
+        let _simulation = self
+            .simulation
+            .as_ref()
+            .map(crate::simulation::Simulation::enter);
+        let wake = {
+            let shared = self.shared.clone();
+            Arc::new(move || shared.owner.wake()) as RegisterWake
+        };
+        let pressure = pressure_of(self.shared.pool_pressure.load(Ordering::Relaxed));
+        let mut grew = false;
+
+        for (rail, sizing) in &mut self.sizing {
+            let Some(device) = self.devices.get_mut(rail) else {
+                continue;
+            };
+            // A lost rail is not sized, but a registration in flight on it
+            // still has to finish: stepping it as closing drops the block.
+            let lost = self.lost.contains(rail);
+            let waiting = self
+                .waiters
+                .get(rail)
+                .map_or(0, |queue| buffer_waiters(queue, &self.links, now));
+            let capacity = device.pool.capacity();
+            let changes = sizing.step(
+                &mut device.pool,
+                &device.device,
+                &mut *growth.charge,
+                &wake,
+                waiting,
+                pressure,
+                self.closing || lost,
+                now,
+            );
+            if lost {
+                sizing.publish(&device.pool, pressure, true);
+                continue;
+            }
+            if changes.drained {
+                for (key, link) in &mut self.links {
+                    if key.rail == *rail {
+                        link.retire_windows(&device.pool);
+                    }
+                }
+            }
+            let reaped = sizing.reap(&mut device.pool);
+            if changes.blocks || reaped {
+                let mut pools = self
+                    .shared
+                    .pools
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if let Some(entry) = pools.get_mut(rail) {
+                    *entry = RailPool::of(&device.pool, Some(sizing));
+                }
+            }
+            sizing.publish(&device.pool, pressure, self.closing);
+            grew |= device.pool.capacity() > capacity;
+        }
+        grew
+    }
+
     /// Attach a registered dma-buf region as `rail`'s device pool `id`.
     fn attach_region(&mut self, rail: u16, id: u32, region: Rc<NativeRegion>) -> Result<usize> {
         if self.closing {
@@ -1925,11 +2154,18 @@ impl Owner {
 
         let quota = self.quota.clone().ok_or(Error::Unavailable)?;
         let mut built = BTreeMap::new();
+        let mut sizing = BTreeMap::new();
 
         for pending in devices {
             let region = pending.region.ok_or(Error::Unavailable)??;
             let implicit = pending.implicit.ok_or(Error::Unavailable)??;
             let pool = Pool::new(region, implicit, buffer_len, quota.clone())?;
+            if self.growth.is_some() {
+                sizing.insert(
+                    pending.tag,
+                    RailSizing::new(pool.capacity(), self.pool_buffers),
+                );
+            }
             built.insert(
                 pending.tag,
                 DeviceState {
@@ -1949,8 +2185,9 @@ impl Owner {
             pools.extend(
                 built
                     .iter()
-                    .map(|(rail, d)| (*rail, d.pool.shared().clone())),
+                    .map(|(rail, d)| (*rail, RailPool::of(&d.pool, sizing.get(rail)))),
             );
+            self.shared.pools_round.fetch_add(1, Ordering::Relaxed);
         }
 
         {
@@ -1968,7 +2205,14 @@ impl Owner {
             );
         }
 
+        let pressure = pressure_of(self.shared.pool_pressure.load(Ordering::Relaxed));
+        for (rail, rail_sizing) in &sizing {
+            if let Some(device) = built.get(rail) {
+                rail_sizing.publish(&device.pool, pressure, false);
+            }
+        }
         self.devices = built;
+        self.sizing = sizing;
         self.settings = Some(settings);
         Ok(())
     }
@@ -2000,7 +2244,7 @@ impl Owner {
     #[allow(clippy::type_complexity)]
     fn start_activation(
         &mut self,
-        config: NodeConfig,
+        mut config: NodeConfig,
     ) -> Result<(Vec<Selection>, Vec<PendingDevice>, usize, Settings)> {
         if self.settings.is_some() || !self.devices.is_empty() || self.activating.is_some() {
             return Err(Error::InvalidRequest);
@@ -2014,6 +2258,11 @@ impl Owner {
             || config.max_links == 0
             || link::depths(config.grants_per_link).is_none()
             || config.idle.is_zero()
+            || config.growth.as_ref().is_some_and(|growth| {
+                growth.block_bytes == 0
+                    || !growth.block_bytes.is_multiple_of(config.buffer_len)
+                    || growth.block_bytes > config.pool_bytes
+            })
         {
             return Err(Error::InvalidConfiguration);
         }
@@ -2065,7 +2314,13 @@ impl Owner {
         }
 
         let mut devices: Vec<Option<NativeDevice>> = discovered.into_iter().map(Some).collect();
-        let count = config.pool_bytes / config.buffer_len;
+        let ceiling = config.pool_bytes / config.buffer_len;
+        // A pool sized to demand registers its first block now and grows
+        // later; otherwise the whole pool registers now.
+        let count = config
+            .growth
+            .as_ref()
+            .map_or(ceiling, |growth| growth.block_bytes / config.buffer_len);
         let mut pending = Vec::new();
 
         for selection in &selected {
@@ -2149,6 +2404,8 @@ impl Owner {
             },
             max_links: config.max_links,
         };
+        self.growth = config.growth.take();
+        self.pool_buffers = ceiling;
         Ok((selected, pending, config.buffer_len, settings))
     }
 
@@ -2533,7 +2790,10 @@ impl Owner {
             return;
         }
 
-        if self.activating.is_some() || !self.attaching.is_empty() {
+        if self.activating.is_some()
+            || !self.attaching.is_empty()
+            || self.sizing.values().any(RailSizing::registering)
+        {
             self.block(DrainBlocker::Registering);
             return;
         }
@@ -2582,6 +2842,8 @@ impl Owner {
             return;
         }
 
+        self.sizing.clear();
+        self.growth = None;
         for (_, device) in std::mem::take(&mut self.devices) {
             if !device.pool.idle() {
                 self.retired.push(device);

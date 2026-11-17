@@ -295,6 +295,13 @@ fn constants_and_keys() {
     assert_eq!(grants_per_link(buffer_count(32 << 30) / 8), 227);
     assert_eq!(grants_per_link(usize::MAX), GRANTS_PER_LINK_CAP);
     const { assert!(GRANTS_PER_LINK_CAP <= crate::rdma::link_setup::MAX_GRANTS_PER_LINK) };
+    // Blocks are an eighth of the rail, within 2..=32 buffers and the rail.
+    assert_eq!(block_buffers(1), 1);
+    assert_eq!(block_buffers(2), 2);
+    assert_eq!(block_buffers(7), 2);
+    assert_eq!(block_buffers(56), 7);
+    assert_eq!(block_buffers(227), 28);
+    assert_eq!(block_buffers(1000), 32);
 
     let key = link_key(&node_id(1), RAIL);
     assert_eq!(key, link_key(&node_id(1), RAIL));
@@ -1067,6 +1074,102 @@ pub(crate) mod send_in_place {
         let (w, ma, _) = metered(w);
         w.a.links.record_http_fallback();
         assert_eq!(ma.count(Event::RdmaHttpFallback), 1);
+    }
+
+    #[test]
+    /// The pool gauges sum the rails' sizing: one block registered at
+    /// activation is both the active and the registered size.
+    fn pool_sizing_is_published() {
+        let w = world();
+        let (w, ma, _) = metered(w);
+        w.a.links.sync_link_metrics();
+        let (_, sizing) = w.a.links.pool_sizing().unwrap();
+        assert_eq!(
+            (sizing.capacity, sizing.registered, sizing.blocks),
+            (2, 2, 1)
+        );
+        assert_eq!(
+            ma.gauge(Gauge::RdmaPoolCapacityBytes),
+            2 * BUFFER_LEN as u64
+        );
+        assert_eq!(
+            ma.gauge(Gauge::RdmaPoolRegisteredBytes),
+            2 * BUFFER_LEN as u64
+        );
+        assert_eq!(ma.gauge(Gauge::RdmaPoolInUseBytes), 0);
+        assert_eq!(ma.gauge(Gauge::RdmaPoolBlocks), 1);
+        assert_eq!(ma.gauge(Gauge::RdmaPoolDrainingBlocks), 0);
+        let mut out = String::new();
+        ma.write_prometheus(&mut out).unwrap();
+        let registered = format!("racer_rdma_pool_registered_bytes {}", 2 * BUFFER_LEN);
+        assert!(out.contains(&registered), "missing {registered}");
+    }
+
+    #[test]
+    /// Block counts are recorded once per activation round: a sample missing
+    /// while the pool table changes keeps the last gauges, a lower sum
+    /// within a round is not a reset, and a new round counts from zero.
+    fn pool_counts_survive_incomplete_samples() {
+        let w = world();
+        let (w, ma, _) = metered(w);
+        let links = &w.a.links;
+        let sample = |round, registrations, deregistrations, blocks| {
+            Some((
+                round,
+                rdma_verbs::PoolSizing {
+                    blocks,
+                    registrations,
+                    deregistrations,
+                    ..Default::default()
+                },
+            ))
+        };
+        let counts = || {
+            (
+                ma.count(Event::RdmaPoolRegistrations),
+                ma.count(Event::RdmaPoolDeregistrations),
+            )
+        };
+        links.publish_pool_sizing(&ma, sample(1, 5, 0, 6));
+        assert_eq!(counts(), (5, 0));
+        links.publish_pool_sizing(&ma, None);
+        assert_eq!(ma.gauge(Gauge::RdmaPoolBlocks), 6, "kept");
+        links.publish_pool_sizing(&ma, sample(1, 0, 0, 1));
+        assert_eq!(ma.gauge(Gauge::RdmaPoolBlocks), 1);
+        links.publish_pool_sizing(&ma, sample(1, 5, 0, 6));
+        assert_eq!(counts(), (5, 0), "not counted twice");
+        links.publish_pool_sizing(&ma, sample(1, 7, 3, 5));
+        assert_eq!(counts(), (7, 3));
+        links.publish_pool_sizing(&ma, sample(2, 2, 1, 2));
+        assert_eq!(counts(), (9, 4), "a new round counts from zero");
+        links.publish_pool_sizing(&ma, sample(2, 2, 1, 2));
+        assert_eq!(counts(), (9, 4));
+    }
+
+    #[test]
+    /// The pool sizing names its activation round: closing keeps the round
+    /// and reactivating starts the next one.
+    fn pool_sizing_round_follows_activation() {
+        let mut w = world();
+        let env = w.env.clone();
+        let (first, _) = w.a.links.pool_sizing().unwrap();
+        w.a.links.close();
+        pump!(w);
+        assert!(w.a.owner.drained());
+        let (closed, sizing) = w.a.links.pool_sizing().unwrap();
+        assert_eq!(closed, first);
+        assert_eq!(sizing, rdma_verbs::PoolSizing::default(), "no active rails");
+        let admission = w.a.admission.clone();
+        let rails = drive!(
+            w,
+            w.a.links
+                .activate(vec![mapping(1)], &admission, 2 * BUFFER_LEN, &scope(&env))
+        )
+        .unwrap();
+        assert_eq!(rails.len(), 1);
+        let (second, sizing) = w.a.links.pool_sizing().unwrap();
+        assert_eq!(second, first + 1);
+        assert_eq!((sizing.blocks, sizing.registrations), (1, 0));
     }
 
     #[test]

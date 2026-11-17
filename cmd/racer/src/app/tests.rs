@@ -5305,18 +5305,20 @@ fn maintain_pools_releases_idle_aligned_storage() {
     };
     drop([take(), take()]);
     assert_eq!(worker.buffer_pool_stats().bytes, 2 * capacity);
-    let window = page_alloc::DEFAULT_WINDOW;
-    let start = std::time::Instant::now();
-    worker.maintain_pools(start);
-    // Reuse within each window retains the storage.
-    for turn in 1..=3 {
+    let step = page_alloc::SAMPLE_PERIOD;
+    let mut now = std::time::Instant::now();
+    worker.maintain_pools(now);
+    // Steady reuse retains the storage.
+    for _ in 0..100 {
+        now += step;
         drop([take(), take()]);
-        worker.maintain_pools(start + window * turn);
+        worker.maintain_pools(now);
         assert_eq!(worker.buffer_pool_stats().bytes, 2 * capacity);
     }
-    // An idle worker releases it within a few windows.
-    for turn in 4..=6 {
-        worker.maintain_pools(start + window * turn);
+    // An idle worker releases it once the hold time passes.
+    for _ in 0..100 {
+        now += step;
+        worker.maintain_pools(now);
     }
     assert_eq!(worker.buffer_pool_stats().bytes, 0);
 }
@@ -5409,8 +5411,8 @@ fn maintain_pools_keeps_idle_cache_entries_until_pressure_then_frees_aligned_sto
     assert!(worker.memory.ciphertext(&page_id).unwrap().is_none());
     // The released buffer is pooled, then decays once nothing reuses it.
     assert!(worker.buffer_pool_stats().bytes > 0);
-    for _ in 0..6 {
-        now += page_alloc::DEFAULT_WINDOW;
+    for _ in 0..100 {
+        now += page_alloc::SAMPLE_PERIOD;
         worker.maintain_pools(now);
     }
     assert_eq!(worker.buffer_pool_stats().bytes, 0);
