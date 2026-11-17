@@ -72,6 +72,7 @@ Extra config keys, all optional:
 |---|---|---|
 | `uri` | from `racer-model.json` | The `racer://` model location. |
 | `staging_bytes` | 256 MiB | Size of each GPU staging buffer. |
+| `page_size` | 16 MiB | Racer page size for the cache. Set the same value as `ClusterCache.spec.pageSize`. |
 | `concurrency` | 4 | Staging buffers, and reads in flight. |
 | `clone` | true | Copy each tensor out of staging before handing it to vLLM. |
 | `socket` | none | Client socket path. |
@@ -96,7 +97,8 @@ the GPU reads section of the Racer reference.
 3. For each file, read the 8-byte header length and the JSON header. All
    headers are read before any tensor data.
 4. Group tensors into ranges that fit a staging buffer. Each range ends on a
-   Racer page boundary (16 MiB), so no page is read twice. A tensor that
+   Racer page boundary (the `page_size` setting, 16 MiB by default), so no page
+   is read twice. A tensor that
    crosses the boundary is split across two ranges and joined again before vLLM
    sees it. Read each range into
    GPU memory with `gpu-read`. If the dataplane cannot do that, use

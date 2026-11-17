@@ -524,6 +524,9 @@ DaemonSet in `unbounded-system`:
 - It sets `GANTRY_RACER_ENABLED=true`.
 - It mounts the Racer sockets from `/run/racer/gantry/client` and
   `/run/racer/gantry/origin`.
+- When the `gantry` cache sets `spec.pageSize`, it sets
+  `GANTRY_RACER_PAGE_SIZE` to that value so the Gantry client and origin use the
+  same page boundaries as the cache.
 - It copies node affinity, node selector, and tolerations from the
   `racer` DaemonSet. Gantry then runs on every Racer node, so each
   node can serve origin reads for the cache.

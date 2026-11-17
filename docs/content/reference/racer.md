@@ -72,10 +72,10 @@ cache. To change the size, delete the ClusterCache and create a new one. The new
 cache has a new UID and starts cold.
 
 Racer does not advertise the page size to clients; there is no page-size
-response header. Configure every client to match the cache out of band:
-`ClientConfig.PageSize` in the Go SDK, `page_size` in the Python client, and
-`--page-size` in `racer-object`. Each defaults to 16 MiB. A mismatch affects
-subscriptions that span a page boundary.
+response header. Configure every client and origin server to match the cache out
+of band: `ClientConfig.PageSize` and `OriginConfig.PageSize` in the Go SDK,
+`page_size` in the Python client, and `--page-size` in `racer-object`. Each
+defaults to 16 MiB. A mismatch affects subscriptions that span a page boundary.
 
 ### Priority
 
@@ -1815,6 +1815,9 @@ or origins.
 default. Set it to the same size as the ClusterCache `spec.pageSize`, or leave
 both unset for the default. The dataplane does not report its page size, so this
 setting is the only way the client learns it.
+
+`OriginConfig.PageSize` sets the same value for an origin server. A custom
+origin must use the cache's page size for its bootstrap range and page bodies.
 
 The Python client takes the same value as `racer.Client(cache="artifacts",
 page_size=...)`. The `racer-object` sidecar takes it as `--page-size`.

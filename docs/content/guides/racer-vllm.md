@@ -176,7 +176,9 @@ vLLM `sharded_state` checkpoint and pass
 records every rank's files; pass `--pattern` if the checkpoint uses a custom
 file name pattern.
 
-See the `racer-vllm` README for loader options such as `staging_bytes`.
+See the `racer-vllm` README for loader options such as `staging_bytes` and
+`page_size`. Set `page_size` to the cache's `spec.pageSize` when it is not the
+16 MiB default.
 
 The first load fills the cache from the origin. Later loads on any node read
 from the cache.

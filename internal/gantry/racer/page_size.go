@@ -17,8 +17,9 @@ const (
 	// The value is a byte count or a human-readable KiB/MiB quantity and must
 	// match the ClusterCache spec.pageSize.
 	PageSizeEnv = "GANTRY_RACER_PAGE_SIZE"
-	// PageSizeFallbackEnv is the shared Racer page-size variable, used when
-	// PageSizeEnv is unset or empty.
+	// PageSizeFallbackEnv is a Gantry-only override used when PageSizeEnv is
+	// unset or empty. The Racer dataplane does not read it and rejects unknown
+	// RACER_ variables, so do not set it on Racer containers.
 	PageSizeFallbackEnv = "RACER_PAGE_SIZE"
 
 	minPageSize = 4 << 10

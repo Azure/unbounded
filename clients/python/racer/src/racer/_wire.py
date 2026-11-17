@@ -24,7 +24,9 @@ PAGE_FRAME = 1
 COMPLETE_FRAME = 2
 MAX_WIRE_INTEGER = (1 << 63) - 1
 
-# Credits the Go SDK grants per Get (pkg/racersdk/client.go: pageCredits = 2).
+# The client grants two page credits per Get and derives byte credits from its
+# configured page size. BYTE_CREDITS is the value at the default page size and
+# stays exported for compatibility.
 PAGE_CREDITS = 2
 BYTE_CREDITS = PAGE_CREDITS * PAGE_SIZE
 

@@ -88,6 +88,7 @@
 //
 // Implement [Origin] and pass it to [ServeOrigin]. Racer calls the origin for
 // metadata and for individual pages of up to the cache's configured page size.
+// Set [OriginConfig.PageSize] to that same size; Racer does not advertise it.
 // Requests for later pages are pinned to the ETag the origin returned for the
 // first one, so origins only need ranged reads of a fixed version. The SDK
 // validates every response, so a short, long, or mismatched body is reported to

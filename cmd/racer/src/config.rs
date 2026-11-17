@@ -3356,7 +3356,8 @@ mod tests {
         );
         let c = control(&[("RACER_PAGE_BYTES", "16777216")]);
         assert_eq!(c.page_size.get(), 16 * 1024 * 1024);
-        // The SDKs and disk index assume 16 MiB pages; other sizes are refused.
+        // The cluster default is fixed at 16 MiB; per-cache overrides use
+        // ClusterCache spec.pageSize.
         for bad in ["4096", "65536", "1048576", "98304", "33554432", "x"] {
             assert_eq!(
                 managed_env(&[("RACER_PAGE_BYTES", bad)])
