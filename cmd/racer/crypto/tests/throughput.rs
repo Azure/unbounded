@@ -3,9 +3,11 @@
 //! Run pinned to one CPU:
 //! `taskset -c 2 cargo test --release -p racer-crypto --test throughput -- --ignored --nocapture`
 use racer_crypto::TAG_LEN;
+use racer_crypto::hmac_sha256;
 use racer_crypto::open;
 use racer_crypto::seal;
 use racer_crypto::verify_tag;
+use sha2::{Digest, Sha256, Sha512};
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -58,7 +60,16 @@ fn page_crypto_throughput() {
         opened.copy_from_slice(black_box(body));
         black_box(&opened);
     });
+    let sha256_rate = rate(iterations, |_| {
+        black_box(Sha256::digest(black_box(&plaintext)));
+    });
+    let sha512_rate = rate(iterations, |_| {
+        black_box(Sha512::digest(black_box(&plaintext)));
+    });
+    let hmac_rate = rate(iterations, |_| {
+        black_box(hmac_sha256(&key, black_box(&plaintext)));
+    });
     println!(
-        "CRYPTO_BENCH {{\"page_bytes\":{PAGE},\"pages\":{iterations},\"seal_gib_s\":{seal_rate:.3},\"open_gib_s\":{open_rate:.3},\"verify_tag_gib_s\":{verify_rate:.3},\"memcpy_gib_s\":{copy_rate:.3}}}"
+        "CRYPTO_BENCH {{\"page_bytes\":{PAGE},\"pages\":{iterations},\"seal_gib_s\":{seal_rate:.3},\"open_gib_s\":{open_rate:.3},\"verify_tag_gib_s\":{verify_rate:.3},\"memcpy_gib_s\":{copy_rate:.3},\"sha256_gib_s\":{sha256_rate:.3},\"sha512_gib_s\":{sha512_rate:.3},\"hmac_sha256_gib_s\":{hmac_rate:.3}}}"
     );
 }

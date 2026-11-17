@@ -13,7 +13,7 @@ name = "racer_core"
 topology = { path = "../topology" }
 racer-wire = { path = "../wire" }
 racer-flow-core = { path = "../flow-core" }
-sha2 = "0.10"
+sha2 = { version = "0.10", features = ["asm"] }
 
 [dev-dependencies]
 racer-wire = { path = "../wire", features = ["test-util"] }
