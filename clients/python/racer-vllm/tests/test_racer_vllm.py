@@ -555,13 +555,16 @@ def test_loader_loads_logs_and_uses_pins(server, uri, torch, monkeypatch, tmp_pa
     mc = types.SimpleNamespace(model=str(tmp_path), quantization=None)
     inst.download_model(mc)
     m = Model()
-    with caplog.at_level(logging.INFO, logger="vllm.racer_vllm.loader"):
+    with caplog.at_level(logging.DEBUG, logger="vllm.racer_vllm.loader"):
         inst.load_weights(m, mc)
     assert m.got == ALL
-    msgs = [r.getMessage() for r in caplog.records if r.name == "vllm.racer_vllm.loader"]
-    loaded = [m for m in msgs if "loaded 2 files" in m]
-    assert len(loaded) == 1 and "host=" in loaded[0] and str(uri) in loaded[0]
-    assert any(m.startswith("racer: prefetch ") for m in msgs)
+    recs = [r for r in caplog.records if r.name == "vllm.racer_vllm.loader"]
+    loaded = [r for r in recs if "loaded 2 files" in r.getMessage()]
+    assert len(loaded) == 1
+    assert "host=" in loaded[0].getMessage() and str(uri) in loaded[0].getMessage()
+    assert loaded[0].levelno == logging.INFO
+    prefetch = [r for r in recs if r.getMessage().startswith("racer: prefetch ")]
+    assert prefetch and all(r.levelno == logging.DEBUG for r in prefetch)
 
     with pytest.raises(ValueError, match="w5"):
         inst.load_weights(Model(tuple(ALL) + ("w5",)), mc)
@@ -608,6 +611,16 @@ def test_loader_prefetches_weight_pages(server, uri, torch, monkeypatch):
     # The ticket is accepted before the loader reads any weight data.
     first_read = min(i for i, s in enumerate(server.seen) if s.method == "POST" and "range" in s.headers)
     assert server.seen.index(seen) < first_read
+
+
+def test_loader_prefetch_messages_are_not_info(server, uri, torch, monkeypatch, caplog):
+    setup_model(server, uri)
+    inst = make_loader(monkeypatch, server, uri=str(uri))
+    with caplog.at_level(logging.INFO, logger="vllm.racer_vllm.loader"):
+        inst.load_weights(Model(), types.SimpleNamespace(model="/unused", quantization=None))
+    msgs = [r.getMessage() for r in caplog.records if r.name == "vllm.racer_vllm.loader"]
+    assert any("loaded 2 files" in m for m in msgs)
+    assert not any(m.startswith("racer: prefetch ") for m in msgs)
 
 
 def test_loader_prefetch_restarts_completed_ticket(server, uri, torch, monkeypatch):
@@ -660,10 +673,11 @@ def test_loader_prefetch_is_best_effort(server, uri, torch, monkeypatch, caplog)
     server.prefetches.passthrough = True
     inst = make_loader(monkeypatch, server, uri=str(uri))
     m = Model()
-    with caplog.at_level(logging.INFO, logger="vllm.racer_vllm.loader"):
+    with caplog.at_level(logging.DEBUG, logger="vllm.racer_vllm.loader"):
         inst.load_weights(m, types.SimpleNamespace(model="/unused", quantization=None))
     assert m.got == ALL
     assert any("prefetch unavailable" in r.getMessage() for r in caplog.records)
+    assert not any("prefetch unavailable" in r.getMessage() and r.levelno == logging.INFO for r in caplog.records)
 
 
 @pytest.mark.parametrize("error", [ConnectionResetError, TimeoutError])
@@ -676,10 +690,11 @@ def test_loader_prefetch_transport_error_is_best_effort(server, uri, torch, monk
 
     monkeypatch.setattr(rv, "prefetch_weights", fails)
     m = Model()
-    with caplog.at_level(logging.INFO, logger="vllm.racer_vllm.loader"):
+    with caplog.at_level(logging.DEBUG, logger="vllm.racer_vllm.loader"):
         inst.load_weights(m, types.SimpleNamespace(model="/unused", quantization=None))
     assert m.got == ALL
     assert any("prefetch unavailable" in r.getMessage() for r in caplog.records)
+    assert not any("prefetch unavailable" in r.getMessage() and r.levelno == logging.INFO for r in caplog.records)
 
 
 def test_loader_prefetch_can_be_disabled(server, uri, torch, monkeypatch):
