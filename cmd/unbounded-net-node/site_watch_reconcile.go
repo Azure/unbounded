@@ -31,6 +31,7 @@ import (
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
+	ebpfpkg "github.com/Azure/unbounded/internal/net/ebpf"
 	"github.com/Azure/unbounded/internal/net/healthcheck"
 	unboundednetnetlink "github.com/Azure/unbounded/internal/net/netlink"
 )
@@ -2174,8 +2175,25 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 
 	if !wgChanged {
 		klog.V(3).Info("State unchanged, skipping tunnel update")
+
+		tunnelMap, assignmentMap := state.tunnelMap, state.assignmentTunnelMap
 		state.mu.Unlock()
 		syncMasqueradeRules(state, nonMasqCIDRs)
+
+		// Heartbeat reconciliations also follow changed native underlay routes.
+		var refreshErrors []error
+
+		for _, tunnelMap := range []*ebpfpkg.TunnelMap{tunnelMap, assignmentMap} {
+			if tunnelMap != nil {
+				if err := tunnelMap.RefreshNativeNexthops(); err != nil {
+					refreshErrors = append(refreshErrors, err)
+				}
+			}
+		}
+
+		if err := errors.Join(refreshErrors...); err != nil {
+			return err
+		}
 
 		return publishGatewayStatus(fabricMTU, peers, gatewayPeers)
 	}

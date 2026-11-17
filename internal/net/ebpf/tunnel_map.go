@@ -242,7 +242,18 @@ func (tm *TunnelMap) UpdateEndpoint(cidr *net.IPNet, ep TunnelEndpoint) error {
 
 	val := endpointToC(resolved)
 
-	return tm.endpoints.Update(key, val, ebpf.UpdateAny)
+	if err := tm.endpoints.Update(key, val, ebpf.UpdateAny); err != nil {
+		return err
+	}
+
+	if tm.lastReconciled == nil {
+		tm.lastReconciled = make(map[string]TunnelEndpoint)
+	}
+
+	ep.Nexthops = slices.Clone(ep.Nexthops)
+	tm.lastReconciled[cidr.String()] = ep
+
+	return nil
 }
 
 // DeleteEndpoint removes an LPM trie entry for a destination CIDR.
@@ -257,7 +268,8 @@ func (tm *TunnelMap) DeleteEndpoint(cidr *net.IPNet) error {
 	}
 
 	err = tm.endpoints.Delete(key)
-	if errors.Is(err, ebpf.ErrKeyNotExist) {
+	if err == nil || errors.Is(err, ebpf.ErrKeyNotExist) {
+		delete(tm.lastReconciled, cidr.String())
 		return nil
 	}
 
@@ -273,7 +285,7 @@ func (tm *TunnelMap) Reconcile(desired map[string]TunnelEndpoint) error {
 
 	desiredByKey := make(map[lpmKey]TunnelEndpoint, len(desired))
 
-	resolvedDesired := make(map[string]TunnelEndpoint, len(desired))
+	originalDesired := make(map[string]TunnelEndpoint, len(desired))
 	for cidrStr, ep := range desired {
 		_, cidr, err := net.ParseCIDR(cidrStr)
 		if err != nil {
@@ -291,7 +303,8 @@ func (tm *TunnelMap) Reconcile(desired map[string]TunnelEndpoint) error {
 		}
 
 		desiredByKey[key] = resolved
-		resolvedDesired[cidrStr] = resolved
+		ep.Nexthops = slices.Clone(ep.Nexthops)
+		originalDesired[cidrStr] = ep
 	}
 
 	var (
@@ -326,9 +339,48 @@ func (tm *TunnelMap) Reconcile(desired map[string]TunnelEndpoint) error {
 	klog.V(2).Infof("eBPF tunnel map reconciled: %d entries (%d stale removed)",
 		len(desiredByKey), len(stale))
 
-	tm.lastReconciled = resolvedDesired
+	tm.lastReconciled = originalDesired
 
 	return nil
+}
+
+// RefreshNativeNexthops follows underlay routing changes without replacing peer
+// configuration or resetting health state.
+func (tm *TunnelMap) RefreshNativeNexthops() error {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	var failures []error
+
+	for cidrStr, ep := range tm.lastReconciled {
+		if !slices.ContainsFunc(ep.Nexthops, func(nh TunnelNexthop) bool { return nh.Protocol == TunnelProtoNone }) {
+			continue
+		}
+
+		resolved, err := resolveNativeNexthops(ep, netlink.RouteGetWithOptions)
+		if err != nil {
+			failures = append(failures, fmt.Errorf("refresh native nexthops for %s: %w", cidrStr, err))
+			continue
+		}
+
+		_, cidr, err := net.ParseCIDR(cidrStr)
+		if err != nil {
+			failures = append(failures, err)
+			continue
+		}
+
+		key, err := cidrToKey(cidr)
+		if err != nil {
+			failures = append(failures, err)
+			continue
+		}
+
+		if err := tm.endpoints.Update(key, endpointToC(resolved), ebpf.UpdateAny); err != nil {
+			failures = append(failures, fmt.Errorf("refresh native endpoint %s: %w", cidrStr, err))
+		}
+	}
+
+	return errors.Join(failures...)
 }
 
 // SetPeerHealth toggles the Healthy field on all BPF map nexthops belonging
@@ -369,7 +421,13 @@ func (tm *TunnelMap) SetPeerHealth(peerName string, healthy bool) int {
 			continue
 		}
 
-		if err := tm.endpoints.Update(key, endpointToC(ep), ebpf.UpdateAny); err != nil {
+		resolved, err := resolveNativeNexthops(ep, netlink.RouteGetWithOptions)
+		if err != nil {
+			klog.Warningf("eBPF SetPeerHealth %s: %v", cidrStr, err)
+			continue
+		}
+
+		if err := tm.endpoints.Update(key, endpointToC(resolved), ebpf.UpdateAny); err != nil {
 			klog.Warningf("eBPF SetPeerHealth %s: %v", cidrStr, err)
 			continue
 		}
