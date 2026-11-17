@@ -73,7 +73,7 @@ pub struct Slab<C: Charge> {
 
     writes: Rc<WriteState>,
 
-    idle_buffer: Rc<RefCell<crate::BufferPool<C>>>,
+    idle_buffer: Rc<crate::StagingPool<C>>,
 }
 
 impl<C: Charge> Slab<C> {
@@ -93,7 +93,7 @@ impl<C: Charge> Slab<C> {
             sim: RefCell::new(None),
             opened: RefCell::new(None),
             writes: Rc::new(WriteState::default()),
-            idle_buffer: Rc::new(RefCell::new(crate::BufferPool::default())),
+            idle_buffer: Rc::new(crate::StagingPool::default()),
         }
     }
 
