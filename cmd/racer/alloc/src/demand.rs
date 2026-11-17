@@ -62,8 +62,9 @@ const DEVIATIONS: i128 = 2;
 /// Largest look-ahead while demand rises, in units.
 const LEAD_UNITS: usize = 2;
 
-/// Most missed windows or samples replayed after a long gap between ticks.
-/// The estimators have converged by then.
+/// Most missed windows or samples replayed into the estimators after a long
+/// gap between ticks. The estimators have converged by then. The correction
+/// still decays over the whole gap.
 const CATCH_UP: u64 = 64;
 
 /// Point-in-time pool counters for telemetry. Counters are cumulative.
@@ -338,6 +339,7 @@ impl Provision {
             for _ in 1..samples.min(CATCH_UP) {
                 self.sample(self.in_use);
             }
+            self.decay(samples);
             self.sample_peak = self.in_use;
             self.next_sample = Some(if samples > CATCH_UP {
                 now + SAMPLE_PERIOD
@@ -382,14 +384,69 @@ impl Provision {
         self.deviation += (error.abs() - self.deviation) >> DEVIATION_SHIFT;
     }
 
-    /// Fold one sample period's peak into the look-ahead and decay the
-    /// correction.
+    /// Fold one sample period's peak into the look-ahead.
     fn sample(&mut self, peak: usize) {
         self.rises = [self.rises[1], peak.saturating_sub(self.previous)];
         self.previous = peak;
-        let hold = nanos(self.effective_hold()).max(1) as i128;
-        let decay = (self.correction * nanos(SAMPLE_PERIOD) as i128 / hold).max(1);
-        self.correction = (self.correction - decay).max(0);
+    }
+
+    /// Decay the correction over `samples` sample periods. Each period
+    /// removes `correction x SAMPLE_PERIOD / H`, at least one scaled unit.
+    /// Runs of periods that remove the same amount are applied together, and
+    /// after `CATCH_UP` runs the rest of a long gap is applied by
+    /// [`Self::gallop`], so the whole gap decays in a bounded number of steps.
+    fn decay(&mut self, mut samples: u64) {
+        let hold = i128::from(nanos(self.effective_hold()).max(1));
+        let period = i128::from(nanos(SAMPLE_PERIOD));
+        let mut runs = 0;
+        while samples > 0 && self.correction > 0 {
+            let per = self.correction.saturating_mul(period) / hold;
+            if per == 0 {
+                self.correction = (self.correction - i128::from(samples)).max(0);
+                return;
+            }
+            if runs == CATCH_UP {
+                samples = self.gallop(samples, hold, period);
+                runs += 1;
+                continue;
+            }
+            runs += 1;
+            // Smallest correction from which a period still removes `per`.
+            let low = (per * hold + period - 1) / period;
+            let steps = ((self.correction - low) / per + 1).min(i128::from(samples));
+            self.correction -= steps * per;
+            samples -= steps as u64;
+        }
+    }
+
+    /// Apply up to `samples` periods of decay as powers of the per-period
+    /// factor `1 - SAMPLE_PERIOD / H`, while a period would still remove at
+    /// least `CATCH_UP` scaled units, then return the periods left. Rounding
+    /// down makes this decay at least as fast as period by period, and the
+    /// runs left before the correction falls below that level are few.
+    fn gallop(&mut self, mut samples: u64, hold: i128, period: i128) -> u64 {
+        const SHIFT: u32 = 32;
+        let keep = (((hold - period).max(0) as u128) << SHIFT) / hold as u128;
+        let mut powers = [keep; u64::BITS as usize];
+        for bit in 1..powers.len() {
+            powers[bit] = (powers[bit - 1] * powers[bit - 1]) >> SHIFT;
+        }
+        for (bit, &power) in powers.iter().enumerate().rev() {
+            let span = 1 << bit;
+            if span > samples {
+                continue;
+            }
+            let correction = self.correction as u128;
+            let mask = (1 << SHIFT) - 1;
+            let next =
+                ((correction >> SHIFT) * power + (((correction & mask) * power) >> SHIFT)) as i128;
+            if next.saturating_mul(period) / hold < i128::from(CATCH_UP) {
+                continue;
+            }
+            self.correction = next;
+            samples -= span;
+        }
+        samples
     }
 
     fn retarget(&mut self) {
@@ -624,6 +681,63 @@ mod tests {
         model.run(0, hold * 3, Pressure::Normal);
         assert_eq!(model.capacity, 2, "surplus falls back to the floor");
         assert_eq!(model.provision.target(), 2);
+    }
+
+    /// Controller configured like a registered RDMA rail that recorded a
+    /// shortfall of `items` at `start`.
+    fn rail_with_shortfall(start: Instant, items: usize) -> Provision {
+        let mut provision = Provision::new(ProvisionConfig {
+            unit: 2,
+            floor: 2,
+            ceiling: 4096,
+            acquire: Duration::from_millis(100),
+        });
+        assert_eq!(provision.hold(), Duration::from_secs(100));
+        assert_eq!(provision.tick(start, 2, 0, Pressure::Normal), Plan::Hold);
+        provision.shortfall(start, items);
+        assert_eq!(provision.target(), items.max(2));
+        provision
+    }
+
+    #[test]
+    fn a_late_tick_decays_the_correction_over_the_whole_gap() {
+        let start = Instant::now();
+        let mut provision = rail_with_shortfall(start, 6);
+        assert_eq!(
+            provision.tick(start + Duration::from_secs(86_400), 6, 0, Pressure::Normal),
+            Plan::Release(1)
+        );
+        assert_eq!(provision.target(), 2);
+    }
+
+    #[test]
+    fn a_late_tick_decays_the_correction_like_timely_ones() {
+        for items in [6, 40, 400, 4000] {
+            for gap in [1, 7, 30, 60, 100, 150, 300, 600, 1_200] {
+                let gap = Duration::from_secs(gap);
+                let start = Instant::now();
+                let mut timely = rail_with_shortfall(start, items);
+                let mut now = start;
+                while now < start + gap {
+                    now += SAMPLE_PERIOD;
+                    timely.tick(now, items, 0, Pressure::Normal);
+                }
+                let mut late = rail_with_shortfall(start, items);
+                late.tick(start + gap, items, 0, Pressure::Normal);
+                assert!(
+                    late.target().abs_diff(timely.target()) <= 1 + timely.target() / 256,
+                    "{items} items after {gap:?}: late {} timely {}",
+                    late.target(),
+                    timely.target()
+                );
+                assert!(
+                    late.correction <= timely.correction,
+                    "{items} items after {gap:?}: late {} timely {}",
+                    late.correction,
+                    timely.correction
+                );
+            }
+        }
     }
 
     #[test]
