@@ -29,13 +29,41 @@ def mapped(name):
 
 def test_unclosed_buffer_is_released_when_collected():
     b = HostBuffer(4096, "racer-test-gc")
-    mapping = b._map
     assert memfds("racer-test-gc")
     del b
     gc.collect()
     assert memfds("racer-test-gc") == []
-    assert mapping.closed
     assert not mapped("racer-test-gc")
+
+
+def test_retained_view_outlives_collection():
+    # torch.frombuffer keeps a reference to the view without a buffer export.
+    b = HostBuffer(4096, "racer-test-keep")
+    fd = b.fileno()
+    view = b.view
+    view[:3] = b"abc"
+    del b
+    gc.collect()
+    assert fd not in memfds("racer-test-keep")
+    assert bytes(view[:3]) == b"abc" and mapped("racer-test-keep")
+    del view
+    gc.collect()
+    assert not mapped("racer-test-keep")
+
+
+def test_torch_tensor_outlives_collection():
+    torch = pytest.importorskip("torch")
+    b = HostBuffer(4096, "racer-test-torch")
+    fd = b.fileno()
+    t = torch.frombuffer(b.view, dtype=torch.uint8)
+    t[:3] = torch.tensor([1, 2, 3], dtype=torch.uint8)
+    del b
+    gc.collect()
+    assert fd not in memfds("racer-test-torch")
+    assert t[:3].tolist() == [1, 2, 3] and mapped("racer-test-torch")
+    del t
+    gc.collect()
+    assert not mapped("racer-test-torch")
 
 
 def test_close_twice():

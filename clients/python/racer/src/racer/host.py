@@ -53,7 +53,7 @@ class HostBuffer:
             raise
         self.view = memoryview(self._map)
         self._pins = []
-        self._finalizer = weakref.finalize(self, _release, self._fd, self._map, self.view, self._pins)
+        self._finalizer = weakref.finalize(self, _release, self._fd, self._pins)
 
     def fileno(self) -> int:
         if self._fd < 0:
@@ -78,8 +78,17 @@ class HostBuffer:
 
     def close(self) -> None:
         """Release the buffer. Safe to call more than once."""
+        if not self._finalizer.alive:
+            return
         self._fd = -1
         self._finalizer()
+        try:
+            self.view.release()
+            self._map.close()
+        except BufferError:
+            # A view of the mapping (such as a ctypes array) still holds an
+            # export, so the mapping stays until it goes.
+            pass
 
     def __enter__(self) -> "HostBuffer":
         return self
@@ -88,17 +97,15 @@ class HostBuffer:
         self.close()
 
 
-def _release(fd: int, mapping: mmap.mmap, view: memoryview, pins: list) -> None:
-    """Unpin, unmap and close a HostBuffer's memfd. Runs once, from close() or garbage collection."""
+def _release(fd: int, pins: list) -> None:
+    """Unpin and close a HostBuffer's memfd. Runs once, from close() or garbage collection.
+
+    It does not unmap: torch.frombuffer keeps the memoryview without holding a
+    buffer export, so after garbage collection the mapping must live until the
+    last reference to the view goes.
+    """
     try:
         while pins:
             pins.pop().close()
-        view.release()
-        mapping.close()
-    except BufferError:
-        # A view of the mapping (such as torch.frombuffer) is still alive, so
-        # the mapping stays until it goes. Closing the memfd now means only
-        # that view keeps the memory.
-        pass
     finally:
         os.close(fd)
