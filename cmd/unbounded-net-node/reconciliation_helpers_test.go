@@ -145,7 +145,7 @@ func TestResolveMeshPeerHealthCheckProfileName(t *testing.T) {
 		t.Fatalf("expected site profile for same-site peer, got %q", got)
 	}
 
-	peer = meshPeerInfo{SiteName: "site-b"}
+	peer = meshPeerInfo{SiteName: "site-b", TransitPoolName: "pool"}
 	if got := resolveMeshPeerHealthCheckProfileName(
 		false,
 		peer,
@@ -157,7 +157,7 @@ func TestResolveMeshPeerHealthCheckProfileName(t *testing.T) {
 		t.Fatalf("expected assignment profile to override peering (more specific), got %q", got)
 	}
 
-	peer = meshPeerInfo{SiteName: "site-c"}
+	peer = meshPeerInfo{SiteName: "site-c", TransitPoolName: "pool"}
 	if got := resolveMeshPeerHealthCheckProfileName(
 		false,
 		peer,

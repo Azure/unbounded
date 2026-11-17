@@ -74,7 +74,7 @@ type wireGuardState struct {
 	gatewayRouteDistances          map[string]map[string]int                  // interface name -> destination CIDR -> distance
 	gatewaySiteCIDRs               map[string][]string                        // interface name -> site CIDRs
 	gatewayPodCIDRs                map[string][]string                        // interface name -> pod CIDRs
-	meshPeerHealthCheckEnabled     map[string]bool                            // peer public key -> whether healthcheck is enabled for this peer
+	meshPeerHealthCheckEnabled     map[string]bool                            // peer name -> whether healthcheck is enabled for this relationship
 	gatewayPeerHealthCheckEnabled  map[string]bool                            // interface name -> whether healthcheck is enabled for this gateway peer
 	healthCheckProfiles            map[string]healthcheck.HealthCheckSettings // Last applied healthcheck settings by profile name
 	siteHealthCheckProfileNames    map[string]string                          // Last resolved site name -> healthcheck profile name
@@ -116,12 +116,15 @@ type wireGuardState struct {
 
 	// tunnelMap is the eBPF LPM trie on unbounded0 that holds per-CIDR
 	// tunnel endpoint entries for every peer (GENEVE/VXLAN/IPIP/WG/None).
-	tunnelMap *ebpfpkg.TunnelMap
+	tunnelMap           *ebpfpkg.TunnelMap
+	assignmentTunnelMap *ebpfpkg.TunnelMap
 
 	// pendingBPFEntries accumulates BPF map entries across GENEVE, VXLAN,
 	// and WG config phases. A single Reconcile is done after all entries
 	// are collected to avoid protocol paths overwriting each other.
-	pendingBPFEntries map[string]ebpfpkg.TunnelEndpoint
+	pendingBPFEntries           map[string]ebpfpkg.TunnelEndpoint
+	pendingDirectBPFEntries     map[string]ebpfpkg.TunnelEndpoint
+	pendingAssignmentBPFEntries map[string]ebpfpkg.TunnelEndpoint
 
 	// Prometheus collector for WireGuard per-peer stats (rx/tx bytes, last handshake)
 	wgCollector *unboundednetnetlink.WireGuardCollector
@@ -207,6 +210,8 @@ type gatewayPeerInfo struct {
 type meshPeerInfo struct {
 	Name                   string
 	SiteName               string // Site this peer belongs to -- drives endpoint/routing logic
+	TransitPoolName        string // Nonempty for an assignment downlink, not an ordinary mesh link
+	TransitWireguardPort   int32
 	HealthCheckProfileName string // Optional resolved healthcheck profile for this specific link
 	WireGuardPublicKey     string
 	InternalIPs            []string

@@ -2714,6 +2714,10 @@ func (s *nodeStatusServer) inspectNodePeers(visit func(WireGuardPeerStatus)) *no
 
 	gatewayTunnelProtoByName := make(map[string]string, len(s.state.gatewayPeers))
 	for _, p := range s.state.peers {
+		if p.TransitPoolName != "" {
+			continue
+		}
+
 		peerNameMap[p.WireGuardPublicKey] = p.Name
 		peerSiteNameMap[p.WireGuardPublicKey] = p.SiteName
 		peerTunnelProtoMap[p.WireGuardPublicKey] = p.TunnelProtocol
@@ -2726,8 +2730,12 @@ func (s *nodeStatusServer) inspectNodePeers(visit func(WireGuardPeerStatus)) *no
 		peerSkipPodCIDRMap[p.WireGuardPublicKey] = p.SkipPodCIDRRoutes
 	}
 
-	for key, value := range s.state.meshPeerHealthCheckEnabled {
-		peerHealthCheckEnabledMap[key] = value
+	for _, peer := range s.state.peers {
+		if peer.TransitPoolName != "" {
+			continue
+		}
+
+		peerHealthCheckEnabledMap[peer.WireGuardPublicKey] = s.state.meshPeerHealthCheckEnabled[peer.Name]
 	}
 
 	for _, p := range s.state.gatewayPeers {
@@ -2968,7 +2976,7 @@ func (s *nodeStatusServer) inspectNodePeers(visit func(WireGuardPeerStatus)) *no
 			}
 		}
 
-		hcEnabled := s.state.meshPeerHealthCheckEnabled[p.WireGuardPublicKey]
+		hcEnabled := s.state.meshPeerHealthCheckEnabled[p.Name]
 
 		peer := WireGuardPeerStatus{
 			Name:              p.Name,
@@ -3531,12 +3539,13 @@ func (s *nodeStatusServer) inspectKernelRoutes(visit func(family, destination st
 // node agent: per-peer WireGuard devices (wg<port>) and the three shared
 // flow-based tunnel devices (named via cfg.GeneveInterfaceName,
 // cfg.VXLANInterfaceName, cfg.IPIPInterfaceName) plus the eBPF dummy
-// (unbounded0). The legacy netlink dataplane used per-peer gn*, ip*, and
+// devices. The legacy netlink dataplane used per-peer gn*, ip*, and
 // vxlan* device names; those were removed in the eBPF-only refactor, so
 // exact-name matches are now sufficient for the shared devices.
 func isManagedTunnelInterface(cfg *config, name string) bool {
 	return isWireGuardInterface(cfg, name) ||
 		name == unbounded0DeviceName ||
+		name == assignmentReturnDeviceName ||
 		name == cfg.GeneveInterfaceName ||
 		name == cfg.VXLANInterfaceName ||
 		name == cfg.IPIPInterfaceName

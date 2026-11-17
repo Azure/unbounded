@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -457,6 +458,8 @@ func configureTunnelPeers(
 	// Build BPF map entries. Peers are routed to the appropriate tunnel
 	// interface based on their protocol.
 	bpfEntries := make(map[string]ebpfpkg.TunnelEndpoint)
+	directEntries := make(map[string]ebpfpkg.TunnelEndpoint)
+	assignmentEntries := make(map[string]ebpfpkg.TunnelEndpoint)
 
 	// Detect default route interface for TunnelProtocolNone (direct routing).
 	_, defaultLinkIdx, _ := unboundednetnetlink.DetectDefaultRouteInterfaceFromCache(nlCache) //nolint:errcheck
@@ -473,10 +476,7 @@ func configureTunnelPeers(
 		}
 
 		peerIfIdx, peerProto := resolveTunnelPeerTarget(peer.TunnelProtocol, geneveIfIndex, ipipIfIndex, vxlanIfIndex, defaultIfIdx, cfg)
-		addPeerBPFEntries(bpfEntries, peer.PodCIDRs, underlayIP, uint32(cfg.GeneveVNI), peerIfIdx, peerProto, peer.Name)
-		// Pin the peer's underlay IP to its tunnel so node-IP traffic
-		// LPM-matches the /32 rather than an enclosing supernet.
-		addPeerBPFEntries(bpfEntries, ipsToHostCIDRs(peer.InternalIPs), underlayIP, uint32(cfg.GeneveVNI), peerIfIdx, peerProto, peer.Name)
+		addMeshPeerBPFEntries(bpfEntries, directEntries, assignmentEntries, peer, underlayIP, uint32(cfg.GeneveVNI), peerIfIdx, peerProto)
 	}
 
 	for _, gwPeer := range gatewayPeers {
@@ -499,7 +499,7 @@ func configureTunnelPeers(
 		// wrong gateway -- which silently fails to forward them on the
 		// LAN. The host CIDR is a longest-prefix match so it overrides the
 		// supernet ECMP without disturbing pod-CIDR traffic.
-		addPeerBPFEntries(bpfEntries, gatewayBPFPrefixes(gwPeer, state.siteRouting.localCIDRs), underlayIP, uint32(cfg.GeneveVNI), peerIfIdx, peerProto, gwPeer.Name)
+		addGatewayBPFEntries(bpfEntries, gatewayBPFPrefixes(gwPeer, state.siteRouting.localCIDRs), gwPeer, underlayIP, uint32(cfg.GeneveVNI), peerIfIdx, peerProto)
 	}
 
 	// Store entries for deferred reconcile (after VXLAN and WG entries are added).
@@ -511,6 +511,16 @@ func configureTunnelPeers(
 	for k, v := range bpfEntries {
 		state.pendingBPFEntries[k] = v
 	}
+
+	if state.pendingDirectBPFEntries == nil {
+		state.pendingDirectBPFEntries = make(map[string]ebpfpkg.TunnelEndpoint)
+	}
+
+	for k, v := range directEntries {
+		state.pendingDirectBPFEntries[k] = v
+	}
+
+	state.pendingAssignmentBPFEntries = assignmentEntries
 	state.mu.Unlock()
 
 	// Build supernet routes on unbounded0 to attract overlay traffic.
@@ -539,37 +549,45 @@ func configureTunnelPeers(
 }
 
 // gatewayPeerReadyForTunnel reports whether a gateway peer can be programmed
-// into the tunnel BPF map. A gateway in a managed Site without a podCIDR is
-// still waiting for CNI setup (it publishes its WireGuard key first), so it
-// stays out of the map. A gateway in a Site with manageCniPlugin=false never
-// gets a podCIDR, so its routed CIDRs are what make it usable.
+// into the tunnel BPF map. Managed gateways wait for CNI readiness; unmanaged
+// gateways can become ready without allocating their own PodCIDRs.
 func gatewayPeerReadyForTunnel(gwPeer gatewayPeerInfo) bool {
 	if len(gwPeer.InternalIPs) == 0 {
 		return false
 	}
 
-	if len(gwPeer.PodCIDRs) > 0 {
-		return true
-	}
-
-	return gwPeer.UnmanagedCNISite && len(gwPeer.RoutedCidrs) > 0
+	return len(gwPeer.PodCIDRs) > 0 || (gwPeer.UnmanagedCNISite && len(gwPeer.RoutedCidrs) > 0)
 }
 
 // addPeerBPFEntries adds LPM trie entries for a set of CIDRs pointing to a
 // tunnel endpoint. Healthy=true is set on every new nexthop so it is
 // forwarded immediately; the healthcheck callback later clears Healthy if
 // the peer goes down. Supports both IPv4 and IPv6 CIDRs.
-func addPeerBPFEntries(entries map[string]ebpfpkg.TunnelEndpoint, cidrs []string, underlayIP net.IP, vni, ifindex, protocol uint32, peerName string) {
+func addPeerBPFEntries(entries map[string]ebpfpkg.TunnelEndpoint, cidrs []string, underlayIP net.IP, vni, ifindex, protocol uint32, peerName string, internalIPs []string) {
 	for _, cidrStr := range cidrs {
 		_, cidr, err := net.ParseCIDR(cidrStr)
 		if err != nil {
 			continue
 		}
 
+		remoteIP := underlayIP
+
+		if protocol == ebpfpkg.TunnelProtoNone {
+			family := "IPv6"
+			if cidr.IP.To4() != nil {
+				family = "IPv4"
+			}
+
+			remoteIP = selectUnderlayIP(internalIPs, family)
+			if remoteIP == nil {
+				continue
+			}
+		}
+
 		key := cidr.String()
 		ep := entries[key] // get existing (may be zero value)
 		ep.Nexthops = append(ep.Nexthops, ebpfpkg.TunnelNexthop{
-			RemoteIP: underlayIP,
+			RemoteIP: remoteIP,
 			VNI:      vni,
 			IfIndex:  ifindex,
 			Healthy:  true,
@@ -577,6 +595,49 @@ func addPeerBPFEntries(entries map[string]ebpfpkg.TunnelEndpoint, cidrs []string
 			PeerName: peerName,
 		})
 		entries[key] = ep
+	}
+}
+
+func addMeshPeerBPFEntries(entries, directEntries, assignmentEntries map[string]ebpfpkg.TunnelEndpoint, peer meshPeerInfo, underlayIP net.IP, vni, ifindex, protocol uint32) {
+	cidrs := append(append([]string(nil), peer.PodCIDRs...), ipsToHostCIDRs(peer.InternalIPs)...)
+	addPeerBPFEntries(entries, cidrs, underlayIP, vni, ifindex, protocol, peer.Name, peer.InternalIPs)
+
+	if peer.TransitPoolName == "" {
+		addPeerBPFEntries(directEntries, cidrs, underlayIP, vni, ifindex, protocol, peer.Name, peer.InternalIPs)
+	} else {
+		addPeerBPFEntries(assignmentEntries, cidrs, underlayIP, vni, ifindex, protocol, peer.Name, peer.InternalIPs)
+	}
+}
+
+func addGatewayBPFEntries(entries map[string]ebpfpkg.TunnelEndpoint, cidrs []string, peer gatewayPeerInfo, underlayIP net.IP, vni, ifindex, protocol uint32) {
+	for _, cidr := range cidrs {
+		prefix, err := parseRoutingPrefix(cidr)
+		if err != nil {
+			continue
+		}
+
+		distance, mostSpecific := 1, -1
+
+		for advertised, advertisedDistance := range peer.RouteDistances {
+			parent, parseErr := parseRoutingPrefix(advertised)
+			if parseErr != nil || parent.Bits() > prefix.Bits() || !parent.Contains(prefix.Addr()) || parent.Bits() <= mostSpecific {
+				continue
+			}
+
+			distance, mostSpecific = effectiveRouteDistance(advertisedDistance), parent.Bits()
+		}
+
+		key := prefix.String()
+		before := len(entries[key].Nexthops)
+		addPeerBPFEntries(entries, []string{key}, underlayIP, vni, ifindex, protocol, peer.Name, peer.InternalIPs)
+
+		endpoint := entries[key]
+		if len(endpoint.Nexthops) == before {
+			continue
+		}
+
+		endpoint.Nexthops[len(endpoint.Nexthops)-1].RouteDistance = distance
+		entries[key] = endpoint
 	}
 }
 
@@ -699,16 +760,6 @@ func collectSupernets(state *wireGuardState, meshPeers []meshPeerInfo, gatewayPe
 		}
 	}
 
-	for _, gwPeer := range gatewayPeers {
-		if gwPeer.SkipPodCIDRRoutes {
-			continue
-		}
-
-		for _, cidr := range gwPeer.PodCIDRs {
-			addIfUncovered(cidr)
-		}
-	}
-
 	return supernets
 }
 
@@ -737,6 +788,14 @@ func addWireGuardPeersToBPFMap(cfg *config, state *wireGuardState, wgMeshPeers [
 		state.pendingBPFEntries = make(map[string]ebpfpkg.TunnelEndpoint)
 	}
 
+	if state.pendingDirectBPFEntries == nil {
+		state.pendingDirectBPFEntries = make(map[string]ebpfpkg.TunnelEndpoint)
+	}
+
+	if state.pendingAssignmentBPFEntries == nil {
+		state.pendingAssignmentBPFEntries = make(map[string]ebpfpkg.TunnelEndpoint)
+	}
+
 	// Add mesh WG peers -- redirect only, no tunnel key.
 	for _, peer := range wgMeshPeers {
 		if len(peer.InternalIPs) == 0 || len(peer.PodCIDRs) == 0 {
@@ -748,11 +807,18 @@ func addWireGuardPeersToBPFMap(cfg *config, state *wireGuardState, wgMeshPeers [
 			continue
 		}
 
-		addPeerBPFEntries(state.pendingBPFEntries, peer.PodCIDRs, underlayIP, 0, wgIfIndex, ebpfpkg.TunnelProtoWireGuard, peer.Name)
-		// Pin each mesh peer's underlay IP to the mesh WG tunnel so
-		// packets destined to that specific peer's node IP take the
-		// right tunnel.
-		addPeerBPFEntries(state.pendingBPFEntries, ipsToHostCIDRs(peer.InternalIPs), underlayIP, 0, wgIfIndex, ebpfpkg.TunnelProtoWireGuard, peer.Name)
+		peerIfIndex := wgIfIndex
+
+		if peer.TransitPoolName != "" {
+			link, linkErr := net.InterfaceByName(wireGuardInterfaceName(cfg, int(peer.TransitWireguardPort)))
+			if linkErr != nil {
+				continue
+			}
+
+			peerIfIndex = uint32(link.Index)
+		}
+
+		addMeshPeerBPFEntries(state.pendingBPFEntries, state.pendingDirectBPFEntries, state.pendingAssignmentBPFEntries, peer, underlayIP, 0, peerIfIndex, ebpfpkg.TunnelProtoWireGuard)
 	}
 
 	// Add gateway WG peers.
@@ -780,7 +846,7 @@ func addWireGuardPeersToBPFMap(cfg *config, state *wireGuardState, wgMeshPeers [
 		gwIfIdx := uint32(gwIface.Index)
 
 		allCIDRs := gatewayBPFPrefixes(gwPeer, state.siteRouting.localCIDRs)
-		addPeerBPFEntries(state.pendingBPFEntries, allCIDRs, underlayIP, 0, gwIfIdx, ebpfpkg.TunnelProtoWireGuard, gwPeer.Name)
+		addGatewayBPFEntries(state.pendingBPFEntries, allCIDRs, gwPeer, underlayIP, 0, gwIfIdx, ebpfpkg.TunnelProtoWireGuard)
 	}
 	state.mu.Unlock()
 
@@ -796,20 +862,47 @@ func reconcilePendingBPFEntries(state *wireGuardState) {
 		return
 	}
 
-	state.mu.Lock()
-	entries := state.pendingBPFEntries
-	state.pendingBPFEntries = nil
-	state.mu.Unlock()
-
-	if entries == nil {
-		entries = make(map[string]ebpfpkg.TunnelEndpoint)
-	}
-
+	entries := takePendingBPFEntries(state)
 	if err := tm.Reconcile(entries); err != nil {
 		klog.Warningf("eBPF: BPF map reconciliation error: %v", err)
 	} else {
 		klog.V(2).Infof("eBPF: reconciled BPF map with %d total entries", len(entries))
 	}
+}
+
+func takePendingBPFEntries(state *wireGuardState) map[string]ebpfpkg.TunnelEndpoint {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	entries := state.pendingBPFEntries
+	if entries == nil {
+		entries = make(map[string]ebpfpkg.TunnelEndpoint)
+	}
+	// Resolve ownership after every protocol has contributed. More-specific
+	// transit advertisements must not redirect a directly meshed PodCIDR.
+	for cidr := range entries {
+		prefix, err := netip.ParsePrefix(cidr)
+		if err != nil {
+			continue
+		}
+
+		for bits := prefix.Bits() - 1; bits >= 0; bits-- {
+			parent := netip.PrefixFrom(prefix.Addr(), bits).Masked().String()
+			if _, direct := state.pendingDirectBPFEntries[parent]; direct {
+				delete(entries, cidr)
+				break
+			}
+		}
+	}
+
+	for prefix, endpoint := range state.pendingDirectBPFEntries {
+		entries[prefix] = endpoint
+	}
+
+	state.pendingBPFEntries = nil
+	state.pendingDirectBPFEntries = nil
+
+	return entries
 }
 
 // peerIfaceName returns the shared tunnel interface name for any gateway
@@ -945,14 +1038,14 @@ func cleanupUnusedTunnelDevices(cfg *config, meshPeers []meshPeerInfo, gatewayPe
 	}
 }
 
-// reapplyRPFilterOnActiveTunnels sets rp_filter=0 on tunnel interfaces that
-// are still in use. This must be called after cleanupUnusedTunnelDevices
-// because deleting interfaces can cause the kernel to reset rp_filter on
-// remaining interfaces.
-func reapplyRPFilterOnActiveTunnels(cfg *config, meshPeers []meshPeerInfo, gatewayPeers, wgGatewayPeers []gatewayPeerInfo, fwdMgr *unboundednetnetlink.ForwardManager, isGateway bool, notrackMgr *unboundednetnetlink.NotrackManager) {
+// reapplyRPFilterOnActiveTunnels restores filtering and forwarding rules on
+// active tunnel and native interfaces. Call it after cleanupUnusedTunnelDevices
+// because deleting interfaces can reset rp_filter on remaining interfaces.
+func reapplyRPFilterOnActiveTunnels(cfg *config, meshPeers []meshPeerInfo, gatewayPeers, wgGatewayPeers []gatewayPeerInfo, fwdMgr *unboundednetnetlink.ForwardManager, isGateway bool, notrackMgr *unboundednetnetlink.NotrackManager, nlCache *unboundednetnetlink.NetlinkCache) {
 	usesGeneve := false
 	usesVXLAN := false
 	usesIPIP := false
+	usesNative := false
 
 	for _, p := range meshPeers {
 		switch p.TunnelProtocol {
@@ -962,6 +1055,8 @@ func reapplyRPFilterOnActiveTunnels(cfg *config, meshPeers []meshPeerInfo, gatew
 			usesVXLAN = true
 		case "IPIP":
 			usesIPIP = true
+		case "None":
+			usesNative = true
 		}
 	}
 
@@ -973,6 +1068,8 @@ func reapplyRPFilterOnActiveTunnels(cfg *config, meshPeers []meshPeerInfo, gatew
 			usesVXLAN = true
 		case "IPIP":
 			usesIPIP = true
+		case "None":
+			usesNative = true
 		}
 	}
 
@@ -984,6 +1081,8 @@ func reapplyRPFilterOnActiveTunnels(cfg *config, meshPeers []meshPeerInfo, gatew
 			usesVXLAN = true
 		case "IPIP":
 			usesIPIP = true
+		case "None":
+			usesNative = true
 		}
 	}
 
@@ -1006,6 +1105,37 @@ func reapplyRPFilterOnActiveTunnels(cfg *config, meshPeers []meshPeerInfo, gatew
 			if isGateway && notrackMgr != nil {
 				notrackMgr.EnsureInterface(d.name)
 			}
+		}
+	}
+
+	if fwdMgr == nil && notrackMgr == nil {
+		return
+	}
+
+	native, _, err := unboundednetnetlink.DetectDefaultRouteInterfaceFromCache(nlCache)
+	if err != nil {
+		return
+	}
+
+	if usesNative {
+		disableRPFilter(native)
+	}
+
+	if fwdMgr != nil {
+		if usesNative {
+			fwdMgr.EnsureInterface(native)
+		} else {
+			fwdMgr.RemoveInterface(native)
+		}
+	}
+
+	// Native ingress and tunnel ingress must agree about transit conntrack,
+	// or a tracked SYN followed by an untracked SYN-ACK makes ACKs INVALID.
+	if notrackMgr != nil {
+		if usesNative && isGateway {
+			notrackMgr.EnsureInterface(native)
+		} else {
+			notrackMgr.RemoveInterface(native)
 		}
 	}
 }

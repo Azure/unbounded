@@ -27,8 +27,7 @@ func TestMeshPeerHealthCheck_SameSite_UsesSiteProfile(t *testing.T) {
 }
 
 func TestMeshPeerHealthCheck_SameSite_AssignmentOverridesSite(t *testing.T) {
-	// Even for same-site peers, a more specific assignment profile wins.
-	peer := meshPeerInfo{SiteName: "s1"}
+	peer := meshPeerInfo{SiteName: "s1", TransitPoolName: "pool"}
 	siteBFD := map[string]string{"s1": "s-s1"}
 	peeringBFD := map[string]string{}
 	assignmentBFD := map[string]string{"s1": "sgpa-s1-pool"}
@@ -53,8 +52,7 @@ func TestMeshPeerHealthCheck_SameSite_PeeringOverridesSite(t *testing.T) {
 }
 
 func TestMeshPeerHealthCheck_DifferentPeeredSite_AssignmentOverridesPeering(t *testing.T) {
-	// SiteGatewayPoolAssignment is more specific than SitePeering.
-	peer := meshPeerInfo{SiteName: "s2"}
+	peer := meshPeerInfo{SiteName: "s2", TransitPoolName: "pool"}
 	siteBFD := map[string]string{"s1": "s-s1", "s2": "s-s2"}
 	peeringBFD := map[string]string{"s2": "sp-s1-s2"}
 	assignmentBFD := map[string]string{"s2": "sgpa-s2-pool"}
@@ -79,7 +77,7 @@ func TestMeshPeerHealthCheck_DifferentPeeredSite_PeeringOnly(t *testing.T) {
 }
 
 func TestMeshPeerHealthCheck_GatewayNode_AssignmentBeatsPeering(t *testing.T) {
-	peer := meshPeerInfo{SiteName: "s2"}
+	peer := meshPeerInfo{SiteName: "s2", TransitPoolName: "extgw1"}
 	siteBFD := map[string]string{"s1": "s-s1"}
 	peeringBFD := map[string]string{"s2": "sp-s1-s2"}
 	assignmentBFD := map[string]string{"s2": "sgpa-s2-extgw1"}
@@ -103,7 +101,7 @@ func TestMeshPeerHealthCheck_GatewayNode_FallsBackToPeering(t *testing.T) {
 }
 
 func TestMeshPeerHealthCheck_DifferentSiteNoDirectPeering_UsesAssignmentProfile(t *testing.T) {
-	peer := meshPeerInfo{SiteName: "s3"}
+	peer := meshPeerInfo{SiteName: "s3", TransitPoolName: "pool"}
 	siteBFD := map[string]string{"s1": "s-s1"}
 	peeringBFD := map[string]string{}
 	assignmentBFD := map[string]string{"s3": "sgpa-s3-pool"}

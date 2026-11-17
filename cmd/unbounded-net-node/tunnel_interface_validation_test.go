@@ -66,6 +66,11 @@ func TestValidateTunnelInterfaceNames(t *testing.T) {
 			wantErrSub: "reserved device name",
 		},
 		{
+			name:   "collide-assignment-return",
+			geneve: "geneve0", vxlan: assignmentReturnDeviceName, ipip: "ipip0",
+			wantErrSub: "reserved device name",
+		},
+		{
 			name:   "duplicate-geneve-vxlan",
 			geneve: "shared", vxlan: "shared", ipip: "ipip0",
 			wantErrSub: "--geneve-interface and --vxlan-interface cannot both be",

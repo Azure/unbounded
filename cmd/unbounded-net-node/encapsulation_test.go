@@ -179,8 +179,8 @@ func TestResolveTunnelProtocolsOnPeers_GatewayMixedPoolTypes(t *testing.T) {
 }
 
 // TestResolveTunnelProtocolsOnPeers_GatewayMeshSGPAScope verifies that gateway
-// nodes use the SiteGatewayPoolAssignment scope (not the Site scope) for
-// same-site mesh peers, matching the non-gateway peer's scope selection.
+// assignment downlinks use their assignment scope without changing the
+// ordinary mesh link, including when both links use WireGuard.
 func TestResolveTunnelProtocolsOnPeers_GatewayMeshSGPAScope(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -211,7 +211,11 @@ func TestResolveTunnelProtocolsOnPeers_GatewayMeshSGPAScope(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			mesh := []meshPeerInfo{{
-				Name:     "user-node",
+				Name:            "user-node",
+				SiteName:        "s6",
+				TransitPoolName: "s6intgw1",
+			}, {
+				Name:     "user-node-mesh",
 				SiteName: "s6",
 			}}
 			siteTunnelProtos := map[string]string{"s6": tt.siteTunnel}
@@ -231,6 +235,10 @@ func TestResolveTunnelProtocolsOnPeers_GatewayMeshSGPAScope(t *testing.T) {
 
 			if mesh[0].TunnelProtocol != tt.wantProtocol {
 				t.Errorf("got %q, want %q", mesh[0].TunnelProtocol, tt.wantProtocol)
+			}
+
+			if mesh[1].TunnelProtocol != tt.siteTunnel {
+				t.Errorf("ordinary mesh got %q, want Site protocol %q", mesh[1].TunnelProtocol, tt.siteTunnel)
 			}
 		})
 	}

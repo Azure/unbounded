@@ -82,9 +82,13 @@ func TestUnmanagedSupernetsHonorSkippedPeerPodCIDRs(t *testing.T) {
 		}
 	}
 
-	for _, cidr := range []string{"10.245.1.0/24", "10.246.1.0/24"} {
+	for _, cidr := range []string{"10.245.1.0/24"} {
 		if !supernets[cidr] {
 			t.Fatalf("non-skipped peer route %s was lost: %v", cidr, supernets)
+		}
+
+		if supernets["10.246.1.0/24"] {
+			t.Fatalf("gateway identity injected its own PodCIDR without a slice or transit advertisement: %v", supernets)
 		}
 	}
 }
