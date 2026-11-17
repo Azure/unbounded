@@ -528,9 +528,13 @@ def iter_weights(
 
 
 def prefetch_id(uri: ModelURI, pinned: list) -> str:
-    """A stable ticket id for this model version and set of files."""
+    """A stable ticket id for this model version and set of files.
+
+    The entries are sorted first, so the id depends only on the set of
+    files, not the order they were collected in.
+    """
     digest = hashlib.sha256(str(uri).encode())
-    for name, meta in pinned:
+    for name, meta in sorted(pinned, key=lambda entry: (entry[0], entry[1].etag)):
         digest.update(b"\0")
         digest.update(name.encode())
         digest.update(b"\0")

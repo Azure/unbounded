@@ -691,8 +691,13 @@ def test_loader_prefetch_can_be_disabled(server, uri, torch, monkeypatch):
 
 def test_prefetch_id_is_stable_per_version(uri):
     a = types.SimpleNamespace(etag='"v1"')
+    b = types.SimpleNamespace(etag='"v2"')
     assert rv.prefetch_id(uri, [("a", a)]) == rv.prefetch_id(uri, [("a", a)])
     assert rv.prefetch_id(uri, [("a", a)]) != rv.prefetch_id(uri, [("a", types.SimpleNamespace(etag='"v2"'))])
+    # The same set of files gives the same id whatever order it is in.
+    forward = rv.prefetch_id(uri, [("a", a), ("b", b)])
+    assert forward == rv.prefetch_id(uri, [("b", b), ("a", a)])
+    assert forward != rv.prefetch_id(uri, [("a", b), ("b", a)])
 
 
 @pytest.mark.parametrize("fail", [True, False])
