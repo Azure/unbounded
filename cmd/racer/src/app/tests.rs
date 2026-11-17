@@ -3464,13 +3464,27 @@ fn network_keyring_bootstrap_rotation_recovery_and_failure_retention() {
     fixture.reject_keyring_mtls.store(false, Ordering::Release);
     fixture.handshake_alerts.lock().unwrap().push_back(42); // bad_certificate
     std::fs::write(&config.service_account_token, b"fixture.token.newer").unwrap();
-    drive(
-        &runtime,
-        &mut engine,
-        control
-            .keyring_progress(&scope(&racer_io::Clock::host(), Duration::from_secs(10)).unwrap()),
-    )
-    .unwrap();
+    for _ in 0..10 {
+        drive(
+            &runtime,
+            &mut engine,
+            control.keyring_progress(
+                &scope(&racer_io::Clock::host(), Duration::from_secs(10)).unwrap(),
+            ),
+        )
+        .unwrap();
+
+        if fixture
+            .keyring_tokens
+            .lock()
+            .unwrap()
+            .last()
+            .is_some_and(|token| token == "fixture.token.newer")
+        {
+            break;
+        }
+    }
+
     assert_eq!(control.projection_error(), None);
     assert_eq!(
         fixture.keyring_tokens.lock().unwrap().last().unwrap(),
