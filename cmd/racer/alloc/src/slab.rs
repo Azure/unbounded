@@ -253,7 +253,8 @@ impl<C: Charge> Slab<C> {
     }
 
     /// Run demand maintenance at `now`, freeing idle entries the controller
-    /// releases, oldest first. Returns released bytes.
+    /// releases, oldest first, or every idle entry under critical pressure.
+    /// Returns released bytes.
     pub fn maintain_idle(&self, now: std::time::Instant) -> usize {
         let Ok(mut pool) = self.idle_buffer.try_borrow_mut() else {
             return 0;
@@ -265,7 +266,7 @@ impl<C: Charge> Slab<C> {
 
     /// Apply memory pressure to the idle pool. Elevated pressure keeps only
     /// what the controller still targets, critical pressure keeps no returns,
-    /// and maintenance releases the rest.
+    /// and maintenance releases the rest, or all idle entries when critical.
     pub fn set_idle_pressure(&self, pressure: crate::Pressure) {
         self.idle_buffer.borrow_mut().set_pressure(pressure);
     }

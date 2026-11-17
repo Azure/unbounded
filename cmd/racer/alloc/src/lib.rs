@@ -805,7 +805,7 @@ impl Drop for Checkout {
 /// A [`Provision`] controller sizes the pool in 64 KiB granules from the bytes
 /// checked out of it; returns are accepted up to the idle byte budget, and
 /// maintenance frees whole buffers the controller releases without dropping
-/// below its target.
+/// below its target, or every idle buffer under critical pressure.
 pub(crate) struct BufferPool<C: Charge> {
     entries: VecDeque<AlignedBuffer<C>>,
     demand: Provision,
@@ -915,13 +915,19 @@ impl<C: Charge> BufferPool<C> {
     /// Remove the entries chosen by demand maintenance, oldest first. Only
     /// whole buffers are released, skipping any whose removal would leave
     /// less than the target, so the release may fall short of the plan.
+    /// Critical pressure releases every idle entry regardless of the plan,
+    /// since idle storage can share a rounded granule with a live checkout.
     pub(crate) fn maintain(&mut self, now: std::time::Instant) -> Vec<AlignedBuffer<C>> {
         // Checkouts and returns made while the list was borrowed were counted
         // but not observed.
         self.observe();
         let mut provisioned = self.in_use.get().saturating_add(self.bytes());
         let capacity = Self::granules(provisioned);
-        let Plan::Release(units) = self.demand.tick(now, capacity, 0, self.pressure) else {
+        let plan = self.demand.tick(now, capacity, 0, self.pressure);
+        if self.pressure == Pressure::Critical {
+            return self.take_all().into();
+        }
+        let Plan::Release(units) = plan else {
             return Vec::new();
         };
         let target = self.demand.target();
@@ -1240,6 +1246,36 @@ mod buffer_tests {
         assert_eq!(live.get(), 0);
         let stats = pool.borrow().stats();
         assert_eq!((stats.entries, stats.bytes, stats.rejects), (0, 0, 1));
+    }
+
+    /// Idle storage sharing a granule with a live checkout is still released.
+    #[test]
+    fn critical_pressure_drains_idle_within_a_checked_out_granule() {
+        let live = Rc::new(Cell::new(0));
+        let alignment = Alignment::new(4096, 1, 1).unwrap();
+        let pool = Rc::new(StagingPool::default());
+        let held = alignment
+            .allocate(4096, TrackedCharge::new(&live, 4096))
+            .unwrap()
+            .pooled(&pool);
+        drop(
+            alignment
+                .allocate(4096, TrackedCharge::new(&live, 4096))
+                .unwrap()
+                .pooled(&pool),
+        );
+        assert_eq!(tallied(&pool), 4096);
+        assert_eq!(live.get(), 2 * 4096);
+        pool.borrow_mut().set_pressure(Pressure::Critical);
+        let released = pool.borrow_mut().maintain(std::time::Instant::now());
+        assert_eq!(released.len(), 1);
+        drop(released);
+        assert_eq!(live.get(), 4096);
+        let stats = pool.borrow().stats();
+        assert_eq!((stats.entries, stats.bytes, stats.trimmed), (0, 0, 1));
+        assert_eq!(stats.target, STAGING_GRANULE);
+        drop(held);
+        assert_eq!(live.get(), 0);
     }
 
     #[test]
