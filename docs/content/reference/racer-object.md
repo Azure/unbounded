@@ -43,7 +43,7 @@ Usage: `racer-object sidecar [flags]`.
 |------|---------|---------|
 | `--cache` | none, required | Racer ClusterCache name. Must match the socket mount path. |
 | `--api` | `s3` | Client-facing API: `s3` or `azure`. |
-| `--page-size` | `16MiB` | Logical page size of the cache: a power of two from 4KiB to 16MiB, as bytes or a ClusterCache label such as `4KiB`. Must match the cache. The injector sets it. `RACER_OBJECT_PAGE_SIZE` is the environment fallback. |
+| `--page-size` | `16MiB` | Logical page size of the cache: a power of two from 4KiB to 16MiB, as bytes or a ClusterCache label such as `4KiB`. Must match the cache. The injector sets it. `RACER_OBJECT_PAGE_SIZE` is the environment fallback; an empty or whitespace-only value uses the default. |
 | `--listen` | `127.0.0.1:8080` | Loopback IP literal and port. Non-loopback addresses are rejected. |
 | `--request-timeout` | `5m` | Request timeout. |
 | `--max-connections` | `128` | Client connections accepted at once, and concurrent reads from Racer, across all workers. 1 to 65536. |

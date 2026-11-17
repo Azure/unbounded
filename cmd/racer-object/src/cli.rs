@@ -199,11 +199,13 @@ fn parse_with_page_size_env(
     }
     // An explicit flag wins over the environment; the environment is read
     // only for a run, so `--help` and `--version` still work when it is bad.
+    // An empty or whitespace-only environment is treated as unset, which
+    // keeps templated pod specs that render an empty value usable.
     let page_size = match page_size {
         Some(size) => size,
-        None => match page_size_env {
+        None => match page_size_env.map(str::trim) {
+            Some("") | None => DEFAULT_PAGE_SIZE,
             Some(value) => parse_page_size(value).ok_or_else(page_size_error)?,
-            None => DEFAULT_PAGE_SIZE,
         },
     };
     if cache.is_empty() {
@@ -592,6 +594,9 @@ mod tests {
             })
         };
         assert_eq!(parsed(None), Ok(DEFAULT_PAGE_SIZE));
+        assert_eq!(parsed(Some("")), Ok(DEFAULT_PAGE_SIZE));
+        assert_eq!(parsed(Some("   ")), Ok(DEFAULT_PAGE_SIZE));
+        assert_eq!(parsed(Some(" 4KiB ")), Ok(4 << 10));
         assert_eq!(parsed(Some("4KiB")), Ok(4 << 10));
         assert_eq!(parsed(Some("8192")), Ok(8 << 10));
         // An explicit flag wins over the environment.
@@ -610,10 +615,6 @@ mod tests {
         // using the default.
         assert_eq!(
             parsed(Some("3KiB")).unwrap_err(),
-            "--page-size must be a power of two from 4KiB to 16MiB"
-        );
-        assert_eq!(
-            parsed(Some("")).unwrap_err(),
             "--page-size must be a power of two from 4KiB to 16MiB"
         );
     }
