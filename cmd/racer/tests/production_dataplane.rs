@@ -534,6 +534,7 @@ impl Rig {
         let document = Arc::new(fixture_publication());
         let snapshot = snapshots.projection(document.clone()).unwrap()().unwrap();
         snapshots.install_publication(&document, &snapshot).unwrap();
+        index.set_page_sizes(&snapshot.page_sizes_served_by(&NodeId(NODE.into())));
         let network = Rc::new(
             PeerNetwork::new(
                 NodeId(NODE.into()),
