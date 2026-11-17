@@ -64,11 +64,11 @@ def test_exported_view_does_not_keep_the_fd(collect):
         gc.collect()
     else:
         b.close()
+        del b
     assert fd not in memfds("racer-test-export")
     # The mapping (and the fd mmap keeps for it) lives as long as the export.
     assert export.raw[:3] == b"abc" and mapped("racer-test-export")
     del export
-    b = None
     gc.collect()
     assert memfds("racer-test-export") == []
     assert not mapped("racer-test-export")
