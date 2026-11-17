@@ -762,6 +762,7 @@ impl Links {
         let bytes = |buffers: usize| (buffers * BUFFER_LEN) as u64;
         for (gauge, value) in [
             (Gauge::RdmaPoolCapacityBytes, bytes(sizing.capacity)),
+            (Gauge::RdmaPoolRegisteredBytes, bytes(sizing.registered)),
             (Gauge::RdmaPoolTargetBytes, bytes(sizing.target)),
             (Gauge::RdmaPoolInUseBytes, bytes(sizing.in_use)),
             (Gauge::RdmaPoolBlocks, sizing.blocks as u64),
@@ -804,6 +805,7 @@ impl Links {
                 continue;
             };
             total.capacity += sizing.capacity;
+            total.registered += sizing.registered;
             total.target += sizing.target;
             total.in_use += sizing.in_use;
             total.blocks += sizing.blocks;

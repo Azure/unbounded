@@ -642,6 +642,12 @@ impl Pool {
         self.tally.total.load(Ordering::Relaxed)
     }
 
+    /// Buffers in registered host blocks, active and draining: a draining
+    /// block stays registered and charged until it is reaped.
+    pub(crate) fn registered(&self) -> usize {
+        self.blocks.values().map(|b| b.shared.count()).sum()
+    }
+
     /// Host buffers not free, draining blocks included: the demand the
     /// blocks are sized to.
     pub(crate) fn in_use(&self) -> usize {

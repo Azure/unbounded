@@ -1875,11 +1875,14 @@ fn growing_pool_follows_demand() {
         assert_eq!(w.b.clients[0].pool_sizing(7), None, "b registers at once");
         let initial = sizing(&w);
         assert_eq!((initial.capacity, initial.blocks), (BLOCK, 1));
+        assert_eq!(initial.registered, BLOCK);
         let (ea, eb) = link_up(&mut w);
 
         let held = hold_grants(&mut w, ea, 2 * BLOCK, 0);
         let grown = sizing(&w);
         assert!(grown.capacity >= 2 * BLOCK, "{grown:?}");
+        assert_eq!(grown.registered, grown.capacity, "nothing drains");
+        assert_eq!(grown.registered, grown.blocks * BLOCK);
         assert!(grown.registrations >= 1);
         assert_eq!(charges.live.load(Ordering::Acquire), grown.blocks - 1);
         assert_eq!(
@@ -1900,6 +1903,7 @@ fn growing_pool_follows_demand() {
             s.capacity == BLOCK && s.blocks == 1
         }));
         let drained = sizing(&w);
+        assert_eq!(drained.registered, BLOCK);
         assert_eq!(drained.deregistrations, grown.registrations);
         assert_eq!(charges.live.load(Ordering::Acquire), 0);
         assert_eq!(w.a.clients[0].free_buffers(7), Some((GROWN, GROWN)));
@@ -1928,6 +1932,8 @@ fn draining_block_waits_for_its_buffers() {
             pump(&mut w);
             let draining = sizing(&w);
             assert_eq!((draining.capacity, draining.draining), (BLOCK, 1));
+            // The draining block is still registered and charged.
+            assert_eq!(draining.registered, 2 * BLOCK, "{draining:?}");
             assert_eq!(charges.live.load(Ordering::Acquire), 1);
             // Added blocks with nothing out deregister at once.
             assert_eq!(draining.deregistrations as usize, grown.blocks - 2);
@@ -1940,16 +1946,20 @@ fn draining_block_waits_for_its_buffers() {
         let reactivated = sizing(&w);
         assert_eq!(reactivated.draining, 0, "{reactivated:?}");
         assert!(reactivated.capacity >= 2 * BLOCK, "{reactivated:?}");
+        assert_eq!(reactivated.registered, reactivated.capacity);
         assert_eq!(reactivated.deregistrations as usize, grown.blocks - 2);
 
         w.a.clients[0].set_pool_pressure(page_alloc::Pressure::Critical);
         w.clock.advance(page_alloc::SAMPLE_PERIOD);
         pump(&mut w);
-        assert_eq!(sizing(&w).draining, 1);
+        let draining = sizing(&w);
+        assert_eq!(draining.draining, 1);
+        assert!(draining.registered > draining.capacity, "{draining:?}");
         release_grants(&mut w, eb, late);
         pump(&mut w);
         let done = sizing(&w);
         assert_eq!((done.blocks, done.draining), (1, 0), "{done:?}");
+        assert_eq!((done.capacity, done.registered), (BLOCK, BLOCK));
         assert_eq!(done.deregistrations, done.registrations);
         assert_eq!(charges.live.load(Ordering::Acquire), 0);
         shutdown(w);

@@ -575,6 +575,7 @@ metrics! { Gauge, GAUGES, GAUGE_COUNT;
             Self::MemoryPressureLevel => "racer_memory_pressure_level",
             Self::RdmaFreeBuffers => "racer_rdma_free_buffers",
             Self::RdmaPoolCapacityBytes => "racer_rdma_pool_capacity_bytes",
+            Self::RdmaPoolRegisteredBytes => "racer_rdma_pool_registered_bytes",
             Self::RdmaPoolTargetBytes => "racer_rdma_pool_target_bytes",
             Self::RdmaPoolInUseBytes => "racer_rdma_pool_in_use_bytes",
             Self::RdmaPoolBlocks => "racer_rdma_pool_blocks",

@@ -1077,6 +1077,35 @@ pub(crate) mod send_in_place {
     }
 
     #[test]
+    /// The pool gauges sum the rails' sizing: one block registered at
+    /// activation is both the active and the registered size.
+    fn pool_sizing_is_published() {
+        let w = world();
+        let (w, ma, _) = metered(w);
+        w.a.links.sync_link_metrics();
+        let sizing = w.a.links.pool_sizing();
+        assert_eq!(
+            (sizing.capacity, sizing.registered, sizing.blocks),
+            (2, 2, 1)
+        );
+        assert_eq!(
+            ma.gauge(Gauge::RdmaPoolCapacityBytes),
+            2 * BUFFER_LEN as u64
+        );
+        assert_eq!(
+            ma.gauge(Gauge::RdmaPoolRegisteredBytes),
+            2 * BUFFER_LEN as u64
+        );
+        assert_eq!(ma.gauge(Gauge::RdmaPoolInUseBytes), 0);
+        assert_eq!(ma.gauge(Gauge::RdmaPoolBlocks), 1);
+        assert_eq!(ma.gauge(Gauge::RdmaPoolDrainingBlocks), 0);
+        let mut out = String::new();
+        ma.write_prometheus(&mut out).unwrap();
+        let registered = format!("racer_rdma_pool_registered_bytes {}", 2 * BUFFER_LEN);
+        assert!(out.contains(&registered), "missing {registered}");
+    }
+
+    #[test]
     /// Link breaks are published by reason, once each, and link states as
     /// gauges; both show up on `/metrics`.
     fn link_breaks_and_states_are_published() {

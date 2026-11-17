@@ -53,8 +53,12 @@ pub struct Growth {
 /// A rail's receive pool sizing, for telemetry. Counts are in buffers.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PoolSizing {
-    /// Buffers in active blocks.
+    /// Buffers in active blocks, which the target is compared against.
     pub capacity: usize,
+
+    /// Buffers in registered blocks, active and draining: what is pinned
+    /// and charged now.
+    pub registered: usize,
 
     /// Buffers the controller wants.
     pub target: usize,
@@ -85,6 +89,7 @@ pub struct PoolSizing {
 #[derive(Debug, Default)]
 pub(crate) struct SizingStats {
     capacity: AtomicU64,
+    registered: AtomicU64,
     target: AtomicU64,
     in_use: AtomicU64,
     blocks: AtomicU64,
@@ -101,6 +106,7 @@ impl SizingStats {
         let count = |v: &AtomicU64| usize::try_from(load(v)).unwrap_or(usize::MAX);
         PoolSizing {
             capacity: count(&self.capacity),
+            registered: count(&self.registered),
             target: count(&self.target),
             in_use: count(&self.in_use),
             blocks: count(&self.blocks),
@@ -346,6 +352,7 @@ impl RailSizing {
         let store = |v: &AtomicU64, n: u64| v.store(n, Ordering::Relaxed);
         let nanos = |d: Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
         store(&self.stats.capacity, pool.capacity() as u64);
+        store(&self.stats.registered, pool.registered() as u64);
         store(&self.stats.target, self.demand.target() as u64);
         store(&self.stats.in_use, pool.in_use() as u64);
         store(&self.stats.blocks, pool.block_count() as u64);

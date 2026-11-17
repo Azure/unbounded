@@ -194,7 +194,9 @@ workers). A rising transition still reclaims idle buffers and staging at once.
 Host pools export `racer_buffer_pool_*` and `racer_staging_pool_*`: entries,
 warm, in-use, target, and cold bytes, and hits, misses, cold hits, rejects,
 trimmed, and unpooled counters. RDMA pools export
-`racer_rdma_pool_{capacity,target,in_use}_bytes`, block and draining block
+`racer_rdma_pool_{registered,capacity,target,in_use}_bytes` (registered
+counts draining blocks until they are deregistered; capacity counts only the
+active blocks that sizing compares with the target), block and draining block
 counts, registration and deregistration counters, and the slowest rail's
 registration and hold times.
 
