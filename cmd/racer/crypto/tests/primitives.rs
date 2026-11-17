@@ -1391,7 +1391,7 @@ fn verify_tag_matches_open_and_reference_and_rejects_tampering() {
     }
 }
 
-/// The ring-backed page cipher is byte-identical to the RustCrypto XAES oracle.
+/// The AWS-LC page cipher is byte-identical to the RustCrypto XAES oracle.
 #[test]
 fn xaes_matches_reference_oracle_in_both_directions() {
     use xaes_256_gcm::{

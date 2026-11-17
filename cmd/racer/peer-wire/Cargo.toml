@@ -15,7 +15,7 @@ racer-crypto = { path = "../crypto" }
 racer-wire = { path = "../wire" }
 racer-io = { path = "../io" }
 base64 = "0.22"
-sha2 = "0.10"
+sha2 = { version = "0.10", features = ["asm"] }
 
 [dev-dependencies]
 racer-crypto = { path = "../crypto", features = ["test-util"] }
