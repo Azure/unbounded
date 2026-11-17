@@ -746,6 +746,7 @@ pub(crate) struct BufferPool<C: Charge> {
     pressure: Pressure,
     budget: usize,
     in_use: usize,
+    idle: usize,
     counters: StagingCounters,
 }
 
@@ -790,15 +791,26 @@ impl<C: Charge> BufferPool<C> {
             pressure: Pressure::Normal,
             budget,
             in_use: 0,
+            idle: 0,
             counters: StagingCounters::default(),
         }
     }
 
     fn bytes(&self) -> usize {
-        self.entries
-            .iter()
-            .map(|b| b.allocation().layout.size())
-            .sum()
+        self.idle
+    }
+
+    /// Keep a returned buffer as the newest idle entry.
+    fn push(&mut self, buffer: AlignedBuffer<C>) {
+        self.idle = self.idle.saturating_add(buffer.allocation().layout.size());
+        self.entries.push_back(buffer);
+    }
+
+    /// Remove the idle entry at `index`.
+    fn remove(&mut self, index: usize) -> Option<AlignedBuffer<C>> {
+        let buffer = self.entries.remove(index)?;
+        self.idle = self.idle.saturating_sub(buffer.allocation().layout.size());
+        Some(buffer)
     }
 
     fn granules(bytes: usize) -> usize {
@@ -842,7 +854,7 @@ impl<C: Charge> BufferPool<C> {
         let mut wanted = units.saturating_mul(STAGING_GRANULE);
         let mut released = Vec::new();
         while wanted > 0
-            && let Some(buffer) = self.entries.pop_front()
+            && let Some(buffer) = self.remove(0)
         {
             wanted = wanted.saturating_sub(buffer.allocation().layout.size());
             released.push(buffer);
@@ -854,6 +866,7 @@ impl<C: Charge> BufferPool<C> {
     /// Remove every idle entry and count it as trimmed.
     pub(crate) fn take_all(&mut self) -> VecDeque<AlignedBuffer<C>> {
         let idle = std::mem::take(&mut self.entries);
+        self.idle = 0;
         self.counters.trimmed = self.counters.trimmed.saturating_add(idle.len() as u64);
         idle
     }
@@ -894,7 +907,7 @@ impl<C: Charge> BufferPool<C> {
             return None;
         };
         self.counters.hits = self.counters.hits.saturating_add(1);
-        self.entries.remove(index)
+        self.remove(index)
     }
 }
 
@@ -998,7 +1011,7 @@ impl<C: Charge> Drop for AlignedBuffer<C> {
                 && idle.accepts(self.allocation().layout.size())
             {
                 self.allocation_mut().prepare_pool();
-                idle.entries.push_back(Self {
+                idle.push(Self {
                     allocation: self.allocation.take(),
                     pool: Weak::new(),
                     length: self.length,
@@ -1035,6 +1048,69 @@ mod buffer_tests {
         /// Address, length, and result of each mapping release on this thread.
         pub(super) static UNMAPS: RefCell<Vec<(usize, usize, i32)>> =
             const { RefCell::new(Vec::new()) };
+    }
+
+    /// Take the newest idle entry through the tallied removal path.
+    fn newest<C: Charge>(pool: &Rc<RefCell<BufferPool<C>>>) -> AlignedBuffer<C> {
+        let mut pool = pool.borrow_mut();
+        let index = pool.entries.len() - 1;
+        pool.remove(index).unwrap()
+    }
+
+    /// Idle bytes, checked against a full scan of the entries.
+    fn tallied<C: Charge>(pool: &Rc<RefCell<BufferPool<C>>>) -> usize {
+        let pool = pool.borrow();
+        let scanned: usize = pool
+            .entries
+            .iter()
+            .map(|b| b.allocation().layout.size())
+            .sum();
+        assert_eq!(pool.bytes(), scanned);
+        scanned
+    }
+
+    #[test]
+    fn idle_tally_follows_returns_reuse_trims_and_reclaim() {
+        let alignment = Alignment::new(64, 1, 1).unwrap();
+        let pool = Rc::new(RefCell::new(BufferPool::default()));
+        let sizes = [STAGING_GRANULE, 2 * STAGING_GRANULE, 3 * STAGING_GRANULE];
+        let held: Vec<_> = sizes
+            .iter()
+            .map(|&size| alignment.allocate(size, ()).unwrap().pooled(&pool))
+            .collect();
+        assert_eq!(tallied(&pool), 0);
+        drop(held);
+        assert_eq!(tallied(&pool), 6 * STAGING_GRANULE);
+        let reused = pool
+            .borrow_mut()
+            .take_for(2 * STAGING_GRANULE, &())
+            .unwrap();
+        assert_eq!(tallied(&pool), 4 * STAGING_GRANULE);
+        assert!(
+            pool.borrow_mut()
+                .take_for(5 * STAGING_GRANULE, &())
+                .is_none()
+        );
+        assert_eq!(tallied(&pool), 4 * STAGING_GRANULE);
+        drop(reused.pooled(&pool));
+        assert_eq!(tallied(&pool), 6 * STAGING_GRANULE);
+        pool.borrow_mut().set_pressure(Pressure::Critical);
+        let released = pool.borrow_mut().maintain(std::time::Instant::now());
+        assert!(!released.is_empty());
+        assert_eq!(tallied(&pool), pool.borrow().stats().bytes);
+        drop(released);
+        pool.borrow_mut().set_pressure(Pressure::Normal);
+        drop(
+            alignment
+                .allocate(STAGING_GRANULE, ())
+                .unwrap()
+                .pooled(&pool),
+        );
+        assert_eq!(tallied(&pool), pool.borrow().stats().bytes);
+        assert!(tallied(&pool) > 0);
+        let all = pool.borrow_mut().take_all();
+        assert!(!all.is_empty());
+        assert_eq!(tallied(&pool), 0);
     }
 
     #[test]
@@ -1083,7 +1159,7 @@ mod buffer_tests {
                         .unwrap()
                         .pooled(&pool),
                 );
-                assert!(pool.borrow().bytes() <= budget);
+                assert!(tallied(&pool) <= budget);
                 assert!(live.get() <= budget);
                 assert_eq!(pool.borrow().in_use, 0);
             }
@@ -1219,12 +1295,12 @@ mod buffer_tests {
         assert_eq!(buffer.as_slice(), vec![0; 1024]);
         drop(buffer);
         assert_eq!(wipes.get(), 0);
-        buffer = pool.borrow_mut().entries.pop_back().unwrap().pooled(&pool);
+        buffer = newest(&pool).pooled(&pool);
         buffer.as_mut_slice().fill(0xa5);
         assert!(!buffer.allocation().clean);
         drop(buffer);
         assert_eq!(wipes.get(), 1);
-        buffer = pool.borrow_mut().entries.pop_back().unwrap().pooled(&pool);
+        buffer = newest(&pool).pooled(&pool);
         assert_eq!(buffer.as_slice(), vec![0; 1024]);
         assert!(buffer.allocation().clean);
         drop(buffer);
@@ -1249,7 +1325,7 @@ mod buffer_tests {
             assert_eq!(buffer.as_slice()[127], 0x5a);
             drop(buffer);
             assert_eq!(wipes.get(), expected);
-            buffer = pool.borrow_mut().entries.pop_back().unwrap().pooled(&pool);
+            buffer = newest(&pool).pooled(&pool);
             assert_eq!(IoBuffer::bytes(&buffer).unwrap(), &[0; 128]);
         }
         // Even an unused mutable borrow must conservatively require a wipe.
@@ -1429,7 +1505,7 @@ mod buffer_tests {
         drop(buffer);
         assert_eq!(live.get(), 15);
         assert!(weak.upgrade().is_none());
-        let mut reused = pool.borrow_mut().entries.pop_back().unwrap();
+        let mut reused = newest(&pool);
         assert_eq!(reused.as_slice().as_ptr(), pointer);
         assert_eq!(reused.as_slice(), &[0; 15]);
         reused.rebind(TrackedCharge::new(&live, 20)).unwrap();
@@ -1476,7 +1552,7 @@ mod buffer_tests {
                 _ => {
                     let idle = alignment.allocate(8, TrackedCharge::new(&live, 8)).unwrap();
                     let pointer = idle.as_slice().as_ptr();
-                    pool.borrow_mut().entries.push_back(idle);
+                    pool.borrow_mut().push(idle);
                     drop(buffer);
                     assert_eq!(live.get(), 8);
                     assert_eq!(pool.borrow().entries[0].as_slice().as_ptr(), pointer);
