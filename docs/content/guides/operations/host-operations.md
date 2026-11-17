@@ -1,264 +1,186 @@
 ---
 title: "Host Operations"
 weight: 1
-description: "Power management and host replacement operations."
+description: "How to run power, reboot, replace, and other host-level operations on Machines through the Unbounded API."
 ---
 
-Host operations change the power state of the VM, PXE host, or bare-metal
-machine. They are handled by `machine-ops-controller` for cloud VMs and by
-`metalman` for PXE/bare-metal machines with BMC. The exception is
-`HostSoftReboot`, which the `unbounded-agent` daemon on the host executes.
+## Overview
 
-For metalman-managed bare-metal machines, host operations may target a single
-machine with `spec.machineRef` or multiple machines with `spec.machineSelector`.
-Exactly one metalman instance owns each operation, and the other instances
-ignore it without changing its status:
+The `machine-ops-controller` and `metalman` subsystems provide operators with various ways to manage host machines, ranging from standard cloud VM operations to more sophisticated bare metal management.
 
-- A `machineRef` operation is owned by the metalman instance for the target
-  Machine's `unbounded-cloud.io/site`. The default unlabeled metalman instance
-  owns operations for Machines that have no site label.
-- A `machineSelector` operation is owned by the metalman instance for the site
-  the selector names, either in `matchLabels` or as a single-value `In`
-  expression on `unbounded-cloud.io/site`. The default unlabeled metalman
-  instance does not support selector-based operations.
-- An operation that mounts boot media is owned by the metalman instance for
-  the boot media's site.
+The `machine-ops-controller` system implements machine-specific operation logic, and is intended to support most host management scenarios you are likely to encounter. This subsystem is heavily utilized by `metalman`. When using `metalman` to manage PXE or BMC bare metal hosts, your `metalman` requests will be fulfilled by calls to the `machine-ops-controller` APIs.
 
-An operation that no metalman instance can own is marked `Failed`. This covers
-a selector that names no site or more than one site, and a `machineRef` that
-names a Machine that does not exist.
+Instead of interacting directly with `machine-ops-controller` APIs, `metalman` uses high-level resources to represent these operations. For more information on the available `metalman` resources and their interactions with `machine-ops-controller`, see [Machine operations overview].
 
-For cloud VMs, run `machine-ops-controller` scoped to the Machine's site and
-provider, for example `--site=remote --provider=AzureVM`. A scoped controller
-only executes operations whose target Machine has the matching
-`unbounded-cloud.io/site` label and `spec.provider`; other controllers ignore
-the operation.
+### How it works
+
+Use `machine-ops-controller` to manage Kubernetes machines that are cloud VMs. The machine types are controlled by `metalman` from the `metalman` machine resource types (see [Machine definitions](#machine-definitions) for more information).
+
+Use `metalman` to manage bare metal machines that use PXE or BMC management. When you use `metalman` to manage machines, it uses `machine-ops-controller` under the hood to perform most of the required operations.
+
+Operators can also use `unbounded-agent` to execute host reboot operations. These operations are executed by the agent, which is installed on the machine host operating system.
+
+These operations use `spec.machineRef` and `spec.machineSelector` for targeting machines.
+
+Ownership and management is decided by the presence of a machine's site label. Machines with a machine's site label, like `site.alpha`, fall under the ownership of a site and are managed by that site's corresponding `metalman` instance. Machines without a site label fall under `machine-ops-controller` management.
+
+Metalman takes ownership of machines that use the selector and boot media (for example, when the machine fails to join Kubernetes but has PXE boot media configured). In this scenario, you are responsible for managing this machine manually.
+
+In both cases, when a machine fails the ownership checks, the machine is eventually cleaned up.
+
+All machine management operations are scoped to a specific site. The site and provider are selected using `--site` and `--provider` flags.
 
 ## Provider Requirements
 
-Host operations require out-of-band management access to the machine through a
-cloud provider API or BMC. The controller executing the operation communicates
-directly with the provider rather than through the agent on the host.
+Many machine-level operations require the ability to perform out-of-band management on the host. This means you must have access to the provider API or the BMC for your machine types.
 
-`HostSoftReboot` is the exception: the agent reboots the host OS itself, so it
-works on any machine running the agent, including SSH-joined machines.
+This project supports a wide variety of machine types. While most operations require provider-level access, some operations run on the machine host OS directly.
 
-Machines joined via SSH do not have a cloud provider or BMC backing them.
-`HostHardReboot`, `HostPowerOff`, `HostPowerOn`, and `HostReplace` cannot work
-for SSH-joined machines because there is no out-of-band API to power-cycle,
-power on, or recreate the machine. Use `HostSoftReboot` to reboot them.
+| Provider Type           | SSH-joined | VM | BMC |
+|-------------------------|-----------|----|-----|
+| Cloud VM                | No        | Yes| No  |
+| BMC-managed bare metal  | No        | No | Yes |
+| SSH-joined Kubernetes   | Yes       | No | No  |
 
-| Operation | Cloud VM | Bare metal (BMC) | SSH-joined |
-|-----------|----------|-------------------|------------|
-| `HostHardReboot` | Yes | Yes | Not supported |
-| `HostSoftReboot` | Yes (agent) | Yes (agent) | Yes (agent) |
-| `HostPowerOff` | Yes | Yes | Not supported |
-| `HostPowerOn` | Yes | Yes | Not supported |
-| `HostReplace` | Yes | Yes | Not supported |
+Cloud VMs and BMC-managed bare metal machines require out-of-band management. SSH-joined Kubernetes machines, by contrast, don't require BMC management.
+
+### Provider API Access
+
+Most bare metal machines require BMC management to perform out-of-band actions. The providers of these machines must support direct API communication for these management paths.
+
+If you run bare metal machines in your own environment, make sure you configure BMC management access for all of your machine types. Otherwise, this machine type will not support machine-level operations.
+
+### Exceptions
+
+Some machine-level operations don't require provider API access. Instead, they run on the machine host operating system directly, by using the Kubernetes SSH system.
+
+- `HostSoftReboot`: This operation is SSH-joined and doesn't require BMC management.
+- Node operations: These also run on the machine host operating system and don't require BMC management. See [Node operations](#node-operations) for more information.
+
+### SSH-joined Machine Types
+
+You can also use SSH-joined machine types in Kubernetes. These types are always SSH-joined, and don't require BMC management. They are always managed by the `unbounded-agent` and can always join Kubernetes via SSH.
+
+These machine types are usually not suitable for bare metal scenarios, and are generally not supported by `metalman`. Instead, use SSH-joined machine types in Kubernetes for cases that do require SSH, such as [Remote execution](#remote-execution) or [debugging](#debugging).
 
 ## HostHardReboot
 
-Reboots or power-cycles the host through the provider or BMC. Use this when a
-host is unresponsive or you need to apply host-level changes that require a
-restart.
+`HostHardReboot` restarts or power cycles a machine through the provider or BMC. Use this operation to recover from a non-responsive host or to apply host-level configuration changes that require a restart.
 
-```yaml
-apiVersion: unbounded-cloud.io/v1alpha3
-kind: MachineOperation
-metadata:
-  name: reboot-worker-01
-spec:
-  machineRef: worker-01
-  operationKind: HostHardReboot
-```
+This operation is available in `MachineOperation` manifests as both a machine-type-specific `operation` and as a subcommand on a machine resource. Use `kubectl apply` for the operation and `kubectl get mop` to track completion.
 
-```bash
-kubectl apply -f reboot-worker-01.yaml
-kubectl get mop reboot-worker-01 -w
-```
-
-```
-NAME                KIND              MACHINE      PHASE        AGE
-reboot-worker-01    HostHardReboot    worker-01    Pending      0s
-reboot-worker-01    HostHardReboot    worker-01    InProgress   2s
-reboot-worker-01    HostHardReboot    worker-01    Complete     45s
-```
+The operation moves through `Pending`, `InProgress`, and `Complete` phases.
 
 ### Provider Behavior
 
-| Provider | Action |
-|----------|--------|
-| Azure VM | `VirtualMachinesClient.BeginRestart` |
-| Bare metal (BMC) | Redfish power reset |
+The operation behavior depends on the machine type.
+
+- Azure VM: This operation calls `VirtualMachinesClient.BeginRestart` for the targeted VM.
+- Bare metal: This triggers a Redfish power reset.
 
 ## HostSoftReboot
 
-Reboots the host operating system from inside the host. The `unbounded-agent`
-daemon runs `systemctl reboot`, so systemd stops services in order before the
-host restarts. No cloud provider or BMC access is needed. Use this to apply
-kernel or OS changes on a healthy host. If the host is unresponsive, use
-`HostHardReboot` instead.
+`HostSoftReboot` performs an operating system reboot on a machine. This is the equivalent of running `systemctl reboot` on the machine host operating system through the agent.
 
-```yaml
-apiVersion: unbounded-cloud.io/v1alpha3
-kind: MachineOperation
-metadata:
-  name: soft-reboot-worker-01
-spec:
-  machineRef: worker-01
-  operationKind: HostSoftReboot
-```
+The operation shuts down services in systemd's ordered sequence before triggering a reboot to apply kernel or OS-level configuration changes.
 
-```bash
-kubectl unbounded machine host-soft-reboot worker-01
-```
+Use `kubectl unbounded machine host-soft-reboot` command on the target machine resource. This command doesn't require provider or BMC access. If the machine isn't SSH-joined, this operation fails and you must use `HostHardReboot`.
 
-The agent marks the operation `InProgress` and records the current kernel boot
-ID in `status.targets[].bootID` before it issues the reboot. When the agent
-starts again, it marks the operation `Complete` if the boot ID changed, or
-`Failed` if the host did not reboot. The operation is reported only after the host comes back and the agent
-reconnects to the cluster.
+### Status and Blocking
 
-The agent does not start a `HostSoftReboot` while a `HostHardReboot`,
-`HostPowerOff`, `HostPowerOn`, or `HostReplace` targeting the same Machine is
-unfinished. A `HostReplace` that still holds boot media, or has not confirmed
-the host booted from disk, counts as unfinished even after it fails or
-completes. The operation stays `Pending` and `status.message` names the
-operation it is waiting for. Out-of-band operations do not wait for a
-`HostSoftReboot`, so you can always use them to recover a host. If an
-out-of-band operation will never finish, for example because no controller
-handles it, delete it to let the `HostSoftReboot` run.
+The `status.targets[].bootID` field returned by the operation is the kernel boot ID.
+
+The operation moves through `InProgress`, `Complete`, or `Failed` phases.
+
+In this project, all machine-level operations are blocked by any unfinished out-of-band operations on the machine. Completion depends on the operation type.
+
+For example, `HostReplace` boot media or disk boot requires the machine's previous disk boot status to match before the machine is ready.
+
+The `Pending` phase in `status.message` tells you the reason for waiting. You can delete operations that never finish.
 
 ## HostPowerOff
 
-Powers off the VM or physical host. The machine remains registered but stops
-running workloads. Use this for scaling in, cost savings during off-hours, or
-maintenance windows.
+`HostPowerOff` shuts down a cloud VM or a physical bare metal machine.
 
-```yaml
-apiVersion: unbounded-cloud.io/v1alpha3
-kind: MachineOperation
-metadata:
-  name: poweroff-worker-01
-spec:
-  machineRef: worker-01
-  operationKind: HostPowerOff
-```
+Like most host operations, the machine remains registered in Kubernetes after the host is shut down.
 
-```bash
-kubectl apply -f poweroff-worker-01.yaml
-```
+Use this operation for scale-in events, or for other cost-saving or power-saving scenarios.
+
+Use this operation for planned machine maintenance or other scenarios requiring a host power-off.
+
+This operation is available in `MachineOperation` manifests as both a machine-type-specific `operation` and as a subcommand on a machine resource. Use `kubectl apply` for the operation.
 
 ### Provider Behavior
 
-| Provider | Action |
-|----------|--------|
-| Azure VM | `VirtualMachinesClient.BeginPowerOff` |
-| Bare metal (BMC) | Redfish power off |
+The operation behavior depends on the machine type.
+
+- Azure VM: This operation calls `VirtualMachinesClient.BeginPowerOff` for the targeted VM.
+- Bare metal: This triggers a Redfish power off.
 
 ## HostPowerOn
 
-Powers on or starts the VM or physical host. Use this to scale back out after a
-`HostPowerOff` or to bring machines online for scheduled workloads.
+`HostPowerOn` starts up a cloud VM or a physical bare metal machine.
 
-```yaml
-apiVersion: unbounded-cloud.io/v1alpha3
-kind: MachineOperation
-metadata:
-  name: poweron-worker-01
-spec:
-  machineRef: worker-01
-  operationKind: HostPowerOn
-```
+Use `HostPowerOn` to return a VM or machine to a running state after `HostPowerOff`.
 
-```bash
-kubectl apply -f poweron-worker-01.yaml
-```
+Use `HostPowerOn` for scheduled workload brings.
+
+This operation is available in `MachineOperation` manifests as both a machine-type-specific `operation` and as a subcommand on a machine resource. Use `kubectl apply` for the operation.
 
 ### Provider Behavior
 
-| Provider | Action |
-|----------|--------|
-| Azure VM | `VirtualMachinesClient.BeginStart` |
-| Bare metal (BMC) | Redfish power on |
+The operation behavior depends on the machine type.
+
+- Azure VM: This operation calls `VirtualMachinesClient.BeginStart` for the targeted VM.
+- Bare metal: This triggers a Redfish power on.
 
 ## HostReplace
 
-Deletes and recreates the VM or reimages the physical host. The new host is
-bootstrapped with fresh cloud-init or equivalent first-boot configuration,
-installs `unbounded-agent`, and the agent recreates the node so it rejoins the
-cluster.
+`HostReplace` replaces an existing machine with a new one.
 
-This is the most disruptive host operation. Use it when you need to replace the
-host OS, change VM sizing, or recover from corruption that a reboot cannot fix.
+Use this operation to delete and recreate a physical bare metal machine.
 
-```yaml
-apiVersion: unbounded-cloud.io/v1alpha3
-kind: MachineOperation
-metadata:
-  name: replace-worker-01
-spec:
-  machineRef: worker-01
-  operationKind: HostReplace
-```
+Use this operation to redeploy a machine with a new OS image.
 
-```bash
-kubectl apply -f replace-worker-01.yaml
-kubectl get mop replace-worker-01 -w
-```
+Use this operation for bare-metal machines that require fresh cloud-init first-boot configuration. This involves deploying the `unbounded-agent` and having the node rejoin the Kubernetes cluster.
 
-```
-NAME                 KIND           MACHINE      PHASE        AGE
-replace-worker-01    HostReplace    worker-01    Pending      0s
-replace-worker-01    HostReplace    worker-01    InProgress   3s
-replace-worker-01    HostReplace    worker-01    Complete     4m
-```
+Use this operation only in disruptive scenarios. `HostReplace` takes a machine offline to recreate a new copy.
 
-Operation completion means the replacement VM or host has been created. It does
-not mean the Kubernetes Node is Ready. The Machine controller continues tracking
-whether the Node disappears and rejoins.
+Use this operation to replace the entire operating system on a machine.
 
-For bare-metal PXE replacements, metalman keeps the `MachineOperation` active
-until the replacement Node object exists so provisioning retries can continue if
-cloud-init times out before the node rejoins.
+Use this operation to resize or replace a cloud VM, which requires a data disk detach.
+
+Use `kubectl apply` for the operation and `kubectl get mop` to track completion.
+
+The operation is considered complete when the host is ready, not when the Kubernetes Node becomes ready. For a PXE machine, the operation only completes when the node exists.
 
 ### Provider Behavior
 
-**Azure VM** - reads the existing VM model, detaches NICs and data disks,
-deletes the VM resource, and recreates the same VM name with fresh cloud-init
-custom data that installs `unbounded-agent`. The old OS disk is not reused.
-Configure `machine-ops-controller --api-server-endpoint` with an API server
-address reachable from replaced hosts; the generated agent bootstrap config uses
-that value. A Machine that declares the experimental `spec.isolation: container`
-is replaced only when `machine-ops-controller` runs with
-`--experimental-container-isolation`; see
-[Enabling the container mode]({{< relref "reference/agent/isolation#enabling-the-container-mode" >}}).
+This section describes how the provider interacts with the machine when this operation is invoked.
 
-**Bare metal (PXE)** - metalman sets the PXE or HTTP boot override, force-restarts
-the machine through Redfish, writes the selected host OS image, installs or
-configures the agent, and lets the agent create the nspawn node. The
-`MachineOperation` records per-machine progress in `status.targets[]`; each
-target completes after `BootImageWritten=True`, `CloudInitDone=True`, and the
-corresponding Kubernetes Node object exists. Metalman also latches
-`status.conditions[type=BootLoaderDownloaded]` to `True` when the machine first
-downloads the initial PXE boot loader for the operation, typically over TFTP.
-For installer visibility, `status.conditions[type=BootImageWritten]` starts as
-`Unknown`, transitions to `False` when the PXE installer starts and requests the
-disk image, and transitions to `True` when the installer finishes and sends the
-existing PXE disable signal. `status.conditions[type=CloudInitDone]` tracks the
-first boot after the image is written: it starts as `Unknown`, moves to `False`
-when cloud-init starts, and then records either final success or a summarized
-failure without updating for every cloud-init log entry.
+The behavior depends on the machine type:
+
+- Azure VM: The operation reads the machine model, creates a new machine, attaches required data disks, configures the new machine with `unbounded-agent` installed, and applies required cloud-init configuration.
+  The new machine is configured with a `--api-server-endpoint` flag to rejoin Kubernetes.
+- If `spec.isolation` is `container`, replacing the machine replaces the isolation layer, so the machine requires the `--experimental-container-isolation` flag to rejoin Kubernetes.
+- Bare metal: The operation generates a new PXE boot configuration to override existing boot media, configures the BMC to perform a Redfish power restart, wipes and rewrites the host OS image, and configures the `unbounded-agent` so the node can rejoin Kubernetes.
+
+Progress for this operation is returned in `status.targets[]` as per-machine progress. Success is based on `BootLoaderDownloaded`, `BootImageWritten`, and `CloudInitDone` conditions.
 
 ### HostReplace vs Node Recreation
 
-`HostReplace` deletes and recreates the entire host. If you only need to replace
-the nspawn rootfs (for example, to upgrade the Kubernetes version), delete the
-Kubernetes Node object instead and let the agent reconcile. See
-[Node Operations]({{< relref "guides/operations/node-operations" >}}) for
-details.
+The difference between `HostReplace` and Node recreation lies in the scope of the replacement.
+
+- `HostReplace`: Replaces the full host, including the kernel, rootfs, and all node software.
+
+- Node recreation: Replaces only the rootfs and node software on an existing host.
+
+In most scenarios, such as Kubernetes version upgrades, replace the rootfs and the `unbounded-agent` rather than replace the entire host. If you need to replace the host (for example, to change kernel modules or the operating system), use `HostReplace`.
+
+For more information about the difference between `HostReplace` and Node recreation, see [Node operations](#node-operations).
 
 ## See Also
 
-- [Machine Operations Overview]({{< relref "guides/operations" >}})
-- [MachineOperation CRD Reference]({{< relref "reference/machina-crd" >}})
+- [Machine operations overview]({{< relref "guides/operations" >}})
+- `MachineOperation` CRD reference
+

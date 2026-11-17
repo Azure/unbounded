@@ -1,55 +1,55 @@
 ---
 title: "Racer Reference"
 weight: 7
-description: "Racer resources, configuration, diagnostics, Go SDK, and RDMA requirements."
+description: "This page is the complete reference for the Racer node-local object cache, including its ClusterCache API, dataplane settings, control plane, metrics, and hardware features."
 ---
 
-{{< callout type="warning" >}}
-Racer is pre-release. Its APIs, flags, and on-disk formats may change without a
-migration path. Cached data is disposable; Racer is not durable storage. Start
-with the [Azure Blob cache guide]({{< relref "guides/azure-blob-cache" >}}).
-{{< /callout >}}
+Racer is the node-local read-through cache that serves object data to workloads through a Unix socket on each Kubernetes node. It is designed around immutable object versions: a key names content that may change, each version of that content has an ETag, and the bytes of one version never change. Racer splits each version into fixed-size pages, places those pages on a small set of owner nodes, and serves a read from local memory, local disk, a peer, or the origin in that order.
 
-See [Racer concepts]({{< relref "concepts/racer" >}}) and the [Azure Blob cache guide]({{< relref "guides/azure-blob-cache" >}}).
+The mental model has four parts. A `ClusterCache` is the Kubernetes object that names a cache and defines its policy. The Racer dataplane is a privileged DaemonSet that stores and serves pages on every selected node. An elected control plane, embedded in the same `racer` process, publishes cluster membership, cache definitions, page keys, and the cluster page size. Clients reach the cache over `/run/racer/<name>/client/socket`, either through the Go SDK or through the injected client socket mount.
+
+This page is the reference for operators who install, size, tune, and troubleshoot Racer. It documents the API fields, every accepted environment variable, the node requirements, the control plane, the diagnostics and metrics surface, and the hardware paths for RDMA and GPU reads. For a task-oriented introduction, start with [Racer concepts]({{< relref "concepts/racer" >}}) and the [vLLM guide]({{< relref "guides/racer-vllm" >}}).
+
+## Components
+
+Racer ships as one container image and one process. The process can run as a standalone dataplane, pointed at your own controller, or in managed mode, where the operator supplies Kubernetes identity and the process runs the embedded control plane on its own bounded thread.
+
+| Component | Where it runs | Responsibility |
+| --- | --- | --- |
+| `racer` process | Dataplane DaemonSet Pod | Reads, verifies, stores, and serves pages; binds the peer and diagnostics listeners; optionally runs embedded cluster control |
+| Embedded authority | Same Pod, managed mode only | Elects seats, publishes membership and cache definitions, rotates page keys, serves bootstrap and webhook endpoints |
+| RDMA verbs adapter | Loaded by the `racer` process | Native zero-copy page transfer when the image is built with the `rdma` feature and a usable port exists |
+| CUDA shim | Loaded on the first `gpu-read` | GPU discovery, allocation import, staging, and page decryption through `libracer_gpu_cuda.so.1` |
+| Admission webhooks | Primary seat, ports 8443 and 9443 | Adds the object sidecar, mounts the client socket, and restricts client Pods to cache nodes |
+| Go SDK | Your client Pods | `pkg/racersdk` client, origin server, and prefetch client over the cache's Unix sockets |
+
+The dataplane does not require a separate controller Deployment. In managed mode the `racer` binary starts the authority first, waits for a bootstrap record that names the cluster ID, block device pattern, page size, and initial membership, and only then assembles its workers. If you run the dataplane without `RACER_NAMESPACE`, you must set `RACER_CLUSTER_ID` and `RACER_CONTROL_ENDPOINT` together so it can enroll with your controller.
+
+The Go SDK is a client library, not a provisioner. It does not create caches, origins, or Kubernetes objects; those come from the `ClusterCache` API and the operator. See [Go SDK](#go-sdk) for its surface.
+
+## Pages, keys, and versions
+
+Racer reads and stores whole pages. `RACER_PAGE_BYTES` is a cluster-wide setting and accepts only `16777216` (16 MiB), because the client SDKs and the disk index do not yet support another size. The value is fixed when the cluster is created: the primary records the value it first published in the `racer-state` Secret and ignores later changes with a warning. A running node rejects a publication that changes the page size, and nodes refuse stored data cut at another size and recover cold rather than reinterpret it.
+
+Every page, fill, stored record, and checkpoint carries the page size it was cut at. The last page of an object may be shorter than the page size; every other page is exactly one page.
+
+A cache key is a canonical 32-byte value, represented by the SDK as 64 lowercase hexadecimal characters. The key is independent of a version. A strong ETag is an opaque, quoted ASCII version identifier, not a content hash. The wire identity of an object version combines three values:
+
+| Field | Meaning |
+| --- | --- |
+| `cache` | The `ClusterCache` UID, a UUID string, used as the wire `CacheID` |
+| `key` | The 32-byte canonical object key |
+| `etag` | The strong ETag that pins one immutable version |
+
+A page identity adds a zero-based page number to the version identity. Placement hashes the cache UID, key, and page number, so page ownership excludes the ETag, while page cache and in-flight fetch identity include it. One read pins one version for all of its pages, even when it fetches pages at different times. Two separate reads of the same key may see different versions unless the caller passes a pinned ETag.
+
+Each page has up to three owners, chosen by weighted rendezvous hashing over the cache UID, key, and page number. A node's `shares` value is its weight, so a node with more shares is ranked first for proportionally more pages. A reader prefers a direct owner, then a member ranked just below the owners that may still hold a copy, then the origin. Ownership is per page and per cache pool, not per object, so the pages of one object can be spread across owners.
+
+The disk store keeps an indexed page per version and uses a checkpoint to rebuild its page index after a restart. Checkpoints are bound to the cluster ID and the slab layout; a checkpoint from another cluster or an incompatible layout is skipped, and the cache starts cold. Cached bytes are disposable by design: a cache has relative capacity shares but no durability promise.
 
 ## ClusterCache
 
-| Property | Contract |
-|----------|----------|
-| API | `racer.unbounded-cloud.io/v1alpha1`, kind `ClusterCache` |
-| Resource / short name | `clustercaches` / `ccache` |
-| Scope | Cluster-scoped |
-| Fields | Optional `spec.origin` for an Azure Blob origin that the dataplane reads directly; optional `spec.priority` for the cache's share of node capacity; optional `spec.passthrough` to proxy reads without caching; optional `spec.nodeSelector` to limit the cache to some nodes; no `status` |
-| Name | DNS subdomain, at most 82 characters total and 63 per dot-separated label |
-| Identity | Kubernetes UID, not name; deleting and recreating a cache creates a new identity |
-
-```yaml
-apiVersion: racer.unbounded-cloud.io/v1alpha1
-kind: ClusterCache
-metadata:
-  name: artifacts
-```
-
-Any ClusterCache triggers installation by the Unbounded operator, not a Site
-component flag. This resource is not a Kubernetes PersistentVolume or
-PersistentVolumeClaim (PVC), does not set absolute capacity, and makes no
-durability promise. `spec.priority` sets only its relative share of each node's
-cache capacity (see [Priority](#priority)). It configures an origin only when `spec.origin` is set (see
-[Azure origin](#azure-origin)). Cached data is disposable. A cache's Kubernetes UID is its
-wire cache identity (`CacheID`).
-
-| Path on the node | Owner and purpose |
-|------------------|-------------------|
-| `/run/racer/<name>/client/socket` | Dataplane; SDK clients connect here |
-| `/run/racer/<name>/origin/socket` | Application origin adapter; dataplane calls it for upstream reads |
-
-Pod mounts grant access: expose only the needed cache/role. Origins need existing trusted
-parent directories. Clients do not automatically bypass Racer to connect directly to origins.
-
-### Priority
-
-`spec.priority` is a relative weight, 0 to 1000. Unset means 500. You can
-change it on a live cache; the new value takes effect without a restart.
+`ClusterCache` is a cluster-scoped custom resource in the `racer.unbounded-cloud.io/v1alpha1` API group. The plural resource name is `clustercaches` and the short name is `ccache`. It is the only custom resource in this group. The operator installs and manages a Racer dataplane for every `ClusterCache`, and a cache is not a `PersistentVolume` or `PersistentVolumeClaim`; it has no volume lifecycle, no `status` field, and no per-cache workload to schedule.
 
 ```yaml
 apiVersion: racer.unbounded-cloud.io/v1alpha1
@@ -57,284 +57,215 @@ kind: ClusterCache
 metadata:
   name: models
 spec:
-  priority: 900
+  priority: 500
 ```
 
-Each cache's weighted share of a resource is `capacity * priority / sum of all
-priorities`. Memory shares count active caches. If all counted priorities are
-0, shares are equal. Shares apply to disk, the pending write queue, and memory:
-plaintext (working memory held by readers) and ciphertext (the only data the
-memory cache retains). Request-serving resources such as request context,
-connections, and in-flight fetches are split equally between active caches
-regardless of priority, so a priority 0 cache can still serve requests.
-Plaintext and ciphertext also keep a per-cache working allowance of one range
-window (`RACER_RANGE_WINDOW_PAGES`) plus one page, capped at an equal split.
-Concurrent requests on that cache share this allowance. The cap can make it
-smaller, so a read can still be rejected with Overloaded. Each I/O worker
-computes shares on its own; pages are spread across workers by hash, so this
-is close to a node-wide share.
+The schema has three optional fields plus `origin`:
 
-A cache above its share is over share. Under pressure, eviction prefers data
-from over-share caches. Scans are bounded, so this is a preference, not a
-guarantee. Idle capacity is still used by any cache, so a cache can grow past
-its share while others do not need the space. Priority is not a quota or a
-reservation, and nodes do not coordinate.
+| Field | Type | Effect |
+| --- | --- | --- |
+| `spec.origin` | `ObjectOrigin` | Reads objects directly from Azure Blob Storage instead of a self-hosted origin socket; fixed at creation |
+| `spec.priority` | integer, 0 to 1000 | Relative share of node cache capacity; unset means 500 |
+| `spec.passthrough` | `Passthrough` | Proxies reads to the origin without caching |
+| `spec.nodeSelector` | `metav1.LabelSelector` | Restricts which Racer nodes store, serve, and read the cache |
 
-Priority 0 has no weighted share when competing with positive-priority caches.
-The cache keeps its working allowance, is preferred for eviction, and is still
-cached while capacity is idle.
+Names are limited to 82 characters so that `/run/racer/<name>/origin/socket` fits in a Linux `sockaddr_un`, and each DNS label is limited to 63 characters. The limits are enforced by CEL rules on the resource, and Kubernetes metadata validation enforces DNS subdomain spelling.
 
-Memory-cache entries do not expire with time at normal memory pressure. An
-entry leaves the memory cache only when its space is needed: a new read or
-fill reclaims least recently used idle entries when the ciphertext budget is
-full, publication keeps headroom for in-flight reads, and entries whose page
-key leaves the keyring or whose cache turns on passthrough are dropped. When
-`RACER_MEMORY_PRESSURE` reports elevated or critical pressure, entries not
-read or written for 30 seconds are also released, and critical pressure
-reclaims idle entries directly.
+The Kubernetes UID is the cache's wire identity. It is the `CacheID` in publications and the identity used by page keys and disk checkpoints. Socket paths use `metadata.name`, which is why the name has a length limit. Because entries are keyed by UID and not by source, changing the object source in place would serve entries fetched from a different source. The API therefore makes the presence of `spec.origin` immutable: you can neither add nor remove it after creation. A different origin requires a new `ClusterCache`, which has a new UID and therefore an empty cache.
+
+Each cache has two socket endpoints under `/run/racer/<name>/`:
+
+| Endpoint | Path | Purpose |
+| --- | --- | --- |
+| Client | `/run/racer/<name>/client/socket` | Reads, metadata, prefetch, host reads, and GPU reads |
+| Origin | `/run/racer/<name>/origin/socket` | A self-hosted origin registers here and supplies cache misses |
+
+The client directory is mounted into client Pods, usually by the admission webhook, and the origin directory is owned by the unprivileged origin user (UID and GID 65532). The dataplane creates the origin directory and assigns it to that user so an origin never needs root or `mkdir` rights under `/run/racer`. Origin directories are separate from client directories, so a Pod receives only the endpoint its mount grants. A client that can reach an origin socket talks to the origin directly; Racer does not automatically bypass the cache for such clients, so any direct origin access must be configured explicitly.
+
+### Priority
+
+`spec.priority` is a relative weight from 0 to 1000. When unset, the effective priority is 500. You may change it at any time; the new weight applies without a restart and does not invalidate cached pages by itself.
+
+Disk shares are weighted across published caches, plus any unpublished caches that still hold data on the node, which count at the default weight. Memory shares are weighted across caches that are actively using memory, and each cache also receives a bounded working allowance from shared memory. Request-serving resources that are split among caches, such as pending queues and in-flight budgets, use an equal split rather than the priority weight.
+
+A priority of 0 receives no weighted share while caches with a positive priority compete, but it keeps its working allowance. That allowance lets a zero-priority cache make progress and hold a small working set. If every counted cache has priority 0, they share equally.
+
+Eviction prefers data from caches that use more than their share, within bounded scans. It is a preference, not a guarantee: an over-share cache can keep a page when the scan does not reach it, and an under-share cache does not reserve capacity it is not using. Idle capacity is available to other caches. Memory entries follow the same idea: a cache at its allowance retains entries while memory pressure permits, and releases them when pressure rises.
+
+{{< callout type="note" >}}
+Priority is a share of node cache capacity, not a quota and not a request admission limit. Raising it changes which pages an eviction scan prefers; it does not promise that a given byte count stays resident.
+{{< /callout >}}
 
 ### Passthrough
 
-Set `spec.passthrough` to turn off caching for a cache. Racer still serves
-reads through the client socket, but proxies them to the origin and keeps no
-data:
+`spec.passthrough` turns off caching for a cache. Racer proxies each read to the origin and keeps no data. Pages are not written to disk, and a page is held in memory only while concurrent readers share an in-flight origin read. Object metadata such as the ETag, size, and expiry is not reused across reads, so each read revalidates with the origin. A single read still pins one object version for all of its pages.
 
-```yaml
-apiVersion: racer.unbounded-cloud.io/v1alpha1
-kind: ClusterCache
-metadata:
-  name: artifacts
-spec:
-  passthrough:
-    route: Peers
-```
+`spec.passthrough.route` selects which node's origin serves a read:
 
-| `route` | Behavior |
-|---------|----------|
-| `Peers` (default) | Each page goes to its owner nodes through the mesh, as for a cached cache. The owner reads from its local origin. Concurrent reads of the same page anywhere in the cluster share one origin read, and many pages are in flight at once. |
-| `Local` | The reading node reads from its own local origin and never asks peers. Concurrent reads of the same page on one node still share one origin read. Every node that reads needs an origin; with `spec.origin`, every dataplane node has one. |
+| Route | Behavior |
+| --- | --- |
+| `Peers` | Routes each page to its owner nodes through the mesh, as for a cached cache. The owner calls its local origin, concurrent reads of the same page anywhere in the cluster share one origin read, and many pages can be in flight at once. Nothing is retained after the readers finish. This is the default when the route is unset. |
+| `Local` | The reading node calls its own local origin directly and never asks peers. Concurrent reads of the same page on one node still share one origin read. With this route, every reading node needs an origin; a managed `spec.origin` is served by every dataplane node. |
 
-- Pages are not written to disk and stay in memory only while concurrent
-  readers share an in-flight origin read.
-- Object metadata (ETag, size, expiry) is not reused across reads, so each read
-  revalidates with the origin. One read still pins one object version for all
-  of its pages.
-- Prefetch is refused. A [prefetch](#prefetch) `PUT` returns
-  `409 passthrough`, and owners refuse prefetch fills for the cache.
-- `spec.priority` still weights in-flight memory use.
-- With the `Local` route, `racer_passthrough_local_origin_fills_total` counts
-  pages that a node read from its own origin.
-- `spec.passthrough` can be added, changed, or removed at any time. When a cache
-  switches to passthrough, data previously cached for it is dropped.
+Passthrough affects both managed and self-hosted origins. The `Peers` route preserves cluster-wide single-flight behavior and pipelining, while `Local` removes the peer hop and the need to route pages to owners.
+
+Prefetch requests for a passthrough cache are refused with `409` and the code `passthrough`. The `spec.priority` weight still applies to in-flight memory use, so a passthrough cache competes for memory while its origin reads are active.
+
+You may add, change, or remove `spec.passthrough` at any time. When a cache switches to passthrough, data previously cached for it is dropped. The metric `racer_passthrough_local_origin_fills_total` counts origin fills served under the `Local` route.
 
 ### Node selector
 
-Set `spec.nodeSelector` to a label selector to choose which Racer nodes store,
-serve, and read the cache, by Node labels. Unset or empty means every Racer
-node.
+`spec.nodeSelector` selects, by Node labels, the Racer nodes that store, serve, and read the cache. When it is unset or empty, every Racer node participates. The selector is a standard `metav1.LabelSelector`, so it supports `matchLabels` and `matchExpressions`.
 
-```yaml
-spec:
-  nodeSelector:
-    matchLabels:
-      pool: gpu
-```
+The admission webhook restricts client Pods that use the cache to matching nodes. It adds the selector to the Pod's required node affinity, and when a Pod already has `spec.nodeName` set it looks up that Node and rejects the Pod if the Node does not match. That check matters because node affinity does not constrain a Pod that bypasses the scheduler. A missing ClusterCache or an invalid selector is denied with `403`; a failed lookup is denied with `503` so the client retries rather than admitting a Pod without its cache's affinity.
 
-- Client pods that use the cache can be scheduled only on matching nodes. The
-  Racer admission webhook adds this restriction. A pod that sets
-  `spec.nodeName` skips the scheduler, so the webhook rejects it unless that
-  Node matches the selector.
-- A managed `spec.origin` runs only on matching nodes.
-- Changing the selector moves the cache to a new set of nodes. Cached data is
-  not moved; pages are read from the origin again. Prefetch tickets on nodes
-  that leave are canceled with `cache_removed`.
+A managed `spec.origin` is placed with the same selector: the dataplane reads the origin only on the selected nodes. Changing the selector moves the cache to a new pool of nodes with no migration. Pages are not copied between pools; they are refilled from the origin on demand, and prefetch tickets canceled by the move are reported with the reason `cache_removed`.
 
-The controller and dataplane must run the same version. A mismatched pair
-rejects the cache catalog.
+The controller and the dataplane must run matching versions. The publication schema and the node's accepted cache definitions are versioned together, and a node rejects a publication it cannot interpret instead of guessing.
 
 ### Azure origin
 
-Set `spec.origin` to have the Racer dataplane read the cache's misses directly
-from an Azure Blob container. No separate origin process runs. Leave it unset
-to deploy your own origin with the [Go SDK](#go-sdk). Do not do both for one cache: when
-`spec.origin` is set, the dataplane ignores the cache's origin socket. Set or
-omit `spec.origin` when you create the cache: it cannot be added or removed
-later. To change the origin, create a new ClusterCache, which starts with an
-empty cache.
+`spec.origin` makes the Racer dataplane read a cache's objects directly from object storage. There is no separate origin process and no origin socket for that cache: the dataplane opens the upstream reads itself, on the nodes selected by `spec.nodeSelector`. Only Azure Blob Storage is supported today, and `spec.origin.azure` is required when `spec.origin` is present.
 
 ```yaml
 apiVersion: racer.unbounded-cloud.io/v1alpha1
 kind: ClusterCache
 metadata:
-  name: artifacts
+  name: models
 spec:
   origin:
+    metadataTTL: 30s
+    requestTimeout: 1m
+    maxConcurrentRequests: 512
     azure:
       containerURL: https://account.blob.core.windows.net/models
       credential:
         workloadIdentity:
-          clientID: 00000000-0000-0000-0000-000000000000
+          clientID: 00000000-0000-4000-8000-000000000001
 ```
 
-| Field | Meaning |
-|-------|---------|
-| `metadataTTL` | Optional. How long object metadata is reused; not negative; rounded down to whole milliseconds. Default `30s` |
-| `requestTimeout` | Optional. Limit for each origin operation, including token acquisition and one retry after an authentication challenge; positive; rounded up to whole milliseconds. Default `1m` |
-| `maxConcurrentRequests` | Optional. Upstream operations in flight for this cache on each node, 1 to 65536. Operations over the limit fail as overloaded rather than wait. Default `512` |
-| `azure.containerURL` | Required. The one blob container the cache may read, as `<account URL>/<container>`, for example `https://account.blob.core.windows.net/models`. `http` or `https`, no credentials, query, fragment, or trailing slash. The container name follows Azure rules: 3 to 63 lowercase letters, digits, and single hyphens. Azurite-style URLs may include one account path segment. Immutable |
-| `azure.credential` | Optional. Omit for anonymous reads. Set exactly one of `default` or `workloadIdentity`; either requires `https` |
-| `azure.credential.default` | The node's managed identity, through the Azure Instance Metadata Service (IMDS). Optional `clientID` selects a user-assigned identity |
-| `azure.credential.workloadIdentity` | Microsoft Entra Workload ID for the `racer` ServiceAccount. Requires `clientID`; optional `tenantID`, otherwise discovered from the storage account |
+| Field | Default | Rules |
+| --- | --- | --- |
+| `spec.origin.metadataTTL` | `30s` | Must not be negative. Bounds how long object metadata is reused before revalidation. |
+| `spec.origin.requestTimeout` | `1m` | Must be positive. Bounds each upstream request. |
+| `spec.origin.maxConcurrentRequests` | `512` | 1 to 65536. Bounds concurrent upstream requests for the cache on each dataplane node. |
+| `spec.origin.azure.containerURL` | required | Must be an `http` or `https` URL, with no credentials, query, or fragment. Fixed at creation. |
+| `spec.origin.azure.credential` | unset | When omitted, requests are anonymous. Otherwise exactly one of `default` or `workloadIdentity`. |
 
-All caches on a node share one dataplane pod, so every credential runs as that
-pod:
+`containerURL` names one container. The last path segment is the container name, which must be 3 to 63 lowercase alphanumeric or hyphen characters. An Azurite-style URL may carry one account path segment before the container, for example `http://127.0.0.1:10000/account/models`. When a credential is configured, the URL must use `https`.
 
-- `default` asks IMDS at `169.254.169.254` for a storage token. Each Racer node
-  needs the identity attached.
-- `workloadIdentity` uses a ServiceAccount token that the operator always
-  projects into the dataplane, with audience `api://AzureADTokenExchange`, at
-  `/var/run/secrets/azure/tokens/azure-identity-token`
-  (`RACER_AZURE_FEDERATED_TOKEN_FILE`). The identity needs a federated credential
-  with subject `system:serviceaccount:<Racer namespace>:racer`, for example
-  `system:serviceaccount:unbounded-system:racer`. No webhook is needed.
+The container URL is immutable. Cache entries do not record the storage account or container, so a different source needs a new `ClusterCache`, which has a new UID and therefore an empty cache. Admission rejects an update that changes the URL, and the operator reports `OriginInvalid` if a stored object bypassed admission and no longer satisfies the rules.
 
-Any ClusterCache can name any identity that trusts the `racer` ServiceAccount
-or is attached to the nodes. Limit who can create ClusterCaches accordingly.
-Tokens are cached per node and never appear in the cache catalog.
+`spec.origin.azure.credential.default` uses the node's managed identity through the Azure Instance Metadata Service. The optional `clientID` selects a user-assigned identity; without it, Racer uses the system-assigned identity or the only user-assigned identity. Every Pod attached to the cache sees the container's whole keyspace.
 
-Every dataplane node needs network access to the storage account, and to IMDS
-when you use `default`. With `hostNetwork` off, the pod network must allow it.
+`spec.origin.azure.credential.workloadIdentity` uses Microsoft Entra Workload ID. Racer exchanges a projected token for its own ServiceAccount, with audience `api://AzureADTokenExchange`, so the identity needs a federated credential whose subject is the Racer dataplane ServiceAccount in its namespace. The dataplane uses the ServiceAccount named by `RACER_SERVICE_ACCOUNT`, which defaults to `racer`, in `RACER_NAMESPACE`; the federated credential subject therefore has the form `system:serviceaccount:<namespace>:<service-account>`. No webhook is needed. `clientID` is required, and `tenantID` is optional; when unset, the tenant is discovered from the storage account's bearer challenge.
 
-Each ClusterCache maps to one container. You cannot change
-`azure.containerURL` after creation. To read a different source, create a new
-ClusterCache. It gets a new UID, so it starts with an empty cache. A pod that
-reads two containers needs two ClusterCaches and two sidecars.
+The dataplane Pod carries one credential scope for all caches it serves. Any identity that can read a container is therefore an identity trusted by every creator of a cache that uses it. Grant the dataplane identity read access only to the containers that caches on those nodes should reach, and remember that a user who can create a `ClusterCache` can name any container that identity can read.
 
-Sidecars attach with `racer.unbounded-cloud.io/object-cache: <ClusterCache name>`.
-They can read any blob in the cache's container. Racer rejects requests for any
-other container with `403`.
+Nodes need network access to the storage endpoint and, for the `default` credential, to the Instance Metadata Service. A node that cannot reach IMDS cannot use a managed identity, and a node that cannot reach the storage endpoint reports origin failures rather than serving stale data.
 
-If the spec is not valid, the operator reports `OriginInvalid`.
+`spec.origin.azure.credential.default.secretRef` is deprecated and unsupported. The dataplane cannot read Secret credentials, so a cache that sets it is rejected. The field remains in the schema only so that a stored cache which still sets it is not pruned into a managed identity credential; it fails closed instead.
+
+The object sidecar serves one cache. It is injected on a Pod with the label `racer.unbounded-cloud.io/object-sidecar: enabled` and the annotation `racer.unbounded-cloud.io/object-cache: <cache>`. The dataplane enforces the cache's configured container, so a sidecar request for another container is refused with `403`. A Pod that needs a second cache uses the client socket mount for that cache, or an application that opens both client sockets.
 
 #### Upgrading from per-cache origin DaemonSets
 
-Earlier versions ran a `racer-origin-<cache>` DaemonSet and ServiceAccount per
-cache. The operator deletes them on upgrade, and the `racer` dataplane pod
-reads the origin instead. Do these steps before you upgrade:
+Earlier operator versions ran one `racer-object` origin DaemonSet and ServiceAccount per cache, named `racer-origin-<cache>`. The dataplane now reads `spec.origin` in process, and the operator prunes the legacy DaemonSets only after every dataplane Pod runs a template marked with the native origin annotation.
 
-- **`workloadIdentity` caches.** The old federated credential trusts
-  `system:serviceaccount:<Racer namespace>:racer-origin-<cache>`. That does not
-  cover the new token, so reads fail until the identity also trusts the `racer`
-  ServiceAccount. Add a federated credential to each identity with your cluster's
-  OIDC issuer, subject `system:serviceaccount:<Racer namespace>:racer`, and
-  audience `api://AzureADTokenExchange`. See
-  [Private Containers]({{< relref "guides/azure-blob-cache" >}}#private-containers)
-  for an `az` example. Remove the old `racer-origin-<cache>` credentials after
-  the rollout.
-- **`default` caches.** The dataplane gets tokens from IMDS on its own node. Attach
-  the identity to every Racer node.
-- **`default.secretRef` caches.** This field is no longer supported, and the API
-  rejects new uses of it. Racer cannot read the
-  Secret. If the authority service still sees the field, it rejects the
-  whole catalog and keeps the last published one, so no cache changes take
-  effect. Before you upgrade, change the cache's `credential` to
-  `workloadIdentity` or `default` with an identity attached to the nodes. You
-  can edit `credential` in place; only `containerURL` is immutable. Then delete
-  the Secret if nothing else uses it.
+The upgrade has a credential step for workload identity. Before you upgrade, add a federated credential for the Racer dataplane ServiceAccount to the identity, with audience `api://AzureADTokenExchange` and the subject named above. The identity needs this credential in addition to the one used by the old per-cache origin ServiceAccount. Once the rollout completes and the legacy DaemonSets are gone, remove the old federated credential and the old ServiceAccount.
+
+Caches that use `credential.default` attach the node's managed identity instead of a per-cache ServiceAccount. Remove `secretRef` before the upgrade if any cache still sets it; the catalog rejects the stale field, and the dataplane cannot read a Secret credential. If you changed a credential, finish the credential change and delete the old Secret before the rollout, so no cache points at a credential that no longer exists.
 
 ## Node requirements
 
-Run Racer on Linux nodes with working `io_uring` support and enough local disk.
-Kernel and container security policy must not block `io_uring`. The dataplane
-runs a privileged UID 0 container with these host paths:
+Racer runs only on Linux nodes with a working `io_uring`. The dataplane container runs as privileged UID 0 because it opens raw block devices, raises file descriptor limits, manages RDMA resources, and creates the origin directories owned by the unprivileged origin user. Your kernel and container security policy must allow those operations. The container mounts these host paths:
 
-| Host path | Use |
-|-----------|-----|
-| `/var/lib/racer/identity` | Node identity state; keep it across restarts and upgrades |
-| `/var/lib/racer/slabs` | Slab files and checkpoints; must stay writable in device mode too |
-| `/run/racer` | Client and origin sockets |
-| `/dev`, mounted read-only at `/host/dev` | Optional [raw cache devices](#raw-device-storage) |
+| Host path | Mount | Purpose |
+| --- | --- | --- |
+| `/var/lib/racer/identity` | writable | Node-private persistent keys; must not overlap another configured path |
+| `/var/lib/racer/slabs` | writable | Slab files and checkpoints; still required and writable in raw-device mode |
+| `/run/racer` | writable | Client and origin sockets |
+| `/dev` | read-only at `/host/dev` | Raw device discovery under `disk/by-id` and device nodes |
 
-Every admitted connection and splice pipe is a file descriptor. At startup the
-dataplane computes the descriptors its final budgets need: 1,024, plus the
-node-wide `RACER_CLIENT_CONNECTIONS`, `RACER_PEER_CONNECTIONS`, and
-`RACER_OUTBOUND_CONNECTIONS`, plus two per `RACER_PIPES`, plus 64 per I/O worker.
-With defaults, a 16-worker node needs about 37,000. The dataplane raises its soft
-`RLIMIT_NOFILE` to that amount when needed, and refuses to start (`stage=fd-limit`)
-when the hard limit is lower. Raise the container runtime's `nofile` limit or lower
-those budgets.
+The socket directory is shared, so protect it with Kubernetes admission policy: a Pod that can mount `/run/racer` can reach every cache socket on the node, not only the cache its sidecar names. The client socket mount feature narrows this by mounting only the per-cache client directory.
 
-Do not turn off cluster-wide admission protections. Authorize these workloads
-narrowly. RDMA is optional; see [RDMA](#rdma).
+Startup computes the file descriptor budget from the final node-wide limits before any worker opens a socket. The budget is 1024 base descriptors, plus `RACER_CLIENT_CONNECTIONS`, `RACER_PEER_CONNECTIONS`, `RACER_OUTBOUND_CONNECTIONS`, twice `RACER_PIPES`, and 64 descriptors per I/O worker for its ring, eventfds, listeners, and cache files. Racer raises the soft `RLIMIT_NOFILE` toward the hard limit when needed and refuses to start when the hard limit is too low. The failure is logged as `stage=fd-limit` and names the variables that set the budget.
 
-Origins that you deploy for caches without `spec.origin` run as the non-root
-UID/GID 65532 and do not need privileged mode.
-For each cache, the dataplane creates `/run/racer/<name>/origin` owned by
-UID/GID 65532 with mode `0700`, and repairs its owner and mode on every cache
-setup. Origins do not create this directory: mount it with hostPath type
-`Directory`, so origin pods wait until the dataplane has created it. The origin
-creates its socket with mode `0600`; the privileged dataplane can still connect.
-When the dataplane takes over a directory left by an older root origin, it
-re-owns that origin's leftover lock, socket, and staging entries to UID/GID 65532
-instead of deleting them, so the new origin can recover them. Run exactly one origin owner per cache on every
-eligible node that can supply origin reads, not only on nodes that read. A
-DaemonSet with the same placement and tolerations as Racer does this. Every
-origin must return the same bytes for the same key and version. Never delete a
-live socket to take over from another owner.
+Connection and pipe budgets are admission limits, not descriptor reservations. A node that admits more sockets than `RLIMIT_NOFILE` allows would fail with `EMFILE` under load instead of answering `Overloaded`, which is why startup checks the budget rather than waiting for the first refusal. Raise the container runtime's nofile ulimit or lower the connection and pipe budgets.
+
+Origins run as UID and GID 65532. The dataplane creates `/run/racer/<cache>/origin` with mode `0700` and that owner, so only the origin user may list, create, or remove endpoint entries. The origin socket is created with mode `0600`. One origin owns each cache's origin socket: a second origin that tries to bind the same path fails rather than sharing it. An origin must return identical bytes for the same key and version; Racer verifies page tags and treats divergent content as corruption.
+
+HTTPS origins use rustls for the handshake and then move the record layer into kernel TLS when the `tls` module is available, so response bodies decrypt directly into page buffers. If `setsockopt(TCP_ULP, "tls")` fails, Racer logs that kernel TLS is unavailable and uses userspace TLS on the worker's reactor, which costs more CPU per byte but no extra threads. Load the module on the node (`modprobe tls`) or list it in `/etc/modules-load.d` to get kernel TLS.
+
+`RACER_MEMORY_PRESSURE` enables cgroup v2 memory-pressure monitoring and reclaim. Keep it enabled on nodes with a cgroup v2 hierarchy; disabling it removes an early warning path and leaves memory admission as the main protection.
 
 ## Node labels and annotations
 
-Keys below use the `racer.unbounded-cloud.io/` prefix unless shown in full.
+Racer uses the `racer.unbounded-cloud.io/` prefix for its own labels and annotations, plus `unbounded-cloud.io/site` for the site label it shares with the rest of Unbounded. The control plane reads Node labels and annotations when it builds membership.
 
-| Key | Meaning |
-|-----|---------|
-| Label `exclude` | Presence excludes the node from membership and dataplane placement, regardless of value |
-| Label `unbounded-cloud.io/site` | Canonical Site boundary for RDMA; absent or empty means HTTP-only |
-| Annotation `shares` | Positive decimal `uint32` placement weight; overrides reported shares; default 4 |
-| Annotation `rdma-nics` | Administrator NIC/rail policy; see [RDMA](#rdma); explicit `[]` disables eligibility |
-| Annotation `block-devices` | Startup-only regex selecting raw cache devices by `disk/by-id` basename; see [raw-device storage](#raw-device-storage) |
+| Key | Object | Meaning |
+| --- | --- | --- |
+| `racer.unbounded-cloud.io/exclude` | Node label | Any value removes the Node from membership and from enrollment eligibility |
+| `unbounded-cloud.io/site` | Node label | Site name; RDMA requires both peers to share a nonempty site |
+| `racer.unbounded-cloud.io/shares` | Node annotation | Positive decimal placement weight; overrides the Pod report |
+| `racer.unbounded-cloud.io/rdma-nics` | Node annotation | JSON NIC array; overrides the Pod report and the discovered inventory |
+| `racer.unbounded-cloud.io/block-devices` | Node annotation | Startup-only regex over `disk/by-id` basenames for raw cache devices |
+| `racer.unbounded-cloud.io/report` | Pod annotation | JSON `{"shares": N, "rdma_nics": [...]}` reported by the Racer Pod itself |
 
-Each dataplane writes its shares and NIC report to its own Pod's
-`racer.unbounded-cloud.io/report` annotation. Control seats do not write Node
-annotations. Old `enrolled-shares`, `enrolled-rdma-nics`, and
-`last-admitted-member` annotations are no longer runtime state.
+Shares default to 4. A Node annotation wins over the Pod report, and `RACER_SHARES` supplies the value a Pod reports when the Node annotation is absent. A shares value must be a nonempty ASCII decimal without a leading `+`, and it must be nonzero; zero shares are invalid. Shares weight page ownership, so a node with twice the shares owns roughly twice as many page slots as a peer.
 
-Malformed membership annotations retain admitted attributes; invalid new nodes are omitted.
-Site uses current labels. Invalid `block-devices` selectors instead fall back to slab files.
+The `report` annotation is limited to 32 KiB of UTF-8, which is the inventory bound rounded up and well below the Kubernetes annotation limit. The admission policy enforces the same byte limit. A malformed report, an invalid shares value, or an unparsable `rdma-nics` value is reported as a diagnostic and the node keeps its previous attributes. A new node with no previous attributes does not join until its annotations are valid.
+
+`rdma-nics` accepts a JSON array of at most 64 entries. Each entry names a device, port, and rail, and may include a GID and a NUMA node. An explicit empty array `[]` disables RDMA eligibility for that node. When the annotation is absent, the dataplane reports the NICs it discovered in its Pod report.
+
+`block-devices` is a Rust regular expression over the basenames under `/host/dev/disk/by-id`. The selector is limited to 1 KiB, is not implicitly anchored, and is compiled at startup only. Anchor it with `^` and `$` when you mean an exact name. A selector that does not compile, or that matches no usable device, falls back to file-backed slabs; the annotation takes effect only after a dataplane restart.
+
+Annotations from earlier releases that scoped one cache by namespace or bucket are no longer read. A cache now maps to one container, and a Pod that needs a second cache uses the client socket mount for that cache. Invalid or retired runtime annotations are ignored or reported, never interpreted with old semantics.
 
 ## Dataplane configuration
 
-Tune `racer-settings` in the installation namespace (normally `unbounded-system`).
-The operator preserves administrator data and hashes edits into managed rollouts.
-Explicit workload environment wiring takes precedence over ConfigMap imports.
-Numeric values are unsigned decimal strings: `268435456`, not `256Mi`.
-The operator checks each value with the same per-key rules the dataplane uses at
-startup, read from the same generated table: known names, enum and boolean
-values, decimal syntax, range limits, the 2 MiB multiples of the GPU byte
-settings, at most one form of each shared budget, and setting
-`RACER_IO_WORKERS` and `RACER_CRYPTO_HELPERS` together. When a key is unknown or
-a value is invalid, reconciliation fails with an error that names every bad
-key, and the DaemonSet keeps its current configuration until the ConfigMap is
-fixed. Limits that depend on the node, such
-as CPU count or memory, are still checked only by the dataplane at startup.
+The operator stores dataplane settings in the `racer-settings` ConfigMap in the Racer namespace. The ConfigMap seeds only when it is missing; after that, the operator preserves administrator data and does not overwrite edits. It hashes the ConfigMap payload into the `unbounded-cloud.io/racer-settings-hash` annotation on the DaemonSet Pod template, so an edit that changes the payload causes a managed rollout. A change that does not change the hash does not restart the dataplane.
+
+The Pod imports the ConfigMap with `envFrom`, so every valid key becomes an environment variable before the process starts. This wiring happens before the dataplane reads its configuration: only `main` reads the process environment, and tests and simulations build a configuration from an explicit map. A value that fails validation prevents the rollout rather than starting a partially configured Pod.
+
+Numeric values are unsigned decimal ASCII digits only. A leading `+`, a sign, whitespace, an exponent, or a unit suffix is rejected with an error that names the variable, its value, and the rule it broke, for example `RACER_RANGE_WINDOW_PAGES="65": must be from 1 to 64`. Booleans are exactly `true` or `false`, and enumerations accept only their listed words.
+
+The operator validates each key against the table exported to `internal/operator/components/racer/dataplane-settings.json`. A key the dataplane does not recognize fails the operator plan and dataplane startup. When validation fails, the operator keeps the existing DaemonSet instead of rolling out an invalid configuration, so a running node continues with the last good settings while the error is reported. Some limits depend on the node, such as the number of workers or the available devices; those are checked at startup, and an unsatisfiable combination fails with a named stage rather than silently reducing counts.
 
 ### Environment variables
 
-Every variable the dataplane accepts is listed below; the tables are generated
-from the dataplane's configuration table (`cmd/racer/src/config/table.rs`).
-Any other `RACER_*` variable fails startup, which catches typos and retired
-names. A value outside its accepted range fails startup with an error that
-names the variable, the value, and the rule. Rules that involve several
-variables, such as exact worker counts fitting the thread cap, name every
-variable involved.
+Every accepted variable is one entry in `cmd/racer/src/config/table.rs`. The same table drives parsing, defaults, bounds, the unknown-variable check, and the generated reference below, so a setting cannot drift between documentation, defaults, and code. The table is regenerated with `BLESS=1 cargo test -p racer config::tests::generated_reference_is_current`, and the test fails when the page or the operator's JSON is stale.
 
-Budgets that I/O workers share come in two forms. The `*_PER_WORKER` form,
-which carries the default, is multiplied by the final I/O worker count, so
-automatic sizing keeps each worker's budget constant on any core count. The
-plain name is a node-wide total that is divided among the workers; setting it
-can reduce the worker count when the total cannot fund every worker. Set at
-most one form of each budget. Other variables marked "Per I/O worker" apply to
-each worker and are never divided.
+Any `RACER_*` variable that the table does not list fails startup. This catches typos and stale names; test harness knobs use other prefixes, such as `DST_*`. A value longer than 4096 bytes or containing a control character is rejected before its kind is checked.
+
+Budgets that I/O workers share come in two forms. The `*_PER_WORKER` form carries the default and is multiplied by the final I/O worker count, so automatic sizing works on any core count. The plain node-wide form is divided among the workers. Set at most one form of each budget; setting both is an error. The worker count is resolved before the division, so a per-worker value follows the final count, not the number of CPUs on the node.
+
+| Node-wide variable | Per-worker variable | Per-worker default |
+| --- | --- | --- |
+| `RACER_PLAINTEXT_BYTES` | `RACER_PLAINTEXT_BYTES_PER_WORKER` | 128 MiB |
+| `RACER_CIPHERTEXT_BYTES` | `RACER_CIPHERTEXT_BYTES_PER_WORKER` | 128 MiB |
+| `RACER_DIRTY_BYTES` | `RACER_DIRTY_BYTES_PER_WORKER` | 160 MiB |
+| `RACER_REGISTERED_BYTES` | `RACER_REGISTERED_BYTES_PER_WORKER` | 384 MiB |
+| `RACER_REQUEST_CONTEXT_BYTES` | `RACER_REQUEST_CONTEXT_BYTES_PER_WORKER` | 32 MiB |
+| `RACER_FLIGHTS` | `RACER_FLIGHTS_PER_WORKER` | 64 |
+| `RACER_QUEUE_ENTRIES` | `RACER_QUEUE_ENTRIES_PER_WORKER` | 256 |
+| `RACER_CLIENT_CONNECTIONS` | `RACER_CLIENT_CONNECTIONS_PER_WORKER` | 64 |
+| `RACER_PEER_CONNECTIONS` | `RACER_PEER_CONNECTIONS_PER_WORKER` | 2048 |
+| `RACER_OUTBOUND_CONNECTIONS` | `RACER_OUTBOUND_CONNECTIONS_PER_WORKER` | 64 |
+| `RACER_PIPES` | `RACER_PIPES_PER_WORKER` | 16 |
+| `RACER_PLACEMENT_CACHE_BYTES` | `RACER_PLACEMENT_CACHE_BYTES_PER_WORKER` | 16 MiB |
+| `RACER_CACHED_PATHS` | `RACER_CACHED_PATHS_PER_WORKER` | 128 |
+| `RACER_PATH_CACHE_BYTES` | `RACER_PATH_CACHE_BYTES_PER_WORKER` | 8 MiB |
+| `RACER_METADATA_ENTRIES` | `RACER_METADATA_ENTRIES_PER_WORKER` | 4096 |
+| `RACER_RELAY_TRANSFERS` | `RACER_RELAY_TRANSFERS_PER_WORKER` | 16 |
+
+Automatic thread sizing uses every eligible physical core unless a CPU quota or a resource budget limits it. `RACER_ALLOW_SMT=true` sizes from logical CPUs instead. A node gets one control plane thread in addition to I/O and crypto threads. Without an explicit cap, eight eligible cores on one NUMA node give five I/O workers and three crypto helpers when the budgets permit, plus the control thread. I/O workers share NUMA-local crypto helpers at approximately a 2:1 ratio.
+
+`RACER_MAX_THREADS` caps I/O, crypto, RDMA owner, and managed control threads; kernel io_uring workers are not counted. Managed deployments need at least 4 threads, or 3 when `RACER_ENABLE_RDMA` is `false`. `RACER_IO_WORKERS` and `RACER_CRYPTO_HELPERS` set an exact split and must be set together. Their sum, plus one RDMA owner thread when RDMA is enabled, must fit `RACER_MAX_THREADS`. Workers and helpers are spread over the NUMA nodes of the RDMA NICs in proportion to their usable CPUs, with each helper on the node of the workers it serves. Insufficient local CPUs, CPU quota, or per-I/O budget fails startup instead of reducing the requested counts.
+
+Budgets are admission ceilings, not memory reservations. Resident memory grows toward them under load. Each worker needs roughly 210 MiB of byte budgets at the default range window: about 80 MiB of plaintext, 96 MiB of ciphertext, 16 MiB of dirty pages, plus request context. To bound memory, cap total threads, set an exact worker split, or set node-wide totals below the per-worker defaults. Crypto helper count affects decrypt throughput and the crypto queue and execution metrics, not the byte budget division, which follows the I/O worker count.
+
+The generated table follows. It lists every accepted variable, its default, whether it is node-wide or per I/O worker, the accepted values, and its description. The scope column says `Operator` for the one setting the operator reads and the dataplane ignores, `Node` for a node-wide setting, and `Per I/O worker` for a value multiplied by the worker count.
 
 <!-- BEGIN GENERATED: racer configuration table -->
 
@@ -419,8 +350,8 @@ each worker and are never divided.
 | `RACER_CIPHERTEXT_BYTES_PER_WORKER` | `134217728` (128 MiB) | Per I/O worker | 1..68,719,476,736 bytes | Ciphertext admission budget, including the memory cache. Each worker's share must fit the range window plus one stored record. Multiplied by the final I/O worker count. |
 | `RACER_DIRTY_BYTES` | Unset: `RACER_DIRTY_BYTES_PER_WORKER` applies | Node | 16,777,232..68,719,476,736 bytes | Budget for pages waiting to be written to disk. Node-wide total, divided among I/O workers. |
 | `RACER_DIRTY_BYTES_PER_WORKER` | `167772160` (160 MiB) | Per I/O worker | 16,777,232..68,719,476,736 bytes | Budget for pages waiting to be written to disk. Multiplied by the final I/O worker count. |
-| `RACER_REGISTERED_BYTES` | Unset: `RACER_REGISTERED_BYTES_PER_WORKER` applies | Node | 1..68,719,476,736 bytes | Most memory the native RDMA page-buffer pool may register, used only when RDMA is enabled; then at least one page plus 16 bytes. One native thread owns the whole pool, so it is never divided. When neither variable is set, the scaled default is capped at 8 GiB node-wide. The pool is split evenly over RDMA rails, and a rail without a whole buffer is not used. Each rail registers one block of buffers (an eighth of its share, 2 to 32 buffers) at activation, registers more blocks as receive demand grows, and deregisters them again some time after demand falls; `racer_rdma_pool_registered_bytes` shows what is registered now. Each grant holds one 18 MiB buffer until its page is consumed; `racer_rdma_free_buffers` shows what is left. Node-wide total, divided among I/O workers. |
-| `RACER_REGISTERED_BYTES_PER_WORKER` | `402653184` (384 MiB) | Per I/O worker | 1..68,719,476,736 bytes | Most memory the native RDMA page-buffer pool may register, used only when RDMA is enabled; then at least one page plus 16 bytes. One native thread owns the whole pool, so it is never divided. When neither variable is set, the scaled default is capped at 8 GiB node-wide. The pool is split evenly over RDMA rails, and a rail without a whole buffer is not used. Each rail registers one block of buffers (an eighth of its share, 2 to 32 buffers) at activation, registers more blocks as receive demand grows, and deregisters them again some time after demand falls; `racer_rdma_pool_registered_bytes` shows what is registered now. Each grant holds one 18 MiB buffer until its page is consumed; `racer_rdma_free_buffers` shows what is left. Multiplied by the final I/O worker count. |
+| `RACER_REGISTERED_BYTES` | Unset: `RACER_REGISTERED_BYTES_PER_WORKER` applies | Node | 1..68,719,476,736 bytes | Native RDMA page-buffer pool, used only when RDMA is enabled; then at least one page plus 16 bytes. One native thread owns the whole pool, so it is never divided. When neither variable is set, the scaled default is capped at 8 GiB node-wide. The pool is split evenly over RDMA rails, and a rail without a whole buffer is not used. Each grant holds one 18 MiB buffer until its page is consumed; `racer_rdma_free_buffers` shows what is left. Node-wide total, divided among I/O workers. |
+| `RACER_REGISTERED_BYTES_PER_WORKER` | `402653184` (384 MiB) | Per I/O worker | 1..68,719,476,736 bytes | Native RDMA page-buffer pool, used only when RDMA is enabled; then at least one page plus 16 bytes. One native thread owns the whole pool, so it is never divided. When neither variable is set, the scaled default is capped at 8 GiB node-wide. The pool is split evenly over RDMA rails, and a rail without a whole buffer is not used. Each grant holds one 18 MiB buffer until its page is consumed; `racer_rdma_free_buffers` shows what is left. Multiplied by the final I/O worker count. |
 | `RACER_REQUEST_CONTEXT_BYTES` | Unset: `RACER_REQUEST_CONTEXT_BYTES_PER_WORKER` applies | Node | 131,072..68,719,476,736 bytes | Request-context budget. Node-wide total, divided among I/O workers. |
 | `RACER_REQUEST_CONTEXT_BYTES_PER_WORKER` | `33554432` (32 MiB) | Per I/O worker | 131,072..68,719,476,736 bytes | Request-context budget. Multiplied by the final I/O worker count. |
 | `RACER_FLIGHTS` | Unset: `RACER_FLIGHTS_PER_WORKER` applies | Node | 1..65,536 | Concurrent single-flight page fetches. Node-wide total, divided among I/O workers. |
@@ -538,1827 +469,501 @@ each worker and are never divided.
 
 <!-- END GENERATED: racer configuration table -->
 
-Exact sizing requires both count settings. Their sum, plus the managed control
-thread, must fit `RACER_MAX_THREADS`;
-the cap is never raised implicitly. The first NUMA node in the normal placement
-preference order must be known and have enough eligible CPUs for the whole split.
-Other host NUMA nodes are allowed, but exact placement does not span nodes or skip
-an undersized preferred node. Insufficient CPU quota or per-I/O resource budgets
-fails startup rather than reducing counts. For a managed 20-I/O comparison, use
-10 helpers with cap 31 or 20 helpers with cap 41. Keep all resource budgets fixed.
-Omit both count settings to retain automatic sizing.
-Extra helpers change available crypto execution capacity, not I/O ownership or
-per-I/O budgets. They do not guarantee higher throughput; compare matched workloads
-before drawing a performance conclusion.
-Each I/O worker submits crypto jobs to its assigned helper, but an idle helper
-runs jobs queued for other helpers on the same NUMA node, so one busy I/O worker
-does not leave its jobs waiting while other helpers on that node sit idle.
-Results always return to the submitting I/O worker. Jobs move to a helper on
-another NUMA node only when they ask for that node: a host-read decrypt into a
-destination resident on the other node runs there (see host reads below).
-`racer_crypto_stolen_jobs_total` counts crypto jobs run by a helper other than
-the submitting I/O worker's own on the same node, and
-`racer_crypto_numa_forwarded_jobs_total` counts jobs forwarded to a helper on
-another node.
-
-Automatic sizing considers CPU affinity, quota, NUMA locality, and progress reserves.
-Without an explicit thread cap, one unpinned control thread runs alongside the
-automatically sized I/O and crypto workers. With a cap, it consumes one slot.
-Node-wide budgets divide by final I/O worker count, not crypto thread count; tight budgets
-can reduce workers. File-backed storage grows with I/O workers; raw-device capacity is
-divided among them. Admission budgets are not RSS limits:
-allocator, TLS, and filesystem cache are additional. Invalid combinations fail validation.
-
 ### Raw-device storage
 
-Set the Node annotation `racer.unbounded-cloud.io/block-devices` to a regex over
-basenames in `/host/dev/disk/by-id`, not full paths. On nodes without udev, where
-`/host/dev/disk/by-id` does not exist, the selector instead matches the kernel
-names in `/sys/block` (such as `nvme1n1`) and, for NVMe devices, the name udev
-would give them (`nvme-<model>_<serial>`, whitespace replaced by `_`), so the
-same selector works on both. The selector is limited to
-1 KiB (1,024 bytes) and compiled with Rust's `regex` crate. Invalid or oversized
-values fall back to file-backed slabs. Matching is **unanchored**:
-use `^` and `$` to avoid unintended substring and partition matches.
+By default Racer stores pages in slab files under `RACER_SLAB_DIRECTORY`. On a node with spare block devices, the `racer.unbounded-cloud.io/block-devices` Node annotation selects raw devices instead. The value is a Rust regular expression over the basenames in `/host/dev/disk/by-id`. Racer also matches the corresponding name under `/sys/block` when it resolves the device.
 
-Discovery runs once after startup enrollment. Changing or removing the annotation
-does not change a running layout or trigger a rollout; restart the affected
-dataplane to apply it. An absent/empty selector, Rust compile failure, discovery
-failure, no usable matches, or too few segments for all workers' reserves falls
-back to file-backed slabs. Rejected candidates are skipped with diagnostics;
-remaining usable devices can still be selected. Aliases for one device are
-deduplicated.
+The selector is limited to 1 KiB and is not implicitly anchored. A pattern such as `^md0$` matches one name; a pattern such as `nvme` matches every basename containing that substring, including partitions and unrelated devices. Use anchors unless a broad match is deliberate.
 
-**Selected devices are overwritten except for reserved guards. There is no
-general filesystem or data-signature check, formatting step, or preservation of
-cache-area contents.** Racer skips
-devices with child partitions, active holders, read-only state, or visible mounts.
-It opens devices with `O_RDWR | O_DIRECT | O_EXCL`. A device whose open fails
-with `EBUSY`, for example while a replaced dataplane is still releasing its
-claim, is retried every 250 ms until `RACER_DEVICE_BUSY_WAIT_SECS` elapses;
-all busy devices share that one deadline. Devices still busy at the deadline
-are skipped. Other rejections, including active holders, are not retried.
-These checks are not proof that a device is safe to erase. A partition itself is
-allowed: a broad selector can overwrite an unmounted OS or data partition.
-Select only dedicated disposable cache devices after checking each match.
+Discovery happens only at startup. A change to the annotation requires a dataplane restart, because the store binds its segments to the selected devices when it opens them. If the selector does not compile, matches nothing, or yields no device that passes the safety checks, Racer falls back to file-backed slabs. `RACER_SLAB_BYTES_PER_WORKER` remains valid in device mode even though it does not limit device capacity; it is the fallback size.
 
-The first and last **1 MiB (1,048,576 bytes)** of each device are reserved and must
-already be entirely zero. Startup reads each full guard through the same held
-exclusive `O_DIRECT` descriptor, using one aligned 1 MiB buffer. Nonzero bytes,
-short reads, I/O errors, or unsupported alignment reject that device. Racer never
-zeros the guards or bypasses partition, holder, or mount checks. Clearing old
-contents is a separate operator-approved operation, not an automatic repair.
-Keeping cache records out of these ends prevents cache data from looking like a
-partition table or filesystem signature; it is not proof against every partition parser.
+{{< callout type="warning" >}}
+Selected devices are overwritten without a signature or filesystem check. A partition is eligible too, including an unmounted OS partition if it matches. The safety checks do not prove that a device is disposable. Select devices by an exact `by-id` name that you know belongs to the cache.
+{{< /callout >}}
 
-The managed privileged container mounts host `/dev` read-only at `/host/dev`.
-This protects directory entries, **not device contents**: raw writes are
-intentional. `RACER_SLAB_DIRECTORY` still holds `checkpoint.0` and `checkpoint.1`
-and must remain writable and available.
+Racer skips a device when it has child partitions, holders, a read-only state, or a mount, and when an exclusive open fails. It opens the selected devices exclusively. A busy device (`EBUSY`) is retried until `RACER_DEVICE_BUSY_WAIT_SECS` expires; the default is 120 seconds, and `0` skips a busy device immediately. All selected devices share one startup deadline, so a single slow device cannot extend startup indefinitely.
 
-Device mode uses `floor((device_bytes - 2 MiB) / segment_bytes)` segments per
-device, at offsets `1 MiB + k * segment_bytes`. These are split among
-the final I/O workers with remainder segments assigned to workers. Each device's
-subsegment tail is unusable. `RACER_SLAB_BYTES_PER_WORKER` is ignored for device capacity,
-but still must pass configuration validation for fallback. The normal per-worker
-free-segment reserve, record headers, AEAD tags, alignment padding, and record
-packing reduce payload capacity. Hard limits can reduce it further:
+Racer validates the first and last 1 MiB of each selected device as guards. A guard region that is not zero makes the device ineligible and is reported rather than overwritten; the guard regions are excluded from usable capacity. The host `/dev` mount is read-only at `/host/dev`, but raw writes are intentional and use the device node itself; the read-only mount does not protect the disk.
 
-- At most 1,000,000 segments per worker, also bounded by signed 64-bit byte offsets.
-- Each worker's page index grows to the larger of its estimated full-page capacity
-  after reserves and its configured share of `RACER_DISK_PAGE_ENTRIES`, capped at
-  1,000,000 entries. The estimate includes the largest record header, AEAD tag,
-  and direct-I/O alignment. Small objects can exhaust the index before disk bytes.
-- Checkpoint working memory grows from a conservative estimate of page entries,
-  metadata entries, and segments, never below `RACER_CHECKPOINT_BYTES`, and is
-  capped at 512 MiB node-wide. Encoded checkpoint files still have a 64 MiB cap.
-  Oversized snapshots are skipped; recovery rejects snapshots over its budget.
+Checkpoints live in `RACER_SLAB_DIRECTORY` even in device mode, so that directory must exist and remain writable. A checkpoint records the device layout and the segment geometry. Recovery accepts a checkpoint only when it matches the live layout and cluster; an older format, a different cluster ID, a changed segment size, or a different device set is rejected and the cache starts cold.
 
-Plan memory for the larger index, resident heat tracking, segment tables, and
-checkpoint scratch, not just the configured admission budgets. The automatic
-checkpoint budget is not an RSS limit or a guarantee that a full cache can be
-checkpointed. Limit warnings explain discarded capacity and checkpoint pressure.
+Device capacity is split into segments of `RACER_SEGMENT_BYTES`, which defaults to 1 GiB. The last partial segment on a device is unusable, so a 1 GiB segment with 16 MiB pages keeps tail waste small. Whole segments are distributed across I/O workers. Each worker's share is subject to hard caps, and a worker may receive a different number of segments on heterogeneous devices. Subsegment tails, reserves, headers, AEAD tags, and alignment all reduce usable capacity.
 
-Checkpoints store the remaining time of each completed-page hold, measured
-on the monotonic clock, so a restart re-arms holds without consulting wall
-time. Time between the checkpoint and the restart does not count against a
-hold, so a restored hold can outlast its original deadline by that gap. They
-bind each worker to
-file mode or its raw-device IDs, sizes, and segment offsets. The raw-layout
-digest also includes both guard sizes. Each checkpoint candidate is
-validated for the whole node: one mismatched worker rejects the entire candidate.
-A changed device layout, storage mode, worker count, or incompatible
-geometry rejects recovery and starts cold when no compatible checkpoint remains.
-Racer does not scan payloads to rebuild the index or migrate cached data. Preserve
-cluster and node identity state; it is separate from disposable cache checkpoints.
+`RACER_DISK_PAGE_ENTRIES` and `RACER_CHECKPOINT_BYTES` can be raised in device mode: the index may grow to fit full pages after reserves, up to 1,000,000 entries per worker, and the checkpoint working memory may grow to 512 MiB. Encoded checkpoints remain capped at 64 MiB, and an oversized cut is skipped rather than written.
 
 ### Range reads
 
-The dataplane always sends a read's pages to the client in order, but fetches
-them in any order:
+A read delivers bytes in order but fetches pages out of order. The range stream starts at the requested offset, checks local memory for the page that contains it, and fills a missing page through the normal flight path. While the client consumes the current page, Racer fetches the next pages in the window ahead of delivery. A page that is missing locally is requested from its owners over the mesh; if the local node is an owner, it fills from its origin.
 
-- It checks local memory for every page in the read window. A page already in
-  memory is ready without waiting for earlier pages.
-- It fills the next page to send and the page after it through the normal
-  fill path.
-- It asks peers for the other missing pages in the window. A peer sends them in
-  any order it chooses. Several requests can be in flight at once, to one or
-  more peers.
-- Pages that arrive early wait in memory until their turn. If
-  `RACER_RANGE_SPILL_PAGES` is above zero, a read can also fetch pages past the
-  window to local disk under a short hold. Each hold is released after its page
-  is sent or the read ends. If a hold is refused or a page fails to spill, the
-  read stops spilling and uses its memory window only.
-- Reads of the same version on one node share page fetches.
+Pages ahead of the reader are admitted into the window and may wait for earlier pages before delivery. This keeps the socket fed without requiring the client to ask for each page. `RACER_RANGE_WINDOW_PAGES` sets the read-ahead window, from 1 to 64 pages; the default is 4. The plaintext budget for each worker must fit one page more than the window, and the ciphertext budget must fit the window plus one stored record.
 
-The window is `RACER_RANGE_WINDOW_PAGES` pages, also limited by the client's
-unreleased credits. Clients cannot choose the order. The `Racer-Ordered` request
-header is no longer used and is ignored.
+A client can also pace a subscription read with `Racer-Page-Credits` and `Racer-Byte-Credits`. Credits limit how many pages and bytes the stream may have outstanding. The parser accepts byte credits down to the smallest page any cluster may publish, and the stream requires at least one page of the cluster's actual size. Direct reads ignore credits and are paced by the dataplane with a minimum window of four pages.
 
-Older dataplanes send pages out of order unless the client sends
-`Racer-Ordered: 1`, which current SDKs no longer send. Upgrade dataplanes
-before SDKs. Older peers accept only one page request at a time from a node.
-The dataplane detects this and falls back to one request at a time for that peer.
+Pages past the delivery window are not fetched unless `RACER_RANGE_SPILL_PAGES` is nonzero. When spill is enabled, a read may fetch that many pages beyond the window to local disk under a short hold. The default is 0, which disables spill. Spill holds are described in [Spill holds](#spill-holds).
+
+Each page fetch is shared per object version and page. Concurrent readers of the same version join one in-flight fetch instead of issuing duplicate origin or peer requests. A read that pins an ETag always fetches the pinned version; a read without a pin resolves the current version once and keeps it for the whole read.
+
+The retired `Racer-Ordered` request header is ignored. Older peers that do not understand a newer request fall back to a single-page request for compatibility, and the requesting node treats that fallback as a normal page response. A peer that cannot serve a page reports a typed failure, and the requester moves to the next owner or the origin.
 
 ### Host reads
 
-A client on the node can ask the dataplane to write an object straight into a
-file it owns, such as a `memfd`, instead of streaming it over the socket:
+A host read writes object plaintext into a file descriptor owned by the client instead of into the socket. The request is `POST /v1/objects/<key>/host-read` with exactly one `SCM_RIGHTS` descriptor attached to the request head. Any other descriptor count, a descriptor on another request, or truncated ancillary data is a `400`.
 
-```
-POST /v1/objects/<key>/host-read HTTP/1.1
-Host: racer
-Content-Length: 0
-Range: bytes=<start>-<end>          optional
-If-Match: "<etag>"                  optional
-Racer-Destination-Offset: <offset>
-Racer-Destination-Length: <length>
-```
+| Header | Required | Meaning |
+| --- | --- | --- |
+| `Racer-Destination-Offset` | yes | Byte offset in the destination file |
+| `Racer-Destination-Length` | yes, nonzero | Length of the destination window |
+| `Range` | no | Byte range of the object to read |
+| `If-Match` | no | Strong ETag that pins a version |
+| `Racer-Metadata` | no | Opaque origin metadata, validated like an object read |
+| `Authorization` | no | Opaque credential passed to the origin |
 
-- Send exactly one file descriptor with the request, as `SCM_RIGHTS` data on
-  the same `sendmsg` as the start of the request. It must be a regular file
-  opened for writing, without `O_APPEND`.
-- The bytes at object offset `o` go to file offset
-  `Racer-Destination-Offset + (o - range start)`.
-- The dataplane answers 400 if there is no descriptor, more than one, a
-  descriptor on any other request, a file that is not regular, or a length
-  smaller than the range. Range and version errors keep their usual statuses.
-- A success has `Racer-Delivery: host`. The body uses the normal frames, but
-  page frames carry no data: a page frame means that page is already in the
-  file. The last frame is the usual completion frame. The client sends no
-  credits.
-- If the read fails partway, the connection closes without the completion frame
-  and the file may hold partial data.
-- If the file is a `memfd` created with `MFD_ALLOW_SEALING`, carries the
-  `F_SEAL_SHRINK` seal (and no write seal), is open for reading and writing,
-  and is at least `Racer-Destination-Offset + Racer-Destination-Length` bytes
-  long, the dataplane maps the destination and decrypts pages straight into
-  it on its crypto workers. That skips a plaintext copy in the dataplane and
-  the kernel copy of a positioned write. Pages that are already plaintext in
-  dataplane memory are still written with positioned writes. The client sees
-  the page's ciphertext briefly before the plaintext, and a page that fails
-  authentication is zeroed, but a page frame is still sent only after the
-  page is authenticated. Any other file gets positioned writes only.
-  `racer_host_read_direct_decrypt_pages_total` and
-  `racer_host_read_direct_decrypt_bytes_total` count pages and plaintext bytes
-  decrypted this way. When such a page arrives from a peer over RDMA, the
-  crypto worker copies it out of the RDMA receive buffer into the dataplane's
-  ciphertext cache and decrypts it in the same pass, 128 KiB at a time, so
-  the received bytes are read from memory once. Each decrypted chunk lands in
-  a small cache-resident buffer and is copied into the client's memfd with
-  non-temporal stores, so the memfd is never read. The receive buffer is held
-  until that pass ends. A page that fails authentication is not cached or
-  persisted. `racer_host_read_fused_decrypt_pages_total` counts pages
-  decrypted this way. Such a page enters the memory cache only after it
-  passes authentication. `racer_host_read_fused_skipped_total` counts host-read pages
-  decrypted without the fused pass, by `reason`: `not_registered` (the page
-  came from memory, disk, or HTTP rather than an RDMA receive buffer, which
-  is expected for local hits), `retained` (another reader already copied the
-  page out of the receive buffer, for example a plaintext or GPU read of the
-  same page), `reservation` (ciphertext admission refused the copy, so the
-  page is copied out before the decrypt instead), or `pool_low` (see below).
-  Pages of a host read are delivered in order, so a page fetched ahead of
-  the first undelivered page of its window waits there, and a fused page
-  holds its receive buffer while it waits. So that such pages cannot take
-  every receive buffer and leave the window heads none, a page ahead of its
-  head is not granted a receive buffer while fewer than a quarter of the
-  buffers of the rail's pool are free: its request fails before anything is
-  sent, without waiting for a buffer, and the window fetches it again after
-  a short backoff, by then possibly as its head. Window heads still wait for
-  a buffer as usual. `racer_rdma_grant_ahead_deferred_total` counts these
-  deferred grants. A page granted just before the pool ran low can still
-  arrive when it is lower: a page ahead of its head is copied out of its
-  receive buffer as soon as it arrives, rather than fused, while fewer than
-  an eighth of the buffers of that rail's pool are free. These pages count
-  as `pool_low`, and that copy costs an extra pass over the page in memory,
-  so a `pool_low` count that keeps growing means the grant reserve is not
-  keeping up. Both checks count the buffers the pool may still register as
-  free and part of the pool: up to the rail's share of
-  `RACER_REGISTERED_BYTES` without memory pressure, at most one block above
-  the buffers in use under `Elevated` pressure, and none under `Critical`
-  pressure, when the pool does not grow, or while a refused or failed block
-  registration waits to retry. If ciphertext admission also refuses
-  that copy, the page is dropped, which frees its buffer, and the window
-  fetches it again later; `racer_host_read_ahead_registered_dropped_total`
-  counts these drops.
-  Each page of a host read is fetched by the page's owning worker, which may
-  be on the other NUMA node from the requesting worker. The decrypt writes
-  two buffers, the ciphertext cache copy and the client's `memfd`, and
-  writes across the socket interconnect cost the most, so the dataplane
-  picks the decrypt's node from the destination: when a page of the
-  client's `memfd` is already resident at the page's destination (for
-  example, a pooled buffer reused for later reads), the decrypt runs on a
-  crypto helper on that page's NUMA node; otherwise it runs on the
-  requesting worker's node, and the decrypt's first write places the
-  destination there. The destination's node is looked up without faulting
-  pages in, once per 2 MiB of a cached mapping. The owning worker then lands
-  an RDMA page on a rail whose NIC is on that node when such a rail is
-  ready, and takes the ciphertext cache copy from storage bound to that
-  node, so all three buffers are local to the decrypt.
-  `racer_host_read_fused_numa_pages_total` counts fused pages by `buffer`
-  (`registered` for the RDMA receive buffer, `store` for the ciphertext cache
-  copy, `destination` for the client's memfd) and `locality`: `local` when
-  the buffer's first page is on the NUMA node of the crypto helper that
-  decrypted it, `remote` when it is on another node, and `unknown` when the
-  kernel does not report either node (for example when seccomp denies
-  `get_mempolicy`). A steady `remote` share means the decrypt reads or writes
-  memory across the socket interconnect.
-- The dataplane keeps mappings of such files in a process-wide cache keyed
-  by the file's device and inode, so repeated requests for the same `memfd`
-  (for example, parallel ranges of one buffer, or a pooled buffer reused for
-  later objects) skip a `mmap`, `munmap`, and page-table populate per request.
-  Every request still presents the descriptor and passes every check above.
-  The cache holds up to 128 mappings and 256 GiB of mapped files, evicting the
-  least recently used beyond that, and unmaps a mapping that no request has
-  used for 5 seconds. While a mapping is cached the client's `memfd` memory
-  stays allocated even if the client closed it, and the client cannot add
-  `F_SEAL_WRITE` to it. Unmapping happens on a background thread.
-  `racer_host_read_mappings_created_total`,
-  `racer_host_read_mapping_reuses_total`, and
-  `racer_host_read_mappings_evicted_total` count new, reused, and evicted
-  mappings; `racer_host_read_mappings_cached` and
-  `racer_host_read_mappings_cached_bytes` report the cache's current size.
-- Pages of one request that are decrypted into a mapped `memfd` run on crypto
-  workers concurrently, up to 4 at a time, instead of one after another.
-  Page frames are still sent in page order, each after its page and every
-  earlier page is in the file. `racer_host_read_inflight_pages_sum` and
-  `racer_host_read_inflight_pages_count` give the average number of such
-  decrypts running for a request each time one starts; a value near 1 means
-  pages arrive more slowly than they decrypt.
-- `racer_host_read_request_nanoseconds_sum` and
-  `racer_host_read_request_nanoseconds_count` time each successful host-read
-  from the start of its delivery (after the request is parsed and the
-  descriptor checked) to the final frame.
-  `racer_host_read_first_page_nanoseconds_sum` and
-  `racer_host_read_first_page_nanoseconds_count` time the same start to the
-  first page being ready, before the response head is sent. The difference
-  is time spent delivering pages and sending frames.
+The destination window is the half-open interval from the offset for the given length. Each delivered byte lands at the destination offset that corresponds to its position in the requested object range, so the destination and object ranges may start at different offsets. A request is rejected with `400` when the window overflows, when the length is zero, when the descriptor count is wrong, or when a required header is missing.
 
-`POST /v1/objects/<key>/gpu-read` writes into GPU memory. It works like
-`host-read`, with these differences:
+A successful response uses `Racer-Delivery: host` frames. Racer writes each page through positioned `io_uring` writes and only acknowledges a page once its bytes are visible to the client. A failure after the response head ends the frame stream; a client must treat a short delivery as an error rather than a truncated success.
 
-- The descriptor comes from `cuMemExportToShareableHandle` with the POSIX file
-  descriptor handle type. `Racer-Allocation-Size` is required and must be the
-  size passed to `cuMemCreate`.
-- `Racer-Gpu-Uuid` is optional: the UUID of the GPU that holds the memory, as
-  `nvidia-smi` prints it (`GPU-xxxxxxxx-...`). Device numbers in the client's
-  container can differ from the dataplane's, so the dataplane uses the UUID to
-  find the GPU. Without it, the dataplane tries each GPU. The Python client
-  sends it.
-- The answer is 501 when GPU mode is off or the memory is on a GPU the
-  dataplane did not find, including an unknown `Racer-Gpu-Uuid`. It is 400 when the size does not match the memory or
-  the window does not fit in it.
-- A success has `Racer-Delivery: gpu`. A page frame means the GPU copy of that
-  page is complete.
-- When the read ends for any reason, the dataplane waits for its GPU work,
-  then releases the memory. See [GPU reads](#gpu-reads).
+When the destination is a regular file, normally a sealed `memfd`, Racer can decrypt sealed pages directly into the destination with the crypto client instead of copying through a plaintext buffer. The metrics `racer_host_read_direct_decrypt_pages_total` and `racer_host_read_direct_decrypt_bytes_total` count that path.
+
+A host read can also fuse the RDMA receive buffer with the decrypt: when the page arrives over RDMA into a registered buffer, the owner decrypts in place and keeps the only copy. The metric `racer_host_read_fused_skipped_total` explains why fusion did not happen, with reasons `not_registered`, `retained`, `reservation`, and `pool_low`. A page ahead of its head is deferred while its rail's pool is low, so the pool is not exhausted by speculative work.
+
+Decrypt buffers are placed on the NUMA node of the destination when that node is known, so the decrypt does not cross a NUMA boundary. `racer_host_read_fused_numa_pages_total` labels the buffer as `registered`, `store`, or `destination` and the locality as `local`, `remote`, or `unknown`, which shows whether placement matched.
+
+The mapping cache for `memfd` destinations is bounded. `racer_host_read_mappings_cached`, `racer_host_read_mappings_cached_bytes`, `racer_host_read_mappings_created_total`, `racer_host_read_mappings_evicted_total`, and `racer_host_read_mapping_reuses_total` describe its size and reuse. Concurrent mapped page decrypts proceed per page, and request and first-page durations are exported as `racer_host_read_request_nanoseconds_{sum,count}` and `racer_host_read_first_page_nanoseconds_{sum,count}`.
+
+`POST /v1/objects/<key>/gpu-read` follows the same shape but delivers into a GPU allocation. It requires `Racer-Allocation-Size`, which must cover the destination window, and `Racer-Gpu-Uuid`, which names the target GPU. The descriptor must be a shareable handle produced by `cuMemExportToShareableHandle`. A node without a GPU backend answers `501`; a malformed allocation, UUID, or window answers `400`. A successful response uses `Racer-Delivery: gpu`.
 
 ### Prefetch
 
-Prefetch asks Racer to load object ranges into the cache before a job reads
-them. It is best effort. Racer does not pin or retain prefetched pages: they are
-stored like any other cached page and can be evicted later.
+Prefetch loads object ranges in the background without returning their contents. It is best effort: nothing is pinned, loaded pages are evicted like any other page, and a ticket can finish `PARTIAL` when some refs fail. Tickets live in memory on one node and are lost when the dataplane restarts. Resubmitting the same ticket ID after a restart is idempotent and loads only the pages that are still missing.
 
-Prefetch uses a JSON API on the client socket
-(`/run/racer/<cache>/client/socket`) with HTTP/1.1 and `Host: racer`, like
-object reads. A client submits a ticket that lists object ranges. The node finds
-the missing 16 MiB pages and asks each page's owner to fill it through the
-normal fill path. Tickets live in memory on the node that received them. A
-restart loses them; submit the same ticket again and only missing pages are
-loaded.
+The API is JSON over the cache's client socket:
 
-| Method | Path | Purpose |
-|--------|------|---------|
-| `PUT` | `/v1/prefetches/{id}` | Create or update a ticket |
-| `GET` | `/v1/prefetches/{id}` | Ticket status; query `wait`, `coverage`, `refs`, `cursor` |
-| `DELETE` | `/v1/prefetches/{id}` | Cancel a ticket |
-| `GET` | `/v1/prefetches` | List this cache's tickets on this node |
+| Method and path | Purpose |
+| --- | --- |
+| `PUT /v1/prefetches/{id}` | Create or update a ticket |
+| `GET /v1/prefetches/{id}` | Read status, optionally long-polling |
+| `DELETE /v1/prefetches/{id}` | Cancel a ticket |
+| `GET /v1/prefetches` | List this cache's tickets |
 
-Other methods return `405` with `Allow: GET, PUT, DELETE` for a ticket path, or
-`Allow: GET` for the list path. `{id}` is chosen by the client, matches
-`[A-Za-z0-9._-]{1,128}`, and is scoped to the socket's cache. `.` and `..` are
-invalid. Query parameters are form-encoded; unknown or repeated parameters are
-`400`.
+An unsupported method receives `405` with an `Allow` header: `GET, PUT, DELETE` on an item and `GET` on the collection. A ticket ID is 1 to 128 characters from `[A-Za-z0-9._-]` and may not be `.` or `..`. Query strings are accepted only on `GET`; `PUT` and `DELETE` reject an unexpected query.
 
-`PUT` needs `Content-Type: application/json` and a body of at most
-`RACER_PREFETCH_MAX_BODY_BYTES`. `Transfer-Encoding`, `Expect`, and
-`Content-Encoding` are rejected. `GET` and `DELETE` take no body. `Authorization`
-is accepted on `PUT` only. Racer sends it to the origin for every ref, keeps it in
-memory only, and replaces it on each accepted `PUT`; a `PUT` without it clears it.
-Prefetch responses close the connection.
+A `PUT` requires `Host: racer`, `Content-Type: application/json`, and a nonzero `Content-Length` within `RACER_PREFETCH_MAX_BODY_BYTES`. It rejects transfer encodings, `Expect`, content encodings, trailers, upgrades, duplicate `Host`, `Content-Length`, `Content-Type`, or `Authorization`, and an `Authorization` value that is empty or has leading or trailing spaces. The parser accepts `Authorization` on `PUT` only, and only its presence is hashed into the ticket hash. A request head larger than `RACER_HEADER_BYTES` receives `413`.
+
+Every response carries `Connection: close`. A long-poll `GET` ends when the ticket changes or its `wait` expires, and a client disconnect cancels the wait.
 
 #### Request body
 
-```json
-{
-  "cache_uid": "5b0c7a5e-2f7d-4b8e-9d0e-6f6f2f3b1a10",
-  "priority": "normal",
-  "generation": 0,
-  "sequence": 0,
-  "ttl_seconds": 600,
-  "max_pending_bytes": 0,
-  "refs": [
-    {"key": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
-     "etag": "\"0x8DC1A2B3C4D5E6F\"", "offset": 0, "length": 1073741824,
-     "metadata": "opaque"},
-    {"key": "60303ae22b998861bce3b28f33eec1be758a213c86c93c076dbe9f558c11c752"}
-  ]
-}
-```
+The body is a strict JSON object. Unknown fields are rejected, and `refs` must be a nonempty array.
 
 | Field | Default | Rules |
-|-------|---------|-------|
-| `cache_uid` | Absent | If set, must equal the live ClusterCache UID, else `409 cache_uid_mismatch` |
-| `priority` | `normal` | `high`, `normal`, or `low` |
-| `generation` | `0` | 0 to 2^53-1 |
-| `sequence` | `0` | 0 to 2^53-1 |
-| `ttl_seconds` | `600` | At least 1; capped at `RACER_PREFETCH_MAX_TTL_SECS`. Status shows the applied value |
-| `max_pending_bytes` | `0` | Bound on the ticket's in-flight bytes. `0` means `RACER_PREFETCH_DEFAULT_PENDING_BYTES`; capped at `RACER_PREFETCH_MAX_PENDING_BYTES` |
-| `refs` | Required | 1 to `RACER_PREFETCH_MAX_REFS` entries |
-| `refs[].key` | Required | 64 lowercase hex characters, as in `/v1/objects/{key}` |
-| `refs[].etag` | Absent | Strong quoted ETag, as in `If-Match`. If absent, Racer resolves the current version once at submit |
-| `refs[].offset` | `0` | Must be less than the object length, else the ref fails with `invalid_range` |
-| `refs[].length` | To end | At least 1 when set; clamped to the object end |
-| `refs[].metadata` | Absent | Sent to the origin like `Racer-Metadata` |
+| --- | --- | --- |
+| `cache_uid` | none | Optional ClusterCache UID, up to 64 characters. A mismatch with the socket's cache is `409 cache_uid_mismatch`. |
+| `priority` | `normal` | One of `high`, `normal`, `low`. |
+| `generation` | 0 | At most `2^53-1`. |
+| `sequence` | 0 | At most `2^53-1`. |
+| `ttl_seconds` | 600 | At least 1, capped at `RACER_PREFETCH_MAX_TTL_SECS`. |
+| `max_pending_bytes` | `RACER_PREFETCH_DEFAULT_PENDING_BYTES` | `0` selects the default, then the value is capped at `RACER_PREFETCH_MAX_PENDING_BYTES`. |
+| `refs[].key` | required | Exactly 64 hexadecimal characters. |
+| `refs[].etag` | none | Strong ETag, which pins a version. |
+| `refs[].offset` | 0 | Start offset in the object. |
+| `refs[].length` | to end of object | When present, at least 1. |
+| `refs[].metadata` | none | Opaque origin metadata, validated like `Racer-Metadata`. |
 
-Unknown fields are `400`. Duplicate refs are allowed; each page is loaded once.
-If version lookup fails for a ref, that ref fails and the `PUT` still succeeds.
-A ref to an empty object with offset 0 and no length succeeds with no pages.
-`max_pending_bytes` limits dispatched bytes, but a ticket with nothing in flight
-can always send one page.
+Duplicate refs are allowed; the ticket deduplicates them to page units in ref order. An empty object ref, a malformed key, an invalid ETag, a zero length, or invalid metadata rejects the whole `PUT` with `400`. A version that cannot be resolved marks that ref failed with `version_changed` rather than failing the whole ticket.
+
+Each ref reports an outcome of `succeeded`, `failed`, or `pending`. A failed ref carries one error from `version_changed`, `not_found`, `forbidden`, `origin_error`, `peer_unsupported`, `budget_timeout`, or `invalid_range`.
 
 #### Generation and sequence
 
-Each ticket stores the `(generation, sequence)` of its last accepted `PUT`, here
-`(G, S)`. Racer also stores a hash of the body and of whether `Authorization` was
-present. The hash ignores whitespace and field order but not omitted fields: an
-explicit default such as `"ttl_seconds": 600` is a different body from leaving
-the field out. The SDKs always encode the same request the same way, so their
-retries match.
+`generation` and `sequence` order updates to one ticket ID. A new ticket records the pair from its body. A later `PUT` is compared with the stored pair before any version is resolved:
 
-| Incoming `(g, s)` | Result |
-|-------------------|--------|
-| No ticket | Created, `201` |
-| `g == G`, `s == S`, same body | `200` with current status; renews the TTL of a ticket that has not expired or been canceled |
-| `g == G`, `s == S`, different body | `409 payload_mismatch` |
-| `g == G`, `s > S` | Replaces the wanted set, `200` |
-| `g == G`, `s < S` | `409 stale_sequence` |
-| `g > G` | Replaces the wanted set and starts a new generation, `200` |
-| `g < G` | `409 stale_generation` |
+| Stored position | Submitted pair | Result |
+| --- | --- | --- |
+| `(g, s)` | `g' < g` | `409 stale_generation` |
+| `(g, s)` | `g' == g`, `s' < s` | `409 stale_sequence` |
+| `(g, s)` | `g' == g`, `s' == s`, different canonical body or `Authorization` presence | `409 payload_mismatch` |
+| `(g, s)` | `g' == g`, `s' == s`, same payload | The current status; the TTL is renewed |
+| `(g, s)` | `g' == g`, `s' > s` | A window update |
+| `(g, s)` | `g' > g` | A new generation, which replaces the wanted set |
 
-A one-shot batch is one `PUT` with `(0, 0)`. A rolling window is the same ticket
-updated with a higher `sequence`. When the wanted set is replaced, pages no
-longer wanted lose this ticket's interest. Queued pages that no ticket wants are
-dropped. Fills already in flight finish. A `PUT` with a higher position also
-restarts a finished ticket.
+The body hash is the SHA-256 of the canonical re-serialized body, with fields in fixed order, absent fields omitted, whitespace removed, plus one bit for the presence of `Authorization`. Two bodies that differ only in whitespace or field order have the same hash and are treated as the same payload. A rotated credential is accepted when the body and the credential presence bit match; the ticket is applied again with the new credential.
 
-Every accepted `PUT` renews the TTL. When the TTL ends, a ticket that is still
-working becomes `CANCELLED` with reason `expired`. A settled ticket keeps its
-state. Either way it releases its interest. Nothing is evicted. Finished tickets
-stay visible for `RACER_PREFETCH_TICKET_RETENTION_SECS` after expiry or cancel.
+A same-generation `PUT` is a rolling window update: refs not already in the ticket's wanted set are added, and refs omitted from the update are dropped from the wanted set. Work that already finished stays counted, so an update does not restart the ticket's totals. A new generation starts a one-shot batch: the wanted set is replaced and the accumulated counters start over. Both forms renew the TTL unless the ticket has already settled.
+
+A settled ticket keeps its final outcomes until `RACER_PREFETCH_TICKET_RETENTION_SECS` expires, which defaults to 300 seconds. During retention, `GET` returns the frozen result and a `DELETE` still cancels it. After retention the ticket is removed and a `GET` returns `404 not_found`. A ticket that expires while it still has open work is canceled with reason `expired`; a settled window that expires only releases its interest.
 
 #### Status
 
-`GET /v1/prefetches/{id}` and successful `PUT` and `DELETE` calls return:
-
-```json
-{
-  "id": "epoch-17",
-  "cache_uid": "5b0c7a5e-2f7d-4b8e-9d0e-6f6f2f3b1a10",
-  "state": "PARTIAL",
-  "reason": null,
-  "priority": "normal",
-  "generation": 2,
-  "sequence": 5,
-  "settled": true,
-  "ttl_seconds": 600,
-  "expires_at_ms": 1793750400000,
-  "created_at_ms": 1793749800000,
-  "updated_at_ms": 1793749810000,
-  "refs_total": 2,
-  "refs_succeeded": 1,
-  "refs_failed": 1,
-  "refs_pending": 0,
-  "bytes": {
-    "logical_requested": 1073741824,
-    "aligned_requested": 1090519040,
-    "already_resident": 268435456,
-    "queued": 0,
-    "in_flight": 0,
-    "joined": 16777216,
-    "fetched_from_origin": 805306368,
-    "admitted": 1090519040,
-    "failed": 16777216
-  },
-  "coverage": {"resident_bytes": 1073741824, "observed_at_ms": 1793749811000},
-  "refs": [
-    {"index": 1, "key": "60303ae2...c752", "etag": null,
-     "offset": 0, "length": 16777216, "outcome": "failed",
-     "error": "version_changed"}
-  ],
-  "next_cursor": null
-}
-```
-
-| `state` | Meaning |
-|---------|---------|
-| `QUEUED` | Accepted; nothing sent yet |
-| `RUNNING` | Pages are queued or in flight |
-| `SUCCEEDED` | Settled; every ref succeeded |
-| `PARTIAL` | Settled; some refs failed |
-| `FAILED` | Settled; every ref failed |
-| `CANCELLED` | Stopped. `reason` is `client`, `expired`, `superseded` (cache UID changed), `cache_removed`, or `passthrough` |
-
-The `CANCELLED` literal keeps its historical spelling because clients match on it.
-
-`reason` is `null` unless the state is `CANCELLED`. `settled` is true when
-nothing for the current position is queued or in flight. A settled window goes
-back to `RUNNING` on its next update.
-
-A ref succeeds when every one of its pages was stored or already present at an
-owner when the ticket settled. Success does not mean the pages stay in the
-cache; normal eviction can remove them later.
-
-`bytes` values are 16 MiB aligned except `logical_requested`:
+A status response describes one ticket:
 
 | Field | Meaning |
-|-------|---------|
-| `logical_requested` | Sum of ref lengths |
-| `aligned_requested` | Bytes of distinct pages |
-| `already_resident` | Present when planned |
-| `queued`, `in_flight` | Current |
-| `joined` | Joined a fill already in progress |
-| `fetched_from_origin` | Started a new origin fill |
-| `admitted` | Stored or already present |
-| `failed` | Belong to failed refs |
+| --- | --- |
+| `id`, `cache_uid` | Ticket ID and the cache's UID |
+| `state` | `QUEUED`, `RUNNING`, `SUCCEEDED`, `PARTIAL`, `FAILED`, or `CANCELLED` |
+| `reason` | Cancellation reason: `client`, `expired`, `superseded`, `cache_removed`, or `passthrough`; absent when not canceled |
+| `priority`, `generation`, `sequence` | Current scheduling priority and position |
+| `settled` | True when no unit is queued or in flight, or the ticket was released |
+| `ttl_seconds`, `expires_at_ms`, `created_at_ms`, `updated_at_ms` | Timing information |
+| `refs_total`, `refs_succeeded`, `refs_failed`, `refs_pending` | Ref counts |
+| `bytes` | Byte accounting, described below |
+| `coverage` | Optional resident coverage, present only when requested |
+| `refs`, `next_cursor` | Optional ref page and cursor |
 
-Query parameters:
+`QUEUED` means no unit has started and no ref has an error. `RUNNING` means at least one unit has started or a ref has already failed. `SUCCEEDED` means every ref succeeded. `PARTIAL` means at least one succeeded and at least one failed. `FAILED` means every ref failed. `CANCELLED` is set when a cancellation was recorded; the `reason` field says why.
 
-- `wait=<duration>` waits until the ticket settles or the time ends, then
-  returns status with `200` either way. Use Go-style units `ms`, `s`, or `m`
-  (`500ms`, `30s`, `2m`). The limit is `RACER_PREFETCH_MAX_WAIT_SECS`; larger is
-  `400`. Closing the connection ends the wait.
-- `coverage=1` asks the owners which pages of the wanted set they hold now and
-  adds `coverage`. It is a snapshot taken at `observed_at_ms`, not a promise.
-  Owners that do not answer before the request deadline count as not holding
-  the page, so `resident_bytes` is a lower bound.
-- `refs=failed` or `refs=all` adds per-ref results, 256 per response. Pass
-  `next_cursor` back as `cursor` for the next page. A cursor from another
-  position is `400`. `index` is the ref position in the `PUT`. `outcome` is
-  `succeeded`, `failed`, or `pending`. `etag` is the resolved ETag, or `null`.
+A ref succeeds when every page it needs is resident or was fetched successfully. A ref that joins an in-flight fetch counts its bytes as joined, not fetched. `settled` describes the current window, not a promise that the data will stay resident: pages can be evicted afterward, and the ticket does not pin them.
 
-Ref `error` values:
+The `bytes` object separates the requested amount from the work:
 
-| Error | Meaning |
-|-------|---------|
-| `version_changed` | The version is no longer available |
-| `not_found` | The object does not exist |
-| `forbidden` | The origin rejected the request |
-| `origin_error` | The origin or owner failed after retries |
-| `peer_unsupported` | The owner runs a dataplane without prefetch |
-| `budget_timeout` | The owner stayed busy after `RACER_PREFETCH_MAX_ATTEMPTS` tries |
-| `invalid_range` | The offset is past the object end |
+| Field | Meaning |
+| --- | --- |
+| `logical_requested` | Bytes the refs asked for, without page alignment |
+| `aligned_requested` | Bytes after rounding each ref to whole pages |
+| `already_resident` | Aligned bytes already present when the ticket started |
+| `queued` | Bytes waiting in the queue |
+| `in_flight` | Bytes being fetched |
+| `joined` | Bytes served by sharing another ticket's fetch |
+| `fetched_from_origin` | Bytes fetched from an origin |
+| `admitted` | Bytes admitted to the cache |
+| `failed` | Bytes that failed |
 
-`GET /v1/prefetches` returns `{"prefetches": [...]}`: summaries sorted by id,
-without `refs` or `coverage`.
+`GET /v1/prefetches/{id}?wait=<duration>` long-polls until the status changes or the wait expires. The wait is capped by `RACER_PREFETCH_MAX_WAIT_SECS`, and the request gets a small slack past that wait before its own deadline. `coverage=1` asks for resident coverage and adds the `coverage` object with `resident_bytes` and `observed_at_ms`; coverage probes use a share of the request budget and are skipped when the budget is too small.
 
-`DELETE` returns `200` with the `CANCELLED` status and reason `client`. It
-releases interest. Fills in flight finish and nothing is evicted.
+`refs=failed` lists only failed refs, and `refs=all` lists every ref. Ref lists are paginated at 256 entries. A `cursor` is accepted only with `refs`, is bound to one `(generation, sequence)`, and is rejected with `400` when it belongs to another pair. The response's `next_cursor` is present only when more refs remain; a null value means the last page.
+
+`GET /v1/prefetches` returns `{"prefetches": [...]}` with at most 1024 summaries for the socket's cache, sorted by ID. Each summary has the ID, state, reason, priority, generation, sequence, settled flag, expiry, and byte counts, but not refs.
+
+`DELETE /v1/prefetches/{id}` cancels the ticket with reason `client` and returns the resulting status with state `CANCELLED`. Deleting an unknown ID returns `404`.
 
 #### Errors
 
-Every non-2xx prefetch response has `Content-Type: application/json` and a body
-like:
+Every prefetch rejection is JSON with a `code` and a `message`, and the connection closes after the response. Object read errors are different: they have empty bodies, while prefetch errors always carry this JSON shape.
 
-```json
-{"code": "stale_sequence", "message": "sequence 3 is older than current 5"}
-```
+| Status | Codes | Meaning |
+| --- | --- | --- |
+| `400` | `invalid_request` | Malformed request line, query, header, JSON body, ref, or ID |
+| `404` | `not_found` | No ticket with that ID on this cache |
+| `405` | `method_not_allowed` | Unsupported method; the `Allow` header names the accepted methods |
+| `409` | `cache_uid_mismatch`, `payload_mismatch`, `stale_sequence`, `stale_generation`, `passthrough` | The ticket conflicts with the socket's cache, an earlier body, an earlier position, or caching is disabled |
+| `413` | `too_large` | Body, ref count, or request head exceeds its limit |
+| `429` | `ticket_limit`, `pending_limit` | Too many tickets or too many pending bytes; `Retry-After` is 1 to 60 seconds |
+| `503` | `unavailable` | The node is draining, the cache is not ready, or the request cannot be served now |
 
-`message` is for people and can change. Object read errors still have empty
-bodies.
-
-| Status | `code` | When |
-|--------|--------|------|
-| `400` | `invalid_request` | Bad JSON, field, id, query, or header |
-| `404` | `not_found` | Unknown id on `GET` or `DELETE` |
-| `405` | `method_not_allowed` | Method not allowed. The `Allow` header lists the allowed methods |
-| `409` | `cache_uid_mismatch`, `payload_mismatch`, `stale_sequence`, `stale_generation`, `passthrough` | See above. A `PUT` to a [passthrough](#passthrough) cache is `409 passthrough` |
-| `413` | `too_large` | Body over `RACER_PREFETCH_MAX_BODY_BYTES` or refs over `RACER_PREFETCH_MAX_REFS` |
-| `429` | `ticket_limit`, `pending_limit` | Node ticket or pending-byte limit. `Retry-After` gives the seconds to wait (currently 5) |
-| `503` | `unavailable` | Node is draining, the cache is not ready, or this node is not one of the cache's selected nodes |
-
-Before answering `429 ticket_limit`, Racer drops the oldest finished ticket to
-make room.
+A `405` names the allowed methods, so a client does not have to guess. A `429` tells the client when to retry; the prefetch driver also retries work internally with backoff, but a client that keeps submitting at the limit receives `429` rather than an unbounded queue.
 
 #### How prefetch runs
 
-- **Priority.** `high` goes before `normal`, and `normal` before `low`. Within a
-  priority, tickets take turns. Within a ticket, refs go in order.
-- **Owners.** Each page goes to its first-ranked owner, which fills it through the
-  shared fill table and stores it with normal eviction. Owners are chosen only
-  from the cache's [node selector](#node-selector) nodes. If membership or the
-  selector changes, queued pages go to the new owner, and stored pages of live
-  tickets whose owner left the cluster or the cache's nodes are queued again.
-- **Shared work.** Tickets that want the same page share one fill.
-- **Demand reads come first.** A read that needs a page being prefetched joins
-  that fill and takes it out of the prefetch limits. Queued prefetch work never
-  delays reads.
-- **Owner limits.** An owner runs at most `RACER_PREFETCH_CONCURRENT_FILLS`
-  prefetch fills and, if set, at most `RACER_PREFETCH_ORIGIN_BYTES_PER_SEC` of
-  origin reads for prefetch. Over a limit it tells the sender to retry later.
-- **Retries.** Busy, unavailable, and I/O failures are retried with backoff
-  (100 ms base, doubling, 10 s cap, random jitter) up to
-  `RACER_PREFETCH_MAX_ATTEMPTS` times per page. Then the ref fails with
-  `budget_timeout` or `origin_error`.
-- **Cache changes.** Switching a cache to passthrough cancels its tickets
-  (`passthrough`). Removing the ClusterCache, changing its UID, or a selector
-  change that drops this node cancels them (`cache_removed`).
+The scheduler dispatches strict priority: `high`, then `normal`, then `low`. Within one priority it round-robins across tickets, and within a ticket it follows ref order. A ticket dispatches only while its in-flight bytes are under its `max_pending_bytes` and the node's pending budget is under `RACER_PREFETCH_NODE_PENDING_BYTES`.
 
-Read the prefetched data with the ETag from the ref status, or pin the ETag in
-the ref, so later reads select the same version.
+Missing pages are scheduled to their rank-0 owners. Owners fill them through the normal flight table and persist them with normal eviction, so a prefetch fill competes with demand reads through the same admission budgets. Demand reads take precedence: a prefetch fetch that can join a demand fetch does so, and a prefetch that would displace demand is deferred. A ticket on a node that is not an owner routes its fills to owners over the mesh, and concurrent prefetch and demand reads of the same page share one fill.
+
+Owner selection uses the current membership. If the cache's `spec.nodeSelector` changes, the ticket's owners change with it, and work that is no longer wanted is canceled with reason `cache_removed`. If the cache switches to passthrough or is deleted, its tickets are canceled with reason `passthrough` or `cache_removed`.
+
+Each owner runs at most `RACER_PREFETCH_CONCURRENT_FILLS` fills at once, 16 by default, and may be limited to `RACER_PREFETCH_ORIGIN_BYTES_PER_SEC` origin read bytes per second. A page is attempted at most `RACER_PREFETCH_MAX_ATTEMPTS` times, 5 by default, with backoff between attempts. Exhausted retries become `budget_timeout` for a deferred or overloaded unit, `origin_error` for an unavailable owner, and `peer_unsupported` when an owner cannot decode or answer the operation.
 
 #### Prefetch settings
 
-Set these in `racer-settings` like the [dataplane settings](#dataplane-configuration).
-Out-of-range values fail startup.
+Prefetch settings are ordinary `racer-settings` keys. Startup rejects a combination outside the documented bounds, and every bound is listed in the generated table above.
 
-The prefetch limits are listed under [environment variables](#environment-variables).
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `RACER_PREFETCH_MAX_BODY_BYTES` | 4 MiB | `PUT` body limit |
+| `RACER_PREFETCH_MAX_REFS` | 16384 | Refs per `PUT` |
+| `RACER_PREFETCH_MAX_TICKETS` | 1024 | Live and finished tickets across all caches |
+| `RACER_PREFETCH_MAX_TTL_SECS` | 3600 | TTL cap |
+| `RACER_PREFETCH_TICKET_RETENTION_SECS` | 300 | How long finished tickets stay visible |
+| `RACER_PREFETCH_MAX_WAIT_SECS` | 60 | Long-poll `wait` cap |
+| `RACER_PREFETCH_DEFAULT_PENDING_BYTES` | 1 GiB | Per-ticket in-flight bound when `max_pending_bytes` is 0 |
+| `RACER_PREFETCH_MAX_PENDING_BYTES` | 16 GiB | Cap on `max_pending_bytes` |
+| `RACER_PREFETCH_NODE_PENDING_BYTES` | 64 GiB | Queued and in-flight bytes on the node |
+| `RACER_PREFETCH_CONCURRENT_FILLS` | 16 | Concurrent fills per owner |
+| `RACER_PREFETCH_ORIGIN_BYTES_PER_SEC` | 0 (off) | Origin read rate per owner |
+| `RACER_PREFETCH_MAX_ATTEMPTS` | 5 | Tries per page |
 
-The old `RACER_WARM_*` settings never had an effect. The operator removes them
-from `racer-settings` on upgrade.
+The retired `RACER_WARM_*` keys never had an effect and are removed by the operator. They are not accepted by the dataplane; a stale key in `racer-settings` is reported during validation.
 
 #### Prefetch metrics
 
-All prefetch metrics have a `priority` label.
-`racer_prefetch_tickets_finished_total` also has `outcome`: `succeeded`,
-`partial`, `failed`, or `cancelled`.
+Prefetch metrics carry only a `priority` label, except ticket outcomes, which also carry an `outcome` label. Requested and aligned byte counters record the logical and page-aligned demand. Resident, queued, fetched, and joined bytes separate the work that was already present, still waiting, fetched from an origin, or shared.
 
-| Metric | Type | Meaning |
-| --- | --- | --- |
-| `racer_prefetch_requested_bytes_total` | counter | Logical bytes requested |
-| `racer_prefetch_aligned_bytes_total` | counter | Page-aligned bytes requested |
-| `racer_prefetch_already_resident_bytes_total` | counter | Bytes already present when planned |
-| `racer_prefetch_queued_bytes` | gauge | Bytes waiting to be sent |
-| `racer_prefetch_fetched_bytes_total` | counter | Bytes that started a new origin fill |
-| `racer_prefetch_joined_bytes_total` | counter | Bytes that joined a fill in progress |
-| `racer_prefetch_admitted_bytes_total` | counter | Bytes stored or already present |
-| `racer_prefetch_failed_bytes_total` | counter | Bytes that failed |
-| `racer_prefetch_demand_joins_total` | counter | Reads that joined a prefetch fill |
-| `racer_prefetch_demand_wait_seconds` | histogram | Time from a read joining a prefetch fill to fill completion |
-| `racer_prefetch_retries_total` | counter | Page retries |
-| `racer_prefetch_deferrals_total` | counter | Owner "retry later" answers |
-| `racer_prefetch_throttle_seconds_total` | counter | Time spent waiting on owner limits |
-| `racer_prefetch_window_updates_total` | counter | Accepted ticket updates |
-| `racer_prefetch_window_dropped_bytes_total` | counter | Bytes dropped from the wanted set by updates |
-| `racer_prefetch_tickets` | gauge | Tickets on the node |
-| `racer_prefetch_tickets_finished_total` | counter | Tickets that finished, by outcome |
+Admitted, failed, demand-join, retry, deferral, and throttle counters describe scheduling. Window update and dropped byte counters describe rolling updates, and `racer_prefetch_tickets` and `racer_prefetch_queued_bytes` are gauges. `racer_prefetch_tickets_finished_total` counts outcomes, `racer_prefetch_throttle_seconds_total` counts time spent throttled, and `racer_prefetch_demand_wait_seconds` is a histogram of demand-read waits.
 
 ### Spill holds
 
-Spill (`RACER_RANGE_SPILL_PAGES`) keeps pages on local disk under a short hard
-hold. Holds bypass second-sight and block eviction of the page and reclamation
-of its segment. Each held page is charged one whole segment. Each worker must
-fit its held pages within `RACER_RETAINED_SEGMENT_PERCENT` of both segments and
-index entries, while keeping the free-segment reserve. That setting now governs
-only spill holds.
+`RACER_RANGE_SPILL_PAGES` lets a read fetch pages past its delivery window to local disk under a short hold. A hold bypasses normal eviction preference: the held page is not a candidate for eviction while the hold is active, so the read can find it when its window advances. Each held page charges one whole segment, which is conservative under fragmentation and keeps the accounting safe.
 
-These gauges refresh on worker health ticks (normally every 100 ms) and are
-summed across storage workers. They were named `racer_warm_held_*` before.
+The number of held pages is bounded per I/O worker by `RACER_RETAINED_SEGMENT_PERCENT`, which defaults to 50 percent of that worker's segments and page-index capacity. Holds are released when the read advances, fails, or is canceled, and the segments become reclaimable.
 
-| Metric | Meaning |
-| --- | --- |
-| `racer_held_pages` | Published indexed pages under live holds |
-| `racer_held_payload_bytes` | Logical payload bytes of those pages |
-| `racer_held_segments` | Distinct segments containing those pages |
+The held set is refreshed on the health tick. `racer_held_pages`, `racer_held_payload_bytes`, and `racer_held_segments` are gauges of the current holds, and they can lag a burst of short reads until the next tick. A hold does not pin data beyond the read that requested it, and spill is disabled when `RACER_RANGE_SPILL_PAGES` is 0.
 
 ### Second-sight disk retention
 
-The default policy allows a currently owned page to persist on its first logical
-read. A non-owned page becomes eligible after an independent reader observes it
-within the recent history window. Retries and copy-only probes do not create
-independent demand. Eligibility is determined before inserting the observation;
-concurrent followers can qualify without promoting the first reader's own attempt.
-Persistence remains best effort and only uses verified ciphertext. A skipped or
-failed optional disk enqueue does not fail an otherwise valid read.
+Disk retention uses the second-sight policy by default (`RACER_ADMISSION_MODE=second-sight`). The policy does not change request admission or authorization; it decides which payloads are worth keeping on disk after they have been read.
 
-Each I/O worker has four rotating Bloom generations for page history. Reader
-accounting uses exact operation-local interest tokens, retained across retries
-and handoffs, rather than an approximate reader-history filter.
-At the default period, observations remain for approximately 180-240 seconds.
-History allocations round down to 32-byte units and do not exceed the node budget.
-A budget too small for the final worker count fails startup rather than growing
-implicitly. Bloom false positives can retain extra pages but cannot suppress
-independent reader detection; history is never authorization or proof of integrity.
+Each page has a reader token and an interest token. A reader token records that a read consumed the page, and an interest token records that something may read it again. Both are hashed into a small Bloom history window whose size is `RACER_ADMISSION_HISTORY_BYTES`, divided among I/O workers, with a rotation period of `RACER_ADMISSION_PERIOD_SECS` (60 seconds by default). The history window bounds how much evidence the filter keeps; it is not an exact access log.
 
-Bounded exact resident heat entries use the worker's disk page-index capacity plus
-its pending-write queue capacity. Heat saturates at three and decays lazily by
-one per 60 seconds, independently of history rotation. Current ownership adds a
-soft eviction preference, not a pin; owned pages remain evictable. History and
-heat are process-local hints, not checkpoint state. `disabled` restores owned-only
-disk admission and neutral eviction scores; resource budgets, integrity checks,
-and authorization still apply. Configuration values are validated even when the
-policy is disabled.
+Resident pages accumulate heat, and heat decays over time. A page that is read again while it is still resident gains rank; a page that is never read again loses it. Eviction ranks candidates by the cache's share and the page's score, so a cache that is over its share is more likely to lose pages, and a low-score page is more likely to lose than a hot one.
 
-[ClusterCache priority](#priority) runs before the score. Each eviction ranks a
-bounded set of candidate pages, first by whether their cache is over share,
-then by score, then by age. Candidates come first from the most over-share
-caches, so an over-share page is normally evicted before any under-share page.
-An under-share page can still go first when the over-share candidates are held.
-An over-share page never replaces an under-share page in a full pending write
-queue. Segment reclamation favors
-segments that hold mostly over-share data; under-share pages in a recycled
-segment are still lost. A non-owned page is not admitted when its cache is over
-share and the worker has no free segments beyond the reserve. Owned pages are
-always admitted. Spill holds are never evicted.
+Ownership also affects retention. A node that owns a page is more likely to keep it than a node that merely fetched it while passing it to a peer. When `RACER_ADMISSION_MODE=disabled`, retention is off and pages are evicted by the ordinary policy without the second-sight score.
 
-Ownership hints use completed rankings for the current accepted placement.
-Missing or obsolete hints provide no bonus until refreshed. Each worker also
-refreshes indexed residents, including recovered idle pages, without requiring
-foreground reads. A background step visits at most one resident, scores at most
-256 members, and visits at most 64 ranking-cache CLOCK entries. Steps are spaced
-at least 1 ms apart; completed passes and errors retry after 100 ms. Refresh is
-independent of other placement maintenance and stops during shutdown. These
-bounds limit background work, not the time to refresh every resident.
+The disk utilization metrics label each disk and each classification. `racer_disk_class_publications_total`, `racer_disk_class_published_payload_bytes_total`, `racer_disk_class_segment_evicted_pages_total`, `racer_disk_class_segment_evicted_payload_bytes_total`, and `racer_disk_class_read_payload_bytes_total` describe publication, eviction, and reads by class. `racer_retention_observations_total`, `racer_retention_qualified_total`, `racer_retention_persistence_attempts_total`, `racer_retention_persistence_accepted_total`, and `racer_retention_share_rejected_total` describe the policy's decisions. `racer_retention_filter_set_bits` and `racer_retention_filter_bits` report filter occupancy.
 
-Low-cardinality `racer_retention_*` metrics aggregate all I/O workers without page,
-cache, or reader labels. Counters report logical observations, qualified
-observations, persistence attempts, and accepted persistence attempts. Acceptance
-does not prove a completed disk publication; use `racer_disk_publications_total`
-for that. Gauges report set/total Bloom bits and tracked heat entries. Samples
-refresh on each worker's health tick (normally every 100 ms), so a stalled worker
-leaves its last sample visible. The aggregate is not an atomic node-wide snapshot.
-Storage metrics use the same health-tick snapshots. `classification` has exactly
-two values, `owned` and `nonowned`, sampled from the current cache-only ownership
-hint at each event. Missing or stale rankings classify as `nonowned`; the event
-does not initiate a ranking. This is an event-time classification, not the class
-at insertion, proof of nonownership, or an exact current resident-class aggregate.
-Ownership refresh affects subsequent events only, never rewrites old counters.
+Background ownership-hint refreshes are bounded, so a large membership cannot make a retention scan unbounded. Pending and indexed payload gauges report bytes waiting for and present in the index, and the checkpoint gauges report encode work and free segments. Writer in-flight and checkpoint deferral gauges show when writes are waiting for a checkpoint fence. `racer_dirty_discard_reasons_total` explains discarded dirty pages with reasons such as `displaced`, `memory_pressure`, `owned_reclaim`, `write_failed`, `write_failed_no_space`, `write_failed_index_full`, `write_failed_io`, `superseded`, `canceled`, and `cache_removed`.
 
-| Metric | Meaning |
-| --- | --- |
-| `racer_disk_size_bytes{disk}` | Gauge of segment capacity assigned to Racer on this backing disk, including reserve segments |
-| `racer_disk_used_bytes{disk}` | Gauge of reserved record bytes on this backing disk, including headers, tags, and alignment padding, until segment recycling |
-| `racer_disk_class_publications_total{classification}` | Completed writer publications; excludes checkpoint restoration and deduplicated enqueue |
-| `racer_disk_class_published_payload_bytes_total{classification}` | Logical page payload bytes in those publications |
-| `racer_disk_class_segment_evicted_pages_total{classification}` | Victim mappings removed by bounded segment reclamation, including index-only segment reclamation |
-| `racer_disk_class_segment_evicted_payload_bytes_total{classification}` | Logical payload bytes of those segment victims, not physical reclaimed disk space |
-| `racer_disk_class_read_payload_bytes_total{classification}` | Logical page payload bytes returned successfully by StoreReader after framing and mapping checks |
-| `racer_disk_pending_payload_bytes` | Total logical payload bytes owned by pending writes, including submitted writes until cleanup |
-| `racer_disk_indexed_payload_bytes` | Total logical payload bytes in retained index mappings, including restored mappings |
-| `racer_cache_disk_resident_bytes{cache}` | Gauge of logical payload bytes in retained index mappings for one ClusterCache, summed over workers |
-| `racer_cache_disk_share_bytes{cache}` | Gauge of the ClusterCache's fair share of disk, summed over workers. Only published ClusterCaches have series; see [Priority](#priority) |
-| `racer_retention_share_rejected_total` | Optional (non-owned) pages not written to disk because their ClusterCache was over its share and free segments were at the reserve |
-| `racer_disk_publications_total` | Queued page writes that completed and were published to the disk index |
-| `racer_dirty_discards_total` | Queued page writes (accepted persistence attempts) dropped without a publication, all reasons |
-| `racer_dirty_discard_reasons_total{reason}` | The same discards split by reason, listed below |
-| `racer_dirty_write_deferred_total` | Writes kept queued because no free segment or index entry could be reclaimed during a checkpoint |
-| `racer_checkpoint_encode_nanoseconds_sum` | Total time spent validating and encoding periodic checkpoint cuts on the checkpoint helper thread. Segment reuse stays frozen on every worker for at least this long per cut |
-| `racer_checkpoint_encode_nanoseconds_count` | Checkpoint cuts validated and encoded, including cuts later skipped as unchanged or rejected |
-| `racer_free_segments` | Gauge of free segments, summed over workers, refreshed as writes complete |
-| `racer_free_segment_target` | Gauge of the free segments reclamation keeps ready, summed over workers; see below |
-
-Each worker's writer keeps up to 8 page writes in flight, submitting the next
-queued page as each write completes. A periodic checkpoint holds back new
-writes on a worker only until that worker has copied its snapshot. After that,
-writes continue into free segments while segment eviction and reuse stay frozen
-until the checkpoint is published. A write that finds no free segment or
-index entry during that window is not discarded: the page stays queued, the
-worker stops starting new writes, and it retries once the checkpoint finishes.
-Each such deferral counts in `racer_dirty_write_deferred_total`. Outside a
-checkpoint, a write that still finds no space after reclamation fails and is
-discarded. Failed writes are logged at most once every 10 seconds per worker
-with `stage=persist` and the cause.
-
-Because a checkpoint freezes segment reuse, writes during that window can only
-fill segments that were already free. Each worker therefore adapts how many
-free segments it keeps ready (`racer_free_segment_target`). It starts at
-`RACER_FREE_SEGMENT_RESERVE_PER_WORKER`. When a checkpoint ends, the target
-becomes the reserve plus 1.5 times the free segments that checkpoint consumed.
-If a write was deferred during it, the target doubles instead. Lower demand
-lowers the target gradually, never below the reserve. The target is capped at
-one eighth of the worker's segments, because free segments hold no cached
-pages. Reclamation evicts whole low-value segments by metadata only: it copies,
-reads, and trims nothing.
-
-On raw devices, each segment holds only whole page records (the page plus a
-small header), so the rest of each segment is unused (`racer_segment_tail_bytes`).
-With 16 MiB pages, a 64 MiB segment fits three records and leaves about 25% of
-the device unused. Racer logs a warning at startup when the unused share is 10%
-or more. The 1 GiB default fits 63 records and leaves under 2% unused.
-
-`reason` takes these values:
-
-| Reason | Meaning |
-| --- | --- |
-| `displaced` | The writer queue was full, so a lower-ranked queued page made room for a new one |
-| `memory_pressure` | A queued page's ciphertext or staging memory was reclaimed for other work, such as new fills |
-| `owned_reclaim` | A queued optional page was dropped to make room for an owned page's persistence |
-| `write_failed_no_space` | The write failed because no free segment was available after reclamation |
-| `write_failed_index_full` | The write failed because no index entry was available after reclamation |
-| `write_failed_io` | The write failed with a device or OS I/O error |
-| `write_failed` | The write failed for any other reason |
-| `superseded` | The write finished, but the page was removed, replaced, or its cache became unavailable first |
-| `canceled` | A deadline, cancellation, or shutdown dropped the queued write |
-| `cache_removed` | The page's ClusterCache was removed while the write was queued |
-
-For per-disk utilization as a percentage, use:
-
-```promql
-100 * racer_disk_used_bytes / racer_disk_size_bytes
-```
-
-The `disk` label is `device:<by-id basename>` for raw devices and
-`file:worker-<id>-slab-0.dat` for file-backed slabs. Workers sharing a device
-contribute only their assigned segments. Size excludes device guards, unused
-tails outside assigned segments, and unassigned capacity. Used bytes include
-failed-write reservations and records whose index mappings were removed, until
-their segments are recycled. These gauges measure Racer's reserved record space,
-not filesystem allocation or whole-device fullness. Sealed segment tails and
-free-segment reserves can require reclamation before utilization reaches 100%.
-They are sampled after recovery and on each worker's health tick.
-
-All payload byte metrics exclude AEAD tags, record headers, and alignment padding.
-Victim counters exclude invalidation, replacement, cache removal, and pending-write
-discards. A mapping is counted only by the removal path that actually evicts it.
-Read bytes count repeated full-page reads, including internal/copy-only consumers;
-AEAD tag validation happens later in fill. They measure disk-to-reader payload,
-not authenticated client-delivered bytes, requested-range bytes, or device I/O.
-Use their rates to compare disk reuse in benchmarks, not as client throughput.
-The pending and indexed payload gauges are exact unclassified worker totals at sampling time, maintained
-on lifecycle events without scanning all pages. A page can briefly count in both
-while a published write is still pending cleanup. They are not physical allocation
-or unique resident-byte totals, nor ownership-split gauges. Tracked heat entries
-remain a separate measurement; persistence acceptance does not measure eviction.
+Raw-device segment tails are counted separately from file-backed slabs, because a partial segment at the end of a device is unusable. A per-disk utilization metric carries the disk label, so a node with several devices shows which one is full.
 
 ### Topology capacity and version compatibility
 
-Placement capacity uses a conservative 1,024-byte structural estimate per cached
-ranking, rounding each worker's byte share down to whole entries. It is not an
-allocator hard bound. Path-cache accounting includes retained buffer capacities
-and reference-count headers, but excludes active search scratch, caller-held
-results, membership graphs, and allocator overhead. A result larger than the
-worker's path-cache budget is returned without retention. Cache entry and byte
-limits do not determine search concurrency: identical canonical queries share
-one active search, while distinct searches can report overload. The node's total
-distinct-search concurrency can reach I/O worker count times
-`RACER_ACTIVE_PATH_SEARCHES_PER_WORKER`.
+Placement keeps a structural estimate of 1024 bytes per cached ranking. `RACER_PLACEMENT_CACHE_BYTES` bounds the ranking cache per worker, split evenly among the pools of the newest membership. A page is ranked only over the members of its cache's pool, so a cache with a small pool does not pay for the full cluster.
 
-The overlay is a mesh per pool over stable node IDs and is independent of
-shares. A pool of up to 256 members is a full mesh: every member is a neighbor
-of every other, so a reader fetches each page directly from an owner. A larger
-pool is a grid of columns, with about `2.83 * sqrt(k)` neighbors per member,
-and some reads take one relay. Neighbors are computed on demand from the
-per-pool columns and hash rings. These allocations are not covered by the
-path-cache byte limit.
+The path cache stores route search results and charges the key and the route vectors it holds; it does not duplicate the shared neighbor graph, which is kept once per membership at roughly 230 bytes per member. `RACER_CACHED_PATHS` bounds entries and `RACER_PATH_CACHE_BYTES` bounds bytes. An entry larger than the byte budget is not cached, and the cache evicts least-recently-used entries to stay under both limits.
 
-Publications with unchanged validated membership version and content reuse the
-whole membership. New versions with identical node IDs share immutable graph
-storage, including shares-only or metadata-only updates; changed IDs rebuild
-the graph. Membership byte estimates are cached at construction and read in
-constant time, but each snapshot's estimate includes the full shared graph.
-Summing them, as the publication grace budget does, is conservative rather than
-deduplicated allocation accounting.
+A worker allows `RACER_ACTIVE_PATH_SEARCHES_PER_WORKER` distinct unfinished searches, 8 by default, and that count is independent of the path cache size. A request that cannot start a search because all slots are busy is refused as overloaded instead of queueing without a bound. `RACER_RETAINED_SNAPSHOTS` keeps at least two topology snapshots so in-flight reads finish on the membership they started with while a new membership is adopted.
 
-Live control updates prepare membership off the I/O polling thread. The
-publication store admits one unfinished preparation job with no queued backlog;
-additional preparation is rejected as overloaded until it finishes. Canceling
-the waiter or reaching its deadline does not interrupt a running CPU job or
-free its admission slot. Preparation does not publish by itself. Shutdown joins
-the owned job rather than detaching it, so cleanup may wait beyond the request
-deadline: the join has no independent timeout. Bounded input and job count are
-not a hard wall-clock shutdown guarantee.
+A pool of up to 256 members is a full mesh. A larger pool is split into columns, mostly by site, where every member of a column links to every other member and each member links to one delegate in every other column. Any two members of a pool are at most two links apart, and a member of a pool of `k` members has about `2.83 * sqrt(k)` neighbors. This keeps a 100,000 member pool at about 940 neighbors per member instead of a full mesh's 100,000.
 
-Routing selection uses `/next-hop/v1`, which independently length-prefixes the
-seed, source ID, and destination ID. All participating dataplanes must use the
-same routing implementation. Matching membership version numbers do not
-negotiate the algorithm, and mixed-version routing is not safe. **When upgrading,
-quiesce traffic until all dataplanes run the same version.**
+A new membership reuses the old pool meshes when IDs, sites, and pool members are unchanged, so a change in endpoints or NICs does not rebuild the graph. Preparation of bounded incremental ranking hints happens outside the publication lock, and a larger change falls back to exact cooperative cold computation on demand. A publication is adopted only after its structures are ready, and shutdown joins the workers that hold them rather than freeing a graph they still use.
+
+Routing compatibility is keyed by the `/next-hop/v1` hash domain. A node that cannot interpret a publication's schema version rejects it instead of routing on a partial graph. Quiesce traffic before a cross-version upgrade, because a mixed cluster can have nodes that understand different publication features even when the wire schema is the same.
 
 ## Elected control plane
 
-`racer` is both the cache daemon and the control-plane binary. There is
-no `racer-controller` Deployment, image, or control Service. Pods elect control
-seats with Leases named `racer-seat-0` through `racer-seat-15`. One seat also
-holds `racer-primary` and commits membership, catalog, keyring, and trust changes.
+The `racer` binary is both the cache daemon and the control binary. There is no `racer-controller` Deployment. In managed mode, every dataplane Pod runs embedded cluster control on a bounded thread, and one seat is the primary. The operator creates 17 Leases: `racer-seat-0` through `racer-seat-15`, plus `racer-primary`. The runtime never creates or deletes them.
 
-Clients discover the seats through the Kubernetes API and verify their pinned
-TLS certificates before sending credentials. They try another seat if one is
-unavailable. They do not depend on a fixed controller DNS name or an
-operator-generated serving CA.
+Seats are claimed by Pods through the seat Leases. A Pod claims the lowest vacant seat below the desired count, with a jittered claim delay spread by Pod UID so a whole DaemonSet does not contend at once. A seat renews its Lease every 10 seconds with a 30 second duration, stops writing and serving after 20 seconds without a fresh renewal, and only a live seat holder may contend for the primary Lease. The primary holds `racer-primary` and is the single writer of durable state.
 
-During managed startup, election keeps running while enrollment and the first
-goal state retry with bounded control requests. The pod stays unready while
-waiting. `RACER_REQUEST_TIMEOUT_MS` still limits data requests; it does not limit
-how long startup can wait for the control plane. SIGTERM stops startup.
+`RACER_CONTROL_SEATS` selects the desired count. `auto` uses one seat per 2,048 members, clamped to 3 through 16, and never more than the number of eligible Pods; a decimal from 1 to 16 fixes the count. Automatic sizing therefore gives a small cluster three seats for availability and grows to 16 at large scale.
 
-```bash
-kubectl -n unbounded-system get leases -l racer.unbounded-cloud.io/control=true
-kubectl -n unbounded-system get daemonset racer
-kubectl -n unbounded-system get endpointslice racer-webhook
-```
+The primary publishes durable state into the `racer-state` Secret, whose UID is the cluster ID. The Secret is created empty by the operator. The first commit initializes it and records the cluster ID; after that, a missing, wiped, or corrupt state fails closed rather than starting a new identity. Seat followers reread the Secret at least every 5 seconds, and a committed state older than 30 seconds by the local clock is not served. The primary Lease carries the committed sequence, so a follower that watches the Lease sees a new record immediately instead of waiting for its next poll.
 
-The `racer-state` Secret holds durable control state. Its UID is the cluster ID.
-Do not delete, replace, or clear it to repair a running installation. The
-operator creates it only for a new installation; it does not generate keys or
-reconcile the runtime's state back to an empty manifest. Back it up securely.
-Never log its data: it contains cache encryption keys.
+The cluster ID binds checkpoints, page keys, and enrollment. Losing the Secret means losing the cluster identity: a node cannot recover its old cache contents, and a new identity requires re-enrollment. Back up the Secret with the rest of the installation state. The operator refuses to proceed when the DaemonSet or ServiceAccount records a different `racer-state` UID, and tells you to restore the Secret or deliberately delete both objects to start a new identity.
 
-When a new installation uses a new cluster ID, nodes automatically re-enroll
-and delete their old managed enrollment state. This happens only after cluster
-control checks that the live DaemonSet and ServiceAccount record the new ID.
-Replacing the Secret alone does not pass this check.
+Page keys rotate. `RACER_RETAINED_PAGE_KEYS` controls how many readable keys a cache keeps: the active encrypt key plus older decrypt keys, 7 by default and at most 16. Lowering it never drops keys at once; extra decrypt keys are dropped at the next rotation, so a read that started before the change can still decrypt. The authority publishes the keyring to seats, and a node that lacks a key for a page reports a decrypt failure rather than returning unverified bytes.
 
-Each cache has one active page key. Key rotation keeps the replaced page key as
-a decrypt-only key, so cached pages stay readable for six more rotations (seven
-readable page keys in total) before their key is dropped. Origin credential keys
-are replaced without a decrypt-only history. Upgrading to the keyring bundle
-format version 3 needs a cold restart of every seat and node.
+The control API listens on port 8443 and the object sidecar webhook on port 9443. The `racer-webhook` Service has no selector; the primary lists ready seat endpoints in the `racer-webhook` EndpointSlice, and the API server reaches a seat through that slice. The operator owns the Service and the EndpointSlice, and admission policy restricts the runtime to writing only that slice. Add a NetworkPolicy in your own overlay if your cluster requires one; the manifests do not ship one.
 
-Seats publish only committed state. A primary change preserves publication and
-keyring counters. Losing serving authority withdraws the seat rather than
-allowing an isolated former primary to keep writing. API access is needed for
-new elections and for confirming authority; an API outage is not permission to
-reset state or mint a new cluster.
+Every Racer Pod runs control under the same ServiceAccount, so every Pod holds the same permissions. Seat and primary roles are runtime state, not a security boundary. RBAC grants Nodes read-only access, ClusterCaches read-only access, TokenReview creation, patch access to the single webhook configuration, get, list, watch, and update on the 17 Leases, get and update on `racer-state`, Pod get/list/watch/patch, get on the `racer` DaemonSet and ServiceAccount, and update on the `racer-webhook` EndpointSlice. The operator binds these grants only after the admission policies are installed and revokes the bindings if a policy is missing or altered. A compromised dataplane Pod can therefore read membership and cache definitions and can patch Pods within the policy limits, but cannot create or delete Leases, Secrets, or workloads.
 
-Every dataplane pod can become a control seat and therefore has the Kubernetes
-permissions needed for that role. Lease ownership is a coordination rule, not
-an RBAC boundary. Treat compromise of a privileged dataplane node as compromise
-of Racer's cluster-wide control state and cache keys.
+The control protocol has fixed bounds. A seat accepts at most 16,384 concurrent control connections, 256 concurrent TLS handshakes, 64 concurrent webhook connections, and 32 concurrent bootstrap requests. Responses with a body are limited to 64 concurrent writes, and a queue past that waits up to 5 seconds before answering `429`. A request head is at most 16 KiB, a watch event line at most 4 MiB, a bearer token at most 16 KiB, and a Kubernetes API response other than a watch stream at most 256 MiB. The effective connection cap is lowered when `RLIMIT_NOFILE` is smaller than the fixed bounds require.
 
-Allow dataplane-to-seat HTTPS on port 8443 and API-server-to-seat webhook
-traffic on port 9443. Preserve peer traffic, diagnostics, DNS, and Kubernetes
-API access. The `racer-webhook` Service has no selector; the primary maintains
-its EndpointSlice and the injector's CA bundle. NetworkPolicy behavior depends
-on the CNI, especially with host-network Pods.
-
-The control protocol keeps its existing byte limits: 64 KiB for bootstrap,
-768 KiB for keyring bundles, and 64 MiB for publications. These are document
-limits, not process memory limits.
+Dataplane Pods discover control seats from the endpoints published in the primary Lease and from their bootstrap response, so a seat change or primary failover does not require a dataplane restart. Each seat publishes its serving certificate and issuer root in its Lease. A client pins the endpoint and certificate it was given, and a seat that cannot present a certificate from the pinned issuer is rejected rather than trusted. A new primary reads the committed state and sequence before serving, and a seat that cannot prove its state is fresh stops serving instead of answering from a stale image.
 
 ### Operator-managed dataplane
 
-When any `ClusterCache` exists, the operator installs DaemonSet `racer`
-with its ServiceAccount, restricted RBAC, election Leases, initial state Secret,
-webhook resources, and ConfigMap `racer-settings`. The ConfigMap is seeded
-only when absent. The DaemonSet uses the operator's registry and tag and imports
-the ConfigMap with `envFrom`. A pod-template annotation carries its payload hash,
-so edits roll out.
-Existing resources with these names that the operator did not create are not
-adopted; reconciliation fails until they are removed. Deleting the last
-`ClusterCache` leaves the dataplane and its durable control state installed.
-The operator still checks the admission guards. If they drift or disappear, it
-revokes dataplane permissions and repairs the guards. It restores permissions
-only when a cache exists again.
+The operator installs Racer only when a `ClusterCache` exists. With no caches, it retains an existing installation and keeps admission guards enforced, so removing the last cache does not tear down the dataplane or silently drop its Pods. The first cache creates the control objects, the `racer-settings` ConfigMap, the DaemonSet, its ServiceAccount, and the admission policies.
 
-Earlier releases named these objects `racer-dataplane`, with ConfigMap
-`racer-dataplane-config`. On upgrade the operator seeds `racer-settings` from
-`racer-dataplane-config`, renaming `RACER_DATAPLANE_NVIDIA` to `RACER_NVIDIA`.
-Once the new DaemonSet is applied, it deletes the old objects it created: the
-DaemonSet, ServiceAccount, RBAC, and ConfigMap first, then the old admission
-policies. Old and new Pods may run side by side briefly. It leaves alone any
-old-named object it did not create.
+`racer-settings` is seeded once and then owned by the administrator. The operator preserves its data, validates every key against the exported table, and hashes the payload into the DaemonSet annotation `unbounded-cloud.io/racer-settings-hash`. A changed hash rolls the DaemonSet; an invalid value stops the rollout and keeps the previous Pods. An existing object that the operator does not manage is not adopted: it fails with `not managed by the unbounded operator; refusing adoption`, so you must remove or relabel an object created outside the operator before it can take over.
 
-| Setting in `racer-settings` | Default | Purpose |
-|------------------------------------|---------|---------|
-| `RACER_CONTROL_SEATS` | `auto` | Choose the number of control seats automatically, or request 1 to 16 |
-| `RACER_NVIDIA` | `env` | How the dataplane asks for NVIDIA driver libraries: `off`, `env`, or `cdi`; see [GPU reads](#gpu-reads) |
+Earlier releases named the component `racer-dataplane`. The operator creates the new `racer` DaemonSet and its RBAC, waits until the new DaemonSet is observed live, and only then deletes the old DaemonSet, RoleBinding, ClusterRoleBinding, ServiceAccount, ConfigMap, and admission policies in stages. A pre-rename `RACER_DATAPLANE_NVIDIA` key becomes `RACER_NVIDIA`, and a prefixed key wins over an unprefixed one so the result does not depend on map order. Old objects are removed only after the new installation is healthy, so the old identity never keeps write access without admission limits.
 
-Set `RACER_CONTROL_SEATS` in `racer-settings` to `auto` (the default) or
-an integer from 1 to 16. The active count cannot exceed the eligible node count.
-For example, to request three seats:
+`RACER_CONTROL_SEATS` and `RACER_NVIDIA` are settings the operator reads. `RACER_NVIDIA` accepts `off`, `env`, and `cdi`. `env` sets `NVIDIA_VISIBLE_DEVICES=all` and `NVIDIA_DRIVER_CAPABILITIES=compute,utility`, and mounts `/run/udev` and a cuFile log volume; runc ignores the variables, so the mode is harmless on nodes without NVIDIA. `cdi` also adds the Pod annotation `cdi.k8s.io/racer: nvidia.com/gpu=all`; containerd then fails the Pod on any node without an NVIDIA CDI spec, so use it only when every dataplane node has one. The dataplane accepts `RACER_NVIDIA` in its environment and ignores it.
 
-```bash
-kubectl -n unbounded-system patch configmap racer-settings \
-  --type merge -p '{"data":{"RACER_CONTROL_SEATS":"3"}}'
-```
+Workload overrides may change scheduling, rollout, and resource fields, add new environment variables, and set host networking. Existing environment values, `envFrom`, volume mounts, volumes, the ServiceAccount, and automatic token mounting are operator-owned wiring and cannot be changed. `RACER_CONTROL_SEATS` must be set in `racer-settings`, not injected into the container, because an environment value would shadow the ConfigMap. An override that tries to change an unsupported field is reported rather than merged.
 
-Workload overrides may target `{component: racer, kind: DaemonSet}` to set, for
-example, `nodeSelector`, tolerations, `updateStrategy`, annotations, resources, or
-additional container `env` entries. Overrides cannot change or remove the
-operator-wired `env` entries, `envFrom`, volumes, or service account of the
-`dataplane` container. Set the seat count through the ConfigMap, not an override.
+The managed dataplane binds its listeners to the Pod IP, not to every address: the peer listener uses `[$RACER_POD_IP]:8082` by default, diagnostics uses `[$RACER_POD_IP]:9090` or `[$RACER_POD_IP]:9091` when the peer port is 9090, control uses `[$RACER_POD_IP]:8443`, and webhook uses `[$RACER_POD_IP]:9443`. A standalone dataplane defaults to `0.0.0.0:7443` for peers and `127.0.0.1:9090` for diagnostics. The peer port is the port published to members, so every node must use the same value.
 
-The operator wires Pod identity through the downward API and mounts two tokens:
-an API-audience token for Kubernetes and a `racer-control` token for enrollment.
-Automatic ServiceAccount token mounting remains disabled. Node identity comes
-from verified enrollment and local recovery, not a caller-supplied Node UID.
-
-The **bare binary** defaults `RACER_PEER_LISTEN` to `0.0.0.0:7443` and
-`RACER_DIAGNOSTICS_LISTEN` to `127.0.0.1:9090`. Managed workloads bind both to the Pod IP
-with peer port 8082 and diagnostics port 9090. Managed control startup does not
-require `RACER_CLUSTER_ID`, `RACER_CONTROL_ENDPOINT`, or `RACER_CONTROL_TRUST_BUNDLE`.
-Static control endpoints remain available for standalone tests, not managed
-cluster discovery.
+The managed Pod projects a `racer-control` audience token at `/var/run/racer-token/token` and an Azure federated token at `/var/run/secrets/azure/tokens/azure-identity-token`. Its identity directory is `/var/lib/racer/identity/private`, beneath the hostPath mount, so the kubelet-created `0755` directory stays untouched while the dataplane creates its private `0700` child.
 
 ### Membership and credential reconciliation
 
-Membership uses Nodes and live Pods owned by the current managed DaemonSet UID.
-The Pod report supplies shares and NICs unless an administrator Node annotation
-overrides them. ClusterCache UIDs remain cache identities; their names determine
-the local socket paths.
+Membership combines Node objects with live Racer Pods. A Node is eligible when it has a name, a valid UID, no deletion timestamp, and no `racer.unbounded-cloud.io/exclude` label. For each eligible Node, the controller selects a Pod on that Node, preferring the operator-owned dataplane Pod, and uses the Pod's IP and peer port for the member endpoint.
 
-Seats authenticate enrollment with TokenReview and live Pod, ServiceAccount,
-DaemonSet, and Node checks. Node private keys stay on the node. Issuer roots and
-cache keys are rotated without resetting version counters. Retired roots stay
-in durable state until certificates they could have issued expire. Keep node
-clocks synchronized.
+The Pod report takes effect through the Node it runs on. A Node annotation for `shares` or `rdma-nics` overrides the Pod report, so an administrator can correct a node without editing the Pod template. The Pod report is a JSON object with `shares` and `rdma_nics` and is limited to 32 KiB. A missing report leaves the default shares and no rails; a malformed report or annotation is a diagnostic, and the node keeps its previous attributes when it had any.
+
+A Node that is not Ready for longer than the grace period is left out of membership even if it was a member. Pod readiness is not used for membership, because `/readyz` depends on membership and would keep a new Pod out forever. A new Node joins only after it reports and serves, which is why a Pod that has not yet bound its peer listener is not published.
+
+The ClusterCache UID is the cache identity, and the socket names come from `metadata.name`. A cache deletion removes its definition from the publication, and nodes stop accepting reads for the old UID and cancel its prefetch tickets. A recreated cache with the same name has a new UID and therefore an empty cache; the socket path is the same name, but the new UID means old pages are never served.
+
+Enrollment authenticates a dataplane Pod with a TokenReview against the `racer-control` audience token. The CSR carries the Node's requested shares and NICs, and the authority issues a node certificate only after the token, the cluster ID, and the enrollment request are consistent. Each Node keeps its private key locally under `RACER_IDENTITY_DIRECTORY` and never sends it to the authority.
+
+Key rotation issues new node and page keys without resetting counters. Retired roots are retained until their NotAfter so a stale Lease cannot break a seat that still trusts the old root. Clock synchronization matters: Lease freshness, committed-state freshness, certificate validity, and token expiry all compare wall-clock times with bounded skew, so keep nodes on a time source.
 
 ## Diagnostics and metrics
 
-| Dataplane HTTP path | Use |
-|---------------------|-----|
-| `/healthz` | Process liveness |
-| `/readyz` | Serving readiness, including usable admission |
-| `/metrics` | Prometheus metrics, including `racer_ready` and `racer_live` |
-| `/debug/membership` | Applied membership state |
-| `/debug/failures` | Bounded failure diagnostics |
-| `/debug/aead`, `/debug/decrypt-failures`, `/debug/send-tag` | Bounded crypto and tag check failure details |
-| `/debug/terminal`, `/debug/admission-final`, `/debug/candidate-final` | Bounded final-outcome records |
-| `/debug/gate-events`, `/debug/flight-expiry` | Bounded gate and in-flight expiry events |
-| `/debug/hardware` | Live JSON report of block devices, RDMA devices, and Racer's claimed disks and RDMA rails |
-| `/debug/pprof/profile?seconds=30` | Opt-in native CPU profile |
+The diagnostics listener defaults to `127.0.0.1:9090` and is managed at `[$RACER_POD_IP]:9090`, or `[$RACER_POD_IP]:9091` when the peer port is 9090. Keep it on the Pod network or a loopback-only port; the endpoints expose membership, failure detail, and CPU profiles. Use `kubectl exec` or a Pod proxy with the RBAC that your cluster requires.
 
-`/metrics` is sent with chunked transfer encoding, so its size grows with the
-cache catalog without a fixed limit. Counters wrap at 2^64; Prometheus treats
-the wrap as a counter reset.
+| Endpoint | Response | Purpose |
+| --- | --- | --- |
+| `/healthz` | Text | Process liveness |
+| `/readyz` | Text | Admission is running and health has reached ready |
+| `/metrics` | Prometheus text | Counters, gauges, and histograms |
+| `/debug/membership` | Text | Published members, pools, caches, and the local view |
+| `/debug/failures` | Text | Recent request, origin, peer, and disk failures |
+| `/debug/aead` | Text | AEAD verification failure detail |
+| `/debug/decrypt-failures` | Text | Decrypt failures by cause |
+| `/debug/send-tag` | Text | Samples for the configured send-tag pair |
+| `/debug/terminal` | Text | Terminal request states |
+| `/debug/admission-final` | Text | Final admission outcomes |
+| `/debug/candidate-final` | Text | Final candidate selection outcomes |
+| `/debug/gate-events` | Text | Peer receive-gate events |
+| `/debug/flight-expiry` | Text | Single-flight expiry events |
+| `/debug/hardware` | JSON | Block-device and RDMA topology report |
+| `/debug/pprof/profile` | Binary profile | CPU profile for 1 to 60 seconds |
 
-`/debug/hardware` reads sysfs on every request. It never opens block devices.
-The read runs on a helper thread, so a slow read does not delay health checks.
-Values it cannot read are `null`, and section failures are listed in `errors`.
-It returns 503 `response_too_large` if the JSON does not fit in one response
-(about 64 KiB), or if discovery exceeds its fixed working-memory budget, which
-can happen on hosts with very many block or RDMA devices. Attribute files
-larger than 4 KiB are reported as `null`. Only one report is built at a time: a request made while another
-is still running returns 409 `busy`. A report that takes longer than 5 seconds
-closes the connection without a response. In managed workloads, read it through the API server pod proxy.
-This needs RBAC `get` on `pods/proxy`:
+`/metrics` is streamed in resumable pieces: the registry exposition first, then health. A large scrape therefore does not require one contiguous buffer. Counters use wrapping arithmetic, and Prometheus reads a wrap as a counter reset; rate queries handle that as they would a process restart.
 
-```sh
-kubectl get --raw "/api/v1/namespaces/<namespace>/pods/<pod>:9090/proxy/debug/hardware"
-```
+`/debug/hardware` runs discovery on a helper thread with its own memory charge and a single in-flight slot. A second request while a discovery or its response is alive receives `409 busy`. A response that would exceed the working bound stops early with `503 response_too_large`. The report does not depend on pprof being enabled, and a hardware request does not make a running profile busy.
 
-CPU profiling is disabled by default. Set the dataplane environment variable
-`RACER_PPROF_ENABLED=true` to enable it; only the exact values `true` and `false`
-are accepted. Use `GET /debug/pprof/profile` on the existing diagnostics listener.
-The optional `seconds` parameter defaults to 30 and must be an integer from 1 to 60.
-Duplicate or unknown parameters return 400. Other methods return 405. Disabled
-profiling returns 404, a concurrent capture or download returns 409, and unavailable
-native sampling or denied perf permissions return 503 with a fixed error code.
+CPU profiles are opt-in with `RACER_PPROF_ENABLED=true`. `/debug/pprof/profile` accepts an optional `seconds` query from 1 to 60 and defaults to 30. A profile reserves a process-wide budget of 192 MiB before it opens rings or allocates, and only one profile may run at a time; a second request receives `409 busy`. A profile is refused with `404` when profiling is disabled, `400` for an invalid duration, and `503` when the process is stopping or the platform does not support sampling. The profile format and symbols are suitable for Parca. A profile contains stack samples from the whole process, so anyone who can reach the diagnostics listener can request one; keep that listener off untrusted networks and grant Pod proxy access accordingly.
 
-The response is a raw pprof protobuf download, capped at 16 MiB. Capture and download
-share a deadline of the requested duration plus 15 seconds, at most 75 seconds.
-Headers still have a two-second deadline. One helper performs CPU sampling and
-encoding; metrics and health remain available during capture. Profiling uses one
-process-wide diagnostic memory reservation (192 MiB, including the output), not a
-16 MiB charge on every worker's request-context quota. This reservation is not a
-strict process RSS limit. Two extra diagnostic reactor slots and their bookkeeping
-are reserved. The enabled per-worker queue floor is nine slots instead of seven;
-small configured budgets can reduce worker count or fail startup. Profiling does
-not increase configured request or queue budgets automatically.
-Shutdown stops new captures, requests cancellation early, and waits for helper cleanup.
-Socket resets and full hangups cancel capture. A TCP FIN alone cannot distinguish a
-disconnected client from a client that closed only its write side, so capture can
-continue until completion or the bounded deadline in that case.
+Racer does not export distributed trace spans and has no OpenTelemetry exporter. Use the Prometheus metrics for rates and saturation, the debug endpoints for bounded forensic detail, and CPU profiles for where time goes. `RACER_SEND_TAG_PAIR` names a `sender,receiver` pair of node UUIDs whose peer sends get a sampled AEAD tag check, which appears in `/debug/send-tag`; it is a diagnostic switch, not a tracing system.
 
-Profiles can contain process addresses and executable paths. This endpoint has no
-authentication and uses the existing listener: localhost for the bare binary, but
-the Pod IP in managed workloads. Restrict network access before opting in. Do not
-expose profiles publicly or grant broad container privileges just to bypass a perf
-permission error.
+The metrics families cover the read path:
 
-This endpoint captures native CPU samples only, not heap or goroutine profiles.
-For a standalone listener, save and inspect a profile with the matching binary:
+| Area | Representative metrics |
+| --- | --- |
+| Requests | `racer_requests_total`, `racer_request_errors_total`, and `_overloaded`, `_unavailable`, `_deadline`, `_cancelled`, `_other` variants |
+| Hits and fills | `racer_memory_hits_total`, `racer_disk_hits_total`, `racer_peer_hits_total`, `racer_origin_fills_total`, `racer_corrupt_misses_total` |
+| Delivery | `racer_delivery_bytes_total`, `racer_delivery_direct_bytes_total`, `racer_delivery_pipe_drains_total` |
+| Lookup | `racer_plaintext_lookup_*`, `racer_ciphertext_lookup_*`, `racer_pending_lookup_*`, `racer_disk_index_lookup_*` with `hits`, `misses`, and `errors` |
+| Buffer pool | `racer_buffer_pool_bytes`, `racer_buffer_pool_misses_total`, `racer_buffer_pool_rejects_total`, `racer_buffer_pool_unpooled_total` |
+| Crypto | `racer_crypto_encrypt_*`, `racer_crypto_decrypt_*`, `racer_crypto_stolen_jobs_total`, `racer_crypto_numa_forwarded_jobs_total` |
+| Peers | `racer_peer_receive_*`, `racer_peer_admission_*`, `racer_peer_probes_total`, `racer_peer_link_failures_total`, `racer_peer_connection_closes_total` |
+| Origin | `racer_origin_fills_total`, `racer_origin_walk_reasons_total`, `racer_fill_origin_nanoseconds_{sum,count}` |
+| Disk | `racer_disk_publications_total`, `racer_disk_indexed_payload_bytes`, `racer_dirty_discards_total`, `racer_dirty_discard_reasons_total` |
+| Prefetch | `racer_prefetch_*`, with `priority` and ticket `outcome` labels |
 
-```sh
-curl --fail --max-time 75 'http://127.0.0.1:9090/debug/pprof/profile?seconds=30' -o profile.pb
-go tool pprof -top ./racer profile.pb
-```
+Request error counters separate `Overloaded`, `Unavailable`, `Deadline`, `Cancelled`, and `Other`, so a dashboard can distinguish a client cancellation from a node that cannot admit work. Delivery byte metrics separate data written through a pipe from data written directly into a client descriptor.
 
-Keep the exact binary and its debug information for symbol resolution. Userspace
-frames outside the recorded executable mappings keep their raw address with an
-unknown mapping. They do not discard the profile or receive an invented mapping.
-Profile comments count unknown locations, frame references, and affected
-aggregated samples; these are not CPU-time or lost-sample counts. A changed
-executable mapping snapshot still rejects capture with `mapping_changed`.
+Peer connection close metrics carry a `reason` label: `abandoned`, `canceled`, `deadline`, `overloaded`, `peer_close`, or `error`. A rise in `overloaded` means the peer connection budget is too small for the peer fan-out; a rise in `deadline` means exchanges are not completing within their attempt timeout. Origin walk reasons explain why a read went to the origin instead of a peer, including rank-0 self, miss, overdue, failed, shed, unreachable, unusable, stale, and not asked.
 
-Native capture requires kernel perf access; the endpoint does not change host perf
-settings, container capabilities, or seccomp policy. Release builds retain frame
-pointers even when profiling is disabled, which can slightly affect CPU performance.
-
-Monitor `racer_requests_total`, `racer_request_errors_total`, `racer_overloads_total`,
-and per-tier `racer_*_lookup_hits_total` / `racer_*_lookup_misses_total`. Page-source events
-are not request counts or byte rates. A scrape is not readiness. Restrict diagnostics
-network access, especially with host networking.
-
-`racer_delivery_bytes_total` counts every body byte delivered to clients;
-`racer_delivery_direct_bytes_total` counts only those sent outside the splice path.
-
-Each I/O worker keeps a pool of page buffers for ciphertext copies, disk
-reads, and plaintext. Its series are node-wide sums, updated about once per
-second:
-
-| Metric | Type | Meaning |
-|--------|------|---------|
-| `racer_buffer_pool_entries` | gauge | Idle buffers kept for reuse, warm or cold |
-| `racer_buffer_pool_bytes` | gauge | Warm idle buffer bytes kept for reuse, charged to the `pool` admission class |
-| `racer_buffer_pool_in_use_bytes` | gauge | Pooled buffer bytes checked out now |
-| `racer_buffer_pool_target` | gauge | Bytes of buffers, in use and idle, the pools size themselves to |
-| `racer_buffer_pool_cold_bytes` | gauge | Idle buffer bytes whose memory was returned to the kernel but whose mappings are kept for reuse; not charged |
-| `racer_buffer_pool_hits_total` | counter | Buffers taken from idle storage |
-| `racer_buffer_pool_misses_total` | counter | Buffers that needed new memory (an `mmap` for page-sized buffers) |
-| `racer_buffer_pool_cold_hits_total` | counter | Hits that reused a cold buffer and so faulted its memory back in |
-| `racer_buffer_pool_rejects_total` | counter | Returned buffers freed instead of kept (an `munmap` for page-sized buffers) |
-| `racer_buffer_pool_trimmed_total` | counter | Idle buffers released because demand fell or memory is under pressure |
-| `racer_buffer_pool_unpooled_total` | counter | Buffers that could not be pooled because every size class held idle buffers of other sizes; each is also a miss |
-| `racer_worker_buffer_pool_bytes` | gauge | `racer_buffer_pool_bytes` per worker, labeled `worker` |
-
-Each pool sizes itself to its recent demand: it keeps the most buffers in use
-at once over the last hold time (1 s for small buffers, about 2 s for 16 MiB
-pages), and releases the rest a step at a time once demand stays lower for that
-long. Released page buffers first go cold, and are unmapped after four more hold
-times unused. Under `Elevated` memory pressure a pool keeps at most one idle
-buffer above what is in use; under `Critical` it keeps none and frees returned
-buffers. The `racer_staging_pool_*` series follow the same rules for disk-write
-staging, without the cold stage.
-
-While load is steady, misses, cold hits, and rejects should stay flat. Misses
-and cold hits that rise with each burst mean bursts come further apart than the
-hold time. Rising rejects mean idle buffers do not fit the `pool` class budget,
-which equals the worker's ciphertext budget. A rising
-`racer_buffer_pool_unpooled_total` means more buffer sizes are in use at
-once than a worker's pool has size classes.
-
-A failed client request also counts in one of
-`racer_request_errors_overloaded_total`, `racer_request_errors_unavailable_total`,
-`racer_request_errors_deadline_total`, `racer_request_errors_cancelled_total`, or
-`racer_request_errors_other_total`, by the first error it reported, and each I/O
-thread logs at most one `stage=client-request state=failed` line every 10 s
-(with the number suppressed since). `/debug/terminal` keeps the details.
-
-`racer_origin_fills_total` counts pages this node fetched from origin and published.
-`racer_origin_walk_reasons_total{reason}` splits the fills that a candidate walk authorized
-by what the walk learned from the page's rank 0 owner:
-
-| `reason` | Meaning |
-|----------|---------|
-| `rank0_self` | This node is the page's rank 0. |
-| `rank0_miss` | Rank 0 answered that it holds no copy of the page. |
-| `rank0_overdue` | Rank 0 timed out or refused for load, and has stopped answering this node, so its watch for the page is overdue. |
-| `rank0_failed` | Rank 0 answered that its own acquisition failed. |
-| `rank0_shed` | Rank 0 shed the probe with a signed `Overloaded`. |
-| `rank0_unreachable` | The exchange with rank 0 failed: no route, a connection failure, or an unsigned `Unavailable`. |
-| `rank0_unusable` | Rank 0's copy could not be used. |
-| `rank0_stale` | Rank 0 was behind this node's membership. |
-| `rank0_not_asked` | The walk never probed rank 0. |
-
-An owner above rank 0 that is refused for load while probing rank 0 leaves the
-fetch to rank 0 and retries. It asks origin itself only after rank 0 stops answering
-this node for the hang interval (half the client request timeout). A rank 0 that
-still answers other probes is busy, not down. On a cluster where every node owns
-every page, most fills on a node that is not rank 0 should be `rank0_miss`. A
-large `rank0_overdue` or `rank0_unreachable` count means pages that rank 0 may
-hold went to origin.
-
-A peer connect that fails because this node ran out of a local resource is load,
-not an unreachable peer: `EADDRNOTAVAIL` (no free ephemeral port toward that peer,
-usually because closed connections still sit in `TIME_WAIT`), `EADDRINUSE`,
-`EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM`, and `EAGAIN` fail the probe `Overloaded`,
-so the walk retries the owner later instead of counting it `rank0_unreachable`
-and asking origin. `racer_peer_connect_local_exhausted_total` counts these connects.
-`/debug/failures` keeps the original errno at `stage=PeerCheckout`.
-
-A peer page body that is already arriving over HTTP when this worker's ciphertext
-budget is full waits for budget, polling every 1 ms for up to 250 ms (at most a
-quarter of the time left in the request), instead of failing at once. Failing
-would close the connection mid-body and leave its port in `TIME_WAIT`.
-`racer_peer_receive_ciphertext_waits_total` counts bodies that waited and
-`racer_peer_receive_ciphertext_wait_granted_total` those that then got budget.
-A page the peer already wrote over an RDMA link waits for budget the same way, and
-the connection that carried its signed completion returns to the pool even if the
-wait runs out.
-
-`racer_peer_connection_closes_total{reason}` counts peer connections this node, as the
-requester, closed instead of returning to its pool. Each close leaves a local port in
-`TIME_WAIT` toward that peer for 60 s, so a sustained rate near the ephemeral port range
-divided by 60 exhausts ports (`racer_peer_connect_local_exhausted_total`). `reason` is
-`abandoned` (the exchange was dropped mid-flight, such as a lost race or a read whose
-client went away), `canceled`, `deadline`, `overloaded` (local admission refused a
-response already on the wire), `peer_close` (the peer answered `Connection: close`),
-or `error` (any other failure after the request was sent). An exchange that fails
-before sending its request, or after a complete bodiless answer such as a peer's
-`Overloaded`, keeps its connection and is not counted. Idle connections closed after
-30 s unused are not counted.
-
-The diagnostics listener uses port 9090 by default.
-Persist scrape configuration on workload templates or supported overrides, not only live Pods.
+Buffer pool misses and rejects show allocation pressure: a miss allocates outside the pool, and a reject means the pool could not serve the request at all. `racer_buffer_pool_bytes` reports pooled bytes, not entry count. The old `racer_recycler_*` metrics are gone; see the rename table in `cmd/racer/README.md` if you are updating an older dashboard.
 
 ### GPU metrics
 
-`/metrics` also reports `gpu-read` state. Labels have fixed values or come
-from the GPUs the dataplane found and the active RDMA rails.
+`racer_gpu_read_requests_total` carries an `outcome` label with values `gpu`, `not_enabled`, `wrong_device`, `busy`, `invalid`, and `failed`. `racer_gpu_enabled` and `racer_gpu_standby` are gauges that are written even without a GPU helper, so a dashboard can distinguish "GPU reads off" from "GPU helper not started".
 
-| Metric | Type | Meaning |
-|--------|------|---------|
-| `racer_gpu_read_requests_total{outcome}` | counter | `gpu-read` requests by how the dataplane opened them: `gpu` (imported on a GPU; the read can still fail later), `not_enabled` (501, `gpu-read` is off), `wrong_device` (501, the memory is on a GPU the dataplane cannot use, or the `Racer-Gpu-Uuid` header names a GPU it did not find), `busy` (503), `invalid` (400), or `failed`. Requests the parser rejects before it knows the mode are not counted. |
-| `racer_gpu_enabled` | gauge | 1 when `gpu-read` is on and found a usable GPU, else 0. |
-| `racer_gpu_standby` | gauge | 1 while `auto` mode waits for the first `gpu-read` before it touches a GPU, else 0. |
+`racer_gpu_decrypt_available` is labeled by `ordinal` and `uuid`, and `racer_gpu_staging_slots_free` and `racer_gpu_executor_queued` are labeled by `ordinal`. `racer_gpu_cufile_enabled` and `racer_gpu_cufile_disabled_total{reason}` report whether direct disk reads through cuFile are active. `racer_gpu_read_pages_total{decrypt}` separates pages decrypted by the GPU from pages decrypted by the CPU.
 
-The rest are reported only when `racer_gpu_enabled` is 1:
+The counters `racer_gpu_pages_rejected_total`, `racer_gpu_cufile_staged_pages_total`, `racer_gpu_cufile_failures_total`, `racer_gpu_staging_exhausted_total`, `racer_gpu_cufile_unsupported_total`, `racer_gpu_landed_pages_decrypted_total`, `racer_gpu_peer_copies_total`, `racer_gpu_peer_copy_bytes_total`, `racer_gpu_peer_failures_total`, `racer_gpu_peer_bounces_total`, and `racer_gpu_executor_queue_full_total` describe staging, errors, and peer copies. `racer_gpu_open_requests` and `racer_gpu_leaked_resources` are gauges; a leaked resource count that does not return to zero after traffic stops is a bug.
 
-| Metric | Type | Meaning |
-|--------|------|---------|
-| `racer_gpu_decrypt_available{ordinal,uuid}` | gauge | 1 when the GPU can decrypt sealed pages. 0 means pages for it are decrypted by the CPU. |
-| `racer_gpu_staging_slots_free{ordinal}` | gauge | Free cuFile staging slots on the GPU. |
-| `racer_gpu_executor_queued{ordinal}` | gauge | Pages queued or running on the GPU's executor. |
-| `racer_gpu_cufile_enabled` | gauge | 1 while cuFile reads are on. A driver-level failure turns it off until restart. |
-| `racer_gpu_cufile_disabled_total{reason}` | counter | Times cuFile was turned off for the node: `driver_open`, `staging_register`, or `file_open` (a file registration error other than unsupported). |
-| `racer_gpu_cufile_unsupported_total` | counter | Devices (`st_dev`) whose files cuFile reported as unsupported. Files on such a device are read through host memory; cuFile stays on for other devices. |
-| `racer_gpu_read_pages_total{decrypt}` | counter | Pages written to GPU memory: `gpu` (decrypted on the GPU) or `cpu` (plaintext from host memory, decrypted by the CPU or already cached). |
-| `racer_gpu_pages_rejected_total` | counter | Sealed pages the GPU rejected for a tag mismatch. |
-| `racer_failed_verdicts_dropped_total` | counter | Failed GPU verdicts lost because the owner worker was far behind. The owner keeps serving the rejected copy, so a nonzero value means corrupt copies may stay eligible. |
-| `racer_gpu_cufile_staged_pages_total` | counter | Pages cuFile read from disk straight into GPU staging. |
-| `racer_gpu_cufile_failures_total` | counter | cuFile reads or registrations that failed. The page is read through host memory instead. |
-| `racer_gpu_staging_exhausted_total` | counter | Disk reads that found no free staging slot and went through host memory. |
-| `racer_gpu_landed_pages_decrypted_total` | counter | Pages decrypted on the GPU from an RDMA landing buffer. |
-| `racer_gpu_peer_copies_total` | counter | Encrypted pages copied from another GPU over NVLink or PCIe peer-to-peer. |
-| `racer_gpu_peer_copy_bytes_total` | counter | Encrypted bytes copied between GPUs over a peer path. |
-| `racer_gpu_peer_failures_total` | counter | Peer copies that failed. Each turns that GPU pair's peer path off until restart. |
-| `racer_gpu_peer_bounces_total` | counter | Encrypted pages moved from another GPU through host memory, because the pair has no peer path or it was turned off. |
-| `racer_gpu_executor_queue_full_total` | counter | Pages refused because their GPU's executor queue was full. The read fails as overloaded. |
-| `racer_gpu_open_requests` | gauge | `gpu-read` requests that hold GPU resources now. |
-| `racer_gpu_leaked_resources` | gauge | GPU resources leaked on purpose after a failed release. |
-
-When GPU landing is configured (GPU decrypt and RDMA both on), each active
-rail also reports the following. Each decrypting GPU's landing buffer is split
-into one slice per rail, so the `{rail,ordinal}` series are per slice.
-
-| Metric | Type | Meaning |
-|--------|------|---------|
-| `racer_gpu_landing_enabled{rail}` | gauge | 1 when at least one GPU landing slice is registered on the rail. |
-| `racer_gpu_landing_slots{rail,ordinal}` | gauge | NIC slots in GPU `ordinal`'s landing slice on the rail. |
-| `racer_gpu_landing_exhausted_total{rail,ordinal}` | counter | Landing grants for that slice that found no free slot. The page lands in host memory instead. |
+Landing metrics are per rail and per GPU: `racer_gpu_landing_enabled{rail}`, `racer_gpu_landing_slots{rail,ordinal}`, and `racer_gpu_landing_exhausted_total{rail,ordinal}`. Landing slots are the GPUDirect RDMA buffers that peers write into; exhaustion means peers are falling back or waiting for a slot.
 
 ## Upgrade and recovery
 
-Keep the operator, dataplane, SDK, and origin adapters on matching
-versions from the same Unbounded release. Keep cluster identity, version counters,
-credentials, and node identity state. Do not delete them to force a fresh start.
-Cached bytes are disposable; this installation state is not. Deleting and
-recreating a ClusterCache creates a new cache identity, even with the same name.
+All Racer components must run matching versions. The `racer` image, the operator, and the deployed CRD schema are versioned together, and a dataplane rejects a publication it cannot interpret. Upgrade the operator and the image together, then let the DaemonSet roll; do not run an old dataplane against a new authority for longer than a quiesced drain.
 
-The move from `racer-controller` to elected dataplane seats is a cold-cache alpha
-upgrade. Quiesce traffic and let the operator retire the old authority before
-the new one starts. Do not run old and new controllers together. Checkpoint
-recovery rejects the previous format and a different cluster ID rather than
-restoring entries under unrelated keys. Origins must remain available while
-caches refill. Never clear raw-device guards or unrelated host files as part of
-this upgrade.
+Durable installation state lives in the `racer-state` Secret and the 17 Leases. Cached bytes are disposable. A restart loses in-memory pages and in-flight reads, and it loses prefetch tickets, which clients resubmit. A node that finds a valid checkpoint restores its page index and completed-page holds, but not jobs, credentials, or in-flight reads.
 
-The operator refuses migration if the old `racer-config` requests a non-default
-peer port, a diagnostics port, host networking, a pod-network node split, or a
-non-default `RACER_NVIDIA`. Managed ports are now fixed at 8082 and
-9090. Review and remove these old settings before migration; use a DaemonSet
-override for host networking and set `RACER_NVIDIA` in
-`racer-config`. The operator does
-not silently discard them or stop the old controller first.
+Earlier releases ran control in a `racer-controller` Deployment. The current operator runs seats inside the dataplane Pods and migrates the installation: it creates the new control objects, waits for the new DaemonSet and seats, and then removes the old controller workload and its RBAC. A pre-rename installation keeps its administrator settings through the `RACER_DATAPLANE_` to `RACER_` translation and its NVIDIA mode through the `RACER_DATAPLANE_NVIDIA` to `RACER_NVIDIA` translation.
 
-The operator writes `racer-settings` only when it is absent, so upgrades keep
-existing values. It rewrites retired keys in place: a renamed key, such as
-`RACER_SLAB_BYTES`, moves to its replacement, such as
-`RACER_SLAB_BYTES_PER_WORKER`, with the same value, because the old budget keys
-were already per-worker amounts. If the replacement is already set to a
-different value, the operator reports the conflict and keeps the current
-DaemonSet until you remove one of them. It removes the `RACER_WARM_*` keys and
-reports `RACER_PEER_PORT`, which you replace with the port of
-`RACER_PEER_LISTEN`. The DaemonSet rolls only after the rewritten ConfigMap is
-saved.
+A checkpoint is bound to the cluster ID, the page size, the segment geometry, and the slab layout. Recovery refuses a checkpoint from another cluster, a different page size, a different segment size, a different device set, or an older format, and starts cold instead. A cold start is safe: it refills from the origin and peers, and the cache's priority only affects how quickly it regains its share.
 
-New installs seed `RACER_SEGMENT_BYTES` at 1 GiB and
-`RACER_SLAB_BYTES_PER_WORKER` at 4 GiB; earlier releases seeded 64 MiB and
-1 GiB, and an upgrade keeps those values. A 64 MiB segment holds only three
-16 MiB page records, wasting about a quarter of each device and leaving a small
-free-segment reserve. To adopt the new geometry on an existing install, edit
-both keys in `racer-settings`; this changes storage geometry and starts a cold
-cache. Keys absent from
-`racer-settings` take the dataplane defaults of the new release.
+The operator rewrites renamed `racer-settings` keys in place with the same value and removes the `RACER_WARM_*` keys, which never had an effect. It reports `RACER_PEER_PORT` for a manual change because the port now comes from `RACER_PEER_LISTEN`; the old variable is not accepted. The rename table in `cmd/racer/README.md` lists every old and new name, and the dataplane has no compatibility aliases.
 
-Expect a cold cache after changing device layout,
-worker count, or storage geometry. Recovery does not scan payloads to rebuild
-the cache. Make sure origins can serve the resulting misses.
+The dataplane defaults are 16 MiB pages, 1 GiB segments, 16 GiB of file-backed slab per worker, and a free reserve of 2 segments per worker. A changed segment size or a changed page size makes existing data unreadable and starts the cache cold. Plan a layout change as a cache rebuild: drain traffic, change the geometry, and expect origin and peer fills during warmup.
 
 ## Go SDK
 
-The Go SDK is `github.com/Azure/unbounded/pkg/racersdk`. Its
-[package documentation](https://pkg.go.dev/github.com/Azure/unbounded/pkg/racersdk)
-is the complete SDK reference, including configuration, the copy and no-copy read
-paths, the origin contract, and error handling. The SDK does not provision caches
-or origins.
+`pkg/racersdk` is the Go client library for Racer. It reads objects through a node-local cache and serves cache misses from your own storage. It does not provision caches or origins and does not create Kubernetes objects; those remain the job of the operator and the `ClusterCache` API.
+
+Create one `Client` per cache and share it. `NewClient` with `ClientConfig{Cache: "names"}` connects to `/run/racer/names/client/socket`. `Client.Get` returns once Racer has accepted the read, with metadata available immediately, and `Client.Stat` returns metadata without reading content. `ReadOptions` selects a byte range or pins a version by ETag.
+
+An `Object` is consumed in exactly one of two ways. `Object.Read` copies bytes into your buffer, which you use to hash, parse, decompress, or transform content. `Object.WriteTo` forwards the object without copying; when the writer is an `*os.File`, a `net.Conn`, or a plain-text HTTP/1 `http.ResponseWriter`, the kernel moves data from the socket with `splice(2)` and it never enters process memory. Other writers get a single reused 256 KiB buffer. `io.Copy` uses `WriteTo` automatically when the source is an `Object`, so `io.Copy(dst, object)` is the no-copy path; wrapping the object in another reader switches to `Read`.
+
+Both paths withhold the last byte until Racer confirms the whole range was delivered intact. A read that is cut short therefore ends in an error rather than a silently truncated result, even when the destination already received the rest of the data.
+
+An `Origin` registered with `ServeOrigin` supplies objects that no Racer in the cluster has cached yet. It binds `/run/racer/<cache>/origin/socket`, which must already exist and be owned by UID and GID 65532. One process may read through a `Client`, serve an `Origin`, or do both.
 
 ### Prefetch
 
-The Go SDK wraps the [prefetch API](#prefetch):
+The SDK exposes the prefetch API through `Client.Prefetch`, `Client.PrefetchStatus`, `Client.CancelPrefetch`, `Client.ListPrefetches`, and `SplitPrefetch`. `PrefetchWindow` wraps one ticket ID and calls `Update` or `Reset` with the next generation or sequence, and `Position` reports the current pair.
 
-```go
-func (c *Client) Prefetch(ctx context.Context, id string, spec PrefetchSpec) (PrefetchStatus, error)
-func (c *Client) PrefetchStatus(ctx context.Context, id string, opts StatusOptions) (PrefetchStatus, error)
-func (c *Client) CancelPrefetch(ctx context.Context, id string) (PrefetchStatus, error)
-func (c *Client) ListPrefetches(ctx context.Context) ([]PrefetchStatus, error)
-func SplitPrefetch(id string, spec PrefetchSpec, maxRefs, maxBodyBytes int) []PrefetchPart
-func (c *Client) NewPrefetchWindow(id string, spec PrefetchSpec) *PrefetchWindow
-func (w *PrefetchWindow) Update(ctx context.Context, refs []PrefetchRef) (PrefetchStatus, error)
-func (w *PrefetchWindow) Reset(ctx context.Context, refs []PrefetchRef) (PrefetchStatus, error)
-```
+`PrefetchSpec` carries the cache UID, priority, generation, sequence, TTL, pending byte bound, authorization, and refs. `PrefetchRef` carries a key, optional ETag, offset, length, and metadata. `PrefetchStatus` mirrors the wire status, including state, reason, priority, generation, sequence, settled, TTL and timestamps, ref counts, bytes, coverage, refs, and next cursor.
 
-`PrefetchSpec.TTL` is rounded up to whole seconds; `0` uses the server default.
-`PrefetchRef.Length` `0` means to the end of the object. `PrefetchStatus.Created`
-is true when the `PUT` created the ticket. A rejected request returns
-`*PrefetchError` with `Status`, `Code`, `Message`, and `RetryAfter`. It matches
-`ErrInvalidRequest` for `400` and `413`, `ErrNotFound` for `404`, and
-`ErrUnavailable` for `429` and `503`.
+`PrefetchError` carries the HTTP status and the Racer error code, and its `Is` method matches errors by code, so you can test for `not_found`, `passthrough`, `stale_generation`, or `pending_limit` without parsing strings. A window update keeps the ticket's achieved work, while `Reset` starts a new generation. Resubmitting an identical spec is idempotent.
 
-With an existing `client`, `ctx`, and object `key`:
-
-```go
-status, err := client.Prefetch(ctx, "epoch-17", racersdk.PrefetchSpec{
-    Refs: []racersdk.PrefetchRef{{Key: key}},
-})
-if err != nil {
-    return err
-}
-status, err = client.PrefetchStatus(ctx, "epoch-17", racersdk.StatusOptions{
-    Wait: 30 * time.Second,
-    Refs: "failed",
-})
-if err != nil {
-    return err
-}
-// PARTIAL or FAILED: inspect status.Refs. Reads still work through normal fills.
-```
-
-`SplitPrefetch` splits a large spec into parts that fit the server's ref and
-body limits. Zero limits use the defaults (16,384 refs, 4 MiB). Part ids are
-`<id>.<n>`, counting from 0.
-
-`PrefetchWindow` keeps one rolling ticket. `Update` increments the sequence and
-`Reset` increments the generation and sets the sequence to 0. A failed call does
-not roll the position back.
-
-```go
-window := client.NewPrefetchWindow("reader-0", racersdk.PrefetchSpec{Priority: "high"})
-if _, err := window.Update(ctx, nextRefs); err != nil {
-    return err
-}
-```
-
-The Python client in `clients/python/racer` has the same calls:
-`prefetch(id, spec)`, `prefetch_status(id, wait=None, coverage=False,
-refs=None, cursor=None)`, `cancel_prefetch(id)`, `list_prefetches()`,
-`split_prefetch`, `PrefetchWindow` (`update` and `reset`), and `PrefetchError`
-(`status`, `code`, `message`, `retry_after`).
-
-```python
-import racer
-
-client = racer.Client(cache="artifacts")
-client.prefetch("epoch-17", racer.PrefetchSpec(refs=[racer.PrefetchRef(key=key)]))
-status = client.prefetch_status("epoch-17", wait=30, refs="failed")
-```
-
-| Socket | Path |
-|--------|------|
-| Client | `/run/racer/<name>/client/socket` |
-| Origin | `/run/racer/<name>/origin/socket`, mode `0600`, in a dataplane-created directory owned by UID/GID 65532 with mode `0700` |
-
-For tests, `github.com/Azure/unbounded/pkg/racersdk/racersdktest` runs a
-noncaching fake Racer. It does not test distributed or RDMA behavior.
+`pkg/racersdk/racersdktest` provides a fake client for tests. The Python client in `clients/python/racer-vllm` uses the same socket paths and respects `RACER_SOCKET`; its behavior mirrors the Go client for client socket selection.
 
 ## Client socket mount
 
-Pods that talk to the dataplane socket directly, such as the Python client,
-opt in with a label. The admission webhook then mounts the cache's client
-directory read-only and tells the app where the socket is.
+The admission webhook can mount a cache's client socket into a Pod without the object sidecar. Opt in with the Pod label `racer.unbounded-cloud.io/client-socket: enabled` and the annotation `racer.unbounded-cloud.io/client-cache: <cache>`. The mount is read-only, but a read-only mount still permits `connect(2)`: the kernel checks write permission on the socket inode, not the mount flag.
 
-| Key | Meaning |
-|-----|---------|
-| Label `racer.unbounded-cloud.io/client-socket: enabled` | Turns on the mount |
-| Annotation `racer.unbounded-cloud.io/client-cache` | ClusterCache name. Required |
-| Annotation `racer.unbounded-cloud.io/client-containers` | Optional comma-separated init or app container names. Default: every init and app container, except the injected `racer-object` sidecar |
-| Annotation `racer.unbounded-cloud.io/client-socket-injected` | Set by the webhook to the cache name; do not edit |
+| Key | Required | Meaning |
+| --- | --- | --- |
+| `racer.unbounded-cloud.io/client-socket` | yes, label | `enabled` opts the Pod into the mount |
+| `racer.unbounded-cloud.io/client-cache` | yes, annotation | Names the ClusterCache whose client socket is mounted |
+| `racer.unbounded-cloud.io/client-containers` | no, annotation | Comma-separated init or app container names; default is every init and app container except `racer-object` |
+| `racer.unbounded-cloud.io/client-socket-injected` | set by webhook | Records the mounted cache; do not edit |
 
-Each selected container gets:
+The webhook adds a volume named `racer-client-socket` with a `hostPath` of type `Directory` at `/run/racer/<cache>/client`, unless the Pod already mounts that directory. It mounts the directory read-only into each selected container and sets `RACER_SOCKET=/run/racer/<cache>/client/socket`. An init container is mounted too, so it can fetch through the socket before the app starts. The Pod gets `kubernetes.io/os=linux` in its node selector, the cache's node affinity, and the exclusion label's anti-affinity.
 
-- `/run/racer/<cache>/client` mounted read-only at the same path. A read-only
-  mount still allows `connect` and `sendmsg` on the socket.
-- `RACER_SOCKET=/run/racer/<cache>/client/socket`.
+The mount and the `racer-object` sidecar are independent opt-ins and can be combined. When both target the same cache, the webhook reuses the sidecar's existing volume instead of adding a second one.
 
-Init containers, including native sidecars (`restartPolicy: Always`), get the
-same mount, so an init container can fetch through the socket before the app
-starts. The pod is placed on Linux nodes without the `exclude` label, like sidecar pods.
-The hostPath type is `Directory`, so the pod waits until the dataplane has
-created the cache directory. Host networking is allowed.
-
-This label works alone or with `object-sidecar`. When both name the same cache,
-the pod gets one shared volume. The webhook rejects the pod when the cache name
-is missing or invalid, when a listed container does not exist, or when a
-container already sets `RACER_SOCKET` or mounts that path.
+The webhook denies a Pod with `403` when the label is set but the client cache annotation is missing or names an invalid cache, when the named ClusterCache does not exist, when `spec.nodeName` names a Node that does not match the cache selector, when a selected container already mounts the client directory or already sets `RACER_SOCKET`, when the Pod already defines a volume named `racer-client-socket`, when the Pod or node selector conflicts with Linux, and when the container list is not a set of distinct existing init or app container names. A failed cache or Node lookup is denied with `503` so the client retries instead of admitting a Pod without its cache affinity.
 
 ## GPU reads
 
-GPU reads let a client on the node read an object straight into its own NVIDIA
-GPU memory. They need:
+GPU reads copy object plaintext directly into a GPU allocation. They require the CUDA dataplane image, which ships the CUDA shim `libracer_gpu_cuda.so.1`, the cuFile runtime, and `/etc/racer/cufile.json`. An image built without CUDA accepts the request but has no GPU backend and answers `501`. NVIDIA nodes need the driver libraries and, for `RACER_NVIDIA=cdi`, a CDI spec for every dataplane node. The dataplane does not request `nvidia.com/gpu`; the privileged container sees the device nodes.
 
-- A dataplane image built with CUDA. The released `racer` image is,
-  so no setup is needed. It runs on nodes without GPUs too. An image built with
-  `--build-arg RACER_NATIVE_CUDA=false` has no GPU reads.
-- An NVIDIA node set up by the unbounded agent, which installs the NVIDIA
-  container runtime and a CDI spec.
-- `RACER_ENABLE_GPU` in `racer-settings`. `auto`, the default, does
-  not touch any GPU until a client sends the first `gpu-read`. Only then does
-  the dataplane load CUDA, look for GPUs, and turn GPU mode on, or off if it
-  finds no usable GPU. It does not try again until the pod restarts. `true`
-  sets up the GPUs at startup and makes startup fail when there is no usable
-  GPU. `false` turns it off.
+`RACER_ENABLE_GPU` selects the mode:
 
-When it sets up the GPUs, the dataplane logs each GPU it finds: ordinal, UUID, PCI address,
-NUMA node, compute mode, and whether it can use it. It skips GPUs in
-`EXCLUSIVE_PROCESS` or `PROHIBITED` mode. One helper thread does all GPU work
-for the process, except cuFile disk reads, which run on four reader threads. At most 256 GPU reads run at once; more get 503.
+| Mode | Behavior |
+| --- | --- |
+| `auto` | Touches no GPU until the first `gpu-read`, then turns GPU mode on if a usable GPU is found |
+| `true` | Sets up GPUs at startup and fails startup when none is found |
+| `false` | Turns GPU reads off; `gpu-read` reports `not_enabled` |
 
-Where the bytes come from decides who decrypts them:
+Discovery logs the GPUs it finds and the mode it selected. A node with no usable GPU keeps `auto` in standby: `racer_gpu_enabled` is 0, `racer_gpu_standby` is 1, and a `gpu-read` that arrives after standby gets `501` at once instead of paying the probe cost on every request.
 
-- A page whose plaintext another read still holds in memory is copied to the
-  GPU. The memory cache itself keeps only encrypted pages.
-- A page fetched from the origin is encrypted on the CPU, so its plaintext is
-  copied to the GPU too.
-- Other pages reach the GPU still encrypted, and the GPU checks and decrypts
-  them. This covers pages kept encrypted in memory, pages on local disk, and
-  pages from peers. The CPU does not decrypt them.
-- A page on local disk is read straight from the disk into GPU memory with
-  cuFile when it can be. Otherwise the CPU reads it and copies it to the GPU.
-  This needs GPUDirect Storage on the host (`nvidia-fs`, or PCIe P2PDMA).
-  For PCI P2PDMA, set `RACER_GPU_PCI_P2PDMA=true`. cuFile then does not fall
-  back to `nvidia-fs`, and if it cannot turn P2PDMA on, the dataplane logs
-  `stage=gpu state=cufile-disabled` and reads through host memory. The
-  `stage=gpu state=enabled` line reports the setting as `pci_p2pdma=<bool>`.
-  `racer_gpu_direct_disk_reads_total` and
-  `racer_gpu_direct_disk_read_bytes_total` count these reads. After a cuFile
-  driver or registration failure the dataplane logs
-  `stage=gpu state=cufile-disabled` and reads through host memory until it
-  restarts. When cuFile only rejects a file because its filesystem or device
-  is not supported, the dataplane logs
-  `stage=gpu state=cufile-unsupported dev=<major>:<minor> reason=<error>` once
-  for that device, reads files on that device through host memory until it
-  restarts, and keeps cuFile on for other devices.
-- When several `gpu-read` requests want the same page at once, such as every
-  GPU loading the same model weights, the page is read from disk or a peer
-  only once. A request for the same GPU, or for a GPU that can copy from it
-  directly (peer access), reuses that encrypted copy. GPUs that cannot copy
-  from each other, such as with `RACER_GPU_PEER=off`, each read the page
-  once and share it among requests for that GPU. Each GPU still checks
-  and decrypts the page itself. The copy is reused only while some request
-  still holds it. `racer_gpu_direct_joined_total` counts reused copies.
+The backend has a coordinator thread and one executor thread per GPU, plus cuFile reader threads. I/O threads talk to them through queues and one-shot channels, so a worker never blocks on CUDA.
 
-- With RDMA on, a page from a peer can be written by the peer's NIC straight
-  into GPU memory on this node (GPUDirect RDMA). See below.
+A GPU read can be served from a plaintext-cached page by copying it into the destination. A page fetched from the origin is decrypted on the CPU before it is copied. A page that is still encrypted and needs a GPU decrypt is staged, verified, and decrypted by the executor. A page already on local disk can be read with cuFile directly into GPU memory; `RACER_GPU_PCI_P2PDMA=true` asks cuFile to use PCI P2PDMA instead of `nvidia-fs` and requires cuFile 1.13 (CUDA 12.8) or later. A page that fails verification is not written to the destination; it is reported as damaged and the request fails rather than returning unverified data.
 
-If the GPU finds a damaged page, the read fails and the dataplane drops that
-copy from memory or disk, as it does when the CPU finds one.
+A shared GPU fetch is reused: concurrent `gpu-read` requests for the same page and version join one fill, and the page is copied to each destination. With RDMA enabled, peers can write GPU-read pages into landing buffers in GPU memory over GPUDirect RDMA. Landing uses `RACER_GPU_LANDING_BYTES` per GPU and is disabled with `0`. A landing buffer that is exhausted is counted, and the page falls back to another path.
 
-When a shared GPU fetch finishes without putting the page in GPU memory, the
-requests waiting on it read the page through host memory rather than each
-trying cuFile or a landing again. If the fetching request is canceled, a
-waiting request tries the GPU fetch itself.
+`RACER_GPU_STAGING_BYTES` sizes the ciphertext staging memory per GPU in 2 MiB slots, 256 MiB by default. One slot holds one sealed page with its tag. Below about 34 MiB the GPU does not decrypt and the CPU does, so do not shrink staging below that unless you intend CPU decrypt. A larger staging area allows more concurrent streams and holds more pages in flight. The window (`RACER_RANGE_WINDOW_PAGES`) and the staging slots should be tuned together: a window larger than the staging slots makes the executor queue, while a much larger staging area than the window adds memory without more concurrency.
 
-When both GPU reads and RDMA are on, each GPU that can decrypt gets a landing
-buffer of `RACER_GPU_LANDING_BYTES` (per GPU, not per rail), split into page
-slots. The buffer is divided across the RDMA rails, so every GPU can land
-pages over every rail. If the buffer has fewer slots than there are rails,
-the rails on the GPU's NUMA node come first. A GPU read that needs a page
-from a peer asks up to two providers, in turn, to write the encrypted page
-into a free slot of that GPU's share on the link's rail. The GPU then checks
-and decrypts it. Such a page is not kept in memory or written to disk,
-because the host never has its bytes, but concurrent GPU reads of the same
-page may share it while any of them still holds it. When no slot is free or
-anything fails, the page comes through host memory as before. Landing buffers are registered when GPU mode turns
-on and at each RDMA activation, and freed when the RDMA node closes or when no rail could register
-them. They are not resized at runtime; changing the setting restarts the
-pods. The dataplane logs `stage=gpu-landing` lines when it registers them, and
-`racer_rdma_pages_landed_total` counts pages that landed in GPU memory.
-
-`RACER_GPU_STAGING_BYTES` is the GPU memory the dataplane keeps on each GPU for
-encrypted pages. It is split into slots of one page rounded up to whole 2 MiB pages (18 MiB). Two
-slots are needed for decryption, so a smaller cap means the CPU decrypts. The
-other slots hold pages read with cuFile. When all of them are in use, the
-dataplane reads the next page through host memory instead. If the image has no
-GPU decrypt support, the CPU decrypts every page.
-
-A GPU read fetches its whole `RACER_RANGE_WINDOW_PAGES` window directly, with
-cuFile where it can, so a larger window keeps more disk reads in flight. To
-load from fast local disks, raise the window, raise `RACER_GPU_STAGING_BYTES`
-to hold every page in flight, and raise the client's reads in flight. Each IO
-worker's share of `RACER_PLAINTEXT_BYTES` and `RACER_CIPHERTEXT_BYTES` must
-still hold the window plus one page. On one NVMe drive, a window of 8, 1 GiB
-of staging, and 8 loader reads loaded a 7B model in vLLM in 2.34 seconds,
-against 2.44 seconds with the defaults. That is close to the drive's speed.
-
-The dataplane does not request `nvidia.com/gpu`. It is privileged, so it
-already sees `/dev/nvidia*`. It only needs the host driver libraries.
-`RACER_NVIDIA` in `racer-settings` controls how it asks for them.
-The operator reads it and changes the DaemonSet:
-
-| `RACER_NVIDIA` | Behavior |
-|--------------------------|----------|
-| `env` (default) | Sets `NVIDIA_VISIBLE_DEVICES=all` and `NVIDIA_DRIVER_CAPABILITIES=compute,utility` on the dataplane container, mounts the host `/run/udev` read-only at `/run/udev` (cuFile reads each slab device's filesystem type from the udev database), and mounts a 64 MiB `emptyDir` at `/var/log/cufile` for the cuFile log. The NVIDIA runtime injects the libraries. Other runtimes ignore these variables, so nodes without NVIDIA are not affected |
-| `cdi` | Everything `env` adds, plus the Pod annotation `cdi.k8s.io/racer: nvidia.com/gpu=all`. containerd fails to create the container on any node that cannot resolve this CDI device, so use it only when every dataplane node has an NVIDIA CDI spec |
-| `off` | Adds none of these: no NVIDIA variables, no CDI annotation, no `/run/udev` mount, and no cuFile log volume. Without driver libraries there is no GPU, so cuFile is not used |
-
-The dataplane image ships `/etc/racer/cufile.json` and sets
-`CUFILE_ENV_PATH_JSON` to it. It turns off cuFile compatibility mode, so
-cuFile fails instead of copying through host memory and Racer uses its own
-host read path, and it logs errors to `/var/log/cufile/cufile.log`. Other
-cuFile settings keep their built-in defaults. To use your own file, build an
-image from the dataplane image that adds it, and set `CUFILE_ENV_PATH_JSON`
-in `racer-settings`. Setting `CUFILE_ALLOW_COMPAT_MODE=true`
-turns compatibility mode back on.
-
-On nodes set up by the unbounded agent, the NVIDIA runtime is the default
-containerd runtime and runs in CDI mode, so `env` is enough there. These env
-entries are operator wiring: workload overrides cannot change them.
+`RACER_GPU_PEER` controls GPU-to-GPU copies of encrypted pages. `auto` uses NVLink or PCIe peer-to-peer where the driver allows it, and `off` moves such pages through host memory. The default is `auto`.
 
 ### Testing on GPUs
 
-Regular CI has no GPU. It compiles the decrypt kernels with `nvcc` and runs
-them on the CPU through an emulation, but never loads them on a GPU. On a
-machine with an NVIDIA driver, `nvcc`, and Rust, run:
+`make racer-gpu-test` builds the CUDA shim with its kernels and runs the GPU hardware tests. It needs `nvcc` and a GPU. `RACER_GPU_TESTS` selects the hardware-test policy; the default `require` fails when the required hardware is absent. cuFile overrides can point the test at a different library path.
 
-```sh
-make racer-gpu-test
-```
-
-This builds `libracer_gpu_cuda.so.1` with its kernels and runs the hardware
-tests in `cmd/racer/gpu/tests/hardware.rs`: shim load, device
-discovery, import of an exported client allocation, GPU decrypt checked
-against the CPU, and cuFile reads. It fails when no GPU is found; pass
-`RACER_GPU_TESTS=1` to skip instead. cuFile tests skip when cuFile cannot open
-or the directory does not support `O_DIRECT` (set `RACER_GPU_TEST_DIR`); set
-`RACER_GPU_TESTS_CUFILE=require` to make that a failure. To also test
-`gpu-read` end to end from the Python client, set `RACER_GPU_E2E_SOCKET` to a
-running dataplane's client socket and `RACER_GPU_E2E_KEY` to the hex key of an
-object it can serve (`RACER_GPU_E2E_METADATA` and
-`RACER_GPU_E2E_AUTHORIZATION` are optional). Without the socket, that test is
-skipped; set `RACER_GPU_E2E=require` to make it a failure.
-
-The `racer gpu` workflow (`.github/workflows/racer-gpu.yaml`) runs this target
-nightly and on demand. It runs only when the repository variable
-`RACER_GPU_RUNNER` holds the GPU runner labels as a JSON array, for example
-`["self-hosted", "linux", "gpu"]`.
-
-See [Load vLLM models from Racer]({{< relref "guides/racer-vllm" >}}).
+The end-to-end Python tests in `clients/python/racer-vllm` use `RACER_SOCKET` and the same socket paths as the Go client. A GPU change can be exercised through the `racer gpu` workflow trigger, which runs the hardware suite on a GPU runner rather than on a CPU-only CI node.
 
 ## RDMA
 
-RDMA is optional per hop. Peers need the same **nonempty Site**, the page's selected rail
-in both published NIC lists, enabled native resources, and compatible local devices.
-Different/missing Sites or unavailable rails retain HTTP, without remapping the page.
-Site uses only `unbounded-cloud.io/site`, not `net.unbounded-cloud.io/site`. It does not
-change placement; in-flight snapshots mean label changes are not immediate revocation.
+RDMA is a per-hop optimization. Two nodes use it only when both are eligible for the same transfer: both publish rails, both share a nonempty Site, and each side has a rail that the other also publishes. A node that is missing a rail, a Site, or a usable port uses HTTP for that hop. HTTP fallback does not remap pages; the same page index and delivery path apply, only the transport changes.
 
-| `RACER_ENABLE_RDMA` | Behavior |
-|---------------------|----------|
-| `auto` (default) | Reserve native resources only with usable startup hardware; otherwise HTTP-only until restart |
-| `true` | Reserve native capacity even without startup hardware, allowing later discovery to activate devices |
-| `false` | Disable native RDMA |
+`RACER_ENABLE_RDMA` accepts `auto`, `true`, and `false`. `auto` uses native RDMA when the image is built with the RDMA feature and ports exist at startup. `true` reserves RDMA resources even without ports, for hotplug. `false` turns RDMA off. Native RDMA is included in release images; the verbs adapter is loaded separately.
 
-Release images include native verbs support; discovery/provider failures retain HTTP.
+Placement is computed over pages, and a page's owners are chosen without regard to rails. A snapshot or placement decision can therefore name an owner that shares no rail with the reader, and that hop falls back to HTTP. The `RACER_REPLICA_SELECTION` setting chooses whether a non-owner asks direct neighbors first and then spreads by a per-node hash, or asks the first-ranked owner; `spread` is the default.
+
+`rdma-nics` entries name a device, a port, a rail, and optionally a GID and a NUMA node. The control plane normalizes rails, validates duplicates and bounds, and publishes them in the membership record. A port that is down, lacks an MW2B-capable verbs port, or has no usable GID is not eligible.
 
 ### RDMA circuit breaker
 
-Each node can keep a circuit breaker per peer and rail (`RACER_RDMA_BREAKER`, off by
-default). Without it, a page whose grant or write fails or times out still falls back
-to HTTP within the same exchange, and a lost device is withdrawn at once, so the
-breaker only saves the timeout on pages sent to a peer whose link is already known to
-be bad. On a 150-node MANA cluster with RDMA cut on 10 nodes for 60 s, it did not
-change cold-read time measurably and cost about half a core per node. A busy link is slow, not broken, so the breaker sorts failure signals in
-three kinds:
+`RACER_RDMA_BREAKER` enables a per-peer and per-rail circuit breaker, off by default. It trips on a hard failure: a link break, a setup failure, or a grant or send error. It also trips after three page timeouts in a row with no RDMA success between them. Load alone never trips it: a missing grant slot or flight room is backpressure, not failure.
 
-- Hard failures trip it at once: a link being torn down (`link_down`), a link setup
-  this node started that failed and was not declined (`setup`), a grant that failed
-  with an error (`grant`), or a write, or the arrival of a page the sender reported
-  written, that failed with an error (`send`).
-- Soft failures trip it only after 3 in a row with no RDMA success with that peer on
-  that rail in between: a grant, write, or arrival that did not finish within
-  `RACER_RDMA_PAGE_TIMEOUT_MS` (5 s) (`timeout`), or a page whose sender answered
-  the grant over HTTP only after that timeout (`slow_fallback`). Any RDMA success
-  ends the streak, and a streak with no soft failure for
-  `RACER_RDMA_BREAKER_MAX_COOLDOWN_MS` starts over. On a congested link pages keep
-  completing between the slow ones; on a stuck link none do.
-- Load never trips it (`load`): no free grant slot, flight room, or ciphertext
-  budget. That page goes over HTTP and the next one tries RDMA again.
+When the breaker opens, pages to and from that peer use HTTP at once. The first cooldown is `RACER_RDMA_BREAKER_COOLDOWN_MS`, 2000 by default. It doubles for each consecutive trip, up to `RACER_RDMA_BREAKER_MAX_COOLDOWN_MS`, 30000 by default, less up to a fifth as jitter. After the cooldown the breaker allows one probe page; a successful probe over RDMA closes it, and a failed probe keeps it open for the next, longer cooldown. `RACER_RDMA_PAGE_TIMEOUT_MS` bounds one page's grant or write before the page goes over HTTP in the same exchange and counts as a soft failure.
 
-While a breaker is open, pages to and from that peer on that rail
-use HTTP at once, with no grant, grant wait, or write. The link keeps reconnecting
-in the background. After a cooldown (`RACER_RDMA_BREAKER_COOLDOWN_MS`, 2 s, doubling
-for each consecutive trip up to `RACER_RDMA_BREAKER_MAX_COOLDOWN_MS`, 30 s, less up
-to a fifth as jitter), one probe page at a time uses RDMA. Its success closes the
-breaker, and its hard or soft failure opens it again for the next longer cooldown.
-A probe that meets load frees the probe slot for the next page.
+`racer_rdma_breaker_trips_total{reason}` counts trips with reasons `link_down`, `grant`, `send`, `timeout`, `slow_fallback`, and `setup`. `racer_rdma_breaker_soft_failures_total{reason}` counts soft failures with `timeout`, `slow_fallback`, and `load`, and `load` never opens the breaker. `racer_rdma_breaker_open`, `racer_rdma_breaker_closes_total`, and `racer_rdma_breaker_http_total` show the current state and the work moved to HTTP.
 
-A write that fails or runs out of `RACER_RDMA_PAGE_TIMEOUT_MS` goes over HTTP in the
-same exchange, so it does not use up one of the page's retries. The sender releases the
-receiver's grant, and the receiver keeps the buffer reserved until that release
-arrives or the link breaks. A write that lands late can never land in a reused buffer.
-`racer_rdma_breaker_trips_total{reason}` counts trips by `reason`: `link_down`,
-`grant`, `send`, `timeout`, `slow_fallback`, or `setup`.
-`racer_rdma_breaker_soft_failures_total{reason}` counts soft and load failures that
-did not trip a breaker, by `reason`: `timeout`, `slow_fallback`, or `load`; a high
-count with few trips means congestion, not broken links. `racer_rdma_breaker_closes_total`
-counts breakers closed by a probe, `racer_rdma_breaker_open` is the number of breakers
-open or half-open now, `racer_rdma_breaker_http_total` counts pages sent or planned over
-HTTP because a breaker was open, and `racer_rdma_page_timeouts_total` counts grants and
-writes that ran out of `RACER_RDMA_PAGE_TIMEOUT_MS`. Trips and closes are logged, at most
-one line per second.
+Activation registers each rail's page-buffer pool. The pool is split evenly over rails, and a rail without a whole buffer is not used. `racer_rdma_free_buffers` shows what is left, and each grant holds one 18 MiB buffer until its page is consumed. `racer_rdma_receive_buffer_hold_nanoseconds_{sum,count}` measures how long a receive buffer is held.
 
-Native activation registers the page-buffer pool within 5 s plus 1 s per GiB of
-`RACER_REGISTERED_BYTES`. When it fails, the dataplane logs
-`stage=rdma-activation state=failed`, counts `racer_rdma_activation_failures_total`,
-reports no RDMA rails (so peers stop planning RDMA to it), and retries; it
-advertises its rails again once activation succeeds. `racer_rdma_active` is 1
-while rails are active, and `racer_rdma_free_buffers` counts free page buffers
-registered now, in blocks that still hand out buffers; it does not count the
-buffers the pool may still register.
+Grants are per link and bounded by the rail's pool. `racer_rdma_grant_waits_total`, `racer_rdma_grant_wait_granted_total`, `racer_rdma_grant_backpressure_total`, `racer_rdma_grant_owner_queue_full_total`, and `racer_rdma_grant_ahead_deferred_total` distinguish waiting, granting, and backpressure. `racer_rdma_owner_stalled` and `racer_rdma_grant_waiters` show a stalled owner thread or a queue of waiters.
 
-Activation registers only the first block of each rail's pool (an eighth of the
-rail's share of `RACER_REGISTERED_BYTES`, 2 to 32 buffers). The native thread
-then sizes each rail to its recent receive demand, in whole blocks: it registers
-another block on a helper thread as soon as a grant finds the rail empty or
-demand climbs, and stops handing out buffers from the newest block once demand
-has stayed below it for the hold time, deregistering the block when its last
-buffer returns. The hold time is 1000 times the measured time to register one
-block, between 1 s and 300 s, so slow registration is repaid before a block is
-dropped. Under memory pressure a rail keeps at most one block above use
-(`Elevated`) or none (`Critical`). `racer_rdma_pool_registered_bytes` shows
-the bytes registered across rails, draining blocks included: a draining block
-stays registered and charged until it is deregistered.
-`racer_rdma_pool_capacity_bytes` shows the bytes in blocks still handing out
-buffers, which sizing compares with `racer_rdma_pool_target_bytes`, the bytes
-wanted; `racer_rdma_pool_in_use_bytes` shows the bytes in use, draining blocks
-included. `racer_rdma_pool_blocks` and `racer_rdma_pool_draining_blocks` count
-blocks; `racer_rdma_pool_registrations_total`
-and `racer_rdma_pool_deregistrations_total` count blocks added and dropped after
-activation; `racer_rdma_pool_register_nanoseconds` and
-`racer_rdma_pool_hold_seconds` report the slowest rail's registration time and
-hold time. Registrations that rise with every burst mean bursts come further
-apart than the hold time.
+Plan and send metrics explain fallback: `racer_rdma_plan_http_total{reason}` uses `no_rail`, `ineligible`, `overflow`, and `direct_http`, and `racer_rdma_send_declined_total{reason}` uses `not_page` and `plan_mismatch`. Link health is reported by `racer_rdma_links_ready`, `racer_rdma_links_connecting`, `racer_rdma_links_backoff`, and `racer_rdma_links_breaking`, and link breaks carry reasons such as `error`, `timeout`, `peer_closed`, `closed`, `abandoned`, `declined`, `grant_expired`, and `device_lost`.
 
-`racer_rdma_receive_buffer_hold_nanoseconds_sum` and `_count` time each received
-page's buffer from its grant until it returns to the pool. A received page is
-copied out of its buffer before it is decrypted, delivered, or persisted, so
-divide the sum by the count: a hold well above the sender's send time means
-something still pins received buffers, and the pool then limits receive rate.
-`racer_rdma_http_fallback_total` counts pages that planned RDMA but went over
-HTTP; `racer_rdma_fallback_no_link_total` and `racer_rdma_fallback_grant_total`
-split out the two common reasons: no ready link to the peer yet, and a grant that
-failed. `racer_rdma_fallback_grant_overloaded_total` counts the subset of grant
-failures that found every page buffer of the rail, or every grant slot of the
-link, in use; for page requests it should stay near 0, since those push back
-instead. A receiver whose grant finds no free slot on its chosen rail first tries
-the peer's other ready rails on the same NUMA node, then waits in line on the
-chosen rail for up to 1 s (at most half the time left in the request). Waiting
-requests are queued in the native thread and use no CPU: each released buffer or
-grant slot goes to the oldest waiting request on its rail. Nothing is reserved
-while a request waits. A grant is held from the request until the sender's page
-lands, so exhaustion on a healthy link usually means a slow sender, and the
-registered pool sets how many pages a node receives at once. If no slot frees in
-time, a page request fails `Overloaded` and its range window retries it with
-backoff, rather than moving the page over HTTP at a much higher receive CPU cost.
-`racer_rdma_grant_backpressure_total` counts those page requests. Non-page
-bodies, and grants that fail because a link broke or a device was lost, still
-fall back to HTTP. `racer_rdma_grant_waits_total` counts grant requests that
-waited, `racer_rdma_grant_wait_granted_total` those that then got a slot, and
-`racer_rdma_grant_waiters` the requests waiting now. A steady backpressure count
-means the pool is too small for the senders' disk latency: raise
-`RACER_REGISTERED_BYTES`. Each link may hold as many grants as its rail has page buffers
-(the `RACER_REGISTERED_BYTES` pool split across rails, at most 1024), capped by
-the largest value whose queue pair and completion queue fit the device's
-reported `max_qp_wr` and `max_cqe` (and, with memory windows, `max_mw`), and by
-the peer's advertised limit. Registration mode posts up to 4 send work requests
-per send, so a device that reports 2048 for both, as MANA does, allows 111
-grants per link. A device that cannot fit even one grant fails RDMA activation.
-A single native thread per node (the RDMA owner) handles every grant, write,
-and release. If the owner spends 2 s inside one pass, or leaves a worker's
-commands queued for 2 s, `racer_rdma_owner_stalled` reads 1 and no rail counts as
-ready: new exchanges go over HTTP until the owner catches up. A grant whose command
-finds the worker's queue to the owner full also goes over HTTP at once, instead of
-pushing back, and counts in `racer_rdma_grant_owner_queue_full_total`.
-`racer_rdma_owner_passes_total` and `racer_rdma_owner_commands_total` count owner
-passes and the commands they handled. `racer_rdma_owner_immediate_wakes_total{reason}`
-counts passes followed at once by another pass instead of a sleep: `commands` (the
-pass used its whole command budget) or `completions` (a link reaped a full
-completion batch, or has completions that raise no event). Passes that keep growing
-on an idle node mean the owner is spinning; a stalled owner with passes that do not
-grow means it is stuck inside one pass.
-`racer_rdma_links_ready`, `racer_rdma_links_connecting`, `racer_rdma_links_backoff`,
-and `racer_rdma_links_breaking` count the node's links by state.
-`racer_rdma_link_breaks_total{reason}` counts links torn down, by `reason`:
-`error` and `timeout` (back off), `abandoned` (a failed setup exchange; backs off),
-`declined` (the peer refused the setup with `409`, `429`, or `503`; retries after
-1 s), `peer_closed` and `closed` (no backoff), and `grant_expired` (an exposed grant
-was neither written nor released within 10 s of its deadline, so the link closed;
-also counted as `closed`), and `device_lost` (the link's RDMA device was removed;
-no backoff). `racer_rdma_link_setups_total{outcome}` counts link
-setups this node initiated as `success`, `declined`, or `failed`.
-`racer_rdma_prefetch_failures_total` counts sends whose source page could not
-be mapped into the NIC ahead of the write (window mode prefetches each page
-through implicit on-demand paging); those writes may stall on NIC page faults.
-`racer_rdma_fallback_overflow_total` counts page bodies received over HTTP because the hop
-qualified by Site and rail but was not among the 256 RDMA peers both nodes chose.
-The receiving node of each such hop counts each delivered body once. Requests that
-deliver no body, such as misses, overloads, and failed exchanges, do not count.
-`racer_rdma_plan_http_total{reason}` counts page exchanges this node sends to a peer
-over HTTP, without ever planning RDMA, while it publishes RDMA rails itself. `reason` is
-`no_rail` (both nodes share a Site and publish rails, but not the page's rail, which
-usually means the nodes number their rails differently), `ineligible` (different or
-missing Site, or the peer publishes no rails), `overflow` (the hop qualified but is not
-among the RDMA peers both nodes chose), or `direct_http` (the exchange was sent directly
-over HTTP). Nodes that publish no rails count nothing.
-`racer_rdma_send_declined_total{reason}` counts granted pages the sending node declined
-to write, so the body went over HTTP and the receiver's grant was released: `not_page`
-(the response carried no page body) or `plan_mismatch` (the sender's plan for the page
-and hop disagreed with the granted rail, for example across a Site or rail change).
-
-An RDMA device can disappear while the dataplane runs, for example when an
-Azure host hot-unplugs and later replugs a MANA VF (`hv_netvsc ... VF slot 0
-removed` in `dmesg`), sometimes bringing it back under a new name such as
-`roceP30832p0s0`. The dataplane notices in either of two ways: the RDMA
-connection manager reports the device removed, or the device's PCI address is
-no longer at its activated name under `/sys/class/infiniband` (checked every
-2 s for rails whose PCI address is known). It then breaks every link on the
-device at once, so pending RDMA transfers fail and their reads fall back to
-HTTP without waiting for their deadlines. It also deactivates RDMA, so
-`racer_rdma_active` drops to 0 and new reads plan HTTP, and it stops
-advertising its rails, the same way as after a failed activation. Each loss
-logs `stage=rdma-device state=lost` and counts `racer_rdma_device_losses_total`.
-While the device is missing, the dataplane does not retry activation. Once
-every lost PCI address is back in sysfs and the old links are gone, it
-reactivates RDMA. It does not wait for received pages that are still held, for
-example by a read in progress: no NIC can reach them once their device is gone,
-so their page buffers are freed later, when the pages are released. Until then
-they stay counted against `RACER_REGISTERED_BYTES`, so a reactivation that
-cannot fund its pool yet fails and retries. While it waits, the dataplane logs
-`stage=rdma-device state=waiting reason=...` each time the reason changes:
-`device_missing:<device>` (nothing at its PCI address that discovery would
-keep: a device whose ports have no GID table or only a null GID, such as the
-`rdmaP...` twin that stays while a MANA VF's RoCE device is unbound, does not
-count, and the
-dataplane waits for as long as it takes), `device_inactive:<device>` (back, but
-no port is ACTIVE yet), `device_settling`, `drain_<blocker>` (the old round is still
-releasing its `links`, its `buffers` that a NIC may still use, its
-`registering` pools, or never releases a `leaked` native object),
-`inventory_refresh:<error>`, or `device_undiscovered`.
-Device names at each lost PCI address must hold still for 5 seconds before
-the dataplane lists devices again, so a udev rename of a replugged VF (for
-example `mana_0` to `roceP30832p0s0`) lands first: libibverbs keeps the name it
-first saw for the life of the process. Before reopening after a loss, the
-dataplane creates fresh `/dev/char/<major>:<minor>` nodes for every verbs
-character device in `/sys/class/infiniband_verbs`, because a container's
-bind-mounted `/dev/infiniband/uverbsN` keeps reaching the removed device and
-rdma-core falls back to `/dev/char`. It refreshes them again whenever the
-numbers sysfs lists change or one of their nodes is missing, including after
-an attempt that could not discover the device, so a device that returns with
-a new minor number after any outage is reopened without a restart. After a loss, activation retries every
-2 seconds instead of backing off. Once the device is back with an ACTIVE port
-and a non-null GID, 6 consecutive attempts that cannot use it (activation
-failures or `device_undiscovered`; waiting while the device is missing,
-inactive, or settling never counts) log `stage=rdma-device
-state=restarting reason=device_unusable` and fail the worker, so the process
-restarts with a fresh verbs device list. Reads use HTTP until then.
-`racer_rdma_reactivation_waiting_device` is 1 while it waits for a device and
-`racer_rdma_reactivation_waiting_drain` is 1 while it waits for the old round.
-A failed activation logs `stage=rdma-activation state=failed` when it withdraws
-the rails, and again on the 1st, 2nd, 4th, 8th, and so on consecutive failed
-retry. A device that came back under a new name
-refreshes the device inventory first; rails are keyed by PCI address, so it
-keeps its rail. Only ports with a non-null GID are inventoried, so a VF that
-comes back as two devices at one PCI address (for example `rdmaP30832p0s0`
-with a null GID and `roceP30832p0s0` with the RoCE GID) uses the RoCE one.
-While its rails are withdrawn, the membership lists none for this node, so
-reactivation (like the retry after a failed activation) uses the discovered
-rails and then advertises them again. A successful reactivation logs
-`stage=rdma-device state=reactivated` and counts
-`racer_rdma_device_reactivations_total`.
-
-A dataplane with RDMA enabled that discovered no usable rail (it logs
-`stage=rdma-activation state=waiting reason=publication_empty:discovered=0`),
-for example because it started while a device was unbound, rescans every 10
-seconds. The rescan first reads `/sys/class/infiniband` only, listing devices
-with an ACTIVE port and a non-null GID, and logs `stage=rdma-rescan
-state=sysfs devices=[...]` each time that list changes. The list must then hold
-still for 5 seconds, so a returning device is opened under its final udev name.
-Only when it lists a
-device the inventory lacks does the dataplane refresh `/dev/char` nodes and
-rediscover ports (without starting a connection manager listener). Once that
-finds rails, it logs `stage=rdma-rescan state=discovered`, activates them, and
-advertises them on success. A node without RDMA hardware therefore costs one
-directory read per rescan and logs once.
-
-The RDMA owner thread hands queue pair and connection manager teardowns to
-helper threads named `racer-rdma-reaper`, at most one teardown every 2 ms per
-helper. A burst of link closes, such as every link going idle at once or a node
-close, therefore reaches the device spread out. A teardown that hangs in the
-kernel also cannot stall the owner. The dataplane keeps every buffer the queue
-pair may still use until the teardown returns, so a teardown that never returns
-leaks that memory instead of freeing it early. Such a hang also keeps RDMA from
-reactivating until the dataplane restarts. Restarting may not help either: a
-thread in uninterruptible sleep can keep the process from exiting, and that
-takes a node reboot.
-
-The Node annotation `racer.unbounded-cloud.io/rdma-nics` accepts at most 64 entries:
-
-```json
-[{"device":"mlx5_0","port":1,"rail":0}]
-```
-
-`port` is 1..255; `rail` is 0..65535. Optional `gid` is 32 lowercase hex digits;
-optional `numa_node` is `uint32`. Device/port pairs must be unique; NICs may share a rail.
-
-Absent administrator policy uses eligible active ports in PCI BDF/port order,
-published from the dataplane's own Pod report. A port is eligible on a device with
-type 2B memory windows (window mode), or on a device without memory windows that
-supports RC queue pairs and has an IPv4-mapped RoCE GID (registration mode, for
-example Azure MANA guest RDMA).
+A device that disappears is detected and counted in `racer_rdma_device_losses_total`; a replacement is counted in `racer_rdma_device_reactivations_total`. Racer refreshes its view of `/dev/char` so rdma-core can resolve a renumbered verbs device by major and minor number, and it retries activation after a restart. A node waiting for a device or a drain reports `racer_rdma_reactivation_waiting_device` or `racer_rdma_reactivation_waiting_drain`. Teardown reaper threads finish cleanup after a link is abandoned or a device is removed.
 
 ### Registration mode
 
-Registration mode keeps transfers zero copy without memory windows or on-demand
-paging. A grant registers the granted page buffer itself for remote write and
-sends that registration's key; the arrival deregisters it, so the key works for
-exactly one transfer into exactly one buffer. A write registers the sender's
-page memory for local access, writes straight from it, and deregisters it on
-completion. Page memory is 2 MiB aligned and huge-page backed, so these
-registrations are cheap. Queue pairs connect through the RDMA connection manager
-on the node's IPv4 address:
+Racer registers page buffers ahead of a transfer and exposes them to the sender through a grant. A grant carries a length, an address, a remote key, and a nonzero 32-bit tag plus a 16-byte transfer ID. The registration key is valid for one transfer; a zero tag, an unknown tag, a duplicate tag, or a credit overrun is rejected. This is zero-copy: the sender writes into the receiver's registered buffer, and the receiver verifies and consumes the page in place.
 
-- The dataplane must run in the host network namespace: patch the `racer`
-  DaemonSet with `hostNetwork: true` and `dnsPolicy: ClusterFirstWithHostNet`.
-- Each dataplane listens on TCP port `RACER_RDMA_CM_PORT` (default 18515) of its
-  RDMA device's address for connection requests. Requests must name a link both
-  peers set up through the authenticated exchange.
-- The image ships rdma-core 65, which has the MANA RC provider (rdma-core 54 or
-  later is required).
-- Window keys rotate per grant in both modes; registration mode reports the
-  whole written length through the immediate's top byte, so link tags use 24 bits. Explicit
-`[]` disables eligibility; a list overrides automatic rails. Discovery cannot infer cabling
-or correct asymmetric initial inventories: use explicit mappings when ordinals do not match.
+Each dataplane's RDMA connection manager listens on `RACER_RDMA_CM_PORT`, 18515 by default, and the port must match on every node. The peer listener and the CM port must be reachable between nodes, so use host networking or a Pod network that routes those ports. The image builds rdma-core 54 with the patches needed for RC queue pairs on Azure MANA; a different rdma-core may not support the same devices.
 
-The private identity directory's `rdma-rails.json` (on the host,
-`/var/lib/racer/identity/rdma-rails.json`) preserves physical-port reservations across
-renewal/restart. A port is identified by its PCI address and port number, or by its device
-name when sysfs reports no PCI address, so a device renamed by a VF hot-unplug/replug (for
-example `mana_0` becoming `roceP30832p0s0`) keeps its rail. Missing ports retain their rails
-until a new port appears; the new port then takes the lowest rail whose port is missing, so
-a replaced device reuses its predecessor's rail. Ports with no reservation append. The
-journal is versioned; a legacy unversioned journal, which was keyed by device name, is
-discarded on start and rails are renumbered in PCI BDF/port order. Do not delete it
-independently of coordinated topology changes. Corruption fails enrollment instead of renumbering rails.
+Rail identity is durable. The identity directory holds a versioned rail reservation journal that maps a stable hardware key, the PCI address plus port, to a rail number. A renamed device at the same PCI address keeps its rail. A withdrawn port keeps its reservation until a new port needs a rail, and the new port then takes the lowest rail whose port is absent, so a replaced device reuses its predecessor's rail instead of growing the rail space. On a node with no journal, rails follow PCI and port order, so homogeneous nodes agree on what rail N means. A malformed journal is reported as a corrupt record and is never silently renumbered.
 
-Dataplanes run privileged as root with escalation allowed and a read-only root filesystem.
-HostPaths `/var/lib/racer/identity`, `/var/lib/racer/slabs`, and `/run/racer` are writable;
-host `/dev` at `/host/dev` and `/dev/infiniband` are read-only for directory entries,
-not device-I/O isolation. Raw cache writes through `/host/dev` are intentional. This is
-hostPath access, not device-plugin/CDI allocation or a host security boundary. Kubelet may
-create an empty device directory on HTTP-only nodes; Racer does not provision drivers/devices.
+The dataplane container must be privileged to open verbs devices, pin memory, and load the native adapter. Mount the host device tree read-only at `/host/dev`, and make sure the container runtime passes through the RDMA character devices and `/dev/infiniband`. Check `/debug/hardware` for the devices and ports Racer sees, confirm the `rdma-nics` annotation or Pod report, and watch `racer_rdma_links_ready` before expecting RDMA traffic. A node with `racer_rdma_active` 0 but `racer_rdma_links_ready` 0 is not failing; it has no eligible port.
 
-Verify from the actual Pod namespaces:
+Coordinate upgrades across both ends of a link. Restart one side at a time, expect the old links to break with `closed` or `peer_closed`, and wait for reactivation before draining the next node. Keep Site labels and rail numbers stable across the upgrade; a changed Site or rail makes the pair ineligible, moves that traffic to HTTP, and shows up in `racer_rdma_plan_http_total{reason="ineligible"}`.
 
-- Compatible drivers/firmware/providers, active MW2B ports, and sufficient pinned-memory/resources.
-- Visible `/sys/class/infiniband`, `/sys/class/infiniband_verbs`, and `/sys/devices`
-  targets; no host `/sys` mount is automatically added.
-- RDMA namespace mode allows device access. Privilege/mounts do not override exclusive
-  namespace ownership; explicitly enable host networking if needed, reviewing port exposure/conflicts.
-- RoCE has the correct namespace-local Ethernet device, address, routing, and GID.
-  The adapter uses **GID index 0**. Annotation `gid` is a matching constraint, not an index
-  selector or RoCE configuration; retain HTTP when another index is required.
+## Related
 
-Coordinate dataplane and origin-adapter upgrades and quiesce traffic; rolling updates
-do not make mixed versions safe.
-Validate transfers, HTTP fallback, and recovery on target hardware before relying on RDMA.
+- [Racer concepts]({{< relref "concepts/racer" >}}) for the cache model and the read path.
+- [Racer object sidecar]({{< relref "reference/racer-object" >}}) for the injected `racer-object` sidecar.
+- [Serving vLLM with Racer]({{< relref "guides/racer-vllm" >}}) for a complete client deployment.
+- [GPU reference]({{< relref "reference/gpu" >}}) for NVIDIA and AMD node setup.
+- [Networking reference]({{< relref "reference/networking" >}}) for Sites, gateways, and node connectivity.

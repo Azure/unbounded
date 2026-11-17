@@ -1,609 +1,944 @@
 ---
 title: "Distribute Container Images with Gantry"
 weight: 8
-description: "Deploy and operate Gantry as a peer-to-peer containerd registry mirror."
+description: "Run the Gantry peer-to-peer OCI distribution agent so nodes share image layers instead of every node pulling them from the upstream registry."
 ---
 
-Gantry is a decentralized, peer-to-peer OCI distribution layer for Kubernetes.
-It reduces duplicate origin-registry traffic during large rollouts by
-coordinating each digest fetch on a small number of nodes and serving the
-content from peers that already have it.
+## Overview
 
-Large container images can put substantial pressure on a registry when hundreds
-or thousands of nodes start the same workload at once. Without coordination,
-every node downloads the same layers independently. This can amplify registry
-traffic, trigger rate limits, and require additional registry replicas or
-egress capacity.
+Gantry is the peer-to-peer OCI distribution layer in Unbounded Kubernetes. It runs a small
+agent on every node that presents itself to containerd as a normal registry mirror, then
+resolves digest-addressed content from three sources in order: the node's own containerd
+content store, a peer that already holds the content, and finally the upstream registry
+through a bounded set of designated pullers.
 
-Gantry moves that fan-out into the cluster. A bounded group of nodes downloads
-new content from the origin, and nodes that finish a pull become providers for
-other nodes.
+The problem it solves is registry fan-out. Without Gantry, a rolling update of a 1,000
+node cluster makes every node request the same layers from the same registry endpoint in
+a short window. The registry front end, its private endpoint, and the network path to it
+all see the full fleet's worth of duplicate requests for identical bytes. With Gantry, a
+small cohort of nodes fetches each unique layer once and the rest of the fleet streams
+those bytes from its neighbors.
 
-Gantry runs as a DaemonSet and uses each node's existing containerd content
-store for complete blobs. Artifact Streaming additionally uses a bounded cache
-of partial byte ranges; neither path needs a central metadata service. Peer
-discovery uses libp2p and a distributed hash table (DHT). Containerd verifies
-complete OCI content digests, while streamed OverlayBD reads validate range
-framing and any checksums carried by ZFile layers.
+Use Gantry when your clusters pull large images repeatedly, when many nodes start the
+same workload at once, or when the link to your registry is expensive or rate limited.
+You do not need it for a small cluster that pulls a handful of images, and you should not
+use it as an image cache in front of a registry that is already local to every node.
 
-After the node-level mirror configuration is installed, Gantry is transparent
-to workloads. Pods continue to use normal OCI image references,
-`imagePullSecrets`, and kubelet credential providers.
+Gantry is a pull-path component. It serves manifest and blob reads to containerd and to
+other agents; it never accepts image pushes. Content integrity comes from the OCI digest,
+so a peer cannot substitute different bytes for the digest it was asked for.
+
+A Gantry deployment needs three things: Linux nodes running containerd with a socket
+Gantry can read, containerd configured to consult `/etc/containerd/certs.d` for registry
+configuration, and at least one upstream registry entry. Unbounded nodes provisioned by
+`unbounded-agent` already meet the containerd side of that contract.
 
 ## Measured at scale
 
-In a 1,000-node cold rollout of a 40 GiB image, the measured chair-design run
-set used 99.2% less ACR Private Endpoint traffic than the direct-origin
-reference set. Mean pod-start P95 was 24.5% lower. Every Gantry run completed
-all 1,000 pods.
+The design targets large, homogeneous fleets where many nodes need the same layer at the
+same moment. Benchmarks in this project therefore measure four things: whether a cold
+rollout can place content on a large number of nodes, how much upstream registry traffic
+that rollout generates, how long a new pod waits before its container starts, and how
+many pods complete within a fixed rollout window.
 
-See [Gantry Performance at Scale](/guides/gantry-benchmark/) for raw run values,
-methodology, calculations, and limitations.
+The results depend on the cluster, the registry, the network, and the image shape, so
+treat any single number as a property of its test environment rather than a guarantee.
+The methodology, the test harness, and the caveats around both live in
+[Distribution benchmarks]({{< relref "guides/gantry-benchmark" >}}). That page is the
+reference for the numbers; this page explains the machinery that produces them.
 
-### Artifact Streaming startup
-
-ACR Artifact Streaming removes the requirement to download and unpack the
-entire image before starting a container. Gantry serves the required image
-ranges from local content, peers, or origin and prefetches mount-critical
-metadata, while whole-layer distribution can continue in the background.
-
-The 1,000-node, 40 GiB/40-layer results are:
-
-| Pod-start latency | Gantry full-image pull, three-run mean | Gantry + Artifact Streaming, five-run mean | Observed reduction |
-| --- | ---: | ---: | ---: |
-| P50 | 636.100s | **8.000s** | **98.7%** |
-| P95 | 712.667s | **20.200s** | **97.2%** |
-| P100 | 803.933s | **49.000s** | **93.9%** |
-
-All five streaming runs on October 22, 2026 completed **1,000/1,000 pods** each
-with a fresh random payload. Values are means of per-run percentiles, not
-pooled percentiles; the maximum across all 5,000 pods was **67 seconds**.
-The full-image and streaming cohorts are historical, unpaired measurements,
-not a controlled A/B test. Streaming times measure startup, not a complete
-payload download or read; shared base layers may already be cached.
-
-See the [Artifact Streaming benchmark details](/guides/gantry-benchmark/#artifact-streaming-startup-benchmarks)
-for individual runs, the metadata-prefetch optimization, and measurement limits.
+One structural caveat is worth stating here because it shapes expectations. Peers can
+only serve content that some node already holds. In a cold cluster with no prior copy of
+an image, the first wave of requests has no providers, and the cold-start path must
+recruit origin pullers before any peer transfer is possible. Gantry bounds that first
+wave deliberately, which means the first rollout of a brand new image is slower than the
+second and later rollouts of the same digest.
 
 ## Design principles
 
-| Principle | Behavior |
-| --- | --- |
-| Transparent to workloads | Pods keep their normal image references, pull policies, and credentials. |
-| Decentralized | There is no central Gantry content server or cluster-wide catalog. |
-| Reuse node storage | Complete blobs use containerd's content store; Artifact Streaming also caches bounded partial ranges. |
-| Digest addressed | Discovery and transfer operate on immutable OCI digests rather than tags. |
-| Horizontally supplied | A node that completes a pull can immediately serve the same content to other nodes. |
-| Registry fallback | Retriable mirror responses let containerd continue through its configured registry host chain. |
+Three properties drive most of the design decisions you will encounter when operating
+the agent.
+
+Workload transparency means a node decides for itself whether and how to participate in
+distribution, using only local state and the content store it can see. There is no
+central catalog that must be consulted before a pull can proceed, and there is no
+controller in the request path. A node that has the bytes serves them; a node that lacks
+them asks the swarm and then, if necessary, asks a designated chair to fetch them.
+
+Decentralization means discovery is content addressed. Agents publish that they hold a
+digest into a cluster-scoped Kademlia DHT and look up holders of that same digest. The
+only shared coordination objects are a fixed set of Kubernetes Leases that elect the
+nodes allowed to pull from origin. Those Leases are not a content index: they bound
+concurrency, they do not describe what exists.
+
+Storage reuse means Gantry does not maintain a second image cache. Its content store is
+the node's containerd content store, so images that kubelet already pulled are available
+to peers, and images Gantry fetched for a peer are available to kubelet. The lifetime of
+a blob is governed by containerd garbage collection, which keeps the agent's disk
+footprint bounded by the same policy that bounds the node's image footprint.
 
 ## Architecture
 
-![Gantry architecture: Requester node with Workload, containerd, and Gantry A; Gantry peer network containing the libp2p DHT and a Selected puller node with Gantry B and its containerd content store; Gantry A looks up providers in the DHT and coordinates pull plus streams image content with Gantry B, which fetches once from the Origin registry, while the requester containerd retains a direct fallback path to the Origin registry](../../img/gantry-architecture.svg)
+![Gantry agents form a DHT-backed peer network and a small chair cohort in front of the upstream registry](../../img/gantry-architecture.svg)
 
-The DHT contains provider records, not image data. Manifests and layers stream
-directly from the selected Gantry peer, while containerd remains responsible
-for digest verification and the node-local content store.
+Each agent runs a libp2p host with a persisted identity, joins a cluster-scoped Kademlia
+DHT using the `/gantry` protocol prefix, and participates in server mode. Server mode is
+required because every agent is also a content provider: a client-mode peer would not
+store provider records for other nodes. Provider records are keyed by a CIDv1 that wraps
+the raw 32 bytes of the OCI digest, so any agent can derive the lookup key for a digest
+without contacting a central service.
 
-Each network endpoint has one role:
+The persisted identity file under `/var/lib/gantry/libp2p` is what makes peer IDs stable
+across restarts. Losing that file is not catastrophic, because provider records age out,
+but it churns the routing table and invalidates the addresses peers recorded for the
+node.
 
-| Port | Purpose | Transport |
-| ---: | --- | --- |
-| 5000 | Node-local containerd mirror | HTTP on node loopback through hostPort |
-| 5001 | Peer manifest and layer transfer | Cleartext HTTP/2 inside the trusted cluster network |
-| 5002 | Ask selected chairs to start origin pulls | TLS with chair identity validation |
-| 4001 | libp2p discovery and coordination | Encrypted TCP and QUIC |
-| 9095 | Readiness, health, and Prometheus metrics | HTTP |
+Bootstrap has two inputs. `libp2p_bootstrap_peers` accepts a static list of multiaddrs,
+which is useful for a fixed set of seed nodes. In normal operation the dynamic bootstrap
+pool comes from the chair Leases: each Lease records the holder's dialable addresses, so
+a starting agent can connect to the current chair holders and join the DHT from there.
+The connection manager trims idle connections above `libp2p_conn_manager_high` back to
+`libp2p_conn_manager_low`, which keeps a large fleet from converging on a full mesh as
+lookups open connections to every peer they walk.
+
+Provider records are refreshed by a sweeping provider. `dht_provider_validity` bounds how
+long a record may be served after its last publication, and `dht_reprovide_interval`
+spreads refreshes across the interval with up to `dht_max_reprovide_delay` of extra delay.
+Validation requires the interval plus the maximum delay to stay below the validity, so a
+record cannot expire before the sweeper is due to renew it. A background advertiser also
+reconciles its inventory against the local content store every
+`advertise_reconcile_interval`; the fast path is an eager publish when a stream commits,
+and the reconcile is the backstop that catches missed events and drives withdrawals.
+
+The agent exposes five listeners. Each has a distinct trust level, which matters when you
+write network policy. Two terms recur below. A provider is any agent that has advertised
+a digest it can serve. A chair is an agent that currently holds one of a fixed set of
+Kubernetes Leases; only chairs may pull from the registry during cold start, which is how
+the fleet bounds origin concurrency.
+
+| Port | Listener | Purpose |
+| --- | --- | --- |
+| `5000` | `mirror_listen` | The containerd-facing OCI mirror. Loopback by default; the default chart profile binds `0.0.0.0` and publishes it as a host port on `127.0.0.1`. |
+| `5001` | `transfer_listen` | Peer-facing HTTP/2 cleartext endpoint that serves blobs and digest-addressed manifests from the local content store. |
+| `5002` | `chair_listen` | HTTPS endpoint for cold-start `please_pull` calls between agents. |
+| `4001` | `libp2p_listen` | libp2p TCP and QUIC transport for DHT traffic and coordination. |
+| `9095` | `metrics_listen` | Prometheus metrics plus the `/livez`, `/healthz`, and `/readyz` probes. |
+
+The mirror and transfer endpoints share the same OCI URL shape, `/v2/<repository>/blobs/<digest>`
+and `/v2/<repository>/manifests/<digest>`, which lets the same client code talk to either
+one. They differ in policy: the mirror may resolve an unknown digest through peers or
+cold start, while the transfer endpoint only ever serves what is already on disk.
 
 ## How Gantry Handles a Pull
 
-Containerd still resolves image tags through the origin registry. That produces
-immutable manifest and layer digests. Gantry handles the digest-addressed
-requests behind containerd's mirror interface.
+A pull passes through the mirror listener on port 5000. containerd selects that listener
+because its `hosts.toml` for the registry lists it first, and it sends the registry name
+as the `?ns=` query parameter whenever the file also declares a `server`. Gantry uses
+`?ns=` to choose which upstream entry applies. If you configure exactly one upstream, the
+parameter is optional and ignored when present. If you configure several, a request whose
+`?ns=` matches none of them is answered with `404`, and the registry must be added to
+`upstream_registries` before its requests can be mirrored.
+
+### Tag resolution and digest-addressed requests
+
+Gantry does not resolve tags. A request for `/v2/<repository>/manifests/<tag>` receives
+`503` with an empty body, which is deliberate: containerd only falls through to the next
+mirror entry on a 5xx response, so the `503` hands tag resolution to the upstream
+registry. A `404` here would be treated as a hard error and break the pull.
+
+Once containerd knows the manifest digest, every later request is digest addressed, and
+that is the traffic Gantry serves. The same rule applies to manifests and blobs: a
+digest-addressed request enters the resolution path, a tag-shaped request does not.
+
+A `HEAD` request for a digest that is not cached returns metadata without warming the
+cache. Caching a multi-gigabyte blob because a client asked for its size would recreate
+the bandwidth amplification Gantry exists to remove. A subsequent `GET` for the same
+digest follows the normal miss path and populates the node.
 
 ### Local and warm pulls
 
-1. Gantry first opens the digest from the local containerd content store.
-2. On a local miss, Gantry asks the DHT for nodes that advertise the digest.
-3. Gantry filters stale, unavailable, self, and suspicious providers, then
-   requests the content from a remaining peer.
-4. The peer reads the bytes from its containerd store and streams them over
-   the transfer endpoint.
-5. The requester hashes the stream while containerd performs the final digest
-   verification and commits the content.
-6. After the commit, the requester advertises itself as another provider.
+The first check is the node's own containerd content store. A hit is served directly from
+disk and counted by `p2p_cache_hit_total`; this is the cheapest outcome and the common
+one after the first pull of an image on that node.
 
-Supply therefore grows during a rollout. Nodes that complete a layer can serve
-it to the next requesters instead of sending every request back to the original
-seed.
+On a miss, the agent asks the DHT for providers of the digest. A lookup can return records
+that are no longer useful, so the agent filters candidates before dialing. It excludes
+itself, because a node cannot fetch from its own transfer endpoint, and it excludes
+providers it recently found to be stale or unavailable. A provider that answers `404` is
+marked stale for three minutes; a provider that cannot be reached is avoided for thirty
+seconds. Both windows are local decisions, not cluster-wide bans.
 
-If a peer stream ends partway through, Gantry can preserve the verified offset
-and resume from another provider with an HTTP Range request instead of
-restarting the entire transfer.
+For each remaining candidate, the agent issues a peer request to the transfer endpoint
+with the `Gantry-Mirrored: 1` header. That header is the loop breaker: the peer either
+serves the requested bytes from its content store or returns `404`, and it never starts
+its own lookup, cold start, or origin pull. Without the header the endpoint rejects the
+request with `400`, which prevents two agents from recursing into each other's miss paths.
+
+The response body is hashed as it streams. Before the content is committed to the
+containerd store under the requested digest, the computed hash must equal the digest, so
+a corrupted or malicious peer response cannot poison the store. A mismatch quarantines
+that provider and fails the attempt.
+
+A completed transfer is committed through containerd with a content lease, and the agent
+advertises the new digest immediately. Other nodes that were waiting on the same layer
+see the provider record and join the warm path without contacting the registry. During a
+rollout the provider set therefore grows from the initial cohort outward, and each new
+node adds capacity instead of load.
+
+If a peer stream fails partway through, the requester can resume from the verified prefix
+with an HTTP `Range` request against another provider or the same one. The transfer
+endpoint answers a satisfiable range with `206 Partial Content` and a correct
+`Content-Range`, so a large layer does not restart from zero because one provider
+disappeared.
 
 ### Cold pulls
 
-When the DHT has no provider, Gantry selects a bounded origin-puller cohort:
+When a digest has no providers, the agent falls back to cold-start coordination. This is
+the path that protects the registry: instead of every requester opening an origin pull,
+a small cohort is elected to fetch the content and the rest of the fleet waits for the
+resulting provider records.
 
-1. Gantry reads the current Kubernetes Lease assignments for the chair pool.
-2. Every requester ranks the same chair slots for the digest using
-   highest-random-weight selection.
-3. The highest-ranked group receives concurrent requests to start the origin
-   pull. Each selected chair starts at most one local pull for the digest.
-4. A chair commits the content to its containerd store and advertises itself.
-5. Waiting requesters discover the provider and continue through the warm path.
+The requester takes a snapshot of the chair Leases and ranks the selectable chairs for
+the digest with highest-random-weight hashing. The ranking is deterministic for a digest,
+so independent requesters tend to choose the same chairs and duplicate origin work is
+suppressed without any shared lock. The cohort size comes from `chair_seed_count`, scaled
+down proportionally when fewer chairs are selectable than `chair_count`.
 
-The default configuration has 64 chair slots and a full-pool seed target of
-eight. Different digests produce different rankings, which distributes origin
-work across the pool without a central per-layer coordinator.
+The requester then calls `please_pull` on each chair in the cohort over HTTPS on port
+5002. It pins the chair's self-signed certificate to the peer ID published in that chair's
+Lease, so the call cannot be redirected to another node, and it includes the Lease
+generation it saw so a chair that has been replaced during rotation can decline. A chair
+can answer in four ways: it started the pull, it is already pulling that digest, it
+recently failed with a class the requester can trust, or the requester's view of the chair
+is stale. A `started` or `already_pulling` answer means the work is under way; a trusted
+failure short-circuits the cascade so requesters do not pile onto an origin that is
+failing for everyone.
 
-Gantry routes content by digest. Tag resolution still reaches the origin, so
-the exact reduction in registry requests depends on image composition and
-rollout size. Large layers distributed to many nodes receive the greatest
-benefit.
+The chair pulls the content from the upstream registry, respecting
+`coord_max_concurrent_pulls` and the origin progress timeout, commits it to its local
+containerd store, and advertises it. The waiting requester polls the DHT for the digest
+while this happens. When a provider appears, the request continues on the warm path,
+which is why a cold pull and a warm pull share the same client code after the wait.
 
-Manifest-child prefetch sends bounded requests to start pulls, rather than
-tracking them to completion. A failed or stale chair gets one refresh and
-retry; failed groups return a partial-prefetch error. Prefetch does not
-automatically redispatch when nodes crash or chair assignments change. A later
-manifest prefetch or pull retry reads a fresh chair snapshot and can restart
-work elsewhere. Once accepted, an origin pull runs independently of the
-request context and chair reassignment, but a process or node crash stops it.
+Chairs also prefetch manifest children so a rollout does not serialize on discovery of
+each layer. `prefetch_coordinator_replicas` limits how many consumers dispatch prefetch
+requests, `prefetch_max_concurrent_groups` bounds simultaneous outbound groups per
+manifest, and `prefetch_dispatch_jitter` spreads the first wave so a cold image does not
+put every node on origin at the same instant. Prefetch is best effort: a failed group is
+reported and retried by a later request rather than failing the pull.
+
+If the cascade runs out of chairs without a provider, or a chair reports a transient
+failure, the requester does not immediately pull from origin itself. A direct origin pull
+requires the fallback gate to pass: the bootstrap window must have elapsed or the routing
+table must have grown past `bootstrap_routing_table_pct`, the DHT must look healthy
+enough, no deduplication collision may exist, a per-node token bucket must admit the
+pull, and a jittered delay must elapse without a provider appearing. When the gate
+refuses, the mirror returns `503` and containerd falls through to the registry directly,
+which preserves the pull at the cost of one origin copy.
 
 ## Failure recovery
 
-Gantry classifies failures so one bad provider does not restart the entire
-rollout:
+Gantry treats peer failures as expected events and classifies them rather than retrying
+indiscriminately. The following behaviors are the ones you will see in logs and metrics.
 
-| Condition | Behavior |
-| --- | --- |
-| Peer returns 404 | Mark the provider stale for the digest and try another provider. |
-| Peer returns 429 | Treat the peer as busy and reselect without quarantining it. |
-| Peer is unavailable | Temporarily avoid that peer. |
-| Stream stops | Resume the verified prefix from another provider when possible. |
-| Digest mismatch | Reject the transfer and quarantine that provider for the digest. |
-| Chair is already pulling | Treat the response as progress and wait for a provider advertisement. |
-| Selected chair group makes no progress | Move to the next ranked group after bounded rechecks. |
-| Warm providers are exhausted | Return a retriable response so containerd can use its next configured host. |
-| Chair ranking is exhausted | Evaluate the guarded direct-origin fallback or return a retriable response. |
+A peer that answers `404` is stale for that digest: its provider record outlived the
+blob, usually because containerd garbage collection removed it or a node evicted the
+image. Gantry skips that provider for three minutes and continues with the next
+candidate. The request does not fail, and a later request may find the record gone.
 
-The guarded direct-origin fallback checks DHT bootstrap and health,
-deduplication, local rate capacity, a randomized delay, and one final provider
-lookup before starting another registry pull. These gates favor retry over an
-uncoordinated registry stampede.
+A peer that answers `429` is alive but at capacity. The transfer endpoint sheds blob
+serves above `transfer_max_concurrent_serves` so that one popular node does not accept
+more streams than it can feed. The requester honors the `Retry-After` hint when present,
+re-discovers providers, and moves to another peer rather than waiting on the busy one.
+
+A peer that cannot be dialed is avoided for thirty seconds. Connection refused and dial
+timeouts are the common cases. If the requester had already written response headers and a
+verified prefix, it closes the truncated response so containerd can retry, and the retry
+resumes from a verified offset.
+
+A digest mismatch is a different class entirely. The stream is aborted before commit, the
+provider is marked suspicious for five minutes, and the failure is counted. Repeated
+mismatches between the same pair of nodes point at storage corruption or a bug, not at
+network flakiness.
+
+Cold-start failures are handled by the chair cascade. A chair that reports
+`already_pulling` returns progress information rather than starting a second pull, so a
+thundering herd of requesters for the same digest converges on one origin fetch. If a
+chair's Lease expires, requesters see it as stale, rank the remaining chairs, and
+continue. Chair rotation reserves a successor before an epoch boundary, so a healthy
+cluster does not have a window where a digest has no eligible chair.
+
+Finally, failure classes are shared where that is safe. Authentication failures, not
+found responses, and rate limiting from origin are trusted cluster-wide for a cooldown
+window, because retrying them from a different node will not help. Transient failures are
+honored only locally, because a different path or a later attempt frequently succeeds.
 
 ## Security and integrity
 
-- Containerd verifies every requested digest before using the content.
-- Gantry also hashes live peer streams and quarantines a provider after a
-  mismatch.
-- libp2p discovery and coordination traffic is encrypted.
-- Chair origin-pull requests use TLS and validate the current Lease holder's
-  identity.
-- The high-volume peer transfer endpoint uses cleartext HTTP/2. Restrict port
-  5001 to trusted Gantry peers with NetworkPolicy or equivalent network
-  controls.
-- The containerd mirror is bound to node loopback through hostPort 5000.
-- Request-scoped registry credentials are not persisted by Gantry.
+Every peer transfer is verified against the OCI digest. The stream hash is computed while
+the body is read and compared before the content is committed, so a peer cannot return
+different bytes for a digest and have them accepted. containerd verifies the same digest
+again when the content is ingested, which means an integrity failure surfaces even if the
+agent's own check were bypassed.
+
+The DHT and the chair RPC use different protections. libp2p traffic is encrypted with
+Noise, and the chair listener serves TLS with a self-signed certificate derived from the
+agent's libp2p identity key. A requester verifies that certificate by recovering the peer
+ID from it and comparing that with the peer ID published in the chair's Lease, so there is
+no certificate authority to operate and no way to redirect the call to another node. The
+chair separately validates that it still owns the Lease generation named in the request,
+so a chair that has been replaced during rotation refuses the work instead of splitting
+the cohort.
+
+The peer transfer endpoint on port 5001 is HTTP/2 cleartext by design. It assumes the
+cluster network is trusted and relies on network policy, the `Gantry-Mirrored` header
+gate, and digest verification rather than on transport encryption. If you need
+on-the-wire confidentiality between nodes, layer a service mesh with mutual TLS above
+Gantry rather than trying to terminate TLS on the transfer listener.
+
+The mirror listener is loopback-only by default, and validation rejects a non-loopback
+bind unless `mirror_bind_allow_non_loopback` is true. The shipped chart sets that opt-in
+because it publishes port 5000 as a host port with `hostIP: 127.0.0.1`: the socket facing
+the cluster is still reachable only from the node, and the wildcard bind inside the pod is
+what makes the host port work. If you run the agent outside Kubernetes, keep the default
+and leave the mirror on the loopback interface.
+
+Registry credentials are handled per request. With requester-delegated authentication,
+containerd's credential travels with the request, the agent relays the registry challenge,
+and the authorization containerd supplies is used for that request and then discarded
+rather than cached on the node. Shared-identity mode exists for compatibility and reads a
+credential file at startup, which means the secret is present on every node that runs the
+agent.
+
+The agent's Kubernetes permissions are deliberately narrow. It can get, list, create,
+and update `leases` in its own namespace, and it can get its own DaemonSet so it knows how
+many holders the chair pool can have. It runs no informer and opens no watch, needs no
+access to Pods or Nodes, and should never be granted a `ClusterRole`.
 
 ## Deployment options
 
-Gantry is available in two deployment models:
+There are two supported ways to install Gantry, and they are mutually exclusive in a
+cluster.
 
-- **Operator managed:** the Unbounded operator owns the Gantry configuration,
-  image, RBAC, chair Leases, and DaemonSet as part of an Unbounded cluster.
-- **Standalone Helm chart:** third-party Kubernetes clusters can install and
-  upgrade Gantry directly from the published OCI chart.
+An operator-managed installation uses the manifests embedded in the `unbounded-operator`
+binary. The operator applies them with its own image, ConfigMap, and Lease ownership
+semantics, installs into the `unbounded-system` namespace, and never runs Helm. Gantry is
+enabled by default for a Site, so an operator-managed cluster normally has it unless a
+Site explicitly disables it.
 
-Use only one ownership model in a cluster. The standalone chart detects the
-operator-managed priority class and refuses to take ownership of the same
-resources.
+A standalone installation uses the released OCI Helm chart. Choose this when the cluster
+has no operator, or when you want the chart's node-side configuration reconciler to own
+the containerd mirror route. The chart installs its own DaemonSet, ConfigMap, ServiceAccount,
+PriorityClass, chair Leases, and optionally the containerd host configuration.
+
+Both paths mark ownership with `PriorityClass/gantry-low`. The chart refuses to install
+when that object already belongs to the operator or to a different release, and the
+operator makes the corresponding check. Clear the old installation rather than deleting
+the PriorityClass by hand, because the marker is what prevents two managers from fighting
+over the same DaemonSet.
 
 ## Installation
 
-### 1. Confirm Compatibility
+### 1. Confirm compatibility
 
-The standalone chart supports Linux nodes running containerd. Before installing,
-confirm that every selected node exposes `/run/containerd/containerd.sock` and
-that containerd reads registry host configuration from
-`/etc/containerd/certs.d`.
+Start by confirming that every node you intend to cover meets the runtime requirements.
 
-The chart does not modify or restart containerd. Provision the `certs.d`
-setting through your node-management system. For standalone installations, the
-chart runs a node-config DaemonSet that continuously reconciles the Gantry
-mirror route shown below. The Unbounded agent owns that route instead on
-operator-managed nodes, where the chart's node-config resources are disabled.
+- The node runs Linux with containerd, and the socket is readable at
+  `/run/containerd/containerd.sock` (or at the path you set in `containerd.socketPath`).
+  Gantry reads and writes content through this socket; the default backend has no
+  alternative storage, and the Racer backend described below replaces it rather than
+  adding to it.
+- containerd is configured to read `/etc/containerd/certs.d` as its CRI registry
+  `config_path`. Gantry does not edit containerd's main configuration and does not restart
+  the service. If the directory is not consulted, the mirror entry has no effect.
+- Either `unbounded-agent` already owns the node's containerd route, or you let the chart
+  manage it. On Unbounded nodes the managed `_default/hosts.toml` mirror entry is already
+  present, and the mirror activates as soon as the agent listens on `127.0.0.1:5000`.
+- The namespace has no existing Gantry installation from the other deployment path. A
+  `PriorityClass/gantry-low` owned by `unbounded-operator` causes the chart to fail with
+  an ownership error rather than adopt it.
 
-The default route written on each node is:
+The DaemonSet mounts the containerd runtime directory rather than the socket file, so a
+containerd restart that replaces the socket is observed by the existing pod. The agent
+runs as UID 65532 with primary GID 0 because many node images expose `containerd.sock` as
+`root:root` with mode `0660`. Check the ownership and mode on your node image before a
+production rollout; if your runtime uses a dedicated socket group, set
+`containerd.socketGroup` to it.
 
-```toml
-# /etc/containerd/certs.d/_default/hosts.toml
-[host."http://127.0.0.1:5000"]
-   capabilities = ["pull", "resolve"]
-   dial_timeout = "200ms"
-```
+### 2. Install the chart
 
-Containerd must already have its CRI registry `config_path` set to
-`/etc/containerd/certs.d`. The chart mounts the runtime directory and expects
-the socket at `/run/containerd/containerd.sock` by default; use the
-`containerd.*` chart values for a different layout.
-
-Do not install the chart on a cluster where the Unbounded operator manages
-Gantry. Both paths check `PriorityClass/gantry-low` and reject ownership by the
-other manager.
-
-### 2. Install the OCI Chart
-
-Find the release on the
-[Unbounded releases page](https://github.com/Azure/unbounded/releases). The
-chart version omits the release tag's leading `v`:
+Install a released chart version and pin the agent image by digest. Using a digest rather
+than a tag keeps the rollout reproducible when a tag is moved.
 
 ```bash
-export GANTRY_VERSION="<release-without-v>"
-export GANTRY_IMAGE_DIGEST="sha256:<digest-from-release-bom>"
-
 helm upgrade --install gantry oci://ghcr.io/azure/charts/gantry \
-   --version "$GANTRY_VERSION" \
-   --namespace gantry-system \
-   --create-namespace \
-   --set image.digest="$GANTRY_IMAGE_DIGEST" \
-   --set gantry.upstreamRegistries[0].name=registry.example.com \
-   --set gantry.upstreamRegistries[0].endpoint=https://registry.example.com \
-   --wait \
-   --timeout 15m
+  --version <release-without-v> \
+  --namespace gantry-system \
+  --create-namespace \
+  --set image.digest=sha256:<gantry-image-digest> \
+  --set gantry.upstreamRegistries[0].name=registry.example.com \
+  --set gantry.upstreamRegistries[0].endpoint=https://registry.example.com
 ```
 
-The chart owns the Gantry ConfigMap, image, RBAC, PriorityClass, chair Leases,
-agent DaemonSet, and node-config DaemonSet. The node-config process checks its
-`_default/hosts.toml` every five seconds and atomically restores it after drift
-or a node upgrade reset. Upgrade those resources through `helm upgrade`, not
-direct edits. Set `nodeConfig.enabled=false` only when another node-management
-system owns mirror routing.
+Replace `<release-without-v>` with the chart version without its leading `v`, and
+`<gantry-image-digest>` with the digest published for that release. At minimum you must
+configure one upstream registry; validation rejects a configuration with none.
 
-During graceful disable or uninstall, the node-config pod removes
-`hosts.toml` only when it still matches the chart payload. Nodes unavailable
-during uninstall may retain the file and should be checked before the Gantry
-endpoint is considered fully removed.
+The release creates the agent DaemonSet, its ConfigMap, a ServiceAccount with the Lease
+permissions described earlier, the `gantry-low` PriorityClass, and one Lease per chair.
+It also creates a second DaemonSet for node configuration unless you disable it. That
+reconciler writes the chart-owned `hosts.toml` payload, checks it every
+`nodeConfig.reconcileIntervalSeconds` (five seconds by default), and atomically restores
+it when it is missing or different, including after a node upgrade or a manual edit.
 
-### 3. Configure Upstream Registries
+Upgrade with `helm upgrade` and keep using the chart. If another system owns the host
+configuration, set `nodeConfig.enabled=false` and manage the registry files yourself; the
+chart then does not write or remove them. Uninstalling removes only unchanged chart-owned
+files, and only on nodes where the terminating pod can run. A node that was unavailable
+during uninstall keeps a stale entry that points containerd at a listener that no longer
+exists, so check those nodes and remove the file.
 
-Set `gantry.upstreamRegistries` in your values file. This list is an opt-in allowlist: add only the
-origin registries whose image pulls you want Gantry to accelerate. Registries
-that are not configured here continue using containerd's normal direct-origin
-path and are not distributed through Gantry.
+### 3. Configure upstream registries
 
-```yaml
-gantry:
-   upstreamRegistries:
-      - name: registry.example.com
-         endpoint: https://registry.example.com
-```
-
-The `name` must match the registry host in the image reference and in
-containerd's `certs.d` directory. Include the port when the image reference
-uses a non-default port. Gantry requires at least one accelerated upstream
-registry.
-
-### 4. Optional: Enable ACR Artifact Streaming
-
-ACR Artifact Streaming support consumes the existing ACR OverlayBD v0.1.0
-artifact contract without running the OverlayBD daemon or snapshotter. Use a
-Linux node pool with NBD and the filesystem support required by the converted
-image. AKS initially selects the native `overlaybd` snapshotter; Gantry's
-managed drop-in switches CRI to the distinct `gantry-overlaybd` proxy while
-leaving that native plugin registered.
-Converted ACR layers use Gantry's NBD data path. Ordinary OCI layers delegate
-to containerd's built-in `overlayfs` snapshotter through a read-only mount of
-the host containerd runtime directory.
-
-For the standalone chart, set both feature gates and select only the AKS
-streaming node pool:
-
-```yaml
-gantry:
-   artifactStreaming:
-      enabled: true
-
-overlaybdConfig:
-   enabled: true
-   nodeSelector:
-      kubernetes.azure.com/agentpool: <streaming-node-pool>
-```
-
-For operator-managed Gantry, use the `Site` API instead:
-
-```yaml
-spec:
-   components:
-      gantry:
-         enabled: true
-         artifactStreaming:
-            enabled: true
-            nodeSelector:
-               kubernetes.azure.com/agentpool: <streaming-node-pool>
-```
-
-Every Site that enables the cluster-wide feature must specify the same
-selector. The node configurator records the previous containerd configuration,
-does not restart containerd on a no-op, and restores its previous value on
-graceful removal only when no other writer changed the managed files.
-
-To roll back, drain active streaming workloads first. Operator-managed installs
-then set `spec.components.gantry.artifactStreaming.enabled` to `false`; the
-operator removes the configurator before rolling Gantry back without the range
-endpoint. Standalone installs first set `overlaybdConfig.enabled=false` while
-leaving `gantry.artifactStreaming.enabled=true`, wait for
-`DaemonSet/gantry-overlaybd-config` to be deleted, and only then disable the
-Gantry endpoint.
-
-### 5. Private Registry Authentication
-
-#### Requester-Delegated Authentication
-
-The workload supplies credentials in the normal Kubernetes way, such as an
-`imagePullSecret` or a kubelet credential provider. For a private HTTPS
-registry, the flow is:
-
-1. Containerd sends an unauthenticated digest request to its local Gantry
-   agent.
-2. Gantry probes the registry's verified HTTPS `/v2/` endpoint and relays its
-   Basic or Bearer `WWW-Authenticate` challenge.
-3. Containerd answers the challenge using the credential supplied by kubelet
-   or CRI. For Bearer authentication, containerd exchanges that credential at
-   the registry's HTTPS token service and sends Gantry the scoped token.
-4. Gantry carries the request-scoped authorization to the selected origin
-   puller. The selected node does not need its own registry identity or access
-   to the requester's `imagePullSecret`.
-5. Gantry discards the authorization after the request. It does not persist
-   the credential or fall back to the puller's identity if the registry
-   rejects it.
-
-Requester-delegated private-registry authentication requires an HTTPS origin.
-Private plaintext HTTP registries are not supported by this mode.
-
-#### ACR Attachment and Explicit Authentication on Flex Nodes
-
-Attach an existing ACR to Gantry without changing authentication:
-
-```bash
-kubectl unbounded gantry attach-acr \
-  --acr-resource-id "$ACR_ID"
-```
-
-To also enable managed private-image authentication on current and future
-Linux Flex workers, opt into AKS identity bindings:
-
-```bash
-kubectl unbounded gantry attach-acr \
-  --acr-resource-id "$ACR_ID" \
-  --auth-mode aks-identity-binding \
-  --cluster-resource-id "$AKS_ID"
-```
-
-`ACR_ID` and `AKS_ID` are full Azure resource IDs. They may be in different
-subscriptions within the same Microsoft Entra tenant. The command creates or
-reuses the Gantry-owned pull identity and identity binding in the AKS subscription,
-and uses the caller's Azure CLI permissions to create the pull-role assignment at
-the ACR scope in the registry's subscription. Existing sufficient grants are
-reused; conditional grants are not broadened.
-
-Use `--kubeconfig /path/to/kubeconfig` to select a cluster; otherwise the current
-context is used. This requires a compatible plugin/operator release, not the
-Azure deployment script's pinned `v0.8.0` baseline.
-
-**Warning:** managed attachment may restart all targeted kubelets concurrently
-without draining nodes. You are responsible for the impact on existing workloads.
-
-Managed authentication uses the stock `acr-credential-provider` and one shared,
-pull-only identity. Application Pods and ServiceAccounts need no changes, and
-new Flex workers inherit the policy without another attachment command.
-Native AKS nodes and customer-owned providers remain untouched; conflicting
-providers or ownership must be resolved explicitly. Shared identity access is
-not per-tenant isolation.
-
-Requirements:
-
-- Linux Flex kubelets >= 1.34 with
-  `KubeletServiceAccountTokenForCredentialProviders` enabled.
-- AKS identity bindings available and their token proxy reachable from every
-  worker. API-server VNet integration is unsupported.
-- Administrative Kubernetes permissions and Azure read access to both resources,
-  permissions to enable AKS workload identity and manage the pull identity and
-  identity binding in the AKS subscription, and permission to read ACR role
-  assignments. If a sufficient pull grant does not already exist, the caller also
-  needs `Microsoft.Authorization/roleAssignments/write` at the ACR scope.
-- Installation images accessible before private ACR authentication is configured.
-
-The command waits for installation, not proof of a successful private-image pull.
-Verify a private pull and Gantry peer distribution separately. Removing the
-selected upstream while retaining managed policy reports a configuration error;
-rerun attachment to restore it.
-
-#### Shared-Identity Authentication
-
-Shared identity is a compatibility mode for environments where kubelet or CRI
-cannot provide a usable request credential. It gives every Gantry agent the
-same registry identity.
-
-To enable it, create `Secret/gantry-registry-credentials` in the release
-namespace and set the matching registry's `credentialsPath` chart value.
-The file contains a `username:password` pair keyed by the registry `name`.
-
-Gantry reads configured credential files eagerly during startup. A missing
-file causes the pod to fail, so do not add `credentials_path` unless the Secret
-is present. Prefer requester-delegated authentication when possible because it
-avoids distributing a shared registry credential to every node.
-
-### 6. Verify Distribution
-
-First verify one agent directly. Select a pod and forward its health and
-metrics listener:
-
-```bash
-GANTRY_POD=$(kubectl -n gantry-system get pods \
-    -l app.kubernetes.io/name=gantry \
-    -o jsonpath='{.items[0].metadata.name}')
-
-kubectl -n gantry-system port-forward "pod/${GANTRY_POD}" 9095:9095
-```
-
-In another shell:
-
-```bash
-curl -fsS http://127.0.0.1:9095/readyz
-curl -fsS http://127.0.0.1:9095/metrics
-```
-
-Roll out the same multi-layer image to at least two nodes, then inspect these
-metrics:
-
-| Signal | Expected result |
-| --- | --- |
-| `p2p_dht_health_score` | Reaches at least `0.7` after the routing table forms. |
-| `gantry_storage_mode_info{mode="containerd"}` | Equals `1` on every agent. |
-| `p2p_cache_hit_total` | Increases when the local containerd store satisfies mirror requests. |
-| `p2p_peer_fetch_total{outcome="hit"}` | Increases when a node receives content from a peer. |
-| `p2p_origin_pull_total` | Increases only on designated origin pullers during a cold rollout. |
-| `gantry_origin_bytes_total{kind}` | Counts bytes read from upstream registries, including partial transfers and retries. |
-| `gantry_peer_fetch_bytes_total{kind}` | Counts bytes received from peer Gantry agents. |
-| `gantry_peer_serve_bytes_total{kind}` | Counts bytes transmitted to peers; range requests count only the transmitted range. |
-| `gantry_mirror_bytes_served_total{kind,source}` | Counts bytes served to local containerd, split by `cache`, `peer`, or `origin`. |
-| `p2p_origin_fallback_total` | Remains near zero during healthy operation. |
-| `gantry_advertise_reconcile_total` | Continues increasing as Gantry reconciles containerd content with the DHT. |
-| `gantry_containerd_lease_created_total` | Increases when coordinated background pulls ingest new content. |
-
-## Use Racer as the Backend
-
-{{< callout type="warning" >}}
-Racer is pre-release. Its APIs, flags, and on-disk formats may change without a
-migration path. Cached data is disposable; Racer is not durable storage. Start
-with the [Azure Blob cache guide]({{< relref "guides/azure-blob-cache" >}}).
-{{< /callout >}}
-
-The installation and distribution flow above describe Gantry's default containerd
-backend. In Racer mode, Racer caches image content and shares it between nodes.
-Gantry still serves the local registry mirror, and it reads from upstream
-registries when Racer asks for content it does not have. Gantry does not use
-containerd storage or its own peer network in this mode.
-
-Racer mode gives image distribution the same benefits as other Racer caches:
-
-- Image data is encrypted and authenticated between nodes and on disk, so no
-  cleartext peer transfer port needs to be fenced off.
-- Large layers are split into 16 MiB pages spread across many nodes, so many
-  nodes serve one layer in parallel.
-- Only each page's owners read from the registry, which keeps registry load
-  low during large rollouts.
-- Images share node cache space with model and dataset caches, weighted by
-  each cache's `spec.priority`.
-
-Racer mode needs the operator-managed Gantry install and the Racer
-[node requirements]({{< relref "reference/racer" >}}#node-requirements). The
-standalone Helm chart does not support Racer mode.
-
-### Turn On Racer Mode
-
-1. Enable Gantry on a Site. Gantry is on by default for every Site unless
-   `spec.components.gantry.enabled` is `false`.
-2. Create a cluster-scoped cache named `gantry`:
-
-   ```yaml
-   apiVersion: racer.unbounded-cloud.io/v1alpha1
-   kind: ClusterCache
-   metadata:
-     name: gantry
-   ```
-
-   Do not set `spec.origin` on this cache. Gantry is its origin. If
-   `spec.origin` is set, the operator keeps Gantry in default mode and reports
-   the reason `RacerOriginConflict`.
-
-Creating any ClusterCache makes the operator install Racer. When the `gantry`
-cache exists and Gantry is enabled, the operator changes the `gantry`
-DaemonSet in `unbounded-system`:
-
-- It sets `GANTRY_RACER_ENABLED=true`.
-- It mounts the Racer sockets from `/run/racer/gantry/client` and
-  `/run/racer/gantry/origin`.
-- It copies node affinity, node selector, and tolerations from the
-  `racer` DaemonSet. Gantry then runs on every Racer node, so each
-  node can serve origin reads for the cache.
-
-The operator waits for `racer` to exist before it makes these
-changes. The cache does not install Gantry. If no Site enables Gantry, the
-`gantry` cache is a plain Racer cache. The exception is a Gantry install the
-operator already manages. It stays in place after every Site turns Gantry off,
-and it still switches to Racer when the `gantry` cache exists. Workload
-overrides on the `gantry` DaemonSet still apply on top of these changes.
-
-### Configure Upstream Registries
-
-The operator creates `ConfigMap/gantry-config` in `unbounded-system` once and
-does not overwrite it. Edit `upstream_registries` there:
+`upstream_registries` is the allowlist of registries Gantry mirrors. Each entry has a
+`name`, an `endpoint`, and optional `credentials_path` and `ns_alias` fields. The `name`
+must match the host, and port when one is used, that containerd addresses for that
+registry; it is also the value the mirror expects in `?ns=` when several registries are
+configured.
 
 ```yaml
 upstream_registries:
-  - name: "registry.example.com"
-    endpoint: "https://registry.example.com"
+  - name: registry.example.com
+    endpoint: https://registry.example.com
+  - name: ghcr.io
+    endpoint: https://ghcr.io
+    credentials_path: /etc/gantry/registry/ghcr
 ```
 
-In Racer mode:
+Validation requires at least one entry, a non-empty unique `name`, and an `endpoint` that
+starts with `http://` or `https://` and contains a host. A duplicate name, or an
+`ns_alias` that collides with another name or alias, is rejected at startup rather than
+silently shadowing an entry.
 
-- `name` must be a bare `host` or `host:port`, with no scheme or path.
-- Gantry fetches only from registries in this list. Requests for other
-  registries return `404`.
-- Gantry uses only requester-delegated credentials. It ignores
-  `credentials_path`. Delegated credentials need an `https` endpoint; `http`
-  endpoints work only for anonymous registries.
-- Containerd and the transfer listener are not used.
+A registry that is not in the list is not mirrored. When containerd asks for it, the
+mirror logs a warning and answers `404`, so that pull makes no use of Gantry and falls
+back to the registry on its own. If you add a registry to the cluster but forget this
+list, the symptom is a normal but slow pull and a repeating warning in the agent log.
 
-Use the same `gantry-config` on every node. Any node can be asked to read from
-an upstream registry.
+The `endpoint` is the origin Gantry reads from, not the address containerd uses. In the
+common case they are the same host. They differ for Artifact Streaming, where the
+endpoint points at the node-local AKS mirror, and for registries fronted by a proxy.
 
-### Verify Racer Mode
+### 4. Optional: enable ACR Artifact Streaming
 
-Check that the DaemonSet runs in Racer mode and that each pod is ready:
+ACR Artifact Streaming serves an image as a sealed OverlayBD artifact, which lets a
+container mount before its full layer has been downloaded. Gantry can act as the
+node-local range proxy for that format, adding peer reuse to the streaming reads ACR
+already supports.
+
+This integration requires Linux nodes that support NBD, ext4, and EROFS when the image
+selects it, plus shared mount propagation. It consumes the existing OverlayBD v0.1.0
+artifact contract without running the OverlayBD daemon; Gantry supplies its own
+`gantry-overlaybd` proxy snapshotter and delegates ordinary OCI layers to a private
+`overlayfs` snapshotter.
+
+For a standalone Helm installation, enable the range endpoint and the host configurator
+together, and point the upstream at the node-local AKS mirror. The chart switches the
+agent to host networking in this mode so it can reach the loopback-only mirror.
+
+```yaml
+nodeSelector:
+  gantry-streaming: "true"
+
+gantry:
+  artifactStreaming:
+    enabled: true
+  upstreamRegistries:
+    - name: <registry>.azurecr.io
+      endpoint: http://127.0.0.1:8578?ns=<registry>.azurecr.io
+
+overlaybdConfig:
+  enabled: true
+  nodeSelector:
+    gantry-streaming: "true"
+```
+
+The host configurator validates that `overlaybdConfig.address` is a socket directly under
+`/run/gantry-overlaybd`, that `overlaybdConfig.gantryEndpoint` is a loopback HTTP `/blobs`
+endpoint, and that the snapshotter root is absolute. It records the previous containerd
+configuration before enabling `/etc/containerd/conf.d/*.toml`, restarting containerd only
+when the effective configuration changes, and refuses to overwrite a conflicting file
+written by another owner.
+
+For an operator-managed installation, enable it through every participating `Site` with
+the same selector. The operator rejects an empty selector, a Site that enables Artifact
+Streaming while disabling Gantry, and conflicting selectors across Sites.
+
+```yaml
+apiVersion: unbounded-cloud.io/v1alpha3
+kind: Site
+metadata:
+  name: <site-name>
+spec:
+  components:
+    gantry:
+      enabled: true
+      artifactStreaming:
+        enabled: true
+        nodeSelector:
+          kubernetes.azure.com/agentpool: <streaming-node-pool>
+```
+
+The adapter DaemonSet uses `OnDelete`, because the snapshotter owns live NBD devices that
+cannot be handed to a replacement pod while in use. To roll it, cordon and drain the
+workloads that use the Gantry snapshotter, delete the adapter pod on that node, bootstrap
+its replacement with native `overlayfs`, verify readiness, restore `gantry-overlaybd` for
+CRI image unpacking, and then uncordon. To disable streaming, drain first, disable the
+configurator while leaving the range endpoint enabled, wait for the configurator to
+restore the host configuration, and then disable the range endpoint.
+
+### 5. Private registry authentication
+
+Gantry supports two authentication models. Prefer requester-delegated authentication,
+which keeps the node free of long-lived registry identity.
+
+#### Requester-delegated authentication
+
+In this mode, containerd's own credentials are used for the origin pull. When a digest
+request arrives without an `Authorization` header and the configured upstream has no
+credential file, the mirror asks the registry's `/v2/` endpoint for its challenge and
+relays that challenge to containerd as a `401` with a `WWW-Authenticate` header.
+containerd answers with the credential kubelet already holds, typically after exchanging
+it for a registry token itself, and the agent forwards that Basic or Bearer value to the
+origin unchanged. The agent never swaps in a different identity when the origin rejects
+the delegated one; it returns the failure instead.
+
+The resulting authorization is attached to the request context and travels with the
+`please_pull` call to the chair, so the chair can pull from the origin without holding a
+registry identity of its own. It is normalized to Basic or Bearer, bounded in size, and
+discarded when the request finishes; it is never written to disk or reused for another
+request.
+
+Challenge discovery and credential delegation are HTTPS-only. An anonymous HTTP registry
+still works, because the agent reports no challenge and the pull proceeds anonymously,
+but a private HTTP registry cannot use this mode. Use an HTTPS endpoint or shared-identity
+mode for that case.
+
+#### ACR attachment and explicit authentication on Flex nodes
+
+For operator-managed clusters, `kubectl unbounded gantry attach-acr` adds an existing ACR
+to `upstream_registries` without replacing unrelated Gantry configuration. It reads the
+operator's `gantry-config` ConfigMap, so operator-managed Gantry must already be
+installed.
 
 ```bash
-kubectl -n unbounded-system get daemonset gantry \
-    -o jsonpath='{.spec.template.spec.containers[?(@.name=="gantry")].env}'
-kubectl -n unbounded-system rollout status daemonset/gantry
-kubectl -n unbounded-system logs -l app.kubernetes.io/name=gantry -c gantry \
-    --prefix --tail=-1 | grep "mirror startup gate released"
+kubectl unbounded gantry attach-acr \
+  --acr-resource-id /subscriptions/<subscription>/resourceGroups/<group>/providers/Microsoft.ContainerRegistry/registries/<registry> \
+  --kubeconfig <path-to-kubeconfig>
 ```
 
-`/readyz` returns `503` until both Racer sockets accept connections. Then pull
-an image from a configured registry and check these metrics:
+The command takes full Azure resource IDs and accepts an ACR and an AKS cluster in
+different subscriptions within the same tenant. `--auth-mode` defaults to `external`,
+which preserves the existing authentication path and changes nothing about how nodes
+authenticate. Set `--auth-mode aks-identity-binding` together with
+`--cluster-resource-id` to install the stock ACR credential provider on current and
+future Linux Flex nodes. That mode prints a warning because it may restart kubelets on
+all targeted nodes concurrently; nodes are not drained automatically, so you own the
+impact on running workloads. The installer also refuses to proceed when kubelet already
+uses a different external credential provider.
 
-| Signal | Expected result |
-| --- | --- |
-| `gantry_racer_mirror_requests_total{method,status,outcome}` | Increases for each mirror request served through Racer. |
-| `gantry_racer_mirror_bytes_total{method}` | Counts bytes sent to local containerd. |
-| `gantry_racer_mirror_duration_seconds` | Shows mirror request latency. |
-| `gantry_racer_origin_requests_total{method,status}` | Increases when Racer asks this node to read from an upstream registry. Stays flat when Racer already has the content. |
-| `gantry_racer_origin_bytes_total{kind}` | Counts bytes read from upstream registries. |
+Use `--namespace` when the operator and Gantry live somewhere other than the default
+system namespace, and `--timeout` to bound the node configuration wait, which defaults to
+ten minutes.
 
-### Troubleshooting
+#### Shared-identity authentication
 
-- Every response from the Racer backend has a `Gantry-Racer-Request-ID`
-  header. Search Gantry logs for that ID.
-- A `503` from the mirror means Racer was not available. Gantry does not fall
-  back to its own peer network in Racer mode. Containerd handles the error as it
-  does for any failed mirror host.
-- A `404` without a `Gantry-Racer-Request-ID` header means the registry is not
-  in `upstream_registries`.
-- If Gantry pods stay not ready, check the `racer` pod on the same
-  node and confirm that `/run/racer/gantry/client` and
-  `/run/racer/gantry/origin` exist.
-- If the operator reports `RacerPending` for Gantry, it is waiting for the
-  `racer` DaemonSet.
+Shared-identity mode exists for compatibility with clusters that cannot delegate a
+credential per request. You create a Secret containing a credentials file, mount it, and
+point the registry entry's `credentials_path` at the mounted file. Each file holds one
+`username:password` pair, or a `_json_key:<json>` value for the well-known Google
+registry pattern.
 
-### Turn Off Racer Mode
+Setting `credentials_path` opts that registry into this mode for requests that arrive
+without delegated authorization. The agent reads the file eagerly at startup, so a
+missing or unreadable file fails the pod instead of failing the first pull. Because the
+secret is present on every node, prefer requester-delegated mode unless you have a
+specific reason to keep a node-local identity.
 
-Delete the cache:
+### 6. Verify distribution
+
+Roll out the DaemonSet and confirm the probes turn green before testing a pull.
 
 ```bash
-kubectl delete clustercache gantry
+kubectl -n gantry-system rollout status daemonset/gantry
+kubectl -n gantry-system get pods -l app.kubernetes.io/name=gantry
 ```
 
-The operator removes the Racer settings and rolls Gantry back to the
-containerd backend. Racer stays installed while other ClusterCaches exist.
+Then check readiness and metrics through the operations port. The `/readyz` endpoint is
+the same check the kubelet uses: it fails while the containerd content store is
+unreachable, while the DHT routing table is empty during bootstrap, and while no chair
+Lease is selectable.
+
+```bash
+kubectl -n gantry-system port-forward pod/<gantry-pod> 9095:9095
+curl -s http://127.0.0.1:9095/readyz
+curl -s http://127.0.0.1:9095/metrics | grep '^p2p_dht_health_score'
+```
+
+To exercise peer reuse, pull a multi-layer image on two nodes and compare the counters.
+On the first node, `p2p_origin_pull_total` should advance and `p2p_peer_fetch_total`
+should not. On the second node, after the first node has advertised, a pull of the same
+digest should increase `p2p_peer_fetch_total` and leave the origin counters alone. If the
+second node also pulls from origin, the peers are not discovering each other, which the
+troubleshooting section covers.
+
+## Configuration reference
+
+The agent accepts configuration from four layers, applied in order: built-in defaults, a
+YAML file passed with `--config`, `GANTRY_*` environment variables, and command-line
+flags. A later layer wins over an earlier one. Unknown YAML keys are an error, so a typo
+in a ConfigMap fails the pod instead of silently keeping the default. Environment
+variables cover scalar fields only; list fields such as `upstream_registries` and
+`libp2p_bootstrap_peers` must come from the file.
+
+The chart exposes a small set of values and writes a complete `config.yaml`; setting
+`gantry.config` replaces that generated file entirely, so use it only for options that
+have no dedicated value.
+
+### Listeners and identity
+
+| Key | Flag | Default | Purpose |
+| --- | --- | --- | --- |
+| `mirror_listen` | `--mirror-listen` | `127.0.0.1:5000` | containerd-facing mirror. Must be loopback unless the non-loopback opt-in is set. |
+| `mirror_bind_allow_non_loopback` | `--mirror-bind-allow-non-loopback` | `false` | Permits a wildcard mirror bind, as the host-port chart profile requires. |
+| `transfer_listen` | `--transfer-listen` | `0.0.0.0:5001` | Peer-facing transfer endpoint. |
+| `chair_listen` | `--chair-listen` | `0.0.0.0:5002` | HTTPS `please_pull` endpoint. |
+| `metrics_listen` | `--metrics-listen` | `0.0.0.0:9095` | Metrics and probes. |
+| `pprof_listen` | `--pprof-listen` | empty | Optional Go profiles; must be a loopback address when set. |
+| `libp2p_listen` | none | empty | Multiaddrs to advertise. The chart sets TCP and QUIC on port 4001. |
+| `libp2p_identity_path` | `--libp2p-identity-path` | `/var/lib/gantry/libp2p/libp2p.key` | Persisted peer identity; the chart writes `identity.key` in the same directory. |
+| `libp2p_bootstrap_peers` | none | empty | Static multiaddrs to seed the DHT. Chair Leases provide the dynamic pool. |
+| `storage_mode` | none | `containerd` | Only `containerd` is accepted; other values fail validation. |
+| `containerd_socket` | `--containerd-socket` | `/run/containerd/containerd.sock` | Required content-store socket. |
+| `containerd_namespace` | `--containerd-namespace` | `k8s.io` | Namespace the image-event subscription watches. |
+| `containerd_lease_ttl` | `--containerd-lease-ttl` | `60m` | TTL of content leases the agent attaches on ingest. |
+
+### Chair and peer coordination
+
+| Key | Flag | Default | Purpose |
+| --- | --- | --- | --- |
+| `chair_count` | `--chair-count` | `64` | Maximum active chair pool; bounded further by the DaemonSet's desired pod count. |
+| `chair_seed_count` | `--chair-seed-count` | `8` | Per-digest seed cohort at a full pool. Must be between 1 and `chair_count`. |
+| `chair_namespace` | `--chair-namespace` | empty | Namespace holding the chair Leases. |
+| `chair_cluster_size_estimate` | `--chair-cluster-size-estimate` | `100000` | Sizes observation and fallback without pod watches. |
+| `chair_lease_duration` | `--chair-lease-duration` | `5m` | Heartbeat expiry for a holder. |
+| `chair_renew_period` | `--chair-renew-period` | `1m` | Heartbeat renewal, must be below the lease duration. |
+| `chair_rotation_period` | `--chair-rotation-period` | `6h` | Wall-clock assignment epoch. |
+| `chair_rotation_lead` | `--chair-rotation-lead` | `5m` | Time before an epoch boundary to reserve a successor. |
+| `peer_fetch_timeout` | `--peer-fetch-timeout` | `15m` | Ceiling on one complete peer fetch, including body transfer and commit. |
+| `peer_rediscover_budget` | `--peer-rediscover-budget` | `5m` | Wall-clock budget for re-discovery rounds; zero disables them. |
+| `peer_rediscover_backoff` | `--peer-rediscover-backoff` | `1s` | Pause between re-discovery rounds. |
+| `transfer_max_concurrent_serves` | `--transfer-max-concurrent-serves` | `10` | Concurrent peer blob serves before the endpoint returns `429`; zero is unlimited. |
+| `transfer_max_concurrent_range_serves` | `--transfer-max-concurrent-range-serves` | `512` | Concurrent bounded-range serves, admitted separately. |
+
+### Discovery, origin, and fallback
+
+| Key | Flag | Default | Purpose |
+| --- | --- | --- | --- |
+| `dht_provider_validity` | `--dht-provider-validity` | `6h` | How long a provider record may be served after its last publication. |
+| `dht_reprovide_interval` | `--dht-reprovide-interval` | `3h` | Interval over which the sweeper refreshes all local content. |
+| `dht_max_reprovide_delay` | `--dht-max-reprovide-delay` | `10m` | Extra delay allowed beyond the scheduled reprovide. |
+| `advertise_reconcile_interval` | `--advertise-reconcile-interval` | `1m` | Background inventory reconcile as a backstop to eager publish. |
+| `coord_max_concurrent_pulls` | `--coord-max-concurrent-pulls` | `16` | Background origin pulls a chair may run from inbound `please_pull`. |
+| `coord_max_digests_per_request` | `--coord-max-digests-per-request` | `256` | Digests accepted in one batch request. |
+| `origin_pull_progress_timeout` | `--origin-pull-progress-timeout` | `5m` | Maximum time a detached origin body may make no progress; zero disables. |
+| `nf5_jitter_base` | `--nf5-jitter-base` | `3s` | Base delay for the direct-origin fallback jitter window. |
+| `nf5_per_node_rate_limit` | `--nf5-per-node-rate-limit` | `2` | Direct-origin fallbacks per node per minute. |
+| `bootstrap_window` | `--bootstrap-window` | `30s` | Period after startup during which an empty DHT is not trusted as cold start. |
+| `bootstrap_routing_table_pct` | `--bootstrap-routing-table-pct` | `25` | Routing-table size percentage that ends the bootstrap window. |
+
+Two tuning traps are worth calling out. `peer_fetch_timeout` is a safety ceiling, not a
+stall detector; setting it below the transfer time of your largest layer makes requesters
+abandon transfers that are making progress. `chair_seed_count` trades origin copies for
+cold-start speed: a larger cohort produces more initial seeds and a wider fan-out, at the
+cost of that many origin pulls per digest.
+
+## Operating and verifying a pull
+
+A healthy pull on an established image is short and quiet. containerd asks the mirror for
+a manifest digest, gets it from the local store or a peer, then asks for each layer and
+gets those from peers. The agent logs the request path with registry, repository, digest,
+and kind fields, and emits a trace span for each request when tracing is enabled. The
+[tracing guide]({{< relref "guides/gantry-tracing" >}}) covers exporter setup and the span
+hierarchy.
+
+Start with the node-side route, because a pull that bypasses the mirror entirely looks
+identical to a working pull from the application's point of view.
+
+```bash
+cat /etc/containerd/certs.d/_default/hosts.toml
+grep -R "config_path" /etc/containerd/config.toml
+```
+
+The hosts file must list `http://127.0.0.1:5000` as a host and must declare the pull and
+resolve capabilities. If the operator or the chart owns the file, edits are reverted on
+the next reconcile, which is the intended behavior. If containerd's `config_path` does
+not point at `/etc/containerd/certs.d`, the file is ignored.
+
+You can probe the mirror directly from the node. A manifest or blob request needs a real
+digest and, when several registries are configured, the matching `?ns=` value.
+
+```bash
+curl -s http://127.0.0.1:5000/v2/
+curl -sI "http://127.0.0.1:5000/v2/<repository>/manifests/sha256:<digest>?ns=<registry>" \
+  -H 'Accept: application/vnd.oci.image.manifest.v1+json'
+curl -s -o /dev/null -w '%{http_code} %{size_download}\n' \
+  "http://127.0.0.1:5000/v2/<repository>/blobs/sha256:<digest>?ns=<registry>"
+```
+
+The first call returns `{}` when the mirror is accepting requests. The `HEAD` call returns
+headers with the origin's content type, which is how containerd learns the media type
+before it fetches a body. The blob `GET` returns `200` and the byte count when the layer
+is available from any source, or a 5xx when the agent cannot obtain it and containerd
+should fall through to the registry.
+
+To watch a pull in progress, follow the agent log while a pod starts on that node. The
+mirror logs the chosen source path, and the counters tell you which path won without
+parsing log lines.
+
+```bash
+kubectl -n gantry-system logs daemonset/gantry -f
+```
+
+If you enable the optional profiles listener, `kubectl port-forward` to it and use
+`go tool pprof` against the loopback address. Profiles are disabled by default and cannot
+bind a non-loopback address.
+
+## Metrics
+
+Every agent serves Prometheus metrics on `9095` at `/metrics`. Scrape all agents, not one:
+the interesting signals are per-node, and cluster-wide origin traffic is the sum across
+nodes. Set `metricsService.enabled=true` in the chart to render a headless Service over
+the agents for annotation-driven scrapers.
+
+The first group tells you where bytes came from.
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `p2p_cache_hit_total` | counter | Local content-store hits on the mirror endpoint. |
+| `p2p_cache_miss_total` | counter | Local misses; a miss can still be served by a peer. |
+| `p2p_peer_fetch_total{outcome}` | counter | Peer fetches the mirror started, by terminal outcome. |
+| `p2p_peer_serve_total` | counter | Peer requests this agent served from its own store. |
+| `p2p_peer_miss_total` | counter | Peer requests that returned `404` because the blob was gone. |
+| `p2p_origin_pull_total{kind}` | counter | Origin pulls started, by OCI kind. |
+| `p2p_origin_pull_success_total{kind}` | counter | Origin pulls that streamed and committed. |
+| `p2p_origin_pull_failure_total{kind,class}` | counter | Terminal origin pull failures by class. |
+| `gantry_mirror_bytes_served_total{kind,source}` | counter | Bytes written to containerd, labeled by `cache`, `peer`, or `origin`. |
+| `gantry_origin_bytes_total{kind}` | counter | Bytes read from upstream registries. |
+| `gantry_peer_fetch_bytes_total{kind}` | counter | Bytes received from peers. |
+| `gantry_peer_serve_bytes_total{kind}` | counter | Bytes sent to peers. |
+| `gantry_active_transfers{source,kind}` | gauge | Origin or peer GETs currently in progress. |
+| `gantry_transfer_bytes_total{source,kind}` | counter | Bytes received while reading, including partial and retried transfers. |
+
+The second group describes discovery and cold start.
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `p2p_dht_health_score` | gauge | Geometric mean of routing-table coverage, lookup latency, and self-test success, in `[0, 1]`. |
+| `p2p_libp2p_conns` | gauge | Open libp2p connections, compared against the trim watermark. |
+| `p2p_dht_lookup_total{outcome}` | counter | Provider lookups by outcome. |
+| `p2p_dht_lookup_duration_seconds{outcome}` | histogram | Provider lookup latency. |
+| `p2p_dht_provide_total` | counter | Successful provider publications. |
+| `p2p_dht_provide_error_total{op}` | counter | Failed publications by call site. |
+| `gantry_advertise_reconcile_total` | counter | Advertiser reconcile passes completed. |
+| `p2p_cold_start_duration_seconds{digest_kind,outcome}` | histogram | Time spent in cold-start resolution. |
+| `p2p_cold_start_selectable_chairs{digest_kind}` | histogram | Chairs considered selectable for a digest. |
+| `p2p_cold_start_seed_chairs_accepted{digest_kind}` | histogram | Chairs that accepted a `please_pull`. |
+| `p2p_in_flight_pulls` | gauge | Background pulls currently running on this agent. |
+
+The third group covers storage, fallback, and streaming.
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `gantry_storage_mode_info{mode}` | gauge | `1` for the active backend; expect `mode="containerd"`. |
+| `gantry_containerd_lease_created_total` | counter | Content leases attached to ingested content. |
+| `gantry_containerd_lease_active` | gauge | Leases currently held. |
+| `p2p_origin_fallback_total` | counter | Direct-origin fallback pulls after cold-start exhaustion. |
+| `p2p_origin_fallback_decline_total{reason}` | counter | Fallback requests refused by the gate, by reason. |
+| `gantry_streaming_requests_total{source,outcome}` | counter | Artifact Streaming range requests by source. |
+| `gantry_streaming_bytes_total{source}` | counter | Streaming bytes by source; `origin` is registry egress. |
+
+A healthy steady state has a high cache-hit rate, peer fetches on nodes that did not
+pull first, a DHT health score that stays high, and a fallback counter that stays near
+zero. `p2p_origin_fallback_decline_total` growing is not a fault by itself: it means the
+gate is doing its job during a cold rollout.
+
+## Troubleshooting
+
+Most Gantry incidents show up as a pull that works but is slower than expected, a pull
+that bypasses the mirror entirely, or an agent that never becomes ready. Work from the
+node outward: route, then readiness, then discovery, then origin.
+
+Start with `kubectl -n <namespace> get pods -l app.kubernetes.io/name=gantry` and the
+`/readyz` body, which names the failing condition. The reasons below are the ones the
+agent emits, and each points at a specific fix.
+
+| Readiness or log message | Likely cause | Action |
+| --- | --- | --- |
+| `dht routing table empty` | No peers reachable: port 4001 blocked, bootstrap peers wrong, or the cluster is still starting | Check `p2p_libp2p_conns`, network policy for TCP and UDP 4001, and `libp2p_bootstrap_peers`. |
+| `containerd content store unavailable` | Socket missing, wrong path, or permission denied | Check `containerd_socket`, the mount, and the socket group. The agent cannot run without it. |
+| `no selectable Lease chair` | Chair Leases absent, expired, or in another namespace | Check `kubectl -n <namespace> get leases` and `chair_namespace`. |
+| `self-announce has no dialable p2p addresses` | `libp2p_listen` family does not match the pod IP family | Use `0.0.0.0` on IPv4-only, `[::]` on IPv6-only, or `:port` for dual stack. |
+| `transfer listener family mismatches Pod IP` | Same mismatch on the transfer listener | Align `transfer_listen` with the pod network family. |
+| `agent starting up` from the mirror | The startup gate has not been released | Fix readiness first; the gate releases only after `/readyz` passes once. |
+| `ignoring request for unconfigured registry` | The registry is missing from `upstream_registries` | Add the entry and roll the agent. |
+| `peer serving at capacity` | A popular provider is at `transfer_max_concurrent_serves` | Raise the cap on large nodes, or accept the requester's reselection. |
+| `warm path exhausted` | No provider and the fallback gate declined | Check `p2p_origin_fallback_decline_total` by reason and DHT health. |
+| Ownership error at install | `PriorityClass/gantry-low` belongs to another manager | Remove the other installation, then install. |
+
+A pull that never reuses peers usually has one of three causes. The registry is not in
+`upstream_registries`, so the mirror refuses every request for it with `404` and the pull
+does not use the cache. The node's `hosts.toml` is missing or not read, so containerd
+never contacts the mirror. Or port 5001 is blocked between pods, so provider records
+exist but every peer dial fails; `p2p_peer_dial_failure_total` climbs while
+`p2p_dht_lookup_total` returns providers. Check the three in that order.
+
+Repeated `404` responses from a provider that used to serve a digest are expected after
+containerd garbage collection. Gantry suppresses that provider for three minutes and
+serves the request from another source. Investigate only if it persists for the same
+digest across many nodes, which points at aggressive GC or a node that keeps advertising
+content it no longer has.
+
+A pull that hangs before any bytes arrive is usually a cold start without an eligible
+chair. Look at `p2p_cold_start_selectable_chairs`: a value well below `chair_count` means
+Leases are missing, expired, or filtered by epoch, and every requester is competing for
+fewer pullers. `p2p_cold_start_chair_dispatch_total{reason="rpc_error"}` climbing means
+chairs are reachable but slow to answer, not that they refuse the work.
+
+Configuration errors fail the pod at startup rather than degrading silently. The message
+names the field, and the common ones are an empty `upstream_registries`, a non-loopback
+`mirror_listen` without the opt-in, a `chair_seed_count` above `chair_count`, a reprovide
+interval plus delay that exceeds provider validity, and Artifact Streaming combined with
+Racer mode. Fix the ConfigMap and restart the DaemonSet.
+
+## Use Racer as the Backend
+
+Gantry can serve its mirror from Racer instead of the containerd content store. Racer is
+a cluster-wide page cache that stores objects in fixed 16 MiB pages, assigns each page an
+owner node, and fetches a missing page from the origin once on behalf of every reader.
+The Gantry cache takes a share of each node's Racer capacity, weighted by the cache's
+`spec.priority` alongside any other caches on the node.
+
+In this mode the agent does not read containerd, does not join the DHT, and does not serve
+the peer transfer endpoint. The mirror forwards OCI requests to the Racer client, Racer
+finds or fetches the pages, and Gantry acts as the origin for the `gantry` cache so Racer
+can read from the upstream registry. Because there is no containerd store, every cached
+byte is reconstructible from origin, which is why Racer treats cached data as disposable
+and why Gantry's Racer path is pre-release.
+
+Use this backend when you want a shared cache that covers more than the OCI image path, or
+when you want page-level sharing without giving Gantry access to the node's containerd
+store. Do not use it if you need Artifact Streaming: the two are mutually exclusive, and
+validation rejects a configuration that enables both.
+
+### Turn on Racer mode
+
+Racer mode is controlled by the operator, not by a Gantry chart value. A standalone Helm
+installation cannot select it.
+
+The switch is the existence of a `ClusterCache` named `gantry`. Create it without
+`spec.origin`, because Gantry is the origin for this cache and Racer allows only one
+owner per origin socket.
+
+```yaml
+apiVersion: racer.unbounded-cloud.io/v1alpha1
+kind: ClusterCache
+metadata:
+  name: gantry
+spec:
+  priority: 500
+```
+
+When the operator sees that object, it waits for Racer's dataplane DaemonSet to exist,
+then rewrites the Gantry DaemonSet to set `GANTRY_RACER_ENABLED=true`, mount the Racer
+client and origin socket directories, and copy the dataplane's node placement so Gantry
+runs on exactly the nodes that run Racer. While it waits, the Gantry component reports
+`RacerPending` and requeues. If the cache sets `spec.origin`, the operator reports
+`RacerOriginConflict` and leaves Gantry in its default mode rather than fighting Racer
+for the origin socket.
+
+### Configure upstream registries
+
+In Racer mode the operator creates `ConfigMap/gantry-config` if it is absent and never
+overwrites an existing payload, so edits to `upstream_registries` survive reconciles. Each
+`name` is a host, or a host and port, with no scheme, user information, path, query, or
+fragment.
+
+The allowlist has the same meaning as in containerd mode: a request for a registry that
+is not listed is refused, and Racer does not read it. `credentials_path` is ignored in
+this mode. Requesters must delegate credentials, and the origin pull uses the
+authorization that arrived with the request. HTTPS registries support that negotiation;
+anonymous HTTP registries work without credentials.
+
+The containerd socket and the transfer listener are unused here, because there is no
+containerd store and no peer network. Keep the configuration otherwise consistent across
+nodes: the cache is cluster-wide, and a node with a different registry set produces
+errors for requests that its peers would have served.
+
+### Verify Racer mode
+
+Confirm the environment variable reached the container, then watch the rollout.
+
+```bash
+kubectl -n <namespace> get daemonset gantry \
+  -o jsonpath='{.spec.template.spec.containers[0].env}'
+kubectl -n <namespace> rollout status daemonset/gantry
+```
+
+`/readyz` returns `503` until the Racer sockets are usable or while the agent drains. A
+`200` means the client connected and the origin service is running. On the metrics side,
+`gantry_racer_mirror_requests_total` counts mirror responses by method and status,
+`gantry_racer_mirror_bytes_total` counts body bytes written downstream, and
+`gantry_racer_origin_requests_total` plus `gantry_racer_origin_bytes_total` describe the
+upstream reads Racer performed.
+
+### Troubleshooting Racer mode
+
+The mirror stamps a `Gantry-Racer-Request-ID` header on responses and logs the same value,
+so you can correlate one failed client request with the agent log and with Racer's own
+records.
+
+A `503` from the mirror means the Racer client could not serve the request, for example
+because a socket is missing or the cache is not ready. containerd falls through to the
+next host entry, so the pull may still succeed from origin; the `503` is a signal that the
+cache path was skipped, not necessarily that the pod failed. A `404` without a request ID
+was rejected before it reached Racer, usually because the registry is not in the
+allowlist.
+
+If the Gantry pods stay pending, check that `/run/racer/gantry/client` and
+`/run/racer/gantry/origin` exist on the node. The DaemonSet mounts them as host
+directories, which means a pod scheduled before Racer created them waits rather than
+creating root-owned directories. If the component reports `RacerPending`, the dataplane
+DaemonSet does not exist yet; if it reports `RacerOriginConflict`, the cache sets
+`spec.origin` and must be recreated without it.
+
+### Turn off Racer mode
+
+Delete `ClusterCache/gantry`. The operator removes the environment variable, the socket
+mounts, and the copied placement, and the DaemonSet returns to the containerd backend on
+the next reconcile. Racer itself keeps running and keeps any other caches on the node;
+only Gantry's use of the `gantry` cache stops.
+
+## Related
+
+The benchmark methodology and measured rollout behavior are documented in
+[Distribution benchmarks]({{< relref "guides/gantry-benchmark" >}}). For request-level
+visibility, see [Trace Gantry pulls]({{< relref "guides/gantry-tracing" >}}). If you need
+a cache that survives beyond the image path, the Racer guides start at
+[Racer reference]({{< relref "reference/racer" >}}), and the cluster cache object is
+described in [Racer objects]({{< relref "reference/racer-object" >}}).
+
+For the registry that Gantry pulls from, the [CLI reference]({{< relref "reference/cli" >}})
+covers `kubectl unbounded gantry attach-acr` in the context of the other plugin commands.
+For node-level operations around containerd and kubelet, see
+[Node operations]({{< relref "guides/operations/node-operations" >}}).
