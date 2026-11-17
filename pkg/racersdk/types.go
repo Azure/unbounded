@@ -17,14 +17,31 @@ import (
 	"github.com/Azure/unbounded/pkg/racersdk/internal/wire"
 )
 
-// PageSize is the unit in which Racer caches and transfers objects (16 MiB).
-// Objects no larger than PageSize may be read with [ReadOptions.SmallObject].
+// PageSize is the default unit in which Racer caches and transfers objects
+// (16 MiB). A cache may use a smaller power of two from 4 KiB through 16 MiB;
+// configure that size with [ClientConfig.PageSize] and [OriginConfig.PageSize].
+// Objects no larger than the cache's page size may be read with
+// [ReadOptions.SmallObject].
 const PageSize = 16 << 20
 
 // The public constant must match the wire protocol.
 var _ [PageSize - wire.PageSize]struct{}
 
 var _ [wire.PageSize - PageSize]struct{}
+
+// validPageSize reports whether size is zero or a supported page size.
+func validPageSize(size int) bool {
+	return size == 0 || size >= wire.MinPageSize && size <= wire.MaxPageSize && size&(size-1) == 0
+}
+
+// pageSizeBytes returns the effective page size for a validated config value.
+func pageSizeBytes(size int) uint64 {
+	if size == 0 {
+		return PageSize
+	}
+
+	return uint64(size)
+}
 
 // Key names an object in a Racer cache. The object's content may change
 // over time; each version is identified by the ETag in its [Metadata] and
@@ -131,10 +148,10 @@ type ReadOptions struct {
 	// unpinned reads may see different versions. If that version is no
 	// longer available, Get fails with [ErrVersionMismatch].
 	ETag string
-	// SmallObject declares that the object is at most [PageSize] bytes. Small
-	// reads use a separate admission queue so they are not delayed behind
-	// large transfers. Get fails with [ErrInvalidRequest] if the object is
-	// larger.
+	// SmallObject declares that the object is at most one page, using the
+	// cache's configured page size. Small reads use a separate admission queue
+	// so they are not delayed behind large transfers. Get fails with
+	// [ErrInvalidRequest] if the object is larger.
 	SmallObject bool
 }
 

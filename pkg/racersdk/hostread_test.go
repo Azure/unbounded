@@ -118,6 +118,11 @@ func hostReadPeer(t *testing.T, serve func(conn *net.UnixConn, req hostReadReque
 // and answers with the frames Racer sends. complete=false omits the
 // completion frame, like a read that fails partway.
 func serveHostRead(body []byte, complete bool, delivery string) func(*net.UnixConn, hostReadRequest, *os.File) {
+	return serveHostReadSize(body, complete, delivery, wire.PageSize)
+}
+
+// serveHostReadSize is serveHostRead for a cache with an explicit page size.
+func serveHostReadSize(body []byte, complete bool, delivery string, pageSize uint64) func(*net.UnixConn, hostReadRequest, *os.File) {
 	return func(conn *net.UnixConn, req hostReadRequest, file *os.File) {
 		if req.fds != 1 || file == nil {
 			_, _ = fmt.Fprint(conn, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
@@ -145,7 +150,7 @@ func serveHostRead(body []byte, complete bool, delivery string) func(*net.UnixCo
 			return
 		}
 
-		pages := wire.PageCount(first, end)
+		pages := wire.PageCount(first, end, pageSize)
 
 		var b strings.Builder
 		b.WriteString("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nETag: \"v1\"\r\n")
@@ -166,9 +171,9 @@ func serveHostRead(body []byte, complete bool, delivery string) func(*net.UnixCo
 		var sent uint64
 
 		for n := uint64(0); n < pages; n++ {
-			page := first/wire.PageSize + n
-			start := max(first, page*wire.PageSize)
-			stop := min(end, (page+1)*wire.PageSize)
+			page := first/pageSize + n
+			start := max(first, page*pageSize)
+			stop := min(end, (page+1)*pageSize)
 
 			if _, err := file.WriteAt(body[start:stop], int64(destOffset+start-first)); err != nil {
 				return
@@ -214,6 +219,44 @@ func patterned(n int) []byte {
 	}
 
 	return b
+}
+
+func TestHostReadConfiguredPageSize(t *testing.T) {
+	const pageSize = 4 << 10
+
+	body := patterned(2*pageSize + 97)
+	path, _ := hostReadPeer(t, serveHostReadSize(body, true, "host", pageSize))
+	c := testClientSize(t, path, 1, pageSize)
+	file := testMemfd(t, 4)
+
+	const offset = pageSize - 2
+
+	var pages [][2]int64
+
+	result, err := c.HostRead(context.Background(), Request{Key: Key{1}}, file, HostReadOptions{
+		Offset: offset, Length: 4, DestinationLength: 4,
+		OnPage: func(offset, length int64) { pages = append(pages, [2]int64{offset, length}) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if result.Offset != offset || result.Length != 4 {
+		t.Fatalf("result %+v", result)
+	}
+
+	if want := [][2]int64{{offset, 2}, {pageSize, 2}}; fmt.Sprint(pages) != fmt.Sprint(want) {
+		t.Fatalf("pages %v, want %v", pages, want)
+	}
+
+	got := make([]byte, 4)
+	if _, err := file.ReadAt(got, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	if !bytes.Equal(got, body[offset:offset+4]) {
+		t.Fatalf("file contents %v, want %v", got, body[offset:offset+4])
+	}
 }
 
 func TestHostReadWholeObjectSpansPages(t *testing.T) {

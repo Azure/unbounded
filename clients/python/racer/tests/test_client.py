@@ -4,7 +4,7 @@ import os
 
 import pytest
 from conftest import FakeGpu
-from fakeserver import Obj
+from fakeserver import FakeRacer, Obj
 
 import racer
 import racer._wire as wire
@@ -20,7 +20,8 @@ def add(server, data=DATA, etag='"v1"', name="obj"):
 
 
 def client(server, **kw):
-    kw.setdefault("staging_bytes", 3 * 4096)
+    kw.setdefault("page_size", server.page_size)
+    kw.setdefault("staging_bytes", 3 * server.page_size)
     return racer.Client(socket_path=server.path, **kw)
 
 
@@ -56,7 +57,7 @@ def test_stream_read_full_and_range(server):
     assert c.read(req) == DATA
     seen = server.seen[-1]
     assert seen.headers["racer-page-credits"] == "2"
-    assert seen.headers["racer-byte-credits"] == str(2 * 16 * 1024 * 1024)
+    assert seen.headers["racer-byte-credits"] == str(2 * server.page_size)
     assert "range" not in seen.headers
     # Every page's credit comes back, including the last one.
     assert seen.credits == [(0, 4096), (1, 4096), (2, 4096), (3, 512)]
@@ -64,6 +65,83 @@ def test_stream_read_full_and_range(server):
     assert server.seen[-1].headers["range"] == "bytes=100-5099"
     assert c.read(req, offset=5000) == DATA[5000:]
     assert server.seen[-1].headers["range"] == "bytes=5000-"
+
+
+def test_default_page_size(default_server):
+    req = add(default_server)
+    c = racer.Client(socket_path=default_server.path)
+    assert c.page_size == racer.PAGE_SIZE == 16 << 20
+    assert c.staging_bytes == 4 * racer.PAGE_SIZE
+    assert racer.BYTE_CREDITS == 2 * racer.PAGE_SIZE
+    out = bytearray(len(DATA))
+    r = c.read_into_host(req, out)
+    assert bytes(out) == DATA and r.pages == 1
+    seen = default_server.seen[-1]
+    assert seen.headers["racer-byte-credits"] == str(2 * racer.PAGE_SIZE)
+    assert seen.credits == [(0, len(DATA))]
+
+
+def test_4k_page_size_uses_configured_boundaries(server):
+    req = add(server)
+    c = racer.Client(socket_path=server.path, page_size=4096)
+    assert c.staging_bytes == 4 * 4096
+    out = bytearray(len(DATA))
+    r = c.read_into_host(req, out)
+    assert bytes(out) == DATA and r.pages == 4
+    seen = server.seen[-1]
+    assert seen.headers["racer-byte-credits"] == str(2 * 4096)
+    assert seen.credits == [(0, 4096), (1, 4096), (2, 4096), (3, 512)]
+
+
+def test_64k_page_size_uses_configured_boundaries(tmp_path):
+    data = b"x" * (2 * 65536 + 17)
+    server = FakeRacer(str(tmp_path / "s"), page_size=65536)
+    racer.forget_modes()
+    try:
+        req = add(server, data=data)
+        c = racer.Client(socket_path=server.path, page_size=65536)
+        assert c.staging_bytes == 4 * 65536
+        out = bytearray(len(data))
+        r = c.read_into_host(req, out)
+        assert bytes(out) == data and (r.first, r.end, r.pages) == (0, len(data), 3)
+        seen = server.seen[-1]
+        assert seen.headers["racer-byte-credits"] == str(2 * 65536)
+        assert seen.credits == [(0, 65536), (1, 65536), (2, 17)]
+    finally:
+        server.close()
+        racer.forget_modes()
+
+
+@pytest.mark.parametrize("size", [4096, 8192, 65536, 1 << 20, 16 << 20])
+def test_valid_page_sizes(size):
+    c = racer.Client(socket_path="/nonexistent", page_size=size)
+    assert c.page_size == size
+    assert c.staging_bytes == 4 * size
+
+
+@pytest.mark.parametrize(
+    "size",
+    [0, -4096, 4095, 4097, 3 * 4096, (1 << 20) + 4096, 32 << 20, 1 << 30, True, False, 4096.0, "4096"],
+)
+def test_invalid_page_sizes_rejected(size):
+    with pytest.raises(racer.RacerError, match="page_size"):
+        racer.Client(socket_path="/nonexistent", page_size=size)
+
+
+def test_page_boundary_validation_uses_configured_size(tmp_path):
+    # The fake dataplane sends 16 MiB pages; a client told to use 4 KiB pages
+    # must reject the frame count before reading any body.
+    data = b"x" * (4096 + 10)
+    server = FakeRacer(str(tmp_path / "s"))
+    racer.forget_modes()
+    try:
+        req = add(server, data=data)
+        c = racer.Client(socket_path=server.path, page_size=4096)
+        with pytest.raises(racer.ProtocolError, match="Content-Length"):
+            c.read(req)
+    finally:
+        server.close()
+        racer.forget_modes()
 
 
 def test_stream_empty_object(server):
@@ -338,14 +416,14 @@ def test_gpu_read_window_check(server):
 
 
 def test_frame_sequence_rules(small_pages):
-    s = wire.Sequence(100, 9000)
+    s = wire.Sequence(100, 9000, small_pages)
     with pytest.raises(racer.ProtocolError):
         s.accept(wire.Frame(1, 0, 0, 4096))  # starts before range
-    s = wire.Sequence(100, 9000)
+    s = wire.Sequence(100, 9000, small_pages)
     s.accept(wire.Frame(1, 0, 100, 3996))
     with pytest.raises(racer.ProtocolError):
         s.accept(wire.Frame(1, 2, 8192, 808))  # skipped a page
-    s = wire.Sequence(100, 9000)
+    s = wire.Sequence(100, 9000, small_pages)
     s.accept(wire.Frame(1, 0, 100, 3996))
     s.accept(wire.Frame(1, 1, 4096, 4096))
     with pytest.raises(racer.ProtocolError):
@@ -358,6 +436,26 @@ def test_frame_sequence_rules(small_pages):
         s.accept(wire.Frame(2, 3, 8900, 0))  # after completion
     assert wire.decode_frame(wire.encode_frame(1, 2, 3, 4)) == wire.Frame(1, 2, 3, 4)
     assert wire.encode_credit(1, 2) == b"\0" * 7 + b"\1" + b"\0\0\0\2"
+
+
+def test_sequence_uses_configured_page_size_for_a_multi_page_object():
+    page = 65536
+    s = wire.Sequence(0, 3 * page + 17, page)
+    assert s.pages == 4
+    s.accept(wire.Frame(1, 0, 0, page))
+    s.accept(wire.Frame(1, 1, page, page))
+    s.accept(wire.Frame(1, 2, 2 * page, page))
+    s.accept(wire.Frame(1, 3, 3 * page, 17))
+    s.accept(wire.Frame(2, 4, 3 * page + 17, 0))
+    assert s.complete
+
+    s = wire.Sequence(0, 3 * page + 17, page)
+    with pytest.raises(racer.ProtocolError):
+        s.accept(wire.Frame(1, 0, 0, page + 1))  # a page frame never crosses a boundary
+    s = wire.Sequence(0, 3 * page + 17, page)
+    s.accept(wire.Frame(1, 0, 0, page))
+    with pytest.raises(racer.ProtocolError):
+        s.accept(wire.Frame(1, 2, 2 * page, page))  # skipped page 1
 
 
 def test_decimal():

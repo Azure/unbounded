@@ -14,10 +14,7 @@ import (
 	"github.com/opencontainers/go-digest"
 )
 
-const (
-	diagnosticPageSize    = 16 << 20
-	diagnosticPageRecords = 8
-)
+const diagnosticPageRecords = 8
 
 var errDiagnosticOracle = errors.New("diagnostic oracle read failed")
 
@@ -27,6 +24,7 @@ type pageRecord struct {
 }
 
 type pageEvidence struct {
+	pageSize              int64
 	firstMismatch         int64
 	examined, mismatching int64
 	records               []pageRecord
@@ -44,7 +42,7 @@ func (e *pageEvidence) LogValue() slog.Value {
 	}
 
 	return slog.GroupValue(slog.Int64("first_mismatch_offset", e.firstMismatch),
-		slog.Int("page_size", diagnosticPageSize), slog.Int64("pages_examined", e.examined),
+		slog.Int64("page_size", e.pageSize), slog.Int64("pages_examined", e.examined),
 		slog.Int64("mismatching_pages", e.mismatching),
 		slog.Int64("omitted_mismatching_pages", max(0, e.mismatching-int64(len(pages)))), slog.Any("records", pages))
 }
@@ -87,7 +85,8 @@ func (p *puller) readBodyDiagnostic(body io.Reader, expected blobSource) (int64,
 
 	oracle := make([]byte, len(*buffer))
 	whole, actualPage, expectedPage := sha256.New(), sha256.New(), sha256.New()
-	evidence := &pageEvidence{firstMismatch: -1}
+	pageSize := int64(effectivePageSize(p.opts.PageSize))
+	evidence := &pageEvidence{pageSize: pageSize, firstMismatch: -1}
 
 	var (
 		total, pageBytes int64
@@ -98,7 +97,7 @@ func (p *puller) readBodyDiagnostic(body io.Reader, expected blobSource) (int64,
 		if pageMismatch {
 			evidence.mismatching++
 			if len(evidence.records) < diagnosticPageRecords {
-				r := pageRecord{Index: evidence.examined, Offset: evidence.examined * diagnosticPageSize, Length: pageBytes}
+				r := pageRecord{Index: evidence.examined, Offset: evidence.examined * pageSize, Length: pageBytes}
 				copy(r.Actual[:], actualPage.Sum(nil))
 				copy(r.Expected[:], expectedPage.Sum(nil))
 				evidence.records = append(evidence.records, r)
@@ -130,7 +129,7 @@ func (p *puller) readBodyDiagnostic(body io.Reader, expected blobSource) (int64,
 			}
 
 			for offset := int64(0); offset < comparable; {
-				length := min(comparable-offset, diagnosticPageSize-pageBytes)
+				length := min(comparable-offset, pageSize-pageBytes)
 
 				actual, want := data[offset:offset+length], oracle[offset:offset+length]
 				if !bytes.Equal(actual, want) {
@@ -151,7 +150,7 @@ func (p *puller) readBodyDiagnostic(body io.Reader, expected blobSource) (int64,
 				pageBytes += length
 				offset += length
 
-				if pageBytes == diagnosticPageSize {
+				if pageBytes == pageSize {
 					finish()
 				}
 			}

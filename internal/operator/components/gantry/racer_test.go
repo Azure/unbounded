@@ -274,6 +274,30 @@ func TestPlanRetainedInstallationFollowsRacerCache(t *testing.T) {
 	}
 }
 
+func TestPlanWithRacerCachePageSize(t *testing.T) {
+	cache := racerCache()
+	size := racerv1.PageSize4KiB
+	cache.Spec.PageSize = &size
+
+	plan, res := planGantry(t, testEnv(t, cache, racerDaemonSet()), *siteWithGantry("edge", nil))
+	if !res.Ready {
+		t.Fatalf("result = %+v, want ready", res)
+	}
+
+	ds, _ := agentDaemonSet(t, plan)
+	for _, variable := range agentContainer(t, ds).Env {
+		if variable.Name == racerPageSizeEnv {
+			if variable.Value != string(size) {
+				t.Fatalf("%s = %q, want %q", racerPageSizeEnv, variable.Value, size)
+			}
+
+			return
+		}
+	}
+
+	t.Fatalf("%s missing in Racer mode", racerPageSizeEnv)
+}
+
 func TestApplyRacerModeIsIdempotent(t *testing.T) {
 	obj := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "apps/v1",
@@ -292,7 +316,7 @@ func TestApplyRacerModeIsIdempotent(t *testing.T) {
 	// An empty dataplane placement clears Gantry's own constraints rather than
 	// keeping them, so Gantry follows the dataplane exactly.
 	for range 2 {
-		if err := applyRacerMode(obj, &workload.NodePlacement{}); err != nil {
+		if err := applyRacerMode(obj, &workload.NodePlacement{}, ""); err != nil {
 			t.Fatalf("applyRacerMode: %v", err)
 		}
 	}
@@ -328,7 +352,7 @@ func TestApplyRacerModeRequiresAgentContainer(t *testing.T) {
 		}}},
 	}}
 
-	if err := applyRacerMode(obj, &workload.NodePlacement{}); err == nil {
+	if err := applyRacerMode(obj, &workload.NodePlacement{}, ""); err == nil {
 		t.Fatal("applyRacerMode succeeded without the agent container")
 	}
 }

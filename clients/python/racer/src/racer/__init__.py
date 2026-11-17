@@ -23,7 +23,7 @@ from .errors import (
     UnsatisfiableRange,
     VersionUnavailable,
 )
-from ._wire import PAGE_SIZE
+from ._wire import BYTE_CREDITS, PAGE_SIZE
 from .prefetch import (
     PrefetchBytes,
     PrefetchCoverage,
@@ -38,6 +38,7 @@ from .host import HostBuffer
 from .keys import Request, canonical_json, object_key, object_request
 
 __all__ = [
+    "BYTE_CREDITS",
     "DEFAULT_MODE_RETRY_SECONDS",
     "GPU",
     "HOST",

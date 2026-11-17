@@ -30,7 +30,7 @@ func TestClientHeadResponseRejectsOtherOperations(t *testing.T) {
 
 func TestRawCanonicalHeaders(t *testing.T) {
 	headRequest := Request{Operation: OperationHead}
-	bootstrap := Request{Operation: OperationBootstrap, Range: BootstrapRange()}
+	bootstrap := Request{Operation: OperationBootstrap, Range: BootstrapRange(PageSize)}
 	metadata := "ETag: \"v\"\r\nRacer-Expires-At: 0\r\n"
 	parseHead := func(head []byte) error {
 		_, err := ParseClientHeadResponse(head, headRequest)
@@ -46,7 +46,7 @@ func TestRawCanonicalHeaders(t *testing.T) {
 	}
 
 	parseRequest := func(head []byte) error {
-		_, err := ParseRequestHead(head, true)
+		_, err := ParseRequestHead(head, true, PageSize)
 		return err
 	}
 	for _, tc := range []struct {

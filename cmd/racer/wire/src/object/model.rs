@@ -150,14 +150,12 @@ pub struct PageId {
 /// this constant bound every [`PageSize`].
 pub const PAGE_BYTES: u64 = PageSize::MAX.get();
 
-/// Cluster-wide logical page size, published by the authority.
+/// Logical page size of one cache, published by the authority.
 ///
 /// Every page, fill, stored record, and checkpoint carries the page size it was cut at. Nodes
-/// refuse data cut at another size and recover cold rather than reinterpret it, and a running
-/// node rejects a publication that changes the size.
+/// refuse data cut at another size and recover cold rather than reinterpret it.
 ///
-/// A power of two in [`PageSize::MIN`]..=[`PageSize::MAX`]; test-support constructors also allow
-/// sizes down to [`PageSize::TEST_MIN`].
+/// A power of two in [`PageSize::MIN`]..=[`PageSize::MAX`].
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct PageSize(u64);
 
@@ -166,9 +164,9 @@ impl PageSize {
     pub const MAX: Self = Self(16 * 1024 * 1024);
     pub const DEFAULT: Self = Self::MAX;
     /// Smallest production page size.
-    pub const MIN: Self = Self(64 * 1024);
+    pub const MIN: Self = Self(4 * 1024);
     /// Smallest page size test-support constructors accept.
-    pub const TEST_MIN: Self = Self(4 * 1024);
+    pub const TEST_MIN: Self = Self::MIN;
 
     /// Validate a production page size.
     pub fn new(bytes: u64) -> Result<Self> {
@@ -645,10 +643,10 @@ mod tests {
     fn page_size_validation() {
         assert_eq!(PageSize::default().get(), 16 << 20);
         assert_eq!(PAGE_BYTES, PageSize::MAX.get());
-        for ok in [64 << 10, 1 << 20, 16 << 20] {
+        for ok in [4 << 10, 32 << 10, 64 << 10, 1 << 20, 16 << 20] {
             assert_eq!(PageSize::new(ok).map(PageSize::get), Ok(ok));
         }
-        for bad in [0, 1, 4 << 10, 32 << 10, 96 << 10, 32 << 20, u64::MAX] {
+        for bad in [0, 1, 2 << 10, 3 << 10, 96 << 10, 32 << 20, u64::MAX] {
             assert_eq!(PageSize::new(bad), Err(Error::InvalidRequest), "{bad}");
         }
         assert_eq!(PageSize::for_tests(4 << 10).map(PageSize::get), Ok(4 << 10));

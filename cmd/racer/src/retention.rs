@@ -638,6 +638,7 @@ mod tests {
             priority,
             mode: racer_wire::control::CacheMode::Cached,
             origin: None,
+            page_size: None,
         };
         // "u" holds payload but is unpublished; "e" is published but empty.
         let _held = [
@@ -689,6 +690,7 @@ mod tests {
             priority,
             mode: racer_wire::control::CacheMode::Cached,
             origin: None,
+            page_size: None,
         };
         // Reference: a fresh full count over the current resident set.
         let check = |policy: &Retention| {
@@ -784,6 +786,7 @@ mod tests {
             priority,
             mode: racer_wire::control::CacheMode::Cached,
             origin: None,
+            page_size: None,
         };
         const CACHES: usize = 2000;
         const LIMIT: usize = 64;

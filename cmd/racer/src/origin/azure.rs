@@ -358,13 +358,16 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
         Ok((snapshot, index))
     }
 
-    /// The published cluster page size; the default before any publication.
-    pub(crate) fn published_page_size(&self) -> Result<racer_wire::object::PageSize> {
+    /// The cache's effective page size; the default before any publication.
+    pub(crate) fn published_page_size(
+        &self,
+        cache: &racer_wire::control::CacheId,
+    ) -> Result<racer_wire::object::PageSize> {
         Ok(self
             .snapshots
             .current()?
             .map_or(racer_wire::object::PageSize::DEFAULT, |snapshot| {
-                snapshot.page_size
+                snapshot.page_size_for(cache)
             }))
     }
 
@@ -376,7 +379,7 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
     ) -> Result<()> {
         reservation.validate(
             ResourceClass::Plaintext,
-            self.published_page_size()?.get() as usize,
+            self.published_page_size(&object.cache)?.get() as usize,
         )?;
         if !self.admission.owns(reservation) || reservation.key() != Some(&object.cache) {
             return Err(Error::InvalidConfiguration);
@@ -494,7 +497,7 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
         scope: &RequestScope,
     ) -> Result<MetadataReply> {
         self.validate_reservation(&reservation, &context.object)?;
-        let page_size = self.published_page_size()?;
+        let page_size = self.published_page_size(&context.object.cache)?;
         let size = page_size.get();
         let begun = self.begin(definition, context, scope).await?;
         let range = ByteRange {
@@ -632,7 +635,7 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
         if page.version.object != context.object {
             return Err(Error::Unauthorized);
         }
-        let page_size = self.published_page_size()?;
+        let page_size = self.published_page_size(&context.object.cache)?;
         let size = page_size.get();
         let first = page.number.0.checked_mul(size).ok_or(Error::InvalidRange)?;
         let last = first
@@ -720,8 +723,11 @@ fn metadata(
 }
 
 impl<T: AzureTransport, K: AzureTokenSource> Origin for AzureOrigin<T, K> {
-    fn page_size(&self) -> Result<racer_wire::object::PageSize> {
-        self.published_page_size()
+    fn page_size(
+        &self,
+        cache: &racer_wire::control::CacheId,
+    ) -> Result<racer_wire::object::PageSize> {
+        self.published_page_size(cache)
     }
 
     fn bootstrap_reserved<'a>(

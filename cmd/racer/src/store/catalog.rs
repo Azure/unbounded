@@ -52,6 +52,14 @@ pub struct Index {
 
     reserved: Cell<usize>,
 
+    /// Active retaining page-size classes, ascending. Empty means the slot
+    /// budget is unpartitioned; one class keeps the whole budget.
+    page_sizes: RefCell<Vec<racer_wire::object::PageSize>>,
+
+    /// Class slots held by in-flight page tickets, one per reservation that
+    /// was not already charged to a hold.
+    class_reserved: RefCell<HashMap<racer_wire::object::PageSize, usize>>,
+
     /// Worker retention policy; startup wiring replaces it once.
     retention: RefCell<Rc<Retention>>,
 
@@ -88,6 +96,19 @@ fn page_slots(capacity: usize, hold_percent: usize) -> Result<u32> {
         .ok_or(Error::InvalidConfiguration)
 }
 
+/// One class's equal share of `total` slots. The remainder goes to the first
+/// classes in ascending page-size order, so the shares sum exactly to `total`.
+fn class_slots(total: usize, classes: usize, position: usize) -> usize {
+    debug_assert!(classes != 0 && position < classes);
+    total / classes + usize::from(position < total % classes)
+}
+
+/// Active class quotas never exceed the total slot budget; each class owns a
+/// share, and an existing over-quota class keeps its pages.
+fn quota_reached(used: usize, extra: usize, quota: usize) -> bool {
+    used.saturating_add(extra) > quota
+}
+
 struct State {
     pages: Pages,
 
@@ -113,13 +134,23 @@ impl State {
 /// future, releases all of it.
 pub struct PageTicket {
     index: Rc<Index>,
+    /// Page-size class this write is charged to.
+    size: racer_wire::object::PageSize,
+    /// Whether the ticket owns one total slot. The ticket keeps it through
+    /// [`Self::append`] and releases it exactly once on publication or drop.
     counted: bool,
+    /// Whether the ticket also owns one slot of its page-size class. A page
+    /// already stored or charged to a hold does not.
+    class_counted: bool,
     reservation: Option<super::pages::Reservation>,
 }
 impl Drop for PageTicket {
     fn drop(&mut self) {
         if std::mem::take(&mut self.counted) {
-            self.index.reserved.set(self.index.reserved.get() - 1);
+            self.index.release_total_reservation();
+        }
+        if std::mem::take(&mut self.class_counted) {
+            self.index.release_class_reservation(self.size);
         }
         if let Some(reservation) = self.reservation.take() {
             self.index.state_mut().pages.release(reservation);
@@ -136,6 +167,11 @@ impl PageTicket {
         segments: &Segments,
         length: usize,
     ) -> Result<(page_alloc::SegmentLease, RecordLocation)> {
+        // A ticket opened for a held or stored page may outlive that charge.
+        // Claim a class slot exactly once if the page became new meanwhile.
+        if !self.class_counted && self.index.claim_class(page, self.size)? {
+            self.class_counted = true;
+        }
         if self.reservation.is_none() {
             self.reservation = Some(self.index.state_mut().pages.reserve(page)?);
         }
@@ -147,8 +183,14 @@ impl PageTicket {
 
     /// Publish the completed write at the location [`Self::append`] returned.
     pub fn publish(mut self, page: PageId, entry: IndexedPage) -> Result<()> {
+        if entry.page_size != self.size {
+            return Err(Error::CorruptRecord);
+        }
         if std::mem::take(&mut self.counted) {
-            self.index.reserved.set(self.index.reserved.get() - 1);
+            self.index.release_total_reservation();
+        }
+        if std::mem::take(&mut self.class_counted) {
+            self.index.release_class_reservation(self.size);
         }
         let reservation = self.reservation.take();
         // Only tests publish a caller-chosen location through a ticket.
@@ -158,7 +200,7 @@ impl PageTicket {
         }
         let index = self.index.clone();
         drop(self);
-        index.publish_with(page, entry, reservation)
+        index.publish_with(page, entry, reservation, true)
     }
 }
 #[derive(Clone, Debug)]
@@ -302,9 +344,13 @@ impl Index {
             version: version.clone(),
             number: crate::model::PageNumber(0),
         };
-        // Pages that join the hold, and how many of them charge capacity.
+        // Pages that join the hold, how many of them charge total capacity,
+        // and how many newly join each page-size class.
         let mut joining = Vec::new();
         let mut joining_unused = 0;
+        let mut joining_unused_classes: HashMap<racer_wire::object::PageSize, usize> =
+            HashMap::default();
+        let class = self.availability.page_size(&version.object.cache);
         for number in members.iter() {
             page.number = number;
             if let Some(location) = state.pages.location(&page) {
@@ -313,7 +359,10 @@ impl Index {
                     .map_err(|_| Error::Overloaded)?;
             }
             if old.is_none_or(|hold| !hold.holders.contains_key(&number)) {
-                joining_unused += usize::from(!state.pages.occupied(&page));
+                if !state.pages.occupied(&page) {
+                    joining_unused += 1;
+                    *joining_unused_classes.entry(class).or_default() += 1;
+                }
                 joining.push(page.clone());
             }
         }
@@ -331,6 +380,11 @@ impl Index {
             > self.page_capacity.get()
         {
             return Err(Error::Overloaded);
+        }
+        for (size, count) in &joining_unused_classes {
+            if !self.class_admits_with(&state, &holds, *size, *count) {
+                return Err(Error::Overloaded);
+            }
         }
         if add_holders
             && let Some(old) = old
@@ -808,6 +862,8 @@ impl Index {
             )),
             availability,
             reserved: Cell::new(0),
+            page_sizes: RefCell::new(vec![racer_wire::object::PageSize::DEFAULT]),
+            class_reserved: RefCell::new(HashMap::default()),
             retention: RefCell::new(Rc::new(
                 Retention::new(256 * 1024, clock.clone()).expect("valid bounded retention"),
             )),
@@ -860,13 +916,193 @@ impl Index {
     pub fn metadata_capacity(&self) -> usize {
         self.metadata_capacity
     }
+    /// Active retaining page-size classes, ascending and deduplicated.
+    pub fn page_sizes(&self) -> Vec<racer_wire::object::PageSize> {
+        self.page_sizes.borrow().clone()
+    }
+
+    /// Replace the retaining page-size classes whose slot budget this index
+    /// partitions. Existing pages stay resident and may exceed a shrunken
+    /// class quota; only new admissions are refused. An empty slice leaves the
+    /// whole slot budget unpartitioned.
+    pub fn set_page_sizes(&self, sizes: &[racer_wire::object::PageSize]) {
+        let mut sizes = sizes.to_vec();
+        sizes.sort_unstable();
+        sizes.dedup();
+        *self.page_sizes.borrow_mut() = sizes;
+    }
+
+    /// Set the total slot budget and the page-size classes it is split over.
+    /// Equivalent to [`Self::set_page_capacity`] followed by
+    /// [`Self::set_page_sizes`]; an invalid total leaves both unchanged.
+    pub fn set_quotas(&self, total: usize, sizes: &[racer_wire::object::PageSize]) -> Result<()> {
+        self.set_page_capacity(total)?;
+        self.set_page_sizes(sizes);
+        Ok(())
+    }
+
+    /// Slots reserved for a page-size class, or `None` when the class is not
+    /// active or the budget is unpartitioned.
+    pub fn class_quota(&self, size: racer_wire::object::PageSize) -> Option<usize> {
+        let sizes = self.page_sizes.borrow();
+        let position = sizes.binary_search(&size).ok()?;
+        Some(class_slots(self.page_capacity.get(), sizes.len(), position))
+    }
+
+    /// Slots charged to `size` right now: stored pages, held pages that are
+    /// not stored yet, and in-flight tickets.
+    pub fn class_used(&self, size: racer_wire::object::PageSize) -> usize {
+        let state = self.state.borrow();
+        let holds = self.holds.borrow();
+        self.class_used_in(&state, &holds, size) + self.class_reserved(size)
+    }
+
+    /// Largest active page size, used to charge the unseen suffix of a
+    /// segment conservatively. Without active classes, the table's last
+    /// stored size is the best available bound.
+    pub fn max_page_size(&self) -> racer_wire::object::PageSize {
+        let configured = self.page_sizes.borrow().last().copied();
+        configured.unwrap_or_else(|| self.state.borrow().pages.page_size())
+    }
+
+    /// Payload bytes this worker's slot budget can hold: the sum of each
+    /// active class quota times its page size, or the whole budget times the
+    /// largest page size when unpartitioned.
+    pub fn capacity_bytes(&self) -> u64 {
+        let total = self.page_capacity.get();
+        let sizes = self.page_sizes.borrow();
+        if sizes.is_empty() {
+            drop(sizes);
+            return (total as u64).saturating_mul(self.max_page_size().get());
+        }
+        sizes
+            .iter()
+            .enumerate()
+            .map(|(position, size)| {
+                (class_slots(total, sizes.len(), position) as u64).saturating_mul(size.get())
+            })
+            .fold(0u64, u64::saturating_add)
+    }
+
+    /// Slots reserved by in-flight tickets for `size`.
+    fn class_reserved(&self, size: racer_wire::object::PageSize) -> usize {
+        self.class_reserved
+            .borrow()
+            .get(&size)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Release one total slot owned by a ticket.
+    fn release_total_reservation(&self) {
+        self.reserved.set(self.reserved.get() - 1);
+    }
+
+    /// Release one class slot owned by a ticket.
+    fn release_class_reservation(&self, size: racer_wire::object::PageSize) {
+        let mut reserved = self.class_reserved.borrow_mut();
+        let count = reserved.get_mut(&size).expect("reserved class slot");
+        *count -= 1;
+        if *count == 0 {
+            reserved.remove(&size);
+        }
+    }
+
+    /// Charge one class slot to a new ticket. The caller has already checked
+    /// the class quota.
+    fn charge_class(&self, size: racer_wire::object::PageSize) {
+        *self.class_reserved.borrow_mut().entry(size).or_default() += 1;
+    }
+
+    /// Charge the class of `page` to its ticket unless the page is already
+    /// stored or charged to a hold. Returns whether a new slot was taken.
+    fn claim_class(&self, page: &PageId, size: racer_wire::object::PageSize) -> Result<bool> {
+        self.expire_holds(HOLD_EXPIRY_BATCH);
+        let state = self.state.borrow();
+        if state.pages.contains_key(page) || Self::hold_available(&state, page) {
+            return Ok(false);
+        }
+        let holds = self.holds.borrow();
+        if !self.class_admits(&state, &holds, size) {
+            return Err(Error::Overloaded);
+        }
+        drop(holds);
+        drop(state);
+        self.charge_class(size);
+        Ok(true)
+    }
+
+    /// Slots used by `size` in already admitted work: stored pages plus hold
+    /// members that are not stored yet. Ticket reservations are added by the
+    /// caller so a mutable hold borrow can be reused.
+    fn class_used_in(
+        &self,
+        state: &State,
+        holds: &super::holds::Holds,
+        size: racer_wire::object::PageSize,
+    ) -> usize {
+        let stored = state
+            .pages
+            .iter()
+            .filter(|view| view.page_size == size)
+            .count();
+        let mut held = 0;
+        for (version, hold) in &holds.entries {
+            if self.availability.page_size(&version.object.cache) != size {
+                continue;
+            }
+            for number in hold.pages.iter() {
+                let page = PageId {
+                    version: version.clone(),
+                    number,
+                };
+                if !state.pages.contains_key(&page) {
+                    held += 1;
+                }
+            }
+        }
+        stored + held
+    }
+
+    /// Whether a new page of `size` fits its class. The total slot budget is
+    /// checked separately. An unpartitioned index admits every size.
+    fn class_admits(
+        &self,
+        state: &State,
+        holds: &super::holds::Holds,
+        size: racer_wire::object::PageSize,
+    ) -> bool {
+        self.class_admits_with(state, holds, size, 1)
+    }
+
+    /// [`Self::class_admits`] for `extra` pages about to join the same class,
+    /// such as new members of one hold.
+    fn class_admits_with(
+        &self,
+        state: &State,
+        holds: &super::holds::Holds,
+        size: racer_wire::object::PageSize,
+        extra: usize,
+    ) -> bool {
+        // A single retaining class owns the whole slot budget, so partitioning
+        // cannot reject it. This fast path also avoids scanning every stored page
+        // on each admission in the common default-only cluster.
+        if self.page_sizes.borrow().len() <= 1 {
+            return true;
+        }
+        let Some(quota) = self.class_quota(size) else {
+            return false;
+        };
+        let used = self.class_used_in(state, holds, size) + self.class_reserved(size);
+        !quota_reached(used, extra, quota)
+    }
+
     /// This worker's payload capacity for fair shares: the tighter of index
     /// entries times a full page and slab segments times segment bytes. Either
     /// one bounds how much payload the worker can keep resident. Segment space
     /// is ignored until segments are bound.
     pub fn disk_capacity(&self) -> u64 {
-        let size = self.state.borrow().pages.page_size().get();
-        let pages = (self.page_capacity.get() as u64).saturating_mul(size);
+        let pages = self.capacity_bytes();
         self.holds
             .borrow()
             .segments
@@ -910,14 +1146,23 @@ impl Index {
             .map(super::pages::PageView::into_entry))
     }
     /// Allocation-free capacity preflight, not a slot reservation. Replacements
-    /// remain admissible at capacity; new pages require an existing free slot.
+    /// remain admissible at capacity; new pages require an existing free slot
+    /// and a free slot in their page-size class.
     pub fn preflight_capacity(&self, page: &PageId) -> Result<()> {
         self.expire_holds(HOLD_EXPIRY_BATCH);
         let state = self.state.borrow();
+        let held = Self::hold_available(&state, page);
+        if !state.pages.contains_key(page) && !held {
+            let size = self.availability.page_size(&page.version.object.cache);
+            let holds = self.holds.borrow();
+            if !self.class_admits(&state, &holds, size) {
+                return Err(Error::Overloaded);
+            }
+        }
         if state.pages.contains_key(page)
             || state.pages.len() + self.reserved.get() + Self::held_unused(&state)
                 < self.page_capacity.get()
-            || Self::hold_available(&state, page)
+            || held
         {
             Ok(())
         } else {
@@ -950,9 +1195,18 @@ impl Index {
     pub(super) fn reserve_page_for(self: &Rc<Self>, page: &PageId) -> Result<PageTicket> {
         self.expire_holds(HOLD_EXPIRY_BATCH);
         let state = self.state.borrow();
+        let size = self.availability.page_size(&page.version.object.cache);
         // A held page charged to the hold moves that charge to the ticket
-        // here, and to its in-flight disk entry once appended.
+        // here, and to its in-flight disk entry once appended. Stored
+        // replacements are charged to neither.
         let held = Self::hold_available(&state, page);
+        let new = !state.pages.contains_key(page) && !held;
+        if new {
+            let holds = self.holds.borrow();
+            if !self.class_admits(&state, &holds, size) {
+                return Err(Error::Overloaded);
+            }
+        }
         if state.pages.len() + self.reserved.get() + Self::held_unused(&state) - usize::from(held)
             >= self.page_capacity.get()
         {
@@ -960,16 +1214,37 @@ impl Index {
         }
         drop(state);
         self.reserved.set(self.reserved.get() + 1);
+        if new {
+            self.charge_class(size);
+        }
         Ok(PageTicket {
             index: self.clone(),
+            size,
             counted: true,
+            class_counted: new,
             reservation: None,
         })
     }
     /// Atomically publish a completed record with its immutable descriptor. Reject
     /// conflicting lengths for one version; never update current-version freshness.
     pub fn publish(&self, page: PageId, entry: IndexedPage) -> Result<()> {
-        self.publish_with(page, entry, None)
+        self.publish_inner(page, entry, None, true, false)
+    }
+    /// Install a recovered mapping. Quotas are bypassed because the cut was
+    /// admitted before the restart; the record still has to match the cache's
+    /// page size.
+    fn publish_restored(&self, page: PageId, entry: IndexedPage) -> Result<()> {
+        self.publish_inner(page, entry, None, false, false)
+    }
+    /// Install a mapping without admission checks, for reader tests that need
+    /// a record and its index entry cut at different sizes. Publication and
+    /// recovery both reject that state.
+    #[cfg(test)]
+    pub(crate) fn install_unchecked_for_test(&self, page: PageId, entry: IndexedPage) {
+        self.state_mut()
+            .pages
+            .insert(page, entry)
+            .expect("test-only index install");
     }
     /// [`Self::publish`] of a reserved write, or of a validated location
     /// when `reservation` is `None`. A reservation is always consumed.
@@ -977,9 +1252,20 @@ impl Index {
         &self,
         page: PageId,
         entry: IndexedPage,
-        mut reservation: Option<super::pages::Reservation>,
+        reservation: Option<super::pages::Reservation>,
+        reserved: bool,
     ) -> Result<()> {
-        let result = self.try_publish(page, entry, &mut reservation);
+        self.publish_inner(page, entry, reservation, true, reserved)
+    }
+    fn publish_inner(
+        &self,
+        page: PageId,
+        entry: IndexedPage,
+        mut reservation: Option<super::pages::Reservation>,
+        enforce_quota: bool,
+        reserved: bool,
+    ) -> Result<()> {
+        let result = self.try_publish(page, entry, &mut reservation, enforce_quota, reserved);
         if let Some(reservation) = reservation {
             self.state_mut().pages.release(reservation);
         }
@@ -990,27 +1276,38 @@ impl Index {
         page: PageId,
         entry: IndexedPage,
         reservation: &mut Option<super::pages::Reservation>,
+        enforce_quota: bool,
+        reserved: bool,
     ) -> Result<()> {
-        if !self
-            .availability
-            .page(&page.version.object.cache, entry.key_id)
-        {
+        let cache = &page.version.object.cache;
+        if !self.availability.page(cache, entry.key_id) {
             return Ok(());
         }
         Self::validate_descriptor(&entry.metadata)?;
         let payload_bytes = u64::from(entry.metadata.page_length_in(&page, entry.page_size)?);
         let mut state = self.state_mut();
         Self::check_length(&state, &entry.metadata)?;
-        if !state.pages.contains_key(&page)
+        let new = !state.pages.contains_key(&page);
+        // A cache's page size never changes while it stays published, so a
+        // record cut at another size is stale and must not enter the table.
+        if self.availability.page_size(cache) != entry.page_size {
+            return Err(Error::CorruptRecord);
+        }
+        let held = new && Self::hold_available(&state, &page);
+        if new && !held && !reserved && enforce_quota {
+            let holds = self.holds.borrow();
+            if !self.class_admits(&state, &holds, entry.page_size) {
+                return Err(Error::Overloaded);
+            }
+        }
+        if new
             && state.pages.len() + self.reserved.get() + Self::held_unused(&state)
-                - usize::from(Self::hold_available(&state, &page))
+                - usize::from(held)
                 >= self.page_capacity.get()
         {
             return Err(Error::Overloaded);
         }
-        let payload = self
-            .retention()
-            .indexed_payload(&page.version.object.cache, payload_bytes);
+        let payload = self.retention().indexed_payload(cache, payload_bytes);
         let inserted = match reservation.take() {
             Some(reservation) => state.pages.publish(reservation, &page, entry),
             None => state.pages.insert(page.clone(), entry).map(|()| true),
@@ -1270,8 +1567,9 @@ impl Index {
             .pages
             .set_hash_key(hash_key)?;
         replacement.set_page_capacity(self.page_capacity.get())?;
+        replacement.set_page_sizes(&self.page_sizes());
         for (p, e) in snapshot.entries {
-            replacement.publish(p, e)?;
+            replacement.publish_restored(p, e)?;
         }
         for m in snapshot.metadata {
             replacement.publish_version(m)?;
@@ -1349,12 +1647,13 @@ impl Index {
         scoring: &crate::retention::Scoring<'_>,
     ) -> u64 {
         let state = self.state.borrow();
-        let size = state.pages.page_size();
+        let max = self.max_page_size();
         state.pages.segment_score(
             segment,
             racer_core::cache::SCAN_BUDGET,
-            racer_core::cache::unseen_value_for(size.get(), scoring.any_over_share()),
+            racer_core::cache::unseen_value_for(max.get(), scoring.any_over_share()),
             |page, metadata, heat| {
+                let size = self.availability.page_size(&page.version.object.cache);
                 racer_core::cache::page_value(
                     metadata.page_length_in(page, size).ok(),
                     size.get() as u32,
@@ -1618,8 +1917,8 @@ impl SegmentClock {
     fn reclaim_to(&self, now: std::time::Instant, free_reserve: usize) -> Result<()> {
         let retention = self.index.retention();
         let scoring = retention.scoring_at(now, self.index.disk_capacity());
-        let size = self.index.state.borrow().pages.page_size();
-        let unseen = racer_core::cache::unseen_value_for(size.get(), scoring.any_over_share());
+        let max = self.index.max_page_size();
+        let unseen = racer_core::cache::unseen_value_for(max.get(), scoring.any_over_share());
         let mut evicted = Vec::new();
         let result = self.index.state_mut().pages.reclaim(
             &self.segments,
@@ -1631,6 +1930,10 @@ impl SegmentClock {
             racer_core::cache::SCAN_BUDGET,
             unseen,
             |page, metadata, heat| {
+                let size = self
+                    .index
+                    .availability
+                    .page_size(&page.version.object.cache);
                 racer_core::cache::page_value(
                     metadata.page_length_in(page, size).ok(),
                     size.get() as u32,
@@ -1638,6 +1941,10 @@ impl SegmentClock {
                 )
             },
             |page, metadata| {
+                let size = self
+                    .index
+                    .availability
+                    .page_size(&page.version.object.cache);
                 evicted.push((
                     page.clone(),
                     metadata.page_length_in(page, size).unwrap_or(0),
@@ -1656,7 +1963,13 @@ mod tests {
     use super::*;
     use crate::model::CacheKey;
     use crate::model::StrongEtag;
+    use racer_wire::control::CacheDefinition;
     use racer_wire::control::CacheId;
+    use racer_wire::control::MembershipVersion;
+    use racer_wire::control::Publication;
+    use racer_wire::control::PublicationSequence;
+    use racer_wire::object::PageSize;
+    use std::sync::Arc;
 
     fn segments(bytes: u64, count: usize) -> Segments {
         let s = Segments::new(bytes);
@@ -1800,6 +2113,145 @@ mod tests {
             env.ctx.clock.clone(),
         )
     }
+
+    fn cache(name: &str) -> CacheId {
+        let digit = (b'a' + name.as_bytes()[0] % 6) as char;
+        let d = digit.to_string().repeat(12);
+        CacheId(format!(
+            "{}-{}-4{}-8{}-{d}",
+            &d[..8],
+            &d[..4],
+            &d[..3],
+            &d[..3]
+        ))
+    }
+
+    /// Publish `caches` at their own page sizes and bind an index to them.
+    fn sized_index(env: &racer_io::Env, pages: usize, caches: &[(&str, PageSize)]) -> Rc<Index> {
+        use racer_wire::control::SCHEMA_VERSION;
+        let ids: Vec<_> = caches.iter().map(|(name, _)| cache(name)).collect();
+        let keys = Rc::new(crate::test_support::security::keys_for(env, &ids));
+        let publications = Arc::new(crate::control::cell::PublicationCell::new(
+            crate::control::Snapshot::retention(1),
+        ));
+        let target = crate::control::publication::PublicationTarget::new(
+            keys.cluster().clone(),
+            publications.clone(),
+            env.ctx.clock.clone(),
+        );
+        let definitions = caches
+            .iter()
+            .map(|(name, size)| {
+                let (client_socket, origin_socket) =
+                    racer_wire::control::canonical_socket_paths(name).unwrap();
+                CacheDefinition {
+                    id: cache(name),
+                    name: (*name).into(),
+                    client_socket,
+                    origin_socket,
+                    priority: racer_wire::control::DEFAULT_PRIORITY,
+                    mode: racer_wire::control::CacheMode::Cached,
+                    origin: None,
+                    page_size: Some(*size),
+                }
+            })
+            .collect();
+        target
+            .apply(
+                Publication {
+                    pools: Vec::new(),
+                    schema_version: SCHEMA_VERSION,
+                    cluster: keys.cluster().clone(),
+                    sequence: PublicationSequence(1),
+                    membership_version: MembershipVersion(1),
+                    members: vec![racer_wire::control::Member {
+                        node: keys.node().clone(),
+                        shares: std::num::NonZeroU32::new(1).unwrap(),
+                        peer_endpoint: "127.0.0.1:1".into(),
+                        rails: vec![],
+                        site: String::new(),
+                    }],
+                    caches: definitions,
+                    page_size: PageSize::DEFAULT,
+                }
+                .with_default_pool(),
+            )
+            .unwrap();
+        let availability = Rc::new(crate::control::Availability::new(publications, keys));
+        let index = Rc::new(Index::new(
+            WorkerId(0),
+            64,
+            availability,
+            env.ctx.clock.clone(),
+        ));
+        index.set_page_capacity(pages).unwrap();
+        index.set_page_sizes(
+            &caches
+                .iter()
+                .map(|(_, size)| *size)
+                .collect::<Vec<PageSize>>(),
+        );
+        index
+    }
+
+    /// Give every named cache an equal retention weight, so segment scores
+    /// reflect payload bytes instead of a zero-priority default.
+    fn weight_equally(index: &Index, names: &[&str]) {
+        let table = crate::priority::Weights::default();
+        table.update(
+            &names
+                .iter()
+                .map(|name| CacheDefinition {
+                    id: cache(name),
+                    name: (*name).into(),
+                    client_socket: "/client".into(),
+                    origin_socket: "/origin".into(),
+                    priority: 500,
+                    mode: racer_wire::control::CacheMode::Cached,
+                    origin: None,
+                    page_size: None,
+                })
+                .collect::<Vec<_>>(),
+        );
+        index.retention().set_weights(table);
+    }
+
+    /// One page-zero entry of `cache_name` cut at `size`.
+    fn sized_entry(
+        cache_name: &str,
+        etag: &str,
+        size: PageSize,
+        segment: u64,
+    ) -> (PageId, IndexedPage) {
+        let metadata = VersionMetadata {
+            content_type: None,
+            version: ObjectVersion {
+                object: ObjectId {
+                    cache: cache(cache_name),
+                    key: CacheKey([0; 32]),
+                },
+                etag: StrongEtag::test_value(etag),
+            },
+            length: size.get(),
+        };
+        (
+            PageId {
+                version: metadata.version.clone(),
+                number: crate::model::PageNumber(0),
+            },
+            IndexedPage {
+                page_size: size,
+                metadata,
+                key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
+                location: RecordLocation {
+                    segment: SegmentId(segment),
+                    generation: Generation(1),
+                    extent: Extent::new(segment * size.get(), 512).unwrap(),
+                },
+            },
+        )
+    }
+
     #[test]
     fn reclaim_prepares_one_scoring_pass() {
         let env = racer_io::Env::host();
@@ -2985,6 +3437,249 @@ mod tests {
         assert!(index.current(&m.version.object).unwrap().is_none());
         assert_eq!(index.version(&m.version).unwrap(), Some(m));
     }
+    #[test]
+    fn class_quotas_split_slots_and_capacity_uses_each_class() {
+        let env = racer_io::Env::host();
+        let small = PageSize::new(4 << 10).unwrap();
+        let medium = PageSize::new(64 << 10).unwrap();
+        let large = PageSize::DEFAULT;
+        let index = index(&env, 8);
+        index.set_page_capacity(8).unwrap();
+        index.set_page_sizes(&[large, small, medium]);
+        // 8 slots over three classes: the remainder goes to the two smallest.
+        assert_eq!(index.page_sizes(), [small, medium, large]);
+        assert_eq!(index.class_quota(small), Some(3));
+        assert_eq!(index.class_quota(medium), Some(3));
+        assert_eq!(index.class_quota(large), Some(2));
+        assert_eq!(index.max_page_size(), large);
+        assert_eq!(
+            index.capacity_bytes(),
+            3 * small.get() + 3 * medium.get() + 2 * large.get()
+        );
+        // One class keeps the whole budget.
+        index.set_page_sizes(&[small]);
+        assert_eq!(index.class_quota(small), Some(8));
+        assert_eq!(index.capacity_bytes(), 8 * small.get());
+        assert_eq!(index.class_quota(medium), None);
+        // No classes leaves the budget unpartitioned.
+        index.set_page_sizes(&[]);
+        assert_eq!(index.class_quota(small), None);
+        assert_eq!(index.capacity_bytes(), 8 * large.get());
+    }
+
+    #[test]
+    fn class_quota_rejects_new_pages_but_keeps_existing_pages_after_shrink() {
+        let env = racer_io::Env::host();
+        let small = PageSize::new(4 << 10).unwrap();
+        let large = PageSize::DEFAULT;
+        let index = sized_index(&env, 6, &[("small", small), ("large", large)]);
+        assert_eq!(index.class_quota(small), Some(3));
+        assert_eq!(index.class_quota(large), Some(3));
+        let mut resident = Vec::new();
+        for (name, size) in [("small", small), ("large", large)] {
+            for i in 0..2 {
+                let (page, entry) = sized_entry(name, &format!("{name}-{i}"), size, 0);
+                index.publish(page.clone(), entry).unwrap();
+                resident.push(page);
+            }
+        }
+        assert_eq!(index.class_used(small), 2);
+        assert_eq!(index.class_used(large), 2);
+        // Shrinking the budget over already resident pages is allowed; quotas
+        // follow the new total and existing pages stay resident.
+        index.set_page_capacity(4).unwrap();
+        assert_eq!(index.class_quota(small), Some(2));
+        assert_eq!(index.class_quota(large), Some(2));
+        assert_eq!(index.class_used(small), 2);
+        assert_eq!(index.class_used(large), 2);
+        let (extra, _) = sized_entry("small", "small-extra", small, 0);
+        assert_eq!(index.preflight_capacity(&extra), Err(Error::Overloaded));
+        assert_eq!(
+            index.reserve_page_for(&extra).err(),
+            Some(Error::Overloaded)
+        );
+        // Replacing a resident page is still admissible at its class quota.
+        let (_, replacement) = sized_entry("small", "small-0", small, 1);
+        index.publish(resident[0].clone(), replacement).unwrap();
+        assert_eq!(index.class_used(small), 2);
+    }
+
+    #[test]
+    fn ticket_reservation_is_not_rechecked_at_publication() {
+        let env = racer_io::Env::host();
+        let small = PageSize::new(4 << 10).unwrap();
+        let large = PageSize::DEFAULT;
+        let index = sized_index(&env, 4, &[("small", small), ("large", large)]);
+        // Two slots per class. One resident small page plus one small ticket
+        // fill the class.
+        let (resident, entry) = sized_entry("small", "small-0", small, 0);
+        index.publish(resident, entry).unwrap();
+        let (reserved, entry) = sized_entry("small", "small-1", small, 0);
+        let ticket = index.reserve_page_for(&reserved).unwrap();
+        assert_eq!(index.class_used(small), 2);
+        // A direct publish of another small page sees the reservation and the
+        // class is already full.
+        let (other, other_entry) = sized_entry("small", "small-2", small, 1);
+        assert_eq!(index.publish(other, other_entry), Err(Error::Overloaded));
+        // The ticket already owns its class slot and must not recheck it.
+        ticket.publish(reserved, entry).unwrap();
+        assert_eq!(index.class_used(small), 2);
+        index.state.borrow().pages.check();
+    }
+
+    #[test]
+    fn mixed_size_restore_bypasses_quotas_but_validates_size() {
+        let env = racer_io::Env::host();
+        let small = PageSize::new(4 << 10).unwrap();
+        let large = PageSize::DEFAULT;
+        let index = sized_index(&env, 4, &[("small", small), ("large", large)]);
+        // 3 small pages exceed their 2-slot class quota, but the cut was
+        // admitted before the restart, so restore installs it.
+        let entries: Vec<_> = (0..3)
+            .map(|i| sized_entry("small", &format!("s{i}"), small, 0))
+            .chain(std::iter::once(sized_entry("large", "l0", large, 1)))
+            .collect();
+        index
+            .restore(IndexSnapshot {
+                entries,
+                metadata: Vec::new(),
+            })
+            .unwrap();
+        assert_eq!(index.class_used(small), 3);
+        assert_eq!(index.class_used(large), 1);
+        let (extra, _) = sized_entry("small", "extra", small, 0);
+        assert_eq!(
+            index.reserve_page_for(&extra).err(),
+            Some(Error::Overloaded)
+        );
+        // A record cut at another size is rejected even though quotas are
+        // bypassed during restore.
+        let (page, entry) = sized_entry("small", "wrong", large, 0);
+        assert_eq!(
+            index.restore(IndexSnapshot {
+                entries: vec![(page, entry)],
+                metadata: Vec::new(),
+            }),
+            Err(Error::CorruptRecord)
+        );
+    }
+
+    #[test]
+    fn hold_admission_charges_the_cache_page_size_class() {
+        let env = racer_io::Env::host();
+        let small = PageSize::new(4 << 10).unwrap();
+        let large = PageSize::DEFAULT;
+        let index = sized_index(&env, 4, &[("small", small), ("large", large)]);
+        index.set_hold_capacity_percent(100).unwrap();
+        let segments = Rc::new(segments(1024, 8));
+        let _clock = SegmentClock::new(index.clone(), segments, 1);
+        let until = racer_io::Clock::host().wall_now() + std::time::Duration::from_secs(60);
+        let (small_page, _) = sized_entry("small", "held-small", small, 0);
+        // One small page takes one of the two small class slots.
+        index.reserve_hold(&small_page.version, 1, until).unwrap();
+        assert_eq!(index.class_used(small), 1);
+        let (other_small, _) = sized_entry("small", "held-small-2", small, 0);
+        index.reserve_hold(&other_small.version, 1, until).unwrap();
+        assert_eq!(index.class_used(small), 2);
+        let (third_small, _) = sized_entry("small", "held-small-3", small, 0);
+        assert_eq!(
+            index.reserve_hold(&third_small.version, 1, until),
+            Err(Error::Overloaded)
+        );
+        // The large class is unaffected.
+        let (large_page, _) = sized_entry("large", "held-large", large, 0);
+        index.reserve_hold(&large_page.version, 1, until).unwrap();
+        assert_eq!(index.class_used(large), 1);
+        // Renewing an existing hold adds no class charge.
+        index.extend_hold(&small_page.version, until).unwrap();
+        assert_eq!(index.class_used(small), 2);
+        index.release_hold(&small_page.version).unwrap();
+        assert_eq!(index.class_used(small), 1);
+        index.reserve_hold(&third_small.version, 1, until).unwrap();
+        assert_eq!(index.class_used(small), 2);
+    }
+
+    #[test]
+    fn mixed_size_reclaim_uses_each_entrys_own_size() {
+        let env = racer_io::Env::host();
+        let small = PageSize::new(4 << 10).unwrap();
+        let large = PageSize::DEFAULT;
+        let index = sized_index(&env, 4, &[("small", small), ("large", large)]);
+        weight_equally(&index, &["small", "large"]);
+        let segments = Rc::new(segments(4 * 1024, 4));
+        for _ in 0..4 {
+            drop(segments.append(4 * 1024).unwrap());
+        }
+        let mut small_pages = Vec::new();
+        for i in 0..2 {
+            let (page, entry) = sized_entry("small", &format!("s{i}"), small, i);
+            index.publish(page.clone(), entry).unwrap();
+            small_pages.push(page);
+        }
+        for i in 0..2 {
+            let (page, entry) = sized_entry("large", &format!("l{i}"), large, i);
+            index.publish(page, entry).unwrap();
+        }
+        let retention = index.retention();
+        let scoring = retention.scoring_at(index.clock().now(), index.disk_capacity());
+        // Scoring derives each entry's length from its own page size, so both
+        // classes score by their real payload share instead of one table-wide
+        // size.
+        assert!(index.segment_score_with(SegmentId(0), &scoring) > 0);
+        assert!(index.segment_score_with(SegmentId(1), &scoring) > 0);
+        drop(scoring);
+        SegmentClock::new(index.clone(), segments, 1)
+            .reclaim_now()
+            .unwrap();
+        index.state.borrow().pages.check();
+    }
+
+    #[test]
+    fn ticket_claims_a_released_hold_class_on_append() {
+        let env = racer_io::Env::host();
+        let small = PageSize::new(4 << 10).unwrap();
+        let large = PageSize::DEFAULT;
+        let index = sized_index(&env, 4, &[("small", small), ("large", large)]);
+        let segments = Rc::new(segments(512, 2));
+        let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
+        let until = racer_io::Clock::host().wall_now() + std::time::Duration::from_secs(60);
+        let (page, entry) = sized_entry("small", "transfer", small, 0);
+        index.reserve_hold(&page.version, 1, until).unwrap();
+        assert_eq!(index.class_used(small), 1);
+        // The hold already owns the class slot, so the ticket does not.
+        let mut ticket = index.reserve_page_for(&page).unwrap();
+        assert_eq!(index.class_used(small), 1);
+        index.release_hold(&page.version).unwrap();
+        assert_eq!(index.class_used(small), 0);
+        // Appending the now-unheld page transfers one class slot to the ticket.
+        let (_lease, location) = ticket.append(&page, &segments, 512).unwrap();
+        assert_eq!(index.class_used(small), 1);
+        ticket
+            .publish(page, IndexedPage { location, ..entry })
+            .unwrap();
+        assert_eq!(index.class_used(small), 1);
+        assert_eq!(index.reserved.get(), 0);
+    }
+
+    #[test]
+    fn class_reservation_is_released_exactly_once() {
+        let env = racer_io::Env::host();
+        let small = PageSize::new(4 << 10).unwrap();
+        let large = PageSize::DEFAULT;
+        let index = sized_index(&env, 4, &[("small", small), ("large", large)]);
+        let (page, _) = sized_entry("small", "reserved", small, 0);
+        let ticket = index.reserve_page_for(&page).unwrap();
+        assert_eq!(index.class_used(small), 1);
+        drop(ticket);
+        assert_eq!(index.class_used(small), 0);
+        assert_eq!(index.reserved.get(), 0);
+        // A mismatched page size at ticket publication releases the slot.
+        let (page, entry) = sized_entry("small", "mismatch", large, 0);
+        let ticket = index.reserve_page_for(&page).unwrap();
+        assert_eq!(ticket.publish(page, entry), Err(Error::CorruptRecord));
+        assert_eq!(index.class_used(small), 0);
+        assert_eq!(index.reserved.get(), 0);
+    }
 }
 
 #[cfg(test)]
@@ -3017,6 +3712,7 @@ mod priority_tests {
             priority,
             mode: racer_wire::control::CacheMode::Cached,
             origin: None,
+            page_size: None,
         }
     }
 

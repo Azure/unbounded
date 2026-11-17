@@ -20,6 +20,7 @@ import metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 // +kubebuilder:validation:XValidation:rule="size(self.metadata.name) <= 82",message="name must fit the canonical Unix socket path"
 // +kubebuilder:validation:XValidation:rule="self.metadata.name.matches('^[^.]{1,63}([.][^.]{1,63})*$')",message="each name label must be at most 63 characters"
 // +kubebuilder:validation:XValidation:rule="(has(self.spec) && has(self.spec.origin)) == (has(oldSelf.spec) && has(oldSelf.spec.origin))",message="spec.origin cannot be added or removed; create a new ClusterCache to change the origin"
+// +kubebuilder:validation:XValidation:rule="(!has(self.spec) || !has(self.spec.pageSize)) == (!has(oldSelf.spec) || !has(oldSelf.spec.pageSize)) && ((!has(self.spec) || !has(self.spec.pageSize)) || self.spec.pageSize == oldSelf.spec.pageSize)",message="spec.pageSize is immutable; create a new ClusterCache to change the page size"
 type ClusterCache struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
@@ -37,6 +38,13 @@ type ClusterCacheSpec struct {
 	// own origin.
 	// +optional
 	Origin *ObjectOrigin `json:"origin,omitempty"`
+
+	// PageSize is the logical page size for this cache. It must be a power of
+	// two from 4KiB through 16MiB. When unset, the cluster default applies.
+	// PageSize is immutable; changing it would reinterpret stored pages, so
+	// create a new ClusterCache instead.
+	// +optional
+	PageSize *PageSize `json:"pageSize,omitempty"`
 
 	// Priority is the relative weight used to share node cache capacity among
 	// ClusterCaches. Disk shares are weighted across published caches, plus any
@@ -73,6 +81,62 @@ type ClusterCacheSpec struct {
 	// restricts client pods that use this cache to matching nodes.
 	// +optional
 	NodeSelector *metav1.LabelSelector `json:"nodeSelector,omitempty"`
+}
+
+// PageSize is a cache's logical page size.
+// +kubebuilder:validation:Enum="4KiB";"8KiB";"16KiB";"32KiB";"64KiB";"128KiB";"256KiB";"512KiB";"1MiB";"2MiB";"4MiB";"8MiB";"16MiB"
+type PageSize string
+
+const (
+	PageSize4KiB   PageSize = "4KiB"
+	PageSize8KiB   PageSize = "8KiB"
+	PageSize16KiB  PageSize = "16KiB"
+	PageSize32KiB  PageSize = "32KiB"
+	PageSize64KiB  PageSize = "64KiB"
+	PageSize128KiB PageSize = "128KiB"
+	PageSize256KiB PageSize = "256KiB"
+	PageSize512KiB PageSize = "512KiB"
+	PageSize1MiB   PageSize = "1MiB"
+	PageSize2MiB   PageSize = "2MiB"
+	PageSize4MiB   PageSize = "4MiB"
+	PageSize8MiB   PageSize = "8MiB"
+	PageSize16MiB  PageSize = "16MiB"
+)
+
+// Bytes returns the number of bytes named by p, or 0 when p is not a valid
+// page size. The CRD enum rejects invalid values before they reach the
+// authority, but callers still validate the result.
+func (p PageSize) Bytes() uint64 {
+	switch p {
+	case PageSize4KiB:
+		return 4 << 10
+	case PageSize8KiB:
+		return 8 << 10
+	case PageSize16KiB:
+		return 16 << 10
+	case PageSize32KiB:
+		return 32 << 10
+	case PageSize64KiB:
+		return 64 << 10
+	case PageSize128KiB:
+		return 128 << 10
+	case PageSize256KiB:
+		return 256 << 10
+	case PageSize512KiB:
+		return 512 << 10
+	case PageSize1MiB:
+		return 1 << 20
+	case PageSize2MiB:
+		return 2 << 20
+	case PageSize4MiB:
+		return 4 << 20
+	case PageSize8MiB:
+		return 8 << 20
+	case PageSize16MiB:
+		return 16 << 20
+	default:
+		return 0
+	}
 }
 
 // PassthroughRoute selects which node's origin serves a passthrough read.

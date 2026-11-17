@@ -51,7 +51,7 @@ def setup_model(server, uri, index=True):
 
 
 def client(server):
-    return racer.Client(socket_path=server.path, staging_bytes=4096)
+    return racer.Client(socket_path=server.path, staging_bytes=4096, page_size=server.page_size)
 
 
 def chunks_for(c, uri, staging=400, pins=None):
@@ -133,7 +133,7 @@ def test_fetch_requires_config(server, uri, tmp_path):
 def test_main(server, uri, tmp_path, monkeypatch, capsys):
     setup_model(server, uri)
     monkeypatch.setenv("RACER_SOCKET", server.path)
-    assert rv.main([str(uri), str(tmp_path)]) == 0
+    assert rv.main([str(uri), str(tmp_path), "--page-size", str(server.page_size)]) == 0
     assert "config.json" in capsys.readouterr().out.split()
     assert (tmp_path / rv.MARKER).exists()
     with pytest.raises(SystemExit):
@@ -306,18 +306,36 @@ def test_iter_weights(server, uri, torch, depth):
     assert torch.events and all(e.synced for e in torch.events)
 
 
-def test_iter_weights_reads_each_page_once(server, uri, torch, monkeypatch):
-    monkeypatch.setattr(racer, "PAGE_SIZE", 64)
-    setup_model(server, uri)
-    c = client(server)
-    assert {n: t.bytes() for n, t in weights(c, uri)} == ALL
+def test_iter_weights_reads_each_page_once(server, uri, torch):
+    # The fake dataplane uses 4096-byte pages; these tensors span several.
+    want = {"w1": b"\1" * 5000, "w2": b"\2" * 5000, "w3": b"\3" * 5000, "w4": b"\0" * 8}
+    a = make_safetensors([("w1", "U8", (5000,), want["w1"]), ("w2", "U8", (5000,), want["w2"])])
+    b = make_safetensors([("w3", "U8", (5000,), want["w3"]), ("w4", "F32", (2,), want["w4"])])
+    put(server, uri, "a.safetensors", a)
+    put(server, uri, "b.safetensors", b)
+    index = {
+        "weight_map": {
+            "w1": "a.safetensors",
+            "w2": "a.safetensors",
+            "w3": "b.safetensors",
+            "w4": "b.safetensors",
+        }
+    }
+    put(server, uri, rv.INDEX, json.dumps(index).encode())
+
+    c = racer.Client(socket_path=server.path, staging_bytes=8192, page_size=server.page_size)
+    pinned = [(n, rv.stat_pinned(c, uri, n)) for n in ("a.safetensors", "b.safetensors")]
+    chunks = rv.read_chunks(c, uri, pinned, 8192)
+    got = dict(rv.iter_weights(c, uri, chunks, 8192, 2, use_vmm=False))
+    assert {n: t.bytes() for n, t in got.items()} == want
+
     pages = {}
     reads = 0
     for s, first, last in range_reads(server):
-        if first in (0, 8) or last + 1 - first == 900:
-            continue  # header reads and the dedicated w3 read
+        if first in (0, 8):
+            continue  # header reads
         reads += 1
-        mine = set(range(first // 64, last // 64 + 1))
+        mine = set(range(first // c.page_size, last // c.page_size + 1))
         assert not mine & pages.setdefault(s.target, set())
         pages[s.target] |= mine
     assert reads >= 2
@@ -536,7 +554,7 @@ def make_loader(monkeypatch, server, **extra):
     rv.register()
     assert registry["calls"] == ["racer"]
     monkeypatch.setenv("RACER_SOCKET", server.path)
-    extra = {"staging_bytes": 400, "concurrency": 2, "use_vmm": False, **extra}
+    extra = {"staging_bytes": 400, "page_size": server.page_size, "concurrency": 2, "use_vmm": False, **extra}
     return registry["racer"](types.SimpleNamespace(model_loader_extra_config=extra))
 
 
@@ -644,14 +662,16 @@ def test_loader_sharded_state_reads_only_own_rank(server, uri, torch, monkeypatc
 
 def test_settings():
     s = rv.settings({})
-    assert (s["staging_bytes"], s["concurrency"], s["clone"], s["use_vmm"], s["sharded_state"]) == (
+    assert (s["staging_bytes"], s["page_size"], s["concurrency"], s["clone"], s["use_vmm"], s["sharded_state"]) == (
         256 << 20,
+        racer.PAGE_SIZE,
         4,
         True,
         True,
         False,
     )
     assert s["mode_retry_seconds"] == racer.DEFAULT_MODE_RETRY_SECONDS
+    assert rv.settings({"page_size": 4096})["page_size"] == 4096
     assert rv.settings({"mode_retry_seconds": None})["mode_retry_seconds"] is None
     assert rv.settings({"mode_retry_seconds": "30"})["mode_retry_seconds"] == 30.0
 

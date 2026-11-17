@@ -405,6 +405,150 @@ func TestEnvtestClusterCachePriorityValidation(t *testing.T) {
 	})
 }
 
+func TestEnvtestClusterCachePageSizeValidation(t *testing.T) {
+	assets := os.Getenv("KUBEBUILDER_ASSETS")
+	if assets == "" {
+		t.Skip("set KUBEBUILDER_ASSETS for real API validation tests")
+	}
+
+	environment := &envtest.Environment{BinaryAssetsDirectory: assets, CRDDirectoryPaths: []string{"crd"}, ErrorIfCRDPathMissing: true}
+	rc, err := environment.Start()
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, environment.Stop()) })
+
+	scheme := runtime.NewScheme()
+	require.NoError(t, AddToScheme(scheme))
+	c, err := client.New(rc, client.Options{Scheme: scheme})
+	require.NoError(t, err)
+
+	n := 0
+	create := func(spec map[string]any) (string, error) {
+		n++
+		name := fmt.Sprintf("page-size-%d", n)
+		obj := &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": GroupVersion.String(),
+			"kind":       "ClusterCache",
+			"metadata":   map[string]any{"name": name},
+		}}
+		if spec != nil {
+			obj.Object["spec"] = spec
+		}
+
+		return name, c.Create(t.Context(), obj)
+	}
+
+	for _, size := range []PageSize{
+		PageSize4KiB, PageSize8KiB, PageSize16KiB, PageSize32KiB, PageSize64KiB,
+		PageSize128KiB, PageSize256KiB, PageSize512KiB, PageSize1MiB, PageSize2MiB,
+		PageSize4MiB, PageSize8MiB, PageSize16MiB,
+	} {
+		t.Run("accepts "+string(size), func(t *testing.T) {
+			_, err := create(map[string]any{"pageSize": string(size)})
+			require.NoError(t, err)
+		})
+	}
+
+	for name, size := range map[string]string{
+		"below minimum": "3KiB",
+		"above maximum": "32MiB",
+		"lowercase":     "4kib",
+		"bytes":         "4096",
+		"empty":         "",
+		"not a size":    "large",
+	} {
+		t.Run("rejects "+name, func(t *testing.T) {
+			_, err := create(map[string]any{"pageSize": size})
+			require.True(t, apierrors.IsInvalid(err), "%v", err)
+			require.ErrorContains(t, err, "spec.pageSize")
+		})
+	}
+
+	t.Run("unset stays unset", func(t *testing.T) {
+		name, err := create(map[string]any{})
+		require.NoError(t, err)
+
+		cache := &ClusterCache{}
+		require.NoError(t, c.Get(t.Context(), client.ObjectKey{Name: name}, cache))
+		require.Nil(t, cache.Spec.PageSize)
+	})
+
+	t.Run("round-trips a page size", func(t *testing.T) {
+		name, err := create(map[string]any{"pageSize": "64KiB"})
+		require.NoError(t, err)
+
+		cache := &ClusterCache{}
+		require.NoError(t, c.Get(t.Context(), client.ObjectKey{Name: name}, cache))
+		require.NotNil(t, cache.Spec.PageSize)
+		require.Equal(t, PageSize64KiB, *cache.Spec.PageSize)
+		require.Equal(t, uint64(64<<10), cache.Spec.PageSize.Bytes())
+	})
+
+	update := func(t *testing.T, name string, pageSize any, mutate func(*unstructured.Unstructured)) error {
+		t.Helper()
+
+		obj := &unstructured.Unstructured{}
+		obj.SetGroupVersionKind(GroupVersion.WithKind("ClusterCache"))
+		require.NoError(t, c.Get(t.Context(), client.ObjectKey{Name: name}, obj))
+
+		if pageSize == nil {
+			unstructured.RemoveNestedField(obj.Object, "spec", "pageSize")
+		} else {
+			require.NoError(t, unstructured.SetNestedField(obj.Object, pageSize, "spec", "pageSize"))
+		}
+		if mutate != nil {
+			mutate(obj)
+		}
+
+		return c.Update(t.Context(), obj)
+	}
+
+	t.Run("rejects adding a page size to an existing cache", func(t *testing.T) {
+		name, err := create(map[string]any{})
+		require.NoError(t, err)
+
+		err = update(t, name, "4KiB", nil)
+		require.True(t, apierrors.IsInvalid(err), "%v", err)
+		require.ErrorContains(t, err, "spec.pageSize is immutable")
+	})
+
+	t.Run("rejects adding a page size without a spec", func(t *testing.T) {
+		name, err := create(nil)
+		require.NoError(t, err)
+
+		err = update(t, name, "4KiB", nil)
+		require.True(t, apierrors.IsInvalid(err), "%v", err)
+		require.ErrorContains(t, err, "spec.pageSize is immutable")
+	})
+
+	t.Run("rejects changing a page size", func(t *testing.T) {
+		name, err := create(map[string]any{"pageSize": "4KiB"})
+		require.NoError(t, err)
+
+		err = update(t, name, "8KiB", nil)
+		require.True(t, apierrors.IsInvalid(err), "%v", err)
+		require.ErrorContains(t, err, "spec.pageSize is immutable")
+	})
+
+	t.Run("rejects removing a page size", func(t *testing.T) {
+		name, err := create(map[string]any{"pageSize": "4KiB"})
+		require.NoError(t, err)
+
+		err = update(t, name, nil, nil)
+		require.True(t, apierrors.IsInvalid(err), "%v", err)
+		require.ErrorContains(t, err, "spec.pageSize is immutable")
+	})
+
+	t.Run("allows other updates with a page size", func(t *testing.T) {
+		name, err := create(map[string]any{"pageSize": "4KiB"})
+		require.NoError(t, err)
+
+		require.NoError(t, update(t, name, "4KiB", func(obj *unstructured.Unstructured) {
+			require.NoError(t, unstructured.SetNestedField(obj.Object, int64(900), "spec", "priority"))
+			obj.SetLabels(map[string]string{"updated": "true"})
+		}))
+	})
+}
+
 func TestEnvtestClusterCachePassthroughValidation(t *testing.T) {
 	assets := os.Getenv("KUBEBUILDER_ASSETS")
 	if assets == "" {

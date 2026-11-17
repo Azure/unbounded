@@ -231,6 +231,27 @@ spec:
                 x-kubernetes-validations:
                 - message: azure is required
                   rule: has(self.azure)
+              pageSize:
+                description: |-
+                  PageSize is the logical page size for this cache. It must be a power of
+                  two from 4KiB through 16MiB. When unset, the cluster default applies.
+                  PageSize is immutable; changing it would reinterpret stored pages, so
+                  create a new ClusterCache instead.
+                enum:
+                - 4KiB
+                - 8KiB
+                - 16KiB
+                - 32KiB
+                - 64KiB
+                - 128KiB
+                - 256KiB
+                - 512KiB
+                - 1MiB
+                - 2MiB
+                - 4MiB
+                - 8MiB
+                - 16MiB
+                type: string
               passthrough:
                 description: |-
                   Passthrough, when set, turns off caching for this cache: Racer proxies
@@ -283,5 +304,10 @@ spec:
             to change the origin
           rule: (has(self.spec) && has(self.spec.origin)) == (has(oldSelf.spec) &&
             has(oldSelf.spec.origin))
+        - message: spec.pageSize is immutable; create a new ClusterCache to change
+            the page size
+          rule: (!has(self.spec) || !has(self.spec.pageSize)) == (!has(oldSelf.spec)
+            || !has(oldSelf.spec.pageSize)) && ((!has(self.spec) || !has(self.spec.pageSize))
+            || self.spec.pageSize == oldSelf.spec.pageSize)
     served: true
     storage: true

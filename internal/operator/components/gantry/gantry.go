@@ -206,7 +206,7 @@ func (c Component) Plan(ctx context.Context, env *component.Env, sites []unbound
 
 	// ClusterCache/gantry only reconfigures a Gantry installation the operator
 	// already reconciles; it never installs Gantry on its own.
-	racerRequested, racerConflict, racerPlacement, err := racerMode(ctx, env)
+	racerRequested, racerConflict, racerPlacement, racerPageSize, err := racerMode(ctx, env)
 	if err != nil {
 		return nil, component.Result{}, err
 	}
@@ -221,6 +221,7 @@ func (c Component) Plan(ctx context.Context, env *component.Env, sites []unbound
 		configHash,
 		artifactStreaming,
 		racerPlacement,
+		racerPageSize,
 	))
 	if err != nil {
 		return nil, component.Result{}, err
@@ -458,7 +459,7 @@ func legacyCleanupOperations(componentName, namespace string) []component.Operat
 // the config payload hash on its pod template so a config change rolls the
 // DaemonSet. Only the agent and its init container are re-imaged. A non-nil
 // racerPlacement switches the agent to the Racer backend.
-func applyMutator(agentImage, overlayBDConfigImage, configHash string, artifactStreaming artifactStreamingConfig, racerPlacement *workload.NodePlacement) func(*unstructured.Unstructured) error {
+func applyMutator(agentImage, overlayBDConfigImage, configHash string, artifactStreaming artifactStreamingConfig, racerPlacement *workload.NodePlacement, racerPageSize string) func(*unstructured.Unstructured) error {
 	return func(obj *unstructured.Unstructured) error {
 		if artifactStreaming.Enabled && racerPlacement != nil {
 			return fmt.Errorf("artifact streaming cannot be combined with the Racer backend")
@@ -490,7 +491,7 @@ func applyMutator(agentImage, overlayBDConfigImage, configHash string, artifactS
 			}
 
 			if racerPlacement != nil {
-				if err := applyRacerMode(obj, racerPlacement); err != nil {
+				if err := applyRacerMode(obj, racerPlacement, racerPageSize); err != nil {
 					return fmt.Errorf("configure gantry Racer backend: %w", err)
 				}
 			}

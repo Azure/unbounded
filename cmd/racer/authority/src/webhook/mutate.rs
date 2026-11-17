@@ -75,9 +75,9 @@ fn check_linux(p: &Pod, what: &str) -> Result<(), Reject> {
     Ok(())
 }
 
-/// Injects the racer-object sidecar. The named ClusterCache must exist, and
-/// its node selector is added to the pod's required node affinity. Ports Go
-/// `mutateSidecar`.
+/// Injects the racer-object sidecar. The named ClusterCache must exist, its
+/// node selector is added to the pod's required node affinity, and its page
+/// size becomes the sidecar's `--page-size`. Ports Go `mutateSidecar`.
 fn mutate_sidecar(pod: &mut Value, image: &str, lookup: &Lookups) -> Result<(), Reject> {
     let p = Pod::read(pod)?;
 
@@ -93,7 +93,7 @@ fn mutate_sidecar(pod: &mut Value, image: &str, lookup: &Lookups) -> Result<(), 
         ));
     }
 
-    let spec = parse_annotations(p.annotations)?;
+    let mut spec = parse_annotations(p.annotations)?;
 
     if has_name(p.volumes, VOLUME_NAME) {
         return Err(deny(format!(
@@ -101,8 +101,9 @@ fn mutate_sidecar(pod: &mut Value, image: &str, lookup: &Lookups) -> Result<(), 
         )));
     }
     check_linux(&p, "racer-object sidecar")?;
-    let pool = selector::cache_requirements(&spec.cache, CACHE_ANNOTATION, lookup.cache)?;
-    selector::check_bound_node(p.node_name, &pool, &spec.cache, lookup.node)?;
+    let cache = selector::cache_requirements(&spec.cache, CACHE_ANNOTATION, lookup.cache)?;
+    selector::check_bound_node(p.node_name, &cache.pool, &spec.cache, lookup.node)?;
+    spec.page_size = cache.page_size;
 
     let client_dir = format!("/run/racer/{}/client", spec.cache);
     let container = json!({
@@ -128,7 +129,7 @@ fn mutate_sidecar(pod: &mut Value, image: &str, lookup: &Lookups) -> Result<(), 
     let s = child(pod, "spec");
     child_array(s, "initContainers").insert(0, container);
     child_array(s, "volumes").push(volume);
-    require_racer_node(pod, &pool)?;
+    require_racer_node(pod, &cache.pool)?;
     set_annotation(pod, INJECTED_ANNOTATION, image);
     Ok(())
 }
@@ -163,8 +164,8 @@ fn mutate_client_socket(pod: &mut Value, lookup: &Lookups) -> Result<(), Reject>
     let containers = p.containers.map(Vec::as_slice).unwrap_or_default();
     let targets = client_targets(p.annotations, init_containers, containers)?;
     check_linux(&p, "Racer client socket")?;
-    let pool = selector::cache_requirements(&cache, CLIENT_CACHE_ANNOTATION, lookup.cache)?;
-    selector::check_bound_node(p.node_name, &pool, &cache, lookup.node)?;
+    let requirements = selector::cache_requirements(&cache, CLIENT_CACHE_ANNOTATION, lookup.cache)?;
+    selector::check_bound_node(p.node_name, &requirements.pool, &cache, lookup.node)?;
 
     let client_dir = format!("/run/racer/{cache}/client");
     let socket = format!("{client_dir}/socket");
@@ -233,7 +234,7 @@ fn mutate_client_socket(pod: &mut Value, lookup: &Lookups) -> Result<(), Reject>
             .push(json!({"name": volume, "mountPath": client_dir, "readOnly": true}));
         child_array(c, "env").push(json!({"name": SOCKET_ENV, "value": socket}));
     }
-    require_racer_node(pod, &pool)?;
+    require_racer_node(pod, &requirements.pool)?;
     set_annotation(pod, CLIENT_SOCKET_INJECTED_ANNOTATION, &cache);
     Ok(())
 }

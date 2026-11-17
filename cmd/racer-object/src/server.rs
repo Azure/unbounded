@@ -1380,7 +1380,7 @@ mod tests {
 #[cfg(test)]
 mod page_tests {
     use super::*;
-    use crate::racer::{FRAME_SIZE, PAGE_SIZE};
+    use crate::racer::{DEFAULT_PAGE_SIZE, FRAME_SIZE};
     use tokio::net::{TcpSocket, UnixStream};
     use tokio::task::JoinHandle;
 
@@ -1409,13 +1409,13 @@ mod page_tests {
         (first..end).map(|i| (i % 251) as u8).collect()
     }
 
-    /// The page frames covering `[first, end)`.
-    fn pages(first: u64, end: u64) -> Vec<(u64, u64, u32)> {
+    /// The page frames of `page_size` bytes covering `[first, end)`.
+    fn pages(first: u64, end: u64, page_size: u64) -> Vec<(u64, u64, u32)> {
         let mut out = Vec::new();
         let mut at = first;
         while at < end {
-            let number = at / PAGE_SIZE;
-            let stop = end.min((number + 1) * PAGE_SIZE);
+            let number = at / page_size;
+            let stop = end.min((number + 1) * page_size);
             out.push((number, at, (stop - at) as u32));
             at = stop;
         }
@@ -1478,11 +1478,12 @@ mod page_tests {
         mut racer: UnixStream,
         first: u64,
         end: u64,
+        page_size: u64,
         split: bool,
         fault: Fault,
     ) -> JoinHandle<Vec<[u8; 12]>> {
         tokio::spawn(async move {
-            let pages = pages(first, end);
+            let pages = pages(first, end, page_size);
             let mut credits = Vec::new();
             for (i, &(number, offset, length)) in pages.iter().enumerate() {
                 let last = i + 1 == pages.len();
@@ -1535,19 +1536,20 @@ mod page_tests {
     async fn run(
         first: u64,
         end: u64,
+        page_size: u64,
         use_pipe: bool,
         split: bool,
         fault: Fault,
         rcvbuf: Option<u32>,
     ) -> Outcome {
         let (ours, theirs) = UnixStream::pair().unwrap();
-        let (number, offset, length) = pages(first, end)[0];
+        let (number, offset, length) = pages(first, end, page_size)[0];
         let mut buffered = frame(PAGE, number, offset, length).to_vec();
         if split {
             buffered.extend_from_slice(&object(first, first + 1000));
         }
-        let racer = racer(theirs, first, end, split, fault);
-        let mut sub = Subscription::for_test(ours, first, end, buffered);
+        let racer = racer(theirs, first, end, page_size, split, fault);
+        let mut sub = Subscription::for_test(ours, first, end, buffered, page_size);
         let (mut server, client) = tcp_pair(rcvbuf).await;
         let reader = client_reader(client, rcvbuf.is_some());
         let pipe = use_pipe.then(|| Pipe::new().unwrap());
@@ -1569,8 +1571,8 @@ mod page_tests {
         Outcome { ok, got, credits }
     }
 
-    fn expected_credits(first: u64, end: u64) -> Vec<[u8; 12]> {
-        pages(first, end)
+    fn expected_credits(first: u64, end: u64, page_size: u64) -> Vec<[u8; 12]> {
+        pages(first, end, page_size)
             .into_iter()
             .map(|(number, _, length)| credit(number, length))
             .collect()
@@ -1578,24 +1580,62 @@ mod page_tests {
 
     #[tokio::test]
     async fn forwards_multiple_pages_exactly() {
-        let (first, end) = (0, PAGE_SIZE + 100_000);
+        let (first, end) = (0, DEFAULT_PAGE_SIZE + 100_000);
         for use_pipe in [true, false] {
-            let out = run(first, end, use_pipe, false, Fault::None, None).await;
+            let out = run(
+                first,
+                end,
+                DEFAULT_PAGE_SIZE,
+                use_pipe,
+                false,
+                Fault::None,
+                None,
+            )
+            .await;
             assert!(out.ok, "pipe={use_pipe}");
             assert!(out.got == object(first, end), "pipe={use_pipe}");
-            assert_eq!(out.credits, expected_credits(first, end));
+            assert_eq!(out.credits, expected_credits(first, end, DEFAULT_PAGE_SIZE));
+        }
+    }
+
+    #[tokio::test]
+    async fn forwards_4kib_pages_exactly() {
+        // A 4 KiB cache has a boundary every 4 KiB; frame validation and
+        // credits must follow the configured size, not the 16 MiB default.
+        let page_size = 4 << 10;
+        let (first, end) = (0, 5 * page_size + 123);
+        for use_pipe in [true, false] {
+            let out = run(first, end, page_size, use_pipe, false, Fault::None, None).await;
+            assert!(out.ok, "pipe={use_pipe}");
+            assert!(out.got == object(first, end), "pipe={use_pipe}");
+            assert_eq!(
+                out.credits,
+                expected_credits(first, end, page_size),
+                "pipe={use_pipe}"
+            );
+            assert_eq!(out.credits[0], credit(0, page_size as u32));
+            assert_eq!(out.credits[5], credit(5, 123));
         }
     }
 
     #[tokio::test]
     async fn forwards_unaligned_range_across_page_boundary() {
         // Starts mid-page with payload already buffered past the header.
-        let (first, end) = (PAGE_SIZE - 70_000, PAGE_SIZE + 70_001);
+        let (first, end) = (DEFAULT_PAGE_SIZE - 70_000, DEFAULT_PAGE_SIZE + 70_001);
         for use_pipe in [true, false] {
-            let out = run(first, end, use_pipe, true, Fault::None, None).await;
+            let out = run(
+                first,
+                end,
+                DEFAULT_PAGE_SIZE,
+                use_pipe,
+                true,
+                Fault::None,
+                None,
+            )
+            .await;
             assert!(out.ok, "pipe={use_pipe}");
             assert!(out.got == object(first, end), "pipe={use_pipe}");
-            assert_eq!(out.credits, expected_credits(first, end));
+            assert_eq!(out.credits, expected_credits(first, end, DEFAULT_PAGE_SIZE));
             assert_eq!(out.credits[0], credit(0, 70_000));
             assert_eq!(out.credits[1], credit(1, 70_001));
         }
@@ -1604,18 +1644,33 @@ mod page_tests {
     #[tokio::test]
     async fn forwards_exactly_under_backpressure() {
         let (first, end) = (5, 600_005);
-        let out = run(first, end, true, true, Fault::None, Some(4096)).await;
+        let out = run(
+            first,
+            end,
+            DEFAULT_PAGE_SIZE,
+            true,
+            true,
+            Fault::None,
+            Some(4096),
+        )
+        .await;
         assert!(out.ok);
         assert!(out.got == object(first, end));
-        assert_eq!(out.credits, expected_credits(first, end));
+        assert_eq!(out.credits, expected_credits(first, end, DEFAULT_PAGE_SIZE));
     }
 
     #[tokio::test]
     async fn fails_when_client_closes() {
         let (ours, theirs) = UnixStream::pair().unwrap();
         let end = 4 << 20;
-        let racer = racer(theirs, 0, end, false, Fault::None);
-        let mut sub = Subscription::for_test(ours, 0, end, frame(PAGE, 0, 0, end as u32).to_vec());
+        let racer = racer(theirs, 0, end, DEFAULT_PAGE_SIZE, false, Fault::None);
+        let mut sub = Subscription::for_test(
+            ours,
+            0,
+            end,
+            frame(PAGE, 0, 0, end as u32).to_vec(),
+            DEFAULT_PAGE_SIZE,
+        );
         let (mut server, client) = tcp_pair(None).await;
         drop(client);
         let pipe = Pipe::new().unwrap();
@@ -1648,13 +1703,25 @@ mod page_tests {
 
     #[tokio::test]
     async fn fails_on_truncated_payload() {
-        let (first, end) = (0, PAGE_SIZE + 100_000);
-        let last = (end - PAGE_SIZE) as usize;
+        let (first, end) = (0, DEFAULT_PAGE_SIZE + 100_000);
+        let last = (end - DEFAULT_PAGE_SIZE) as usize;
         for keep in [0, 1, last / 2, last - 1] {
             for use_pipe in [true, false] {
-                let out = run(first, end, use_pipe, false, Fault::Truncate(keep), None).await;
+                let out = run(
+                    first,
+                    end,
+                    DEFAULT_PAGE_SIZE,
+                    use_pipe,
+                    false,
+                    Fault::Truncate(keep),
+                    None,
+                )
+                .await;
                 assert_incomplete(&out, first, end);
-                assert_eq!(out.credits, expected_credits(first, end)[..1]);
+                assert_eq!(
+                    out.credits,
+                    expected_credits(first, end, DEFAULT_PAGE_SIZE)[..1]
+                );
             }
         }
     }
@@ -1663,7 +1730,16 @@ mod page_tests {
     async fn fails_on_truncated_single_page() {
         let (first, end) = (0, 200_000);
         for keep in [1000, 150_000, 199_999] {
-            let out = run(first, end, true, true, Fault::Truncate(keep), None).await;
+            let out = run(
+                first,
+                end,
+                DEFAULT_PAGE_SIZE,
+                true,
+                true,
+                Fault::Truncate(keep),
+                None,
+            )
+            .await;
             assert_incomplete(&out, first, end);
             assert!(out.credits.is_empty());
         }
@@ -1671,17 +1747,26 @@ mod page_tests {
 
     #[tokio::test]
     async fn withholds_final_byte_without_completion() {
-        let (first, end) = (0, PAGE_SIZE + 100_000);
-        let out = run(first, end, true, false, Fault::NoCompletion, None).await;
+        let (first, end) = (0, DEFAULT_PAGE_SIZE + 100_000);
+        let out = run(
+            first,
+            end,
+            DEFAULT_PAGE_SIZE,
+            true,
+            false,
+            Fault::NoCompletion,
+            None,
+        )
+        .await;
         assert_incomplete(&out, first, end);
         assert_eq!(out.got.len() as u64, end - first - 1);
         // The final credit is still sent before waiting for completion.
-        assert_eq!(out.credits, expected_credits(first, end));
+        assert_eq!(out.credits, expected_credits(first, end, DEFAULT_PAGE_SIZE));
     }
 
     #[tokio::test]
     async fn withholds_final_byte_on_invalid_completion() {
-        let (first, end) = (0, PAGE_SIZE + 100_000);
+        let (first, end) = (0, DEFAULT_PAGE_SIZE + 100_000);
         let bytes = end - first;
         for bad in [
             frame(COMPLETE, 1, bytes, 0),
@@ -1690,7 +1775,16 @@ mod page_tests {
             frame(PAGE, 2, bytes, 0),
             frame(9, 2, bytes, 0),
         ] {
-            let out = run(first, end, true, false, Fault::Completion(bad), None).await;
+            let out = run(
+                first,
+                end,
+                DEFAULT_PAGE_SIZE,
+                true,
+                false,
+                Fault::Completion(bad),
+                None,
+            )
+            .await;
             assert_incomplete(&out, first, end);
             assert_eq!(out.got.len() as u64, bytes - 1);
         }
@@ -1698,19 +1792,28 @@ mod page_tests {
 
     #[tokio::test]
     async fn fails_on_wrong_page_frame() {
-        let (first, end) = (0, PAGE_SIZE + 100_000);
+        let (first, end) = (0, DEFAULT_PAGE_SIZE + 100_000);
         let len = 100_000;
         for bad in [
-            frame(PAGE, 2, PAGE_SIZE, len),
-            frame(PAGE, 0, PAGE_SIZE, len),
-            frame(PAGE, 1, PAGE_SIZE + 1, len),
-            frame(PAGE, 1, PAGE_SIZE, len - 1),
-            frame(COMPLETE, 1, PAGE_SIZE, 0),
+            frame(PAGE, 2, DEFAULT_PAGE_SIZE, len),
+            frame(PAGE, 0, DEFAULT_PAGE_SIZE, len),
+            frame(PAGE, 1, DEFAULT_PAGE_SIZE + 1, len),
+            frame(PAGE, 1, DEFAULT_PAGE_SIZE, len - 1),
+            frame(COMPLETE, 1, DEFAULT_PAGE_SIZE, 0),
         ] {
-            let out = run(first, end, true, false, Fault::SecondFrame(bad), None).await;
+            let out = run(
+                first,
+                end,
+                DEFAULT_PAGE_SIZE,
+                true,
+                false,
+                Fault::SecondFrame(bad),
+                None,
+            )
+            .await;
             assert_incomplete(&out, first, end);
             // Only the first page was delivered.
-            assert_eq!(out.got.len() as u64, PAGE_SIZE);
+            assert_eq!(out.got.len() as u64, DEFAULT_PAGE_SIZE);
         }
     }
 }

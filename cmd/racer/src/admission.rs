@@ -310,6 +310,7 @@ mod observer_tests {
             priority,
             mode: racer_wire::control::CacheMode::Cached,
             origin: None,
+            page_size: None,
         };
         // Unknown caches use the default priority, so shares start equal.
         assert_eq!(quotas.policy().weight(&a), 500);
@@ -355,6 +356,7 @@ mod observer_tests {
             priority,
             mode: racer_wire::control::CacheMode::Cached,
             origin: None,
+            page_size: None,
         };
         quotas
             .policy()
@@ -881,6 +883,7 @@ mod tests {
             priority,
             mode: racer_wire::control::CacheMode::Cached,
             origin: None,
+            page_size: None,
         };
         limits.range_window_pages = std::num::NonZeroUsize::new(2).unwrap();
         limits.plaintext_bytes = std::num::NonZeroUsize::new(4 * PAGE_BYTES as usize).unwrap();

@@ -52,6 +52,7 @@ fn options(api: Api) -> Options {
         request_timeout: Duration::from_secs(10),
         max_connections: 16,
         workers: 1,
+        page_size: racer_object::racer::DEFAULT_PAGE_SIZE,
     }
 }
 
@@ -850,7 +851,11 @@ async fn handoff_to_stopped_worker_is_served_locally() {
     let (stop, shutdown) = watch::channel(false);
     let done = tokio::spawn(serve(
         Source::Listener { listener, peers },
-        racer_object::racer::Client::new(missing_socket(), 4),
+        racer_object::racer::Client::new(
+            missing_socket(),
+            4,
+            racer_object::racer::DEFAULT_PAGE_SIZE,
+        ),
         Config {
             api: Api::S3,
             request_timeout: Duration::from_secs(10),

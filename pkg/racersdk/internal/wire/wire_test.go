@@ -89,7 +89,7 @@ func TestRequestWire(t *testing.T) {
 	} {
 		head := rawRequest(tt.method, tt.fields+"Racer-Metadata: opaque,\xff value\r\nAuthorization: Bearer secret\r\n")
 
-		r, err := ParseRequestHead(head, tt.origin)
+		r, err := ParseRequestHead(head, tt.origin, PageSize)
 		if err != nil || r.Operation != tt.op {
 			t.Fatalf("%s %s: %v", tt.method, tt.fields, err)
 		}
@@ -98,12 +98,12 @@ func TestRequestWire(t *testing.T) {
 			t.Fatal("lost context bytes")
 		}
 
-		canonical, err := RequestHead(r)
+		canonical, err := RequestHead(r, PageSize)
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		roundTrip, err := ParseRequestHead(canonical, tt.origin)
+		roundTrip, err := ParseRequestHead(canonical, tt.origin, PageSize)
 		if err != nil || roundTrip != r {
 			t.Fatal("request round trip")
 		}
@@ -113,20 +113,20 @@ func TestRequestWire(t *testing.T) {
 		"", "Range: bytes=0-1\r\n", "Range: bytes=1-16777215\r\nIf-Match: \"v\"\r\n", "Range: bytes=0-16777216\r\nIf-Match: \"v\"\r\n", "Range: bytes=-1\r\nIf-Match: \"v\"\r\n", "Range: bytes=0-\r\nIf-Match: \"v\"\r\n",
 		"Range: bytes=0-16777215\r\nContent-Length: 1\r\n", "Range: bytes=0-16777215\r\nIf-Match: W/\"v\"\r\n",
 	} {
-		_, err := ParseRequestHead(rawRequest("GET", fields), true)
+		_, err := ParseRequestHead(rawRequest("GET", fields), true, PageSize)
 		assertKind(t, err, ErrorInvalidArgument)
 	}
 
 	for _, field := range []string{"Transfer-Encoding: identity", "Content-Encoding: identity", "Expect: 100-continue", "Trailer: X", "If-None-Match: *", "If-Modified-Since: date", "If-Unmodified-Since: date", "If-Range: \"v\"", "Connection: Upgrade", "Content-Length: 00", "Content-Range: bytes */0", "If-Match:", "Authorization:", "Host: racer"} {
-		_, err := ParseRequestHead(rawRequest("HEAD", field+"\r\n"), true)
+		_, err := ParseRequestHead(rawRequest("HEAD", field+"\r\n"), true, PageSize)
 		if err == nil {
 			t.Fatalf("accepted %s", field)
 		}
 	}
 
-	_, err := ParseRequestHead(rawRequest("HEAD", "Range: bytes=0-0\r\n"), true)
+	_, err := ParseRequestHead(rawRequest("HEAD", "Range: bytes=0-0\r\n"), true, PageSize)
 	assertKind(t, err, ErrorInvalidArgument)
-	_, err = ParseRequestHead(rawRequest("POST", ""), true)
+	_, err = ParseRequestHead(rawRequest("POST", ""), true, PageSize)
 
 	var typed *Error
 	if !errors.As(err, &typed) || typed.Status != 405 {
@@ -137,20 +137,20 @@ func TestRequestWire(t *testing.T) {
 	for _, target := range []string{ObjectPrefix + keyString([32]byte{}) + "?", ObjectPrefix + keyString([32]byte{}) + "#x", "http://racer" + ObjectPrefix + keyString([32]byte{}), ObjectPrefix + strings.Repeat("A", 64), ObjectPrefix + "%30" + strings.Repeat("0", 63), "/v1//objects/" + keyString([32]byte{})} {
 		head := strings.Replace(valid, ObjectPrefix+keyString([32]byte{}), target, 1)
 
-		_, err := ParseRequestHead([]byte(head), true)
+		_, err := ParseRequestHead([]byte(head), true, PageSize)
 		if err == nil {
 			t.Fatalf("accepted target %s", target)
 		}
 	}
 
 	for _, head := range []string{strings.Replace(valid, "HTTP/1.1", "HTTP/1.0", 1), strings.Replace(valid, "Host: racer\r\n", "", 1), strings.Replace(valid, "Host: racer", "Host: other", 1)} {
-		_, err := ParseRequestHead([]byte(head), true)
+		_, err := ParseRequestHead([]byte(head), true, PageSize)
 		if err == nil {
 			t.Fatal("accepted bad envelope")
 		}
 	}
 
-	_, err = RequestHead(Request{})
+	_, err = RequestHead(Request{}, PageSize)
 	assertKind(t, err, ErrorInvalidArgument)
 }
 
@@ -164,7 +164,7 @@ func TestOutgoingHeaderBudget(t *testing.T) {
 		AdapterMetadata: strings.Repeat("m", MaxFieldBytes),
 		Authorization:   strings.Repeat("a", MaxFieldBytes),
 	}
-	if err := ValidateRequest(r); err != nil {
+	if err := ValidateRequest(r, PageSize); err != nil {
 		t.Fatal(err)
 	}
 
@@ -185,14 +185,14 @@ func TestOutgoingHeaderBudget(t *testing.T) {
 		t.Fatalf("outgoing head exceeds limit: %d", wire.Len())
 	}
 
-	got, err := ParseRequestHead(wire.Bytes(), false)
+	got, err := ParseRequestHead(wire.Bytes(), false, PageSize)
 	if err != nil || got != r {
 		t.Fatalf("outgoing request failed round trip: %v", err)
 	}
 }
 
 func TestResponseWire(t *testing.T) {
-	bootstrap := Request{Operation: OperationBootstrap, Range: BootstrapRange()}
+	bootstrap := Request{Operation: OperationBootstrap, Range: BootstrapRange(PageSize)}
 
 	tag := `"a,b"`
 
@@ -252,7 +252,7 @@ func TestResponseWire(t *testing.T) {
 }
 
 func TestErrorResponses(t *testing.T) {
-	r := Request{Operation: OperationBootstrap, Range: BootstrapRange()}
+	r := Request{Operation: OperationBootstrap, Range: BootstrapRange(PageSize)}
 
 	for _, status := range []int{400, 401, 403, 404, 405, 412, 416, 431, 500, 502, 503} {
 		fields := "Content-Length: 0\r\n"
@@ -318,20 +318,20 @@ func TestOriginResponseSelection(t *testing.T) {
 
 	r := Request{Operation: OperationPinned, Pin: tag, Range: page}
 
-	got, err := OriginResponse(r, m)
+	got, err := OriginResponse(r, m, PageSize)
 	if err != nil || got.Length != 1 || got.First != PageSize || got.Last != got.First {
 		t.Fatal("short final page", err)
 	}
 
 	wrong := m
 	wrong.ETag = `"other"`
-	_, err = OriginResponse(r, wrong)
+	_, err = OriginResponse(r, wrong, PageSize)
 	assertKind(t, err, ErrorBadGateway)
-	_, err = OriginResponse(r, Metadata{})
+	_, err = OriginResponse(r, Metadata{}, PageSize)
 	assertKind(t, err, ErrorBadGateway)
 
 	m.Size = PageSize
-	_, err = OriginResponse(r, m)
+	_, err = OriginResponse(r, m, PageSize)
 	assertKind(t, err, ErrorUnsatisfiableRange)
 
 	partial, err := ClosedRange(0, 0)
@@ -340,29 +340,29 @@ func TestOriginResponseSelection(t *testing.T) {
 	}
 
 	r.Range = partial
-	_, err = OriginResponse(r, m)
+	_, err = OriginResponse(r, m, PageSize)
 	assertKind(t, err, ErrorInvalidArgument)
 
-	bootstrap := Request{Operation: OperationBootstrap, Range: BootstrapRange()}
+	bootstrap := Request{Operation: OperationBootstrap, Range: BootstrapRange(PageSize)}
 
-	got, err = OriginResponse(bootstrap, m)
+	got, err = OriginResponse(bootstrap, m, PageSize)
 	if err != nil || got.Length != int64(PageSize) {
 		t.Fatal("bootstrap", err)
 	}
 
 	m.Size = 0
 
-	got, err = OriginResponse(bootstrap, m)
+	got, err = OriginResponse(bootstrap, m, PageSize)
 	if err != nil || got.Length != 0 {
 		t.Fatal("empty bootstrap", err)
 	}
 
-	got, err = OriginResponse(Request{Operation: OperationHead}, m)
+	got, err = OriginResponse(Request{Operation: OperationHead}, m, PageSize)
 	if err != nil || got.Length != 0 {
 		t.Fatal("HEAD", err)
 	}
 
-	_, err = OriginResponse(Request{}, m)
+	_, err = OriginResponse(Request{}, m, PageSize)
 	assertKind(t, err, ErrorInvalidArgument)
 }
 
@@ -374,7 +374,7 @@ func TestClientHeadSendsNoRetention(t *testing.T) {
 		t.Fatal(string(client), err)
 	}
 
-	origin, err := RequestHead(r)
+	origin, err := RequestHead(r, PageSize)
 	if err != nil || !bytes.Equal(client, origin) {
 		t.Fatal(string(origin), err)
 	}
@@ -408,33 +408,33 @@ func FuzzWireHead(f *testing.F) {
 			return
 		}
 
-		if request, err := ParseRequestHead(head, false); err == nil {
-			canonical, err := RequestHead(request)
+		if request, err := ParseRequestHead(head, false, PageSize); err == nil {
+			canonical, err := RequestHead(request, PageSize)
 			if err != nil {
 				t.Fatal(err)
 			}
 
-			again, err := ParseRequestHead(canonical, false)
+			again, err := ParseRequestHead(canonical, false, PageSize)
 			if err != nil || again != request {
 				t.Fatal("wire round trip")
 			}
 		}
 
-		_, _ = ParseResponseHead(head, Request{Operation: OperationBootstrap, Range: BootstrapRange()}, nil)
+		_, _ = ParseResponseHead(head, Request{Operation: OperationBootstrap, Range: BootstrapRange(PageSize)}, nil)
 	})
 }
 
 func TestConstructedRequestValidation(t *testing.T) {
 	for _, request := range []Request{
-		{Operation: OperationHead, Range: BootstrapRange()},
-		{Operation: OperationBootstrap, Range: BootstrapRange(), Pin: `"v"`},
+		{Operation: OperationHead, Range: BootstrapRange(PageSize)},
+		{Operation: OperationBootstrap, Range: BootstrapRange(PageSize), Pin: `"v"`},
 		{Operation: OperationBootstrap},
-		{Operation: OperationPinned, Range: BootstrapRange()},
+		{Operation: OperationPinned, Range: BootstrapRange(PageSize)},
 		{Operation: OperationPinned, Pin: `"v"`},
 		{Operation: OperationHead, Pin: "bad\r\nHeader: injected"},
 		{Operation: OperationHead, Authorization: "bad\r\nHeader: injected"},
 	} {
-		if _, err := RequestHead(request); err == nil {
+		if _, err := RequestHead(request, PageSize); err == nil {
 			t.Fatal("serialized invalid private request")
 		}
 	}
@@ -485,21 +485,21 @@ func TestRangeResolution(t *testing.T) {
 }
 
 func TestWholePages(t *testing.T) {
-	_, _, err := (Range{}).ResolvePage(1)
+	_, _, err := (Range{}).ResolvePage(1, PageSize)
 	assertKind(t, err, ErrorInvalidArgument)
-	_, _, err = BootstrapRange().ResolvePage(math.MaxInt64 + 1)
+	_, _, err = BootstrapRange(PageSize).ResolvePage(math.MaxInt64+1, PageSize)
 	assertKind(t, err, ErrorInvalidArgument)
 
 	p := uint64(PageSize)
 	for _, size := range []uint64{1, PageSize - 1, PageSize, PageSize + 1, math.MaxInt64} {
 		start := (uint64(size) - 1) / uint64(PageSize) * uint64(PageSize)
-		for _, end := range []uint64{uint64(size) - 1, NominalPageEnd(start)} {
+		for _, end := range []uint64{uint64(size) - 1, NominalPageEnd(start, PageSize)} {
 			r, err := ClosedRange(start, end)
 			if err != nil {
 				t.Fatal(err)
 			}
 
-			first, last, err := r.ResolvePage(size)
+			first, last, err := r.ResolvePage(size, PageSize)
 			if err != nil || uint64(first) != start || last != size-1 {
 				t.Fatalf("page %d: %d-%d %v", size, first, last, err)
 			}
@@ -518,7 +518,7 @@ func TestWholePages(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		_, _, err = r.ResolvePage(tt.size)
+		_, _, err = r.ResolvePage(tt.size, PageSize)
 		assertKind(t, err, tt.kind)
 	}
 }
@@ -543,7 +543,7 @@ func FuzzRange(f *testing.F) {
 			t.Fatal("invalid resolved bounds")
 		}
 
-		first, last, err = r.ResolvePage(n)
+		first, last, err = r.ResolvePage(n, PageSize)
 		if err == nil && (uint64(first)%uint64(PageSize) != 0 || first > last || uint64(last) >= n || uint64(last-first)+1 > uint64(PageSize)) {
 			t.Fatal("invalid whole-page bounds")
 		}
@@ -566,7 +566,7 @@ func TestSubscriptionHeadRoundTrip(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		parsed, err := ParseSubscriptionRequest(req)
+		parsed, err := ParseSubscriptionRequest(req, PageSize)
 		if err != nil || parsed.Request != r || parsed.First != 3 || !parsed.Ranged || parsed.PageCredits != 2 || parsed.ByteCredits != 2*PageSize {
 			t.Fatal("request round trip", parsed, err)
 		}
@@ -589,7 +589,7 @@ func TestSubscriptionHeadRoundTrip(t *testing.T) {
 		legacy.Header.Add("Racer-Ordered", "bad")
 		legacy.Header.Add("Racer-Ordered", "1")
 
-		if got, err := ParseSubscriptionRequest(legacy); err != nil || got != parsed {
+		if got, err := ParseSubscriptionRequest(legacy, PageSize); err != nil || got != parsed {
 			t.Fatal("legacy Racer-Ordered header changed parsing", got, err)
 		}
 
@@ -597,13 +597,13 @@ func TestSubscriptionHeadRoundTrip(t *testing.T) {
 			bad := req.Clone(t.Context())
 			bad.Header.Set(field, "bad")
 
-			if _, err := ParseSubscriptionRequest(bad); err == nil {
+			if _, err := ParseSubscriptionRequest(bad, PageSize); err == nil {
 				t.Fatal("accepted malformed credit", field)
 			}
 
 			bad.Header.Add(field, "1")
 
-			if _, err := ParseSubscriptionRequest(bad); err == nil {
+			if _, err := ParseSubscriptionRequest(bad, PageSize); err == nil {
 				t.Fatal("accepted duplicate credit", field)
 			}
 		}
@@ -629,7 +629,7 @@ func TestSubscriptionResponseRoundTrip(t *testing.T) {
 	for _, size := range []uint64{0, 7, PageSize + 1} {
 		m := Metadata{Size: size, ETag: `"v"`, ExpiresAt: time.UnixMilli(1).UTC(), ContentType: "text/plain"}
 
-		h, err := SubscriptionHeaders(m, 0, size)
+		h, err := SubscriptionHeaders(m, 0, size, PageSize)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -640,7 +640,7 @@ func TestSubscriptionResponseRoundTrip(t *testing.T) {
 		}
 
 		r, err := ParseSubscriptionResponse(b.Bytes(), SubscriptionOptions{})
-		if err != nil || r.Metadata != m || r.First != 0 || r.End != size || r.Pages != PageCount(0, size) {
+		if err != nil || r.Metadata != m || r.First != 0 || r.End != size || r.Pages != PageCount(0, size, PageSize) {
 			t.Fatal("response round trip", r, err)
 		}
 
@@ -654,7 +654,7 @@ func TestSubscriptionResponseRoundTrip(t *testing.T) {
 		}
 	}
 
-	if _, err := SubscriptionHeaders(Metadata{}, 0, math.MaxInt64); err == nil {
+	if _, err := SubscriptionHeaders(Metadata{}, 0, math.MaxInt64, PageSize); err == nil {
 		t.Fatal("accepted overflowing frame length")
 	}
 }
@@ -895,7 +895,7 @@ func TestSequence(t *testing.T) {
 	b := Frame{Kind: PageFrame, Number: 1, Offset: PageSize, Length: 3}
 	complete := Frame{Kind: CompleteFrame, Number: 2, Offset: 5}
 
-	s := NewSequence(first, end)
+	s := NewSequence(first, end, PageSize)
 	for _, f := range []Frame{a, b, complete} {
 		if err := s.Accept(f, "subscription frame"); err != nil {
 			t.Fatal(err)
@@ -907,28 +907,28 @@ func TestSequence(t *testing.T) {
 	}
 
 	// The server always delivers in page order, so out-of-order frames are rejected.
-	s = NewSequence(first, end)
+	s = NewSequence(first, end, PageSize)
 	if s.Accept(b, "subscription frame") == nil {
 		t.Fatal("accepted out-of-order frame")
 	}
 
 	for _, f := range []Frame{b, complete, {Kind: 3}, {Kind: PageFrame, Offset: first, Length: 1}, {Kind: PageFrame, Offset: first + 1, Length: 2}, {Kind: PageFrame, Number: 1, Offset: first, Length: 2}} {
-		if NewSequence(first, end).Accept(f, "subscription frame") == nil {
+		if NewSequence(first, end, PageSize).Accept(f, "subscription frame") == nil {
 			t.Fatal("accepted malformed frame", f)
 		}
 	}
 
-	s = NewSequence(first, end)
+	s = NewSequence(first, end, PageSize)
 	if s.Accept(a, "subscription frame") != nil || s.Accept(a, "subscription frame") == nil {
 		t.Fatal("duplicate page")
 	}
 
-	if err := NewSequence(0, 0).Accept(Frame{Kind: CompleteFrame}, "subscription complete"); err != nil {
+	if err := NewSequence(0, 0, PageSize).Accept(Frame{Kind: CompleteFrame}, "subscription complete"); err != nil {
 		t.Fatal("empty completion", err)
 	}
 
 	for _, f := range []Frame{{Kind: CompleteFrame, Number: 1}, {Kind: CompleteFrame, Offset: 1}, {Kind: CompleteFrame, Length: 1}} {
-		if NewSequence(0, 0).Accept(f, "subscription complete") == nil {
+		if NewSequence(0, 0, PageSize).Accept(f, "subscription complete") == nil {
 			t.Fatal("invalid empty completion")
 		}
 	}
@@ -1062,7 +1062,7 @@ func TestSubscriptionResponseSelection(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			m := Metadata{Size: tt.size, ETag: `"v"`, ExpiresAt: time.UnixMilli(1).UTC()}
 
-			h, err := SubscriptionHeaders(m, tt.first, tt.end)
+			h, err := SubscriptionHeaders(m, tt.first, tt.end, PageSize)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1168,7 +1168,7 @@ func TestWriterFailures(t *testing.T) {
 		}
 	}
 
-	s := NewSequence(0, 0)
+	s := NewSequence(0, 0, PageSize)
 
 	w := &failingWriter{failAt: 1, err: cause}
 	if err := s.Write(w, Frame{Kind: CompleteFrame}); !errors.Is(err, cause) {

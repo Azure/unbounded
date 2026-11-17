@@ -26,13 +26,28 @@ import (
 // origin requests share one object path, so the caller must expose this handler
 // only on the client socket. The caller owns transport and server lifetime,
 // including canceling request contexts to close hijacked subscription sockets.
-// Prefetch tickets use a default [Prefetches] in which every ref succeeds.
+// Prefetch tickets use a default [Prefetches] in which every ref succeeds. The
+// handler uses the default 16 MiB page size.
 func NewHandler(transport http.RoundTripper) http.Handler {
-	return NewHandlerWithPrefetch(transport, NewPrefetches(PrefetchConfig{}))
+	return NewHandlerWithPageSize(transport, wire.PageSize)
+}
+
+// NewHandlerWithPageSize is NewHandler for a cache with a non-default logical
+// page size.
+func NewHandlerWithPageSize(transport http.RoundTripper, pageSize uint64) http.Handler {
+	return NewHandlerWithPrefetchAndPageSize(transport, NewPrefetches(PrefetchConfig{PageSize: pageSize}), pageSize)
 }
 
 // NewHandlerWithPrefetch serves prefetch requests from prefetches.
 func NewHandlerWithPrefetch(transport http.RoundTripper, prefetches *Prefetches) http.Handler {
+	return NewHandlerWithPrefetchAndPageSize(transport, prefetches, prefetches.PageSize())
+}
+
+// NewHandlerWithPrefetchAndPageSize serves prefetch requests from prefetches
+// for a cache with the given logical page size.
+func NewHandlerWithPrefetchAndPageSize(transport http.RoundTripper, prefetches *Prefetches, pageSize uint64) http.Handler {
+	pageSize = wire.PageSizeOrDefault(pageSize)
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == wire.PrefetchPath || strings.HasPrefix(r.URL.Path, wire.PrefetchPath+"/") {
 			prefetches.ServeHTTP(w, r)
@@ -40,11 +55,11 @@ func NewHandlerWithPrefetch(transport http.RoundTripper, prefetches *Prefetches)
 		}
 
 		if r.Method == http.MethodPost {
-			serveSubscription(w, r, transport)
+			serveSubscription(w, r, transport, pageSize)
 			return
 		}
 
-		serveHead(w, r, transport)
+		serveHead(w, r, transport, pageSize)
 	})
 }
 
@@ -120,8 +135,8 @@ func (c *Credits) Reserve(ctx context.Context, s wire.SubscriptionRequest, page 
 	}
 }
 
-func serveSubscription(w http.ResponseWriter, r *http.Request, transport http.RoundTripper) {
-	s, err := wire.ParseSubscriptionRequest(r)
+func serveSubscription(w http.ResponseWriter, r *http.Request, transport http.RoundTripper, pageSize uint64) {
+	s, err := wire.ParseSubscriptionRequest(r, pageSize)
 	if err != nil {
 		writeError(w, 400)
 		return
@@ -153,12 +168,14 @@ func serveSubscription(w http.ResponseWriter, r *http.Request, transport http.Ro
 
 // servePages selects a snapshot and the first page before committing success.
 func servePages(ctx context.Context, w *bufio.Writer, transport http.RoundTripper, s wire.SubscriptionRequest, credits *Credits) {
+	s.PageSize = wire.PageSizeOrDefault(s.PageSize)
+
 	page := s.Request
 	if page.Pin == "" && s.First == 0 {
-		page.Operation, page.Range = wire.OperationBootstrap, wire.Range{Present: true, Last: wire.PageSize - 1}
+		page.Operation, page.Range = wire.OperationBootstrap, wire.BootstrapRange(s.PageSize)
 	}
 
-	res, response, err := fetchPage(ctx, transport, page, nil)
+	res, response, err := fetchPage(ctx, transport, page, nil, s.PageSize)
 
 	defer func() {
 		if res != nil {
@@ -183,22 +200,22 @@ func servePages(ctx context.Context, w *bufio.Writer, transport http.RoundTrippe
 		return
 	}
 
-	pages := wire.PageCount(s.First, end)
+	pages := wire.PageCount(s.First, end, s.PageSize)
 	// Like the real listener, acquire the first selected slice before committing
 	// success headers. In particular, a first-page 401 must remain a 401.
 	if pages != 0 && page.Operation != wire.OperationBootstrap {
 		closeBody(res.Body)
 
-		page = pinnedPage(page, snapshot, s.First)
+		page = pinnedPage(page, snapshot, s.First, s.PageSize)
 
-		res, response, err = fetchPage(ctx, transport, page, &snapshot)
+		res, response, err = fetchPage(ctx, transport, page, &snapshot, s.PageSize)
 		if err != nil {
 			writeOriginError(w, res, err)
 			return
 		}
 	}
 
-	h, err := wire.SubscriptionHeaders(snapshot, s.First, end)
+	h, err := wire.SubscriptionHeaders(snapshot, s.First, end, s.PageSize)
 	if err != nil {
 		writeOriginError(w, nil, err)
 		return
@@ -215,10 +232,11 @@ func servePages(ctx context.Context, w *bufio.Writer, transport http.RoundTrippe
 	streamPages(ctx, w, transport, s, credits, response, body, end)
 }
 
-func pinnedPage(request wire.Request, snapshot wire.Metadata, first uint64) wire.Request {
-	first = first / wire.PageSize * wire.PageSize
+func pinnedPage(request wire.Request, snapshot wire.Metadata, first, pageSize uint64) wire.Request {
+	pageSize = wire.PageSizeOrDefault(pageSize)
+	first = first / pageSize * pageSize
 	request.Operation, request.Pin = wire.OperationPinned, snapshot.ETag
-	request.Range = wire.Range{Present: true, First: first, Last: wire.NominalPageEnd(first)}
+	request.Range = wire.Range{Present: true, First: first, Last: wire.NominalPageEnd(first, pageSize)}
 
 	return request
 }
@@ -226,13 +244,15 @@ func pinnedPage(request wire.Request, snapshot wire.Metadata, first uint64) wire
 func streamPages(ctx context.Context, w *bufio.Writer, transport http.RoundTripper, s wire.SubscriptionRequest, credits *Credits, response wire.Response, body io.ReadCloser, end uint64) {
 	defer func() { closeBody(body) }()
 
+	s.PageSize = wire.PageSizeOrDefault(s.PageSize)
+
 	snapshot := response.Metadata
 	buffer := make([]byte, 256*1024)
-	sequence := wire.NewSequence(s.First, end)
+	sequence := wire.NewSequence(s.First, end, s.PageSize)
 
 	for first := s.First; first < end; {
-		number := first / wire.PageSize
-		pageEnd := min(wire.NominalPageEnd(number*wire.PageSize)+1, end)
+		number := first / s.PageSize
+		pageEnd := min(wire.NominalPageEnd(number*s.PageSize, s.PageSize)+1, end)
 
 		n := uint32(pageEnd - first)
 		if credits.Reserve(ctx, s, number, n) != nil {
@@ -240,7 +260,7 @@ func streamPages(ctx context.Context, w *bufio.Writer, transport http.RoundTripp
 		}
 
 		if first != s.First {
-			res, next, err := fetchPage(ctx, transport, pinnedPage(s.Request, snapshot, first), &snapshot)
+			res, next, err := fetchPage(ctx, transport, pinnedPage(s.Request, snapshot, first, s.PageSize), &snapshot, s.PageSize)
 			if res != nil {
 				body = res.Body
 			}
@@ -267,7 +287,7 @@ func streamPages(ctx context.Context, w *bufio.Writer, transport http.RoundTripp
 		first = pageEnd
 	}
 
-	if sequence.Write(w, wire.Frame{Kind: wire.CompleteFrame, Number: wire.PageCount(s.First, end), Offset: end - s.First}) != nil {
+	if sequence.Write(w, wire.Frame{Kind: wire.CompleteFrame, Number: wire.PageCount(s.First, end, s.PageSize), Offset: end - s.First}) != nil {
 		return
 	}
 
@@ -321,8 +341,8 @@ func writeOriginError(w *bufio.Writer, res *http.Response, err error) {
 // fetchPage uses the wire validators as well as the actual origin server. The
 // response head is reconstructed from net/http only on this private fake hop;
 // Client still validates raw bytes on its ordinary direct streaming path.
-func fetchPage(ctx context.Context, transport http.RoundTripper, request wire.Request, snapshot *wire.Metadata) (*http.Response, wire.Response, error) {
-	if err := wire.ValidateRequest(request); err != nil {
+func fetchPage(ctx context.Context, transport http.RoundTripper, request wire.Request, snapshot *wire.Metadata, pageSize uint64) (*http.Response, wire.Response, error) {
+	if err := wire.ValidateRequest(request, pageSize); err != nil {
 		return nil, wire.Response{}, err
 	}
 
@@ -358,14 +378,14 @@ func fetchPage(ctx context.Context, transport http.RoundTripper, request wire.Re
 	return res, response, err
 }
 
-func serveHead(w http.ResponseWriter, r *http.Request, transport http.RoundTripper) {
+func serveHead(w http.ResponseWriter, r *http.Request, transport http.RoundTripper, pageSize uint64) {
 	descriptor, err := wire.ParseClientHead(r)
 	if err != nil {
 		writeError(w, 400)
 		return
 	}
 
-	res, _, err := fetchPage(r.Context(), transport, descriptor, nil)
+	res, _, err := fetchPage(r.Context(), transport, descriptor, nil, pageSize)
 	if res != nil {
 		defer closeBody(res.Body)
 	}

@@ -5,6 +5,7 @@
 //! all work, so existing pod specs keep working unchanged.
 
 use crate::object::Api;
+use crate::racer::{DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, MIN_PAGE_SIZE};
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
@@ -19,6 +20,8 @@ pub struct Options {
     pub max_connections: usize,
     /// Serving threads, each with its own single-threaded runtime.
     pub workers: usize,
+    /// Logical page size of the cache, which Racer does not report.
+    pub page_size: u64,
 }
 
 /// What `main` should do.
@@ -31,6 +34,8 @@ pub enum Command {
 
 const MAX_CONNECTIONS: i64 = 65536;
 const MAX_WORKERS: i64 = 256;
+/// Environment fallback for `--page-size`, in bytes or a ClusterCache label.
+pub const PAGE_SIZE_ENV: &str = "RACER_OBJECT_PAGE_SIZE";
 /// The default `--workers` is the usable CPUs (cgroup quota and affinity
 /// included), at most this many.
 const DEFAULT_WORKERS_MAX: usize = 4;
@@ -67,6 +72,8 @@ pub fn sidecar_usage() -> String {
     \tLoopback IP literal and port (default \"127.0.0.1:8080\")
   -max-connections int
     \tConcurrent client connections and Racer reads; 1..65536 (default 128)
+  -page-size string
+    \tLogical page size of the cache: a power of two from 4KiB to 16MiB, as bytes or the ClusterCache spelling (default \"16MiB\"; env RACER_OBJECT_PAGE_SIZE)
   -request-timeout duration
     \tPositive sidecar request timeout (default 5m0s)
   -version
@@ -77,9 +84,20 @@ pub fn sidecar_usage() -> String {
     .to_string()
 }
 
-/// Parse `args` (without the program name). Errors are safe to print: they
-/// never echo argument values.
+/// Parse `args` (without the program name), using `RACER_OBJECT_PAGE_SIZE` as
+/// the fallback for `--page-size`. Errors are safe to print: they never echo
+/// argument values.
 pub fn parse(args: &[String]) -> Result<Command, String> {
+    parse_with_page_size_env(args, std::env::var(PAGE_SIZE_ENV).ok().as_deref())
+}
+
+/// Parse `args` with the `--page-size` environment fallback as an explicit
+/// value, so tests do not depend on the process environment. An explicit flag
+/// wins over the environment.
+fn parse_with_page_size_env(
+    args: &[String],
+    page_size_env: Option<&str>,
+) -> Result<Command, String> {
     let Some(command) = args.first() else {
         return Err("expected sidecar (use --help)".into());
     };
@@ -103,6 +121,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
     let mut timeout = Some(Duration::from_secs(300));
     let mut max_connections: i64 = 128;
     let mut workers = default_workers() as i64;
+    let mut page_size = None;
     let mut show_version = false;
 
     let mut rest = &args[1..];
@@ -142,6 +161,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 | "request-timeout"
                 | "max-connections"
                 | "workers"
+                | "page-size"
         ) {
             return Err(invalid());
         }
@@ -167,6 +187,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
             }
             "max-connections" => max_connections = parse_int(&value).ok_or_else(invalid)?,
             "workers" => workers = parse_int(&value).ok_or_else(invalid)?,
+            "page-size" => page_size = Some(parse_page_size(&value).ok_or_else(page_size_error)?),
             _ => unreachable!("flag names are checked above"),
         }
     }
@@ -176,6 +197,15 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
     if show_version {
         return Ok(Command::Print(version() + "\n"));
     }
+    // An explicit flag wins over the environment; the environment is read
+    // only for a run, so `--help` and `--version` still work when it is bad.
+    let page_size = match page_size {
+        Some(size) => size,
+        None => match page_size_env {
+            Some(value) => parse_page_size(value).ok_or_else(page_size_error)?,
+            None => DEFAULT_PAGE_SIZE,
+        },
+    };
     if cache.is_empty() {
         return Err("--cache is required".into());
     }
@@ -205,7 +235,35 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
         request_timeout,
         max_connections: max_connections as usize,
         workers: workers as usize,
+        page_size,
     }))
+}
+
+fn page_size_error() -> String {
+    "--page-size must be a power of two from 4KiB to 16MiB".to_string()
+}
+
+/// A page size in bytes, or a ClusterCache `spec.pageSize` label. Only the
+/// labels Racer accepts are valid, so a value copied from a ClusterCache works
+/// unchanged.
+pub fn parse_page_size(s: &str) -> Option<u64> {
+    let bytes = match s {
+        "4KiB" => 4 << 10,
+        "8KiB" => 8 << 10,
+        "16KiB" => 16 << 10,
+        "32KiB" => 32 << 10,
+        "64KiB" => 64 << 10,
+        "128KiB" => 128 << 10,
+        "256KiB" => 256 << 10,
+        "512KiB" => 512 << 10,
+        "1MiB" => 1 << 20,
+        "2MiB" => 2 << 20,
+        "4MiB" => 4 << 20,
+        "8MiB" => 8 << 20,
+        "16MiB" => 16 << 20,
+        _ => u64::try_from(parse_int(s)?).ok()?,
+    };
+    (bytes.is_power_of_two() && (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&bytes)).then_some(bytes)
 }
 
 fn parse_bool(s: &str) -> Option<bool> {
@@ -402,6 +460,7 @@ mod tests {
         assert_eq!(o.request_timeout, Duration::from_secs(300));
         assert_eq!(o.max_connections, 128);
         assert_eq!(o.debug_listen, None);
+        assert_eq!(o.page_size, DEFAULT_PAGE_SIZE);
         assert_eq!(o.workers, default_workers());
         assert!((1..=4).contains(&o.workers));
 
@@ -467,6 +526,96 @@ mod tests {
             "invalid flags (use --help)",
         );
         assert!(sidecar_usage().contains("  -workers int\n"));
+    }
+
+    #[test]
+    fn page_size_flag() {
+        for (value, want) in [
+            ("4KiB", 4 << 10),
+            ("8KiB", 8 << 10),
+            ("64KiB", 64 << 10),
+            ("1MiB", 1 << 20),
+            ("16MiB", 16 << 20),
+            ("4096", 4 << 10),
+            ("0x4000", 16 << 10),
+            ("16777216", 16 << 20),
+        ] {
+            let o = options(&["sidecar", CACHE, &format!("--page-size={value}")]).unwrap();
+            assert_eq!(o.page_size, want, "{value}");
+        }
+        // Separate values, single dashes, and last flag wins.
+        assert_eq!(
+            options(&["sidecar", CACHE, "-page-size", "1MiB"])
+                .unwrap()
+                .page_size,
+            1 << 20
+        );
+        assert_eq!(
+            options(&["sidecar", CACHE, "--page-size=4KiB", "--page-size=16MiB"])
+                .unwrap()
+                .page_size,
+            16 << 20
+        );
+        for value in [
+            "",
+            "0",
+            "2KiB",
+            "5KiB",
+            "1MiB+1",
+            "17MiB",
+            "32MiB",
+            "1.5MiB",
+            "16mib",
+            "x",
+            "99999999999999999999",
+        ] {
+            assert_eq!(
+                options(&["sidecar", CACHE, &format!("--page-size={value}")]).unwrap_err(),
+                "--page-size must be a power of two from 4KiB to 16MiB",
+                "{value}"
+            );
+        }
+        assert_eq!(
+            options(&["sidecar", CACHE, "--page-size"]).unwrap_err(),
+            "invalid flags (use --help)"
+        );
+        assert!(sidecar_usage().contains("  -page-size string\n"));
+        assert!(sidecar_usage().contains(PAGE_SIZE_ENV));
+    }
+
+    #[test]
+    fn page_size_env() {
+        let parsed = |env: Option<&str>| {
+            parse_with_page_size_env(&args(&["sidecar", CACHE]), env).map(|c| match c {
+                Command::Run(o) => o.page_size,
+                Command::Print(_) => panic!("printed"),
+            })
+        };
+        assert_eq!(parsed(None), Ok(DEFAULT_PAGE_SIZE));
+        assert_eq!(parsed(Some("4KiB")), Ok(4 << 10));
+        assert_eq!(parsed(Some("8192")), Ok(8 << 10));
+        // An explicit flag wins over the environment.
+        assert_eq!(
+            parse_with_page_size_env(
+                &args(&["sidecar", CACHE, "--page-size=16MiB"]),
+                Some("4KiB")
+            )
+            .map(|c| match c {
+                Command::Run(o) => o.page_size,
+                Command::Print(_) => panic!("printed"),
+            }),
+            Ok(16 << 20)
+        );
+        // An invalid environment value fails startup rather than silently
+        // using the default.
+        assert_eq!(
+            parsed(Some("3KiB")).unwrap_err(),
+            "--page-size must be a power of two from 4KiB to 16MiB"
+        );
+        assert_eq!(
+            parsed(Some("")).unwrap_err(),
+            "--page-size must be a power of two from 4KiB to 16MiB"
+        );
     }
 
     #[test]

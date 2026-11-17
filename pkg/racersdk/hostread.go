@@ -113,6 +113,7 @@ func (c *Client) HostRead(ctx context.Context, request Request, file *os.File, o
 		Pin:               o.ETag,
 		DestinationOffset: uint64(o.DestinationOffset),
 		DestinationLength: uint64(o.DestinationLength),
+		PageSize:          c.pageSize,
 	}
 
 	head, err := wire.HostReadHead(r, wo)
@@ -169,7 +170,7 @@ func (c *Client) hostRead(conn *clientConn, file *os.File, head []byte, o wire.H
 		return HostReadResult{}, err
 	}
 
-	seq := wire.NewSequence(response.First, response.End)
+	seq := wire.NewSequence(response.First, response.End, o.PageSize)
 
 	var frame [wire.FrameSize]byte
 

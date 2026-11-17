@@ -53,17 +53,19 @@ const (
 
 // Configuration and registry origin adapter.
 
-// ClientConfig maps Gantry settings to the SDK without overriding SDK defaults.
+// ClientConfig maps Gantry settings and the Racer page-size environment to the
+// SDK without overriding other SDK defaults.
 func ClientConfig(c *config.Config, cache string) racersdk.ClientConfig {
 	return racersdk.ClientConfig{
-		Cache: cache, MaxConnections: c.RacerMaxConnections,
+		Cache: cache, MaxConnections: c.RacerMaxConnections, PageSize: configuredPageSize(),
 	}
 }
 
-// OriginConfig maps the registry callback's concurrency and request limits.
+// OriginConfig maps the registry callback's concurrency, request limits, and
+// the page size shared with the client.
 func OriginConfig(c *config.Config, cache string) racersdk.OriginConfig {
 	return racersdk.OriginConfig{
-		Cache: cache, MaxConcurrentRequests: c.RacerOriginConcurrentRequests,
+		Cache: cache, MaxConcurrentRequests: c.RacerOriginConcurrentRequests, PageSize: configuredPageSize(),
 	}
 }
 
@@ -419,10 +421,22 @@ type Handler struct {
 	logger      *slog.Logger
 	diagnostics racerFailureDiagnostics
 	retry       retryPolicy
+	pageSize    int
 }
 
 // HandlerOption configures optional Handler behavior.
 type HandlerOption func(*Handler)
+
+// WithPageSize sets the cache page size used to choose Racer's small-object
+// lane. It must be a power of two from 4 KiB through 16 MiB. Invalid values
+// are ignored, leaving the configured environment value or the 16 MiB default.
+func WithPageSize(size int) HandlerOption {
+	return func(h *Handler) {
+		if validPageSize(size) {
+			h.pageSize = size
+		}
+	}
+}
 
 // WithRetryBudget bounds the total time one request may spend backing off
 // between retries of transient Racer failures. Zero disables retries.
@@ -444,7 +458,8 @@ func NewHandler(client Client, auth authenticationChallenger, logger *slog.Logge
 
 	h := &Handler{
 		client: client, auth: auth, logger: logger.With(slog.String("subsystem", "mirror")),
-		retry: retryPolicy{budget: handlerDefaultRetryBudget, base: defaultRetryBase, cap: defaultRetryCap},
+		retry:    retryPolicy{budget: handlerDefaultRetryBudget, base: defaultRetryBase, cap: defaultRetryCap},
+		pageSize: handlerPageSize(),
 	}
 	for _, opt := range opts {
 		opt(h)
@@ -520,6 +535,9 @@ func (s *Handler) ServeContent(w http.ResponseWriter, r *http.Request, ref iface
 		return
 	}
 
+	// Manifests above the SDK's maximum page are always rejected. Smaller
+	// configured pages do not trigger this cap: prepareResponse sends any
+	// manifest larger than one configured page through the bulk lane.
 	if kind == ifaces.KindManifest && actual.Size > racersdk.PageSize {
 		s.logRacerFailure(id, "manifest_size", errors.New("manifest too large"), int64(actual.Size), 0)
 		http.Error(w, "Racer manifest too large", http.StatusBadGateway)
@@ -538,13 +556,12 @@ func (s *Handler) ServeContent(w http.ResponseWriter, r *http.Request, ref iface
 
 // prepareResponse handles HEAD and validates the snapshot needed for blob resume.
 // A true done result means it already wrote a final response; no Object is open.
-// Full GETs get metadata from Get instead of issuing a redundant Stat.
+// Full GETs get metadata from Get instead of issuing a redundant Stat, except
+// manifests, which Stat first to choose the small-object or bulk lane from the
+// configured page size.
 func (s *Handler) prepareResponse(w http.ResponseWriter, r *http.Request, id string, ref ifaces.OriginRef, request racersdk.Request, offset int64, retry *retryState) (racersdk.Metadata, []racersdk.ReadOptions, bool) {
-	if r.Method != http.MethodHead && offset == 0 {
-		if ref.Kind == ifaces.KindManifest {
-			return racersdk.Metadata{}, []racersdk.ReadOptions{{SmallObject: true}}, false
-		}
-
+	fullGet := r.Method != http.MethodHead && offset == 0
+	if fullGet && ref.Kind != ifaces.KindManifest {
 		return racersdk.Metadata{}, nil, false
 	}
 
@@ -570,15 +587,24 @@ func (s *Handler) prepareResponse(w http.ResponseWriter, r *http.Request, id str
 		return metadata, nil, true
 	}
 
-	if offset >= int64(metadata.Size) {
+	// A full manifest GET has no caller range to validate; only a positive blob
+	// resume can be unsatisfiable.
+	if offset > 0 && offset >= int64(metadata.Size) {
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", metadata.Size))
 		http.Error(w, "range not satisfiable", http.StatusRequestedRangeNotSatisfiable)
 
 		return metadata, nil, true
 	}
 
+	smallObject := metadata.Size <= int64(s.pageSize)
+	if fullGet {
+		// The manifest is already fully described by Stat; the small lane avoids
+		// bulk contention only when the object fits in one configured page.
+		return metadata, []racersdk.ReadOptions{{SmallObject: smallObject}}, false
+	}
+
 	// Pin the version and compare returned metadata before serving it.
-	options := []racersdk.ReadOptions{{Offset: offset, ETag: metadata.ETag, SmallObject: metadata.Size <= racersdk.PageSize}}
+	options := []racersdk.ReadOptions{{Offset: offset, ETag: metadata.ETag, SmallObject: smallObject}}
 
 	return metadata, options, false
 }

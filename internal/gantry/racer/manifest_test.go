@@ -98,6 +98,14 @@ func TestRacerRegistryContentType(t *testing.T) {
 					wantHeads, wantGets := int32(0), int32(1)
 					if method == http.MethodHead {
 						wantHeads, wantGets = 1, 0
+					} else if tc.route == "manifests" {
+						// A full manifest GET is preceded by Stat. An unsupplied
+						// media type stops there; a supplied one still reads the
+						// body, including an empty manifest.
+						wantHeads, wantGets = 1, 0
+						if supplied {
+							wantGets = 1
+						}
 					}
 
 					if heads.Load() != wantHeads || gets.Load() != wantGets {

@@ -701,8 +701,14 @@ func TestRacerResumeAndInvalidRange(t *testing.T) {
 					t.Fatalf("kind=%v offset=%d: status=%d headers=%v body=%q", kind, offset, w.Code, w.Header(), w.Body.String())
 				}
 
-				if client.stats.Load() != 0 || client.gets.Load() != 1 {
-					t.Fatalf("non-blob resume selected: Stat=%d Get=%d", client.stats.Load(), client.gets.Load())
+				wantStats := int32(0)
+				if kind == ifaces.KindManifest {
+					// Full manifest GETs stat first to choose the small-object lane.
+					wantStats = 1
+				}
+
+				if client.stats.Load() != wantStats || client.gets.Load() != 1 {
+					t.Fatalf("non-blob resume selected: Stat=%d Get=%d; want %d/1", client.stats.Load(), client.gets.Load(), wantStats)
 				}
 
 				options := <-client.options
@@ -868,7 +874,7 @@ func TestRacerSDKRequestTranscript(t *testing.T) {
 		{"HEAD", http.MethodHead, "blobs", "", blob, 1, 0},
 		{"resume", http.MethodGet, "blobs", fmt.Sprintf("bytes=%d-", racersdk.PageSize+7), blob, 1, 1},
 		{"unsatisfiable", http.MethodGet, "blobs", fmt.Sprintf("bytes=%d-", len(blob)), blob, 1, 0},
-		{"manifest", http.MethodGet, "manifests", "", []byte(`{"schemaVersion":2}`), 0, 1},
+		{"manifest", http.MethodGet, "manifests", "", []byte(`{"schemaVersion":2}`), 1, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			data := tc.data
@@ -892,7 +898,7 @@ func TestRacerSDKRequestTranscript(t *testing.T) {
 			options := <-client.options
 			if tc.name == "manifest" {
 				if len(options) != 1 || options[0] != (racersdk.ReadOptions{SmallObject: true}) {
-					t.Fatal("manifest must use the small-object bootstrap without metadata preflight")
+					t.Fatal("small manifest must use the small-object lane after metadata preflight")
 				}
 
 				return
@@ -1771,8 +1777,8 @@ func TestRacerManifestGETWithSaturatedBulkPool(t *testing.T) {
 		t.Fatalf("isolated manifest: status=%d bytes=%d err=%v", resp.StatusCode, len(body), err)
 	}
 
-	if heads.Load() != 0 || gets.Load() != 65 {
-		t.Fatalf("manifest used HEAD or bulk capacity: heads=%d gets=%d", heads.Load(), gets.Load())
+	if heads.Load() != 1 || gets.Load() != 65 {
+		t.Fatalf("manifest transcript: heads=%d gets=%d; want 1/65", heads.Load(), gets.Load())
 	}
 }
 

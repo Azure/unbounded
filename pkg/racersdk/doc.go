@@ -87,11 +87,11 @@
 // # Serving cache misses
 //
 // Implement [Origin] and pass it to [ServeOrigin]. Racer calls the origin for
-// metadata and for individual pages of up to [PageSize] bytes. Requests for
-// later pages are pinned to the ETag the origin returned for the first one,
-// so origins only need ranged reads of a fixed version. The SDK validates
-// every response, so a short, long, or mismatched body is reported to Racer
-// instead of being cached.
+// metadata and for individual pages of up to the cache's configured page size.
+// Requests for later pages are pinned to the ETag the origin returned for the
+// first one, so origins only need ranged reads of a fixed version. The SDK
+// validates every response, so a short, long, or mismatched body is reported to
+// Racer instead of being cached.
 //
 // # Errors
 //

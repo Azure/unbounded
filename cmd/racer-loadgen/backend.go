@@ -64,7 +64,21 @@ func sdkClientConfig(opts pullOptions, capacity int) racersdk.ClientConfig {
 	// each holding its own connection.
 	limit := max(1, capacity*opts.BlobConcurrency*rangeFanout(opts))
 
-	return racersdk.ClientConfig{Cache: opts.Cache, MaxConnections: limit, PageCredits: opts.PageCredits}
+	return racersdk.ClientConfig{
+		Cache: opts.Cache, MaxConnections: limit, PageCredits: opts.PageCredits, PageSize: opts.PageSize,
+	}
+}
+
+// sdkOriginConfig maps the synthetic workload to the SDK origin, including the
+// page size that must match the ClusterCache spec.
+func sdkOriginConfig(opts pullOptions, capacity int) racersdk.OriginConfig {
+	limit := max(1, capacity*opts.BlobConcurrency)
+
+	return racersdk.OriginConfig{
+		Cache: opts.Cache, RecoverStaleSocket: true,
+		MaxConcurrentRequests: max(64, limit),
+		PageSize:              opts.PageSize,
+	}
 }
 
 func (p *puller) configureUDS(capacity int) error {

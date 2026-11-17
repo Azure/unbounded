@@ -4,7 +4,9 @@ use super::Priority;
 use super::api::{self, Reason, RefError, RefOutcome, State};
 use super::registry::{PutCheck, Registry, Resolution, RetryKind, UnitKey, UnitOutcome};
 use super::{Config, metrics::Counter, metrics::Outcome};
-use crate::model::{CacheKey, ObjectId, ObjectVersion, PAGE_BYTES, StrongEtag, VersionMetadata};
+use crate::model::{
+    CacheKey, ObjectId, ObjectVersion, PAGE_BYTES, PageSize, StrongEtag, VersionMetadata,
+};
 use racer_wire::control::{CacheId, NodeId};
 use racer_wire::object::prefetch::{ErrorCode, RefsFilter};
 use std::time::{Duration, Instant};
@@ -16,18 +18,26 @@ fn cache() -> CacheId {
     CacheId("5b0c7a5e-2f7d-4b8e-9d0e-6f6f2f3b1a10".into())
 }
 
-fn version(key: &str, etag: &str) -> VersionMetadata {
+fn other_cache() -> CacheId {
+    CacheId("8f1d3c2a-6b4e-4f7a-8c9d-1e2f3a4b5c60".into())
+}
+
+fn version_in(cache: &CacheId, key: &str, etag: &str, length: u64) -> VersionMetadata {
     VersionMetadata {
         content_type: None,
         version: ObjectVersion {
             object: ObjectId {
-                cache: cache(),
+                cache: cache.clone(),
                 key: CacheKey::parse_hex(key.as_bytes()).unwrap(),
             },
             etag: StrongEtag::test_value(etag),
         },
-        length: 4 * PAGE_BYTES,
+        length,
     }
+}
+
+fn version(key: &str, etag: &str) -> VersionMetadata {
+    version_in(&cache(), key, etag, 4 * PAGE_BYTES)
 }
 
 fn body(extra: &str, refs: &[&str]) -> String {
@@ -52,6 +62,15 @@ fn pages(key: &str, first: u64, count: u64) -> String {
         "\"key\":\"{key}\",\"offset\":{},\"length\":{}",
         first * PAGE_BYTES,
         count * PAGE_BYTES
+    )
+}
+
+/// A ref expressed in pages of `size`, for caches cut at another page size.
+fn page_range(key: &str, first: u64, count: u64, size: PageSize) -> String {
+    format!(
+        "\"key\":\"{key}\",\"offset\":{},\"length\":{}",
+        first * size.get(),
+        count * size.get()
     )
 }
 
@@ -87,23 +106,49 @@ impl Rig {
             .collect()
     }
 
+    /// Resolve `spec` against versions in `cache`, so one registry can hold
+    /// tickets of several caches.
+    fn resolve_in(&self, cache: &CacheId, spec: &api::Spec) -> Vec<Resolution> {
+        spec.refs
+            .iter()
+            .map(|r| {
+                let (key, etag) = if r.key.to_hex() == KEY_A {
+                    (KEY_A, "a1")
+                } else {
+                    (KEY_B, "b1")
+                };
+                Resolution::Version(version_in(cache, key, etag, 4 * PAGE_BYTES))
+            })
+            .collect()
+    }
+
     fn put(&mut self, id: &str, spec: api::Spec) -> Result<(u16, api::Status), ErrorCode> {
-        match self
-            .registry
-            .check_put(&cache(), id, &spec, &None, self.now)
-        {
+        self.put_in(&cache(), id, spec)
+    }
+
+    fn put_in(
+        &mut self,
+        cache: &CacheId,
+        id: &str,
+        spec: api::Spec,
+    ) -> Result<(u16, api::Status), ErrorCode> {
+        match self.registry.check_put(cache, id, &spec, &None, self.now) {
             Err(e) => return Err(e.code),
             Ok(PutCheck::Replay(status)) => return Ok((200, *status)),
             Ok(PutCheck::Proceed) => {}
         }
-        let resolved = self.resolve(&spec);
+        let resolved = self.resolve_in(cache, &spec);
         self.registry
-            .apply_put(&cache(), id, spec, resolved, None, self.now)
+            .apply_put(cache, id, spec, resolved, None, self.now)
             .map_err(|e| e.code)
     }
 
     fn status(&self, id: &str) -> api::Status {
-        self.registry.status(&cache(), id, None, None).unwrap()
+        self.status_in(&cache(), id)
+    }
+
+    fn status_in(&self, cache: &CacheId, id: &str) -> api::Status {
+        self.registry.status(cache, id, None, None).unwrap()
     }
 
     /// Dispatch everything ready and answer each page with `answer`.
@@ -127,6 +172,15 @@ impl Rig {
 
 fn node(name: &str) -> NodeId {
     NodeId(name.into())
+}
+
+/// The unit `page` of `key` in `cache`, matching [`Rig::resolve_in`].
+fn unit_in(cache: &CacheId, key: &str, page: u64) -> UnitKey {
+    let etag = if key == KEY_A { "a1" } else { "b1" };
+    UnitKey {
+        version: version_in(cache, key, etag, 4 * PAGE_BYTES).version,
+        page,
+    }
 }
 
 #[test]
@@ -162,13 +216,14 @@ fn idempotency_and_ordering_table() {
     );
 }
 
-/// Refs are cut at the cluster page size, so a 16 MiB range of a
+/// Refs are cut at the fallback page size, so a 16 MiB range of a
 /// 64 KiB-page cluster is 256 units and every byte count uses 64 KiB.
 #[test]
-fn refs_are_cut_at_the_cluster_page_size() {
+fn refs_are_cut_at_the_fallback_page_size() {
     let small = crate::model::PageSize::new(64 << 10).unwrap();
     let mut r = rig(Config::default());
     r.registry.set_page_size(small);
+    assert_eq!(r.registry.page_size_for(&cache()), small);
     let offset = small.get() - 1;
     let (code, status) = r
         .put(
@@ -195,6 +250,346 @@ fn refs_are_cut_at_the_cluster_page_size() {
     assert_eq!(status.state, State::Succeeded);
     assert_eq!(status.bytes.admitted, 3 * small.get());
     assert_eq!(r.registry.pending_bytes(), 0);
+}
+
+fn mixed_rig() -> (Rig, CacheId, CacheId, PageSize, PageSize) {
+    let small = PageSize::new(64 << 10).unwrap();
+    let large = PageSize::new(2 << 20).unwrap();
+    let a = cache();
+    let b = other_cache();
+    let mut r = rig(Config::default());
+    r.registry
+        .set_page_sizes(PageSize::DEFAULT, [(a.clone(), small), (b.clone(), large)]);
+    (r, a, b, small, large)
+}
+
+#[test]
+fn set_page_sizes_replaces_the_fallback_and_every_cache_entry() {
+    let mut r = rig(Config::default());
+    let a = cache();
+    let b = other_cache();
+    let small = PageSize::new(64 << 10).unwrap();
+    let large = PageSize::new(2 << 20).unwrap();
+    r.registry.set_page_sizes(small, [(a.clone(), large)]);
+    assert_eq!(r.registry.page_size_for(&a), large);
+    assert_eq!(r.registry.page_size_for(&b), small);
+    r.registry.set_page_size_for(&b, large);
+    assert_eq!(r.registry.page_size_for(&b), large);
+    r.registry.set_page_sizes(PageSize::DEFAULT, []);
+    assert_eq!(r.registry.page_size_for(&a), PageSize::DEFAULT);
+    assert_eq!(r.registry.page_size_for(&b), PageSize::DEFAULT);
+}
+
+/// Each cache cuts refs and counts bytes at its own page size, and every
+/// batch carries the size it was cut at.
+#[test]
+fn refs_are_cut_at_each_caches_page_size() {
+    let (mut r, a, b, small, large) = mixed_rig();
+    assert_eq!(r.registry.page_size_for(&a), small);
+    assert_eq!(r.registry.page_size_for(&b), large);
+    assert_eq!(
+        r.registry.page_size_for(&CacheId("unlisted".into())),
+        PageSize::DEFAULT
+    );
+    let offset = small.get() - 1;
+    let (code, status) = r
+        .put_in(
+            &a,
+            "a",
+            spec(
+                "",
+                &[&format!(
+                    "\"key\":\"{KEY_A}\",\"offset\":{offset},\"length\":{}",
+                    small.get() + 2
+                )],
+            ),
+        )
+        .unwrap();
+    assert_eq!(code, 201);
+    assert_eq!(status.bytes.aligned_requested, 3 * small.get());
+    let (code, status) = r
+        .put_in(&b, "b", spec("", &[&page_range(KEY_B, 0, 2, large)]))
+        .unwrap();
+    assert_eq!(code, 201);
+    assert_eq!(status.bytes.aligned_requested, 2 * large.get());
+    assert_eq!(
+        r.registry.pending_bytes(),
+        3 * small.get() + 2 * large.get()
+    );
+    let mut sizes = Vec::new();
+    while let Some(batch) = r.registry.next_batch(r.now, 1) {
+        sizes.push((batch.metadata.version.object.cache.clone(), batch.page_size));
+        for page in batch.pages {
+            let unit = UnitKey {
+                version: batch.metadata.version.clone(),
+                page,
+            };
+            r.registry
+                .complete(&unit, UnitOutcome::Admitted, None, r.now);
+        }
+    }
+    assert!(sizes.contains(&(a.clone(), small)));
+    assert!(sizes.contains(&(b.clone(), large)));
+    assert_eq!(r.status_in(&a, "a").bytes.admitted, 3 * small.get());
+    assert_eq!(r.status_in(&b, "b").bytes.admitted, 2 * large.get());
+    assert_eq!(r.registry.pending_bytes(), 0);
+}
+
+/// Queued bytes in the node gauges use each unit's own page size.
+#[test]
+fn gauges_use_each_units_page_size() {
+    let (mut r, a, b, small, large) = mixed_rig();
+    r.put_in(
+        &a,
+        "h",
+        spec("\"priority\":\"high\",", &[&page_range(KEY_A, 0, 2, small)]),
+    )
+    .unwrap();
+    r.put_in(
+        &b,
+        "l",
+        spec("\"priority\":\"low\",", &[&page_range(KEY_B, 0, 1, large)]),
+    )
+    .unwrap();
+    assert_eq!(r.registry.pending_bytes(), 2 * small.get() + large.get());
+    let (queued, tickets) = r.registry.gauges();
+    assert_eq!(queued, [2 * small.get(), 0, large.get()]);
+    assert_eq!(tickets, [1, 0, 1]);
+}
+
+/// Per-ticket bounds and in-flight accounting convert bytes to pages using
+/// the ticket's own page size.
+#[test]
+fn pending_bounds_and_in_flight_bytes_use_each_caches_page_size() {
+    let (mut r, a, b, small, large) = mixed_rig();
+    let bound_a = 2 * small.get();
+    let bound_b = 2 * large.get();
+    r.put_in(
+        &a,
+        "a",
+        spec(
+            &format!("\"priority\":\"high\",\"max_pending_bytes\":{bound_a},"),
+            &[&page_range(KEY_A, 0, 4, small)],
+        ),
+    )
+    .unwrap();
+    r.put_in(
+        &b,
+        "b",
+        spec(
+            &format!("\"priority\":\"low\",\"max_pending_bytes\":{bound_b},"),
+            &[&page_range(KEY_B, 0, 4, large)],
+        ),
+    )
+    .unwrap();
+    let first = r.registry.next_batch(r.now, 256).unwrap();
+    assert_eq!(first.page_size, small);
+    assert_eq!(first.pages, vec![0, 1]);
+    assert_eq!(r.status_in(&a, "a").bytes.in_flight, bound_a);
+    r.registry
+        .complete(&unit_in(&a, KEY_A, 0), UnitOutcome::Admitted, None, r.now);
+    let second = r.registry.next_batch(r.now, 256).unwrap();
+    assert_eq!((second.page_size, second.pages.clone()), (small, vec![2]));
+    r.registry
+        .complete(&unit_in(&a, KEY_A, 1), UnitOutcome::Admitted, None, r.now);
+    let third = r.registry.next_batch(r.now, 256).unwrap();
+    assert_eq!((third.page_size, third.pages.clone()), (small, vec![3]));
+    r.registry
+        .complete(&unit_in(&a, KEY_A, 2), UnitOutcome::Admitted, None, r.now);
+    let fourth = r.registry.next_batch(r.now, 256).unwrap();
+    assert_eq!(fourth.page_size, large);
+    assert_eq!(fourth.pages, vec![0, 1]);
+    assert_eq!(r.status_in(&b, "b").bytes.in_flight, bound_b);
+    r.registry
+        .complete(&unit_in(&a, KEY_A, 3), UnitOutcome::Admitted, None, r.now);
+    for page in fourth.pages {
+        r.registry.complete(
+            &unit_in(&b, KEY_B, page),
+            UnitOutcome::Admitted,
+            None,
+            r.now,
+        );
+    }
+    let fifth = r.registry.next_batch(r.now, 256).unwrap();
+    assert_eq!(fifth.page_size, large);
+    assert_eq!(fifth.pages, vec![2, 3]);
+    for page in fifth.pages {
+        r.registry.complete(
+            &unit_in(&b, KEY_B, page),
+            UnitOutcome::Admitted,
+            None,
+            r.now,
+        );
+    }
+    assert_eq!(r.registry.pending_bytes(), 0);
+}
+
+/// A window shrink releases each dropped queued unit at the size it was
+/// created with.
+#[test]
+fn window_drop_counts_each_units_page_size() {
+    let (mut r, a, b, small, large) = mixed_rig();
+    r.put_in(
+        &a,
+        "a",
+        spec(
+            "\"priority\":\"high\",\"sequence\":0,\"max_pending_bytes\":16777216,",
+            &[&page_range(KEY_A, 0, 3, small)],
+        ),
+    )
+    .unwrap();
+    r.put_in(
+        &b,
+        "b",
+        spec(
+            "\"priority\":\"low\",\"sequence\":0,\"max_pending_bytes\":16777216,",
+            &[&page_range(KEY_B, 0, 3, large)],
+        ),
+    )
+    .unwrap();
+    let _ = r.registry.take_events();
+    r.put_in(
+        &a,
+        "a",
+        spec(
+            "\"priority\":\"high\",\"sequence\":1,\"max_pending_bytes\":16777216,",
+            &[&page_range(KEY_A, 2, 1, small)],
+        ),
+    )
+    .unwrap();
+    r.put_in(
+        &b,
+        "b",
+        spec(
+            "\"priority\":\"low\",\"sequence\":1,\"max_pending_bytes\":16777216,",
+            &[&page_range(KEY_B, 2, 1, large)],
+        ),
+    )
+    .unwrap();
+    let (events, _) = r.registry.take_events();
+    let dropped = |priority: Priority| -> u64 {
+        events
+            .iter()
+            .filter(|(c, p, _)| *c == Counter::WindowDroppedBytes && *p == priority)
+            .map(|(_, _, n)| *n)
+            .sum()
+    };
+    assert_eq!(dropped(Priority::High), 2 * small.get());
+    assert_eq!(dropped(Priority::Low), 2 * large.get());
+    assert_eq!(r.registry.pending_bytes(), small.get() + large.get());
+    assert_eq!(r.status_in(&a, "a").bytes.aligned_requested, small.get());
+    assert_eq!(r.status_in(&b, "b").bytes.aligned_requested, large.get());
+}
+
+/// Requeued admitted pages return to pending at each unit's own page size.
+#[test]
+fn requeue_counts_each_units_page_size() {
+    let (mut r, a, b, small, large) = mixed_rig();
+    r.put_in(
+        &a,
+        "a",
+        spec("\"priority\":\"high\",", &[&page_range(KEY_A, 0, 2, small)]),
+    )
+    .unwrap();
+    r.put_in(
+        &b,
+        "b",
+        spec("\"priority\":\"low\",", &[&page_range(KEY_B, 0, 2, large)]),
+    )
+    .unwrap();
+    r.drain(|_| UnitOutcome::Admitted);
+    assert!(r.status_in(&a, "a").settled);
+    assert!(r.status_in(&b, "b").settled);
+    r.registry.requeue_departed(|_, _| false);
+    let a_status = r.status_in(&a, "a");
+    let b_status = r.status_in(&b, "b");
+    assert!(!a_status.settled);
+    assert!(!b_status.settled);
+    assert_eq!(a_status.bytes.queued, 2 * small.get());
+    assert_eq!(b_status.bytes.queued, 2 * large.get());
+    assert_eq!(a_status.bytes.admitted, 0);
+    assert_eq!(b_status.bytes.admitted, 0);
+    assert_eq!(
+        r.registry.pending_bytes(),
+        2 * small.get() + 2 * large.get()
+    );
+}
+
+/// Completion counters, including joined fills, add each unit's own page
+/// size to every interested ticket.
+#[test]
+fn complete_counters_use_each_units_page_size() {
+    let (mut r, a, b, small, large) = mixed_rig();
+    r.put_in(
+        &a,
+        "a",
+        spec("\"priority\":\"high\",", &[&page_range(KEY_A, 0, 2, small)]),
+    )
+    .unwrap();
+    r.put_in(
+        &b,
+        "b",
+        spec("\"priority\":\"low\",", &[&page_range(KEY_B, 0, 2, large)]),
+    )
+    .unwrap();
+    r.put_in(
+        &b,
+        "b2",
+        spec("\"priority\":\"low\",", &[&page_range(KEY_B, 0, 2, large)]),
+    )
+    .unwrap();
+    let _ = r.registry.take_events();
+    while let Some(batch) = r.registry.next_batch(r.now, 256) {
+        for page in batch.pages {
+            let outcome = if page == 0 {
+                UnitOutcome::Resident
+            } else {
+                UnitOutcome::Admitted
+            };
+            let unit = UnitKey {
+                version: batch.metadata.version.clone(),
+                page,
+            };
+            r.registry
+                .complete(&unit, outcome, Some(node("owner")), r.now);
+        }
+    }
+    let a_status = r.status_in(&a, "a");
+    assert_eq!(a_status.bytes.already_resident, small.get());
+    assert_eq!(a_status.bytes.fetched_from_origin, small.get());
+    assert_eq!(a_status.bytes.joined, 0);
+    assert_eq!(a_status.bytes.admitted, 2 * small.get());
+    let b_status = r.status_in(&b, "b");
+    assert_eq!(b_status.bytes.already_resident, large.get());
+    assert_eq!(b_status.bytes.fetched_from_origin, large.get());
+    assert_eq!(b_status.bytes.joined, 0);
+    assert_eq!(b_status.bytes.admitted, 2 * large.get());
+    let b2_status = r.status_in(&b, "b2");
+    assert_eq!(b2_status.bytes.already_resident, large.get());
+    assert_eq!(b2_status.bytes.fetched_from_origin, 0);
+    assert_eq!(b2_status.bytes.joined, large.get());
+    assert_eq!(b2_status.bytes.admitted, 2 * large.get());
+    assert_eq!(r.registry.pending_bytes(), 0);
+    let (events, _) = r.registry.take_events();
+    let sum = |counter: Counter, priority: Priority| -> u64 {
+        events
+            .iter()
+            .filter(|(c, p, _)| *c == counter && *p == priority)
+            .map(|(_, _, n)| *n)
+            .sum()
+    };
+    assert_eq!(
+        sum(Counter::AlreadyResidentBytes, Priority::High),
+        small.get()
+    );
+    assert_eq!(
+        sum(Counter::AlreadyResidentBytes, Priority::Low),
+        2 * large.get()
+    );
+    assert_eq!(sum(Counter::AdmittedBytes, Priority::High), 2 * small.get());
+    assert_eq!(sum(Counter::AdmittedBytes, Priority::Low), 4 * large.get());
+    assert_eq!(sum(Counter::FetchedBytes, Priority::Low), large.get());
+    assert_eq!(sum(Counter::JoinedBytes, Priority::Low), large.get());
 }
 
 #[test]

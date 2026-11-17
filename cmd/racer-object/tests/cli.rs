@@ -28,6 +28,7 @@ fn help_and_version_exit_zero() {
     let text = String::from_utf8(out.stdout).unwrap();
     assert!(text.starts_with("Usage: racer-object sidecar [flags]\n"));
     assert!(text.contains("  -cache string\n"));
+    assert!(text.contains("  -page-size string\n"));
 }
 
 #[test]
@@ -52,12 +53,42 @@ fn errors_exit_one_without_leaking() {
             &["sidecar", "--cache=c", "--workers=0"],
             "racer-object: --workers must be between 1 and 256\n",
         ),
+        (
+            &["sidecar", "--cache=c", "--page-size=3KiB"],
+            "racer-object: --page-size must be a power of two from 4KiB to 16MiB\n",
+        ),
     ] {
         let out = bin().args(args).output().unwrap();
         assert_eq!(out.status.code(), Some(1), "{args:?}");
         assert_eq!(String::from_utf8(out.stderr).unwrap(), message);
         assert!(out.stdout.is_empty());
     }
+}
+
+#[test]
+fn page_size_env_fallback() {
+    // An invalid fallback fails a run, but help still works.
+    let out = bin()
+        .env("RACER_OBJECT_PAGE_SIZE", "3KiB")
+        .args(["sidecar", "--cache=c"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8(out.stderr).unwrap(),
+        "racer-object: --page-size must be a power of two from 4KiB to 16MiB\n"
+    );
+    let out = bin()
+        .env("RACER_OBJECT_PAGE_SIZE", "3KiB")
+        .args(["sidecar", "--help"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .contains("  -page-size string\n")
+    );
 }
 
 #[test]

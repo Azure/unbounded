@@ -529,7 +529,7 @@ pub(crate) async fn serve_fill(
     if local.cache_passthrough(&version.object.cache) {
         return vec![PageResult::Failed(FailCode::Unavailable); pages.len()];
     }
-    let size = match local.page_size() {
+    let size = match local.page_size(&version.object.cache) {
         Ok(size) => size,
         Err(error) => return vec![PageResult::Failed(fail_code(error)); pages.len()],
     };
@@ -618,8 +618,8 @@ pub(crate) async fn serve(
             priority,
             page_size,
         } => {
-            // Pages are numbered at the sender's page size; the cluster has one.
-            if local.page_size()? != page_size {
+            // Pages are numbered at the cache's page size.
+            if local.page_size(&version.object.cache)? != page_size {
                 return Err(Error::InvalidRequest);
             }
             let metadata = VersionMetadata {
@@ -664,7 +664,7 @@ async fn dispatch(
         Ok(context) => context,
         Err(_) => return all(UnitOutcome::Failed(RefError::OriginError)),
     };
-    let page_size = match local.page_size() {
+    let page_size = match local.page_size(&version.object.cache) {
         Ok(size) => size,
         Err(error) => return all(classify(error)),
     };
@@ -957,11 +957,11 @@ async fn coverage(
             .or_default()
             .push(unit.page);
     }
-    let Ok(page_size) = local.page_size() else {
-        return 0;
-    };
     let mut resident = 0u64;
     for ((owner, version), pages) in groups {
+        let Ok(page_size) = local.page_size(&version.object.cache) else {
+            continue;
+        };
         for chunk in pages.chunks(racer_core::prefetch::MAX_OPERATION_PAGES) {
             if scope.check().is_err() {
                 return resident;
@@ -1088,12 +1088,11 @@ async fn handle_inner(
             }
             let resolved = resolve(local, cache, &membership, &spec, authorization.as_ref()).await;
             scope.check().map_err(|_| unavailable("request expired"))?;
-            // The cluster adopts one page size and never changes it.
             let page_size = local
-                .page_size()
+                .page_size(cache)
                 .map_err(|_| unavailable("cache is not ready"))?;
             let (status, body) = prefetch.with_registry(|r| {
-                r.set_page_size(page_size);
+                r.set_page_size_for(cache, page_size);
                 r.apply_put(cache, &id, spec, resolved, authorization, prefetch.now())
             })?;
             if let Ok(local) = directory.local_coordinator() {

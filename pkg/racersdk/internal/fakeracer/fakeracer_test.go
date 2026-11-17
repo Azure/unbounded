@@ -310,7 +310,7 @@ func TestSubscriptionPages(t *testing.T) {
 						t.Fatal(err)
 					}
 
-					first, last, err := bounds.ResolvePage(test.size)
+					first, last, err := bounds.ResolvePage(test.size, wire.PageSize)
 					if test.size != 0 && err != nil {
 						t.Fatal(err)
 					}
@@ -348,7 +348,7 @@ func TestSubscriptionPages(t *testing.T) {
 
 				return &http.Response{StatusCode: status, Status: fmt.Sprintf("%d %s", status, http.StatusText(status)), Header: h, Body: body}, nil
 			})
-			s := wire.SubscriptionRequest{Request: wire.Request{Operation: wire.OperationHead, Pin: test.pin}, First: test.first, End: test.end, Ranged: true, PageCredits: 2, ByteCredits: 2 * wire.PageSize}
+			s := wire.SubscriptionRequest{Request: wire.Request{Operation: wire.OperationHead, Pin: test.pin}, First: test.first, End: test.end, Ranged: true, PageCredits: 2, ByteCredits: 2 * wire.PageSize, PageSize: wire.PageSize}
 
 			var output bytes.Buffer
 			servePages(t.Context(), bufio.NewWriter(&output), transport, s, NewCredits())
@@ -395,7 +395,7 @@ func TestSubscriptionPages(t *testing.T) {
 			}
 
 			end := min(test.end, test.size)
-			sequence := wire.NewSequence(test.first, end)
+			sequence := wire.NewSequence(test.first, end, wire.PageSize)
 			reader := bytes.NewReader(data)
 
 			for {
@@ -491,7 +491,7 @@ func TestWriteHeadFailure(t *testing.T) {
 }
 
 func TestFetchInvalidRequest(t *testing.T) {
-	if _, _, err := fetchPage(t.Context(), nil, wire.Request{}, nil); err == nil {
+	if _, _, err := fetchPage(t.Context(), nil, wire.Request{}, nil, wire.PageSize); err == nil {
 		t.Fatal("accepted invalid request")
 	}
 }

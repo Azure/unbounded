@@ -5,9 +5,13 @@
 //! gating and shutdown drain predicates remain in app.rs.
 
 use super::*;
+use crate::control::Caches;
 use crate::runtime::HashMap;
 use crate::runtime::HashSet;
+use crate::store::checkpoint::CHECKPOINT_VERSION_V4;
 use crate::store::checkpoint::CheckpointImage;
+use crate::store::checkpoint::CutIdentity;
+use racer_wire::object::PageSize;
 
 /// Shared collection, publication, and acknowledgment state for one node cut.
 #[derive(Default)]
@@ -327,7 +331,10 @@ impl WorkerApplication {
                     self.store
                         .checkpoint
                         .publish_async(
-                            self.keys.cluster().clone(),
+                            CutIdentity {
+                                cluster: self.keys.cluster().clone(),
+                                default_page_size: self.snapshots.current()?.page_size,
+                            },
                             shards,
                             self.runtime.reactor.clone(),
                             deadline.clone(),
@@ -456,9 +463,19 @@ impl WorkerApplication {
                     return Ok(());
                 }
             };
+            let default_page_size = match self.snapshots.current() {
+                Ok(snapshot) => snapshot.page_size,
+                Err(error) => {
+                    cut.fail(error);
+                    return Ok(());
+                }
+            };
             drop(cut);
             match self.store.checkpoint.publish_changed_async(
-                self.keys.cluster().clone(),
+                CutIdentity {
+                    cluster: self.keys.cluster().clone(),
+                    default_page_size,
+                },
                 shards,
                 self.runtime.reactor.clone(),
                 scope(&self.ctx().clock, self.timeout)?,
@@ -675,16 +692,16 @@ fn select(
     workers: &crate::read::dispatch::NodeDirectory,
     (page_capacity, metadata_capacity): (usize, usize),
     keys: &Keyring,
-    caches: &[racer_wire::control::CacheDefinition],
-    page_size: racer_wire::object::PageSize,
+    caches: &Caches,
+    page_size: PageSize,
 ) -> Option<CheckpointImage> {
     // The disk scanner supplies newest-first images, never retaining a second
     // decoded candidate while validating the first.
     candidates.into_iter().find_map(|image| {
         let sequence = image.sequence;
-        // A cut taken under another published page size cuts every page at
-        // the wrong offsets: start cold rather than serve it.
-        if image.page_size != page_size {
+        // A v4 cut has one page size for the whole image. A v5 header size is
+        // informational, so each entry is checked against its cache below.
+        if image.version == CHECKPOINT_VERSION_V4 && image.page_size != page_size {
             eprintln!("racer: skipping checkpoint sequence {sequence} cut at another page size");
             return None;
         }
@@ -695,6 +712,7 @@ fn select(
             (page_capacity, metadata_capacity),
             keys,
             caches,
+            page_size,
         );
         if selected.is_none() {
             eprintln!("racer: skipping incompatible checkpoint sequence {sequence}");
@@ -710,7 +728,8 @@ fn validate_candidate(
     workers: &crate::read::dispatch::NodeDirectory,
     (page_capacity, metadata_capacity): (usize, usize),
     keys: &Keyring,
-    caches: &[racer_wire::control::CacheDefinition],
+    caches: &Caches,
+    page_size: PageSize,
 ) -> Option<CheckpointImage> {
     // Key and cache IDs can repeat across clusters, so a foreign cut is only a stale hint.
     if &image.cluster != keys.cluster() {
@@ -720,11 +739,29 @@ fn validate_candidate(
     if ids.len() != image.shards.len() || ids != geometry.keys().copied().collect() {
         return None;
     }
-    let available = |cache: &racer_wire::control::CacheId| caches.iter().any(|c| &c.id == cache);
+    let available = |cache: &racer_wire::control::CacheId| caches.contains(cache);
+    let effective = |cache: &racer_wire::control::CacheId| {
+        caches.find(cache).map(|c| c.page_size.unwrap_or(page_size))
+    };
     Recovery::filter_available(
         &mut image,
         |cache| available(cache) && keys.active(cache, KeyPurpose::Page).is_ok(),
-        |cache, id| available(cache) && keys.lease(Some(cache), id, KeyPurpose::Page).is_ok(),
+        |cache, id, entry_size| {
+            let expected = effective(cache);
+            if let Some(expected) = expected
+                && expected != entry_size
+            {
+                eprintln!(
+                    "racer: dropping checkpoint entry for cache {:?} cut at {} bytes, published {} bytes",
+                    cache.0,
+                    entry_size.get(),
+                    expected.get()
+                );
+            }
+            available(cache)
+                && keys.lease(Some(cache), id, KeyPurpose::Page).is_ok()
+                && expected == Some(entry_size)
+        },
     );
     for shard in &image.shards {
         if geometry.get(&shard.worker) != Some(&shard.geometry) || shard.validate().is_err() {
@@ -1129,10 +1166,21 @@ mod tests {
     fn geometry() -> CheckpointGeometry {
         CheckpointGeometry::new(8192, 4096, 2, Alignment::new(4096, 4096, 4096).unwrap()).unwrap()
     }
-    fn caches() -> Vec<racer_wire::control::CacheDefinition> {
+    fn cache_definition(
+        id: &str,
+        page_size: Option<PageSize>,
+    ) -> racer_wire::control::CacheDefinition {
         let mut cache = crate::app::tests::definition();
-        cache.id = racer_wire::control::CacheId(crate::test_support::security::CACHE.into());
-        vec![cache]
+        cache.id = racer_wire::control::CacheId(id.into());
+        cache.page_size = page_size;
+        cache
+    }
+
+    fn caches() -> Caches {
+        Caches::new(vec![cache_definition(
+            crate::test_support::security::CACHE,
+            None,
+        )])
     }
     fn image(sequence: u64, ids: &[WorkerId]) -> CheckpointImage {
         CheckpointImage {
@@ -1166,6 +1214,210 @@ mod tests {
                 .collect(),
         }
     }
+    /// One shard with one page entry per cache, each carrying its cut size.
+    fn cut_with_sizes(
+        sequence: u64,
+        specs: &[(racer_wire::control::CacheId, PageSize)],
+    ) -> CheckpointImage {
+        let g = geometry();
+        let segments = Segments::new(g.segment_bytes);
+        segments
+            .configure(
+                g.slab_bytes,
+                g.segment_count as usize,
+                g.alignment().unwrap(),
+            )
+            .unwrap();
+        let mut entries = Vec::new();
+        let mut leases = Vec::new();
+        for (i, (cache, page_size)) in specs.iter().enumerate() {
+            let (lease, extent) = segments.append(4096).unwrap();
+            let metadata = crate::model::VersionMetadata {
+                content_type: None,
+                version: crate::model::ObjectVersion {
+                    object: crate::model::ObjectId {
+                        cache: cache.clone(),
+                        key: crate::model::CacheKey([i as u8 + 1; 32]),
+                    },
+                    etag: crate::model::StrongEtag::test_value(&i.to_string()),
+                },
+                length: 3,
+            };
+            let page = crate::model::PageId {
+                version: metadata.version.clone(),
+                number: crate::model::PageNumber(0),
+            };
+            entries.push((
+                page,
+                crate::store::catalog::IndexedPage {
+                    page_size: *page_size,
+                    metadata,
+                    key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
+                    location: crate::store::catalog::RecordLocation {
+                        segment: lease.id(),
+                        generation: lease.generation(),
+                        extent,
+                    },
+                },
+            ));
+            leases.push(lease);
+        }
+        let mut cut = image(sequence, &[WorkerId(0)]);
+        cut.shards[0].index.entries = entries;
+        cut.shards[0].segments = segments.snapshot();
+        cut.version = crate::store::checkpoint::wire_version(&cut.shards, PageSize::DEFAULT);
+        cut
+    }
+
+    #[test]
+    fn v5_recovery_filters_entries_by_each_cache_published_page_size() {
+        let env = racer_io::Env::host();
+        let cache_a = racer_wire::control::CacheId(crate::test_support::security::CACHE.into());
+        let cache_b = racer_wire::control::CacheId("44444444-4444-4444-8444-444444444444".into());
+        let keys =
+            crate::test_support::security::keys_for(&env, &[cache_a.clone(), cache_b.clone()]);
+        let node = NodeState::new(vec![WorkerId(0)], 16, racer_io::WorkerCtx::host()).unwrap();
+        let geometry = [(WorkerId(0), geometry())].into_iter().collect();
+        let large = PageSize::new(64 << 10).unwrap();
+        let published = Caches::new(vec![
+            cache_definition(&cache_a.0, None),
+            cache_definition(&cache_b.0, Some(large)),
+        ]);
+        let select_one = |cut: CheckpointImage, caches: &Caches| {
+            select(
+                vec![cut],
+                &geometry,
+                &node.workers,
+                (16, 16),
+                &keys,
+                caches,
+                PageSize::DEFAULT,
+            )
+        };
+        let selected = select_one(
+            cut_with_sizes(
+                9,
+                &[
+                    (cache_a.clone(), PageSize::DEFAULT),
+                    (cache_b.clone(), large),
+                ],
+            ),
+            &published,
+        )
+        .unwrap();
+        assert_eq!(selected.shards[0].index.entries.len(), 2);
+        assert!(
+            selected.shards[0]
+                .index
+                .entries
+                .iter()
+                .any(|(page, entry)| {
+                    page.version.object.cache == cache_a && entry.page_size == PageSize::DEFAULT
+                })
+        );
+        assert!(
+            selected.shards[0]
+                .index
+                .entries
+                .iter()
+                .any(|(page, entry)| {
+                    page.version.object.cache == cache_b && entry.page_size == large
+                })
+        );
+        // Publishing the default for B makes B's larger entry a stale-size
+        // entry, while A's default entry remains installable.
+        let default_only = Caches::new(vec![
+            cache_definition(&cache_a.0, None),
+            cache_definition(&cache_b.0, None),
+        ]);
+        let selected = select_one(
+            cut_with_sizes(
+                10,
+                &[
+                    (cache_a.clone(), PageSize::DEFAULT),
+                    (cache_b.clone(), large),
+                ],
+            ),
+            &default_only,
+        )
+        .unwrap();
+        assert_eq!(selected.shards[0].index.entries.len(), 1);
+        assert_eq!(
+            selected.shards[0].index.entries[0].0.version.object.cache,
+            cache_a
+        );
+        assert_eq!(
+            selected.shards[0].index.entries[0].1.page_size,
+            PageSize::DEFAULT
+        );
+        // A v5 cut whose every entry has a stale size still keeps its sequence,
+        // so the next publication cannot reuse it.
+        let selected = select_one(
+            cut_with_sizes(11, &[(cache_b.clone(), large)]),
+            &default_only,
+        )
+        .unwrap();
+        assert_eq!(selected.sequence, 11);
+        assert!(selected.shards[0].index.entries.is_empty());
+        // It also wins over an older compatible cut for the same reason.
+        let selected = select(
+            vec![
+                cut_with_sizes(12, &[(cache_b.clone(), large)]),
+                cut_with_sizes(8, &[(cache_a.clone(), PageSize::DEFAULT)]),
+            ],
+            &geometry,
+            &node.workers,
+            (16, 16),
+            &keys,
+            &default_only,
+            PageSize::DEFAULT,
+        )
+        .unwrap();
+        assert_eq!(selected.sequence, 12);
+        assert!(selected.shards[0].index.entries.is_empty());
+    }
+
+    #[test]
+    fn v4_whole_image_size_falls_back_while_v5_header_is_informational() {
+        let env = racer_io::Env::host();
+        let cache = racer_wire::control::CacheId(crate::test_support::security::CACHE.into());
+        let keys = crate::test_support::security::keys(&env);
+        let node = NodeState::new(vec![WorkerId(0)], 16, racer_io::WorkerCtx::host()).unwrap();
+        let geometry = [(WorkerId(0), geometry())].into_iter().collect();
+        let caches = Caches::new(vec![cache_definition(&cache.0, None)]);
+        let large = PageSize::new(64 << 10).unwrap();
+        let mut resized = image(4, &[WorkerId(0)]);
+        resized.version = CHECKPOINT_VERSION_V4;
+        resized.page_size = large;
+        let selected = select(
+            vec![resized, image(2, &[WorkerId(0)])],
+            &geometry,
+            &node.workers,
+            (16, 16),
+            &keys,
+            &caches,
+            PageSize::DEFAULT,
+        )
+        .unwrap();
+        assert_eq!(selected.sequence, 2);
+        // A v5 header size is only context. Each entry is judged by its cache.
+        let mut informational = cut_with_sizes(5, &[(cache.clone(), PageSize::DEFAULT)]);
+        informational.version = CHECKPOINT_VERSION;
+        informational.page_size = large;
+        let selected = select(
+            vec![informational],
+            &geometry,
+            &node.workers,
+            (16, 16),
+            &keys,
+            &caches,
+            PageSize::DEFAULT,
+        )
+        .unwrap();
+        assert_eq!(selected.sequence, 5);
+        assert_eq!(selected.shards[0].index.entries.len(), 1);
+    }
+
     #[test]
     fn layout_digest_rejects_mismatched_cuts_and_one_mismatched_worker() {
         let env = racer_io::Env::host();
@@ -1228,8 +1480,9 @@ mod tests {
                 .sequence,
             2
         );
-        // A cut taken under another published page size starts cold.
+        // A v4 cut taken under another published page size starts cold.
         let mut resized = candidate(4, guarded);
+        resized.version = CHECKPOINT_VERSION_V4;
         resized.page_size = racer_wire::object::PageSize::new(64 << 10).unwrap();
         assert_eq!(
             choose(vec![resized, candidate(2, guarded)], &g)
@@ -1531,7 +1784,7 @@ mod tests {
             &node.workers,
             (16, 16),
             &keys,
-            &[],
+            &Caches::default(),
             racer_wire::object::PageSize::DEFAULT,
         )
         .unwrap();

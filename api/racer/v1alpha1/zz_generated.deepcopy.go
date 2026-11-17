@@ -158,6 +158,11 @@ func (in *ClusterCacheSpec) DeepCopyInto(out *ClusterCacheSpec) {
 		*out = new(ObjectOrigin)
 		(*in).DeepCopyInto(*out)
 	}
+	if in.PageSize != nil {
+		in, out := &in.PageSize, &out.PageSize
+		*out = new(PageSize)
+		**out = **in
+	}
 	if in.Priority != nil {
 		in, out := &in.Priority, &out.Priority
 		*out = new(int32)

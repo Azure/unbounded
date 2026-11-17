@@ -22,6 +22,9 @@ pub struct CacheInfo {
     /// spec.nodeSelector as written; None when unset. Parsed by `build` so an
     /// invalid selector drops only this cache.
     pub node_selector: Option<Value>,
+    /// spec.pageSize as written; None when unset. Parsed by `build` so an
+    /// invalid value fails the catalog.
+    pub page_size: Option<Value>,
 }
 
 impl CacheInfo {
@@ -37,6 +40,10 @@ impl CacheInfo {
             origin: v.pointer("/spec/origin").filter(|o| !o.is_null()).cloned(),
             node_selector: v
                 .pointer("/spec/nodeSelector")
+                .filter(|p| !p.is_null())
+                .cloned(),
+            page_size: v
+                .pointer("/spec/pageSize")
                 .filter(|p| !p.is_null())
                 .cloned(),
         }
@@ -224,10 +231,50 @@ fn to_millis(d: std::time::Duration, up: bool) -> Option<std::time::Duration> {
     Some(std::time::Duration::from_millis(millis))
 }
 
-/// Build the catalog sorted by UID. A cache with an invalid node selector is
-/// left out and named in [`Catalog::rejected`]; any other invalid cache fails
-/// the whole catalog.
+/// Parse spec.pageSize and normalize the cluster default to `None`.
+fn page_size(
+    value: Option<&Value>,
+    cluster_default: racer_wire::object::PageSize,
+) -> Result<Option<racer_wire::object::PageSize>, wire::Error> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let Some(label) = value.as_str() else {
+        return Err(wire::Error::InvalidRequest);
+    };
+    let bytes = match label {
+        "4KiB" => 4 << 10,
+        "8KiB" => 8 << 10,
+        "16KiB" => 16 << 10,
+        "32KiB" => 32 << 10,
+        "64KiB" => 64 << 10,
+        "128KiB" => 128 << 10,
+        "256KiB" => 256 << 10,
+        "512KiB" => 512 << 10,
+        "1MiB" => 1 << 20,
+        "2MiB" => 2 << 20,
+        "4MiB" => 4 << 20,
+        "8MiB" => 8 << 20,
+        "16MiB" => 16 << 20,
+        _ => return Err(wire::Error::InvalidRequest),
+    };
+    let size = racer_wire::object::PageSize::new(bytes).map_err(|_| wire::Error::InvalidRequest)?;
+    Ok((size != cluster_default).then_some(size))
+}
+
+/// Build the catalog sorted by UID, using the default page size for caches
+/// without an override. A cache with an invalid node selector is left out and
+/// named in [`Catalog::rejected`]; any other invalid cache fails the catalog.
 pub fn build(caches: &[CacheInfo]) -> Result<Catalog, wire::Error> {
+    build_with_default(caches, racer_wire::object::PageSize::DEFAULT)
+}
+
+/// Build the catalog with the cluster default page size applied to caches that
+/// do not specify one.
+pub fn build_with_default(
+    caches: &[CacheInfo],
+    cluster_default: racer_wire::object::PageSize,
+) -> Result<Catalog, wire::Error> {
     let (mut ids, mut names) = (HashSet::new(), HashSet::new());
     let mut out = Vec::with_capacity(caches.len());
     let mut selectors = BTreeMap::new();
@@ -258,6 +305,7 @@ pub fn build(caches: &[CacheInfo]) -> Result<Catalog, wire::Error> {
             priority: priority as u16,
             mode: mode(c.passthrough.as_ref())?,
             origin: origin_definition(c.origin.as_ref())?,
+            page_size: page_size(c.page_size.as_ref(), cluster_default)?,
         });
         if let Some(s) = selector {
             selectors.insert(CacheId(c.uid.clone()), s);
@@ -284,6 +332,7 @@ mod tests {
             passthrough: None,
             origin: None,
             node_selector: None,
+            page_size: None,
         }
     }
 

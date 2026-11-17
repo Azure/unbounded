@@ -486,7 +486,7 @@ const BASE: &[Var] = &[
         Group::Storage,
         uint(1, MAX_ENTRIES, COUNT),
         Value("65536"),
-        "Disk page-index budget in file mode; device mode can raise it.",
+        "Total disk page-index budget in file mode, divided equally among the active page-size classes; device mode can raise it. With a single page-size class this matches the previous behavior. Small pages use one entry per object, so a git-like cache needs a much higher count: 1,048,576 entries at 4 KiB is about 4 GiB.",
     ),
     var(
         "RACER_CHECKPOINT_BYTES",
@@ -914,7 +914,7 @@ const BASE: &[Var] = &[
         Group::Kubernetes,
         uint(16 * 1024 * 1024, 16 * 1024 * 1024, BYTES),
         Value("16777216"),
-        "Cluster-wide logical page size. Only 16777216 (16 MiB) is accepted: the client SDKs and the disk index do not yet support other sizes. Fixed at cluster creation: the authority publishes the value of the primary that made the first publication, records it in the `racer-state` Secret, and ignores later changes with a warning in the primary's log. Running nodes reject a publication that changes it.",
+        "Cluster-default logical page size, used by caches without `spec.pageSize`. Only 16777216 (16 MiB) is accepted; an individual cache can set another size through `spec.pageSize`. Fixed at cluster creation: the authority publishes the value of the primary that made the first publication, records it in the `racer-state` Secret, and ignores later changes with a warning in the primary's log. Running nodes reject a publication that changes this default.",
     )),
     control(var(
         "RACER_KUBE_API_CA",

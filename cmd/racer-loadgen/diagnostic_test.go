@@ -21,7 +21,11 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
+
+	"github.com/Azure/unbounded/pkg/racersdk"
 )
+
+const diagnosticPageSize = racersdk.PageSize
 
 type diagnosticChunks struct {
 	data []byte
@@ -178,6 +182,35 @@ func (r diagnosticPattern) ReadAt(p []byte, offset int64) (int, error) {
 	}
 
 	return len(p), nil
+}
+
+func TestDiagnosticConfiguredPageSize(t *testing.T) {
+	const pageSize = 4 << 10
+
+	opts := pullTestOptions("http://localhost")
+	opts.PageSize = pageSize
+	p, _ := pullTestNew(t, pullTestImage(t), opts)
+
+	data := bytes.Repeat([]byte{9}, 3*pageSize+11)
+	actual := bytes.Clone(data)
+	actual[pageSize+5] ^= 1
+	desc := byteDescriptor("test", data)
+
+	n, _, evidence, err := p.readBodyDiagnostic(bytes.NewReader(actual), blobSource{desc, bytes.NewReader(data)})
+	require.NoError(t, err)
+	require.Equal(t, int64(len(data)), n)
+	require.Equal(t, int64(pageSize), evidence.pageSize)
+	require.Equal(t, int64(4), evidence.examined)
+	require.Equal(t, int64(1), evidence.mismatching)
+	require.Len(t, evidence.records, 1)
+	require.Equal(t, int64(pageSize), evidence.records[0].Offset)
+	require.Equal(t, int64(pageSize), evidence.records[0].Length)
+
+	var output bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&output, nil))
+	logger.Error("diagnostic", slog.Any("pages", evidence))
+	require.Contains(t, output.String(), `"page_size":4096`)
+	require.Contains(t, output.String(), `"offset":4096`)
 }
 
 func TestDiagnosticPageCapAndLogging(t *testing.T) {

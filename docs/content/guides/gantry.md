@@ -489,8 +489,8 @@ Racer mode gives image distribution the same benefits as other Racer caches:
 
 - Image data is encrypted and authenticated between nodes and on disk, so no
   cleartext peer transfer port needs to be fenced off.
-- Large layers are split into 16 MiB pages spread across many nodes, so many
-  nodes serve one layer in parallel.
+- Large layers are split into pages (16 MiB by default) spread across many
+  nodes, so many nodes serve one layer in parallel.
 - Only each page's owners read from the registry, which keeps registry load
   low during large rollouts.
 - Images share node cache space with model and dataset caches, weighted by

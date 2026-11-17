@@ -599,6 +599,10 @@ mod definitions {
         /// Object origin the dataplane reads directly. None keeps the cache's
         /// origin Unix socket as the only origin.
         pub origin: Option<crate::control::OriginDefinition>,
+
+        /// Logical page size for this cache. None inherits `Publication.page_size`;
+        /// Some overrides it for this cache only.
+        pub page_size: Option<crate::object::PageSize>,
     }
 
     /// Pool identity: `default`, or `sel-` and 32 lowercase hexadecimal digits.
@@ -1362,6 +1366,16 @@ mod codec {
         // their canonical bytes.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin: Option<OriginDto>,
+
+        // Optional and omitted when the cache inherits the publication page
+        // size, so publications and canonical bytes at the default stay
+        // identical. Explicit null is rejected.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "nonnull_page_bytes"
+        )]
+        page_bytes: Option<u64>,
     }
 
     /// Wire spelling of `OriginDefinition`.
@@ -1552,6 +1566,14 @@ mod codec {
         Vec::<u32>::deserialize(d).map(Some)
     }
 
+    /// Accept a present per-cache page size only as an unsigned integer,
+    /// never explicit null.
+    fn nonnull_page_bytes<'de, D: serde::Deserializer<'de>>(
+        d: D,
+    ) -> std::result::Result<Option<u64>, D::Error> {
+        u64::deserialize(d).map(Some)
+    }
+
     /// Convert decoded pools; validation happens against the decoded catalog.
     fn pools_from_dto(pools: Vec<PoolDto>) -> Vec<Pool> {
         let mut pools: Vec<_> = pools
@@ -1642,6 +1664,12 @@ mod codec {
                     priority: c.priority,
                     mode: c.mode.into(),
                     origin: c.origin.map(OriginDto::into_definition).transpose()?,
+                    page_size: c
+                        .page_bytes
+                        .map(|bytes| {
+                            crate::object::PageSize::new(bytes).map_err(|_| Error::InvalidRequest)
+                        })
+                        .transpose()?,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1702,6 +1730,13 @@ mod codec {
                     .as_ref()
                     .map(OriginDto::from_definition)
                     .transpose()?,
+                // An explicit size equal to the cluster default must encode
+                // exactly like an omitted one, so canonical content does not
+                // depend on how the authority spelled the inherited size.
+                page_bytes: c
+                    .page_size
+                    .filter(|size| *size != p.page_size)
+                    .map(crate::object::PageSize::get),
             });
         }
         caches.sort_by(|a, b| a.id.cmp(&b.id));
@@ -1921,6 +1956,15 @@ mod codec {
         original.caches = d.caches;
         original.pools = d.pools;
         original.page_bytes = d.page_bytes;
+        // A delta may spell an inherited size explicitly. Normalize it against
+        // the target's cluster default so the target hash matches the canonical
+        // form that omits it.
+        let page_bytes = original.page_bytes;
+        for cache in &mut original.caches {
+            if cache.page_bytes == Some(page_bytes) {
+                cache.page_bytes = None;
+            }
+        }
         original.sequence = d.sequence;
         original.membership_version = d.membership_version;
         encode(&original, MAX_PUBLICATION_BYTES)?;
@@ -2574,6 +2618,184 @@ mod codec {
             }
         }
 
+        /// Explicitly spelling the cluster default and omitting it are one
+        /// canonical publication, because the inherited size is not content.
+        #[test]
+        fn cache_page_size_explicit_default_matches_omitted() {
+            let mut p = decode_publication(&fixture("publication.json")).unwrap();
+            p.caches[0].page_size = None;
+            let omitted = encode_publication(&p).unwrap();
+            let hashes = content_hashes(&p).unwrap();
+            let value: Value = serde_json::from_slice(&omitted).unwrap();
+            assert!(value["caches"][0].get("page_bytes").is_none());
+            p.caches[0].page_size = Some(p.page_size);
+            assert_eq!(encode_publication(&p).unwrap(), omitted);
+            assert_eq!(content_hashes(&p).unwrap(), hashes);
+            assert_eq!(validate_publication(&p).unwrap().caches[0].page_size, None);
+            assert_eq!(
+                decode_publication(&omitted).unwrap().caches[0].page_size,
+                None
+            );
+        }
+
+        /// Per-cache overrides survive full and delta transport alongside an
+        /// inherited cache, and a delta may spell an inherited size explicitly.
+        #[test]
+        fn mixed_page_sizes_round_trip_through_full_and_delta() {
+            let mut base = decode_publication(&fixture("publication.json")).unwrap();
+            base.sequence.0 = 1;
+            base.membership_version.0 = 1;
+            let mut next = base.clone();
+            next.sequence.0 = 2;
+            next.membership_version.0 = 2;
+            add_cache(
+                &mut next,
+                "55555555-5555-4555-8555-555555555555",
+                "cache-b",
+                Some(crate::object::PageSize::new(64 << 10).unwrap()),
+            );
+            let full = encode_publication(&next).unwrap();
+            let decoded = decode_publication(&full).unwrap();
+            assert_eq!(decoded.caches, next.caches);
+            assert_eq!(
+                content_hash(&decoded).unwrap(),
+                content_hash(&next).unwrap()
+            );
+            let d = dto(&next).unwrap();
+            let mut delta = serde_json::json!({
+                "delta_version":2,"cluster":base.cluster.0,"base_sequence":base.sequence.0.to_string(),
+                "base_hash":content_hash(&base).unwrap(),"sequence":next.sequence.0.to_string(),
+                "membership_version":next.membership_version.0.to_string(),"content_hash":content_hash(&next).unwrap(),
+                "upsert_members":[],"remove_members":[],"caches":d.caches,"pools":d.pools,"page_bytes":d.page_bytes
+            });
+            let applied = apply_delta(&base, &serde_json::to_vec(&delta).unwrap()).unwrap();
+            assert_eq!(encode_publication(&applied).unwrap(), full);
+            assert_eq!(
+                content_hash(&applied).unwrap(),
+                content_hash(&next).unwrap()
+            );
+            // The inherited cache may repeat the cluster default without
+            // changing the target hash.
+            delta["caches"][0]["page_bytes"] = base.page_size.get().into();
+            let explicit = apply_delta(&base, &serde_json::to_vec(&delta).unwrap()).unwrap();
+            assert_eq!(explicit.caches[0].page_size, None);
+            assert_eq!(encode_publication(&explicit).unwrap(), full);
+            assert_eq!(
+                content_hash(&explicit).unwrap(),
+                content_hash(&next).unwrap()
+            );
+        }
+
+        /// Page-size changes are content-only: membership bytes never carry
+        /// cache definitions or the default size.
+        #[test]
+        fn page_size_changes_alter_content_hash_not_membership_hash() {
+            let mut p = decode_publication(&fixture("publication.json")).unwrap();
+            let base = content_hashes(&p).unwrap();
+            let small = crate::object::PageSize::new(64 << 10).unwrap();
+            p.caches[0].page_size = Some(small);
+            let per_cache = content_hashes(&p).unwrap();
+            assert_ne!(per_cache.0, base.0);
+            assert_eq!(per_cache.1, base.1);
+            p.caches[0].page_size = None;
+            p.page_size = small;
+            let cluster = content_hashes(&p).unwrap();
+            assert_ne!(cluster.0, base.0);
+            assert_ne!(cluster.0, per_cache.0);
+            assert_eq!(cluster.1, base.1);
+        }
+
+        /// Per-cache sizes reject explicit null, non-integers, and sizes
+        /// outside the power-of-two production range, and omit the default.
+        #[test]
+        fn cache_page_bytes_rejects_null_and_out_of_range() {
+            let mut value: Value = serde_json::from_slice(&fixture("publication.json")).unwrap();
+            value["caches"][0]["page_bytes"] = Value::Null;
+            assert_eq!(
+                decode_publication(&serde_json::to_vec(&value).unwrap()).err(),
+                Some(Error::InvalidRequest)
+            );
+            for bad in [0u64, 1024, 3 << 20, 32 << 20, u64::MAX] {
+                value["caches"][0]["page_bytes"] = bad.into();
+                assert_eq!(
+                    decode_publication(&serde_json::to_vec(&value).unwrap()).err(),
+                    Some(Error::InvalidRequest),
+                    "{bad}"
+                );
+            }
+            for bad in ["\"65536\"", "true", "[]", "{}"] {
+                value["caches"][0]["page_bytes"] = serde_json::from_str(bad).unwrap();
+                assert!(
+                    decode_publication(&serde_json::to_vec(&value).unwrap()).is_err(),
+                    "{bad}"
+                );
+            }
+            for good in [4u64 << 10, 64 << 10, 16 << 20] {
+                value["caches"][0]["page_bytes"] = good.into();
+                let p = decode_publication(&serde_json::to_vec(&value).unwrap()).unwrap();
+                assert_eq!(
+                    p.caches[0].page_size,
+                    Some(crate::object::PageSize::new(good).unwrap())
+                );
+                let encoded: Value =
+                    serde_json::from_slice(&encode_publication(&p).unwrap()).unwrap();
+                if good == p.page_size.get() {
+                    assert!(encoded["caches"][0].get("page_bytes").is_none());
+                } else {
+                    assert_eq!(encoded["caches"][0]["page_bytes"], Value::from(good));
+                }
+            }
+        }
+
+        /// A reader from before per-cache sizes rejects the new field rather
+        /// than silently ignoring a size it cannot enforce.
+        #[test]
+        fn old_reader_deny_unknown_fields_rejects_cache_page_bytes() {
+            /// Cache record accepted before `page_bytes` existed.
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            #[allow(dead_code)]
+            struct OldCache {
+                id: String,
+
+                name: String,
+
+                client_socket: String,
+
+                origin_socket: String,
+
+                priority: u16,
+            }
+            let mut p = decode_publication(&fixture("publication.json")).unwrap();
+            p.caches[0].page_size = Some(crate::object::PageSize::new(64 << 10).unwrap());
+            let value: Value = serde_json::from_slice(&encode_publication(&p).unwrap()).unwrap();
+            let cache = value["caches"][0].clone();
+            assert_eq!(cache["page_bytes"], Value::from(64u64 << 10));
+            assert!(serde_json::from_value::<OldCache>(cache.clone()).is_err());
+            let mut without = cache;
+            without.as_object_mut().unwrap().remove("page_bytes");
+            assert!(serde_json::from_value::<OldCache>(without).is_ok());
+        }
+
+        /// Append a cache with its own page size and extend the default pool.
+        fn add_cache(
+            p: &mut Publication,
+            id: &str,
+            name: &str,
+            page_size: Option<crate::object::PageSize>,
+        ) {
+            let mut cache = p.caches[0].clone();
+            cache.id = CacheId(id.into());
+            cache.name = name.into();
+            (cache.client_socket, cache.origin_socket) = canonical_socket_paths(name).unwrap();
+            cache.page_size = page_size;
+            let id = cache.id.clone();
+            p.caches.push(cache);
+            p.caches.sort_by(|a, b| a.id.cmp(&b.id));
+            p.pools[0].caches.push(id);
+            p.pools[0].caches.sort();
+        }
+
         /// Site additions, changes, and removals agree with Go and reject replay.
         #[test]
         fn shared_site_vectors() {
@@ -3142,7 +3364,7 @@ mod codec {
             let mut paged: Value = serde_json::from_str(&raw).unwrap();
             paged.as_object_mut().unwrap().remove("page_bytes");
             assert!(decode_publication(&serde_json::to_vec(&paged).unwrap()).is_err());
-            for bad in [0u64, 4096, 98304, 32 << 20] {
+            for bad in [0u64, 1024, 98304, 32 << 20] {
                 paged["page_bytes"] = bad.into();
                 assert!(decode_publication(&serde_json::to_vec(&paged).unwrap()).is_err());
             }

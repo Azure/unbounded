@@ -461,7 +461,10 @@ impl PeerServer {
         requester: &racer_wire::control::NodeId,
         membership: &std::sync::Arc<crate::topology::Membership>,
     ) -> bool {
-        if let Some(size) = self.page_size.as_ref().and_then(|o| o.page_size().ok()) {
+        if let Some(origin) = self.page_size.as_ref() {
+            let Ok(size) = origin.page_size(&page.version.object.cache) else {
+                return false;
+            };
             self.serve.borrow_mut().set_page_bytes(size.get());
         }
         if !self.serve.borrow().hot(page) {

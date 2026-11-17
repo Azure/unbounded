@@ -34,6 +34,7 @@ use racer_io::scoped::fs::prelude::*;
 use racer_wire::control::CacheId;
 use racer_wire::control::ClusterId;
 use racer_wire::control::KeyId;
+use racer_wire::object::PageSize;
 use sha2::Digest;
 use sha2::Sha256;
 use std::cell::Cell;
@@ -260,8 +261,14 @@ impl Checkpointer {
         shards: Vec<ShardImage>,
     ) -> Operation<'_, ()> {
         let directory = self.directory.clone();
+        let identity = CutIdentity {
+            cluster,
+            // Store fixtures cut at the default page size. A shard with another
+            // uniform size is written as v5 and keeps its per-entry size.
+            default_page_size: PageSize::DEFAULT,
+        };
         let result = block_on_io(env, |reactor, ctx| async move {
-            publish_next(&reactor, &ctx, &directory, cluster, shards).await
+            publish_next(&reactor, &ctx, &directory, identity, shards).await
         });
         Box::pin(async move { result })
     }
@@ -271,7 +278,7 @@ impl Checkpointer {
     #[allow(clippy::too_many_arguments)]
     pub fn publish_async(
         &self,
-        cluster: ClusterId,
+        identity: impl Into<CutIdentity>,
         shards: Vec<ShardImage>,
         reactor: Rc<crate::runtime::Reactor>,
         scope: crate::runtime::RequestScope,
@@ -280,7 +287,7 @@ impl Checkpointer {
         budget: usize,
     ) -> Result<Operation<'static, ()>> {
         let publish = self.publish_changed_async(
-            cluster, shards, reactor, scope, sequence, slot, budget, None,
+            identity, shards, reactor, scope, sequence, slot, budget, None,
         )?;
         Ok(Box::pin(async move { publish.await.map(drop) }))
     }
@@ -292,7 +299,7 @@ impl Checkpointer {
     #[allow(clippy::too_many_arguments)]
     pub fn publish_changed_async(
         &self,
-        cluster: ClusterId,
+        identity: impl Into<CutIdentity>,
         shards: Vec<ShardImage>,
         reactor: Rc<crate::runtime::Reactor>,
         scope: crate::runtime::RequestScope,
@@ -301,8 +308,10 @@ impl Checkpointer {
         budget: usize,
         previous: Option<[u8; DIGEST_BYTES]>,
     ) -> Result<Operation<'static, Option<[u8; DIGEST_BYTES]>>> {
+        let identity: CutIdentity = identity.into();
+        let version = wire_version(&shards, identity.default_page_size);
         // Bound simultaneous decoded image, encoding and submission scratch.
-        let estimated = snapshot_image_bytes(&shards)?;
+        let estimated = snapshot_image_bytes(&shards, version)?;
         if estimated > budget / 2 {
             return Err(Error::Overloaded);
         }
@@ -317,9 +326,9 @@ impl Checkpointer {
         let offload = !reactor.ctx().is_simulated();
         Ok(Box::pin(async move {
             let image = CheckpointImage {
-                version: CHECKPOINT_VERSION,
-                page_size: shards_page_size(&shards)?,
-                cluster,
+                version,
+                page_size: identity.default_page_size,
+                cluster: identity.cluster,
                 sequence,
                 shards,
             };
@@ -473,7 +482,12 @@ pub(super) fn snapshot_base_bytes(segments: usize) -> Result<usize> {
         .ok_or(Error::Overloaded)
 }
 
-fn snapshot_image_bytes(shards: &[ShardImage]) -> Result<usize> {
+fn snapshot_image_bytes(shards: &[ShardImage], version: u32) -> Result<usize> {
+    let entry_bytes = if version == CHECKPOINT_VERSION_V4 {
+        PAGE_ENTRY_BYTES_V4
+    } else {
+        PAGE_ENTRY_BYTES_V5
+    };
     let mut total = HEADER_BYTES + CLUSTER_BYTES + 4 + DIGEST_BYTES;
     for shard in shards {
         total = total.checked_add(SHARD_BYTES).ok_or(Error::Overloaded)?;
@@ -488,7 +502,7 @@ fn snapshot_image_bytes(shards: &[ShardImage]) -> Result<usize> {
             .index
             .entries
             .iter()
-            .map(|(_, entry)| snapshot_entry_bytes(&entry.metadata))
+            .map(|(_, entry)| entry_bytes + descriptor_string_bytes(&entry.metadata))
             .chain(shard.index.metadata.iter().map(snapshot_metadata_bytes))
         {
             total = total.checked_add(bytes).ok_or(Error::Overloaded)?;
@@ -514,13 +528,12 @@ impl Recovery {
     pub fn filter_available(
         image: &mut CheckpointImage,
         mut metadata_available: impl FnMut(&racer_wire::control::CacheId) -> bool,
-        mut available: impl FnMut(&racer_wire::control::CacheId, KeyId) -> bool,
+        mut available: impl FnMut(&racer_wire::control::CacheId, KeyId, PageSize) -> bool,
     ) {
         for shard in &mut image.shards {
-            shard
-                .index
-                .entries
-                .retain(|(page, entry)| available(&page.version.object.cache, entry.key_id));
+            shard.index.entries.retain(|(page, entry)| {
+                available(&page.version.object.cache, entry.key_id, entry.page_size)
+            });
             shard
                 .index
                 .metadata
@@ -643,7 +656,7 @@ async fn publish_next(
     reactor: &racer_io::Reactor,
     ctx: &racer_io::OpCtx,
     directory: &Path,
-    cluster: ClusterId,
+    identity: CutIdentity,
     shards: Vec<ShardImage>,
 ) -> Result<()> {
     let mut found = candidates(reactor, directory, MAX_CHECKPOINT_BYTES, ctx).await?;
@@ -654,10 +667,11 @@ async fn publish_next(
     // Replace the slot opposite the newest valid image, including after a
     // torn newer publication. The surviving valid generation stays intact.
     let (slot, sequence) = SLOTS.next_publication(newest).ok_or(Error::Unavailable)?;
+    let version = wire_version(&shards, identity.default_page_size);
     let bytes = encode(&CheckpointImage {
-        version: CHECKPOINT_VERSION,
-        page_size: shards_page_size(&shards)?,
-        cluster,
+        version,
+        page_size: identity.default_page_size,
+        cluster: identity.cluster,
         sequence,
         shards,
     })?;
@@ -722,16 +736,26 @@ pub(crate) fn read_candidates_with_budget(
 // string, key[32], quoted ETag string, length:u64, and a counted ASCII MIME
 // string where zero length means absent. A segment is id:u64, generation:u64,
 // state:u8, used_bytes:u64, and counted record-offset hold deadlines
-// (offset:u64, seconds:u64, nanos:u32). A page entry is its descriptor,
+// (offset:u64, seconds:u64, nanos:u32). A v4 page entry is its descriptor,
 // page:u64, key_id[16], segment:u64, generation:u64, offset:u64,
-// disk_length:u64. Encoder ordering is canonical by worker, segment, and full
-// version/page identity. No freshness or payload bytes are serialized.
-// cluster is the canonical lowercase cluster UUID. Cache IDs survive a cluster
-// change, and key IDs only add a random 32-bit suffix to a generation that
-// restarts at 1, so they can repeat across clusters. Recovery skips a cut
-// from another cluster. Checkpoints with any other version or cluster are
-// discarded as disposable cache hints.
-pub const CHECKPOINT_VERSION: u32 = 4;
+// disk_length:u64. A v5 page entry appends page_size:u32 so caches on one node
+// can publish different sizes. Encoder ordering is canonical by worker,
+// segment, and full version/page identity. No freshness or payload bytes are
+// serialized. cluster is the canonical lowercase cluster UUID. Cache IDs
+// survive a cluster change, and key IDs only add a random 32-bit suffix to a
+// generation that restarts at 1, so they can repeat across clusters. Recovery
+// skips a cut from another cluster. Checkpoints with any other version or
+// cluster are discarded as disposable cache hints.
+pub const CHECKPOINT_VERSION: u32 = 5;
+/// Caches whose pages all use the cluster default still publish v4 during a
+/// rolling upgrade. Only a mixed-size cut needs the v5 per-entry field.
+pub(crate) const CHECKPOINT_VERSION_V4: u32 = 4;
+
+/// Whether a checkpoint version can be decoded and installed.
+pub(crate) const fn supported_version(version: u32) -> bool {
+    version == CHECKPOINT_VERSION_V4 || version == CHECKPOINT_VERSION
+}
+
 const CLUSTER_BYTES: usize = 36;
 pub const FILE_LAYOUT_DIGEST: [u8; 32] = *b"racer-file-layout-v1\0\0\0\0\0\0\0\0\0\0\0\0";
 /// Largest encoded checkpoint file. Recovery additionally bounds decoded memory
@@ -752,8 +776,13 @@ const SEGMENT_BYTES: usize = 25; // id + generation + state + used.
 /// Entry index + remaining hold nanoseconds.
 pub(super) const HELD_RECORD_BYTES: usize = 12;
 const DESCRIPTOR_BYTES: usize = 52; // key + length + three u32 string lengths.
-const PAGE_ENTRY_BYTES: usize = DESCRIPTOR_BYTES + PAGE_FIELD_BYTES;
-const PAGE_FIELD_BYTES: usize = 56; // page + key ID + segment + generation + offset + length.
+const PAGE_FIELD_BYTES_V4: usize = 56; // page + key ID + segment + generation + offset + length.
+const PAGE_FIELD_BYTES_V5: usize = 60; // v4 fields plus page_size:u32.
+const PAGE_ENTRY_BYTES_V4: usize = DESCRIPTOR_BYTES + PAGE_FIELD_BYTES_V4;
+const PAGE_ENTRY_BYTES_V5: usize = DESCRIPTOR_BYTES + PAGE_FIELD_BYTES_V5;
+/// Conservative charge for writer and recovery budgets. A v5 cut must never be
+/// skipped because its entries are four bytes wider than a v4 entry.
+const PAGE_ENTRY_BYTES: usize = PAGE_ENTRY_BYTES_V5;
 
 /// Persist allocation geometry so a valid checksum cannot hide incompatible slabs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -942,13 +971,33 @@ impl ShardImage {
 
 pub struct CheckpointImage {
     pub version: u32,
-    /// Page size every entry was cut at. Recovery under another
-    /// published page size discards the image and starts cold.
-    pub page_size: racer_wire::object::PageSize,
+    /// Cluster default page size when the cut was taken. A v4 cut requires every
+    /// entry to use it. A v5 cut keeps it as context and stores each entry size.
+    pub page_size: PageSize,
     /// Cluster UID that owns the keys named by page entries.
     pub cluster: ClusterId,
     pub sequence: u64,
     pub shards: Vec<ShardImage>,
+}
+
+/// Cluster identity and accepted cluster default needed to choose a checkpoint
+/// wire version and stamp the image header.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CutIdentity {
+    pub cluster: ClusterId,
+    pub default_page_size: PageSize,
+}
+
+/// Store fixtures that only know a cluster keep the default page size.
+/// Production publication passes the accepted default explicitly.
+#[cfg(any(test, feature = "dst"))]
+impl From<ClusterId> for CutIdentity {
+    fn from(cluster: ClusterId) -> Self {
+        Self {
+            cluster,
+            default_page_size: PageSize::DEFAULT,
+        }
+    }
 }
 
 /// Shared canonical cluster UID for checkpoint fixtures.
@@ -1031,6 +1080,9 @@ pub async fn encode_incremental(image: &CheckpointImage) -> Result<Vec<u8>> {
             out.u64(entry.location.generation.0)?;
             out.u64(entry.location.extent.offset())?;
             out.u64(entry.location.extent.length() as u64)?;
+            if image.version == CHECKPOINT_VERSION {
+                out.u32(u32::try_from(entry.page_size.get()).map_err(|_| Error::CorruptRecord)?)?;
+            }
         }
         out.count(shard.index.metadata.len())?;
         let mut metadata: Vec<_> = shard.index.metadata.iter().collect();
@@ -1093,11 +1145,11 @@ pub fn decode_with_budget(bytes: &[u8], budget: usize) -> Result<CheckpointImage
         return Err(Error::CorruptRecord);
     }
     let version = input.u32()?;
-    if version != CHECKPOINT_VERSION {
+    if !supported_version(version) {
         return Err(Error::CorruptRecord);
     }
-    let page_size = racer_wire::object::PageSize::from_wire(u64::from(input.u32()?))
-        .map_err(|_| Error::CorruptRecord)?;
+    let page_size =
+        PageSize::from_wire(u64::from(input.u32()?)).map_err(|_| Error::CorruptRecord)?;
     let sequence = input.u64()?;
     if input.u64()? != bytes.len() as u64 {
         return Err(Error::CorruptRecord);
@@ -1137,7 +1189,12 @@ pub fn decode_with_budget(bytes: &[u8], budget: usize) -> Result<CheckpointImage
                 used_bytes: input.u64()?,
             });
         }
-        let count = input.count(MAX_ITEMS, PAGE_ENTRY_BYTES)?;
+        let entry_bytes = if version == CHECKPOINT_VERSION_V4 {
+            PAGE_ENTRY_BYTES_V4
+        } else {
+            PAGE_ENTRY_BYTES_V5
+        };
+        let count = input.count(MAX_ITEMS, entry_bytes)?;
         let mut entries = Vec::with_capacity(count);
         for _ in 0..count {
             let metadata = input.descriptor()?;
@@ -1151,10 +1208,17 @@ pub fn decode_with_budget(bytes: &[u8], budget: usize) -> Result<CheckpointImage
             let offset = input.u64()?;
             let length = usize::try_from(input.u64()?).map_err(|_| Error::CorruptRecord)?;
             let extent = Extent::new(offset, length)?;
+            // v4 named one size for the whole cut in the header. v5 names the
+            // size on every entry so caches can publish independently.
+            let entry_page_size = if version == CHECKPOINT_VERSION_V4 {
+                page_size
+            } else {
+                PageSize::from_wire(u64::from(input.u32()?)).map_err(|_| Error::CorruptRecord)?
+            };
             entries.push((
                 page,
                 IndexedPage {
-                    page_size,
+                    page_size: entry_page_size,
                     metadata,
                     key_id,
                     location: RecordLocation {
@@ -1255,7 +1319,12 @@ pub(super) fn recovery_memory(bytes: &[u8], budget: usize) -> Result<usize> {
     {
         return Err(Error::CorruptRecord);
     }
-    sequence_hint(bytes)?;
+    let version = checkpoint_version(bytes)?;
+    let (entry_bytes, field_bytes) = if version == CHECKPOINT_VERSION_V4 {
+        (PAGE_ENTRY_BYTES_V4, PAGE_FIELD_BYTES_V4)
+    } else {
+        (PAGE_ENTRY_BYTES_V5, PAGE_FIELD_BYTES_V5)
+    };
     let mut used = bytes.len();
     let mut charge = |count: usize, size: usize| -> Result<()> {
         used = count
@@ -1282,11 +1351,11 @@ pub(super) fn recovery_memory(bytes: &[u8], budget: usize) -> Result<usize> {
         }
         charge(segments, std::mem::size_of::<SegmentSnapshot>() + 512)?;
         input.take(segments * SEGMENT_BYTES)?;
-        let pages = input.count(MAX_ITEMS, PAGE_ENTRY_BYTES)?;
+        let pages = input.count(MAX_ITEMS, entry_bytes)?;
         charge(pages, std::mem::size_of::<(PageId, IndexedPage)>() + 512)?;
         for _ in 0..pages {
             charge(input.descriptor_bytes()?, 4)?;
-            input.take(PAGE_FIELD_BYTES)?;
+            input.take(field_bytes)?;
         }
         let metadata = input.count(MAX_ITEMS, DESCRIPTOR_BYTES)?;
         charge(metadata, std::mem::size_of::<VersionMetadata>() + 512)?;
@@ -1306,15 +1375,24 @@ pub(super) fn recovery_memory(bytes: &[u8], budget: usize) -> Result<usize> {
     Ok(used)
 }
 
+/// Version from the fixed header. Both supported versions are accepted so a
+/// node recognizes its own v5 slot after restart.
+fn checkpoint_version(bytes: &[u8]) -> Result<u32> {
+    if bytes.len() < HEADER_BYTES || &bytes[..8] != MAGIC {
+        return Err(Error::CorruptRecord);
+    }
+    let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+    if supported_version(version) {
+        Ok(version)
+    } else {
+        Err(Error::CorruptRecord)
+    }
+}
+
 /// Untrusted ordering hint only. Full length, digest and structure are checked
 /// after reading the selected slot, never used to authorize installation.
 pub(crate) fn sequence_hint(bytes: &[u8]) -> Result<u64> {
-    if bytes.len() < HEADER_BYTES
-        || &bytes[..8] != MAGIC
-        || u32::from_le_bytes(bytes[8..12].try_into().unwrap()) != CHECKPOINT_VERSION
-    {
-        return Err(Error::CorruptRecord);
-    }
+    checkpoint_version(bytes)?;
     Ok(u64::from_le_bytes(bytes[16..24].try_into().unwrap()))
 }
 
@@ -1337,47 +1415,58 @@ fn version_key(version: &ObjectVersion) -> (&str, &[u8; 32], &[u8]) {
         version.etag.as_bytes(),
     )
 }
-/// The one page size shared by every entry of `shards`; the default when
-/// there are no entries. Mixed sizes are a corrupt cut.
-pub fn shards_page_size(shards: &[ShardImage]) -> Result<racer_wire::object::PageSize> {
-    let mut sizes = shards
+/// v4 for a cut whose every entry uses the cluster default, including an empty
+/// cut, so new binaries keep writing v4 during a rolling upgrade. Any other cut
+/// needs v5's per-entry size.
+pub fn wire_version(shards: &[ShardImage], default_page_size: PageSize) -> u32 {
+    let default_only = shards
         .iter()
-        .flat_map(|shard| shard.index.entries.iter().map(|(_, entry)| entry.page_size));
-    let first = sizes.next().unwrap_or_default();
-    if sizes.all(|size| size == first) {
-        Ok(first)
+        .flat_map(|shard| shard.index.entries.iter())
+        .all(|(_, entry)| entry.page_size == default_page_size);
+    if default_only {
+        CHECKPOINT_VERSION_V4
     } else {
-        Err(Error::CorruptRecord)
+        CHECKPOINT_VERSION
     }
 }
 
 fn validate_image(image: &CheckpointImage) -> Result<()> {
-    if image.version != CHECKPOINT_VERSION
+    if !supported_version(image.version)
         || image.cluster.0.len() != CLUSTER_BYTES
         || !racer_crypto::identity::canonical_uuid(&image.cluster.0)
         || image.shards.is_empty()
         || image.shards.len() > MAX_SHARDS
-        || image.shards.iter().any(|shard| {
-            shard
-                .index
-                .entries
-                .iter()
-                .any(|(_, entry)| entry.page_size != image.page_size)
-        })
     {
         return Err(Error::CorruptRecord);
     }
     let mut workers = HashSet::default();
     let mut pages = HashSet::default();
     let mut lengths: HashMap<&ObjectVersion, &VersionMetadata> = HashMap::default();
+    let mut cache_sizes: HashMap<&str, PageSize> = HashMap::default();
     for shard in &image.shards {
         if !workers.insert(shard.worker) {
             return Err(Error::CorruptRecord);
         }
         shard.validate()?;
-        for (page, _) in &shard.index.entries {
+        for (page, entry) in &shard.index.entries {
             if !pages.insert(page) {
                 return Err(Error::CorruptRecord);
+            }
+            if image.version == CHECKPOINT_VERSION_V4 {
+                if entry.page_size != image.page_size {
+                    return Err(Error::CorruptRecord);
+                }
+            } else {
+                let cache = page.version.object.cache.0.as_str();
+                match cache_sizes.get(cache) {
+                    Some(size) if *size != entry.page_size => {
+                        return Err(Error::CorruptRecord);
+                    }
+                    Some(_) => {}
+                    None => {
+                        cache_sizes.insert(cache, entry.page_size);
+                    }
+                }
             }
         }
         for metadata in shard
@@ -1500,7 +1589,11 @@ impl Recovery {
     ) -> Operation<'_, Option<CheckpointImage>> {
         let result = read_candidates(env, &self.directory).map(|cuts| {
             cuts.into_iter().find_map(|(_, mut image)| {
-                Recovery::filter_available(&mut image, |_| true, &available);
+                Recovery::filter_available(
+                    &mut image,
+                    |_| true,
+                    |cache, key, _| available(cache, key),
+                );
                 let valid = image.shards.iter().all(|s| {
                     s.geometry.matches_alignment(alignment)
                         && self.geometry.get().is_none_or(|g| s.geometry == g)
@@ -1550,9 +1643,16 @@ mod budget_tests {
                 let mut encoder = Encoder(Vec::new());
                 encoder.descriptor(&metadata).unwrap();
                 assert_eq!(snapshot_metadata_bytes(&metadata), encoder.0.len());
-                assert_eq!(snapshot_entry_bytes(&metadata), encoder.0.len() + 56);
+                assert_eq!(
+                    snapshot_entry_bytes(&metadata),
+                    encoder.0.len() + PAGE_FIELD_BYTES_V5
+                );
                 assert_eq!(DESCRIPTOR_BYTES, 52);
-                assert_eq!(PAGE_ENTRY_BYTES, 108);
+                assert_eq!(PAGE_FIELD_BYTES_V4, 56);
+                assert_eq!(PAGE_ENTRY_BYTES_V4, 108);
+                assert_eq!(PAGE_FIELD_BYTES_V5, 60);
+                assert_eq!(PAGE_ENTRY_BYTES_V5, 112);
+                assert_eq!(PAGE_ENTRY_BYTES, 112);
             }
         }
     }
@@ -1742,7 +1842,10 @@ mod budget_tests {
                     }],
                 };
                 let encoded = encode(&image).unwrap();
-                assert_eq!(snapshot_image_bytes(&image.shards).unwrap(), encoded.len());
+                assert_eq!(
+                    snapshot_image_bytes(&image.shards, image.version).unwrap(),
+                    encoded.len()
+                );
                 let decoded = decode(&encoded).unwrap();
                 assert_eq!(decoded.shards[0].holds.len(), records);
                 assert_eq!(encode(&decoded).unwrap(), encoded);
@@ -1803,5 +1906,245 @@ mod budget_tests {
         assert!(checkpoint.frozen.borrow().is_some());
         checkpoint.finish_snapshot();
         assert!(segments.append(4096).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+
+    fn geometry() -> CheckpointGeometry {
+        CheckpointGeometry::new(8192, 4096, 2, Alignment::new(4096, 4096, 4096).unwrap()).unwrap()
+    }
+
+    /// One shard with one page entry per `(cache, size)` fixture.
+    fn shard(worker: u16, specs: &[(&str, PageSize)]) -> ShardImage {
+        let geometry = geometry();
+        let segments = Segments::new(geometry.segment_bytes);
+        segments
+            .configure(
+                geometry.slab_bytes,
+                geometry.segment_count as usize,
+                geometry.alignment().unwrap(),
+            )
+            .unwrap();
+        let mut entries = Vec::new();
+        let mut leases = Vec::new();
+        for (i, (cache, page_size)) in specs.iter().enumerate() {
+            let (lease, extent) = segments.append(4096).unwrap();
+            let metadata = VersionMetadata {
+                content_type: None,
+                version: ObjectVersion {
+                    object: ObjectId {
+                        cache: CacheId((*cache).into()),
+                        key: CacheKey([worker as u8 * 16 + i as u8 + 1; 32]),
+                    },
+                    etag: StrongEtag::test_value(&i.to_string()),
+                },
+                length: 3,
+            };
+            let page = PageId {
+                version: metadata.version.clone(),
+                number: PageNumber(0),
+            };
+            entries.push((
+                page,
+                IndexedPage {
+                    page_size: *page_size,
+                    metadata,
+                    key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
+                    location: RecordLocation {
+                        segment: lease.id(),
+                        generation: lease.generation(),
+                        extent,
+                    },
+                },
+            ));
+            leases.push(lease);
+        }
+        ShardImage {
+            worker: WorkerId(worker),
+            geometry,
+            index: IndexSnapshot {
+                entries,
+                metadata: Vec::new(),
+            },
+            segments: segments.snapshot(),
+            holds: Vec::new(),
+        }
+    }
+
+    fn image(shards: Vec<ShardImage>, version: Option<u32>) -> CheckpointImage {
+        let version = version.unwrap_or_else(|| wire_version(&shards, PageSize::DEFAULT));
+        CheckpointImage {
+            version,
+            page_size: PageSize::DEFAULT,
+            cluster: test_cluster(),
+            sequence: 1,
+            shards,
+        }
+    }
+
+    #[test]
+    fn v4_round_trip_stamps_the_header_page_size_on_every_entry() {
+        let size = PageSize::new(64 << 10).unwrap();
+        let mut image = image(
+            vec![shard(0, &[("cache-a", size), ("cache-b", size)])],
+            Some(4),
+        );
+        image.page_size = size;
+        let encoded = encode(&image).unwrap();
+        assert_eq!(&encoded[8..12], &CHECKPOINT_VERSION_V4.to_le_bytes());
+        let decoded = decode(&encoded).unwrap();
+        assert_eq!(decoded.version, CHECKPOINT_VERSION_V4);
+        assert_eq!(decoded.page_size, size);
+        assert!(
+            decoded.shards[0]
+                .index
+                .entries
+                .iter()
+                .all(|(_, entry)| entry.page_size == size)
+        );
+        assert_eq!(encode(&decoded).unwrap(), encoded);
+    }
+
+    #[test]
+    fn v5_round_trip_preserves_each_entrys_page_size() {
+        let large = PageSize::new(64 << 10).unwrap();
+        let image = image(
+            vec![shard(
+                0,
+                &[("cache-a", PageSize::DEFAULT), ("cache-b", large)],
+            )],
+            None,
+        );
+        assert_eq!(image.version, CHECKPOINT_VERSION);
+        let encoded = encode(&image).unwrap();
+        assert_eq!(&encoded[8..12], &CHECKPOINT_VERSION.to_le_bytes());
+        let decoded = decode(&encoded).unwrap();
+        assert_eq!(decoded.version, CHECKPOINT_VERSION);
+        let sizes: Vec<_> = decoded.shards[0]
+            .index
+            .entries
+            .iter()
+            .map(|(_, entry)| entry.page_size)
+            .collect();
+        assert_eq!(sizes, vec![PageSize::DEFAULT, large]);
+        assert_eq!(encode(&decoded).unwrap(), encoded);
+    }
+
+    #[test]
+    fn default_only_cuts_write_v4_and_mixed_cuts_write_v5() {
+        let default = image(vec![shard(0, &[("cache-a", PageSize::DEFAULT)])], None);
+        assert_eq!(default.version, CHECKPOINT_VERSION_V4);
+        assert_eq!(
+            wire_version(&default.shards, PageSize::DEFAULT),
+            CHECKPOINT_VERSION_V4
+        );
+        assert_eq!(
+            &encode(&default).unwrap()[8..12],
+            &CHECKPOINT_VERSION_V4.to_le_bytes()
+        );
+        let empty = image(vec![shard(0, &[])], None);
+        assert_eq!(
+            wire_version(&empty.shards, PageSize::DEFAULT),
+            CHECKPOINT_VERSION_V4
+        );
+        let large = PageSize::new(64 << 10).unwrap();
+        let mixed = image(
+            vec![shard(
+                0,
+                &[("cache-a", PageSize::DEFAULT), ("cache-b", large)],
+            )],
+            None,
+        );
+        assert_eq!(
+            wire_version(&mixed.shards, PageSize::DEFAULT),
+            CHECKPOINT_VERSION
+        );
+        assert_eq!(
+            &encode(&mixed).unwrap()[8..12],
+            &CHECKPOINT_VERSION.to_le_bytes()
+        );
+    }
+
+    #[test]
+    fn sequence_hint_accepts_v4_and_v5_and_rejects_other_versions() {
+        for (version, sequence) in [(CHECKPOINT_VERSION_V4, 11), (CHECKPOINT_VERSION, 12)] {
+            let image = image(
+                vec![shard(0, &[("cache-a", PageSize::DEFAULT)])],
+                Some(version),
+            );
+            let mut image = image;
+            image.sequence = sequence;
+            let encoded = encode(&image).unwrap();
+            assert_eq!(sequence_hint(&encoded), Ok(sequence));
+        }
+        let mut image = image(vec![shard(0, &[("cache-a", PageSize::DEFAULT)])], Some(5));
+        image.sequence = 13;
+        let mut encoded = encode(&image).unwrap();
+        encoded[8..12].copy_from_slice(&6u32.to_le_bytes());
+        assert_eq!(sequence_hint(&encoded), Err(Error::CorruptRecord));
+        assert!(decode(&encoded).is_err());
+    }
+
+    #[test]
+    fn validate_image_requires_one_size_per_cache_across_shards() {
+        let large = PageSize::new(64 << 10).unwrap();
+        let consistent = image(
+            vec![
+                shard(0, &[("cache-a", PageSize::DEFAULT)]),
+                shard(1, &[("cache-a", PageSize::DEFAULT)]),
+            ],
+            Some(CHECKPOINT_VERSION),
+        );
+        assert!(encode(&consistent).is_ok());
+        let mixed_shards = image(
+            vec![
+                shard(0, &[("cache-a", PageSize::DEFAULT)]),
+                shard(1, &[("cache-a", large)]),
+            ],
+            Some(CHECKPOINT_VERSION),
+        );
+        assert_eq!(encode(&mixed_shards), Err(Error::CorruptRecord));
+        let mixed_entries = image(
+            vec![shard(
+                0,
+                &[("cache-a", PageSize::DEFAULT), ("cache-a", large)],
+            )],
+            Some(CHECKPOINT_VERSION),
+        );
+        assert_eq!(encode(&mixed_entries), Err(Error::CorruptRecord));
+        // v4 has one size for the whole image, so a differently sized entry is
+        // corrupt even when it is the only entry.
+        let v4_mismatch = image(vec![shard(0, &[("cache-a", large)])], Some(4));
+        assert_eq!(encode(&v4_mismatch), Err(Error::CorruptRecord));
+    }
+
+    #[test]
+    fn image_charge_matches_each_versions_encoded_width() {
+        let shards = vec![shard(
+            0,
+            &[
+                ("cache-a", PageSize::DEFAULT),
+                ("cache-b", PageSize::DEFAULT),
+            ],
+        )];
+        let v4 = image(shards, Some(CHECKPOINT_VERSION_V4));
+        let encoded = encode(&v4).unwrap();
+        assert_eq!(
+            snapshot_image_bytes(&v4.shards, CHECKPOINT_VERSION_V4).unwrap(),
+            encoded.len()
+        );
+        let v5 = image(v4.shards, Some(CHECKPOINT_VERSION));
+        let encoded = encode(&v5).unwrap();
+        assert_eq!(
+            snapshot_image_bytes(&v5.shards, CHECKPOINT_VERSION).unwrap(),
+            encoded.len()
+        );
+        assert_eq!(
+            snapshot_image_bytes(&v5.shards, CHECKPOINT_VERSION).unwrap(),
+            snapshot_image_bytes(&v5.shards, CHECKPOINT_VERSION_V4).unwrap() + 2 * 4
+        );
     }
 }

@@ -19,7 +19,7 @@ KEY_B = "b" * 64
 
 @pytest.fixture
 def client(server):
-    return racer.Client(socket_path=server.path, timeout=5)
+    return racer.Client(socket_path=server.path, timeout=5, page_size=server.page_size)
 
 
 def last(server):

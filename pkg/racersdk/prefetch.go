@@ -90,7 +90,7 @@ const (
 )
 
 // PrefetchBytes is a ticket's byte accounting. Every value except
-// LogicalRequested is a multiple of [PageSize].
+// LogicalRequested is a multiple of the cache's page size.
 type PrefetchBytes struct {
 	LogicalRequested  int64
 	AlignedRequested  int64

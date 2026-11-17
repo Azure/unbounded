@@ -43,6 +43,7 @@ Usage: `racer-object sidecar [flags]`.
 |------|---------|---------|
 | `--cache` | none, required | Racer ClusterCache name. Must match the socket mount path. |
 | `--api` | `s3` | Client-facing API: `s3` or `azure`. |
+| `--page-size` | `16MiB` | Logical page size of the cache: a power of two from 4KiB to 16MiB, as bytes or a ClusterCache label such as `4KiB`. Must match the cache. The injector sets it. `RACER_OBJECT_PAGE_SIZE` is the environment fallback. |
 | `--listen` | `127.0.0.1:8080` | Loopback IP literal and port. Non-loopback addresses are rejected. |
 | `--request-timeout` | `5m` | Request timeout. |
 | `--max-connections` | `128` | Client connections accepted at once, and concurrent reads from Racer, across all workers. 1 to 65536. |
@@ -53,6 +54,12 @@ Usage: `racer-object sidecar [flags]`.
 To profile the sidecar, use
 `perf` or another sampling profiler on the node. The binary is built with frame
 pointers, so `perf record -g -p <pid>` gives usable call stacks.
+
+The sidecar must use the same page size as the cache. Racer does not report its
+page size, so the sidecar cannot discover it. Automatic injection sets
+`--page-size` from the cache's effective page size when it is available. In a
+manual pod spec, set it yourself. A mismatch affects subscriptions that span a
+page boundary.
 
 Earlier releases also had an `origin` command. The Racer dataplane now reads
 Azure Blob itself, so it was removed. racer-object no longer reads S3 or any
@@ -160,7 +167,7 @@ The webhook makes these changes to the pod:
 - Adds an init container named `racer-object` with `restartPolicy: Always`, placed
   first. It uses the `racer-object` image of the same release as
   `racer`, and the args
-  `sidecar --cache=...` plus `--api` and `--listen`
+  `sidecar --cache=...` plus `--api`, `--listen`, and `--page-size`
   when set.
 - Sets the security context described below, with `RuntimeDefault` seccomp.
 - Adds the volume `racer-object-client`: hostPath `/run/racer/<cache>/client`,
@@ -208,7 +215,7 @@ Requirements:
   `runAsNonRoot: true`, no privilege escalation, all capabilities dropped,
   `RuntimeDefault` seccomp, and a read-only root filesystem. The
   application containers can run as any user.
-- **Arguments.** Set `--cache` to the ClusterCache name. Add `--api=azure` if the application uses the Azure Blob API.
+- **Arguments.** Set `--cache` to the ClusterCache name. Add `--api=azure` if the application uses the Azure Blob API. Set `--page-size` to the cache's logical page size; the default is `16MiB`.
 - **No credentials.** Do not give the sidecar or the application upstream
   credentials.
 - **No probes or Services.** Do not add an HTTP readiness probe or expose the

@@ -978,6 +978,7 @@ fn definition() -> CacheDefinition {
         priority: racer_wire::control::DEFAULT_PRIORITY,
         mode: racer_wire::control::CacheMode::Cached,
         origin: None,
+        page_size: None,
     }
 }
 fn scope() -> RequestScope {
@@ -3002,6 +3003,7 @@ fn priority_only_changes_reuse_listeners_beyond_retirement_bound() {
                 priority: racer_wire::control::DEFAULT_PRIORITY,
                 mode: racer_wire::control::CacheMode::Cached,
                 origin: None,
+                page_size: None,
             }
         })
         .collect();
@@ -3045,6 +3047,9 @@ fn listener_reuse_ignores_only_priority() {
     let current = definition();
     let mut next = definition();
     next.priority = 0;
+    assert!(same_endpoint(&current, &next));
+    // Page size changes only the logical geometry, not the bound endpoint.
+    next.page_size = Some(racer_wire::object::PageSize::new(64 << 10).unwrap());
     assert!(same_endpoint(&current, &next));
     for mode in [
         racer_wire::control::CacheMode::PassthroughPeers,

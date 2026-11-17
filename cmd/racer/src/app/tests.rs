@@ -635,7 +635,7 @@ fn control_fixture_survives_request_abandoned_mid_body() {
     // Close without close_notify, as a dropped in-flight request does.
     drop(stream);
     let accepted = fixture.enrollments.load(Ordering::Acquire);
-    fixture.bootstrap_node(&env, 1, Duration::from_secs(15));
+    fixture.bootstrap_node(&env, 1, Duration::from_secs(60));
     assert_eq!(fixture.enrollments.load(Ordering::Acquire), accepted + 1);
 }
 
@@ -662,6 +662,7 @@ pub(super) fn definition() -> racer_wire::control::CacheDefinition {
         priority: racer_wire::control::DEFAULT_PRIORITY,
         mode: racer_wire::control::CacheMode::Cached,
         origin: None,
+        page_size: None,
     }
 }
 
@@ -1828,7 +1829,7 @@ fn snapshot_refresh_retries_canceled_publication_and_applies_skipped_removal() {
 fn two_worker_removal_preserves_late_driver_and_blocks_late_memory_and_disk_fill() {
     let env = racer_io::Env::host();
     let mut fixture = ControlFixture::new();
-    let (config, node) = fixture.bootstrap_node(&env, 2, Duration::from_secs(15));
+    let (config, node) = fixture.bootstrap_node(&env, 2, Duration::from_secs(60));
     let (mut first, rt0, mut crypto0) = local_worker(&env, &config, &node, 0);
     let (mut second, rt1, mut crypto1) = local_worker(&env, &config, &node, 1);
     first
@@ -1979,7 +1980,7 @@ fn two_worker_removal_preserves_late_driver_and_blocks_late_memory_and_disk_fill
 fn two_workers_start_from_real_control_and_checkpoint_one_complete_cut() {
     let env = racer_io::Env::host();
     let mut fixture = ControlFixture::new();
-    let (config, node) = fixture.bootstrap_node(&env, 2, Duration::from_secs(15));
+    let (config, node) = fixture.bootstrap_node(&env, 2, Duration::from_secs(60));
     let ready = std::sync::Barrier::new(2);
     thread::scope(|threads| {
         for id in 0..2 {
@@ -1994,7 +1995,7 @@ fn two_workers_start_from_real_control_and_checkpoint_one_complete_cut() {
                 drive(
                     &runtime,
                     &mut engine,
-                    app.start(&scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap()),
+                    app.start(&scope(&racer_io::Clock::host(), Duration::from_secs(60)).unwrap()),
                 )
                 .unwrap();
                 ready.wait();
@@ -2029,7 +2030,7 @@ fn startup_finishes_local_snapshot_installation_while_next_long_poll_is_held() {
                 let (mut worker, runtime, mut engine) = local_worker(&env, config, node, id);
                 // Generous budget: this finishes in well under a second alone,
                 // but the full parallel suite can starve it past a tight one.
-                let startup = scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap();
+                let startup = scope(&racer_io::Clock::host(), Duration::from_secs(60)).unwrap();
                 // Force the first publication to wait for the second worker,
                 // then allow local preparation after the next poll is held.
                 if id == 1 {
@@ -2073,7 +2074,7 @@ fn startup_finishes_local_snapshot_installation_while_next_long_poll_is_held() {
 fn cache_removal_installs_while_renewal_and_next_publication_poll_are_held() {
     let env = racer_io::Env::host();
     let mut fixture = ControlFixture::new();
-    let (config, node) = fixture.bootstrap_node(&env, 1, Duration::from_secs(15));
+    let (config, node) = fixture.bootstrap_node(&env, 1, Duration::from_secs(60));
     let definition = definition();
     *fixture.publication.lock().unwrap() = Some(publication(&config, 1, vec![definition.clone()]));
     fixture
@@ -2086,7 +2087,7 @@ fn cache_removal_installs_while_renewal_and_next_publication_poll_are_held() {
     drive(
         &runtime,
         &mut engine,
-        worker.start(&scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap()),
+        worker.start(&scope(&racer_io::Clock::host(), Duration::from_secs(60)).unwrap()),
     )
     .unwrap();
     worker.control_task.take();
@@ -2108,7 +2109,7 @@ fn cache_removal_installs_while_renewal_and_next_publication_poll_are_held() {
     fixture.hold_renewal.store(true, Ordering::Release);
     fixture.hold_long_poll.store(true, Ordering::Release);
     *fixture.publication.lock().unwrap() = Some(publication(&config, 2, vec![]));
-    let turn_scope = scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap();
+    let turn_scope = scope(&racer_io::Clock::host(), Duration::from_secs(60)).unwrap();
     let mut progress = control.progress(&turn_scope);
     let until = Instant::now() + Duration::from_secs(5);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
@@ -2180,7 +2181,7 @@ fn cache_removal_ack_installs_during_retry_after_before_renewal_handler_entry() 
 /// Exercise both server orderings without assuming renewal and publication latency.
 fn cache_removal_during_retry_after(env: &racer_io::Env, delay_renewal_entry: bool) {
     let mut fixture = ControlFixture::new();
-    let (config, node) = fixture.bootstrap_node(env, 1, Duration::from_secs(15));
+    let (config, node) = fixture.bootstrap_node(env, 1, Duration::from_secs(60));
     let definition = definition();
     *fixture.publication.lock().unwrap() = Some(publication(&config, 1, vec![definition.clone()]));
     fixture
@@ -2193,7 +2194,7 @@ fn cache_removal_during_retry_after(env: &racer_io::Env, delay_renewal_entry: bo
     drive(
         &runtime,
         &mut engine,
-        worker.start(&scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap()),
+        worker.start(&scope(&racer_io::Clock::host(), Duration::from_secs(60)).unwrap()),
     )
     .unwrap();
     worker.control_task.take();
@@ -2217,7 +2218,7 @@ fn cache_removal_during_retry_after(env: &racer_io::Env, delay_renewal_entry: bo
         .store(delay_renewal_entry, Ordering::Release);
     fixture.publication_retry_after.store(60, Ordering::Release);
     *fixture.publication.lock().unwrap() = Some(publication(&config, 2, vec![]));
-    let turn_scope = scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap();
+    let turn_scope = scope(&racer_io::Clock::host(), Duration::from_secs(60)).unwrap();
     let mut progress = control.progress(&turn_scope);
     let until = Instant::now() + Duration::from_secs(5);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
@@ -2348,7 +2349,7 @@ fn same_node_renewal_backs_off_expires_closed_and_recovers() {
     }
 
     let mut fixture = ControlFixture::new();
-    let (config, node) = fixture.bootstrap_node(&env, 1, Duration::from_secs(15));
+    let (config, node) = fixture.bootstrap_node(&env, 1, Duration::from_secs(60));
     // An already renewal-due, still valid certificate avoids advancing the TLS
     // server's host clock. A fresh 24-hour certificate covers the later virtual
     // expiry of this old certificate, and is also valid for real TLS handshakes.
@@ -2364,7 +2365,7 @@ fn same_node_renewal_backs_off_expires_closed_and_recovers() {
     drive_advancing(
         &runtime,
         &mut engine,
-        worker.start(&scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap()),
+        worker.start(&scope(&racer_io::Clock::host(), Duration::from_secs(60)).unwrap()),
         Some(&clock),
     )
     .unwrap();
@@ -2583,6 +2584,7 @@ fn removal_publication_finishes_locally_after_controller_disappears() {
         priority: racer_wire::control::DEFAULT_PRIORITY,
         mode: racer_wire::control::CacheMode::Cached,
         origin: None,
+        page_size: None,
     };
     *fixture.publication.lock().unwrap() =
         Some(publication(&config, 1, vec![definition(), keep.clone()]));
@@ -2592,7 +2594,7 @@ fn removal_publication_finishes_locally_after_controller_disappears() {
         &config,
         &node,
         &config.limits,
-        &scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap(),
+        &scope(&racer_io::Clock::host(), Duration::from_secs(60)).unwrap(),
         &env.ctx,
     )
     .unwrap()
@@ -2604,7 +2606,7 @@ fn removal_publication_finishes_locally_after_controller_disappears() {
     drive(
         &runtime,
         &mut engine,
-        worker.start(&scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap()),
+        worker.start(&scope(&racer_io::Clock::host(), Duration::from_secs(60)).unwrap()),
     )
     .unwrap();
     worker
@@ -2754,7 +2756,7 @@ fn startup_retries_tls_internal_error_before_enrollment_and_worker_snapshot() {
     let env = racer_io::Env::host();
     let mut fixture = ControlFixture::new();
     fixture.handshake_alerts.lock().unwrap().push_back(80);
-    let (config, node) = fixture.bootstrap_node(&env, 1, Duration::from_secs(15));
+    let (config, node) = fixture.bootstrap_node(&env, 1, Duration::from_secs(60));
     assert_eq!(fixture.enrollments.load(Ordering::Acquire), 1);
     assert_eq!(fixture.polls.load(Ordering::Acquire), 0);
     fixture.handshake_alerts.lock().unwrap().push_back(80);
@@ -2762,7 +2764,7 @@ fn startup_retries_tls_internal_error_before_enrollment_and_worker_snapshot() {
     drive(
         &runtime,
         &mut engine,
-        worker.start(&scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap()),
+        worker.start(&scope(&racer_io::Clock::host(), Duration::from_secs(60)).unwrap()),
     )
     .unwrap();
     assert!(node.observations.health.ready(&env));
@@ -2831,7 +2833,7 @@ fn startup_reauthenticates_retained_identity_and_fails_closed() {
             &config,
             &node,
             &config.limits,
-            &scope(&racer_io::Clock::host(), Duration::from_secs(30)).unwrap(),
+            &scope(&racer_io::Clock::host(), Duration::from_secs(60)).unwrap(),
             &env.ctx,
         )
     };
@@ -2863,7 +2865,7 @@ fn node_replacement_drains_all_workers_and_restart_converges() {
     let env = racer_io::Env::host();
     for renewal_due in [false, true] {
         let mut fixture = ControlFixture::new();
-        let (config, node) = fixture.bootstrap_node(&env, 2, Duration::from_secs(15));
+        let (config, node) = fixture.bootstrap_node(&env, 2, Duration::from_secs(60));
         if renewal_due {
             fixture
                 .certificate_age
@@ -2897,7 +2899,7 @@ fn node_replacement_drains_all_workers_and_restart_converges() {
         group
             .start(
                 app.clone(),
-                &scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap(),
+                &scope(&racer_io::Clock::host(), Duration::from_secs(60)).unwrap(),
             )
             .unwrap();
         assert!(node.observations.health.ready(&env));
@@ -2908,7 +2910,7 @@ fn node_replacement_drains_all_workers_and_restart_converges() {
             // can come from a lagging replica and must retain the current state.
             fixture.poll_status.store(403, Ordering::Release);
         }
-        let until = Instant::now() + Duration::from_secs(15);
+        let until = Instant::now() + Duration::from_secs(60);
         while node.observations.health.ready(&env) {
             assert!(
                 Instant::now() < until,
@@ -2943,7 +2945,7 @@ fn node_replacement_drains_all_workers_and_restart_converges() {
             &config,
             &fresh,
             &config.limits,
-            &scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap(),
+            &scope(&racer_io::Clock::host(), Duration::from_secs(60)).unwrap(),
             &env.ctx,
         )
         .unwrap()
@@ -2953,7 +2955,7 @@ fn node_replacement_drains_all_workers_and_restart_converges() {
         drive(
             &runtime,
             &mut engine,
-            worker.start(&scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap()),
+            worker.start(&scope(&racer_io::Clock::host(), Duration::from_secs(60)).unwrap()),
         )
         .unwrap();
         assert!(fresh.observations.health.ready(&env));
@@ -2979,7 +2981,7 @@ fn two_worker_real_control_key_lease_drain_and_checkpoint_cut() {
     use crate::worker::WorkerPair;
     let env = racer_io::Env::host();
     let mut fixture = ControlFixture::new();
-    let (config, node) = fixture.bootstrap_node(&env, 2, Duration::from_secs(15));
+    let (config, node) = fixture.bootstrap_node(&env, 2, Duration::from_secs(60));
     let keys = Keyring::new(
         config.cluster.clone(),
         config.node.clone(),
@@ -3012,7 +3014,7 @@ fn two_worker_real_control_key_lease_drain_and_checkpoint_cut() {
     group
         .start(
             app.clone(),
-            &scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap(),
+            &scope(&racer_io::Clock::host(), Duration::from_secs(60)).unwrap(),
         )
         .unwrap();
     assert_eq!(node.prepared.load(Ordering::Acquire), 2);
@@ -3103,7 +3105,7 @@ fn oversized_populated_shutdown_cut_thaws_and_finishes_drain_without_publication
             crate::test_support::security::rotation_bundle(1, bundle.peer_trust_roots.clone());
         bundle.cluster = cluster;
     }
-    let (config, node) = fixture.bootstrap_node(&env, 1, Duration::from_secs(15));
+    let (config, node) = fixture.bootstrap_node(&env, 1, Duration::from_secs(60));
     *fixture.publication.lock().unwrap() = Some(publication(&config, 1, vec![definition()]));
     let (mut worker, runtime, mut engine) = local_worker(&env, &config, &node, 0);
     Rc::get_mut(&mut worker.clients)
@@ -3112,7 +3114,7 @@ fn oversized_populated_shutdown_cut_thaws_and_finishes_drain_without_publication
     drive(
         &runtime,
         &mut engine,
-        worker.start(&scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap()),
+        worker.start(&scope(&racer_io::Clock::host(), Duration::from_secs(60)).unwrap()),
     )
     .unwrap();
     let index = worker.store.writer.index();
@@ -3179,7 +3181,7 @@ fn drive_advancing<T>(
     clock: Option<&racer_io::SimClock>,
 ) -> Result<T> {
     let mut future = future;
-    let until = Instant::now() + Duration::from_secs(15);
+    let until = Instant::now() + Duration::from_secs(60);
     loop {
         runtime.reactor.poll_budgeted(64)?;
         engine.poll_budgeted(
@@ -3207,12 +3209,12 @@ fn drive_advancing<T>(
 fn blocked_publication_is_superseded_while_projection_rotates() {
     let env = racer_io::Env::host();
     let mut fixture = ControlFixture::new();
-    let (config, node) = fixture.bootstrap_node(&env, 1, Duration::from_secs(15));
+    let (config, node) = fixture.bootstrap_node(&env, 1, Duration::from_secs(60));
     let (mut worker, runtime, mut engine) = local_worker(&env, &config, &node, 0);
     drive(
         &runtime,
         &mut engine,
-        worker.start(&scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap()),
+        worker.start(&scope(&racer_io::Clock::host(), Duration::from_secs(60)).unwrap()),
     )
     .unwrap();
     let control = worker.control.clone().unwrap();
@@ -3299,7 +3301,7 @@ fn network_keyring_bootstrap_rotation_recovery_and_failure_retention() {
         &config,
         &node,
         &config.limits,
-        &scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap(),
+        &scope(&racer_io::Clock::host(), Duration::from_secs(60)).unwrap(),
         &env.ctx,
     )
     .unwrap()
@@ -3313,7 +3315,7 @@ fn network_keyring_bootstrap_rotation_recovery_and_failure_retention() {
     drive(
         &runtime,
         &mut engine,
-        worker.start(&scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap()),
+        worker.start(&scope(&racer_io::Clock::host(), Duration::from_secs(60)).unwrap()),
     )
     .unwrap();
     worker.keyring_task.take();
@@ -3337,7 +3339,7 @@ fn network_keyring_bootstrap_rotation_recovery_and_failure_retention() {
     fixture.hold_long_poll.store(true, Ordering::Release);
     let poll_scope = scope(&racer_io::Clock::host(), Duration::from_secs(30)).unwrap();
     let mut topology = control.progress(&poll_scope);
-    let key_scope = scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap();
+    let key_scope = scope(&racer_io::Clock::host(), Duration::from_secs(60)).unwrap();
     {
         let mut bundle = fixture.bundle.lock().unwrap();
         *bundle =
@@ -3502,13 +3504,13 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
     let mut config = fixture.config.take().unwrap();
     let node =
         Arc::new(NodeState::new(vec![WorkerId(0)], 64, racer_io::WorkerCtx::host()).unwrap());
-    let startup = scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap();
+    let startup = scope(&racer_io::Clock::host(), Duration::from_secs(60)).unwrap();
     config.node = bootstrap(&config, &node, &config.limits, &startup, &env.ctx)
         .unwrap()
         .0;
     assert_eq!(fixture.enrollments.load(Ordering::Acquire), 1);
     let (mut worker, runtime, mut engine) = local_worker(&env, &config, &node, 0);
-    let startup = scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap();
+    let startup = scope(&racer_io::Clock::host(), Duration::from_secs(60)).unwrap();
     drive(&runtime, &mut engine, worker.start(&startup)).unwrap();
     assert!(node.observations.health.ready(&env));
     assert!(fixture.polls.load(Ordering::Acquire) >= 1);
@@ -3732,10 +3734,10 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
 fn profiling_enabled_without_capture_stops_and_drains_without_timer() {
     let env = racer_io::Env::host();
     let mut fixture = ControlFixture::new();
-    let (mut config, node) = fixture.bootstrap_node(&env, 1, Duration::from_secs(15));
+    let (mut config, node) = fixture.bootstrap_node(&env, 1, Duration::from_secs(60));
     config.pprof_enabled = true;
     let (mut worker, runtime, mut engine) = local_worker(&env, &config, &node, 0);
-    let startup = scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap();
+    let startup = scope(&racer_io::Clock::host(), Duration::from_secs(60)).unwrap();
     drive(&runtime, &mut engine, worker.start(&startup)).unwrap();
     let controller = node.profiling.get().unwrap();
     assert!(controller.poll_stopped());

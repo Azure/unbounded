@@ -1067,7 +1067,7 @@ pub(crate) async fn cache_lookups(
     names: Vec<String>,
     at: Instant,
 ) -> std::collections::BTreeMap<String, crate::webhook::CacheLookup> {
-    use crate::webhook::CacheLookup;
+    use crate::webhook::{Cache, CacheLookup};
     futures::future::join_all(names.into_iter().map(|name| async move {
         let path = format!(
             "{}/{}",
@@ -1075,10 +1075,21 @@ pub(crate) async fn cache_lookups(
             crate::kube::escape(&name)
         );
         let found = match rt::deadline(at, api.get(&path)).await {
-            Ok(Ok(cache)) => match cache.get("spec").and_then(|s| s.get("nodeSelector")) {
-                None | Some(serde_json::Value::Null) => CacheLookup::Found(None),
-                Some(sel) => CacheLookup::Found(Some(sel.clone())),
-            },
+            Ok(Ok(cache)) => {
+                // An absent or null field means unset. The webhook validates
+                // the shapes, so this mapping never panics on a bad value.
+                let field = |key: &str| {
+                    cache
+                        .get("spec")
+                        .and_then(|s| s.get(key))
+                        .filter(|v| !v.is_null())
+                        .cloned()
+                };
+                CacheLookup::Found(Cache {
+                    node_selector: field("nodeSelector"),
+                    page_size: field("pageSize"),
+                })
+            }
             Ok(Err(crate::kube::KubeError::NotFound)) => CacheLookup::NotFound,
             _ => CacheLookup::Unavailable,
         };
@@ -1440,13 +1451,16 @@ mod tests {
 
     #[test]
     fn cache_lookups_map_api_results() {
-        use crate::webhook::CacheLookup;
+        use crate::webhook::{Cache, CacheLookup};
         fake::run(|api, kube| async move {
             let path = |n: &str| format!("{}/{n}", crate::kube::paths::CACHES);
             let sel = serde_json::json!({"matchLabels": {"pool": "gpu"}});
             api.put_object(
                 &path("pooled"),
-                serde_json::json!({"metadata": {"name": "pooled"}, "spec": {"nodeSelector": sel}}),
+                serde_json::json!({
+                    "metadata": {"name": "pooled"},
+                    "spec": {"nodeSelector": sel, "pageSize": "1MiB"},
+                }),
             );
             api.put_object(
                 &path("plain"),
@@ -1459,8 +1473,14 @@ mod tests {
                 crate::rt::now() + Duration::from_secs(2),
             )
             .await;
-            assert_eq!(got["pooled"], CacheLookup::Found(Some(sel)));
-            assert_eq!(got["plain"], CacheLookup::Found(None));
+            assert_eq!(
+                got["pooled"],
+                CacheLookup::Found(Cache {
+                    node_selector: Some(sel),
+                    page_size: Some(serde_json::json!("1MiB")),
+                })
+            );
+            assert_eq!(got["plain"], CacheLookup::Found(Cache::default()));
             assert_eq!(got["absent"], CacheLookup::NotFound);
 
             // An API error is not proof of absence: retryable.
@@ -1491,7 +1511,7 @@ mod tests {
     /// at once, so three slow GETs cost one round trip, not three.
     #[test]
     fn review_lookups_run_concurrently_under_one_deadline() {
-        use crate::webhook::{CacheLookup, NodeLookup};
+        use crate::webhook::{Cache, CacheLookup, NodeLookup};
         fake::run(|api, kube| async move {
             let sel = serde_json::json!({"matchLabels": {"pool": "gpu"}});
             for n in ["a", "b"] {
@@ -1537,8 +1557,14 @@ mod tests {
             let (caches, node) =
                 review_lookups(&kube, &review, started + Duration::from_millis(700)).await;
             assert!(started.elapsed() < Duration::from_millis(700));
-            assert_eq!(caches["a"], CacheLookup::Found(Some(sel.clone())));
-            assert_eq!(caches["b"], CacheLookup::Found(Some(sel.clone())));
+            assert_eq!(
+                caches["a"],
+                CacheLookup::Found(Cache {
+                    node_selector: Some(sel.clone()),
+                    page_size: None,
+                })
+            );
+            assert_eq!(caches["b"], caches["a"]);
             let gpu = [("pool".to_owned(), "gpu".to_owned())].into();
             assert_eq!(node, Some((NodeLookup::Found(gpu), "n1".to_owned())));
 

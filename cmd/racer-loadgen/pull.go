@@ -45,6 +45,7 @@ type pullOptions struct {
 	Verify            bool
 	DiagnoseIntegrity bool
 	PageCredits       int
+	PageSize          int
 	RangeBytes        int64
 	RangeParallel     int
 	RangeRetries      int
@@ -107,6 +108,10 @@ func newPuller(img *syntheticImage, opts pullOptions, metrics *loadMetrics) (*pu
 
 	if opts.Concurrency < 0 || opts.BlobConcurrency < 1 || opts.Timeout <= 0 || opts.RetryDelay <= 0 || opts.Interval < 0 {
 		return nil, errors.New("concurrency and interval must be nonnegative; blob concurrency, timeout, and retry delay must be positive")
+	}
+
+	if err := validatePageSize(opts.PageSize); err != nil {
+		return nil, err
 	}
 
 	capacity := opts.Concurrency

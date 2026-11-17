@@ -17,6 +17,7 @@ MAX_HEAD_BYTES = 32 * 1024
 MAX_FIELD_BYTES = 8192
 OBJECT_PREFIX = "/v1/objects/"
 PAGE_SIZE = 16 * 1024 * 1024
+MIN_PAGE_SIZE = 4 * 1024
 FRAME_SIZE = 21
 CREDIT_SIZE = 12
 PAGE_FRAME = 1
@@ -29,6 +30,19 @@ BYTE_CREDITS = PAGE_CREDITS * PAGE_SIZE
 
 _FRAME = struct.Struct(">BQQI")
 _CREDIT = struct.Struct(">QI")
+
+
+def validate_page_size(page_size: int) -> int:
+    """Check a cache page size: a power of two from 4 KiB through 16 MiB."""
+    if (
+        not isinstance(page_size, int)
+        or isinstance(page_size, bool)
+        or page_size < MIN_PAGE_SIZE
+        or page_size > PAGE_SIZE
+        or page_size & (page_size - 1)
+    ):
+        raise RacerError("page_size must be a power of two from 4 KiB to 16 MiB")
+    return page_size
 
 
 @dataclass(frozen=True)
@@ -57,23 +71,26 @@ def decode_credit(raw: bytes) -> tuple[int, int]:
     return _CREDIT.unpack(raw)
 
 
-def page_count(first: int, end: int) -> int:
+def page_count(first: int, end: int, page_size: int = PAGE_SIZE) -> int:
     if end <= first:
         return 0
-    return (end - 1) // PAGE_SIZE - first // PAGE_SIZE + 1
+    return (end - 1) // page_size - first // page_size + 1
 
 
 class Sequence:
     """Validates page and completion frames like wire.Sequence.Accept.
 
-    Pages must arrive strictly in page order, so tracking the count of
-    delivered pages is enough to reject duplicates.
+    page_size is the cache's configured logical page size, which a client
+    must know ahead of time: responses do not carry it. Pages must arrive
+    strictly in page order, so tracking the count of delivered pages is
+    enough to reject duplicates.
     """
 
-    def __init__(self, first: int, end: int) -> None:
+    def __init__(self, first: int, end: int, page_size: int = PAGE_SIZE) -> None:
         self.first = first
         self.end = end
-        self.pages = page_count(first, end)
+        self.page_size = page_size
+        self.pages = page_count(first, end, page_size)
         self.delivered = 0
         self.bytes = 0
         self.complete = False
@@ -97,15 +114,15 @@ class Sequence:
             or f.length == 0
             or f.offset < self.first
             or f.offset >= self.end
-            or f.number != f.offset // PAGE_SIZE
+            or f.number != f.offset // self.page_size
         ):
             raise ProtocolError("invalid page frame")
-        start = max(self.first, f.number * PAGE_SIZE)
-        end = min(self.end, (f.number + 1) * PAGE_SIZE)
+        start = max(self.first, f.number * self.page_size)
+        end = min(self.end, (f.number + 1) * self.page_size)
         if (
             f.offset != start
             or f.length != end - start
-            or f.number != self.first // PAGE_SIZE + self.delivered
+            or f.number != self.first // self.page_size + self.delivered
         ):
             raise ProtocolError("page frame out of order")
         self.delivered += 1

@@ -48,8 +48,9 @@ class FakeRacer:
     called as gpu_write(fd, dest_offset, bytes) to emulate the GPU write.
     """
 
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, page_size: int = wire.PAGE_SIZE) -> None:
         self.path = path
+        self.page_size = page_size
         self.objects: dict[str, Obj] = {}
         self.old = False
         self.gpu_status = 501
@@ -58,7 +59,7 @@ class FakeRacer:
         self.bad_frame = False
         self.truncate = False
         self.seen: list[Seen] = []
-        self.prefetches = FakePrefetches()
+        self.prefetches = FakePrefetches(page_size=self.page_size)
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.sock.bind(path)
         self.sock.listen(16)
@@ -238,7 +239,7 @@ class FakeRacer:
             if first >= size and size > 0 or first > size:
                 self._error(conn, 416, size)
                 return
-        pages = wire.page_count(first, end)
+        pages = wire.page_count(first, end, self.page_size)
         sel = meta + [
             ("Content-Type", "application/octet-stream"),
             ("Racer-Object-Length", str(size)),
@@ -298,14 +299,13 @@ class FakeRacer:
         seen.credits.append(wire.decode_credit(buf[: wire.CREDIT_SIZE]))
         return buf[wire.CREDIT_SIZE :]
 
-    @staticmethod
-    def _page_frames(first, end):
+    def _page_frames(self, first, end):
         if end <= first:
             return
-        n = first // wire.PAGE_SIZE
+        n = first // self.page_size
         o = first
         while o < end:
-            e = min(end, (n + 1) * wire.PAGE_SIZE)
+            e = min(end, (n + 1) * self.page_size)
             yield wire.Frame(wire.PAGE_FRAME, n, o, e - o)
             n += 1
             o = e

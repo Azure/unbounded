@@ -1150,17 +1150,21 @@ fn hedge_suppresses_without_independent_route_credits_or_local_memory() {
         // racer-core finds five attempts and nine links too few to hedge
         // (`walk::tests::hedge_rules`).
         let eligible = reason != "credits";
-        let result = futures::executor::block_on(f.fill.dependencies.candidates.hedge_page(
-            &candidates,
-            (0, 1, eligible),
-            &f.context,
-            &operation,
-            &f.scope,
-            &mut budget,
-            admission,
-            f.fill.page_plaintext_bytes().unwrap(),
-            |_, _| Box::pin(async { panic!("suppressed hedge validation") }),
-        ));
+        let result = futures::executor::block_on(
+            f.fill.dependencies.candidates.hedge_page(
+                &candidates,
+                (0, 1, eligible),
+                &f.context,
+                &operation,
+                &f.scope,
+                &mut budget,
+                admission,
+                f.fill
+                    .page_plaintext_bytes(&f.context.object.cache)
+                    .unwrap(),
+                |_, _| Box::pin(async { panic!("suppressed hedge validation") }),
+            ),
+        );
         assert!(matches!(
             result,
             Ok((None, racer_core::read::walk::HedgeEnd::NotStarted))
@@ -2115,32 +2119,36 @@ fn hedge_loser_child_cancels_accepted_crypto_but_waits_for_completion_fence() {
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 10, 18);
     let scopes = RefCell::new(Vec::<RequestScope>::new());
     let primary_canceled = Cell::new(false);
-    let mut pair = Box::pin(f.fill.dependencies.candidates.hedge_page(
-        &candidates,
-        (0, 1, true),
-        &f.context,
-        &operation,
-        &f.scope,
-        &mut budget,
-        &f.fill.dependencies.admission,
-        f.fill.page_plaintext_bytes().unwrap(),
-        |response, child| {
-            let first = scopes.borrow().is_empty();
-            scopes.borrow_mut().push(child.clone());
-            let fill = &f.fill;
-            let page = &f.page;
-            let canceled = &primary_canceled;
-            Box::pin(async move {
-                if first {
-                    let result = fill.decrypt_response(page, response, None, &child).await;
-                    canceled.set(matches!(result, Err(Error::Canceled)));
-                    result
-                } else {
-                    Ok(crate::read::tests::page(2))
-                }
-            })
-        },
-    ));
+    let mut pair = Box::pin(
+        f.fill.dependencies.candidates.hedge_page(
+            &candidates,
+            (0, 1, true),
+            &f.context,
+            &operation,
+            &f.scope,
+            &mut budget,
+            &f.fill.dependencies.admission,
+            f.fill
+                .page_plaintext_bytes(&f.context.object.cache)
+                .unwrap(),
+            |response, child| {
+                let first = scopes.borrow().is_empty();
+                scopes.borrow_mut().push(child.clone());
+                let fill = &f.fill;
+                let page = &f.page;
+                let canceled = &primary_canceled;
+                Box::pin(async move {
+                    if first {
+                        let result = fill.decrypt_response(page, response, None, &child).await;
+                        canceled.set(matches!(result, Err(Error::Canceled)));
+                        result
+                    } else {
+                        Ok(crate::read::tests::page(2))
+                    }
+                })
+            },
+        ),
+    );
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     assert!(pair.as_mut().poll(&mut cx).is_pending());
     assert_eq!(

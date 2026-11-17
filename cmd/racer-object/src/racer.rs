@@ -21,8 +21,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-/// Racer page size; only the last page of an object may be shorter.
-pub const PAGE_SIZE: u64 = 16 * 1024 * 1024;
+/// Default Racer page size; only the last page of an object may be shorter.
+pub const DEFAULT_PAGE_SIZE: u64 = 16 * 1024 * 1024;
+/// Smallest page size Racer accepts.
+pub const MIN_PAGE_SIZE: u64 = 4 * 1024;
+/// Largest page size Racer accepts.
+pub const MAX_PAGE_SIZE: u64 = DEFAULT_PAGE_SIZE;
 /// Page frame header: kind, number, offset, length.
 pub const FRAME_SIZE: usize = 21;
 /// Largest response head Racer may send.
@@ -59,6 +63,8 @@ struct IdleConn {
 /// Racer client shared by all connections.
 pub struct Client {
     path: PathBuf,
+    /// Logical page size of the cache; Racer does not report it.
+    page_size: u64,
     idle: Mutex<Vec<IdleConn>>,
     /// Idle connections held by all workers' pools together.
     idle_total: Arc<AtomicUsize>,
@@ -78,12 +84,17 @@ pub struct Scratch {
 
 impl Client {
     /// `max_connections` bounds concurrent Stats and subscriptions.
-    pub fn new(path: PathBuf, max_connections: usize) -> Self {
+    /// `page_size` is the cache's logical page size, validated by the CLI.
+    pub fn new(path: PathBuf, max_connections: usize, page_size: u64) -> Self {
+        debug_assert!(
+            page_size.is_power_of_two() && (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&page_size)
+        );
         let seed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(1, |d| d.as_nanos() as u64 | 1);
         Self {
             path,
+            page_size,
             idle: Mutex::new(Vec::with_capacity(STAT_IDLE)),
             idle_total: Arc::new(AtomicUsize::new(0)),
             max_idle: STAT_IDLE.min(max_connections),
@@ -99,6 +110,7 @@ impl Client {
     pub fn sibling(&self) -> Self {
         Self {
             path: self.path.clone(),
+            page_size: self.page_size,
             idle: Mutex::new(Vec::with_capacity(self.max_idle)),
             idle_total: self.idle_total.clone(),
             max_idle: self.max_idle,
@@ -227,7 +239,7 @@ impl Client {
         scratch: &mut Scratch,
     ) -> Result<Subscription, Failure> {
         let permit = Self::admit(&self.bulk_lane).await?;
-        subscribe_request(id, pin, range, &mut scratch.request);
+        subscribe_request(id, pin, range, self.page_size, &mut scratch.request);
 
         let mut stream = self.dial().await?;
         // The subscription keeps the head buffer for already-received body
@@ -243,8 +255,8 @@ impl Client {
             Ok(Err(HeadError::Io(..))) | Err(_) => return Err(Failure::Unavailable),
         };
         let head = parse_head(&response[..head_len])?;
-        let (meta, first, end) = head.subscription(pin)?;
-        let seq = Sequence::new(first, end);
+        let (meta, first, end) = head.subscription(pin, self.page_size)?;
+        let seq = Sequence::new(first, end, self.page_size);
         Ok(Subscription {
             stream,
             buf: response,
@@ -275,6 +287,7 @@ pub fn subscribe_request(
     id: &Identity,
     pin: Option<&[u8]>,
     range: RangeSpec,
+    page_size: u64,
     request: &mut Vec<u8>,
 ) {
     let mut buf = itoa_buf();
@@ -286,7 +299,7 @@ pub fn subscribe_request(
     );
     request.extend_from_slice(fmt_u64(PAGE_CREDITS, &mut buf));
     request.extend_from_slice(b"\r\nRacer-Byte-Credits: ");
-    request.extend_from_slice(fmt_u64(PAGE_CREDITS * PAGE_SIZE, &mut buf));
+    request.extend_from_slice(fmt_u64(PAGE_CREDITS * page_size, &mut buf));
     request.extend_from_slice(b"\r\n");
     let at = request.len();
     request.extend_from_slice(b"Range: ");
@@ -625,7 +638,11 @@ impl Head<'_> {
     }
 
     /// Validate a subscription response and return metadata plus the selected `[first, end)`.
-    fn subscription(&self, pin: Option<&[u8]>) -> Result<(Meta, u64, u64), Failure> {
+    fn subscription(
+        &self,
+        pin: Option<&[u8]>,
+        page_size: u64,
+    ) -> Result<(Meta, u64, u64), Failure> {
         let bad = Failure::BadGateway;
         let length = self.content_length.and_then(decimal).ok_or(bad)?;
         if self.status != 200 {
@@ -658,7 +675,7 @@ impl Head<'_> {
         if first > end || end > size || pin.is_some_and(|p| p != meta.etag.as_slice()) {
             return Err(bad);
         }
-        let pages = page_count(first, end);
+        let pages = page_count(first, end, page_size);
         let framing = (pages + 1) * FRAME_SIZE as u64;
         if length != (end - first).checked_add(framing).ok_or(bad)? {
             return Err(bad);
@@ -667,12 +684,12 @@ impl Head<'_> {
     }
 }
 
-/// Number of pages covering `[first, end)`.
-pub fn page_count(first: u64, end: u64) -> u64 {
+/// Number of pages of `page_size` bytes covering `[first, end)`.
+pub fn page_count(first: u64, end: u64, page_size: u64) -> u64 {
     if end <= first {
         0
     } else {
-        (end - 1) / PAGE_SIZE - first / PAGE_SIZE + 1
+        (end - 1) / page_size - first / page_size + 1
     }
 }
 
@@ -719,18 +736,20 @@ pub fn credit_bytes(f: &Frame) -> [u8; 12] {
 pub struct Sequence {
     first: u64,
     end: u64,
+    page_size: u64,
     pub pages: u64,
     delivered: u64,
     bytes: u64,
 }
 
 impl Sequence {
-    /// Expect the pages covering `[first, end)`.
-    pub fn new(first: u64, end: u64) -> Self {
+    /// Expect the pages of `page_size` bytes covering `[first, end)`.
+    pub fn new(first: u64, end: u64, page_size: u64) -> Self {
         Self {
             first,
             end,
-            pages: page_count(first, end),
+            page_size,
+            pages: page_count(first, end, page_size),
             delivered: 0,
             bytes: 0,
         }
@@ -755,16 +774,16 @@ impl Sequence {
             || f.length == 0
             || f.offset < self.first
             || f.offset >= self.end
-            || f.number != f.offset / PAGE_SIZE
+            || f.number != f.offset / self.page_size
             || self.delivered == self.pages
         {
             return Err(bad);
         }
-        let start = self.first.max(f.number * PAGE_SIZE);
-        let end = self.end.min((f.number + 1) * PAGE_SIZE);
+        let start = self.first.max(f.number * self.page_size);
+        let end = self.end.min((f.number + 1) * self.page_size);
         if f.offset != start
             || u64::from(f.length) != end - start
-            || f.number != self.first / PAGE_SIZE + self.delivered
+            || f.number != self.first / self.page_size + self.delivered
         {
             return Err(bad);
         }
@@ -813,8 +832,14 @@ impl Subscription {
     /// A subscription over `stream` for `[first, end)` whose response head
     /// was already consumed, with `buffered` body bytes read past it.
     #[cfg(test)]
-    pub fn for_test(stream: UnixStream, first: u64, end: u64, buffered: Vec<u8>) -> Self {
-        let seq = Sequence::new(first, end);
+    pub fn for_test(
+        stream: UnixStream,
+        first: u64,
+        end: u64,
+        buffered: Vec<u8>,
+        page_size: u64,
+    ) -> Self {
+        let seq = Sequence::new(first, end, page_size);
         let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
         Self {
             stream,
@@ -933,7 +958,7 @@ mod tests {
 
     #[tokio::test]
     async fn idle_budget_is_process_wide() {
-        let a = Client::new(PathBuf::from("/nonexistent"), 64);
+        let a = Client::new(PathBuf::from("/nonexistent"), 64, DEFAULT_PAGE_SIZE);
         let workers: Vec<Client> = (0..7).map(|_| a.sibling()).collect();
         for w in std::iter::once(&a).chain(&workers) {
             for _ in 0..3 {
@@ -960,7 +985,7 @@ mod tests {
 
     #[tokio::test]
     async fn idle_budget_respects_max_connections() {
-        let a = Client::new(PathBuf::from("/nonexistent"), 1);
+        let a = Client::new(PathBuf::from("/nonexistent"), 1, DEFAULT_PAGE_SIZE);
         let b = a.sibling();
         a.recycle(conn(), far());
         b.recycle(conn(), far());
@@ -969,7 +994,7 @@ mod tests {
 
     #[tokio::test]
     async fn expired_idle_releases_budget() {
-        let a = Client::new(PathBuf::from("/nonexistent"), 64);
+        let a = Client::new(PathBuf::from("/nonexistent"), 64, DEFAULT_PAGE_SIZE);
         let b = a.sibling();
         for _ in 0..STAT_IDLE {
             a.recycle(conn(), Instant::now());
@@ -1014,7 +1039,7 @@ mod tests {
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
         let not_found: &[u8] = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
         let server = tokio::spawn(serve_one(listener, vec![not_found, not_found]));
-        let client = Client::new(path.clone(), 64);
+        let client = Client::new(path.clone(), 64, DEFAULT_PAGE_SIZE);
         let mut scratch = Scratch::default();
         assert_eq!(
             client.stat(&id(), &mut scratch).await,
@@ -1051,7 +1076,7 @@ mod tests {
             let path = sock(name);
             let listener = tokio::net::UnixListener::bind(&path).unwrap();
             let server = tokio::spawn(serve_one(listener, vec![resp]));
-            let client = Client::new(path.clone(), 64);
+            let client = Client::new(path.clone(), 64, DEFAULT_PAGE_SIZE);
             let mut scratch = Scratch::default();
             assert!(client.stat(&id(), &mut scratch).await.is_err(), "{name}");
             assert_eq!(client.idle_len(), 0, "{name}");
@@ -1112,14 +1137,25 @@ mod tests {
 
     #[test]
     fn pages() {
-        assert_eq!(page_count(0, 0), 0);
-        assert_eq!(page_count(0, 1), 1);
-        assert_eq!(page_count(0, PAGE_SIZE), 1);
-        assert_eq!(page_count(PAGE_SIZE - 4, PAGE_SIZE + 7), 2);
+        assert_eq!(page_count(0, 0, DEFAULT_PAGE_SIZE), 0);
+        assert_eq!(page_count(0, 1, DEFAULT_PAGE_SIZE), 1);
+        assert_eq!(page_count(0, DEFAULT_PAGE_SIZE, DEFAULT_PAGE_SIZE), 1);
+        assert_eq!(
+            page_count(
+                DEFAULT_PAGE_SIZE - 4,
+                DEFAULT_PAGE_SIZE + 7,
+                DEFAULT_PAGE_SIZE
+            ),
+            2
+        );
+        // A 4 KiB cache has page boundaries every 4 KiB.
+        assert_eq!(page_count(0, 4 << 10, MIN_PAGE_SIZE), 1);
+        assert_eq!(page_count((4 << 10) - 1, (4 << 10) + 1, MIN_PAGE_SIZE), 2);
+        assert_eq!(page_count(4 << 10, 4 << 10, MIN_PAGE_SIZE), 0);
         let f = Frame {
             kind: 1,
             number: 3,
-            offset: 3 * PAGE_SIZE,
+            offset: 3 * DEFAULT_PAGE_SIZE,
             length: 9,
         };
         assert_eq!(Frame::decode(&f.encode()), f);
@@ -1171,7 +1207,7 @@ mod tests {
     }
 
     fn sub(raw: &str, pin: Option<&[u8]>) -> Result<(Meta, u64, u64), Failure> {
-        parse_head(raw.as_bytes())?.subscription(pin)
+        parse_head(raw.as_bytes())?.subscription(pin, DEFAULT_PAGE_SIZE)
     }
 
     #[test]
@@ -1246,6 +1282,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn subscription_heads_use_configured_page_size() {
+        // Two 4 KiB pages carry 12 bytes plus three frame headers. The same
+        // Content-Length is invalid at the 16 MiB default, where the range
+        // fits in one page.
+        let raw = "HTTP/1.1 200 OK\r\nETag: \"v\"\r\nRacer-Expires-At: 1\r\nContent-Type: application/octet-stream\r\nRacer-Object-Length: 10000\r\nRacer-Range-Start: 4090\r\nRacer-Range-End: 4102\r\nContent-Length: 75\r\nConnection: close\r\n\r\n";
+        let (meta, first, end) = parse_head(raw.as_bytes())
+            .unwrap()
+            .subscription(None, MIN_PAGE_SIZE)
+            .unwrap();
+        assert_eq!((meta.size, first, end), (10000, 4090, 4102));
+        assert_eq!(
+            parse_head(raw.as_bytes())
+                .unwrap()
+                .subscription(None, DEFAULT_PAGE_SIZE),
+            Err(Failure::BadGateway)
+        );
+    }
+
     fn id() -> Identity {
         crate::object::identity(b"bucket", b"key", b"").unwrap()
     }
@@ -1268,7 +1323,7 @@ mod tests {
         let id = id();
         let request = |pin: Option<&[u8]>, range| {
             let mut out = b"stale".to_vec();
-            subscribe_request(&id, pin, range, &mut out);
+            subscribe_request(&id, pin, range, DEFAULT_PAGE_SIZE, &mut out);
             String::from_utf8(out).unwrap()
         };
         let prefix = format!(
@@ -1294,6 +1349,14 @@ mod tests {
         assert_eq!(
             request(Some(b"\"v\""), RangeSpec::Full),
             format!("{prefix}If-Match: \"v\"\r\n{metadata}")
+        );
+        // Byte credits follow the configured page size.
+        let mut out = Vec::new();
+        subscribe_request(&id, None, RangeSpec::Full, MIN_PAGE_SIZE, &mut out);
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("\r\nRacer-Page-Credits: 2\r\nRacer-Byte-Credits: 8192\r\n"),
+            "{text}"
         );
     }
 
@@ -1332,49 +1395,77 @@ mod tests {
     #[test]
     fn sequence_accepts_valid_streams() {
         // Empty selection: completion only.
-        let mut s = Sequence::new(0, 0);
+        let mut s = Sequence::new(0, 0, DEFAULT_PAGE_SIZE);
         assert!(s.last_page());
         assert_eq!(s.accept(&complete(0, 0)), Ok(()));
         // A small range inside one page.
-        let mut s = Sequence::new(2, 5);
+        let mut s = Sequence::new(2, 5, DEFAULT_PAGE_SIZE);
         assert_eq!(s.accept(&page(0, 2, 3)), Ok(()));
         assert!(s.last_page());
         assert_eq!(s.accept(&complete(1, 3)), Ok(()));
         // A small range crossing a page boundary.
-        let mut s = Sequence::new(PAGE_SIZE - 2, PAGE_SIZE + 3);
-        assert_eq!(s.accept(&page(0, PAGE_SIZE - 2, 2)), Ok(()));
+        let mut s = Sequence::new(
+            DEFAULT_PAGE_SIZE - 2,
+            DEFAULT_PAGE_SIZE + 3,
+            DEFAULT_PAGE_SIZE,
+        );
+        assert_eq!(s.accept(&page(0, DEFAULT_PAGE_SIZE - 2, 2)), Ok(()));
         assert!(!s.last_page());
-        assert_eq!(s.accept(&page(1, PAGE_SIZE, 3)), Ok(()));
+        assert_eq!(s.accept(&page(1, DEFAULT_PAGE_SIZE, 3)), Ok(()));
         assert_eq!(s.accept(&complete(2, 5)), Ok(()));
         // Full pages followed by a short last page.
-        let end = 2 * PAGE_SIZE + 1;
-        let mut s = Sequence::new(0, end);
-        assert_eq!(s.accept(&page(0, 0, PAGE_SIZE as u32)), Ok(()));
-        assert_eq!(s.accept(&page(1, PAGE_SIZE, PAGE_SIZE as u32)), Ok(()));
-        assert_eq!(s.accept(&page(2, 2 * PAGE_SIZE, 1)), Ok(()));
+        let end = 2 * DEFAULT_PAGE_SIZE + 1;
+        let mut s = Sequence::new(0, end, DEFAULT_PAGE_SIZE);
+        assert_eq!(s.accept(&page(0, 0, DEFAULT_PAGE_SIZE as u32)), Ok(()));
+        assert_eq!(
+            s.accept(&page(1, DEFAULT_PAGE_SIZE, DEFAULT_PAGE_SIZE as u32)),
+            Ok(())
+        );
+        assert_eq!(s.accept(&page(2, 2 * DEFAULT_PAGE_SIZE, 1)), Ok(()));
         assert_eq!(s.accept(&complete(3, end)), Ok(()));
+        // The same object at 4 KiB pages has many more boundaries.
+        let end = 3 * MIN_PAGE_SIZE + 5;
+        let mut s = Sequence::new(0, end, MIN_PAGE_SIZE);
+        for page_number in 0..3 {
+            assert_eq!(
+                s.accept(&page(
+                    page_number,
+                    page_number * MIN_PAGE_SIZE,
+                    MIN_PAGE_SIZE as u32
+                )),
+                Ok(())
+            );
+        }
+        assert_eq!(s.accept(&page(3, 3 * MIN_PAGE_SIZE, 5)), Ok(()));
+        assert_eq!(s.accept(&complete(4, end)), Ok(()));
     }
 
     #[test]
     fn sequence_rejects_invalid_frames() {
         let bad = Err(Failure::BadGateway);
-        let fresh = || Sequence::new(PAGE_SIZE - 2, PAGE_SIZE + 3);
+        let fresh = || {
+            Sequence::new(
+                DEFAULT_PAGE_SIZE - 2,
+                DEFAULT_PAGE_SIZE + 3,
+                DEFAULT_PAGE_SIZE,
+            )
+        };
         for f in [
             // Unknown kind.
             Frame {
                 kind: 3,
-                ..page(0, PAGE_SIZE - 2, 2)
+                ..page(0, DEFAULT_PAGE_SIZE - 2, 2)
             },
             // Empty page.
-            page(0, PAGE_SIZE - 2, 0),
+            page(0, DEFAULT_PAGE_SIZE - 2, 0),
             // Wrong offset, length, or number.
-            page(0, PAGE_SIZE - 3, 3),
-            page(0, PAGE_SIZE - 2, 1),
-            page(1, PAGE_SIZE - 2, 2),
+            page(0, DEFAULT_PAGE_SIZE - 3, 3),
+            page(0, DEFAULT_PAGE_SIZE - 2, 1),
+            page(1, DEFAULT_PAGE_SIZE - 2, 2),
             // Out of order: the second page first.
-            page(1, PAGE_SIZE, 3),
+            page(1, DEFAULT_PAGE_SIZE, 3),
             // Outside the selection.
-            page(1, PAGE_SIZE + 3, 1),
+            page(1, DEFAULT_PAGE_SIZE + 3, 1),
             // Completion before any page (truncated stream).
             complete(2, 5),
             complete(0, 0),
@@ -1383,14 +1474,14 @@ mod tests {
         }
         // Completion after a partial delivery.
         let mut s = fresh();
-        assert_eq!(s.accept(&page(0, PAGE_SIZE - 2, 2)), Ok(()));
+        assert_eq!(s.accept(&page(0, DEFAULT_PAGE_SIZE - 2, 2)), Ok(()));
         assert_eq!(s.accept(&complete(2, 5)), bad);
         assert_eq!(s.accept(&complete(1, 2)), bad);
         // A repeated page.
-        assert_eq!(s.accept(&page(0, PAGE_SIZE - 2, 2)), bad);
+        assert_eq!(s.accept(&page(0, DEFAULT_PAGE_SIZE - 2, 2)), bad);
         // Extra pages after the last, and a mismatched completion.
-        assert_eq!(s.accept(&page(1, PAGE_SIZE, 3)), Ok(()));
-        assert_eq!(s.accept(&page(1, PAGE_SIZE, 3)), bad);
+        assert_eq!(s.accept(&page(1, DEFAULT_PAGE_SIZE, 3)), Ok(()));
+        assert_eq!(s.accept(&page(1, DEFAULT_PAGE_SIZE, 3)), bad);
         assert_eq!(s.accept(&complete(2, 4)), bad);
         assert_eq!(s.accept(&complete(3, 5)), bad);
         assert_eq!(

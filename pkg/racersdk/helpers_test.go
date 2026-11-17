@@ -57,7 +57,14 @@ func socketDir(t testing.TB) string {
 func testClient(t testing.TB, path string, maxConnections int) *Client {
 	t.Helper()
 
-	c, err := newClient(ClientConfig{Cache: "test", MaxConnections: maxConnections}, path)
+	return testClientSize(t, path, maxConnections, 0)
+}
+
+// testClientSize is testClient with an explicit cache page size.
+func testClientSize(t testing.TB, path string, maxConnections, pageSize int) *Client {
+	t.Helper()
+
+	c, err := newClient(ClientConfig{Cache: "test", MaxConnections: maxConnections, PageSize: pageSize}, path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,18 +112,34 @@ func unixTransport(path string) *http.Transport {
 func originClient(t testing.TB, path string, maxConnections int) *Client {
 	t.Helper()
 
+	return originClientSize(t, path, maxConnections, 0)
+}
+
+// originClientSize is originClient for a cache with an explicit page size.
+func originClientSize(t testing.TB, path string, maxConnections, pageSize int) *Client {
+	t.Helper()
+
 	transport := unixTransport(path)
 	t.Cleanup(transport.CloseIdleConnections)
 
-	return testClient(t, rawClientPeer(t, fakeracer.NewHandler(transport)), maxConnections)
+	handler := fakeracer.NewHandlerWithPageSize(transport, pageSizeBytes(pageSize))
+
+	return testClientSize(t, rawClientPeer(t, handler), maxConnections, pageSize)
 }
 
 // fakeClient serves origin and returns a Client that reads through it.
 func fakeClient(t *testing.T, origin Origin) *Client {
 	t.Helper()
 
-	path, cancel, done := startOrigin(t, nil, origin)
-	c := originClient(t, path, 0)
+	return fakeClientSize(t, 0, origin)
+}
+
+// fakeClientSize is fakeClient for a cache with an explicit page size.
+func fakeClientSize(t *testing.T, pageSize int, origin Origin) *Client {
+	t.Helper()
+
+	path, cancel, done := startOrigin(t, func(l *originLimits) { l.pageSize = pageSizeBytes(pageSize) }, origin)
+	c := originClientSize(t, path, 0, pageSize)
 
 	t.Cleanup(func() { closeQuietly(c); cancel(); <-done })
 
@@ -126,6 +149,13 @@ func fakeClient(t *testing.T, origin Origin) *Client {
 // rawServer accepts client connections on a socket and hands each one, with
 // its parsed request head, to serve. The connection closes when serve returns.
 func rawServer(t testing.TB, serve func(conn net.Conn, r *bufio.Reader, head []byte)) *Client {
+	t.Helper()
+
+	return rawServerSize(t, 0, serve)
+}
+
+// rawServerSize is rawServer for a cache with an explicit page size.
+func rawServerSize(t testing.TB, pageSize int, serve func(conn net.Conn, r *bufio.Reader, head []byte)) *Client {
 	t.Helper()
 	path := filepath.Join(socketDir(t), "socket")
 
@@ -158,16 +188,21 @@ func rawServer(t testing.TB, serve func(conn net.Conn, r *bufio.Reader, head []b
 
 	t.Cleanup(func() { closeQuietly(l); <-done })
 
-	c := testClient(t, path, 1)
+	c := testClientSize(t, path, 1, pageSize)
 	c.limits.bodyTimeout = 2 * time.Second
 
 	return c
 }
 
 // subscriptionHead is a valid subscription response for [first, end) of an
-// object with the given size and ETag "v".
+// object with the given size and ETag "v" at the default page size.
 func subscriptionHead(size, first, end uint64) string {
-	pages := wire.PageCount(first, end)
+	return subscriptionHeadSize(size, first, end, PageSize)
+}
+
+// subscriptionHeadSize is subscriptionHead at an explicit page size.
+func subscriptionHeadSize(size, first, end, pageSize uint64) string {
+	pages := wire.PageCount(first, end, pageSize)
 
 	return fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: %d\r\nETag: \"v\"\r\nRacer-Expires-At: 0\r\nRacer-Object-Length: %d\r\nRacer-Range-Start: %d\r\nRacer-Range-End: %d\r\nConnection: close\r\n\r\n", end-first+wire.FrameSize*(pages+1), size, first, end)
 }

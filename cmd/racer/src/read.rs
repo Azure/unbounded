@@ -345,7 +345,10 @@ impl Coordinator {
     ) -> Result<PeerResponse> {
         match self.fill.copy_only_joining(page, scope, join).await? {
             Some((metadata, ciphertext)) => {
-                metadata.immutable().validate_page(ciphertext.envelope())?;
+                let page_size = self.fill.page_size(&page.version.object.cache)?;
+                metadata
+                    .immutable()
+                    .validate_page_in(ciphertext.envelope(), page_size)?;
                 if &ciphertext.envelope().page != page {
                     return Err(Error::CorruptRecord);
                 }
@@ -383,6 +386,7 @@ impl Coordinator {
             let membership = snapshot.membership.clone();
             let directory = self.streams.directory();
             let ClientRequest { kind, origin } = request;
+            let page_size = snapshot.page_size_for(&origin.object.cache);
             let selector = match &kind {
                 ReadKind::Subscription { pin, .. }
                 | ReadKind::HostRead { pin, .. }
@@ -412,7 +416,7 @@ impl Coordinator {
                         pin: None,
                         range,
                         page_credits: direct_window,
-                        byte_credits: direct_byte_credits(direct_window, snapshot.page_size),
+                        byte_credits: direct_byte_credits(direct_window, page_size),
                     }
                 }
                 kind => kind,
@@ -433,7 +437,7 @@ impl Coordinator {
                     let range = resolve_range(
                         range.unwrap_or(ByteRange::From(0)),
                         metadata.length,
-                        snapshot.page_size,
+                        page_size,
                     )?;
                     let passthrough = self.fill.passthrough(&origin.object.cache);
                     let mut body = self.streams.open(
@@ -493,13 +497,13 @@ impl Coordinator {
         Ok(snapshot.membership.clone())
     }
 
-    /// The page size the cluster publication fixed; unavailable before one is adopted.
-    pub(crate) fn page_size(&self) -> Result<PageSize> {
+    /// The effective page size of a cache; unavailable before a publication is adopted.
+    pub(crate) fn page_size(&self, cache: &racer_wire::control::CacheId) -> Result<PageSize> {
         Ok(self
             .snapshots
             .current()?
             .ok_or(Error::Unavailable)?
-            .page_size)
+            .page_size_for(cache))
     }
 
     pub(crate) fn cache_passthrough(&self, cache: &racer_wire::control::CacheId) -> bool {

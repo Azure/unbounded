@@ -51,7 +51,7 @@ func TestApplyMutatorRejectsArtifactStreamingWithRacer(t *testing.T) {
 		"kind": "DaemonSet", "metadata": map[string]any{"name": daemonSetName},
 	}}
 	mutate := applyMutator("gantry:test", "gantry-node-config:test", "hash",
-		artifactStreamingConfig{Enabled: true}, &workload.NodePlacement{})
+		artifactStreamingConfig{Enabled: true}, &workload.NodePlacement{}, "")
 
 	err := mutate(object)
 	if err == nil || !strings.Contains(err.Error(), "cannot be combined") {

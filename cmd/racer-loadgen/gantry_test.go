@@ -159,7 +159,7 @@ func TestGantryIntegration(t *testing.T) {
 		require.Equal(t, float64(2*imageBytes), testutil.ToFloat64(metrics.receivedBytes))
 		require.Equal(t, float64(2), testutil.ToFloat64(metrics.pulls.WithLabelValues("success")))
 		require.Zero(t, testutil.ToFloat64(metrics.inFlight))
-		require.Equal(t, int64(10), callbacks.Load(), "each pull needs manifest, config, and three layer pages")
+		require.Equal(t, int64(12), callbacks.Load(), "each pull needs a manifest preflight, manifest, config, and three layer pages")
 		assertRanges(t, 2, 2, 2)
 	})
 
@@ -266,7 +266,7 @@ func TestGantryIntegration(t *testing.T) {
 		require.Equal(t, float64(1), testutil.ToFloat64(metrics.requests.WithLabelValues("layer", "error")))
 		require.Zero(t, testutil.ToFloat64(metrics.pulls.WithLabelValues("success")))
 		require.Zero(t, testutil.ToFloat64(metrics.inFlight))
-		require.Equal(t, int64(4), callbacks.Load(), "failed page must not be retried or bypassed")
+		require.Equal(t, int64(5), callbacks.Load(), "manifest preflight plus one attempt per object and page; failed page must not be retried or bypassed")
 		assertRanges(t, 1, 1, 0)
 	})
 }

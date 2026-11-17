@@ -3,10 +3,18 @@ use super::*;
 const IMAGE: &str = "example.com/racer-object:v1";
 const CACHE: &str = "test-cache";
 
-/// Every cache exists with no node selector.
+/// A ClusterCache with `selector` and no page size override.
+fn cache(selector: Option<Value>) -> Cache {
+    Cache {
+        node_selector: selector,
+        page_size: None,
+    }
+}
+
+/// Every cache exists with no node selector or page size.
 fn admit(review: &[u8], image: &str) -> Result<Vec<u8>, Error> {
     let lookups = Lookups {
-        cache: &|_| CacheLookup::Found(None),
+        cache: &|_| CacheLookup::Found(Cache::default()),
         node: &|n| panic!("unexpected Node lookup {n}"),
     };
     super::admit(review, image, &lookups)
@@ -204,6 +212,66 @@ fn success_cases() {
             out["spec"]["containers"],
             pod(json!({}))["spec"]["containers"]
         );
+    }
+}
+
+#[test]
+fn cache_page_size_is_injected() {
+    let out = run_cache(
+        &pod(json!({})),
+        Cache {
+            node_selector: None,
+            page_size: Some(json!("1MiB")),
+        },
+    );
+    assert_eq!(
+        out["spec"]["initContainers"][0]["args"],
+        json!(["sidecar", "--cache=test-cache", "--page-size=1MiB"])
+    );
+}
+
+#[test]
+fn unset_page_size_uses_the_sidecar_default() {
+    // The sidecar default is 16MiB, which is also the authority's default
+    // cluster page size, so an unset spec.pageSize omits the flag rather than
+    // guessing a value the webhook cannot see.
+    for page_size in [None, Some(Value::Null)] {
+        let out = run_cache(
+            &pod(json!({})),
+            Cache {
+                node_selector: None,
+                page_size,
+            },
+        );
+        assert_eq!(
+            out["spec"]["initContainers"][0]["args"],
+            json!(["sidecar", "--cache=test-cache"])
+        );
+    }
+}
+
+#[test]
+fn invalid_page_size_denies_without_panicking() {
+    for (value, want) in [
+        (json!("3KiB"), "is not one of"),
+        (json!("1miB"), "is not one of"),
+        (json!(1024), "must be a string"),
+        (json!(true), "must be a string"),
+    ] {
+        let resp = run_with(&pod(json!({})), &|_| {
+            CacheLookup::Found(Cache {
+                node_selector: None,
+                page_size: Some(value.clone()),
+            })
+        });
+        assert_eq!(resp["allowed"], false, "{value}");
+        assert_eq!(resp["status"]["code"], 403);
+        let msg = resp["status"]["message"].as_str().unwrap();
+        assert!(
+            msg.contains("invalid spec.pageSize") && msg.contains(want),
+            "{value}: {msg}"
+        );
+        assert!(resp.get("patch").is_none());
     }
 }
 
@@ -1108,17 +1176,22 @@ fn run_nodes(
     response(&super::admit(&review("CREATE", pod), IMAGE, &lookups).unwrap())
 }
 
-/// Runs the review where CACHE has `sel` and returns the patched pod.
-fn run_selector(pod: &Value, sel: Value) -> Value {
+/// Runs the review where CACHE is `found` and returns the patched pod.
+fn run_cache(pod: &Value, found: Cache) -> Value {
     let resp = run_with(pod, &|c| {
         assert_eq!(c, CACHE);
-        CacheLookup::Found(Some(sel.clone()))
+        CacheLookup::Found(found.clone())
     });
     assert_eq!(resp["allowed"], true, "{resp}");
     let raw = base64::engine::general_purpose::STANDARD
         .decode(resp["patch"].as_str().unwrap())
         .unwrap();
     apply(pod, &serde_json::from_slice::<Vec<Value>>(&raw).unwrap())
+}
+
+/// Runs the review where CACHE has `sel` and returns the patched pod.
+fn run_selector(pod: &Value, sel: Value) -> Value {
+    run_cache(pod, cache(Some(sel)))
 }
 
 fn terms(p: &Value) -> Value {
@@ -1245,7 +1318,7 @@ fn selector_is_idempotent_and_shared_by_both_opt_ins() {
     let gpu = json!({"key": "pool", "operator": "In", "values": ["gpu"]});
     assert_eq!(terms(&out), json!([{"matchExpressions": [excl(), gpu]}]));
     // A second pass changes nothing.
-    let resp = run_with(&out, &|_| CacheLookup::Found(Some(sel.clone())));
+    let resp = run_with(&out, &|_| CacheLookup::Found(cache(Some(sel.clone()))));
     assert_eq!(resp["allowed"], true);
     assert!(resp.get("patch").is_none(), "{resp}");
 }
@@ -1257,8 +1330,8 @@ fn different_caches_are_looked_up_separately() {
     let r = Review::parse(&review("CREATE", &p)).unwrap();
     assert_eq!(r.caches(), vec![CACHE.to_owned(), "other".to_owned()]);
     let resp = run_with(&p, &|c| match c {
-        CACHE => CacheLookup::Found(Some(json!({"matchLabels": {"a": "1"}}))),
-        _ => CacheLookup::Found(Some(json!({"matchLabels": {"b": "2"}}))),
+        CACHE => CacheLookup::Found(cache(Some(json!({"matchLabels": {"a": "1"}})))),
+        _ => CacheLookup::Found(cache(Some(json!({"matchLabels": {"b": "2"}})))),
     });
     let raw = base64::engine::general_purpose::STANDARD
         .decode(resp["patch"].as_str().unwrap())
@@ -1274,7 +1347,7 @@ fn different_caches_are_looked_up_separately() {
     );
     let resp = run_with(&p, &|c| {
         if c == CACHE {
-            CacheLookup::Found(None)
+            CacheLookup::Found(cache(None))
         } else {
             CacheLookup::NotFound
         }
@@ -1345,7 +1418,7 @@ fn invalid_selector_is_denied() {
         (json!({"matchExpressions": ["x"]}), "matchExpressions[0]"),
     ] {
         for p in [client_pod(json!({})), pod(json!({}))] {
-            let resp = run_with(&p, &|_| CacheLookup::Found(Some(sel.clone())));
+            let resp = run_with(&p, &|_| CacheLookup::Found(cache(Some(sel.clone()))));
             assert_eq!(resp["allowed"], false, "{sel}");
             assert_eq!(resp["status"]["code"], 403);
             let msg = resp["status"]["message"].as_str().unwrap();
@@ -1380,7 +1453,7 @@ fn review_caches_skips_injected_sidecar() {
         // A cache missing from the lookup result is still unavailable, not
         // silently allowed.
         let resp = run_with(&p, &|c| match c {
-            "other" => CacheLookup::Found(None),
+            "other" => CacheLookup::Found(cache(None)),
             _ => CacheLookup::Unavailable,
         });
         assert_eq!(resp["allowed"], json!(true), "{list}");
@@ -1427,7 +1500,7 @@ fn bound(mut p: Value, node: &str) -> Value {
 }
 
 fn gpu_cache(_: &str) -> CacheLookup {
-    CacheLookup::Found(Some(json!({"matchLabels": {"pool": "gpu"}})))
+    CacheLookup::Found(cache(Some(json!({"matchLabels": {"pool": "gpu"}}))))
 }
 
 #[test]
@@ -1500,7 +1573,7 @@ fn node_lookup_is_skipped_when_not_needed() {
             bound(pod(json!({})), "n1"),
             bound(client_pod(json!({})), "n1"),
         ] {
-            let resp = run_with(&p, &|_| CacheLookup::Found(sel.clone()));
+            let resp = run_with(&p, &|_| CacheLookup::Found(cache(sel.clone())));
             assert_eq!(resp["allowed"], true, "{resp}");
         }
     }

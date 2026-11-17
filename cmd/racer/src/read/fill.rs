@@ -585,7 +585,11 @@ impl Fill {
             };
             let page = grant.page.clone();
             let accepted = async {
-                let copy = response_copy(response.response(), &page, self.page_size()?)?;
+                let copy = response_copy(
+                    response.response(),
+                    &page,
+                    self.page_size(&page.version.object.cache)?,
+                )?;
                 drop(response);
                 // Allocate and authenticate on the stable owner, which can reclaim
                 // every payload charge retained by its page cache.
@@ -771,7 +775,7 @@ impl Fill {
                 .reserve(
                     Some(&page.version.object.cache),
                     ResourceClass::Plaintext,
-                    self.page_plaintext_bytes()?,
+                    self.page_plaintext_bytes(&page.version.object.cache)?,
                 )
                 .map_err(Into::into)
         })
@@ -786,7 +790,7 @@ impl Fill {
     ) -> Result<flow_control::Charge<AdmissionPolicy>> {
         let admission = &self.dependencies.admission;
         let cache = &page.version.object.cache;
-        let amount = self.page_plaintext_bytes()?;
+        let amount = self.page_plaintext_bytes(cache)?;
         // The memory cache retains no plaintext, so nothing local can be
         // reclaimed. Retry once after a yield, which lets completed readers
         // drop their plaintext. With a timer, keep waiting for them under a
@@ -865,7 +869,7 @@ impl Fill {
         if !scope.ahead {
             return Ok(());
         }
-        let page = self.page_plaintext_bytes()?;
+        let page = self.page_plaintext_bytes(cache)?;
         let admission = &self.dependencies.admission;
         let class = ResourceClass::Plaintext;
         let need = page.saturating_mul(2);
@@ -961,20 +965,23 @@ impl Fill {
         &self,
         cache: &racer_wire::control::CacheId,
     ) -> Result<flow_control::Charge<AdmissionPolicy>> {
-        let amount = self.page_plaintext_bytes()?;
+        let amount = self.page_plaintext_bytes(cache)?;
         self.reserve_with_reclamation(cache, ResourceClass::Plaintext, amount)
     }
 
-    /// One page's plaintext at the published cluster page size: what an origin fill or
+    /// One page's plaintext at the cache's page size: what an origin fill or
     /// bootstrap reserves before the page length is known.
-    pub(crate) fn page_plaintext_bytes(&self) -> Result<usize> {
-        Ok(self.page_size()?.get() as usize)
+    pub(crate) fn page_plaintext_bytes(
+        &self,
+        cache: &racer_wire::control::CacheId,
+    ) -> Result<usize> {
+        Ok(self.page_size(cache)?.get() as usize)
     }
 
-    /// The published cluster page size. Every page this node accepts must be cut at
-    /// it, since ranges are sliced at it.
-    pub(crate) fn page_size(&self) -> Result<PageSize> {
-        self.dependencies.origin.page_size()
+    /// The cache's page size. Every page this node accepts must be cut at it,
+    /// since ranges are sliced at it.
+    pub(crate) fn page_size(&self, cache: &racer_wire::control::CacheId) -> Result<PageSize> {
+        self.dependencies.origin.page_size(cache)
     }
 
     /// A received or retained copy already fixes the output length. Validate it
@@ -984,7 +991,7 @@ impl Fill {
         page: &PageId,
         copy: &crate::memory::CiphertextCopy,
     ) -> Result<flow_control::Charge<AdmissionPolicy>> {
-        validate_copy(copy, page, self.page_size()?)?;
+        validate_copy(copy, page, self.page_size(&page.version.object.cache)?)?;
         // Charge the pooled capacity up front so reclamation covers it.
         let capacity = self
             .dependencies
@@ -1427,8 +1434,11 @@ impl Fill {
                 // slot, or HTTP): use it privately rather than fetch it again.
                 crate::peer::Delivered::Response(response) => {
                     // A miss or unusable answer: ask the next provider.
-                    let Ok(copy) = response_copy(response.response(), page, self.page_size()?)
-                    else {
+                    let Ok(copy) = response_copy(
+                        response.response(),
+                        page,
+                        self.page_size(&page.version.object.cache)?,
+                    ) else {
                         continue;
                     };
                     return Ok(self
@@ -1459,7 +1469,7 @@ impl Fill {
         }
         metadata
             .immutable()
-            .validate_page_in(&envelope, self.page_size()?)?;
+            .validate_page_in(&envelope, self.page_size(&page.version.object.cache)?)?;
         let sealed = Box::new(super::sealed::SealedPage {
             fused_store: None,
             aad: crate::security::page_aad(&envelope)?,
@@ -1520,7 +1530,11 @@ impl Fill {
         host: Option<Option<u16>>,
         ahead: bool,
     ) -> Result<Box<super::sealed::SealedPage>> {
-        validate_copy(&copy.copy, page, self.page_size()?)?;
+        validate_copy(
+            &copy.copy,
+            page,
+            self.page_size(&page.version.object.cache)?,
+        )?;
         let pool_low = host.is_some()
             && ahead
             && copy
@@ -2110,6 +2124,10 @@ impl Fill {
         if origin.metadata.version != page.version {
             return Err(Error::CorruptRecord);
         }
+        let page_size = self.page_size(&page.version.object.cache)?;
+        if origin.page_size != page_size {
+            return Err(Error::CorruptRecord);
+        }
         use crate::admission::ResourceClass;
         if origin.plaintext.bytes()?.len()
             != origin
@@ -2219,7 +2237,7 @@ impl Fill {
                     self.dependencies.memory.ciphertext(page),
                 )?
             {
-                validate_copy(&copy, page, self.page_size()?)?;
+                validate_copy(&copy, page, self.page_size(&page.version.object.cache)?)?;
                 self.metrics.record(Event::MemoryHit, 1);
                 return Ok(Some((copy.metadata, copy.ciphertext)));
             }
@@ -2229,7 +2247,7 @@ impl Fill {
                     self.dependencies.writer.copy_only(page),
                 )?
             {
-                validate_copy(&copy, page, self.page_size()?)?;
+                validate_copy(&copy, page, self.page_size(&page.version.object.cache)?)?;
                 self.metrics.record(Event::MemoryHit, 1);
                 return Ok(Some((copy.metadata, copy.ciphertext)));
             }
@@ -2425,7 +2443,9 @@ impl Fill {
                     Err(error) => return Err(error),
                 }
             }
-            if !want_plaintext && validate_copy(&copy, page, self.page_size()?).is_ok() {
+            if !want_plaintext
+                && validate_copy(&copy, page, self.page_size(&page.version.object.cache)?).is_ok()
+            {
                 self.metrics.record(
                     if token.is_some() {
                         Event::DiskHit
@@ -2508,7 +2528,7 @@ impl Fill {
         token: &crate::store::ReadToken,
         scope: &RequestScope,
     ) -> Result<()> {
-        let result = match validate_copy(copy, page, self.page_size()?) {
+        let result = match validate_copy(copy, page, self.page_size(&page.version.object.cache)?) {
             Ok(()) => {
                 self.dependencies
                     .crypto
@@ -2595,7 +2615,11 @@ impl Fill {
                         .map(AcquiredPage::from)
                 } else {
                     Ok(AcquiredPage::Ciphertext(UnverifiedPage {
-                        copy: response_copy(response.response(), page, self.page_size()?)?,
+                        copy: response_copy(
+                            response.response(),
+                            page,
+                            self.page_size(&page.version.object.cache)?,
+                        )?,
                         disk_token: None,
                     }))
                 }
@@ -2668,7 +2692,7 @@ impl Fill {
                                     scope,
                                     budget,
                                     &self.dependencies.admission,
-                                    self.page_plaintext_bytes()?,
+                                    self.page_plaintext_bytes(&context.object.cache)?,
                                     |response, child| {
                                         Box::pin(async move {
                                             self.metrics.record_duration(
@@ -2680,7 +2704,7 @@ impl Fill {
                                             let copy = response_copy(
                                                 response.response(),
                                                 page,
-                                                self.page_size()?,
+                                                self.page_size(&page.version.object.cache)?,
                                             )?;
                                             if let Some(existing) = self
                                                 .retained_metadata(&page.version, &child)
@@ -2739,7 +2763,7 @@ impl Fill {
                             self.reserve_with_reclamation(
                                 &context.object.cache,
                                 ResourceClass::Ciphertext,
-                                self.page_plaintext_bytes()? + 16,
+                                self.page_plaintext_bytes(&context.object.cache)? + 16,
                             )
                         },
                     )?;
@@ -2871,7 +2895,7 @@ impl Fill {
                 self.reserve_with_reclamation(
                     &context.object.cache,
                     ResourceClass::Ciphertext,
-                    self.page_plaintext_bytes()? + 16,
+                    self.page_plaintext_bytes(&context.object.cache)? + 16,
                 )
             })?;
         let origin = self
@@ -2900,6 +2924,10 @@ impl Fill {
     ) -> Result<PageResult> {
         use racer_io::ring::IoBuffer;
         if origin.metadata.version != page.version {
+            return Err(Error::CorruptRecord);
+        }
+        let page_size = self.page_size(&page.version.object.cache)?;
+        if origin.page_size != page_size {
             return Err(Error::CorruptRecord);
         }
         let expected = origin
@@ -2936,12 +2964,16 @@ impl Fill {
         scope: &RequestScope,
     ) -> Result<PageResult> {
         scope.check()?;
-        let copy =
-            response_copy(response.response(), page, self.page_size()?).inspect_err(|error| {
-                if *error == Error::CorruptRecord {
-                    self.metrics.record(Event::CorruptMiss, 1);
-                }
-            })?;
+        let copy = response_copy(
+            response.response(),
+            page,
+            self.page_size(&page.version.object.cache)?,
+        )
+        .inspect_err(|error| {
+            if *error == Error::CorruptRecord {
+                self.metrics.record(Event::CorruptMiss, 1);
+            }
+        })?;
         let reservation = match reservation {
             Some(reserved) => reserved,
             None => {
@@ -3074,7 +3106,7 @@ impl Fill {
         // this helper. They are independent of the exact AEAD engine counters,
         // which are reaped even if a waiting fill has been abandoned.
         let result = async {
-            validate_copy(&copy, page, self.page_size()?)?;
+            validate_copy(&copy, page, self.page_size(&page.version.object.cache)?)?;
             // Keep the original immutable ciphertext lease across crypto submission.
             self.metrics.record(Event::PageDecrypt, 1);
             let length = copy.ciphertext.envelope().plaintext_length as usize;
@@ -3241,7 +3273,7 @@ impl Fill {
         // One sealed page at the published page size. Before a size is
         // adopted, fall back to the largest page, which only over-reserves.
         let sealed_page = self
-            .page_plaintext_bytes()
+            .page_plaintext_bytes(cache)
             .unwrap_or(PAGE_BYTES as usize)
             .saturating_add(16);
         if !owned

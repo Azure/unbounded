@@ -89,7 +89,8 @@ class FakePrefetches:
     """Ticket registry. Tests set outcome(ticket_id, ref_dict) -> Outcome and
     admit(ticket_id, body) -> Fail | None, and may replace now()."""
 
-    def __init__(self) -> None:
+    def __init__(self, page_size: int = PAGE) -> None:
+        self.page_size = page_size
         self.cache_uid = None
         self.passthrough = False
         self.max_body = 4194304
@@ -354,10 +355,10 @@ class FakePrefetches:
             aligned = 0
             off = r.ref.get("offset", 0)
             if r.length:
-                for p in range(off // PAGE, (off + r.length - 1) // PAGE + 1):
+                for p in range(off // self.page_size, (off + r.length - 1) // self.page_size + 1):
                     if (r.ref["key"], p) not in pages:
                         pages.add((r.ref["key"], p))
-                        aligned += PAGE
+                        aligned += self.page_size
             b["aligned_requested"] += aligned
             counts[r.outcome] += 1
             if r.outcome == "succeeded":

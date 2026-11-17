@@ -72,9 +72,9 @@ pub trait Origin {
         selector: MetadataSelector,
         scope: &'a RequestScope,
     ) -> Operation<'a, MetadataReply>;
-    /// The published cluster page size that sizes one page's plaintext reservation. Adapters
+    /// The effective cache page size that sizes one page's plaintext reservation. Adapters
     /// without a publication (test doubles) keep the default.
-    fn page_size(&self) -> Result<PageSize> {
+    fn page_size(&self, _cache: &racer_wire::control::CacheId) -> Result<PageSize> {
         Ok(PageSize::DEFAULT)
     }
 }
@@ -140,7 +140,7 @@ impl OriginClient {
     ) -> Result<MetadataReply> {
         scope.check()?;
         self.validate_reservation(&reservation, context)?;
-        let size = self.page_size()?;
+        let size = self.page_size(&context.object.cache)?;
         let mut head = request(context, "GET")?;
         // The first page, as the page fetch below would request it.
         head.headers.push(Header::new(
@@ -256,7 +256,7 @@ impl OriginClient {
         if page.version.object != context.object {
             return Err(Error::Unauthorized);
         }
-        let size = self.page_size()?;
+        let size = self.page_size(&context.object.cache)?;
         let first = page
             .number
             .0
@@ -296,7 +296,10 @@ impl OriginClient {
         reservation: &flow_control::Charge<AdmissionPolicy>,
         context: &OriginContext,
     ) -> Result<()> {
-        reservation.validate(ResourceClass::Plaintext, self.page_size()?.get() as usize)?;
+        reservation.validate(
+            ResourceClass::Plaintext,
+            self.page_size(&context.object.cache)?.get() as usize,
+        )?;
         if !self.admission.owns(reservation) || reservation.key() != Some(&context.object.cache) {
             return Err(Error::InvalidConfiguration);
         }
@@ -367,13 +370,13 @@ fn resolve_socket(root: &Path, cache: &CacheDefinition) -> Result<PathBuf> {
     Ok(endpoint)
 }
 impl Origin for OriginClient {
-    /// The published cluster page size; the default before any publication (callers that pass
+    /// The cache's effective page size; the default before any publication (callers that pass
     /// an explicit endpoint may run without one).
-    fn page_size(&self) -> Result<PageSize> {
+    fn page_size(&self, cache: &racer_wire::control::CacheId) -> Result<PageSize> {
         Ok(self
             .snapshots
             .current()?
-            .map_or(PageSize::DEFAULT, |snapshot| snapshot.page_size))
+            .map_or(PageSize::DEFAULT, |snapshot| snapshot.page_size_for(cache)))
     }
 
     fn bootstrap_reserved<'a>(

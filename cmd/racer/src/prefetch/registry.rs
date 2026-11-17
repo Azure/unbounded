@@ -112,6 +112,9 @@ impl UnitState {
 /// credential at most once.
 struct Unit {
     metadata: VersionMetadata,
+    /// Bytes in this unit's page. Resolved when the unit is created so
+    /// accounting never depends on the current per-cache setting.
+    page_size: PageSize,
     /// The first interested ref's origin metadata.
     ref_metadata: Option<String>,
     interest: BTreeSet<TicketKey>,
@@ -151,6 +154,8 @@ struct Ticket {
     hash: [u8; 32],
     ttl_seconds: u64,
     max_pending_bytes: u64,
+    /// Bytes in one of this ticket's pages, resolved at PUT.
+    page_size: PageSize,
     expires_at: Instant,
     expires_at_ms: u64,
     created_at_ms: u64,
@@ -184,6 +189,8 @@ pub struct Batch {
     pub metadata: VersionMetadata,
     pub context: Arc<UnitContext>,
     pub pages: Vec<u64>,
+    /// Bytes in one of this batch's pages, resolved when its ticket was put.
+    pub page_size: PageSize,
 }
 
 /// What a PUT does after the idempotency check.
@@ -208,8 +215,10 @@ pub struct Registry {
     rng: u64,
     events: Vec<CounterEvent>,
     finished: Vec<(Priority, Outcome)>,
-    /// Cluster page size refs are cut at.
+    /// Fallback page size for caches without their own setting.
     page: PageSize,
+    /// Page size of each cache that has its own setting.
+    pages: HashMap<CacheId, PageSize>,
 }
 
 /// Wall-clock milliseconds for status timestamps.
@@ -233,13 +242,35 @@ impl Registry {
             events: Vec::new(),
             finished: Vec::new(),
             page: PageSize::DEFAULT,
+            pages: HashMap::new(),
         }
     }
 
-    /// Cut refs into pages of `size`, the cluster page size. Set before the
-    /// first ticket; a cluster never changes its page size once adopted.
+    /// Cut refs into pages of `size` for caches without their own setting. Set
+    /// before the first ticket; a cache never changes its page size once
+    /// adopted.
     pub fn set_page_size(&mut self, size: PageSize) {
         self.page = size;
+    }
+
+    /// Cut `cache`'s refs into pages of `size`.
+    pub fn set_page_size_for(&mut self, cache: &CacheId, size: PageSize) {
+        self.pages.insert(cache.clone(), size);
+    }
+
+    /// Replace the fallback and every per-cache page size.
+    pub fn set_page_sizes(
+        &mut self,
+        fallback: PageSize,
+        sizes: impl IntoIterator<Item = (CacheId, PageSize)>,
+    ) {
+        self.page = fallback;
+        self.pages = sizes.into_iter().collect();
+    }
+
+    /// Page size refs of `cache` are cut at.
+    pub fn page_size_for(&self, cache: &CacheId) -> PageSize {
+        self.pages.get(cache).copied().unwrap_or(self.page)
     }
 
     pub fn configure(&mut self, config: Config) {
@@ -293,7 +324,7 @@ impl Registry {
                 .map(|t| t.priority)
                 .min()
                 .unwrap_or_default();
-            queued[priority.index()] += self.page.get();
+            queued[priority.index()] += unit.page_size.get();
         }
         (queued, tickets)
     }
@@ -411,6 +442,7 @@ impl Registry {
         }
         let key = (cache.clone(), id.to_owned());
         self.check_limits(&key)?;
+        let page = self.page_size_for(cache);
         let wall = wall_ms(&self.clock);
         let created = !self.tickets.contains_key(&key);
         if let Some(old) = self.tickets.get(&key) {
@@ -447,8 +479,7 @@ impl Registry {
                             .length
                             .map_or(length, |l| raw.offset.saturating_add(l).min(length));
                         entry.length = end - raw.offset;
-                        let page = self.page.get();
-                        entry.pages = raw.offset / page..end.div_ceil(page);
+                        entry.pages = raw.offset / page.get()..end.div_ceil(page.get());
                         logical = logical.saturating_add(entry.length);
                         for page in entry.pages.clone() {
                             let unit = UnitKey {
@@ -477,8 +508,8 @@ impl Registry {
                 .collect();
             let priority = old.priority;
             for unit in dropped {
-                if self.drop_interest(&key, &unit) {
-                    self.event(Counter::WindowDroppedBytes, priority, self.page.get());
+                if let Some(size) = self.drop_interest(&key, &unit) {
+                    self.event(Counter::WindowDroppedBytes, priority, size.get());
                 }
             }
         }
@@ -499,6 +530,7 @@ impl Registry {
             hash: spec.hash,
             ttl_seconds: spec.ttl_seconds,
             max_pending_bytes: spec.max_pending_bytes,
+            page_size: page,
             expires_at: now + Duration::from_secs(spec.ttl_seconds),
             expires_at_ms: wall + spec.ttl_seconds * 1000,
             created_at_ms: previous.as_ref().map_or(wall, |old| old.created_at_ms),
@@ -512,7 +544,7 @@ impl Registry {
             open: 0,
             in_flight_bytes: 0,
             logical_requested: logical,
-            aligned_requested: desired.len() as u64 * self.page.get(),
+            aligned_requested: desired.len() as u64 * page.get(),
             already_resident: 0,
             joined: 0,
             fetched: 0,
@@ -553,7 +585,7 @@ impl Registry {
                     // same way a window shrink does, or a queued unit with no
                     // interest is never dispatched and its page stays in
                     // `pending_bytes` forever.
-                    self.drop_interest(&key, &unit_key);
+                    let _ = self.drop_interest(&key, &unit_key);
                     ticket.rejected.insert(unit_key);
                 }
                 // Every credential so far was refused, and this PUT brings a
@@ -595,7 +627,7 @@ impl Registry {
                             t.rejected.insert(unit_key.clone());
                         }
                     }
-                    self.pending_bytes += self.page.get();
+                    self.pending_bytes += unit.page_size.get();
                     ticket.open += 1;
                 }
                 Some(unit) => {
@@ -603,13 +635,11 @@ impl Registry {
                     if unit.state.open() {
                         ticket.open += 1;
                     } else if unit.state == UnitState::Admitted && !already {
-                        ticket.already_resident += self.page.get();
-                        ticket.admitted += self.page.get();
-                        self.events.push((
-                            Counter::AlreadyResidentBytes,
-                            priority,
-                            self.page.get(),
-                        ));
+                        let size = unit.page_size.get();
+                        ticket.already_resident += size;
+                        ticket.admitted += size;
+                        self.events
+                            .push((Counter::AlreadyResidentBytes, priority, size));
                     }
                 }
                 None => {
@@ -617,6 +647,7 @@ impl Registry {
                         unit_key,
                         Unit {
                             metadata,
+                            page_size: page,
                             ref_metadata,
                             interest: BTreeSet::from([key.clone()]),
                             credential: None,
@@ -628,7 +659,7 @@ impl Registry {
                             dispatcher: None,
                         },
                     );
-                    self.pending_bytes += self.page.get();
+                    self.pending_bytes += page.get();
                     ticket.open += 1;
                 }
             }
@@ -659,27 +690,28 @@ impl Registry {
         }
     }
 
-    /// Remove `key`'s interest in `unit`. Returns whether a queued unit was
-    /// dropped because nothing else wants it.
-    fn drop_interest(&mut self, key: &TicketKey, unit_key: &UnitKey) -> bool {
+    /// Remove `key`'s interest in `unit`. Returns the page size of a queued
+    /// unit that was dropped because nothing else wants it.
+    fn drop_interest(&mut self, key: &TicketKey, unit_key: &UnitKey) -> Option<PageSize> {
         let Some(unit) = self.units.get_mut(unit_key) else {
-            return false;
+            return None;
         };
         unit.interest.remove(key);
         if !unit.interest.is_empty() {
-            return false;
+            return None;
         }
         match unit.state {
             // In-flight fills complete normally and are dropped then.
-            UnitState::InFlight => false,
+            UnitState::InFlight => None,
             UnitState::Queued => {
+                let size = unit.page_size;
                 self.units.remove(unit_key);
-                self.pending_bytes = self.pending_bytes.saturating_sub(self.page.get());
-                true
+                self.pending_bytes = self.pending_bytes.saturating_sub(size.get());
+                Some(size)
             }
             UnitState::Admitted | UnitState::Failed(_) => {
                 self.units.remove(unit_key);
-                false
+                None
             }
         }
     }
@@ -736,13 +768,14 @@ impl Registry {
     fn collect(&mut self, key: &TicketKey, now: Instant, max_pages: usize) -> Option<Batch> {
         const SCAN: usize = 8192;
         let ticket = self.tickets.get(key)?;
+        let page = ticket.page_size;
         let budget = ticket
             .max_pending_bytes
             .saturating_sub(ticket.in_flight_bytes);
         // An idle ticket may always dispatch one page, even under a bound
         // smaller than a page.
         let floor = usize::from(ticket.in_flight_bytes == 0);
-        let room = usize::try_from(budget / self.page.get())
+        let room = usize::try_from(budget / page.get())
             .unwrap_or(usize::MAX)
             .max(floor)
             .min(max_pages);
@@ -808,17 +841,19 @@ impl Registry {
             authorization: credential.clone(),
         });
         let mut pages = Vec::with_capacity(chosen.len());
+        let mut in_flight = 0u64;
         for unit_key in &chosen {
             let unit = self.units.get_mut(unit_key).expect("chosen unit");
             unit.state = UnitState::InFlight;
             unit.dispatcher = Some(key.clone());
             unit.credential = Some(credential.clone());
+            in_flight += unit.page_size.get();
             pages.push(unit_key.page);
         }
         pages.sort_unstable();
         pages.dedup();
         if let Some(ticket) = self.tickets.get_mut(key) {
-            ticket.in_flight_bytes += chosen.len() as u64 * self.page.get();
+            ticket.in_flight_bytes += in_flight;
         }
         Some(Batch {
             dispatcher: key.clone(),
@@ -826,6 +861,7 @@ impl Registry {
             metadata,
             context,
             pages,
+            page_size: page,
         })
     }
 
@@ -909,9 +945,10 @@ impl Registry {
         if unit.state != UnitState::InFlight {
             return;
         }
+        let page = unit.page_size;
         let dispatcher = unit.dispatcher.take();
         if let Some(ticket) = dispatcher.as_ref().and_then(|k| self.tickets.get_mut(k)) {
-            ticket.in_flight_bytes = ticket.in_flight_bytes.saturating_sub(self.page.get());
+            ticket.in_flight_bytes = ticket.in_flight_bytes.saturating_sub(page.get());
         }
         let dispatch_priority = dispatcher
             .as_ref()
@@ -953,7 +990,7 @@ impl Registry {
                         .is_some_and(|u| u.interest.is_empty())
                     {
                         self.units.remove(unit_key);
-                        self.pending_bytes = self.pending_bytes.saturating_sub(self.page.get());
+                        self.pending_bytes = self.pending_bytes.saturating_sub(page.get());
                     }
                     return;
                 }
@@ -963,7 +1000,7 @@ impl Registry {
         unit.state = next;
         unit.owner = owner;
         unit.not_before = None;
-        self.pending_bytes = self.pending_bytes.saturating_sub(self.page.get());
+        self.pending_bytes = self.pending_bytes.saturating_sub(page.get());
         let interested: Vec<TicketKey> = unit.interest.iter().cloned().collect();
         let resident = outcome == UnitOutcome::Resident;
         for key in &interested {
@@ -973,20 +1010,20 @@ impl Registry {
             ticket.open = ticket.open.saturating_sub(1);
             let priority = ticket.priority;
             if next == UnitState::Admitted {
-                ticket.admitted += self.page.get();
+                ticket.admitted += page.get();
                 let counter = if resident {
-                    ticket.already_resident += self.page.get();
+                    ticket.already_resident += page.get();
                     Counter::AlreadyResidentBytes
                 } else if Some(key) == dispatcher.as_ref() {
-                    ticket.fetched += self.page.get();
+                    ticket.fetched += page.get();
                     Counter::FetchedBytes
                 } else {
-                    ticket.joined += self.page.get();
+                    ticket.joined += page.get();
                     Counter::JoinedBytes
                 };
-                self.events.push((counter, priority, self.page.get()));
+                self.events.push((counter, priority, page.get()));
                 self.events
-                    .push((Counter::AdmittedBytes, priority, self.page.get()));
+                    .push((Counter::AdmittedBytes, priority, page.get()));
             }
         }
         if interested.is_empty() {
@@ -1029,17 +1066,20 @@ impl Registry {
                 unit.attempts = 0;
                 unit.not_before = None;
                 unit.owner = None;
-                requeued.push(unit.interest.iter().cloned().collect::<Vec<_>>());
+                requeued.push((
+                    unit.interest.iter().cloned().collect::<Vec<_>>(),
+                    unit.page_size,
+                ));
             }
         }
-        for interested in requeued {
-            self.pending_bytes += self.page.get();
+        for (interested, page) in requeued {
+            self.pending_bytes += page.get();
             for key in interested {
                 if let Some(ticket) = self.tickets.get_mut(&key) {
                     ticket.open += 1;
                     ticket.cursor = 0;
                     ticket.finished_recorded = false;
-                    ticket.admitted = ticket.admitted.saturating_sub(self.page.get());
+                    ticket.admitted = ticket.admitted.saturating_sub(page.get());
                 }
                 self.schedule(&key);
             }
@@ -1057,7 +1097,7 @@ impl Registry {
         let frozen = self.ref_outcomes(ticket);
         let units = ticket.units.clone();
         for unit in &units {
-            self.drop_interest(key, unit);
+            let _ = self.drop_interest(key, unit);
         }
         let retention = Duration::from_secs(self.config.ticket_retention_secs);
         if let Some(ticket) = self.tickets.get_mut(key) {
@@ -1271,7 +1311,7 @@ impl Registry {
             .iter()
             .zip(&ticket.refs)
             .filter(|((o, _), _)| *o == RefOutcome::Failed)
-            .map(|(_, r)| (r.pages.end - r.pages.start) * self.page.get())
+            .map(|(_, r)| (r.pages.end - r.pages.start) * ticket.page_size.get())
             .sum()
     }
 
@@ -1284,9 +1324,13 @@ impl Registry {
                 .iter()
                 .filter(|k| !ticket.rejected.contains(*k))
             {
-                match self.units.get(key).map(|u| u.state) {
-                    Some(UnitState::Queued) => queued += self.page.get(),
-                    Some(UnitState::InFlight) => in_flight += self.page.get(),
+                match self.units.get(key) {
+                    Some(unit) if unit.state == UnitState::Queued => {
+                        queued += unit.page_size.get();
+                    }
+                    Some(unit) if unit.state == UnitState::InFlight => {
+                        in_flight += unit.page_size.get();
+                    }
                     _ => {}
                 }
             }

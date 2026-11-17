@@ -679,6 +679,7 @@ fn optional_persistence_owned_dirty_pressure_keeps_disk_share_order() {
         priority,
         mode: racer_wire::control::CacheMode::Cached,
         origin: None,
+        page_size: None,
     };
     let weigh = |under_priority, over_priority| {
         policy.weights().update(&[
@@ -2957,6 +2958,7 @@ mod pressure {
                 priority,
                 mode: racer_wire::control::CacheMode::Cached,
                 origin: None,
+                page_size: None,
             };
             let weigh = |under_priority, over_priority| {
                 admission.policy().weights().update(&[
@@ -3410,6 +3412,7 @@ impl Fixture {
                 priority: racer_wire::control::DEFAULT_PRIORITY,
                 mode: racer_wire::control::CacheMode::Cached,
                 origin: None,
+                page_size: None,
             }],
             page_size: racer_wire::object::PageSize::DEFAULT,
         };
@@ -3792,6 +3795,7 @@ pub(super) fn adapter_client(
                     priority: racer_wire::control::DEFAULT_PRIORITY,
                     mode: racer_wire::control::CacheMode::Cached,
                     origin: None,
+                    page_size: None,
                 }],
                 page_size: racer_wire::object::PageSize::DEFAULT,
             }
@@ -6562,7 +6566,10 @@ impl Origin for SizedOrigin {
     ) -> Operation<'a, OriginPage> {
         unreachable!("the reservation test does not fetch")
     }
-    fn page_size(&self) -> crate::error::Result<racer_wire::object::PageSize> {
+    fn page_size(
+        &self,
+        _: &racer_wire::control::CacheId,
+    ) -> crate::error::Result<racer_wire::object::PageSize> {
         Ok(self.0)
     }
 }
@@ -6575,7 +6582,10 @@ fn small_page_cluster_reserves_page_sized_plaintext() {
     let small = racer_wire::object::PageSize::new(64 << 10).unwrap();
     let mut f = fixture(&env);
     f.fill.dependencies.origin = Rc::new(SizedOrigin(small));
-    assert_eq!(f.fill.page_plaintext_bytes(), Ok(64 << 10));
+    assert_eq!(
+        f.fill.page_plaintext_bytes(&f.context.object.cache),
+        Ok(64 << 10)
+    );
     let bootstrap = f.fill.reserve_bootstrap(&f.context.object.cache).unwrap();
     assert_eq!(bootstrap.amount(), 64 << 10);
     let network =

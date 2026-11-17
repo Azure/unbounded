@@ -32,6 +32,7 @@ const (
 	RacerCacheName = "gantry"
 
 	racerEnabledEnv    = "GANTRY_RACER_ENABLED"
+	racerPageSizeEnv   = "GANTRY_RACER_PAGE_SIZE"
 	racerClientVolume  = "racer-client"
 	racerOriginVolume  = "racer-origin"
 	reasonRacerPending = "RacerPending"
@@ -58,40 +59,44 @@ func racerSocketDir(role string) string {
 // exist yet, so no safe placement is known and the caller must wait.
 // conflict=true means the cache sets spec.origin; Racer then runs its own
 // origin on the Gantry origin socket, so Gantry stays in default mode.
-func racerMode(ctx context.Context, env *component.Env) (requested, conflict bool, placement *workload.NodePlacement, err error) {
+func racerMode(ctx context.Context, env *component.Env) (requested, conflict bool, placement *workload.NodePlacement, pageSize string, err error) {
 	cache := &racerv1.ClusterCache{}
 
 	err = env.LiveReader().Get(ctx, client.ObjectKey{Name: RacerCacheName}, cache)
 	if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
-		return false, false, nil, nil
+		return false, false, nil, "", nil
 	}
 
 	if err != nil {
-		return false, false, nil, fmt.Errorf("get ClusterCache/%s: %w", RacerCacheName, err)
+		return false, false, nil, "", fmt.Errorf("get ClusterCache/%s: %w", RacerCacheName, err)
 	}
 
 	if cache.DeletionTimestamp != nil {
-		return false, false, nil, nil
+		return false, false, nil, "", nil
+	}
+
+	if cache.Spec.PageSize != nil {
+		pageSize = string(*cache.Spec.PageSize)
 	}
 
 	if cache.Spec.Origin != nil {
-		return false, true, nil, nil
+		return false, true, nil, pageSize, nil
 	}
 
 	ds := &appsv1.DaemonSet{}
 
 	err = env.LiveReader().Get(ctx, client.ObjectKey{Namespace: env.Namespace, Name: workload.DataplaneDaemonSetName}, ds)
 	if apierrors.IsNotFound(err) {
-		return true, false, nil, nil
+		return true, false, nil, pageSize, nil
 	}
 
 	if err != nil {
-		return false, false, nil, fmt.Errorf("get DaemonSet/%s placement: %w", workload.DataplaneDaemonSetName, err)
+		return false, false, nil, "", fmt.Errorf("get DaemonSet/%s placement: %w", workload.DataplaneDaemonSetName, err)
 	}
 
 	got := workload.PlacementOf(&ds.Spec.Template.Spec)
 
-	return true, false, &got, nil
+	return true, false, &got, pageSize, nil
 }
 
 // racerPending is the result while Gantry waits for Racer to deploy its
@@ -115,7 +120,7 @@ func racerOriginConflict() component.Result {
 // every node that runs the dataplane, and only there. The socket directories
 // are mounted with hostPath type Directory, so a Pod scheduled before Racer
 // creates them waits instead of creating root-owned directories.
-func applyRacerMode(obj *unstructured.Unstructured, placement *workload.NodePlacement) error {
+func applyRacerMode(obj *unstructured.Unstructured, placement *workload.NodePlacement, pageSize string) error {
 	containers, _, err := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", "containers")
 	if err != nil {
 		return fmt.Errorf("get gantry containers: %w", err)
@@ -133,6 +138,12 @@ func applyRacerMode(obj *unstructured.Unstructured, placement *workload.NodePlac
 
 		if err := upsertNamed(container, "env", &corev1.EnvVar{Name: racerEnabledEnv, Value: "true"}); err != nil {
 			return err
+		}
+
+		if pageSize != "" {
+			if err := upsertNamed(container, "env", &corev1.EnvVar{Name: racerPageSizeEnv, Value: pageSize}); err != nil {
+				return err
+			}
 		}
 
 		for _, mount := range []corev1.VolumeMount{

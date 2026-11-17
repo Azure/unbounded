@@ -491,6 +491,8 @@ struct PendingVersion {
     metadata: VersionMetadata,
     /// The key of every queued page, or `None` once two keys were seen.
     key: Option<racer_wire::control::KeyId>,
+    /// The page size of every queued page, or `None` once two sizes were seen.
+    page_size: Option<racer_wire::object::PageSize>,
 }
 
 /// Queued dirty copies keyed by page, with a per-version summary kept in step
@@ -516,10 +518,12 @@ impl PendingWrites {
 
     fn insert(&mut self, page: PageId, dirty: Dirty) {
         let key = dirty.page.ciphertext.envelope().key_id;
+        let page_size = dirty.page.ciphertext.envelope().page_size;
         match self.versions.get_mut(&page.version) {
             Some(version) => {
                 version.pages += 1;
                 version.key = version.key.filter(|known| *known == key);
+                version.page_size = version.page_size.filter(|known| *known == page_size);
             }
             None => {
                 self.versions.insert(
@@ -528,6 +532,7 @@ impl PendingWrites {
                         pages: 1,
                         metadata: dirty.page.metadata.immutable(),
                         key: Some(key),
+                        page_size: Some(page_size),
                     },
                 );
             }
@@ -769,7 +774,9 @@ impl StoreWriter {
     fn allowed(&self, page: &CiphertextCopy) -> bool {
         let e = page.ciphertext.envelope();
         let cache = &e.page.version.object.cache;
-        self.availability.page(cache, e.key_id) && !self.availability.passthrough(cache)
+        self.availability.page(cache, e.key_id)
+            && !self.availability.passthrough(cache)
+            && self.availability.page_size(cache) == e.page_size
     }
     pub fn enqueue(
         &self,
@@ -1139,11 +1146,13 @@ impl StoreWriter {
             return Ok(None);
         };
         let cache = &version.object.cache;
-        let allowed = match entry.key {
-            Some(key) => {
-                self.availability.page(cache, key) && !self.availability.passthrough(cache)
+        let allowed = match (entry.key, entry.page_size) {
+            (Some(key), Some(page_size)) => {
+                self.availability.page(cache, key)
+                    && !self.availability.passthrough(cache)
+                    && self.availability.page_size(cache) == page_size
             }
-            None => pending
+            _ => pending
                 .pages
                 .iter()
                 .any(|(p, d)| &p.version == version && self.allowed(&d.page)),

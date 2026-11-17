@@ -19,7 +19,7 @@ See [Racer concepts]({{< relref "concepts/racer" >}}) and the [Azure Blob cache 
 | API | `racer.unbounded-cloud.io/v1alpha1`, kind `ClusterCache` |
 | Resource / short name | `clustercaches` / `ccache` |
 | Scope | Cluster-scoped |
-| Fields | Optional `spec.origin` for an Azure Blob origin that the dataplane reads directly; optional `spec.priority` for the cache's share of node capacity; optional `spec.passthrough` to proxy reads without caching; optional `spec.nodeSelector` to limit the cache to some nodes; no `status` |
+| Fields | Optional `spec.origin` for an Azure Blob origin that the dataplane reads directly; optional `spec.pageSize` for the cache's logical page size; optional `spec.priority` for the cache's share of node capacity; optional `spec.passthrough` to proxy reads without caching; optional `spec.nodeSelector` to limit the cache to some nodes; no `status` |
 | Name | DNS subdomain, at most 82 characters total and 63 per dot-separated label |
 | Identity | Kubernetes UID, not name; deleting and recreating a cache creates a new identity |
 
@@ -45,6 +45,37 @@ wire cache identity (`CacheID`).
 
 Pod mounts grant access: expose only the needed cache/role. Origins need existing trusted
 parent directories. Clients do not automatically bypass Racer to connect directly to origins.
+
+### Page size
+
+`spec.pageSize` sets the cache's logical page size. It is one of `4KiB`,
+`8KiB`, `16KiB`, `32KiB`, `64KiB`, `128KiB`, `256KiB`, `512KiB`, `1MiB`,
+`2MiB`, `4MiB`, `8MiB`, or `16MiB`. Unset uses the cluster default,
+`RACER_PAGE_BYTES`, currently 16 MiB. The default is fixed for the life of the
+cluster.
+
+```yaml
+apiVersion: racer.unbounded-cloud.io/v1alpha1
+kind: ClusterCache
+metadata:
+  name: artifacts
+spec:
+  pageSize: 1MiB
+```
+
+The dataplane uses this size for page, range, and credit accounting; origin
+fetches; prefetch; and stored records. Each cache keeps its own size, so one
+node can serve caches of different sizes.
+
+The field is immutable: you cannot add, change, or remove it on an existing
+cache. To change the size, delete the ClusterCache and create a new one. The new
+cache has a new UID and starts cold.
+
+Racer does not advertise the page size to clients; there is no page-size
+response header. Configure every client to match the cache out of band:
+`ClientConfig.PageSize` in the Go SDK, `page_size` in the Python client, and
+`--page-size` in `racer-object`. Each defaults to 16 MiB. A mismatch affects
+subscriptions that span a page boundary.
 
 ### Priority
 
@@ -390,7 +421,7 @@ each worker and are never divided.
 | `RACER_SLAB_BYTES_PER_WORKER` | `17179869184` (16 GiB) | Per I/O worker | 1..9,223,372,036,854,775,807 bytes | File-backed slab size of each I/O worker; a multiple of `RACER_SEGMENT_BYTES`. Does not limit device-mode capacity. |
 | `RACER_SEGMENT_BYTES` | `1073741824` (1 GiB) | Node | 16,797,712..9,223,372,036,854,775,807 bytes | Segment size; must fit one page plus storage overhead. |
 | `RACER_FREE_SEGMENT_RESERVE_PER_WORKER` | `2` | Per I/O worker | 1..1,048,575 | Reserved free segments in each I/O worker, fewer than that worker's segments. |
-| `RACER_DISK_PAGE_ENTRIES` | `65536` | Node | 1..1,048,576 | Disk page-index budget in file mode; device mode can raise it. |
+| `RACER_DISK_PAGE_ENTRIES` | `65536` | Node | 1..1,048,576 | Total disk page-index budget in file mode, divided equally among the active page-size classes; device mode can raise it. With a single page-size class this matches the previous behavior. Small pages use one entry per object, so a git-like cache needs a much higher count: 1,048,576 entries at 4 KiB is about 4 GiB. |
 | `RACER_CHECKPOINT_BYTES` | `67108864` (64 MiB) | Node | 1..536,870,912 bytes | Checkpoint working-set budget; device mode can raise it. |
 | `RACER_RETAINED_SEGMENT_PERCENT` | `50` | Per I/O worker | 1..100 % | Spill-hold cap of each I/O worker, as a percentage of its segments and page-index capacity. |
 | `RACER_RANGE_SPILL_PAGES` | `0` | Node | 0..1,024 | Pages past the read window that a read may fetch to local disk under a short hold; `0` disables spill. |
@@ -522,7 +553,7 @@ each worker and are never divided.
 | `RACER_WEBHOOK_LISTEN` | `:9443` | Node | `ip:port` | Object sidecar admission webhook listener. `:port` binds every IPv4 address. |
 | `RACER_OBJECT_IMAGE` | Unset: webhook serving off | Node | image reference | Image injected as the object sidecar. |
 | `RACER_RETAINED_PAGE_KEYS` | `7` | Node | 1..16 | Readable page keys per cache: the active key plus older decrypt keys. Read by the authority. Lowering it never drops keys at once: extra decrypt keys are dropped at the next key rotation. |
-| `RACER_PAGE_BYTES` | `16777216` (16 MiB) | Node | 16,777,216..16,777,216 bytes | Cluster-wide logical page size. Only 16777216 (16 MiB) is accepted: the client SDKs and the disk index do not yet support other sizes. Fixed at cluster creation: the authority publishes the value of the primary that made the first publication, records it in the `racer-state` Secret, and ignores later changes with a warning in the primary's log. Running nodes reject a publication that changes it. |
+| `RACER_PAGE_BYTES` | `16777216` (16 MiB) | Node | 16,777,216..16,777,216 bytes | Cluster-default logical page size, used by caches without `spec.pageSize`. Only 16777216 (16 MiB) is accepted; an individual cache can set another size through `spec.pageSize`. Fixed at cluster creation: the authority publishes the value of the primary that made the first publication, records it in the `racer-state` Secret, and ignores later changes with a warning in the primary's log. Running nodes reject a publication that changes this default. |
 | `RACER_KUBE_API_CA` | `/var/run/secrets/kubernetes.io/serviceaccount/ca.crt` | Node | absolute path | Kubernetes API CA bundle. |
 | `RACER_KUBE_API_TOKEN` | `/var/run/secrets/kubernetes.io/serviceaccount/token` | Node | absolute path | Default-audience token, used only for the Kubernetes API. |
 | `RACER_DAEMONSET` | `racer` | Node | DNS label | Dataplane DaemonSet name. |
@@ -837,7 +868,7 @@ stored like any other cached page and can be evicted later.
 Prefetch uses a JSON API on the client socket
 (`/run/racer/<cache>/client/socket`) with HTTP/1.1 and `Host: racer`, like
 object reads. A client submits a ticket that lists object ranges. The node finds
-the missing 16 MiB pages and asks each page's owner to fill it through the
+the missing pages and asks each page's owner to fill it through the
 normal fill path. Tickets live in memory on the node that received them. A
 restart loses them; submit the same ticket again and only missing pages are
 loaded.
@@ -994,7 +1025,7 @@ A ref succeeds when every one of its pages was stored or already present at an
 owner when the ticket settled. Success does not mean the pages stay in the
 cache; normal eviction can remove them later.
 
-`bytes` values are 16 MiB aligned except `logical_requested`:
+`bytes` values are page aligned except `logical_requested`:
 
 | Field | Meaning |
 |-------|---------|
@@ -1257,9 +1288,10 @@ reads, and trims nothing.
 
 On raw devices, each segment holds only whole page records (the page plus a
 small header), so the rest of each segment is unused (`racer_segment_tail_bytes`).
-With 16 MiB pages, a 64 MiB segment fits three records and leaves about 25% of
-the device unused. Racer logs a warning at startup when the unused share is 10%
-or more. The 1 GiB default fits 63 records and leaves under 2% unused.
+With the default 16 MiB pages, a 64 MiB segment fits three records and leaves
+about 25% of the device unused. Racer logs a warning at startup when the unused
+share is 10% or more. The 1 GiB default fits 63 records and leaves under 2%
+unused.
 
 `reason` takes these values:
 
@@ -1737,15 +1769,37 @@ saved.
 New installs seed `RACER_SEGMENT_BYTES` at 1 GiB and
 `RACER_SLAB_BYTES_PER_WORKER` at 4 GiB; earlier releases seeded 64 MiB and
 1 GiB, and an upgrade keeps those values. A 64 MiB segment holds only three
-16 MiB page records, wasting about a quarter of each device and leaving a small
-free-segment reserve. To adopt the new geometry on an existing install, edit
-both keys in `racer-settings`; this changes storage geometry and starts a cold
-cache. Keys absent from
-`racer-settings` take the dataplane defaults of the new release.
+default-size page records, wasting about a quarter of each device and leaving a
+small free-segment reserve. To adopt the new geometry on an existing install,
+edit both keys in `racer-settings`; this changes storage geometry and starts a
+cold cache. Keys absent from `racer-settings` take the dataplane defaults of the
+new release.
 
 Expect a cold cache after changing device layout,
 worker count, or storage geometry. Recovery does not scan payloads to rebuild
 the cache. Make sure origins can serve the resulting misses.
+
+### Page-size rollout
+
+A cluster that uses only the default page size remains wire-compatible: the
+per-cache `page_bytes` control field is optional and is omitted when a cache
+uses the cluster default, so old and new nodes publish the same bytes. This
+compatibility covers publication bytes only; the general guidance to run one
+version and quiesce traffic still applies.
+
+A cache with a non-default `spec.pageSize` is not compatible with older
+dataplanes. Upgrade in this order:
+
+1. Upgrade the authority.
+2. Upgrade every dataplane node.
+3. Create caches with a non-default `spec.pageSize`.
+
+An older node rejects a publication that introduces a non-default cache.
+Checkpoints are format version 4 for default-only cuts and version 5 for cuts
+that contain non-default page sizes. New nodes read version 4, so existing
+checkpoint state survives a rolling upgrade. A node never reinterprets pages
+cut at one size as another size; a cache recreated at a different page size
+starts cold.
 
 ## Go SDK
 
@@ -1754,6 +1808,16 @@ The Go SDK is `github.com/Azure/unbounded/pkg/racersdk`. Its
 is the complete SDK reference, including configuration, the copy and no-copy read
 paths, the origin contract, and error handling. The SDK does not provision caches
 or origins.
+
+### Page size in the SDKs
+
+`ClientConfig.PageSize` sets the cache's logical page size. Zero uses the 16 MiB
+default. Set it to the same size as the ClusterCache `spec.pageSize`, or leave
+both unset for the default. The dataplane does not report its page size, so this
+setting is the only way the client learns it.
+
+The Python client takes the same value as `racer.Client(cache="artifacts",
+page_size=...)`. The `racer-object` sidecar takes it as `--page-size`.
 
 ### Prefetch
 

@@ -214,6 +214,10 @@ These flags help when many nodes load one very large blob, such as 1 TB:
 - `--page-credits=N` (UDS only, 0-64) sets how many pages Racer may send ahead
   of each read. The dataplane's fetch window for a read is the smaller of this
   and `RACER_RANGE_WINDOW_PAGES`; 0 keeps the SDK default of 2.
+- `--page-size=N` sets the cache's logical page size in bytes for UDS SDK
+  reads and for integrity diagnostics. It must be a power of two from 4096
+  through 16777216 and match the ClusterCache `spec.pageSize`. Zero keeps the
+  SDK default of 16 MiB.
 - `--range-bytes=N` (UDS only, requires `--verify=false` unless
   `--delivery=host-read`) reads each blob as
   byte ranges pinned to one ETag. `--range-parallel` ranges run at once (raise

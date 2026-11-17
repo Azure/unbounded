@@ -42,8 +42,13 @@ type ClientConfig struct {
 	// each [Client.Get]. Racer's fetch window for a read is the smaller of
 	// this and its RACER_RANGE_WINDOW_PAGES, so it bounds single-read
 	// throughput. Zero means 2; the maximum is 64. Each credit lets Racer hold
-	// one more 16 MiB page for the read.
+	// one more page for the read.
 	PageCredits int
+	// PageSize is the cache's logical page size in bytes. It must be a power
+	// of two from 4 KiB through 16 MiB and match the ClusterCache spec.pageSize.
+	// Zero means 16 MiB. Racer does not report its page size, so a mismatch is
+	// not detected until a subscription spans a page boundary.
+	PageSize int
 }
 
 // Internal limits. Stat and small-object reads have their own lanes so they
@@ -88,10 +93,11 @@ var defaultClientLimits = clientLimits{
 // Client reads objects from a Racer cache over its local Unix socket. It is
 // safe for concurrent use; create one per cache and share it.
 type Client struct {
-	path    string
-	limits  clientLimits
-	maxIdle int
-	credits int
+	path     string
+	limits   clientLimits
+	maxIdle  int
+	credits  int
+	pageSize uint64
 
 	bulk, small, stat lane
 
@@ -146,18 +152,23 @@ func newClient(config ClientConfig, path string) (*Client, error) {
 		config.PageCredits = defaultPageCredits
 	}
 
+	if !validPageSize(config.PageSize) {
+		return nil, invalid("client config", errors.New("PageSize must be a power of two in [4 KiB, 16 MiB]"))
+	}
+
 	ctx, cancel := context.WithCancelCause(context.Background())
 
 	return &Client{
-		path:    path,
-		limits:  defaultClientLimits,
-		credits: config.PageCredits,
-		maxIdle: min(statIdleConnections, config.MaxConnections),
-		bulk:    newLane(config.MaxConnections, bulkQueue),
-		small:   newLane(smallConnections, smallQueue),
-		stat:    newLane(config.MaxConnections, statQueue),
-		ctx:     ctx,
-		cancel:  cancel,
+		path:     path,
+		limits:   defaultClientLimits,
+		credits:  config.PageCredits,
+		pageSize: pageSizeBytes(config.PageSize),
+		maxIdle:  min(statIdleConnections, config.MaxConnections),
+		bulk:     newLane(config.MaxConnections, bulkQueue),
+		small:    newLane(smallConnections, smallQueue),
+		stat:     newLane(config.MaxConnections, statQueue),
+		ctx:      ctx,
+		cancel:   cancel,
 	}, nil
 }
 
@@ -357,7 +368,8 @@ func (c *Client) Get(ctx context.Context, request Request, options ...ReadOption
 		Offset:      uint64(o.Offset),
 		Length:      uint64(o.Length),
 		PageCredits: c.credits,
-		ByteCredits: uint64(c.credits) * PageSize,
+		ByteCredits: uint64(c.credits) * c.pageSize,
+		PageSize:    c.pageSize,
 		SmallObject: o.SmallObject,
 		Pin:         o.ETag,
 	}
@@ -445,7 +457,7 @@ func (c *Client) open(ctx context.Context, head []byte, o wire.SubscriptionOptio
 		conn:     conn,
 		timeout:  c.limits.bodyTimeout,
 		metadata: fromWireMetadata(response.Metadata),
-		seq:      wire.NewSequence(response.First, response.End),
+		seq:      wire.NewSequence(response.First, response.End, o.PageSize),
 		first:    response.First,
 		end:      response.End,
 		pages:    response.Pages,

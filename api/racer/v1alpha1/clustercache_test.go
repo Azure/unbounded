@@ -97,6 +97,53 @@ func TestClusterCachePriorityJSONDeepCopyAndDefault(t *testing.T) {
 	require.Equal(t, DefaultPriority, unset.Spec.EffectivePriority())
 }
 
+func TestClusterCachePageSizeJSONDeepCopyAndBytes(t *testing.T) {
+	sizes := map[PageSize]uint64{
+		PageSize4KiB:   4 << 10,
+		PageSize8KiB:   8 << 10,
+		PageSize16KiB:  16 << 10,
+		PageSize32KiB:  32 << 10,
+		PageSize64KiB:  64 << 10,
+		PageSize128KiB: 128 << 10,
+		PageSize256KiB: 256 << 10,
+		PageSize512KiB: 512 << 10,
+		PageSize1MiB:   1 << 20,
+		PageSize2MiB:   2 << 20,
+		PageSize4MiB:   4 << 20,
+		PageSize8MiB:   8 << 20,
+		PageSize16MiB:  16 << 20,
+	}
+	require.Len(t, sizes, 13)
+	for size, want := range sizes {
+		require.Equal(t, want, size.Bytes(), "%s", size)
+	}
+	require.Zero(t, PageSize("3KiB").Bytes())
+	require.Zero(t, PageSize("").Bytes())
+
+	pageSize := PageSize4KiB
+	cache := &ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "cache"}, Spec: ClusterCacheSpec{PageSize: &pageSize}}
+	data, err := json.Marshal(cache)
+	require.NoError(t, err)
+	require.JSONEq(t, `{"metadata":{"name":"cache"},"spec":{"pageSize":"4KiB"}}`, string(data))
+
+	decoded := &ClusterCache{}
+	require.NoError(t, json.Unmarshal(data, decoded))
+	require.Equal(t, cache, decoded)
+	require.Equal(t, uint64(4<<10), decoded.Spec.PageSize.Bytes())
+
+	copy := cache.DeepCopy()
+	*copy.Spec.PageSize = PageSize16MiB
+	require.Equal(t, PageSize4KiB, *cache.Spec.PageSize)
+
+	unset := &ClusterCache{}
+	require.NoError(t, json.Unmarshal([]byte(`{"metadata":{"name":"cache"},"spec":{}}`), unset))
+	require.Nil(t, unset.Spec.PageSize)
+
+	data, err = json.Marshal(&ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "cache"}})
+	require.NoError(t, err)
+	require.NotContains(t, string(data), "pageSize")
+}
+
 func TestClusterCachePassthroughJSONDeepCopyAndDefault(t *testing.T) {
 	route, ok := ClusterCacheSpec{}.EffectivePassthroughRoute()
 	require.False(t, ok)

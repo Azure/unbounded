@@ -332,7 +332,10 @@ fn owner_refuses_a_fill_cut_at_another_page_size() {
     let membership = pooled_membership(&mut f, &signers, &[0]);
     let (local, mut endpoint, _publication) =
         coordinator(&env, &f, &signers[0], &membership, NoPeer::requester(&env));
-    assert_eq!(local.page_size(), Ok(crate::model::PageSize::DEFAULT));
+    assert_eq!(
+        local.page_size(&f.context.object.cache),
+        Ok(crate::model::PageSize::DEFAULT)
+    );
     let context = crate::security::OriginContext {
         object: f.context.object.clone(),
         metadata: None,

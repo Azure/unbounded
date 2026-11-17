@@ -261,6 +261,7 @@ mod tests {
             priority: wire::DEFAULT_PRIORITY,
             mode: wire::CacheMode::Cached,
             origin: None,
+            page_size: None,
         }
     }
 

@@ -364,6 +364,7 @@ mod tests {
             priority,
             mode: racer_wire::control::CacheMode::Cached,
             origin: None,
+            page_size: None,
         }
     }
 

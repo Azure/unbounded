@@ -28,11 +28,17 @@ Use `--api=s3` (the default) for S3 clients. Mount the cache's Racer client
 socket directory into the sidecar container. The sidecar connects to
 `/run/racer/<cache>/client/socket`.
 
-Flags: `--cache` (required), `--api`,
+Flags: `--cache` (required), `--api`, `--page-size`,
 `--listen` (loopback IP and port), `--request-timeout`, `--max-connections`,
 `--workers` (see [Workers](#workers)), `--debug-listen`, and `--version`. `--flag=value`, `--flag value`, and a
 single dash all work. Invalid arguments print `racer-object: <message>` and
 exit with status 1.
+
+`--page-size` is the cache's logical page size, `4KiB` through `16MiB`, and must
+match the ClusterCache `spec.pageSize`; it defaults to `16MiB` and can also be
+set with `RACER_OBJECT_PAGE_SIZE`. Racer does not report its page size, so the
+sidecar cannot discover it. A mismatch affects subscriptions that span a page
+boundary.
 
 ## Build and test
 
@@ -59,7 +65,8 @@ shutdown. Reads through a real Racer are covered by the kind-based suite in
   as `internal/racerobject`, and its SHA-256 key).
 - `src/racer.rs`: Racer client socket protocol. Metadata `HEAD` requests reuse
   at most four idle connections in total, shared by all workers. Reads are credit-paced
-  subscriptions on their own connection, with frame checks.
+  subscriptions on their own connection, with frame checks at the configured
+  page size.
 - `src/server.rs`: a small HTTP/1.1 server with keep-alive and pipelining, and
   the request flow.
 - `src/splice.rs`: the zero-copy body path.

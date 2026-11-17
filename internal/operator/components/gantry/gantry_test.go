@@ -195,7 +195,7 @@ func TestApplyMutatorStampsDaemonSetAndSkipsConfig(t *testing.T) {
 		}},
 	}}
 
-	if err := applyMutator("ghcr.io/azure/gantry:test", "ghcr.io/azure/gantry-node-config:test", "gantry-hash", artifactStreamingConfig{}, nil)(ds); err != nil {
+	if err := applyMutator("ghcr.io/azure/gantry:test", "ghcr.io/azure/gantry-node-config:test", "gantry-hash", artifactStreamingConfig{}, nil, "")(ds); err != nil {
 		t.Fatalf("applyMutator: %v", err)
 	}
 
@@ -207,7 +207,7 @@ func TestApplyMutatorStampsDaemonSetAndSkipsConfig(t *testing.T) {
 	config := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "v1", "kind": "ConfigMap", "metadata": map[string]any{"name": configName},
 	}}
-	if err := applyMutator("ghcr.io/azure/gantry:test", "ghcr.io/azure/gantry-node-config:test", "gantry-hash", artifactStreamingConfig{}, nil)(config); err != nil || config.Object != nil {
+	if err := applyMutator("ghcr.io/azure/gantry:test", "ghcr.io/azure/gantry-node-config:test", "gantry-hash", artifactStreamingConfig{}, nil, "")(config); err != nil || config.Object != nil {
 		t.Fatalf("gantry ConfigMap was not skipped: err=%v object=%#v", err, config.Object)
 	}
 }
@@ -266,7 +266,7 @@ func TestApplyMutatorImagesOnlyGantryContainers(t *testing.T) {
 		}},
 	}}
 
-	if err := applyMutator(derived, "ghcr.io/azure/gantry-node-config:v1.2.3", "h", artifactStreamingConfig{}, nil)(agent); err != nil {
+	if err := applyMutator(derived, "ghcr.io/azure/gantry-node-config:v1.2.3", "h", artifactStreamingConfig{}, nil, "")(agent); err != nil {
 		t.Fatalf("applyMutator: %v", err)
 	}
 
@@ -298,7 +298,7 @@ func TestApplyMutatorImagesOnlyGantryContainers(t *testing.T) {
 		}},
 	}}
 
-	if err := applyMutator(derived, "ghcr.io/azure/gantry-node-config:v1.2.3", "h", artifactStreamingConfig{}, nil)(nodeDS); err != nil {
+	if err := applyMutator(derived, "ghcr.io/azure/gantry-node-config:v1.2.3", "h", artifactStreamingConfig{}, nil, "")(nodeDS); err != nil {
 		t.Fatalf("applyMutator node-config: %v", err)
 	}
 
@@ -340,7 +340,7 @@ func TestApplyMutatorEnablesArtifactStreaming(t *testing.T) {
 		}},
 	}}
 
-	mutate := applyMutator("gantry:test", "gantry-node-config:test", "hash", artifact, nil)
+	mutate := applyMutator("gantry:test", "gantry-node-config:test", "hash", artifact, nil, "")
 	if err := mutate(agent); err != nil {
 		t.Fatal(err)
 	}

@@ -16,9 +16,10 @@ of a blob fetches it from Azure. Later reads come from the cache.
 
 The cache runs on your existing nodes, so you need no extra cache servers. The
 Racer dataplane reads Azure itself, so there is no separate origin process.
-Racer splits each blob into 16 MiB pages. Each page is read from Azure only
-by its few owner nodes, even when every node reads it. Apps keep using the Azure Blob or S3 SDK they already use and change only
-settings: the endpoint, plus
+Racer splits each blob into pages, 16 MiB by default. Each page is read from
+Azure only by its few owner nodes, even when every node reads it. Apps keep
+using the Azure Blob or S3 SDK they already use and change only settings: the
+endpoint, plus
 [path-style addressing and checksum settings]({{< relref "reference/racer-object#s3-api" >}})
 for S3.
 

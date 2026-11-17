@@ -91,6 +91,9 @@ struct Inner {
     /// Indexed payload charge of each stored page, released when the
     /// page leaves the table.
     charges: Vec<Option<Payload>>,
+    /// Page size of the record stored in each slot. `None` while the slot is
+    /// only held or being written, so mixed sizes share the table.
+    sizes: Vec<Option<racer_wire::object::PageSize>>,
 }
 
 /// Page table sized at first use; see the module docs.
@@ -99,9 +102,10 @@ pub(super) struct Pages {
     slots: u32,
     /// Stored pages (in-flight reservations excluded).
     stored: usize,
-    /// Page size of every stored record. Fixed by the first stored page
-    /// while the table is empty; a record cut at another size is refused.
-    page_size: racer_wire::object::PageSize,
+    /// Page size of the most recently stored record. Transitional fallback for
+    /// catalog callers that still need one number while page sizes become
+    /// per-cache; stored records may carry different sizes.
+    last_page_size: racer_wire::object::PageSize,
     versions: HashMap<ObjectVersion, (VersionMetadata, usize)>,
     /// Hold identities a rebuilt disk index must stay above.
     hold_floor: HoldId,
@@ -159,6 +163,7 @@ impl Inner {
             caches: CacheTable::default(),
             keys: vec![KeyId([0; 16]); slots as usize],
             charges: (0..slots).map(|_| None).collect(),
+            sizes: (0..slots).map(|_| None).collect(),
         })
     }
 }
@@ -170,22 +175,21 @@ impl Pages {
             inner: None,
             slots,
             stored: 0,
-            page_size: racer_wire::object::PageSize::DEFAULT,
+            last_page_size: racer_wire::object::PageSize::DEFAULT,
             versions: HashMap::default(),
             hold_floor: HoldId::default(),
             hash_key: KeyedState::default(),
         }
     }
 
-    /// Whether a record cut at `size` may join the table: every stored page
-    /// shares one page size, adopted while the table is empty.
-    fn accepts(&self, size: racer_wire::object::PageSize) -> bool {
-        self.stored == 0 || self.page_size == size
-    }
-
-    /// Page size of the stored records.
+    /// Page size of the most recently stored record.
+    ///
+    /// Transitional: records stored side by side may have been cut at
+    /// different sizes, so this is not a table-wide invariant and mixed sizes
+    /// are accepted. Catalog callers that still need one number (capacity and
+    /// retention scoring) use it until they consult each record's own size.
     pub fn page_size(&self) -> racer_wire::object::PageSize {
-        self.page_size
+        self.last_page_size
     }
 
     /// Stored pages, excluding in-flight reservations.
@@ -266,7 +270,8 @@ impl Pages {
                 (
                     page.clone(),
                     IndexedPage {
-                        page_size: self.page_size,
+                        page_size: inner.sizes[slot.0 as usize]
+                            .expect("stored page has a page size"),
                         location: location(&view),
                         metadata: self.versions[&page.version].0.clone(),
                         key_id: inner.keys[slot.0 as usize],
@@ -298,7 +303,7 @@ impl Pages {
         let page = inner.slots.key(slot).expect("interned page");
         PageView {
             page,
-            page_size: self.page_size,
+            page_size: inner.sizes[slot.0 as usize].expect("stored page has a page size"),
             location: location(view),
             metadata: &self.versions[&page.version].0,
             key_id: inner.keys[slot.0 as usize],
@@ -396,10 +401,6 @@ impl Pages {
             metadata,
             key_id,
         } = entry;
-        if !self.accepts(page_size) {
-            self.release(reservation);
-            return Err(Error::InvalidRequest);
-        }
         let same = self
             .inner
             .as_ref()
@@ -430,7 +431,8 @@ impl Pages {
             }
         };
         inner.keys[slot.0 as usize] = key_id;
-        self.page_size = page_size;
+        inner.sizes[slot.0 as usize] = Some(page_size);
+        self.last_page_size = page_size;
         if replaced.is_none() {
             self.stored += 1;
             self.versions
@@ -451,9 +453,6 @@ impl Pages {
             metadata,
             key_id,
         } = entry;
-        if !self.accepts(page_size) {
-            return Err(Error::InvalidRequest);
-        }
         let (slot, cache) = self.intern(&page)?;
         let inner = self.inner.as_mut().expect("initialized page table");
         let placed = inner.disk.borrow_mut().place(
@@ -471,7 +470,8 @@ impl Pages {
             }
         };
         inner.keys[slot.0 as usize] = key_id;
-        self.page_size = page_size;
+        inner.sizes[slot.0 as usize] = Some(page_size);
+        self.last_page_size = page_size;
         if replaced.is_none() {
             self.stored += 1;
             self.versions
@@ -485,11 +485,13 @@ impl Pages {
     fn forget(
         versions: &mut HashMap<ObjectVersion, (VersionMetadata, usize)>,
         charges: &mut [Option<Payload>],
+        sizes: &mut [Option<racer_wire::object::PageSize>],
         slots: &mut Interner,
         disk: &DiskIndex,
         slot: PageSlot,
     ) {
         charges[slot.0 as usize] = None;
+        sizes[slot.0 as usize] = None;
         let page = slots.key(slot).expect("interned page");
         if let Some((_, count)) = versions.get_mut(&page.version) {
             *count -= 1;
@@ -520,6 +522,7 @@ impl Pages {
         Self::forget(
             &mut self.versions,
             &mut inner.charges,
+            &mut inner.sizes,
             &mut inner.slots,
             &disk,
             slot,
@@ -554,6 +557,7 @@ impl Pages {
             slots,
             caches,
             charges,
+            sizes,
             ..
         } = inner;
         let mut disk = disk.borrow_mut();
@@ -561,7 +565,7 @@ impl Pages {
         caches.drain(&mut disk, usize::MAX, |slot, _| removed.push(slot));
         self.stored -= removed.len();
         for slot in removed {
-            Self::forget(&mut self.versions, charges, slots, &disk, slot);
+            Self::forget(&mut self.versions, charges, sizes, slots, &disk, slot);
         }
     }
 
@@ -815,7 +819,14 @@ impl Pages {
         for slot in removed {
             let page = inner.slots.key(slot).expect("interned page");
             evicted(page, &versions[&page.version].0);
-            Self::forget(versions, &mut inner.charges, &mut inner.slots, &disk, slot);
+            Self::forget(
+                versions,
+                &mut inner.charges,
+                &mut inner.sizes,
+                &mut inner.slots,
+                &disk,
+                slot,
+            );
         }
         drop(disk);
         self.settle();
@@ -880,6 +891,7 @@ impl Pages {
         let disk = inner.disk.borrow();
         assert_eq!(inner.slots.len(), disk.len() + disk.holds_unused());
         assert_eq!(self.stored, disk.iter().count());
+        assert_eq!(self.stored, inner.sizes.iter().flatten().count());
         drop(disk);
         let mut counts: HashMap<&ObjectVersion, usize> = HashMap::default();
         for view in self.iter() {
@@ -932,31 +944,63 @@ mod tests {
         }
     }
 
+    fn segments(bytes: u64, count: usize) -> Segments {
+        let segments = Segments::new(bytes);
+        segments
+            .configure(
+                bytes * count as u64,
+                count,
+                page_alloc::Alignment::new(512, 512, 512).unwrap(),
+            )
+            .unwrap();
+        segments
+    }
+
     #[test]
-    fn stored_pages_share_one_page_size_adopted_while_empty() {
+    fn stored_pages_keep_their_own_page_sizes() {
         let small = racer_wire::object::PageSize::new(64 << 10).unwrap();
+        let large = racer_wire::object::PageSize::new(256 << 10).unwrap();
+        let default = racer_wire::object::PageSize::DEFAULT;
         let mut pages = Pages::new(4);
-        let (a0, a1) = (page("c", "a", 0), page("c", "a", 1));
-        let resized = |page: &PageId, segment| IndexedPage {
-            page_size: small,
+        let (a0, a1, a2) = (page("c", "a", 0), page("c", "a", 1), page("c", "a", 2));
+        let cut = |page: &PageId, segment, page_size| IndexedPage {
+            page_size,
             ..entry(page, segment)
         };
-        pages.insert(a0.clone(), resized(&a0, 0)).unwrap();
-        assert_eq!(pages.page_size(), small);
-        assert_eq!(pages.get(&a0).unwrap().into_entry().page_size, small);
-        // A record cut at another size never joins the table.
-        assert_eq!(
-            pages.insert(a1.clone(), entry(&a1, 1)),
-            Err(Error::InvalidRequest)
-        );
-        assert!(pages.get(&a1).is_none());
-        pages.insert(a1.clone(), resized(&a1, 1)).unwrap();
-        assert!(pages.remove(&a0, None));
-        assert!(pages.remove(&a1, None));
-        // Empty again, the table adopts the next size.
-        pages.insert(a0.clone(), entry(&a0, 2)).unwrap();
-        assert_eq!(pages.page_size(), racer_wire::object::PageSize::DEFAULT);
+        pages.insert(a0.clone(), cut(&a0, 0, small)).unwrap();
+        // Mixed sizes share the table; each view reports its own.
+        pages.insert(a1.clone(), cut(&a1, 1, default)).unwrap();
+        assert_eq!(pages.page_size(), default);
+        assert_eq!(pages.get(&a0).unwrap().page_size, small);
+        assert_eq!(pages.get(&a1).unwrap().page_size, default);
         pages.check();
+        // Publication stores the page size too.
+        let segments = segments(512, 2);
+        let mut reservation = pages.reserve(&a2).unwrap();
+        let (_lease, location) = reservation.append(&segments, 512).unwrap();
+        let published = IndexedPage {
+            location,
+            ..cut(&a2, 0, large)
+        };
+        assert!(pages.publish(reservation, &a2, published).unwrap());
+        assert_eq!(pages.get(&a2).unwrap().page_size, large);
+        assert_eq!(pages.page_size(), large);
+        pages.check();
+        // Removing a page clears its slot's size.
+        assert!(pages.remove(&a0, None));
+        assert!(pages.get(&a0).is_none());
+        pages.check();
+        // Re-inserting preserves every entry's own size.
+        pages.resize(8).unwrap();
+        assert_eq!(pages.get(&a1).unwrap().page_size, default);
+        assert_eq!(pages.get(&a2).unwrap().page_size, large);
+        pages.check();
+        assert!(pages.remove(&a1, None));
+        assert!(pages.remove(&a2, None));
+        assert_eq!(pages.len(), 0);
+        pages.check();
+        // The transitional fallback reports the last stored size.
+        assert_eq!(pages.page_size(), large);
     }
 
     #[test]

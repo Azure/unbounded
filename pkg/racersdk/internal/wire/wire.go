@@ -22,15 +22,39 @@ import (
 )
 
 const (
-	MaxHeadBytes       = 32 * 1024
-	MaxFieldBytes      = 8192
-	ObjectPrefix       = "/v1/objects/"
+	MaxHeadBytes  = 32 * 1024
+	MaxFieldBytes = 8192
+	ObjectPrefix  = "/v1/objects/"
+	// PageSize is the default logical page size. A cache may use any power of
+	// two from MinPageSize through MaxPageSize; the client must configure the
+	// cache's size explicitly because it is not advertised on the wire.
 	PageSize           = 16 * 1024 * 1024
+	MinPageSize        = 4 * 1024
+	MaxPageSize        = PageSize
 	FrameSize          = 21
 	CreditSize         = 12
 	PageFrame     byte = 1
 	CompleteFrame byte = 2
 )
+
+// ValidPageSize reports whether size is a supported logical page size.
+func ValidPageSize(size uint64) bool {
+	return size >= MinPageSize && size <= MaxPageSize && size&(size-1) == 0
+}
+
+// PageSizeOrDefault returns size, or PageSize when size is zero.
+func PageSizeOrDefault(size uint64) uint64 {
+	return pageSizeOrDefault(size)
+}
+
+// pageSizeOrDefault applies the default page size to calls that omit one.
+func pageSizeOrDefault(size uint64) uint64 {
+	if size == 0 {
+		return PageSize
+	}
+
+	return size
+}
 
 // ErrorKind classifies wire failures. The SDK maps kinds to its public
 // sentinel errors.
@@ -340,20 +364,23 @@ func (r Range) Resolve(size uint64) (uint64, uint64, error) {
 	return r.First, min(size-1, r.Last), nil
 }
 
-func ValidatePageShape(r Range) error {
-	if !r.Present || r.First > r.Last || r.Last > math.MaxInt64 || r.First%PageSize != 0 || r.Last > NominalPageEnd(r.First) {
+func ValidatePageShape(r Range, pageSize uint64) error {
+	pageSize = pageSizeOrDefault(pageSize)
+	if !r.Present || r.First > r.Last || r.Last > math.MaxInt64 || r.First%pageSize != 0 || r.Last > NominalPageEnd(r.First, pageSize) {
 		return failure(ErrorInvalidArgument, "origin range", nil)
 	}
 
 	return nil
 }
 
-func NominalPageEnd(first uint64) uint64 {
-	return first + min(uint64(PageSize)-1, uint64(math.MaxInt64)-first)
+func NominalPageEnd(first, pageSize uint64) uint64 {
+	pageSize = pageSizeOrDefault(pageSize)
+
+	return first + min(pageSize-1, uint64(math.MaxInt64)-first)
 }
 
-func (r Range) ResolvePage(size uint64) (uint64, uint64, error) {
-	if err := ValidatePageShape(r); err != nil {
+func (r Range) ResolvePage(size, pageSize uint64) (uint64, uint64, error) {
+	if err := ValidatePageShape(r, pageSize); err != nil {
 		return 0, 0, err
 	}
 
@@ -362,7 +389,7 @@ func (r Range) ResolvePage(size uint64) (uint64, uint64, error) {
 		return 0, 0, err
 	}
 
-	if r.Last != NominalPageEnd(r.First) && r.Last != size-1 {
+	if r.Last != NominalPageEnd(r.First, pageSize) && r.Last != size-1 {
 		return 0, 0, failure(ErrorInvalidArgument, "origin range", nil)
 	}
 
@@ -453,7 +480,9 @@ func ContentRangeValue(first, last, size uint64) (string, error) {
 	return "bytes " + strconv.FormatUint(uint64(first), 10) + "-" + strconv.FormatUint(uint64(last), 10) + "/" + strconv.FormatUint(uint64(size), 10), nil
 }
 
-func BootstrapRange() Range { return Range{Present: true, Last: PageSize - 1} }
+func BootstrapRange(pageSize uint64) Range {
+	return Range{Present: true, Last: pageSizeOrDefault(pageSize) - 1}
+}
 
 // ReadRawHead consumes one validated head from a connection-owned buffered reader.
 // Keep using that reader for the body and next head: it may have read ahead.
@@ -674,7 +703,7 @@ func (r Request) Format(s fmt.State, _ rune) {
 // ParseRequestHead validates a complete raw head without reading the body.
 // When origin is true, pinned requests must follow whole-page shape rules.
 // The returned descriptor also supplies the request for response validation.
-func ParseRequestHead(head []byte, origin bool) (Request, error) {
+func ParseRequestHead(head []byte, origin bool, pageSize uint64) (Request, error) {
 	var result Request
 	if err := ValidateRawHead(head, false); err != nil {
 		return result, err
@@ -706,7 +735,7 @@ func ParseRequestHead(head []byte, origin bool) (Request, error) {
 	}
 
 	result.Key = key
-	if err := result.selectOperation(method, origin); err != nil {
+	if err := result.selectOperation(method, origin, pageSize); err != nil {
 		return Request{}, err
 	}
 
@@ -780,7 +809,7 @@ func requestFields(h http.Header) (Request, error) {
 	return result, nil
 }
 
-func (r *Request) selectOperation(method string, origin bool) error {
+func (r *Request) selectOperation(method string, origin bool, pageSize uint64) error {
 	bad := failure(ErrorInvalidArgument, "request", nil)
 
 	switch method {
@@ -796,7 +825,7 @@ func (r *Request) selectOperation(method string, origin bool) error {
 		}
 
 		if r.Pin == "" {
-			if r.Range != BootstrapRange() {
+			if r.Range != BootstrapRange(pageSize) {
 				return bad
 			}
 
@@ -804,7 +833,7 @@ func (r *Request) selectOperation(method string, origin bool) error {
 		} else {
 			r.Operation = OperationPinned
 			if origin {
-				return ValidatePageShape(r.Range)
+				return ValidatePageShape(r.Range, pageSize)
 			}
 		}
 	default:
@@ -814,7 +843,7 @@ func (r *Request) selectOperation(method string, origin bool) error {
 	return nil
 }
 
-func ValidateRequest(r Request) error {
+func ValidateRequest(r Request, pageSize uint64) error {
 	if r.Operation < OperationHead || r.Operation > OperationPinned {
 		return failure(ErrorInvalidArgument, "request", nil)
 	}
@@ -841,7 +870,7 @@ func ValidateRequest(r Request) error {
 			return failure(ErrorInvalidArgument, "request", nil)
 		}
 	case OperationBootstrap:
-		if r.Pin != "" || r.Range != BootstrapRange() {
+		if r.Pin != "" || r.Range != BootstrapRange(pageSize) {
 			return failure(ErrorInvalidArgument, "request", nil)
 		}
 	case OperationPinned:
@@ -879,8 +908,8 @@ func RequestHeaders(r Request) http.Header {
 }
 
 // RequestHead validates and serializes an origin operation as HTTP/1.1.
-func RequestHead(r Request) ([]byte, error) {
-	return requestHead(r)
+func RequestHead(r Request, pageSize uint64) ([]byte, error) {
+	return requestHead(r, pageSize)
 }
 
 // ClientHead serializes a client-socket HEAD.
@@ -889,7 +918,7 @@ func ClientHead(r Request) ([]byte, error) {
 		return nil, failure(ErrorInvalidArgument, "client HEAD", nil)
 	}
 
-	return requestHead(r)
+	return requestHead(r, PageSize)
 }
 
 // ParseClientHead parses a client-socket HEAD.
@@ -907,11 +936,11 @@ func ParseClientHead(r *http.Request) (Request, error) {
 
 	raw.WriteString("\r\n")
 
-	return ParseRequestHead(raw.Bytes(), false)
+	return ParseRequestHead(raw.Bytes(), false, PageSize)
 }
 
-func requestHead(r Request) ([]byte, error) {
-	if err := ValidateRequest(r); err != nil {
+func requestHead(r Request, pageSize uint64) ([]byte, error) {
+	if err := ValidateRequest(r, pageSize); err != nil {
 		return nil, err
 	}
 
@@ -1149,7 +1178,7 @@ func connectionHasToken(h http.Header, want string) bool {
 // 502 contracts; invalid partial pages are 400 and out-of-object pages are 416.
 // The caller owns all body rules (including HEAD nil, empty bootstrap probe,
 // nonempty body presence, final-byte holdback, and closing on every error).
-func OriginResponse(request Request, m Metadata) (Response, error) {
+func OriginResponse(request Request, m Metadata, pageSize uint64) (Response, error) {
 	if err := m.Validate(); err != nil {
 		return Response{}, failure(ErrorBadGateway, "origin metadata", err)
 	}
@@ -1172,7 +1201,7 @@ func OriginResponse(request Request, m Metadata) (Response, error) {
 		return Response{}, failure(ErrorInvalidArgument, "origin operation", nil)
 	}
 
-	first, last, err := request.Range.ResolvePage(m.Size)
+	first, last, err := request.Range.ResolvePage(m.Size, pageSize)
 	if err != nil {
 		return Response{}, err
 	}
@@ -1187,9 +1216,11 @@ type SubscriptionOptions struct {
 	Offset, Length uint64
 	PageCredits    int
 	ByteCredits    uint64
-	SmallObject    bool
-	Pin            string
-	Metadata       *Metadata
+	// PageSize is the cache's logical page size. Zero means PageSize.
+	PageSize    uint64
+	SmallObject bool
+	Pin         string
+	Metadata    *Metadata
 }
 
 // SubscriptionHead builds the client POST envelope after SDK option validation.
@@ -1238,10 +1269,12 @@ type HostReadOptions struct {
 	Offset, Length                       uint64
 	Pin                                  string
 	DestinationOffset, DestinationLength uint64
+	// PageSize is the cache's logical page size. Zero means PageSize.
+	PageSize uint64
 }
 
 func (o HostReadOptions) subscription() SubscriptionOptions {
-	return SubscriptionOptions{Offset: o.Offset, Length: o.Length, Pin: o.Pin}
+	return SubscriptionOptions{Offset: o.Offset, Length: o.Length, PageSize: o.PageSize, Pin: o.Pin}
 }
 
 // HostReadHead builds the POST /v1/objects/<key>/host-read request head.
@@ -1366,7 +1399,7 @@ func parseBodyResponse(head []byte, o SubscriptionOptions, delivery string) (Sub
 		payload = 0
 	}
 
-	pages := PageCount(first, end)
+	pages := PageCount(first, end, o.PageSize)
 	if pages+1 > (math.MaxInt64-payload)/FrameSize || length != payload+FrameSize*(pages+1) {
 		return result, bad
 	}
@@ -1421,7 +1454,7 @@ func validateSubscriptionSelection(m Metadata, first, end uint64, o Subscription
 		return bad
 	}
 
-	if o.SmallObject && m.Size > PageSize {
+	if o.SmallObject && m.Size > pageSizeOrDefault(o.PageSize) {
 		return failure(ErrorInvalidArgument, "small object size", nil)
 	}
 
@@ -1433,12 +1466,15 @@ type SubscriptionRequest struct {
 	First, End               uint64
 	Ranged                   bool
 	PageCredits, ByteCredits uint64
+	// PageSize is the cache's logical page size. Zero means PageSize.
+	PageSize uint64
 }
 
 // ParseSubscriptionRequest translates a normalized HTTP envelope for the fake peer.
 // Raw socket servers must validate the head before net/http normalizes it.
-func ParseSubscriptionRequest(r *http.Request) (SubscriptionRequest, error) {
-	s := SubscriptionRequest{End: math.MaxInt64, PageCredits: 2, ByteCredits: 2 * PageSize}
+func ParseSubscriptionRequest(r *http.Request, pageSize uint64) (SubscriptionRequest, error) {
+	pageSize = pageSizeOrDefault(pageSize)
+	s := SubscriptionRequest{End: math.MaxInt64, PageCredits: 2, ByteCredits: 2 * pageSize, PageSize: pageSize}
 	bad := failure(ErrorInvalidArgument, "fake subscription", nil)
 
 	const prefix = ObjectPrefix
@@ -1483,7 +1519,7 @@ func ParseSubscriptionRequest(r *http.Request) (SubscriptionRequest, error) {
 	}
 
 	raw.WriteString("\r\n")
-	request, err := ParseRequestHead(raw.Bytes(), false)
+	request, err := ParseRequestHead(raw.Bytes(), false, pageSize)
 	s.Request = request
 
 	return s, err
@@ -1492,13 +1528,15 @@ func ParseSubscriptionRequest(r *http.Request) (SubscriptionRequest, error) {
 func (s *SubscriptionRequest) parseCredits(h http.Header) error {
 	bad := failure(ErrorInvalidArgument, "fake subscription", nil)
 
+	pageSize := pageSizeOrDefault(s.PageSize)
+
 	for _, credit := range []struct {
 		name     string
 		dest     *uint64
 		min, max uint64
 	}{
 		{"Racer-Page-Credits", &s.PageCredits, 1, 64},
-		{"Racer-Byte-Credits", &s.ByteCredits, PageSize, 64 * PageSize},
+		{"Racer-Byte-Credits", &s.ByteCredits, pageSize, 64 * pageSize},
 	} {
 		if values, ok := h[credit.name]; ok {
 			n, err := Decimal(values[0])
@@ -1543,8 +1581,8 @@ func WriteSubscriptionHead(w io.Writer, status int, h http.Header) error {
 }
 
 // SubscriptionHeaders builds a bounded success envelope; oversized framing is rejected.
-func SubscriptionHeaders(m Metadata, first, end uint64) (http.Header, error) {
-	length, pages := end-first, PageCount(first, end)
+func SubscriptionHeaders(m Metadata, first, end, pageSize uint64) (http.Header, error) {
+	length, pages := end-first, PageCount(first, end, pageSize)
 	if pages+1 > (math.MaxInt64-length)/FrameSize {
 		return nil, failure(ErrorProtocol, "subscription response", nil)
 	}
@@ -1654,14 +1692,17 @@ type pageInterval struct{ first, end uint64 }
 // Counts advance on accepted headers; callers must consume each payload before the next.
 type Sequence struct {
 	first, end, pages, delivered, bytes uint64
+	pageSize                            uint64
 	complete                            bool
 	intervals                           []pageInterval
 }
 
 // NewSequence tracks one subscription range. Pages must arrive strictly in order:
 // the server may fetch out of order, but it always delivers in page order.
-func NewSequence(first, end uint64) *Sequence {
-	return &Sequence{first: first, end: end, pages: PageCount(first, end)}
+func NewSequence(first, end, pageSize uint64) *Sequence {
+	pageSize = pageSizeOrDefault(pageSize)
+
+	return &Sequence{first: first, end: end, pages: PageCount(first, end, pageSize), pageSize: pageSize}
 }
 
 // Intervals reports bounded tracking storage for diagnostics after a receive operation.
@@ -1673,12 +1714,14 @@ func (s *Sequence) Intervals() int {
 	return len(s.intervals)
 }
 
-func PageCount(first, end uint64) uint64 {
+func PageCount(first, end, pageSize uint64) uint64 {
 	if end <= first {
 		return 0
 	}
 
-	return (end-1)/PageSize - first/PageSize + 1
+	pageSize = pageSizeOrDefault(pageSize)
+
+	return (end-1)/pageSize - first/pageSize + 1
 }
 
 // Accept checks page identity, shape, uniqueness, ordering, and terminal totals.
@@ -1699,14 +1742,14 @@ func (s *Sequence) Accept(f Frame, operation string) error {
 		return nil
 	}
 
-	if f.Kind != PageFrame || f.Length == 0 || f.Offset < s.first || f.Offset >= s.end || f.Number != f.Offset/PageSize {
+	if f.Kind != PageFrame || f.Length == 0 || f.Offset < s.first || f.Offset >= s.end || f.Number != f.Offset/s.pageSize {
 		return bad
 	}
 
-	start := max(s.first, f.Number*PageSize)
+	start := max(s.first, f.Number*s.pageSize)
 
-	end := min(s.end, (f.Number+1)*PageSize)
-	if f.Offset != start || uint64(f.Length) != end-start || f.Number != s.first/PageSize+s.delivered {
+	end := min(s.end, (f.Number+1)*s.pageSize)
+	if f.Offset != start || uint64(f.Length) != end-start || f.Number != s.first/s.pageSize+s.delivered {
 		return bad
 	}
 

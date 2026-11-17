@@ -1054,15 +1054,18 @@ fn record_cut_at_another_page_size_than_its_index_entry_is_a_corrupt_miss() {
     // still decodes and its plaintext fits either size, so only the page
     // size comparison can refuse it.
     f.store.reader.invalidate(&token).unwrap();
-    index
-        .publish(
-            id.clone(),
-            catalog::IndexedPage {
-                page_size: racer_wire::object::PageSize::new(64 << 10).unwrap(),
-                ..entry
-            },
-        )
-        .unwrap();
+    // Publication refuses an index entry cut at another size.
+    let mismatched = catalog::IndexedPage {
+        page_size: racer_wire::object::PageSize::new(64 << 10).unwrap(),
+        ..entry.clone()
+    };
+    assert_eq!(
+        index.publish(id.clone(), mismatched.clone()),
+        Err(Error::CorruptRecord)
+    );
+    // Install it directly to exercise the reader's own page-size check against
+    // a record that is still cut at the default size.
+    index.install_unchecked_for_test(id.clone(), mismatched);
     assert!(
         drive(&f.reactor, f.store.reader.read(&id, &scope(&env)))
             .unwrap()
@@ -5029,7 +5032,7 @@ mod checkpoint {
         let env = racer_io::Env::host();
         let original = image(&env, 3);
         let bytes = encode(&original).unwrap();
-        assert_eq!(CHECKPOINT_VERSION, 4);
+        assert_eq!(CHECKPOINT_VERSION, 5);
         assert_eq!(&bytes[32..68], original.cluster.0.as_bytes());
         let decoded = decode(&bytes).unwrap();
         assert_eq!(decoded.cluster, original.cluster);
@@ -5254,7 +5257,7 @@ mod checkpoint {
             .collect();
         assert_eq!(
             digest,
-            "bbf59ea8dd0c1f31c0790d92da22835a5d1ab13391ea37c16c8a5dbc824376bf"
+            "88ed6a8a024173219e95082565b9b58421fbe0f694cb8ed7ba07f871498cdf5f"
         );
     }
 
@@ -5265,18 +5268,18 @@ mod checkpoint {
         // image(7) layout: header 32 + cluster UUID 36 + shard count 4 + worker 2 + geometry 80
         // + segment count 4 + two segments 50 + page count 4 + descriptor 92
         // (36-byte cache, 32-byte key, 4-byte quoted ETag, length 8, three
-        // string lengths 12) + page fields 56 (page number, key ID, segment,
-        // generation, extent offset and length) + descriptor count 4 + the
-        // standalone "empty" descriptor 95 + hold count 4 = 463 body bytes,
-        // then the digest.
-        assert_eq!(bytes.len(), 495);
-        let digest: String = bytes[463..]
+        // string lengths 12) + page fields 60 (page number, key ID, segment,
+        // generation, extent offset and length, page size) + descriptor count 4
+        // + the standalone "empty" descriptor 95 + hold count 4 = 467 body
+        // bytes, then the digest.
+        assert_eq!(bytes.len(), 499);
+        let digest: String = bytes[467..]
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect();
         assert_eq!(
             digest,
-            "23b6ac07a293ccf5f5ea277ec59980d3fc5a82b66a68b0a2190100ec07e51caa"
+            "476def2ce9f4cbacde4966d348aaa2420f971428c1a9ebd178f96cbde4fb2132"
         );
         let decoded = checkpoint_format::decode(&bytes).unwrap();
         assert_eq!(decoded.shards[0].index.entries.len(), 1);
@@ -5413,7 +5416,7 @@ mod checkpoint {
         let mut corrupt = encoded.clone();
         corrupt[20] ^= 1;
         assert!(checkpoint_format::decode(&corrupt).is_err());
-        for (offset, value) in [(8, 5u32), (12, 1), (32, u32::MAX)] {
+        for (offset, value) in [(8, 6u32), (12, 1), (32, u32::MAX)] {
             let mut corrupt = encoded.clone();
             corrupt[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
             resign(&mut corrupt);
@@ -5549,7 +5552,7 @@ mod checkpoint {
         assert_eq!(segments.snapshot()[0].used_bytes, before[0].used_bytes);
         let mut recovered = image(&env, 1);
         let page = recovered.shards[0].index.entries[0].0.clone();
-        Recovery::filter_available(&mut recovered, |_| true, |_, _| false);
+        Recovery::filter_available(&mut recovered, |_| true, |_, _, _| false);
         block_on(recovery.install_shard(recovered.shards.pop())).unwrap();
         assert!(index.lookup(&page).unwrap().is_none());
         assert!(
@@ -5946,6 +5949,7 @@ fn over_share_fixture(env: &racer_io::Env) -> (Fixture, CacheId, CacheId) {
         priority,
         mode: racer_wire::control::CacheMode::Cached,
         origin: None,
+        page_size: None,
     };
     f.store
         .writer
@@ -6047,6 +6051,7 @@ fn cache_definition(id: &str, name: &str) -> racer_wire::control::CacheDefinitio
         priority: 1,
         mode: racer_wire::control::CacheMode::Cached,
         origin: None,
+        page_size: None,
     }
 }
 
@@ -6192,6 +6197,7 @@ fn owned_reclaim_never_lets_unheld_over_share_page_take_under_share_write() {
         priority,
         mode: racer_wire::control::CacheMode::Cached,
         origin: None,
+        page_size: None,
     };
     writer
         .retention()

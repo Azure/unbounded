@@ -237,13 +237,18 @@ class Client:
         cache: str | None = None,
         socket_path: str | None = None,
         timeout: float | None = 60.0,
-        staging_bytes: int = DEFAULT_STAGING_BYTES,
+        staging_bytes: int | None = None,
         pin_staging: bool = True,
         mode_retry_seconds: float | None = DEFAULT_MODE_RETRY_SECONDS,
         clock: Callable[[], float] = time.monotonic,
+        page_size: int = wire.PAGE_SIZE,
     ) -> None:
+        # The cache page size is not in responses, so the client must be told.
+        self.page_size = wire.validate_page_size(page_size)
         self.socket_path = socket_path_for(cache, socket_path)
         self.timeout = timeout
+        if staging_bytes is None:
+            staging_bytes = 4 * self.page_size
         if staging_bytes <= 0:
             raise RacerError("staging_bytes must be positive")
         self.staging_bytes = staging_bytes
@@ -570,7 +575,8 @@ class Client:
     ) -> ReadResult:
         head = (
             f"POST {wire.OBJECT_PREFIX}{request.hex} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\n"
-            f"Racer-Page-Credits: {wire.PAGE_CREDITS}\r\nRacer-Byte-Credits: {wire.BYTE_CREDITS}\r\n"
+            f"Racer-Page-Credits: {wire.PAGE_CREDITS}\r\n"
+            f"Racer-Byte-Credits: {wire.PAGE_CREDITS * self.page_size}\r\n"
         )
         head += self._range_header(offset, length)
         if if_match:
@@ -585,7 +591,7 @@ class Client:
             h = wire.parse_response_head(conn.read_head())
             wire.check_error_status(h)
             meta, first, end = self._check_selection(h, offset, length, if_match)
-            pages = wire.page_count(first, end)
+            pages = wire.page_count(first, end, self.page_size)
             body = wire.decimal(h.get("content-length"))
             if body != end - first + wire.FRAME_SIZE * (pages + 1):
                 raise ProtocolError("bad Content-Length")
@@ -596,7 +602,7 @@ class Client:
                 raise RacerError("destination is smaller than the range")
             if on_head:
                 on_head()
-            seq = wire.Sequence(first, end)
+            seq = wire.Sequence(first, end, self.page_size)
             for _ in range(pages):
                 f = wire.decode_frame(conn.read_exact(wire.FRAME_SIZE))
                 seq.accept(f)
@@ -673,10 +679,10 @@ class Client:
                 raise ProtocolError("range is larger than the destination")
             if on_head:
                 on_head()
-            pages = wire.page_count(first, end)
+            pages = wire.page_count(first, end, self.page_size)
             if wire.decimal(h.get("content-length")) != wire.FRAME_SIZE * (pages + 1):
                 raise ProtocolError("bad Content-Length")
-            seq = wire.Sequence(first, end)
+            seq = wire.Sequence(first, end, self.page_size)
             for _ in range(pages):
                 f = wire.decode_frame(conn.read_exact(wire.FRAME_SIZE))
                 seq.accept(f)

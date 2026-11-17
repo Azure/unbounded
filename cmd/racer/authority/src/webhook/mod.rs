@@ -18,7 +18,8 @@
 //!   bypasses the scheduler. A missing or non-matching Node is denied with
 //!   403, and a failed Node lookup with 503.
 //! - Opted-in pod: allowed with a JSON Patch. When the cache has a node
-//!   selector, the patch adds it to the pod's required node affinity.
+//!   selector, the patch adds it to the pod's required node affinity. When the
+//!   cache sets `spec.pageSize`, the patch adds `--page-size` to the sidecar.
 //!
 //! [`admit`] returns [`Error`] only when the review itself cannot be answered,
 //! for example when it is not JSON or has no request UID.
@@ -115,11 +116,21 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// The ClusterCache fields the webhook uses, read from its GET of the cache.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Cache {
+    /// `spec.nodeSelector`, or `None` when unset.
+    pub node_selector: Option<Value>,
+    /// `spec.pageSize` as written, or `None` when unset. Parsed during the
+    /// mutation so an invalid value denies the pod.
+    pub page_size: Option<Value>,
+}
+
 /// Result of looking up a ClusterCache by name.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CacheLookup {
-    /// The cache exists. Holds its `spec.nodeSelector`, or `None` when unset.
-    Found(Option<Value>),
+    /// The cache exists.
+    Found(Cache),
     /// No ClusterCache has this name.
     NotFound,
     /// The lookup failed, for example with an API error. The pod is denied
@@ -461,19 +472,32 @@ struct SidecarSpec {
     cache: String,
     api: Option<String>,
     listen: Option<String>,
+    /// `spec.pageSize` of the named cache, in the ClusterCache spelling.
+    /// `None` when unset.
+    page_size: Option<String>,
     resources: Value,
 }
 
 impl SidecarSpec {
     fn args(&self) -> Vec<String> {
-        // Kubelet expands $(VAR) in container args. Cache, api, and listen
-        // values are validated and cannot contain "$", so no escaping is needed.
+        // Kubelet expands $(VAR) in container args. Cache, api, listen, and
+        // page size values are validated and cannot contain "$", so no
+        // escaping is needed.
         let mut args = vec!["sidecar".to_owned(), format!("--cache={}", self.cache)];
         if let Some(api) = &self.api {
             args.push(format!("--api={api}"));
         }
         if let Some(listen) = &self.listen {
             args.push(format!("--listen={listen}"));
+        }
+        // A cache without spec.pageSize omits the flag and the sidecar uses
+        // its built-in default. That default, 16MiB, is also the authority's
+        // default cluster page size, so the two agree until the deployment
+        // configures a different cluster default. The webhook cannot see that
+        // configuration, so injecting the effective default is not possible
+        // here.
+        if let Some(page_size) = &self.page_size {
+            args.push(format!("--page-size={page_size}"));
         }
         args
     }
@@ -527,6 +551,8 @@ fn parse_annotations(a: Option<&Map<String, Value>>) -> Result<SidecarSpec, Reje
         cache: cache.to_owned(),
         api: api.map(str::to_owned),
         listen: listen.map(str::to_owned),
+        // Filled from the cache's spec.pageSize once it is looked up.
+        page_size: None,
         resources: parse_resources(a)?,
     })
 }

@@ -183,16 +183,17 @@ def weight_files(client, uri: ModelURI, pins: dict | None = None) -> list:
     return files
 
 
-def fetch(uri, dest: str, client=None, pattern=None) -> list:
+def fetch(uri, dest: str, client=None, pattern=None, page_size: int = racer.PAGE_SIZE) -> list:
     """Copy the small model files to dest and write racer-model.json.
 
     racer-model.json records the URI and the ETag of every fetched file and
     every weight file, so the loader reads the same model version. Without
     safetensors weights, it records the files of a sharded_state checkpoint
-    (pattern, else vLLM's default patterns) for every rank.
+    (pattern, else vLLM's default patterns) for every rank. page_size is used
+    only when no client is supplied.
     """
     u = parse_uri(uri) if isinstance(uri, str) else uri
-    client = client or racer.Client(cache=u.cache)
+    client = client or racer.Client(cache=u.cache, page_size=page_size)
     os.makedirs(dest, exist_ok=True)
     names = list(CONFIG_FILES)
     fetched = []
@@ -390,8 +391,13 @@ def _limit(start: int, staging_bytes: int, page_bytes: int) -> int:
     return end - end % page_bytes if page_bytes else end
 
 
-def read_chunks(client, uri: ModelURI, files: list, staging_bytes: int) -> list:
-    """Read every file's header and plan its chunks. files holds (name, Metadata)."""
+def read_chunks(client, uri: ModelURI, files: list, staging_bytes: int, page_bytes: int | None = None) -> list:
+    """Read every file's header and plan its chunks. files holds (name, Metadata).
+
+    page_bytes defaults to the client's configured cache page size.
+    """
+    if page_bytes is None:
+        page_bytes = getattr(client, "page_size", racer.PAGE_SIZE)
     chunks = []
     for name, meta in files:
         req = uri.request(name)
@@ -400,7 +406,7 @@ def read_chunks(client, uri: ModelURI, files: list, staging_bytes: int) -> list:
             tensors = parse_header(client.read(req, 8, n, if_match=meta.etag), meta.size)
         except (racer.VersionUnavailable, racer.NotFound):
             raise _changed(uri, name, meta.etag) from None
-        chunks += plan_chunks(name, meta.etag, tensors, staging_bytes, racer.PAGE_SIZE)
+        chunks += plan_chunks(name, meta.etag, tensors, staging_bytes, page_bytes)
     return chunks
 
 
@@ -659,6 +665,7 @@ def settings(extra: dict) -> dict:
     return {
         "uri": extra.get("uri"),
         "staging_bytes": int(extra.get("staging_bytes", DEFAULT_STAGING_BYTES)),
+        "page_size": int(extra.get("page_size", racer.PAGE_SIZE)),
         "concurrency": int(extra.get("concurrency", DEFAULT_CONCURRENCY)),
         "clone": bool(extra.get("clone", True)),
         "socket": extra.get("socket"),
@@ -694,6 +701,7 @@ def register() -> None:
                 socket_path=o["socket"],
                 staging_bytes=o["staging_bytes"],
                 mode_retry_seconds=o["mode_retry_seconds"],
+                page_size=o["page_size"],
             )
             try:
                 if o["sharded_state"]:
@@ -763,8 +771,9 @@ def main(argv=None) -> int:
     p.add_argument("uri", help="racer://<cache>/<bucket>/<prefix>")
     p.add_argument("dest", help="local directory")
     p.add_argument("--pattern", help="sharded_state file name pattern, as the loader's pattern option")
+    p.add_argument("--page-size", type=int, default=racer.PAGE_SIZE, help="cache page size in bytes (default 16 MiB)")
     a = p.parse_args(argv)
-    for name in fetch(a.uri, a.dest, pattern=a.pattern):
+    for name in fetch(a.uri, a.dest, pattern=a.pattern, page_size=a.page_size):
         print(name)
     return 0
 

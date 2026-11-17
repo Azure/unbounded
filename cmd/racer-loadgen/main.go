@@ -88,6 +88,7 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 	f.DurationVar(&opts.duration, "duration", 0, "Load phase duration; zero runs until signaled")
 	f.StringVar(&opts.blobDigests, "trusted-blob-digests", "", "Comma-separated digests computed earlier for the first catalog blobs (same seed and size); skips hashing them at startup")
 	f.IntVar(&opts.pull.PageCredits, "page-credits", 0, "UDS only: pages Racer may send ahead of each read, 0-64 (0 uses the SDK default of 2); bounds Racer's per-read fetch window")
+	f.IntVar(&opts.pull.PageSize, "page-size", 0, fmt.Sprintf("Racer cache page size in bytes, a power of two in [%d, %d] (0 uses the SDK default of %d); must match ClusterCache spec.pageSize", minPageSize, maxPageSize, maxPageSize))
 	f.Int64Var(&opts.pull.RangeBytes, "range-bytes", 0, "UDS only: read each blob as pinned byte ranges of this size, resuming a failed range at its first unread byte (0 reads whole objects); requires verify=false unless delivery=host-read")
 	f.StringVar(&opts.pull.Delivery, "delivery", deliveryStream, "UDS only: stream (SDK Get over the socket) or host-read (Racer writes each blob into a pooled, preallocated memfd passed with SCM_RIGHTS; with range-bytes, each range lands at its offset, so verify works)")
 	f.IntVar(&opts.pull.RangeParallel, "range-parallel", 0, "UDS only: concurrent ranges per blob with range-bytes (0 means 1)")
@@ -116,12 +117,16 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 		return opts, err
 	}
 
+	if err := validatePageSize(opts.pull.PageSize); err != nil {
+		return opts, err
+	}
+
 	if opts.pull.Backend == "uds" {
 		if opts.pull.Cache == "" {
 			return opts, fmt.Errorf("uds requires a valid cache: empty cache name: %w", racersdk.ErrInvalidRequest)
 		}
 
-		client, err := racersdk.NewClient(racersdk.ClientConfig{Cache: opts.pull.Cache})
+		client, err := racersdk.NewClient(racersdk.ClientConfig{Cache: opts.pull.Cache, PageSize: opts.pull.PageSize})
 		if err != nil {
 			return opts, fmt.Errorf("uds requires a valid cache: %w", err)
 		}
@@ -351,14 +356,9 @@ func runWithOriginStarter(parent context.Context, opts options, startOrigin orig
 					capacity = maxLiveConcurrency
 				}
 
-				limit := max(1, capacity*p.opts.BlobConcurrency)
-
 				var stopOrigin func()
 
-				stopOrigin, err = startOrigin(ctx, startupCtx, racersdk.OriginConfig{
-					Cache: p.opts.Cache, RecoverStaleSocket: true,
-					MaxConcurrentRequests: max(64, limit),
-				}, adapter, probe, func(originErr error) { serveErrors <- originErr; cancel() })
+				stopOrigin, err = startOrigin(ctx, startupCtx, sdkOriginConfig(p.opts, capacity), adapter, probe, func(originErr error) { serveErrors <- originErr; cancel() })
 				if err == nil {
 					defer stopOrigin()
 					defer ready.Store(nil)

@@ -15,7 +15,7 @@ import (
 func TestOperatorStreamingUsesNodeNetwork(t *testing.T) {
 	for _, enabled := range []bool{false, true} {
 		objects, err := decodeManifests(testEnv(t), applyMutator("gantry:test", "gantry-node-config:test", "hash",
-			artifactStreamingConfig{Enabled: enabled, NodeSelector: map[string]string{"pool": "streaming"}}, nil))
+			artifactStreamingConfig{Enabled: enabled, NodeSelector: map[string]string{"pool": "streaming"}}, nil, ""))
 		if err != nil {
 			t.Fatal(err)
 		}

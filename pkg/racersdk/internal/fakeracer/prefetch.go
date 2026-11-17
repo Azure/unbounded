@@ -51,6 +51,8 @@ type PrefetchReject struct {
 type PrefetchConfig struct {
 	// CacheUID is the live ClusterCache UID. Empty accepts any cache_uid.
 	CacheUID string
+	// PageSize is the cache's logical page size in bytes. Zero means 16 MiB.
+	PageSize uint64
 	// Passthrough rejects every PUT with 409 passthrough.
 	Passthrough bool
 	// MaxBodyBytes, MaxRefs, MaxTickets, and RefsPage default to 4194304,
@@ -105,6 +107,8 @@ type ticket struct {
 
 // NewPrefetches returns an empty registry.
 func NewPrefetches(config PrefetchConfig) *Prefetches {
+	config.PageSize = wire.PageSizeOrDefault(config.PageSize)
+
 	if config.MaxBodyBytes <= 0 {
 		config.MaxBodyBytes = wire.PrefetchDefaultBody
 	}
@@ -139,6 +143,9 @@ func NewPrefetches(config PrefetchConfig) *Prefetches {
 
 	return &Prefetches{config: config, tickets: make(map[string]*ticket)}
 }
+
+// PageSize returns the cache's logical page size used for byte accounting.
+func (p *Prefetches) PageSize() uint64 { return p.config.PageSize }
 
 type prefetchFailure struct {
 	status     int
@@ -674,11 +681,11 @@ func (p *Prefetches) render(ctx context.Context, t *ticket, q wire.PrefetchQuery
 		aligned := uint64(0)
 
 		if ref.length != 0 {
-			for page := ref.ref.Offset / wire.PageSize; page <= (ref.ref.Offset+ref.length-1)/wire.PageSize; page++ {
+			for page := ref.ref.Offset / p.config.PageSize; page <= (ref.ref.Offset+ref.length-1)/p.config.PageSize; page++ {
 				name := ref.ref.Key + "/" + strconv.FormatUint(page, 10)
 				if _, ok := pages[name]; !ok {
 					pages[name] = struct{}{}
-					aligned += wire.PageSize
+					aligned += p.config.PageSize
 				}
 			}
 		}

@@ -147,13 +147,28 @@ pub struct Snapshot {
     /// reads them through `membership`.
     pub pools: Vec<racer_wire::control::Pool>,
 
-    /// Cluster-wide page size, fixed for the life of the process: a publication that
-    /// changes it is rejected.
+    /// Cluster-default page size, fixed for the life of the process: a publication that
+    /// changes it is rejected. Caches may override it per cache.
     pub page_size: racer_wire::object::PageSize,
 
     content_hash: [u8; 32],
 
     membership_hash: [u8; 32],
+}
+
+impl Snapshot {
+    /// Page size a cache's pages are cut at, falling back to the cluster default.
+    pub fn page_size_for(&self, cache: &CacheId) -> racer_wire::object::PageSize {
+        self.caches
+            .find(cache)
+            .and_then(|c| c.page_size)
+            .unwrap_or(self.page_size)
+    }
+
+    /// Distinct page-size classes among retained caches.
+    pub fn page_sizes(&self) -> Vec<racer_wire::object::PageSize> {
+        self.caches.page_sizes(self.page_size)
+    }
 }
 
 #[cfg(test)]
@@ -197,10 +212,10 @@ pub struct Availability {
 
     keys: Rc<Keyring>,
 
-    /// Worker-local copy of the published cache index, reloaded on epoch change.
-    /// It holds only the cache index, never the membership, so idle workers do
-    /// not consume publication grace capacity.
-    caches: cell::EpochCopy<Arc<Caches>>,
+    /// Worker-local copy of the published cache index and cluster-default page
+    /// size, reloaded on epoch change. It holds only the cache index, never the
+    /// membership, so idle workers do not consume publication grace capacity.
+    caches: cell::EpochCopy<(racer_wire::object::PageSize, Arc<Caches>)>,
 }
 
 impl Availability {
@@ -219,8 +234,8 @@ impl Availability {
     fn with_cache<R>(&self, cache: &CacheId, f: impl FnOnce(Option<&CacheDefinition>) -> R) -> R {
         self.caches.with(
             &self.publications,
-            |s| s.caches.clone(),
-            |caches| f(caches.and_then(|c| c.find(cache))),
+            |s| (s.page_size, s.caches.clone()),
+            |published| f(published.and_then(|(_, caches)| caches.find(cache))),
         )
     }
 
@@ -238,6 +253,34 @@ impl Availability {
     /// Whether this cache retains no pages or metadata.
     pub fn passthrough(&self, cache: &CacheId) -> bool {
         self.mode(cache).passthrough()
+    }
+
+    /// Effective page size of this cache, or the cluster default before a publication.
+    pub fn page_size(&self, cache: &CacheId) -> racer_wire::object::PageSize {
+        self.caches.with(
+            &self.publications,
+            |s| (s.page_size, s.caches.clone()),
+            |published| {
+                published.map_or(
+                    racer_wire::object::PageSize::DEFAULT,
+                    |(default, caches)| {
+                        caches
+                            .find(cache)
+                            .and_then(|c| c.page_size)
+                            .unwrap_or(*default)
+                    },
+                )
+            },
+        )
+    }
+
+    /// Distinct page-size classes among the current publication's retained caches.
+    pub fn page_sizes(&self) -> Vec<racer_wire::object::PageSize> {
+        self.publications
+            .current()
+            .ok()
+            .flatten()
+            .map_or_else(Vec::new, |snapshot| snapshot.page_sizes())
     }
 
     /// Require both cache admission and an active page key for metadata reads.
@@ -295,6 +338,22 @@ impl Caches {
     /// Whether `cache` is published.
     pub fn contains(&self, cache: &CacheId) -> bool {
         self.position(cache).is_some()
+    }
+
+    /// Distinct page sizes of caches that retain data, sorted ascending.
+    pub fn page_sizes(
+        &self,
+        default: racer_wire::object::PageSize,
+    ) -> Vec<racer_wire::object::PageSize> {
+        let mut sizes: Vec<_> = self
+            .definitions
+            .iter()
+            .filter(|cache| !cache.mode.passthrough())
+            .map(|cache| cache.page_size.unwrap_or(default))
+            .collect();
+        sizes.sort_unstable();
+        sizes.dedup();
+        sizes
     }
 }
 
@@ -393,6 +452,7 @@ impl Availability {
                             priority: racer_wire::control::DEFAULT_PRIORITY,
                             mode,
                             origin: None,
+                            page_size: None,
                         }
                     })
                     .collect(),
@@ -3361,6 +3421,7 @@ mod caches_tests {
             priority,
             mode: racer_wire::control::CacheMode::default(),
             origin: None,
+            page_size: None,
         }
     }
 

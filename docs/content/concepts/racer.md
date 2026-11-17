@@ -32,7 +32,7 @@ another fetch.
   Racer when you create a `ClusterCache`.
 - **Capacity and bandwidth that grow with the cluster.** Every node stores
   pages and serves them to other nodes. Adding nodes adds cache space and
-  serving bandwidth. Racer places each 16 MiB page on its own owners, so the
+  serving bandwidth. Racer places each page on its own owners, so the
   pages of one large file are spread across many nodes and served in parallel.
 - **Low, bounded source load.** Only a page's owners, at most three nodes,
   read it from the source. All other nodes get the page from those owners. A
@@ -165,6 +165,11 @@ Optional `spec.priority` (0 to 1000, default 500) sets how a cache shares each
 node's capacity with other caches. It is a relative weight, not a quota. See
 [Priority]({{< relref "reference/racer" >}}#priority).
 
+Optional `spec.pageSize` sets the cache's logical page size, from 4 KiB to
+16 MiB. Unset uses the cluster default, 16 MiB. It is immutable; to change it,
+delete the cache and create a new one, which starts cold. See
+[Page size]({{< relref "reference/racer" >}}#page-size).
+
 Optional `spec.passthrough` turns off caching: Racer proxies reads to the
 origin and keeps no data. Its `route` is `Peers` (default; owner nodes read
 from their origins and share reads cluster-wide) or `Local` (each node reads
@@ -184,8 +189,11 @@ from its own origin). See
 
 ### Pages
 
-Racer splits every object into **16 MiB pages**. A page is the unit for caching,
-transfer between nodes, placement, and origin reads.
+Racer splits every object into pages. The page size belongs to the cache:
+`spec.pageSize` selects from 4 KiB through 16 MiB, and unset uses the cluster
+default of 16 MiB. A page is the unit for caching, transfer between nodes,
+placement, and origin reads. See
+[Page size]({{< relref "reference/racer" >}}#page-size).
 
 ### Origins
 

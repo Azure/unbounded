@@ -55,11 +55,11 @@ type OriginRequest struct {
 	Head bool
 	// ETag, when set, is the only version that may be served.
 	ETag string
-	// Offset is the first byte to return. It is always a multiple of
-	// [PageSize].
+	// Offset is the first byte to return. It is always a multiple of the
+	// cache's configured page size.
 	Offset int64
-	// Length is the maximum number of bytes to return, at most [PageSize].
-	// The range may extend past the end of the object.
+	// Length is the maximum number of bytes to return, at most one cache
+	// page. The range may extend past the end of the object.
 	Length int64
 }
 
@@ -102,6 +102,10 @@ type OriginConfig struct {
 	// returning, later calls fail until the socket is removed by hand or by
 	// a startup step that knows no other origin is serving.
 	RecoverStaleSocket bool
+	// PageSize is the cache's logical page size in bytes. It must be a power
+	// of two from 4 KiB through 16 MiB and match the ClusterCache
+	// spec.pageSize. Zero means 16 MiB.
+	PageSize int
 }
 
 type originLimits struct {
@@ -115,6 +119,7 @@ type originLimits struct {
 	socketMode        os.FileMode
 	recoverStale      bool
 	cacheUID          string
+	pageSize          uint64
 }
 
 func (c OriginConfig) limits() (originLimits, error) {
@@ -130,6 +135,10 @@ func (c OriginConfig) limits() (originLimits, error) {
 		return originLimits{}, invalid("origin config", errors.New("CacheUID must be a lowercase UUID"))
 	}
 
+	if !validPageSize(c.PageSize) {
+		return originLimits{}, invalid("origin config", errors.New("PageSize must be a power of two in [4 KiB, 16 MiB]"))
+	}
+
 	l := originLimits{
 		maxConnections:    128,
 		maxRequests:       64,
@@ -141,6 +150,7 @@ func (c OriginConfig) limits() (originLimits, error) {
 		socketMode:        0o600,
 		recoverStale:      c.RecoverStaleSocket,
 		cacheUID:          c.CacheUID,
+		pageSize:          pageSizeBytes(c.PageSize),
 	}
 	if c.MaxConcurrentRequests != 0 {
 		l.maxRequests = c.MaxConcurrentRequests
@@ -246,7 +256,7 @@ func serveOriginLimits(ctx context.Context, limits originLimits, origin Origin, 
 	return ioFailure("origin serve", err)
 }
 
-func newOriginRequest(r wire.Request) OriginRequest {
+func newOriginRequest(r wire.Request, pageSize uint64) OriginRequest {
 	o := OriginRequest{
 		Request: Request{Key: r.Key, Metadata: r.AdapterMetadata, Authorization: r.Authorization},
 		ETag:    r.Pin,
@@ -256,7 +266,7 @@ func newOriginRequest(r wire.Request) OriginRequest {
 	case wire.OperationHead:
 		o.Head = true
 	case wire.OperationBootstrap:
-		o.Length = PageSize
+		o.Length = int64(wire.BootstrapRange(pageSize).Last + 1)
 	case wire.OperationPinned:
 		o.Offset = int64(r.Range.First)
 		o.Length = int64(r.Range.Last - r.Range.First + 1)
@@ -355,7 +365,7 @@ func serveOperation(w http.ResponseWriter, r *http.Request, limits originLimits,
 		return
 	}
 
-	result, received := awaitOrigin(ctx, origin, newOriginRequest(request), slots)
+	result, received := awaitOrigin(ctx, origin, newOriginRequest(request, limits.pageSize), slots)
 	if !received {
 		writeOriginError(w, http.StatusServiceUnavailable, 0)
 		return
@@ -393,7 +403,7 @@ func serveOperation(w http.ResponseWriter, r *http.Request, limits originLimits,
 		return
 	}
 
-	response, err := wire.OriginResponse(request, metadata)
+	response, err := wire.OriginResponse(request, metadata, limits.pageSize)
 	if err != nil {
 		writeOriginError(w, callbackStatus(err, pinned), metadata.Size)
 		return
@@ -770,12 +780,12 @@ func (c *originConn) Read(p []byte) (int, error) {
 
 		var request wire.Request
 		if err == nil {
-			request, err = wire.ParseRequestHead(raw, true)
+			request, err = wire.ParseRequestHead(raw, true, c.limits.pageSize)
 		}
 
 		entry := originHead{request: request, err: err, at: at}
 		if err == nil {
-			c.head, err = wire.RequestHead(request)
+			c.head, err = wire.RequestHead(request, c.limits.pageSize)
 			if err != nil {
 				return 0, err
 			}

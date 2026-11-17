@@ -118,7 +118,7 @@ func TestParseOptionsHelp(t *testing.T) {
 				"-layers", "-layer-bytes", "-jitter", "-seed", "-target", "-namespace",
 				"-concurrency", "zero serves only the origin", "-blob-concurrency",
 				"-pull-timeout", "-retry-delay", "-interval", "-verify", "-start-delay", "-duration",
-				"-catalog-images", "-startup-timeout", "-profile", "-zipf-exponent",
+				"-catalog-images", "-startup-timeout", "-profile", "-zipf-exponent", "-page-size",
 			} {
 				require.Contains(t, output.String(), text)
 			}

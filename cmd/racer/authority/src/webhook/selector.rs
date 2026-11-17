@@ -1,4 +1,5 @@
-//! ClusterCache lookup and its `spec.nodeSelector` as node affinity.
+//! ClusterCache lookup: its `spec.nodeSelector` as node affinity and its
+//! `spec.pageSize` for the sidecar.
 //!
 //! A cache with a selector serves only the nodes the selector matches, so a
 //! pod bound to it must schedule there. The selector is a
@@ -11,26 +12,66 @@ use serde_json::{Map, Value, json};
 
 use super::*;
 
-/// Looks up `cache` and returns the node requirements its selector adds.
-/// Empty when the cache has no selector or an empty one.
+/// Page sizes the CRD allows, in the spelling the sidecar accepts. This
+/// mirrors the ClusterCache `spec.pageSize` enum: a value outside it denies
+/// the pod instead of being forwarded to the sidecar, which is stricter than
+/// the sidecar's own parser on purpose.
+const PAGE_SIZES: [&str; 13] = [
+    "4KiB", "8KiB", "16KiB", "32KiB", "64KiB", "128KiB", "256KiB", "512KiB", "1MiB", "2MiB",
+    "4MiB", "8MiB", "16MiB",
+];
+
+/// The ClusterCache fields a pod mutation needs.
+pub(crate) struct CacheRequirements {
+    /// Node requirements from `spec.nodeSelector`. Empty when unset.
+    pub pool: Vec<Value>,
+    /// `spec.pageSize` in the ClusterCache spelling, or `None` when unset so
+    /// the sidecar uses its built-in default (16MiB).
+    pub page_size: Option<String>,
+}
+
+/// Looks up `cache` and returns the node requirements its selector adds and
+/// its page size. An unset or empty selector adds no requirements. An invalid
+/// selector or page size denies the pod.
 pub(crate) fn cache_requirements(
     cache: &str,
     annotation: &str,
     lookup: &dyn Fn(&str) -> CacheLookup,
-) -> Result<Vec<Value>, Reject> {
+) -> Result<CacheRequirements, Reject> {
     match lookup(cache) {
-        CacheLookup::Found(None) => Ok(Vec::new()),
-        CacheLookup::Found(Some(sel)) => requirements(&sel).map_err(|e| {
-            deny(format!(
-                "ClusterCache {cache:?} named by annotation {annotation} has an invalid spec.nodeSelector: {e}"
-            ))
-        }),
+        CacheLookup::Found(found) => {
+            let pool = match found.node_selector {
+                None | Some(Value::Null) => Vec::new(),
+                Some(sel) => requirements(&sel).map_err(|e| {
+                    deny(format!(
+                        "ClusterCache {cache:?} named by annotation {annotation} has an invalid spec.nodeSelector: {e}"
+                    ))
+                })?,
+            };
+            let page_size = page_size(found.page_size.as_ref()).map_err(|e| {
+                deny(format!(
+                    "ClusterCache {cache:?} named by annotation {annotation} has an invalid spec.pageSize: {e}"
+                ))
+            })?;
+            Ok(CacheRequirements { pool, page_size })
+        }
         CacheLookup::NotFound => Err(deny(format!(
             "annotation {annotation} names ClusterCache {cache:?}, which does not exist"
         ))),
         CacheLookup::Unavailable => Err(Reject::Unavailable(format!(
             "ClusterCache {cache:?} named by annotation {annotation} could not be looked up; retry"
         ))),
+    }
+}
+
+/// Parses `spec.pageSize`. Unset or null means the sidecar default, so no
+/// flag is injected. Any other value must be one of [`PAGE_SIZES`].
+fn page_size(value: Option<&Value>) -> Result<Option<String>, String> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) if PAGE_SIZES.contains(&s.as_str()) => Ok(Some(s.clone())),
+        Some(Value::String(s)) => Err(format!("{s:?} is not one of {}", PAGE_SIZES.join(", "))),
+        Some(_) => Err("must be a string".into()),
     }
 }
 

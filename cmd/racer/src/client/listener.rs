@@ -1609,8 +1609,10 @@ fn temporary_name(name: &str) -> bool {
 /// disk and memory sharing, and mode only changes retention and routing, so a
 /// priority- or mode-only change must not replace the socket or consume a
 /// retirement slot. The same holds for the origin definition, which only
-/// selects where fills read from. A reused listener keeps its original
-/// priority, mode, and origin, which listener code never reads.
+/// selects where fills read from, and page size only changes the logical page
+/// geometry, not which endpoint the listener binds. A reused listener keeps its
+/// original priority, mode, origin, and page size, which listener code never
+/// reads.
 pub(super) fn same_endpoint(current: &CacheDefinition, next: &CacheDefinition) -> bool {
     let CacheDefinition {
         id,
@@ -1620,6 +1622,7 @@ pub(super) fn same_endpoint(current: &CacheDefinition, next: &CacheDefinition) -
         priority: _,
         mode: _,
         origin: _,
+        page_size: _,
     } = current;
     *id == next.id
         && *name == next.name
