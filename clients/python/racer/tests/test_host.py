@@ -17,6 +17,7 @@ def memfds(name):
             if os.readlink(f"/proc/self/fd/{fd}").startswith(f"/memfd:{name} "):
                 out.append(int(fd))
         except OSError:
+            # The fd closed between listdir and readlink.
             pass
     return out
 
