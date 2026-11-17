@@ -174,8 +174,7 @@ mod slab;
 pub mod stream;
 
 pub use demand::{
-    DEFAULT_DECAY_WINDOWS, DEFAULT_INITIAL_TARGET, DEFAULT_MAX_DEPTH, DEFAULT_MIN_DEPTH,
-    DEFAULT_WINDOW, PoolDemand, PoolStats,
+    MAX_HOLD, MIN_HOLD, Plan, PoolStats, Pressure, Provision, ProvisionConfig, SAMPLE_PERIOD,
 };
 use racer_io::ring::IoBuffer;
 pub use segments::{
@@ -735,32 +734,66 @@ pub struct AlignedBuffer<C: Charge> {
     length: usize,
 }
 
-/// Small demand-sized free lists, grouped in 64 KiB size classes without locks.
+/// Demand-sized free lists, grouped in 64 KiB size classes without locks.
 ///
 /// Entries are kept oldest first so maintenance trims the longest-idle storage.
+/// A [`Provision`] controller sizes the pool in 64 KiB granules from the bytes
+/// checked out of it; returns are accepted up to the idle byte budget, and
+/// maintenance frees whatever the controller releases.
 pub(crate) struct BufferPool<C: Charge> {
     entries: VecDeque<AlignedBuffer<C>>,
-    demand: PoolDemand,
+    demand: Provision,
+    pressure: Pressure,
     budget: usize,
+    in_use: usize,
+    counters: StagingCounters,
 }
+
+#[derive(Default)]
+struct StagingCounters {
+    hits: u64,
+    misses: u64,
+    rejects: u64,
+    trimmed: u64,
+}
+
+/// Size class granule of the staging pool, and its controller's unit.
+const STAGING_GRANULE: usize = 64 * 1024;
+
+/// Expected time to allocate and fault in one staging granule.
+const STAGING_ACQUIRE: std::time::Duration = std::time::Duration::from_micros(20);
 
 impl<C: Charge> Default for BufferPool<C> {
     fn default() -> Self {
-        Self {
-            entries: VecDeque::new(),
-            demand: PoolDemand::new(),
-            budget: 128 * 1024 * 1024,
-        }
+        Self::with_budget(128 * 1024 * 1024, std::time::Instant::now())
     }
 }
 
 /// Round backing capacity without changing the length of an I/O transfer.
 pub fn buffer_capacity(length: usize) -> Option<usize> {
-    const UNIT: usize = 64 * 1024;
-    length.checked_add(UNIT - 1).map(|n| n / UNIT * UNIT)
+    length
+        .checked_add(STAGING_GRANULE - 1)
+        .map(|n| n / STAGING_GRANULE * STAGING_GRANULE)
 }
 
 impl<C: Charge> BufferPool<C> {
+    fn with_budget(budget: usize, now: std::time::Instant) -> Self {
+        let config = ProvisionConfig {
+            unit: 1,
+            floor: 0,
+            ceiling: usize::MAX / STAGING_GRANULE,
+            acquire: STAGING_ACQUIRE,
+        };
+        Self {
+            entries: VecDeque::new(),
+            demand: Provision::new(config, now),
+            pressure: Pressure::Normal,
+            budget,
+            in_use: 0,
+            counters: StagingCounters::default(),
+        }
+    }
+
     fn bytes(&self) -> usize {
         self.entries
             .iter()
@@ -768,31 +801,84 @@ impl<C: Charge> BufferPool<C> {
             .sum()
     }
 
+    fn granules(bytes: usize) -> usize {
+        bytes.div_ceil(STAGING_GRANULE)
+    }
+
+    /// Count `capacity` bytes as checked out of this pool.
+    fn check_out(&mut self, capacity: usize) {
+        self.in_use = self.in_use.saturating_add(capacity);
+        self.demand.observe(Self::granules(self.in_use));
+    }
+
+    /// Count `capacity` bytes as returned and decide whether to keep them.
+    /// Under pressure only the controller's remaining target is kept.
     fn accepts(&mut self, capacity: usize) -> bool {
-        let bytes = self.bytes();
-        self.demand
-            .admit(self.entries.len(), bytes, capacity, self.budget)
+        self.in_use = self.in_use.saturating_sub(capacity);
+        self.demand.observe(Self::granules(self.in_use));
+        let idle = self.bytes().saturating_add(capacity);
+        let room = match self.pressure {
+            Pressure::Normal => self.budget,
+            Pressure::Elevated | Pressure::Critical => self
+                .demand
+                .target()
+                .saturating_mul(STAGING_GRANULE)
+                .saturating_sub(self.in_use)
+                .min(self.budget),
+        };
+        if idle > room {
+            self.counters.rejects = self.counters.rejects.saturating_add(1);
+            return false;
+        }
+        true
     }
 
     /// Remove the entries chosen by demand maintenance, oldest first.
     pub(crate) fn maintain(&mut self, now: std::time::Instant) -> Vec<AlignedBuffer<C>> {
-        let release = self.demand.tick(now, self.entries.len());
-        self.entries.drain(..release).collect()
+        let capacity = Self::granules(self.in_use.saturating_add(self.bytes()));
+        let Plan::Release(units) = self.demand.tick(now, capacity, 0, self.pressure) else {
+            return Vec::new();
+        };
+        let mut wanted = units.saturating_mul(STAGING_GRANULE);
+        let mut released = Vec::new();
+        while wanted > 0
+            && let Some(buffer) = self.entries.pop_front()
+        {
+            wanted = wanted.saturating_sub(buffer.allocation().layout.size());
+            released.push(buffer);
+        }
+        self.counters.trimmed = self.counters.trimmed.saturating_add(released.len() as u64);
+        released
     }
 
     /// Remove every idle entry and count it as trimmed.
     pub(crate) fn take_all(&mut self) -> VecDeque<AlignedBuffer<C>> {
         let idle = std::mem::take(&mut self.entries);
-        self.demand.record_trim(idle.len(), 0);
+        self.counters.trimmed = self.counters.trimmed.saturating_add(idle.len() as u64);
         idle
     }
 
-    pub(crate) fn set_constrained(&mut self, constrained: bool) {
-        self.demand.set_constrained(constrained);
+    /// Apply memory pressure; [`Self::maintain`] releases the surplus.
+    pub(crate) fn set_pressure(&mut self, pressure: Pressure) {
+        self.pressure = pressure;
     }
 
     pub(crate) fn stats(&self) -> PoolStats {
-        self.demand.stats(self.entries.len(), self.bytes())
+        PoolStats {
+            entries: self.entries.len(),
+            bytes: self.bytes(),
+            in_use: self.in_use,
+            target: self.demand.target().saturating_mul(STAGING_GRANULE),
+            cold: 0,
+            hold: self.demand.effective_hold(),
+            hits: self.counters.hits,
+            misses: self.counters.misses,
+            cold_hits: 0,
+            rejects: self.counters.rejects,
+            trimmed: self.counters.trimmed,
+            constrained: self.pressure != Pressure::Normal,
+            unpooled: 0,
+        }
     }
 
     fn take_for(&mut self, length: usize, charge: &C) -> Option<AlignedBuffer<C>> {
@@ -804,12 +890,11 @@ impl<C: Charge> BufferPool<C> {
                 && charge.covers(capacity)
         });
         let Some(index) = index else {
-            self.demand.record_miss();
+            self.counters.misses = self.counters.misses.saturating_add(1);
             return None;
         };
-        let buffer = self.entries.remove(index);
-        self.demand.record_hit(self.entries.len());
-        buffer
+        self.counters.hits = self.counters.hits.saturating_add(1);
+        self.entries.remove(index)
     }
 }
 
@@ -837,6 +922,9 @@ impl<C: Charge> AlignedBuffer<C> {
 
     /// Attach a weak return destination without extending the pool's lifetime.
     pub(crate) fn pooled(mut self, pool: &Rc<RefCell<BufferPool<C>>>) -> Self {
+        if let Ok(mut pool) = pool.try_borrow_mut() {
+            pool.check_out(self.allocation().layout.size());
+        }
         self.pool = Rc::downgrade(pool);
         self
     }
@@ -980,13 +1068,12 @@ mod buffer_tests {
     }
 
     #[test]
-    fn free_lists_bound_depth_and_bytes_under_size_flood() {
+    fn free_lists_bound_bytes_under_size_flood() {
         let alignment = Alignment::new(64, 1, 1).unwrap();
         for budget in [128 * 1024, 128 * 1024 * 1024] {
             let live = Rc::new(Cell::new(0));
             let pool = Rc::new(RefCell::new(BufferPool {
                 budget,
-                demand: PoolDemand::new().with_target(8),
                 ..BufferPool::default()
             }));
             for length in (1..=32).map(|n| n * 8192) {
@@ -996,11 +1083,14 @@ mod buffer_tests {
                         .unwrap()
                         .pooled(&pool),
                 );
-                assert!(pool.borrow().entries.len() <= 8);
+                assert!(pool.borrow().bytes() <= budget);
                 assert!(live.get() <= budget);
+                assert_eq!(pool.borrow().in_use, 0);
             }
             if budget > 128 * 1024 {
-                assert_eq!(pool.borrow().entries.len(), 8);
+                assert_eq!(pool.borrow().entries.len(), 32);
+            } else {
+                assert!(pool.borrow().stats().rejects > 0);
             }
             drop(pool);
             assert_eq!(live.get(), 0);
@@ -1356,7 +1446,7 @@ mod buffer_tests {
         for scenario in 0..4 {
             let live = Rc::new(Cell::new(0));
             let pool = Rc::new(RefCell::new(BufferPool {
-                demand: PoolDemand::new().with_bounds(0, 1).with_target(1),
+                budget: 8,
                 ..BufferPool::default()
             }));
             let mut buffer = alignment

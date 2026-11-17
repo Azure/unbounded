@@ -38,10 +38,10 @@ pub(crate) fn default_disk_alignment() -> page_alloc::Alignment {
 /// to that class and its byte budget is the real bound. A small fixed count
 /// made every page past the first few under high concurrency map on take and
 /// unmap on return. The cap is a ceiling, not a steady state:
-/// [`BufferPool::maintain_idle_buffers`] sheds half of the idle storage after
-/// each window without a checkout, so an idle worker's pool empties within a
-/// few windows while continuous reuse keeps it warm. Memory pressure sheds it
-/// at once.
+/// [`BufferPool::maintain_idle_buffers`] sizes each class to its recent
+/// demand (see [`page_alloc::Provision`]), so idle storage above what recent
+/// peaks needed is released within a few hold times while steady reuse keeps
+/// it warm. Memory pressure sheds it at once.
 pub(crate) const POOL_IDLE_PER_CLASS: usize = 4;
 
 /// Per-class idle cap for a worker whose [`ResourceClass::Pool`] budget is
@@ -126,16 +126,6 @@ unsafe impl racer_io::ring::IoBuffer for CiphertextBuffer {
     }
 }
 
-/// Demand state for trimming one worker's idle pooled storage.
-#[derive(Clone, Copy, Debug, Default)]
-struct IdleDemand {
-    window_start: Option<std::time::Instant>,
-    takes_at_start: u64,
-    idle_at_start: usize,
-    constrained: bool,
-    trimmed: u64,
-}
-
 /// Per-worker ciphertext and plaintext allocation front end.
 ///
 /// Cloned handles share one [`page_alloc::buf::Pool`], so buffers return to
@@ -151,9 +141,6 @@ pub struct BufferPool {
     /// returns here from any thread, so a warm path reuses a mapping instead
     /// of mapping and unmapping a fresh one.
     disk: Rc<std::cell::RefCell<page_alloc::buf::Pool>>,
-    /// Per-class idle cap of `disk`.
-    idle_cap: usize,
-    demand: Rc<std::cell::Cell<IdleDemand>>,
 }
 /// Mutable staging buffer, not proof of authentication and not client-deliverable.
 /// Fixed-size owned backing stays at the same address when this owner moves.
@@ -550,8 +537,6 @@ impl BufferPool {
             admission,
             alignment,
             disk: Rc::new(std::cell::RefCell::new(disk)),
-            idle_cap,
-            demand: Default::default(),
         }
     }
     /// Direct-I/O alignment of aligned ciphertext buffers from this worker.
@@ -559,79 +544,27 @@ impl BufferPool {
     pub(crate) fn alignment(&self) -> page_alloc::Alignment {
         self.alignment
     }
-    /// Idle and trimming counters of this worker's pool. `bytes` is the
-    /// charged idle storage; `misses` are checkouts that mapped new storage
-    /// and `rejects` returns that were freed; `unpooled` checkouts found no
-    /// size class. `entries` is not tracked and not exported.
+    /// Sizing snapshot of this worker's pool (see
+    /// [`page_alloc::buf::Pool::stats`]). `bytes` is the charged idle storage;
+    /// `misses` are checkouts that mapped new storage and `rejects` returns
+    /// that were freed; `unpooled` checkouts found no size class.
     pub(crate) fn pool_stats(&self) -> page_alloc::PoolStats {
-        let demand = self.demand.get();
-        let Ok(pool) = self.disk.try_borrow() else {
-            return Default::default();
-        };
-        let counters = pool.counters();
-        page_alloc::PoolStats {
-            bytes: pool.idle_bytes(),
-            target: self.idle_cap,
-            max_depth: self.idle_cap,
-            hits: counters.hits,
-            misses: counters.misses,
-            rejects: counters.rejects,
-            unpooled: counters.unpooled,
-            trimmed: demand.trimmed,
-            constrained: demand.constrained,
-            ..Default::default()
-        }
+        self.disk
+            .try_borrow()
+            .map_or_else(|_| Default::default(), |pool| pool.stats())
     }
-    /// Release idle storage that went unused for a whole maintenance window:
-    /// half of what was idle when the window opened, provided nothing was
-    /// checked out since, or all of it while constrained. O(1) until
-    /// the window elapses; returns bytes released.
+    /// Size the pool to its recent demand: release idle storage above the
+    /// target of its class (see [`page_alloc::buf::Pool::maintain`]). Cheap
+    /// between controller samples; returns resident bytes released.
     pub(crate) fn maintain_idle_buffers(&self, now: std::time::Instant) -> usize {
-        let mut demand = self.demand.get();
-        let Ok(mut pool) = self.disk.try_borrow_mut() else {
-            return 0;
-        };
-        let takes = pool.takes();
-        if demand.constrained {
-            let released = pool.shed(usize::MAX);
-            if released > 0 {
-                demand.trimmed = demand.trimmed.saturating_add(1);
-                self.demand.set(demand);
-            }
-            return released;
-        }
-        let Some(start) = demand.window_start else {
-            demand.window_start = Some(now);
-            demand.takes_at_start = takes;
-            demand.idle_at_start = pool.idle_bytes();
-            self.demand.set(demand);
-            return 0;
-        };
-        let mut released = 0;
-        if now.saturating_duration_since(start) >= page_alloc::DEFAULT_WINDOW {
-            // Only storage idle since the window started counts as unused.
-            let stale = pool.idle_bytes().min(demand.idle_at_start);
-            if takes == demand.takes_at_start && stale > 0 {
-                released = pool.shed(stale.div_ceil(2));
-            }
-            demand.window_start = Some(now);
-            demand.takes_at_start = takes;
-            demand.idle_at_start = pool.idle_bytes();
-        }
-        if released > 0 {
-            demand.trimmed = demand.trimmed.saturating_add(1);
-        }
-        self.demand.set(demand);
-        released
+        self.disk
+            .try_borrow_mut()
+            .map_or(0, |mut pool| pool.maintain(now))
     }
-    /// Release idle storage now, and at every maintenance while memory is
-    /// constrained.
-    pub(crate) fn constrain_idle_buffers(&self, constrained: bool) {
-        let mut demand = self.demand.get();
-        demand.constrained = constrained;
-        self.demand.set(demand);
-        if constrained {
-            self.shed_disk_buffers();
+    /// Set the memory pressure idle storage sizing responds to.
+    pub(crate) fn set_idle_pressure(&self, pressure: page_alloc::Pressure) {
+        if let Ok(mut pool) = self.disk.try_borrow_mut() {
+            pool.set_pressure(pressure);
         }
     }
     /// Discard idle disk read storage (`MADV_DONTNEED`) and release its
@@ -719,8 +652,10 @@ impl BufferPool {
         self.top_up(&mut reservation, capacity)?;
         self.aligned_ciphertext(reservation, length)
     }
-    /// Grow `reservation` to at least `capacity` under its key, shedding idle
-    /// pooled buffers once if admission refuses.
+    /// Grow `reservation` to at least `capacity` under its key. Idle pooled
+    /// storage is charged to [`ResourceClass::Pool`], not Ciphertext, so
+    /// shedding it would not make room here; callers that can reclaim reserve
+    /// the full capacity up front.
     fn top_up(&self, reservation: &mut CiphertextCharge, capacity: usize) -> Result<()> {
         let Some(needed) = capacity
             .checked_sub(reservation.amount())
@@ -729,16 +664,9 @@ impl BufferPool {
             return Ok(());
         };
         let key = reservation.key().cloned();
-        let mut extra = self
+        let extra = self
             .admission
             .reserve(key.as_ref(), ResourceClass::Ciphertext, needed);
-        if extra.is_err() {
-            // Idle pooled buffers may be what pins this worker's admission.
-            self.shed_disk_buffers();
-            extra = self
-                .admission
-                .reserve(key.as_ref(), ResourceClass::Ciphertext, needed);
-        }
         reservation
             .merge(extra?)
             .map_err(|_| Error::InvalidConfiguration)
@@ -4999,7 +4927,7 @@ pub(crate) mod tests {
         limits.ciphertext_bytes = std::num::NonZeroUsize::new(capacity * (depth + 1)).unwrap();
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
         let pool = BufferPool::new(admission.clone());
-        assert!(pool.pool_stats().max_depth >= depth);
+        assert!(pool_idle_per_class(admission.limit(ResourceClass::Pool)) >= depth);
         let burst = || {
             let buffers: Vec<_> = (0..depth)
                 .map(|_| {
@@ -5026,7 +4954,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn aligned_pool_empties_when_idle_and_is_retained_while_reused() {
+    fn aligned_pool_follows_recent_demand_and_pressure() {
         let admission = admission(8);
         let pool = BufferPool::new(admission.clone());
         let length = PAGE_BYTES as usize + 16;
@@ -5042,38 +4970,57 @@ pub(crate) mod tests {
             drop(buffers);
         };
         let full = POOL_IDLE_PER_CLASS * capacity;
+        let period = page_alloc::SAMPLE_PERIOD;
+        let start = std::time::Instant::now();
+        let mut now = start;
         burst(POOL_IDLE_PER_CLASS);
         assert_eq!(pool.disk_idle_bytes(), full);
-        let window = page_alloc::DEFAULT_WINDOW;
-        let start = std::time::Instant::now();
-        assert_eq!(pool.maintain_idle_buffers(start), 0);
-        // Active reuse every window keeps the pool full.
-        for turn in 1..=20 {
+        // Active reuse at the same level keeps the pool full.
+        for _ in 0..200 {
+            now += period;
             burst(POOL_IDLE_PER_CLASS);
-            assert_eq!(pool.maintain_idle_buffers(start + window * turn), 0);
+            assert_eq!(pool.maintain_idle_buffers(now), 0);
             assert_eq!(pool.disk_idle_bytes(), full);
         }
-        // Once idle, each window releases half; a few windows release all.
-        let mut now = start + window * 21;
-        assert_eq!(pool.maintain_idle_buffers(now), full / 2);
-        for _ in 0..POOL_IDLE_PER_CLASS {
-            now += window;
+        let misses = pool.pool_stats().misses;
+        assert_eq!(
+            misses, POOL_IDLE_PER_CLASS as u64,
+            "steady reuse maps nothing"
+        );
+        // A trickle of one buffer at a time does not pin the earlier level.
+        for _ in 0..200 {
+            now += period;
+            burst(1);
+            pool.maintain_idle_buffers(now);
+        }
+        assert_eq!(pool.disk_idle_bytes(), capacity);
+        let stats = pool.pool_stats();
+        assert_eq!(stats.target, capacity);
+        assert_eq!(stats.misses, misses, "the trickle reuses kept storage");
+        assert!(stats.trimmed >= 3);
+        // Once idle, the rest is released too.
+        for _ in 0..200 {
+            now += period;
             pool.maintain_idle_buffers(now);
         }
         assert_eq!(pool.disk_idle_bytes(), 0);
-        assert!(pool.pool_stats().trimmed >= 2);
         assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
         assert_eq!(admission.used(ResourceClass::Pool), 0);
 
-        // A constrained pool sheds at once and at every maintenance.
+        // Critical pressure releases idle storage and frees returns.
         burst(1);
-        pool.constrain_idle_buffers(true);
+        assert_eq!(pool.disk_idle_bytes(), capacity);
+        pool.set_idle_pressure(page_alloc::Pressure::Critical);
         assert!(pool.pool_stats().constrained);
-        assert_eq!(pool.disk_idle_bytes(), 0);
-        burst(1);
+        now += period;
         assert_eq!(pool.maintain_idle_buffers(now), capacity);
         assert_eq!(pool.disk_idle_bytes(), 0);
-        pool.constrain_idle_buffers(false);
+        let rejects = pool.pool_stats().rejects;
+        burst(1);
+        assert_eq!(pool.pool_stats().rejects, rejects + 1);
+        assert_eq!(pool.disk_idle_bytes(), 0);
+        pool.set_idle_pressure(page_alloc::Pressure::Normal);
+        assert!(!pool.pool_stats().constrained);
         burst(1);
         assert_eq!(pool.disk_idle_bytes(), capacity);
     }

@@ -338,7 +338,9 @@ pub(crate) fn trim_allocator() -> bool {
 /// Work each worker should perform for a level on a pressure tick.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct PressureActions {
-    pub(crate) constrain_pools: bool,
+    /// Pressure the idle buffer pools size for: Elevated keeps at most one
+    /// idle buffer above use, Critical keeps none and refuses returns.
+    pub(crate) pool_pressure: page_alloc::Pressure,
     pub(crate) reclaim_idle_buffers: bool,
     pub(crate) clear_idle_connections: bool,
     /// Memory-cache reclaim quanta to run per tick.
@@ -352,7 +354,7 @@ pub(crate) struct PressureActions {
 /// Policy table mapping a level to actions.
 pub(crate) fn pressure_actions(level: PressureLevel) -> PressureActions {
     let pressured = PressureActions {
-        constrain_pools: true,
+        pool_pressure: page_alloc::Pressure::Elevated,
         reclaim_idle_buffers: true,
         clear_idle_connections: true,
         reclaim_cache_quanta: 0,
@@ -363,6 +365,7 @@ pub(crate) fn pressure_actions(level: PressureLevel) -> PressureActions {
         PressureLevel::Normal => PressureActions::default(),
         PressureLevel::Elevated => pressured,
         PressureLevel::Critical => PressureActions {
+            pool_pressure: page_alloc::Pressure::Critical,
             reclaim_cache_quanta: 1,
             ..pressured
         },
@@ -690,7 +693,8 @@ mod tests {
     fn action_policy() {
         assert_eq!(pressure_actions(Normal), PressureActions::default());
         let elevated = pressure_actions(Elevated);
-        assert!(elevated.constrain_pools && elevated.reclaim_idle_buffers);
+        assert_eq!(elevated.pool_pressure, page_alloc::Pressure::Elevated);
+        assert!(elevated.reclaim_idle_buffers);
         assert!(elevated.clear_idle_connections && elevated.trim_allocator);
         assert_eq!(elevated.reclaim_cache_quanta, 0);
         // Idle cache entries persist at Normal and expire under pressure.
@@ -700,6 +704,7 @@ mod tests {
         assert_eq!(
             pressure_actions(Critical),
             PressureActions {
+                pool_pressure: page_alloc::Pressure::Critical,
                 reclaim_cache_quanta: 1,
                 ..elevated
             }
@@ -714,14 +719,15 @@ mod tests {
         assert_eq!(responder.on_level(Normal), None);
         let up = responder.on_level(Elevated).expect("change");
         assert_eq!((up.from, up.to, up.reclaim), (Normal, Elevated, true));
-        assert!(up.actions.constrain_pools);
+        assert_eq!(up.actions.pool_pressure, page_alloc::Pressure::Elevated);
         // Repeated observations of the same level are not transitions.
         assert_eq!(responder.on_level(Elevated), None);
         let critical = responder.on_level(Critical).expect("change");
         assert!(critical.reclaim);
         assert_eq!(critical.actions.reclaim_cache_quanta, 1);
         let down = responder.on_level(Elevated).expect("change");
-        assert!(!down.reclaim && down.actions.constrain_pools);
+        assert!(!down.reclaim);
+        assert_eq!(down.actions.pool_pressure, page_alloc::Pressure::Elevated);
         let normal = responder.on_level(Normal).expect("change");
         assert_eq!((normal.from, normal.reclaim), (Elevated, false));
         assert_eq!(normal.actions, PressureActions::default());

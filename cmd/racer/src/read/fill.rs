@@ -971,6 +971,13 @@ impl Fill {
         Ok(self.page_size()?.get() as usize)
     }
 
+    /// Ciphertext admission for encrypting `plaintext` bytes into a pooled
+    /// buffer. Reserving the padded capacity here, where reclamation can run,
+    /// leaves the encryption output nothing to top up.
+    fn encryption_capacity(&self, plaintext: usize) -> Result<usize> {
+        self.dependencies.buffers.aligned_capacity(plaintext + 16)
+    }
+
     /// The published cluster page size. Every page this node accepts must be cut at
     /// it, since ranges are sliced at it.
     pub(crate) fn page_size(&self) -> Result<PageSize> {
@@ -2149,7 +2156,7 @@ impl Fill {
                 self.reserve_with_reclamation(
                     &page.version.object.cache,
                     ResourceClass::Ciphertext,
-                    origin.page_size.get() as usize + 16,
+                    self.encryption_capacity(origin.page_size.get() as usize)?,
                 )
             })?;
         let (plaintext, ciphertext) = self
@@ -2739,7 +2746,7 @@ impl Fill {
                             self.reserve_with_reclamation(
                                 &context.object.cache,
                                 ResourceClass::Ciphertext,
-                                self.page_plaintext_bytes()? + 16,
+                                self.encryption_capacity(self.page_plaintext_bytes()?)?,
                             )
                         },
                     )?;
@@ -2871,7 +2878,7 @@ impl Fill {
                 self.reserve_with_reclamation(
                     &context.object.cache,
                     ResourceClass::Ciphertext,
-                    self.page_plaintext_bytes()? + 16,
+                    self.encryption_capacity(self.page_plaintext_bytes()?)?,
                 )
             })?;
         let origin = self

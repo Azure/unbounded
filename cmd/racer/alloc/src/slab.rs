@@ -253,7 +253,7 @@ impl<C: Charge> Slab<C> {
     }
 
     /// Run demand maintenance at `now`, freeing idle entries the controller
-    /// releases oldest first. Returns released bytes; O(1) between windows.
+    /// releases, oldest first. Returns released bytes.
     pub fn maintain_idle(&self, now: std::time::Instant) -> usize {
         let Ok(mut pool) = self.idle_buffer.try_borrow_mut() else {
             return 0;
@@ -263,9 +263,10 @@ impl<C: Charge> Slab<C> {
         released.iter().map(|b| b.allocation().layout.size()).sum()
     }
 
-    /// Hold the idle pool at its minimum depth and refuse returns while constrained.
-    pub fn constrain_idle(&self, constrained: bool) {
-        self.idle_buffer.borrow_mut().set_constrained(constrained);
+    /// Apply memory pressure to the idle pool. Under pressure it keeps only
+    /// what the controller still targets, and maintenance releases the rest.
+    pub fn set_idle_pressure(&self, pressure: crate::Pressure) {
+        self.idle_buffer.borrow_mut().set_pressure(pressure);
     }
 
     /// Current idle pool size, target, and cumulative counters.

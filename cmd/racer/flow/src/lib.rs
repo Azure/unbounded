@@ -27,7 +27,7 @@ pub use racer_flow_core::{Class, Error, Result, coalesce, fifo, progress, subscr
 mod pipe;
 mod pool_account;
 
-pub use page_alloc::{PoolDemand, PoolStats};
+pub use page_alloc::PoolStats;
 pub use pipe::{MAX_PIPE_BYTES, PipeLease, PipePool, splice_unsupported};
 pub use pool_account::QuotaPoolAccount;
 pub use racer_flow_core::admission::{
