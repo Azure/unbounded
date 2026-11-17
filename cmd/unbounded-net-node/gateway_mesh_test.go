@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -466,5 +467,63 @@ func TestAssignmentReturnRuleFailures(t *testing.T) {
 				t.Fatalf("%s failure was hidden: %v", operation, err)
 			}
 		})
+	}
+}
+
+func TestAssignmentReturnKernelRouteOwnership(t *testing.T) {
+	originalList, originalDel := assignmentRouteList, assignmentRouteDel
+
+	t.Cleanup(func() { assignmentRouteList, assignmentRouteDel = originalList, originalDel })
+
+	_, wanted, _ := net.ParseCIDR("10.244.1.0/24")
+	_, withdrawn, _ := net.ParseCIDR("10.244.2.0/24")
+	_, withdrawnV6, _ := net.ParseCIDR("fd44:2::/64")
+	owned := netlink.Route{Table: assignmentReturnTableBase + 1, LinkIndex: 42, Protocol: unix.RTPROT_STATIC, Dst: withdrawn}
+	retained, foreignDevice, foreignTable, foreignProtocol, defaultRoute, ipv6 := owned, owned, owned, owned, owned, owned
+	retained.Dst = wanted
+	foreignDevice.LinkIndex = 43
+	foreignTable.Table++
+	foreignProtocol.Protocol = unix.RTPROT_BOOT
+	defaultRoute.Dst = nil
+	ipv6.Dst = withdrawnV6
+
+	assignmentRouteList = func(family int, filter *netlink.Route, mask uint64) ([]netlink.Route, error) {
+		if filter.Table != owned.Table || filter.LinkIndex != 42 || filter.Protocol != unix.RTPROT_STATIC ||
+			mask != netlink.RT_FILTER_TABLE|netlink.RT_FILTER_OIF|netlink.RT_FILTER_PROTOCOL {
+			t.Fatalf("assignment scan was not scoped to its table, protocol, and device: %+v, %d", filter, mask)
+		}
+
+		if family == netlink.FAMILY_V6 {
+			return []netlink.Route{ipv6}, nil
+		}
+
+		return []netlink.Route{retained, owned, foreignDevice, foreignTable, foreignProtocol, defaultRoute}, nil
+	}
+
+	var deleted []netlink.Route
+
+	assignmentRouteDel = func(route *netlink.Route) error { deleted = append(deleted, *route); return nil }
+
+	if err := reconcileAssignmentReturnKernelRoutes([]string{wanted.String()}, 42); err != nil {
+		t.Fatal(err)
+	}
+
+	if !reflect.DeepEqual(deleted, []netlink.Route{owned, defaultRoute, ipv6}) {
+		t.Fatalf("stale routes survived or unrelated kernel routes were removed: %+v", deleted)
+	}
+
+	failure := errors.New("netlink failed")
+	assignmentRouteList = func(int, *netlink.Route, uint64) ([]netlink.Route, error) { return nil, failure }
+
+	deleted = nil
+	if err := reconcileAssignmentReturnKernelRoutes(nil, 42); !errors.Is(err, failure) || len(deleted) != 0 {
+		t.Fatalf("listing failure caused downstream deletion: %v, %+v", err, deleted)
+	}
+
+	assignmentRouteList = func(int, *netlink.Route, uint64) ([]netlink.Route, error) { return []netlink.Route{owned}, nil }
+	assignmentRouteDel = func(*netlink.Route) error { return failure }
+
+	if err := reconcileAssignmentReturnKernelRoutes(nil, 42); !errors.Is(err, failure) {
+		t.Fatalf("route deletion failure was hidden: %v", err)
 	}
 }

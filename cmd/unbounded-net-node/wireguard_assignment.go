@@ -23,9 +23,11 @@ const (
 )
 
 var (
-	assignmentRuleList = netlink.RuleList
-	assignmentRuleAdd  = netlink.RuleAdd
-	assignmentRuleDel  = netlink.RuleDel
+	assignmentRuleList  = netlink.RuleList
+	assignmentRuleAdd   = netlink.RuleAdd
+	assignmentRuleDel   = netlink.RuleDel
+	assignmentRouteList = netlink.RouteListFiltered
+	assignmentRouteDel  = netlink.RouteDel
 )
 
 // Ingress-only rules return forwarded pod and node traffic over assignment
@@ -150,8 +152,57 @@ func prepareAssignmentReturnRoutes(cfg *config, state *wireGuardState, prefixes 
 	}
 
 	routes, _ := assignmentReturnPlan(prefixes, iface.Index, nil)
+	if err := reconcileAssignmentReturnKernelRoutes(prefixes, iface.Index); err != nil {
+		return nil, err
+	}
 
 	return routes, nil
+}
+
+func reconcileAssignmentReturnKernelRoutes(prefixes []string, linkIndex int) error {
+	desired := make(map[string]bool, len(prefixes))
+	for _, value := range prefixes {
+		_, prefix, err := net.ParseCIDR(value)
+		if err == nil {
+			desired[prefix.String()] = true
+		}
+	}
+
+	for _, family := range []int{netlink.FAMILY_V4, netlink.FAMILY_V6} {
+		filter := &netlink.Route{
+			Table: assignmentReturnTableBase + 1, LinkIndex: linkIndex, Protocol: unix.RTPROT_STATIC,
+		}
+
+		routes, err := assignmentRouteList(family, filter, netlink.RT_FILTER_TABLE|netlink.RT_FILTER_OIF|netlink.RT_FILTER_PROTOCOL)
+		if err != nil {
+			return fmt.Errorf("list assignment return routes: %w", err)
+		}
+
+		for _, route := range routes {
+			if route.Table != filter.Table || route.LinkIndex != linkIndex || route.Protocol != unix.RTPROT_STATIC || len(route.MultiPath) != 0 {
+				continue
+			}
+
+			prefix := "0.0.0.0/0"
+			if family == netlink.FAMILY_V6 {
+				prefix = "::/0"
+			}
+
+			if route.Dst != nil {
+				prefix = route.Dst.String()
+			}
+
+			if desired[prefix] {
+				continue
+			}
+
+			if err := assignmentRouteDel(&route); err != nil && !errors.Is(err, unix.ESRCH) {
+				return fmt.Errorf("delete stale assignment return route %s: %w", prefix, err)
+			}
+		}
+	}
+
+	return nil
 }
 
 func reconcileAssignmentReturnDataplane(cfg *config, state *wireGuardState) error {

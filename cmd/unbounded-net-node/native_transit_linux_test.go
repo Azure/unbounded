@@ -148,3 +148,105 @@ func TestNativeTransitInterfaceRules(t *testing.T) {
 		}
 	}
 }
+
+func TestAssignmentReturnRoutesAfterRestart(t *testing.T) {
+	runtime.LockOSThread()
+
+	defer runtime.UnlockOSThread()
+
+	original, err := netns.Get()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = original.Close() }()
+
+	isolated, err := netns.New()
+	if errors.Is(err, unix.EPERM) {
+		t.Skip("requires network namespace privileges")
+	}
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer func() { _ = isolated.Close() }()
+	defer func() {
+		if err := netns.Set(original); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	owned := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: assignmentReturnDeviceName}}
+
+	foreign := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "other0"}}
+	for _, link := range []netlink.Link{owned, foreign} {
+		if err := netlink.LinkAdd(link); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := netlink.LinkSetUp(link); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	table := assignmentReturnTableBase + 1
+	for _, fixture := range []struct {
+		cidr, device    string
+		protocol, table int
+	}{
+		{"10.246.1.0/24", owned.Name, unix.RTPROT_STATIC, table},
+		{"fd46:1::/64", owned.Name, unix.RTPROT_STATIC, table},
+		{"10.246.2.0/24", owned.Name, unix.RTPROT_STATIC, table},
+		{"fd46:2::/64", owned.Name, unix.RTPROT_STATIC, table},
+		{"10.247.0.0/24", owned.Name, unix.RTPROT_BOOT, table},
+		{"10.248.0.0/24", foreign.Name, unix.RTPROT_STATIC, table},
+		{"10.249.0.0/24", owned.Name, unix.RTPROT_STATIC, table + 1},
+	} {
+		link, err := netlink.LinkByName(fixture.device)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		_, prefix, _ := net.ParseCIDR(fixture.cidr)
+		if err := netlink.RouteReplace(&netlink.Route{
+			LinkIndex: link.Attrs().Index, Dst: prefix, Table: fixture.table,
+			Protocol: netlink.RouteProtocol(fixture.protocol), Scope: netlink.SCOPE_LINK,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	state := &wireGuardState{}
+
+	routes, err := prepareAssignmentReturnRoutes(&config{TunnelDataplaneMapSize: 64}, state, []string{"10.246.1.0/24", "fd46:1::/64"}, 1400)
+	if state.assignmentTunnelMap != nil {
+		defer func() { _ = state.assignmentTunnelMap.Close() }()
+	}
+
+	if err != nil || len(routes) != 2 {
+		t.Fatalf("restart preparation failed: %v, %+v", err, routes)
+	}
+
+	kernelRoutes, err := netlink.RouteListFiltered(netlink.FAMILY_ALL, &netlink.Route{Table: table}, netlink.RT_FILTER_TABLE)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	present := make(map[string]bool)
+
+	for _, route := range kernelRoutes {
+		if route.Dst != nil {
+			present[route.Dst.String()] = true
+		}
+	}
+
+	if len(present) != 4 || !present["10.246.1.0/24"] || !present["fd46:1::/64"] ||
+		!present["10.247.0.0/24"] || !present["10.248.0.0/24"] {
+		t.Fatalf("restart retained withdrawn routes or removed unrelated routes: %+v", kernelRoutes)
+	}
+
+	otherTable, err := netlink.RouteListFiltered(netlink.FAMILY_V4, &netlink.Route{Table: table + 1}, netlink.RT_FILTER_TABLE)
+	if err != nil || len(otherTable) != 1 {
+		t.Fatalf("restart changed an unrelated routing table: %v, %+v", err, otherTable)
+	}
+}
