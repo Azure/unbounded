@@ -1084,12 +1084,19 @@ impl Index {
         size: racer_wire::object::PageSize,
         extra: usize,
     ) -> bool {
-        // A single retaining class owns the whole slot budget, so partitioning
-        // cannot reject it. This fast path also avoids scanning every stored page
-        // on each admission in the common default-only cluster.
-        if self.page_sizes.borrow().len() <= 1 {
+        // An unpartitioned index admits every size. A single retaining class
+        // owns the whole slot budget, so it admits only its own size without
+        // scanning stored pages. This keeps the common default-only cluster
+        // fast while still rejecting pages of a class the node no longer
+        // serves.
+        let classes = self.page_sizes.borrow();
+        if classes.is_empty() {
             return true;
         }
+        if classes.len() == 1 {
+            return classes[0] == size;
+        }
+        drop(classes);
         let Some(quota) = self.class_quota(size) else {
             return false;
         };
@@ -3465,6 +3472,28 @@ mod tests {
         index.set_page_sizes(&[]);
         assert_eq!(index.class_quota(small), None);
         assert_eq!(index.capacity_bytes(), 8 * large.get());
+    }
+
+    #[test]
+    fn single_class_rejects_pages_of_another_size() {
+        let env = racer_io::Env::host();
+        let small = PageSize::new(4 << 10).unwrap();
+        let large = PageSize::DEFAULT;
+        let index = sized_index(&env, 4, &[("small", small), ("large", large)]);
+        // The node no longer serves the large class, but its cache remains
+        // published so in-flight work can still resolve its page size.
+        index.set_page_sizes(&[small]);
+        let (large_page, _) = sized_entry("large", "large-page", large, 0);
+        assert_eq!(
+            index.preflight_capacity(&large_page),
+            Err(Error::Overloaded)
+        );
+        assert_eq!(
+            index.reserve_page_for(&large_page).err(),
+            Some(Error::Overloaded)
+        );
+        let (small_page, _) = sized_entry("small", "small-page", small, 0);
+        assert_eq!(index.preflight_capacity(&small_page), Ok(()));
     }
 
     #[test]

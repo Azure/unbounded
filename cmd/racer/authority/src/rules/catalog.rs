@@ -337,6 +337,93 @@ mod tests {
     }
 
     #[test]
+    fn page_size_labels_and_default_normalization() {
+        let u = "11111111-1111-4111-8111-111111111111";
+        let parse = |label: &str, cluster_default| {
+            let mut info = c(u, "a");
+            info.page_size = Some(Value::String(label.into()));
+            build_with_default(&[info], cluster_default).map(|out| out.caches[0].page_size)
+        };
+        let default = racer_wire::object::PageSize::DEFAULT;
+        for (label, bytes) in [
+            ("4KiB", 4 << 10),
+            ("8KiB", 8 << 10),
+            ("16KiB", 16 << 10),
+            ("32KiB", 32 << 10),
+            ("64KiB", 64 << 10),
+            ("128KiB", 128 << 10),
+            ("256KiB", 256 << 10),
+            ("512KiB", 512 << 10),
+            ("1MiB", 1 << 20),
+            ("2MiB", 2 << 20),
+            ("4MiB", 4 << 20),
+            ("8MiB", 8 << 20),
+        ] {
+            let size = racer_wire::object::PageSize::new(bytes).unwrap();
+            assert_eq!(parse(label, default), Ok(Some(size)), "{label}");
+        }
+        assert_eq!(parse("16MiB", default), Ok(None));
+        assert_eq!(parse("3KiB", default), Err(wire::Error::InvalidRequest));
+        assert_eq!(parse("16mib", default), Err(wire::Error::InvalidRequest));
+    }
+
+    #[test]
+    fn page_size_normalizes_against_the_effective_cluster_default() {
+        let u = "11111111-1111-4111-8111-111111111111";
+        let default = racer_wire::object::PageSize::new(16 << 20).unwrap();
+        let mut explicit_default = c(u, "a");
+        explicit_default.page_size = Some(Value::String("16MiB".into()));
+        assert_eq!(
+            build_with_default(&[explicit_default], default)
+                .unwrap()
+                .caches[0]
+                .page_size,
+            None
+        );
+        let mut default_override = c(u, "a");
+        default_override.page_size = Some(Value::String("1MiB".into()));
+        assert_eq!(
+            build_with_default(
+                &[default_override],
+                racer_wire::object::PageSize::new(1 << 20).unwrap()
+            )
+            .unwrap()
+            .caches[0]
+                .page_size,
+            None
+        );
+        let mut sixteen = c(u, "a");
+        sixteen.page_size = Some(Value::String("16MiB".into()));
+        assert_eq!(
+            build_with_default(
+                &[sixteen],
+                racer_wire::object::PageSize::new(1 << 20).unwrap()
+            )
+            .unwrap()
+            .caches[0]
+                .page_size,
+            Some(racer_wire::object::PageSize::DEFAULT)
+        );
+    }
+
+    #[test]
+    fn page_size_json_null_and_numbers_are_unset_or_invalid() {
+        let u = "11111111-1111-4111-8111-111111111111";
+        let parse = |spec: Value| {
+            let info = CacheInfo::from_json(
+                &serde_json::json!({"metadata":{"uid":u,"name":"a"},"spec":spec}),
+            );
+            build(&[info]).map(|out| out.caches[0].page_size)
+        };
+        assert_eq!(parse(serde_json::json!({})), Ok(None));
+        assert_eq!(parse(serde_json::json!({"pageSize":null})), Ok(None));
+        assert_eq!(
+            parse(serde_json::json!({"pageSize":4096})),
+            Err(wire::Error::InvalidRequest)
+        );
+    }
+
+    #[test]
     fn sorted_by_uid() {
         let out = build(&[
             c("22222222-2222-4222-8222-222222222222", "b"),

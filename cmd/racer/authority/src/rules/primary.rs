@@ -193,9 +193,10 @@ pub fn plan_pass(i: &PassInputs<'_>, rng: &mut dyn Entropy) -> Result<PassPlan, 
     // fails to build or admit and no image of the committed record exists.
     // Unknown is not empty: it must neither publish an empty catalog nor
     // drop cache keys.
+    let page_size = effective_page_size(i);
     let built = inv
         .caches_synced
-        .then(|| catalog::build(&catalog_input).ok())
+        .then(|| catalog::build_with_default(&catalog_input, page_size).ok())
         .flatten();
     let rejected_caches = built
         .as_ref()
@@ -212,7 +213,6 @@ pub fn plan_pass(i: &PassInputs<'_>, rng: &mut dyn Entropy) -> Result<PassPlan, 
             .ok()
             .map(|caches| (caches, c.selectors))
     });
-    let page_size = effective_page_size(i);
     let catalog: Option<Vec<_>> = admitted
         .as_ref()
         .map(|(caches, _)| caches.clone())
