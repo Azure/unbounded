@@ -1792,6 +1792,11 @@ const BLOCK: usize = 2;
 const GROWN: usize = 8;
 
 fn growing_world() -> (World, BlockCharges) {
+    growing_world_with(GROWN as u32)
+}
+
+/// A [`growing_world`] whose links advertise `grants_per_link` grants.
+fn growing_world_with(grants_per_link: u32) -> (World, BlockCharges) {
     let sim = Simulation::new();
     let clock = SimClock::new(7);
     let mut a = node(&sim, 1, clock.ctx(1));
@@ -1801,7 +1806,7 @@ fn growing_world() -> (World, BlockCharges) {
         open: Arc::new(std::sync::atomic::AtomicBool::new(true)),
     };
     for (n, node) in [&mut a, &mut b].into_iter().enumerate() {
-        let mut config = config_with(&node.charge, GROWN as u32);
+        let mut config = config_with(&node.charge, grants_per_link);
         config.pool_bytes = GROWN * len();
         if n == 0 {
             let live = charges.live.clone();
@@ -1908,6 +1913,53 @@ fn growing_pool_follows_demand() {
         assert_eq!(charges.live.load(Ordering::Acquire), 0);
         assert_eq!(w.a.clients[0].free_buffers(7), Some((GROWN, GROWN)));
         assert_eq!(w.a.clients[0].buffers(7, BufferState::Free), Some(BLOCK));
+        shutdown(w);
+    });
+}
+
+#[test]
+/// Requests parked behind their link's grant cap are not buffer demand: a
+/// link capped at one grant, with many requests parked on it, keeps the pool
+/// at its first block, and its waiters are still served as the slot frees.
+fn slot_capped_waiters_do_not_grow_the_pool() {
+    profiles(|| {
+        let (mut w, charges) = growing_world_with(1);
+        let (ea, eb) = link_up(&mut w);
+        let held = hold_grants(&mut w, ea, 1, 0);
+        let deadline = w.now() + 600 * SECOND;
+        let until = w.now() + 60 * SECOND;
+        let parked: Vec<_> = (0..GROWN - 1)
+            .map(|i| {
+                let op =
+                    w.a.clients[0].grant_parked(TO_B, ea, [10 + i as u8; 16], 10, deadline, until);
+                pump(&mut w);
+                op
+            })
+            .collect();
+        assert!(parked.iter().all(pending));
+        assert_eq!(w.a.clients[0].grant_waiters(), GROWN - 1);
+
+        for _ in 0..50 {
+            w.clock.advance(page_alloc::SAMPLE_PERIOD);
+            pump(&mut w);
+        }
+        let capped = sizing(&w);
+        assert_eq!(
+            (capped.capacity, capped.blocks, capped.registrations),
+            (BLOCK, 1, 0),
+            "{capped:?}"
+        );
+        assert_eq!(charges.live.load(Ordering::Acquire), 0);
+
+        release_grants(&mut w, eb, held);
+        let first = ready(&parked[0]).unwrap();
+        assert!(first.waited);
+        assert!(parked[1..].iter().all(pending));
+        drop(parked);
+        release_grants(&mut w, eb, vec![first]);
+        pump(&mut w);
+        assert_eq!(w.a.clients[0].grant_waiters(), 0);
+        assert_eq!(sizing(&w).registrations, 0);
         shutdown(w);
     });
 }

@@ -729,7 +729,12 @@ impl Link {
 
     /// True while every grant slot of the link is held.
     pub(crate) fn grants_full(&self) -> bool {
-        self.grants.len() >= self.grant_cap as usize
+        self.free_grant_slots() == 0
+    }
+
+    /// Grant slots of the link not held.
+    pub(crate) fn free_grant_slots(&self) -> usize {
+        (self.grant_cap as usize).saturating_sub(self.grants.len())
     }
 
     /// Bind a window over a free buffer and queue a `Grant`. `done` gets the

@@ -197,10 +197,11 @@ impl RailSizing {
             || pool.draining_blocks() > 0
     }
 
-    /// Finish a ready registration, then size the pool for `waiting` parked
-    /// requests and the buffers in use. `charge` reserves a new block,
-    /// `device` registers it, and `wake` runs when it is done. While
-    /// `closing`, only finishes registrations, dropping what they built.
+    /// Finish a ready registration, then size the pool for the buffers in
+    /// use and `waiting` parked requests that a free buffer would serve.
+    /// `charge` reserves a new block, `device` registers it, and `wake` runs
+    /// when it is done. While `closing`, only finishes registrations,
+    /// dropping what they built.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn step(
         &mut self,

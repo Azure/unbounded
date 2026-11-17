@@ -1332,6 +1332,36 @@ struct Waiter {
     done: Completer<Granted>,
 }
 
+/// Parked requests in `queue` that a free buffer would let through: each
+/// ready link's live waiters, up to its free grant slots. A request blocked
+/// by its link's grant cap, or whose link is gone, would take no buffer.
+fn buffer_waiters(
+    queue: &VecDeque<Waiter>,
+    links: &BTreeMap<LinkKey, Link>,
+    now: Instant,
+) -> usize {
+    let mut slots: BTreeMap<LinkKey, usize> = BTreeMap::new();
+
+    queue
+        .iter()
+        .filter(|waiter| now < waiter.until && !waiter.done.is_abandoned())
+        .filter(|waiter| {
+            let Some(link) = links
+                .get(&waiter.key)
+                .filter(|link| link.epoch() == waiter.epoch && link.phase() == Phase::Ready)
+            else {
+                return false;
+            };
+            let free = slots
+                .entry(waiter.key)
+                .or_insert_with(|| link.free_grant_slots());
+            let counted = *free > 0;
+            *free = free.saturating_sub(1);
+            counted
+        })
+        .count()
+}
+
 impl Owner {
     /// Build the owner. Call on the native thread; `ctx` supplies its time
     /// and entropy (and it captures the thread's simulation, in tests).
@@ -1976,7 +2006,10 @@ impl Owner {
             // A lost rail is not sized, but a registration in flight on it
             // still has to finish: stepping it as closing drops the block.
             let lost = self.lost.contains(rail);
-            let waiting = self.waiters.get(rail).map_or(0, VecDeque::len);
+            let waiting = self
+                .waiters
+                .get(rail)
+                .map_or(0, |queue| buffer_waiters(queue, &self.links, now));
             let capacity = device.pool.capacity();
             let changes = sizing.step(
                 &mut device.pool,

@@ -157,15 +157,19 @@ is the floor and stays for the round; the rest of the budget is the ceiling.
 
 The native owner ticks one `Provision` per rail (`verbs/src/sizing.rs`) in
 every pass with the unit of one block. In-use counts buffers not free plus
-grant requests parked on the rail. A take that found the rail empty reports a
-shortfall, at most once per sample. Growth first reactivates a draining block,
-which costs nothing, and otherwise reserves the block's `Registered`
-admission charge through `Growth::charge` and starts `Registering::host` on a
-helper thread, one block in flight per rail. The owner keeps serving; when the
-registration finishes, it adds the block, reports the measured time, and
-serves parked grants again. A refused charge marks the rail saturated
-(freezing the correction) and a failed registration logs; either way growth
-retries after 1 s, and until then the rail reports no room to grow.
+grant requests parked on the rail that a free buffer would serve: each
+ready link's live requests up to its free grant slots, so requests held back
+by their link's grant cap do not grow the pool. A take that found the rail
+empty reports a shortfall, at most once per sample; a link checks its grant
+cap before taking, so a capped request never reports one. Growth first
+reactivates a draining block, which costs nothing, and otherwise reserves the
+block's `Registered` admission charge through `Growth::charge` and starts
+`Registering::host` on a helper thread, one block in flight per rail. The
+owner keeps serving; when the registration finishes, it adds the block,
+reports the measured time, and serves parked grants again. A refused charge
+marks the rail saturated (freezing the correction) and a failed registration
+logs; either way growth retries after 1 s, and until then the rail reports no
+room to grow.
 
 Release marks the newest active block draining: it hands out no more buffers
 and the links free its memory windows as grants return, since a window stays
