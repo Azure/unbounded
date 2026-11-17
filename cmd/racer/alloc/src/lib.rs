@@ -824,19 +824,22 @@ impl<C: Charge> BufferPool<C> {
     }
 
     /// Count `capacity` bytes as returned and decide whether to keep them.
-    /// Under pressure only the controller's remaining target is kept.
+    /// Elevated pressure keeps only the controller's remaining target, and
+    /// critical pressure keeps nothing.
     fn accepts(&mut self, capacity: usize) -> bool {
         self.in_use = self.in_use.saturating_sub(capacity);
         self.demand.observe(Self::granules(self.in_use));
         let idle = self.bytes().saturating_add(capacity);
         let room = match self.pressure {
             Pressure::Normal => self.budget,
-            Pressure::Elevated | Pressure::Critical => self
+            Pressure::Elevated => self
                 .demand
                 .target()
                 .saturating_mul(STAGING_GRANULE)
                 .saturating_sub(self.in_use)
                 .min(self.budget),
+            // The last target may still count buffers being returned now.
+            Pressure::Critical => 0,
         };
         if idle > room {
             self.counters.rejects = self.counters.rejects.saturating_add(1);
@@ -1111,6 +1114,28 @@ mod buffer_tests {
         let all = pool.borrow_mut().take_all();
         assert!(!all.is_empty());
         assert_eq!(tallied(&pool), 0);
+    }
+
+    #[test]
+    fn critical_pressure_refuses_returns_counted_in_the_target() {
+        let live = Rc::new(Cell::new(0));
+        let alignment = Alignment::new(64, 1, 1).unwrap();
+        let pool = Rc::new(RefCell::new(BufferPool::default()));
+        let buffer = alignment
+            .allocate(STAGING_GRANULE, TrackedCharge::new(&live, STAGING_GRANULE))
+            .unwrap()
+            .pooled(&pool);
+        pool.borrow_mut().set_pressure(Pressure::Critical);
+        assert!(
+            pool.borrow_mut()
+                .maintain(std::time::Instant::now())
+                .is_empty()
+        );
+        assert_eq!(pool.borrow().stats().target, STAGING_GRANULE);
+        drop(buffer);
+        assert_eq!(live.get(), 0);
+        let stats = pool.borrow().stats();
+        assert_eq!((stats.entries, stats.bytes, stats.rejects), (0, 0, 1));
     }
 
     #[test]

@@ -263,8 +263,9 @@ impl<C: Charge> Slab<C> {
         released.iter().map(|b| b.allocation().layout.size()).sum()
     }
 
-    /// Apply memory pressure to the idle pool. Under pressure it keeps only
-    /// what the controller still targets, and maintenance releases the rest.
+    /// Apply memory pressure to the idle pool. Elevated pressure keeps only
+    /// what the controller still targets, critical pressure keeps no returns,
+    /// and maintenance releases the rest.
     pub fn set_idle_pressure(&self, pressure: crate::Pressure) {
         self.idle_buffer.borrow_mut().set_pressure(pressure);
     }
