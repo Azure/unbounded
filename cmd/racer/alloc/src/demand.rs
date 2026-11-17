@@ -143,6 +143,7 @@ pub struct Provision {
     acquire: u64,
     in_use: usize,
     sample_peak: usize,
+    tick_peak: usize,
     next_sample: Option<Instant>,
     previous: usize,
     rises: [usize; 2],
@@ -175,6 +176,7 @@ impl Provision {
             acquire: nanos(config.acquire),
             in_use: 0,
             sample_peak: 0,
+            tick_peak: 0,
             next_sample: None,
             previous: 0,
             rises: [0; 2],
@@ -235,6 +237,7 @@ impl Provision {
     pub fn observe(&mut self, in_use: usize) {
         self.in_use = in_use;
         self.sample_peak = self.sample_peak.max(in_use);
+        self.tick_peak = self.tick_peak.max(in_use);
         let window = &mut self.windows[self.window];
         *window = (*window).max(in_use);
     }
@@ -325,6 +328,7 @@ impl Provision {
     }
 
     fn advance(&mut self, now: Instant) {
+        let fresh = std::mem::take(&mut self.tick_peak);
         let next_sample = *self.next_sample.get_or_insert(now + SAMPLE_PERIOD);
         let window_start = *self.window_start.get_or_insert(now);
         if now >= next_sample {
@@ -360,6 +364,10 @@ impl Provision {
         if steps >= HISTORY as u64 {
             self.windows = [self.in_use; HISTORY];
         }
+        // Demand observed since the last tick may have come at any point in
+        // the gap, so hold it from now rather than from the start of the gap.
+        let newest = &mut self.windows[self.window];
+        *newest = (*newest).max(fresh);
         self.window_start = Some(if steps > CATCH_UP {
             now
         } else {
@@ -703,6 +711,58 @@ mod tests {
         }
         assert_eq!(provision.hold(), MAX_HOLD);
         provision.acquired(now, 0, Duration::from_secs(10));
+    }
+
+    /// Report a burst that came and went since the last tick, then tick
+    /// `gap` after `start` with the burst's capacity still provisioned.
+    fn burst_after_gap(provision: &mut Provision, start: Instant, gap: Duration) -> Plan {
+        provision.observe(10);
+        provision.observe(0);
+        provision.tick(start + gap, 10, 0, Pressure::Normal)
+    }
+
+    #[test]
+    fn a_burst_right_after_an_idle_gap_is_held() {
+        let config = ProvisionConfig {
+            acquire: Duration::ZERO,
+            ..HOST
+        };
+        let hold = Provision::new(config).hold();
+        assert_eq!(hold, MIN_HOLD);
+        let width = hold / WINDOWS as u32;
+        for gap in [
+            width + Duration::from_millis(1),
+            hold + width,
+            hold * 4 + width,
+            Duration::from_secs(40),
+        ] {
+            let start = Instant::now();
+            let mut provision = Provision::new(config);
+            assert_eq!(provision.tick(start, 0, 0, Pressure::Normal), Plan::Hold);
+            assert_eq!(
+                burst_after_gap(&mut provision, start, gap),
+                Plan::Hold,
+                "gap {gap:?}"
+            );
+            assert_eq!(provision.target(), 10, "gap {gap:?}");
+            let mut now = start + gap;
+            let mut capacity = 10;
+            let mut released_at = None;
+            while released_at.is_none() {
+                now += SAMPLE_PERIOD;
+                match provision.tick(now, capacity, 0, Pressure::Normal) {
+                    Plan::Hold => {}
+                    Plan::Release(units) => {
+                        capacity -= units;
+                        released_at = Some(now);
+                    }
+                    Plan::Grow(units) => panic!("gap {gap:?}: grew {units}"),
+                }
+                assert!(now < start + gap + hold * 8, "gap {gap:?}: never released");
+            }
+            let held = released_at.unwrap() - (start + gap);
+            assert!(held >= hold - width, "gap {gap:?}: released after {held:?}");
+        }
     }
 
     #[test]
