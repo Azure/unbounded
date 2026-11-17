@@ -116,7 +116,7 @@ pub use node::{
 };
 pub use pool::{BufferState, DevicePage, RegisteredPage};
 pub use role::{DRAIN_REPORT, OwnerRole, OwnerStop};
-pub use sizing::{BlockCharge, Growth, PoolSizing};
+pub use sizing::{BlockCharge, Growth, PoolSizing, PoolSizings};
 
 #[cfg(any(test, feature = "simulation"))]
 pub use ffi::simulation;

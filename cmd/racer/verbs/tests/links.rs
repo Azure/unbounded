@@ -1806,28 +1806,43 @@ fn growing_world_with(grants_per_link: u32) -> (World, BlockCharges) {
         open: Arc::new(std::sync::atomic::AtomicBool::new(true)),
     };
     for (n, node) in [&mut a, &mut b].into_iter().enumerate() {
-        let mut config = config_with(&node.charge, grants_per_link);
-        config.pool_bytes = GROWN * len();
-        if n == 0 {
-            let live = charges.live.clone();
-            let open = charges.open.clone();
-            config.growth = Some(rdma_verbs::Growth {
-                block_bytes: BLOCK * len(),
-                charge: Box::new(move |bytes| {
-                    assert_eq!(bytes, BLOCK * len());
-                    if !open.load(Ordering::Acquire) {
-                        return None;
-                    }
-                    live.fetch_add(1, Ordering::AcqRel);
-                    Some(Arc::new(Charge(live.clone())) as rdma_verbs::Guard)
-                }),
-            });
-        }
+        let config = if n == 0 {
+            growing_config(&node.charge, grants_per_link, &charges)
+        } else {
+            let mut config = config_with(&node.charge, grants_per_link);
+            config.pool_bytes = GROWN * len();
+            config
+        };
         let activation = node.clients[0].activate(config);
         node.owner().poll_budgeted(4).unwrap();
         ready(&activation).unwrap();
     }
     (World { sim, clock, a, b }, charges)
+}
+
+/// A pool of up to `GROWN` buffers that starts with one block of `BLOCK`
+/// and charges each later block to `charges`.
+fn growing_config(
+    charge: &Arc<AtomicUsize>,
+    grants_per_link: u32,
+    charges: &BlockCharges,
+) -> NodeConfig {
+    let mut config = config_with(charge, grants_per_link);
+    config.pool_bytes = GROWN * len();
+    let live = charges.live.clone();
+    let open = charges.open.clone();
+    config.growth = Some(rdma_verbs::Growth {
+        block_bytes: BLOCK * len(),
+        charge: Box::new(move |bytes| {
+            assert_eq!(bytes, BLOCK * len());
+            if !open.load(Ordering::Acquire) {
+                return None;
+            }
+            live.fetch_add(1, Ordering::AcqRel);
+            Some(Arc::new(Charge(live.clone())) as rdma_verbs::Guard)
+        }),
+    });
+    config
 }
 
 /// Hold `count` grants into `a`, each parked so that it may wait for growth.
@@ -1913,6 +1928,40 @@ fn growing_pool_follows_demand() {
         assert_eq!(charges.live.load(Ordering::Acquire), 0);
         assert_eq!(w.a.clients[0].free_buffers(7), Some((GROWN, GROWN)));
         assert_eq!(w.a.clients[0].buffers(7, BufferState::Free), Some(BLOCK));
+        shutdown(w);
+    });
+}
+
+#[test]
+/// One read of the pool table gives every rail's sizing with the round that
+/// installed it, and a new activation starts a new round whose counts
+/// restart, so a caller can tell a reset from a partial view.
+fn pool_sizings_restart_with_each_round() {
+    profiles(|| {
+        let (mut w, charges) = growing_world();
+        let (ea, eb) = link_up(&mut w);
+        let held = hold_grants(&mut w, ea, 2 * BLOCK, 0);
+        let first = w.a.clients[0].pool_sizings().unwrap();
+        assert_eq!(first.round, 1);
+        assert_eq!(first.rails.get(&7), Some(&sizing(&w)));
+        assert!(first.rails[&7].registrations >= 1, "{first:?}");
+        let b = w.b.clients[0].pool_sizings().unwrap();
+        assert!(b.rails.is_empty(), "b is not sized to demand");
+        release_grants(&mut w, eb, held);
+
+        w.a.clients[0].close();
+        pump(&mut w);
+        assert!(w.a.clients[0].drained());
+        let closed = w.a.clients[0].pool_sizings().unwrap();
+        assert_eq!((closed.round, closed.rails.len()), (1, 0));
+
+        w.a.clients[0].reopen().unwrap();
+        let activation =
+            w.a.clients[0].activate(growing_config(&w.a.charge, GROWN as u32, &charges));
+        assert!(wait(&mut w, &activation).is_ok());
+        let second = w.a.clients[0].pool_sizings().unwrap();
+        assert_eq!(second.round, 2);
+        assert_eq!(second.rails[&7].registrations, 0, "{second:?}");
         shutdown(w);
     });
 }

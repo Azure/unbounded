@@ -30,7 +30,7 @@ use crate::{
     ffi::{self, Access, NativeDevice, NativeRegion, RegisterWake, Registering},
     link::{self, Break, Epoch, Granted, Limits, Link, Phase, Role, Source},
     pool::{BufferState, Pool, PoolShared, Tally},
-    sizing::{Growth, PoolSizing, RailSizing, SizingStats},
+    sizing::{Growth, PoolSizing, PoolSizings, RailSizing, SizingStats},
 };
 
 /// Commands each worker may queue before [`Error::Overloaded`].
@@ -398,6 +398,11 @@ struct NodeShared {
     /// Host page pools by rail, republished when blocks change.
     pools: RwLock<BTreeMap<u16, RailPool>>,
 
+    /// Activations whose [`Self::pools`] were installed, bumped under its
+    /// write lock, so a reader holding the read lock sees the round of the
+    /// table it reads.
+    pools_round: AtomicU64,
+
     /// [`Client::set_pool_pressure`] as `Pressure as u8`.
     pool_pressure: AtomicU8,
 
@@ -621,6 +626,7 @@ pub fn node(workers: usize) -> Result<(Vec<Client>, OwnerPort)> {
     let shared = Arc::new(NodeShared {
         links: Snapshot::new(),
         pools: RwLock::new(BTreeMap::new()),
+        pools_round: AtomicU64::new(0),
         pool_pressure: AtomicU8::new(0),
         device_pools: RwLock::new(BTreeMap::new()),
         prefetch: RwLock::new(BTreeMap::new()),
@@ -1059,6 +1065,21 @@ impl Client {
     pub fn pool_sizing(&self, rail: u16) -> Option<PoolSizing> {
         let pools = self.shared.pools.try_read().ok()?;
         Some(pools.get(&rail)?.sizing.as_ref()?.snapshot())
+    }
+
+    /// How every rail's host pool is sized to demand, from one read of the
+    /// pool table, so the rails and their round always belong together.
+    /// Rails activated without [`NodeConfig::growth`] are left out. `None`
+    /// while the pool table is being changed.
+    pub fn pool_sizings(&self) -> Option<PoolSizings> {
+        let pools = self.shared.pools.try_read().ok()?;
+        Some(PoolSizings {
+            round: self.shared.pools_round.load(Ordering::Relaxed),
+            rails: pools
+                .iter()
+                .filter_map(|(rail, pool)| Some((*rail, pool.sizing.as_ref()?.snapshot())))
+                .collect(),
+        })
     }
 
     /// Memory pressure for pools sized to demand: under pressure they keep
@@ -2166,6 +2187,7 @@ impl Owner {
                     .iter()
                     .map(|(rail, d)| (*rail, RailPool::of(&d.pool, sizing.get(rail)))),
             );
+            self.shared.pools_round.fetch_add(1, Ordering::Relaxed);
         }
 
         {

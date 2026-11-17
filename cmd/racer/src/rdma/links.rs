@@ -414,6 +414,15 @@ pub enum SetupOutcome {
     Failed,
 }
 
+/// Pool block counts already recorded for one activation round (see
+/// [`rdma_verbs::PoolSizings::round`]).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PoolSeen {
+    round: u64,
+    registrations: u64,
+    deregistrations: u64,
+}
+
 /// Per-worker facade over the node owner.
 pub struct Links {
     client: Client,
@@ -438,7 +447,7 @@ pub struct Links {
 
     /// Block registrations and deregistrations last recorded, summed over
     /// rails, so [`Self::sync_link_metrics`] records only the growth.
-    pool_seen: Cell<(u64, u64)>,
+    pool_seen: Cell<PoolSeen>,
 
     /// [`OWNER_STALL`], shorter in tests.
     owner_stall: Duration,
@@ -474,7 +483,7 @@ impl Links {
             draining: Cell::new(false),
             breaks_seen: Cell::new([0; rdma_verbs::BreakReason::ALL.len()]),
             loop_seen: Cell::new(rdma_verbs::OwnerLoop::default()),
-            pool_seen: Cell::new((0, 0)),
+            pool_seen: Cell::new(PoolSeen::default()),
             owner_stall: OWNER_STALL,
             metrics: None,
             ctx,
@@ -757,8 +766,21 @@ impl Links {
 
     /// Publish how the registered pools are sized, summed over active rails.
     fn sync_pool_metrics(&self, metrics: &crate::telemetry::Metrics) {
+        self.publish_pool_sizing(metrics, self.pool_sizing());
+    }
+
+    /// Publish `sample`, an activation round and its pools' sizing summed
+    /// over active rails. Without one (the owner was changing the pool
+    /// table), keep the last sample: a partial sum would read as a drop.
+    fn publish_pool_sizing(
+        &self,
+        metrics: &crate::telemetry::Metrics,
+        sample: Option<(u64, rdma_verbs::PoolSizing)>,
+    ) {
         use crate::telemetry::{Event, Gauge};
-        let sizing = self.pool_sizing();
+        let Some((round, sizing)) = sample else {
+            return;
+        };
         let bytes = |buffers: usize| (buffers * BUFFER_LEN) as u64;
         for (gauge, value) in [
             (Gauge::RdmaPoolCapacityBytes, bytes(sizing.capacity)),
@@ -775,33 +797,50 @@ impl Links {
         ] {
             metrics.set_gauge(gauge, value);
         }
-        let seen = self
-            .pool_seen
-            .replace((sizing.registrations, sizing.deregistrations));
-        // Counters restart with each activation round.
-        let grown = |now: u64, before: u64| if now < before { now } else { now - before };
-        for (event, grown) in [
+        // Counts restart only with a new round. Within one they only grow,
+        // so a lower sum (rails leaving the active set) is not a reset.
+        let seen = self.pool_seen.get();
+        let before = if seen.round == round {
+            seen
+        } else {
+            PoolSeen {
+                round,
+                ..PoolSeen::default()
+            }
+        };
+        self.pool_seen.set(PoolSeen {
+            round,
+            registrations: before.registrations.max(sizing.registrations),
+            deregistrations: before.deregistrations.max(sizing.deregistrations),
+        });
+        for (event, now, before) in [
             (
                 Event::RdmaPoolRegistrations,
-                grown(sizing.registrations, seen.0),
+                sizing.registrations,
+                before.registrations,
             ),
             (
                 Event::RdmaPoolDeregistrations,
-                grown(sizing.deregistrations, seen.1),
+                sizing.deregistrations,
+                before.deregistrations,
             ),
         ] {
+            let grown = now.saturating_sub(before);
             if grown > 0 {
                 metrics.record(event, grown);
             }
         }
     }
 
-    /// How the registered pools are sized, summed over active rails; the
-    /// register and hold times are the slowest rail's.
-    pub fn pool_sizing(&self) -> rdma_verbs::PoolSizing {
+    /// How the registered pools are sized, summed over active rails, and
+    /// the activation round they belong to; the register and hold times are
+    /// the slowest rail's. `None` while the owner is changing the pool
+    /// table, rather than a sum that misses some rails.
+    pub fn pool_sizing(&self) -> Option<(u64, rdma_verbs::PoolSizing)> {
+        let sizings = self.client.pool_sizings()?;
         let mut total = rdma_verbs::PoolSizing::default();
         for rail in self.active() {
-            let Some(sizing) = self.client.pool_sizing(rail.rail.0) else {
+            let Some(sizing) = sizings.rails.get(&rail.rail.0) else {
                 continue;
             };
             total.capacity += sizing.capacity;
@@ -815,7 +854,7 @@ impl Links {
             total.register = total.register.max(sizing.register);
             total.hold = total.hold.max(sizing.hold);
         }
-        total
+        Some((sizings.round, total))
     }
 
     /// Memory pressure the registered pools size for.

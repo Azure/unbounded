@@ -12,6 +12,7 @@
 //! `designs/racer-pool-control.md`.
 
 use std::{
+    collections::BTreeMap,
     rc::Rc,
     sync::{
         Arc,
@@ -83,6 +84,17 @@ pub struct PoolSizing {
 
     /// Time surplus blocks are kept after demand falls.
     pub hold: Duration,
+}
+
+/// Every rail's [`PoolSizing`] from one read of the pool table.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PoolSizings {
+    /// Activation that installed the pools, counted since the node started.
+    /// Their registration counts start at zero with each one.
+    pub round: u64,
+
+    /// By rail, for pools sized to demand.
+    pub rails: BTreeMap<u16, PoolSizing>,
 }
 
 /// [`PoolSizing`] published by the owner for clients.
