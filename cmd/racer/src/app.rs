@@ -2204,12 +2204,12 @@ impl WorkerApplication {
         self.memory.remove_caches(&passthrough)?;
         self.store.writer.remove_caches(&passthrough)?;
         // Partition the slot budget after the purge, so only retaining caches
-        // that are still published claim a page-size class. Existing pages in
-        // a class that shrinks or disappears stay resident.
+        // this node serves claim a page-size class. Existing pages in a class
+        // that shrinks or disappears stay resident.
         self.store
             .writer
             .index()
-            .set_page_sizes(&snapshot.page_sizes());
+            .set_page_sizes(&snapshot.page_sizes_served_by(&self.local));
         // Prefetch tickets end with their cache: a passthrough switch cancels
         // them with `passthrough`, and removal, a UID change (a new cache
         // id), or this node leaving the cache's pool with `cache_removed`.

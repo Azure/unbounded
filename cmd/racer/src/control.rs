@@ -169,6 +169,26 @@ impl Snapshot {
     pub fn page_sizes(&self) -> Vec<racer_wire::object::PageSize> {
         self.caches.page_sizes(self.page_size)
     }
+
+    /// Distinct page-size classes among retained caches this node serves.
+    ///
+    /// Caches whose pool excludes `node` contribute no class: reserving index
+    /// slots for pages this worker cannot store would reject local writes.
+    pub fn page_sizes_served_by(
+        &self,
+        node: &racer_wire::control::NodeId,
+    ) -> Vec<racer_wire::object::PageSize> {
+        let mut sizes: Vec<_> = self
+            .caches
+            .iter()
+            .filter(|cache| !cache.mode.passthrough())
+            .filter(|cache| self.membership.serves(&cache.id, node))
+            .map(|cache| cache.page_size.unwrap_or(self.page_size))
+            .collect();
+        sizes.sort_unstable();
+        sizes.dedup();
+        sizes
+    }
 }
 
 #[cfg(test)]
@@ -3438,5 +3458,37 @@ mod caches_tests {
         assert!(!caches.contains(&CacheId("d".into())));
         assert_eq!(caches[0].id, CacheId("c".into()));
         assert!(!Caches::default().contains(&CacheId("a".into())));
+    }
+
+    #[test]
+    fn page_sizes_served_by_exclude_caches_outside_the_nodes_pools() {
+        use crate::topology::tests::fixtures::member;
+        use crate::topology::tests::pool_tests::{NARROW, pooled};
+
+        let small = racer_wire::object::PageSize::new(4 << 10).unwrap();
+        let mut narrow = definition(NARROW, 0);
+        narrow.page_size = Some(small);
+
+        let snapshot = Snapshot {
+            cluster: ClusterId("test".into()),
+            sequence: PublicationSequence(1),
+            membership: std::sync::Arc::new(pooled(1, 4, vec![1, 2], None)),
+            caches: std::sync::Arc::new(Caches::new(vec![narrow, definition("wide", 0)])),
+            pools: Vec::new(),
+            page_size: racer_wire::object::PageSize::DEFAULT,
+            content_hash: [0; 32],
+            membership_hash: [0; 32],
+        };
+
+        let outside = member(0, 4).node;
+        let inside = member(1, 4).node;
+        assert_eq!(
+            snapshot.page_sizes_served_by(&outside),
+            vec![racer_wire::object::PageSize::DEFAULT]
+        );
+        assert_eq!(
+            snapshot.page_sizes_served_by(&inside),
+            vec![small, racer_wire::object::PageSize::DEFAULT]
+        );
     }
 }
