@@ -50,7 +50,6 @@ func meshWireGuardAllowedIPs(peer meshPeerInfo, peeredSite bool) []string {
 // - wg<gwPort>: Separate interfaces for each gateway peer (for ECMP routing)
 // Endpoint and routing decisions are driven by peer.SiteName and peeredSites membership.
 func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers []meshPeerInfo, gatewayPeers []gatewayPeerInfo, mySiteName string, peeredSites, networkPeeredSites, gatewayNodePubKeys map[string]bool, siteHealthCheckProfileNames, peeringSiteHealthCheckProfileNames, assignmentSiteHealthCheckProfileNames, assignmentPoolHealthCheckProfileNames, poolHealthCheckProfileNames map[string]string, siteTunnelMTUs, peeringSiteTunnelMTUs, assignmentSiteTunnelMTUs, assignmentPoolTunnelMTUs, poolTunnelMTUs map[string]int, additionalRoutes []unboundednetnetlink.DesiredRoute, geneveHCPeers map[string]bool, state *wireGuardState, profiles map[string]healthcheck.HealthCheckSettings) error {
-	nodePodCIDRs := state.nodePodCIDRs
 	isGatewayNode := state.isGatewayNode
 	myGatewayPort := state.myGatewayPort
 
@@ -259,9 +258,10 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 		return fmt.Errorf("failed to configure WireGuard: %w", err)
 	}
 
-	// Sync addresses on mesh interface
-	if err := syncPodCIDRAddresses(state.linkManager, nodePodCIDRs, state.manageCniPlugin); err != nil {
-		return fmt.Errorf("failed to sync addresses on WireGuard interface: %w", err)
+	// Gateway source addresses live on unbounded0. Keeping transport devices
+	// unnumbered also prevents external-CNI device autodetection on them.
+	if err := state.linkManager.EnsureUnnumbered(); err != nil {
+		return fmt.Errorf("clear addresses on WireGuard interface: %w", err)
 	}
 
 	// Bring mesh interface up
@@ -465,9 +465,8 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 			continue
 		}
 
-		// Add the same addresses to gateway interfaces for source IP selection
-		if err := syncPodCIDRAddresses(gwLinkManager, nodePodCIDRs, state.manageCniPlugin); err != nil {
-			klog.Warningf("Failed to sync addresses on gateway interface %s: %v", gwIfaceName, err)
+		if err := gwLinkManager.EnsureUnnumbered(); err != nil {
+			return fmt.Errorf("clear addresses on gateway interface %s: %w", gwIfaceName, err)
 		}
 
 		// Bring gateway interface up

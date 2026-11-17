@@ -286,7 +286,7 @@ func TestManagedTunnelInterfaceDetection(t *testing.T) {
 		IPIPInterfaceName:        "ipip0",
 	}
 
-	for _, iface := range []string{"unbounded0", "wg51820", "geneve0", "vxlan0", "ipip0"} {
+	for _, iface := range []string{"unbounded0", "unbounded1", "wg51820", "geneve0", "vxlan0", "ipip0"} {
 		if !isManagedTunnelInterface(cfg, iface) {
 			t.Fatalf("expected %s to be managed", iface)
 		}

@@ -2312,8 +2312,15 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 		unboundedMTU := resolveCNIConfigMTU(cfg.MTU, localScopeMTU, peers, gatewayPeers,
 			unboundednetnetlink.DetectDefaultRouteMTUFromCache(state.netlinkCache))
 		if unboundedMTU > 0 {
+			// Raise the lower device first; a MACVLAN cannot exceed its
+			// parent's MTU. Both hooks must accept the fabric packet size.
+			backend := unboundednetnetlink.NewLinkManager(unbounded1DeviceName)
+			if err := backend.EnsureMTU(unboundedMTU); err != nil {
+				return fmt.Errorf("set backend MTU: %w", err)
+			}
+
 			unboundedLinkManager := unboundednetnetlink.NewLinkManager(unbounded0DeviceName)
-			if err := unboundedLinkManager.EnsureMTUWithCache(state.netlinkCache, unboundedMTU); err != nil {
+			if err := unboundedLinkManager.EnsureMTU(unboundedMTU); err != nil {
 				klog.Warningf("Failed to set MTU on %s: %v", unbounded0DeviceName, err)
 			}
 		}

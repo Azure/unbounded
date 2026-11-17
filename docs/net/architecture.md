@@ -25,8 +25,8 @@ graph TB
     subgraph "Data Plane"
         subgraph "Node 1"
             NA1[Node Agent]
-            UB1[unbounded0<br/>dummy NOARP]
-            BPF1[TC egress<br/>unbounded_encap]
+            UB1[unbounded0<br/>private MACVLAN NOARP]
+            BPF1[unbounded1 dummy<br/>TC egress unbounded_encap]
             TUN1[geneve0 / vxlan0 / ipip0<br/>FlowBased]
             WG1[WireGuard<br/>wg&lt;port&gt;]
             CNI1[CNI<br/>Bridge]
@@ -34,8 +34,8 @@ graph TB
 
         subgraph "Node 2"
             NA2[Node Agent]
-            UB2[unbounded0<br/>dummy NOARP]
-            BPF2[TC egress<br/>unbounded_encap]
+            UB2[unbounded0<br/>private MACVLAN NOARP]
+            BPF2[unbounded1 dummy<br/>TC egress unbounded_encap]
             TUN2[geneve0 / vxlan0 / ipip0<br/>FlowBased]
             WG2[WireGuard<br/>wg&lt;port&gt;]
             CNI2[CNI<br/>Bridge]
@@ -305,15 +305,16 @@ flowchart TD
 
 ## Tunnel Dataplane
 
-The node agent uses an eBPF dataplane: a single dummy device (`unbounded0`) as a routing anchor, a TC egress BPF program for tunnel endpoint resolution, and shared flow-based tunnel interfaces. This design avoids per-peer interface creation and scales to large meshes with minimal kernel resource usage.
+The node agent uses a staged eBPF dataplane: private MACVLAN `unbounded0` as a routing anchor over unnumbered dummy `unbounded1`, a backend TC egress BPF program for tunnel endpoint resolution, and shared flow-based tunnel interfaces. This separates external-CNI processing from encapsulation without per-peer staging devices.
 
 #### Architecture
 
 ```mermaid
 graph LR
     subgraph "eBPF Dataplane on a Node"
-        POD[Pod traffic] -->|route| UB0[unbounded0<br/>dummy NOARP]
-        UB0 -->|TC egress| BPF["unbounded_encap<br/>(BPF program)"]
+        POD[Pod traffic] -->|route| UB0[unbounded0<br/>private MACVLAN NOARP]
+        UB0 -->|normal transmission after CNI egress| UB1[unbounded1<br/>unnumbered dummy]
+        UB1 -->|TC egress| BPF["unbounded_encap<br/>(BPF program)"]
         BPF -->|LPM lookup| MAPS["LPM Tries<br/>v4: 8B key, 20B val<br/>v6: 20B key, 32B val"]
         MAPS -->|match| BPF
         BPF -->|"set_tunnel_key + redirect"| GEN[geneve0<br/>FlowBased]
@@ -325,18 +326,23 @@ graph LR
 
 #### unbounded0 Device
 
-`unbounded0` is a **dummy** network interface configured with:
+`unbounded0` is a **private MACVLAN** network interface configured with:
 
 - `NOARP` flag (no ARP resolution needed)
-- Overlay IPs assigned directly (scope global)
+- Pod-CIDR gateway IPs assigned directly only for managed-CNI Sites (scope global)
 - Supernet routes pointing to it for all remote pod CIDRs
-- A `clsact` qdisc for TC program attachment
+- An external CNI may attach its own egress program
 
-All traffic destined for remote overlay CIDRs is routed to `unbounded0`, where the TC egress BPF program intercepts it.
+Traffic destined for remote overlay CIDRs is routed to `unbounded0`. If frontend
+processing permits normal transmission, it reaches lower device `unbounded1`,
+where Unbounded owns the encapsulation hook. A frontend drop does not reach the
+backend. `unbounded1` has no addresses or routes. WireGuard transports are also
+unnumbered; managed-CNI source gateway addresses remain on `unbounded0`.
+External-CNI Sites do not reserve addresses from their pod CIDRs.
 
 #### TC Egress BPF Program
 
-The `unbounded_encap` program (defined in `bpf/unbounded_encap.c`) is attached as a TC egress classifier on `unbounded0`. For each outgoing packet, it:
+The `unbounded_encap` program (defined in `bpf/unbounded_encap.c`) is attached as a TC egress classifier on `unbounded1`. For each outgoing packet, it:
 
 1. Extracts the destination IP from the IPv4 or IPv6 header and builds a 16-byte LPM key (IPv4 destinations are stored in IPv4-mapped IPv6 form, `::ffff:<v4>`)
 2. Performs an LPM (longest-prefix-match) lookup against the unified `unb_endpts` trie

@@ -130,6 +130,14 @@ func printNodeInfoPane(w io.Writer, status clusterStatusResponse, overview nodeS
 		wgStatus = colorize(wgStatus, valueOr(overview.CniTone, "yellow"))
 	}
 
+	podCIDRGateways := joinOrDash(firstUsableIPs(node.NodeInfo.PodCIDRs))
+	for _, site := range status.Sites {
+		if site.Name == node.NodeInfo.SiteName && !site.ManageCniPlugin {
+			podCIDRGateways = "Externally managed"
+			break
+		}
+	}
+
 	rows := [][2]string{
 		{"Name", node.NodeInfo.Name},
 		{"Type", nodeType},
@@ -151,7 +159,7 @@ func printNodeInfoPane(w io.Writer, status clusterStatusResponse, overview nodeS
 		{"Internal IPs", joinOrDash(node.NodeInfo.InternalIPs)},
 		{"External IPs", joinOrDash(node.NodeInfo.ExternalIPs)},
 		{"Pod CIDRs", joinOrDash(node.NodeInfo.PodCIDRs)},
-		{"Pod CIDR Gateways", joinOrDash(firstUsableIPs(node.NodeInfo.PodCIDRs))},
+		{"Pod CIDR Gateways", podCIDRGateways},
 		{"Node Image", nodeImage},
 		{"Kubelet Version", valueOr(node.NodeInfo.Kubelet, "-")},
 		{"Kernel", valueOr(node.NodeInfo.Kernel, "-")},

@@ -86,6 +86,15 @@ test('native browser Load data, polling, refresh, expiry and cleanup lifecycle',
   const tabs = page.locator('.detail-tabs');
   const freshness = info.locator('.node-info-card').filter({ hasText: 'Status Push Updated' });
   await info.getByText('Node Info', { exact: true }).waitFor();
+  const gateways = info.locator('.node-info-card').filter({ hasText: 'Pod CIDR Gateways' });
+  assert.match(await gateways.innerText(), /10\.1\.0\.1/);
+  await page.getByRole('button', { name: 'External CNI', exact: true }).click();
+  assert.match(await gateways.innerText(), /Externally managed/);
+  assert.doesNotMatch(await gateways.innerText(), /10\.1\.0\.1/);
+  await page.getByRole('button', { name: 'Managed CNI', exact: true }).click();
+  assert.match(await gateways.innerText(), /10\.1\.0\.1/);
+  await page.getByRole('button', { name: 'Other site', exact: true }).click();
+  assert.match(await gateways.innerText(), /10\.1\.0\.1/);
   assert.match(await info.innerText(), /192\.0\.2\.10/);
   assert.match(await info.innerText(), /summary-build/);
   assert.match(await freshness.innerText(), /\ds ago/);
@@ -100,6 +109,8 @@ test('native browser Load data, polling, refresh, expiry and cleanup lifecycle',
   await load();
   await loaded();
   await page.getByText('loaded-peer', { exact: true }).waitFor();
+  await page.getByRole('button', { name: 'External CNI', exact: true }).click();
+  assert.match(await gateways.innerText(), /Externally managed/);
   await page.getByRole('button', { name: 'Update summary' }).click();
   await info.getByText('updated-summary-kernel', { exact: true }).waitFor();
   assert.equal(await page.getByText('Route mismatch', { exact: true }).count(), 1);

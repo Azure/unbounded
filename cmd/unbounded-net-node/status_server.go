@@ -3531,6 +3531,7 @@ func (s *nodeStatusServer) inspectKernelRoutes(visit func(family, destination st
 func isManagedTunnelInterface(cfg *config, name string) bool {
 	return isWireGuardInterface(cfg, name) ||
 		name == unbounded0DeviceName ||
+		name == unbounded1DeviceName ||
 		name == cfg.GeneveInterfaceName ||
 		name == cfg.VXLANInterfaceName ||
 		name == cfg.IPIPInterfaceName

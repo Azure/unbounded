@@ -40,8 +40,8 @@ func validateTunnelInterfaceNames(geneve, vxlan, ipip string) error {
 			return fmt.Errorf("--%s %q is too long: kernel limit is %d bytes", flag, name, maxLinuxIfNameLen)
 		}
 
-		if name == unbounded0DeviceName {
-			return fmt.Errorf("--%s %q collides with the agent's reserved device name %q", flag, name, unbounded0DeviceName)
+		if name == unbounded0DeviceName || name == unbounded1DeviceName {
+			return fmt.Errorf("--%s %q collides with the agent's reserved device name %q", flag, name, name)
 		}
 	}
 
@@ -91,8 +91,8 @@ func validateWireGuardInterfacePrefix(prefix string) error {
 		return fmt.Errorf("--wireguard-interface-prefix %q must not contain '/'", prefix)
 	}
 
-	if prefix == unbounded0DeviceName {
-		return fmt.Errorf("--wireguard-interface-prefix %q collides with the agent's reserved device name %q", prefix, unbounded0DeviceName)
+	if prefix == unbounded0DeviceName || prefix == unbounded1DeviceName {
+		return fmt.Errorf("--wireguard-interface-prefix %q collides with the agent's reserved device name %q", prefix, prefix)
 	}
 
 	return nil

@@ -125,6 +125,8 @@ func TestNodeShowOverviewConsistency(t *testing.T) {
 	for _, tc := range []struct {
 		name, ready, cni         string
 		old, missingInfo, legacy bool
+		sites                    []siteStatus
+		gateways                 string
 	}{
 		{name: "unenriched diagnostics", ready: "Ready", cni: "Healthy"},
 		{name: "older diagnostics", ready: "Ready", cni: "Healthy", old: true},
@@ -136,6 +138,10 @@ func TestNodeShowOverviewConsistency(t *testing.T) {
 		{name: "missing metadata", ready: "Ready", cni: "Healthy", missingInfo: true, old: true},
 		{name: "missing health", missingInfo: true, old: true},
 		{name: "legacy overview", ready: "Ready", cni: "Healthy", legacy: true},
+		{name: "managed CNI", ready: "Ready", cni: "Healthy", sites: []siteStatus{{Name: "site", ManageCniPlugin: true}}},
+		{name: "external CNI", ready: "Ready", cni: "Healthy", sites: []siteStatus{{Name: "site"}}, gateways: "Externally managed"},
+		{name: "unrelated external CNI", ready: "Ready", cni: "Healthy", sites: []siteStatus{{Name: "other"}}},
+		{name: "legacy external CNI", ready: "Ready", cni: "Healthy", legacy: true, sites: []siteStatus{{Name: "site"}}, gateways: "Externally managed"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			result := detailResultFixture()
@@ -175,9 +181,9 @@ func TestNodeShowOverviewConsistency(t *testing.T) {
 				result.Details.Status.NodeErrors = []statusv1alpha1.NodeError{{Message: "old diagnostic error"}}
 			}
 
-			var overview any = clusterSummary{NodeSummaries: []nodeSummary{entry}}
+			var overview any = clusterSummary{NodeSummaries: []nodeSummary{entry}, Sites: tc.sites}
 			if tc.legacy {
-				overview = clusterStatusResponse{Nodes: []statusv1alpha1.NodeStatusResponse{entry.statusMetadata()}}
+				overview = clusterStatusResponse{Nodes: []statusv1alpha1.NodeStatusResponse{entry.statusMetadata()}, Sites: tc.sites}
 			}
 
 			var summaries, details atomic.Int32
@@ -240,7 +246,7 @@ func TestNodeShowOverviewConsistency(t *testing.T) {
 				"Node Image": "Ubuntu 24.04.4", "Kernel": "6.8.0-1067-azure", "Kubelet Version": "v1.35.7",
 				"Instance Type": "Standard_D2ads_v6", "Region": "canadacentral", "Availability Zone": "canadacentral-1",
 				"Internal IPs": "10.224.0.103", "Pod CIDRs": "10.20.0.0/24", "WireGuard Public Key": "current-key",
-				"Node Agent Build": "Commit: current-build",
+				"Node Agent Build": "Commit: current-build", "Pod CIDR Gateways": valueOr(tc.gateways, "10.20.0.1"),
 			}
 			for key, value := range want {
 				if tc.missingInfo {

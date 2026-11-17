@@ -13,6 +13,7 @@ import (
 	"syscall"
 
 	"github.com/vishvananda/netlink"
+	"github.com/vishvananda/netlink/nl"
 	"github.com/vishvananda/netns"
 	"k8s.io/klog/v2"
 )
@@ -372,6 +373,79 @@ func (lm *LinkManager) EnsureDummyInterface() error {
 
 	if err := netlink.LinkSetUp(link); err != nil {
 		return fmt.Errorf("failed to bring up %s: %w", lm.ifaceName, err)
+	}
+
+	return nil
+}
+
+// EnsurePrivateMACVLANInterface creates the routing frontend over a dedicated
+// unnumbered backend. NOARP avoids neighbor discovery on the local handoff.
+func (lm *LinkManager) EnsurePrivateMACVLANInterface(parentName string) error {
+	parent, err := netlink.LinkByName(parentName)
+	if err != nil {
+		return fmt.Errorf("find MACVLAN parent %s: %w", parentName, err)
+	}
+
+	if parent.Type() != "dummy" {
+		return fmt.Errorf("MACVLAN parent %s must be dummy, got %s", parentName, parent.Type())
+	}
+
+	link, err := netlink.LinkByName(lm.ifaceName)
+	if err != nil {
+		var notFound netlink.LinkNotFoundError
+		if !errors.As(err, &notFound) {
+			return fmt.Errorf("find MACVLAN %s: %w", lm.ifaceName, err)
+		}
+
+		link = &netlink.Macvlan{
+			LinkAttrs: netlink.LinkAttrs{
+				Name:        lm.ifaceName,
+				ParentIndex: parent.Attrs().Index,
+			},
+			Mode: netlink.MACVLAN_MODE_PRIVATE,
+		}
+		if err := netlink.LinkAdd(link); err != nil {
+			return fmt.Errorf("create private MACVLAN %s: %w", lm.ifaceName, err)
+		}
+	} else {
+		macvlan, ok := link.(*netlink.Macvlan)
+		if !ok || macvlan.ParentIndex != parent.Attrs().Index || macvlan.Mode != netlink.MACVLAN_MODE_PRIVATE {
+			return fmt.Errorf("interface %s is not a private MACVLAN over %s", lm.ifaceName, parentName)
+		}
+	}
+
+	if err := netlink.LinkSetARPOff(link); err != nil {
+		return fmt.Errorf("disable ARP on %s: %w", lm.ifaceName, err)
+	}
+
+	if err := netlink.LinkSetUp(link); err != nil {
+		return fmt.Errorf("bring up MACVLAN %s: %w", lm.ifaceName, err)
+	}
+
+	return nil
+}
+
+// EnsureUnnumbered removes addresses and disables automatic IPv6 link-local
+// assignment so transport devices stay out of external-CNI device discovery.
+func (lm *LinkManager) EnsureUnnumbered() error {
+	link, err := netlink.LinkByName(lm.ifaceName)
+	if err != nil {
+		return fmt.Errorf("find unnumbered interface %s: %w", lm.ifaceName, err)
+	}
+
+	if err := netlink.LinkSetIP6AddrGenMode(link, nl.IN6_ADDR_GEN_MODE_NONE); err != nil {
+		return fmt.Errorf("disable IPv6 address generation on %s: %w", lm.ifaceName, err)
+	}
+
+	addresses, err := netlink.AddrList(link, netlink.FAMILY_ALL)
+	if err != nil {
+		return fmt.Errorf("list addresses on %s: %w", lm.ifaceName, err)
+	}
+
+	for _, address := range addresses {
+		if err := netlink.AddrDel(link, &address); err != nil {
+			return fmt.Errorf("remove address %s from %s: %w", address.IPNet, lm.ifaceName, err)
+		}
 	}
 
 	return nil

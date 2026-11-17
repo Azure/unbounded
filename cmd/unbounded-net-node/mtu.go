@@ -64,6 +64,7 @@ func verifyActiveTunnelMTUs(cfg *config, fabricMTU int, meshPeers []meshPeerInfo
 	required := make(map[string]bool)
 	if len(meshPeers) > 0 || len(gatewayPeers) > 0 {
 		required[unbounded0DeviceName] = true
+		required[unbounded1DeviceName] = true
 	}
 
 	needsGeneve, needsIPIP, needsVXLAN := neededTunnelProtocols(meshPeers, gatewayPeers)

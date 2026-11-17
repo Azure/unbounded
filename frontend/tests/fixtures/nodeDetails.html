@@ -15,6 +15,7 @@
       function Harness() {
         const [selected, select] = useState(null);
         const [tab, selectTab] = useState('peerings');
+        const [sites, updateSites] = useState([]);
         const [summary, updateSummary] = useState(() => ({
           name: 'node-a', siteName: 'site-a', k8sReady: 'Ready',
           cniStatus: 'Healthy', cniTone: 'success', statusSource: 'ws',
@@ -24,9 +25,12 @@
             kernel: 'summary-kernel', buildInfo: { version: 'summary-build' },
           },
         }));
-        const { detail, load } = useNodeDetails(selected);
+        const { detail, load } = useNodeDetails(selected, [summary]);
         return React.createElement(React.Fragment, null,
           React.createElement('button', { onClick: () => select('node-a') }, 'Open node'),
+          React.createElement('button', { onClick: () => updateSites([{ name: 'site-a', manageCniPlugin: false }]) }, 'External CNI'),
+          React.createElement('button', { onClick: () => updateSites([{ name: 'site-a', manageCniPlugin: true }]) }, 'Managed CNI'),
+          React.createElement('button', { onClick: () => updateSites([{ name: 'other', manageCniPlugin: false }]) }, 'Other site'),
           React.createElement('button', {
             onClick: () => updateSummary((previous) => ({
               ...previous, cniStatus: 'Route mismatch', cniTone: 'warning',
@@ -35,7 +39,7 @@
           }, 'Update summary'),
           React.createElement(NodeDetailDialog, {
             nodeName: selected, summary, detail, onLoad: load,
-            allNodeNames: ['node-a'], gatewayByNode: new Map(),
+            allNodeNames: ['node-a'], gatewayByNode: new Map(), sites,
             theme: 'light', detailTab: tab,
             onDetailTabChange: selectTab, onSelectNode: select,
             onClose: () => select(null),

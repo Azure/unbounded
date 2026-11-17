@@ -114,7 +114,7 @@ type wireGuardState struct {
 	// Notrack manager for skipping conntrack on transit traffic (gateway nodes only)
 	notrackManager *unboundednetnetlink.NotrackManager
 
-	// tunnelMap is the eBPF LPM trie on unbounded0 that holds per-CIDR
+	// tunnelMap is the eBPF LPM trie on unbounded1 that holds per-CIDR
 	// tunnel endpoint entries for every peer (GENEVE/VXLAN/IPIP/WG/None).
 	tunnelMap *ebpfpkg.TunnelMap
 

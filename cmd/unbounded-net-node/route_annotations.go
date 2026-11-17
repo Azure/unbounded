@@ -363,7 +363,7 @@ func annotateNodeRoutes(
 
 	// Mark supernet routes on unbounded0 as expected. These are managed
 	// routes that don't correspond to individual peers but exist in the FIB
-	// because the BPF program on unbounded0 attracts overlay traffic via
+	// because the staged datapath attracts overlay traffic via
 	// aggregate routes.
 	markSupernetRoutesExpected(cfg, ipv4Routes)
 	markSupernetRoutesExpected(cfg, ipv6Routes)
@@ -376,7 +376,7 @@ func annotateNodeRoutes(
 }
 
 // markSupernetRoutesExpected adjusts route annotations to reflect the
-// BPF-on-unbounded0 forwarding model:
+// Staged unbounded0-to-unbounded1 forwarding model:
 //   - FIB-present routes on unbounded0 with no Expected annotation are marked
 //     as expected (these are supernet routes the per-peer logic doesn't know).
 //   - Nexthops on tunnel and WG interfaces that are not present in the FIB

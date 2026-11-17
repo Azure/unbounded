@@ -19,7 +19,7 @@ type NodeInfoPanelProps = {
   nodeInfo: NodeStatus['nodeInfo'];
   externalIps: string[];
   podCidrs: string[];
-  podCidrFirstIps: string[];
+  podCidrGateways: string;
   nodeImage: string;
   instanceType: string;
   region: string;
@@ -38,7 +38,7 @@ function NodeInfoPanel({
   nodeInfo,
   externalIps,
   podCidrs,
-  podCidrFirstIps,
+  podCidrGateways,
   nodeImage,
   instanceType,
   region,
@@ -78,7 +78,7 @@ function NodeInfoPanel({
         </div>
         <div className="node-info-card">
           <div className="node-info-label">Pod CIDR Gateways</div>
-          <div className="node-info-value comma-wrap">{withCommaBreaks(podCidrFirstIps.join(', '))}</div>
+          <div className="node-info-value comma-wrap">{withCommaBreaks(podCidrGateways)}</div>
         </div>
         <div className="node-info-card">
           <div className="node-info-label">Node Image</div>
