@@ -169,6 +169,7 @@ func TestManifestLaneUsesConfiguredPageSize(t *testing.T) {
 			}
 
 			options := <-client.options
+
 			want := racersdk.ReadOptions{SmallObject: tc.small}
 			if len(options) != 1 || options[0] != want {
 				t.Fatalf("manifest options = %+v; want %+v", options, want)

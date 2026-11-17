@@ -425,6 +425,7 @@ func TestEnvtestClusterCachePageSizeValidation(t *testing.T) {
 	create := func(spec map[string]any) (string, error) {
 		n++
 		name := fmt.Sprintf("page-size-%d", n)
+
 		obj := &unstructured.Unstructured{Object: map[string]any{
 			"apiVersion": GroupVersion.String(),
 			"kind":       "ClusterCache",
@@ -495,6 +496,7 @@ func TestEnvtestClusterCachePageSizeValidation(t *testing.T) {
 		} else {
 			require.NoError(t, unstructured.SetNestedField(obj.Object, pageSize, "spec", "pageSize"))
 		}
+
 		if mutate != nil {
 			mutate(obj)
 		}

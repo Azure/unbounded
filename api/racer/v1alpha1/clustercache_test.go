@@ -114,9 +114,11 @@ func TestClusterCachePageSizeJSONDeepCopyAndBytes(t *testing.T) {
 		PageSize16MiB:  16 << 20,
 	}
 	require.Len(t, sizes, 13)
+
 	for size, want := range sizes {
 		require.Equal(t, want, size.Bytes(), "%s", size)
 	}
+
 	require.Zero(t, PageSize("3KiB").Bytes())
 	require.Zero(t, PageSize("").Bytes())
 

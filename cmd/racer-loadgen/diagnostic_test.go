@@ -207,6 +207,7 @@ func TestDiagnosticConfiguredPageSize(t *testing.T) {
 	require.Equal(t, int64(pageSize), evidence.records[0].Length)
 
 	var output bytes.Buffer
+
 	logger := slog.New(slog.NewJSONHandler(&output, nil))
 	logger.Error("diagnostic", slog.Any("pages", evidence))
 	require.Contains(t, output.String(), `"page_size":4096`)

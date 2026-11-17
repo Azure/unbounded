@@ -693,9 +693,7 @@ impl Registry {
     /// Remove `key`'s interest in `unit`. Returns the page size of a queued
     /// unit that was dropped because nothing else wants it.
     fn drop_interest(&mut self, key: &TicketKey, unit_key: &UnitKey) -> Option<PageSize> {
-        let Some(unit) = self.units.get_mut(unit_key) else {
-            return None;
-        };
+        let unit = self.units.get_mut(unit_key)?;
         unit.interest.remove(key);
         if !unit.interest.is_empty() {
             return None;

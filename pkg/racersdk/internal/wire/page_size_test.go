@@ -107,6 +107,7 @@ func TestSubscriptionCreditBoundsUsePageSize(t *testing.T) {
 	const page = 64 << 10
 
 	request := Request{Operation: OperationHead, Pin: `"v"`}
+
 	head, err := SubscriptionHead(request, SubscriptionOptions{
 		Offset: 1, Length: 10, PageCredits: 2, ByteCredits: 2 * page,
 	})
