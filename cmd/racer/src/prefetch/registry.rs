@@ -464,6 +464,20 @@ impl Registry {
             }
             refs.push(entry);
         }
+        // A settled ticket being restarted by a higher generation or sequence
+        // releases its old interest first, so the new PUT re-plans every page.
+        // Its admitted pages may have been evicted since it settled, so keeping
+        // them would skip the fills it now needs. Fills still probe residency,
+        // so pages that are in fact resident are reported without an origin
+        // fetch. Tickets with open units keep them: a concurrent loader's
+        // in-flight progress must not be aborted.
+        let restart = self
+            .tickets
+            .get(&key)
+            .is_some_and(|old| !old.released && old.open == 0);
+        if restart {
+            self.release(&key, now);
+        }
         // Release the old window's interest in pages it no longer wants.
         let wanted: std::collections::HashSet<&UnitKey> = desired.iter().map(|(k, ..)| k).collect();
         if let Some(old) = self.tickets.get(&key)
