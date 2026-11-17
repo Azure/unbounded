@@ -1973,9 +1973,9 @@ impl Owner {
             let Some(device) = self.devices.get_mut(rail) else {
                 continue;
             };
-            if self.lost.contains(rail) {
-                continue;
-            }
+            // A lost rail is not sized, but a registration in flight on it
+            // still has to finish: stepping it as closing drops the block.
+            let lost = self.lost.contains(rail);
             let waiting = self.waiters.get(rail).map_or(0, VecDeque::len);
             let capacity = device.pool.capacity();
             let changes = sizing.step(
@@ -1985,9 +1985,12 @@ impl Owner {
                 &wake,
                 waiting,
                 pressure,
-                self.closing,
+                self.closing || lost,
                 now,
             );
+            if lost {
+                continue;
+            }
             if changes.drained {
                 for (key, link) in &mut self.links {
                     if key.rail == *rail {

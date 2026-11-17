@@ -2021,3 +2021,39 @@ fn block_registration_does_not_block_and_shutdown_waits() {
         assert_eq!(w.sim.live_resources(), 0);
     });
 }
+
+#[test]
+/// A block registration in flight when its rail is lost still finishes: the
+/// lost rail drops the block instead of growing, releasing its charge, and
+/// the round then drains.
+fn block_registration_finishes_on_lost_rail() {
+    profiles(|| {
+        let (mut w, charges) = growing_world();
+        let (ea, _) = link_up(&mut w);
+        let _held = hold_grants(&mut w, ea, BLOCK, 0);
+        w.sim.hold_registrations(true);
+        let deadline = w.now() + 5 * SECOND;
+        let until = w.now() + 10 * SECOND;
+        let parked = w.a.clients[0].grant_parked(TO_B, ea, [9; 16], 10, deadline, until);
+        pump(&mut w);
+        assert!(pending(&parked));
+        assert_eq!(charges.live.load(Ordering::Acquire), 1, "registering");
+        w.a.clients[0].report_lost(7);
+        pump(&mut w);
+        assert_eq!(w.a.clients[0].lost_rails(), vec![7]);
+        assert_eq!(charges.live.load(Ordering::Acquire), 1, "still registering");
+        w.sim.hold_registrations(false);
+        pump(&mut w);
+        assert_eq!(charges.live.load(Ordering::Acquire), 0, "block dropped");
+        let lost = sizing(&w);
+        assert_eq!((lost.capacity, lost.blocks), (BLOCK, 1), "{lost:?}");
+        assert_eq!(lost.registrations, 0);
+        w.a.clients[0].close();
+        pump(&mut w);
+        assert!(w.a.clients[0].drained());
+        assert_eq!(w.a.clients[0].drain_blocker(), None);
+        w.b.clients[0].close();
+        pump(&mut w);
+        assert!(w.b.clients[0].drained());
+    });
+}
