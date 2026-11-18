@@ -26,8 +26,10 @@ updates, and ask it. This document proposes that piece:
 The service limits how many nodes in each Site update at once, drains nodes
 with `kubectl drain`'s rules, and makes sure every update it starts in Nebraska
 either finishes or is ended before Nebraska would count it as timed out.
-Nebraska decides which version nodes get and how fast the fleet moves. When an
-update fails, the service stops updating the cluster until a person looks.
+Nebraska decides which version nodes get and how fast the fleet moves. When a
+node doesn't come back healthy on a new version, the service stops updating
+that image flavor until a person looks; a node whose update keeps failing
+before its restart is held on its own.
 
 The name comes from center-pivot irrigation, common on Nebraska's farms, which
 brings fresh water to a field one section at a time.
@@ -91,7 +93,9 @@ node's agent sends, and must act on a grant right away.
 3. Let Nebraska decide which version nodes get, and how fast the fleet moves.
 4. End every grant the service starts: finished, or reported failed, before
    Nebraska's timeout. Never create extra Nebraska instances.
-5. Notice failed updates, and stop the cluster's updates until a person looks.
+5. Notice failed updates. Stop an image flavor's updates when a node doesn't
+   come back healthy on its new version, and hold a node whose update keeps
+   failing, until a person looks.
 
 ## 4. Design
 
@@ -146,16 +150,21 @@ into the node stack's container instead, and graceful node shutdown
    check, and keeps it until its update ends.
 2. Nodes already unavailable for other reasons use slots too, each counted
    once: nodes that are not Ready, nodes someone else cordoned, and nodes whose
-   Machine has an unfinished MachineOperation or is being rebuilt.
-3. While any managed node is held after a failure, no slots are given out in
-   the cluster.
-4. Among the nodes due for a check, nodes labeled canary go first, then the
+   Machine has an unfinished MachineOperation or no Node, as while it's
+   rebuilt.
+3. A node held after it restarted into a new version stops its app: no node of
+   that app gets a slot, in any Site, until a person clears the hold. A node
+   held for any other reason keeps only itself from updating (section 4.9).
+4. A node whose last update left a grant to end gets no slot until it's ended
+   (section 4.7).
+5. Among the nodes due for a check, nodes labeled canary go first, then the
    node checked longest ago.
+6. Slots are given out as soon as one frees, and every 30 seconds.
 
 ```mermaid
 flowchart TB
-    Start(["a slot frees, or a node is due"]) --> Held{"any node held?"}
-    Held -->|yes| Wait(["give out no slots"])
+    Start(["a slot frees, or a node is due"]) --> Held{"is the node's app held?"}
+    Held -->|yes| Wait(["no slot for the node"])
     Held -->|no| Count["free slots in the node's Site:<br/>maxUnavailable, minus nodes unavailable"]
     Count --> Free{"a free slot?"}
     Free -->|no| Wait2(["wait"])
@@ -213,25 +222,28 @@ than reading it once.
 3. **Update check.** It sends Nebraska one check as the node: the instance ID
    and version from `agent-info`, the node's architecture (`arm64` sent as
    `aarch64`, as the agent does), and the server, the node's app ID, and the
-   track the request will name. It never sends progress events or pings. Nebraska records the
-   service's IP address for the node until the agent's next check. With no
-   update, or a refusal, it gives the slot back. With "update in progress", it
-   ends that update (section 4.7) and gives the slot back.
+   track the request will name. It never sends pings or progress events; the
+   only event it sends is the one that ends a grant (section 4.7). Nebraska
+   records the service's IP address for the node until the agent's next check.
+   With no update, or a refusal, it gives the slot back. With "update in
+   progress", it ends that update (section 4.7) and gives the slot back.
 4. **Stage.** With a grant for version V, it writes a `stage` request at once.
    The agent's own check gets the same grant, and it downloads V into the
    unused copy while the node keeps running.
 5. **Drain.** It taints the node with `centerpivot.unbounded-cloud.io/updating`
    (`NoSchedule`) and evicts its pods (section 4.6).
-6. **Finalize.** If enough of the grant's time is left for the restart
-   (section 4.8), it writes `finalize`. Otherwise it ends the grant instead.
+6. **Finalize.** If enough of the grant's time is left for the finalize and
+   the restart (section 4.8), it writes `finalize`. Otherwise it ends the
+   grant instead.
 7. **Restart.** The agent restarts the node into V, commits, writes
    `update-commit-status`, and tells Nebraska the update finished.
 8. **Check.** The service waits until the commit status is `Success`, the
    node's `agent-info` shows V, and the Node is Ready.
 9. **Recover.** It removes its taint, then waits until the Deployments,
    StatefulSets, and ReplicaSets whose pods it moved have as many pods
-   available as before the drain, plus a settle time, and gives the slot back.
-   Pods of other controllers aren't tracked.
+   available as before the drain, or as many as they now want, if that's
+   fewer, as after a scale-down. Then it waits a settle time, and gives the
+   slot back. Pods of other controllers aren't tracked.
 
 ```mermaid
 sequenceDiagram
@@ -268,34 +280,39 @@ stateDiagram-v2
     Checking --> Idle: can't drain now, no update, refused, or in progress
     Checking --> Staging: Nebraska grants V
     Staging --> Draining: stage Success
-    Staging --> Idle: already at V, or stage failed
+    Staging --> Staging: refused, and the channel moved
+    Staging --> Idle: already at V, stage failed, or Node rebuilt
     Draining --> Finalizing: pods moved, and time left
-    Draining --> Idle: drain deadline, or no time left
+    Draining --> Idle: drain deadline, no time left, or Node rebuilt
     Finalizing --> Restarting: finalize Success
+    Finalizing --> Recovering: already at V
     Finalizing --> Staging: NotStaged
-    Finalizing --> Idle: finalize failed
+    Finalizing --> Idle: finalize failed, or Node rebuilt
     Restarting --> Recovering: commit Success, runs V, Ready
     Recovering --> Idle: workloads recovered, settle time passed
-    Staging --> Held: no status, or a bug
-    Finalizing --> Held: no status, or set to restart but didn't
-    Restarting --> Held: boot failed, wrong version, or deadline
-    Recovering --> Held: workloads didn't recover in time
+    Staging --> Held: no status, too slow, wrong request, 3rd attempt, or Node gone
+    Draining --> Held: 3rd attempt, or Node gone
+    Finalizing --> Held: no status, too slow, agent error, 3rd attempt, or Node gone
+    Restarting --> Held: boot failed, wrong version, or deadline (stops the app)
+    Recovering --> Held: workloads didn't recover (stops the app)
     Held --> Idle: a person clears the hold
 ```
 
-| State | What the service does | Leaves when | Deadline, and what happens at it | Nebraska grant when it leaves |
-|---|---|---|---|---|
-| Idle | Nothing. | The node is due and gets a slot. | | None open |
-| Checking | The drain check, then the update check. | No update, a refusal, or a node it can't drain: back to Idle. A grant: Staging. "Update in progress": ends it, then Idle. | | None, granted, or ended |
-| Staging | Writes `stage`, and waits for its status. | `Success`: Draining. `AlreadyAtTarget`, or a failure: Idle. | Writes the request again if no status comes within the status deadline; holds after 3 tries. | Failures are reported by the agent. With no status, the grant stays open until Nebraska times it out: the agent isn't answering. |
-| Draining | Taints the node, and evicts its pods. | All pods moved and time left: Finalizing. | At the drain deadline, or with too little time left: ends the grant, removes the taint, and goes back to Idle. | Ended |
-| Finalizing | Writes `finalize`. | `Success`: Restarting. `NotStaged`: Staging. A failure: Idle. | Status deadline, as in Staging. | Failures are reported by the agent. |
-| Restarting | Waits for the commit, the version, and Ready. | All three: Recovering. | At the restart deadline: holds. | Finished, or reported failed by the agent |
-| Recovering | Removes its taint, and waits for the moved workloads, then the settle time. | Both: Idle, and the slot frees. | At the recovery deadline: holds. | Finished |
-| Held | Nothing; no new updates start in the cluster. | A person clears the hold. | | As the previous state left it |
+| State | What the service does | Leaves when | Deadline, and what happens at it |
+|---|---|---|---|
+| Idle | Nothing. | The node is due and gets a slot. | |
+| Checking | The drain check, then the update check. | No update, a refusal, or a node it can't drain: back to Idle. A grant: Staging. "Update in progress": ends it, then Idle. | |
+| Staging | Writes `stage`, and waits for its status. | `Success`: Draining. `AlreadyAtTarget`, or a failure: Idle. `InvalidRequest`: checks again, and stages the new version if the channel moved. | No status within the status deadline, or no final one within the stage deadline (section 4.8): holds the node. |
+| Draining | Taints the node, and evicts its pods. | All pods moved and time left: Finalizing. | At the drain deadline, or with too little time left: removes the taint, and goes back to Idle. |
+| Finalizing | Writes `finalize`. | `Success`: Restarting. `AlreadyAtTarget`: Recovering. `NotStaged`: Staging. A failure: Idle. | As in Staging, with the finalize deadline; holds the node, keeping the taint. |
+| Restarting | Waits for the commit, the version, and Ready. | All three: Recovering. | At the restart deadline: holds the node, and stops its app. |
+| Recovering | Removes its taint, and waits for the moved workloads, then the settle time. | Both: Idle, and the slot frees. | At the recovery deadline: holds the node, and stops its app. |
+| Held | Nothing. | A person clears the hold. | |
 
-Every `stage` or `finalize` failure, and every drain that misses its deadline,
-counts as an attempt at V on that node. After 3 attempts, the node is held.
+Every way back to Idle or Held, except a finished update, ends the node's
+grant (section 4.7). Every `stage` or `finalize` failure, every drain that
+misses its deadline, and every drain left with too little time counts as an
+attempt at V on that node. After 3 attempts, the node is held.
 
 ### 4.6 Moving workloads
 
@@ -317,7 +334,8 @@ cordoning it, so it never removes a cordon someone else set.
 
 A drain that misses its deadline, despite the drain check, ends the grant at
 once rather than waiting: the node starts again at a later check, and the
-update downloads again. Repeated blocked drains hold the node (section 4.5).
+update downloads again. Repeated blocked drains hold that node, and only it
+(section 4.5).
 
 After the drain, only DaemonSet and static pods remain; they stop when the node
 restarts. Kubelet's graceful node shutdown lets them stop cleanly, once we've
@@ -335,68 +353,117 @@ For applications, this means:
 
 ### 4.7 Ending a grant
 
-The service ends an update it can't finish by writing a new `stage` request.
-Nebraska answers the agent's update check with "update in progress", so the
-agent tells Nebraska the update failed, which closes the grant, and reports
-`OperationFailed`. This is the agent's recovery for an update left in
-progress (`UpdateInProgress` in `annotations/orchestrator.rs`). The node keeps
-running its current version, and the staged copy is overwritten by the next
-update.
+When an update stops without finishing, the service ends its grant itself. As
+the node, it sends Nebraska the event the agent sends when an update fails
+(`report_failure` in Trident's `core/nebraska/client.rs`: "update complete",
+with an error result), with the instance ID, app, track, and version of the
+check that took the grant. Nebraska then counts the update as failed rather
+than in progress, and the node's next check may be granted again. The node
+keeps running its current version, and the next update overwrites anything
+staged.
 
-The request must name a version other than the running one, because the agent
-compares the two before it asks Nebraska. The service uses the version it last
-tried for that node, or the running version with its patch number raised.
+1. **It works whatever the agent did.** Nebraska accepts the event from the
+   grant until the update finishes or fails, so it ends a grant the agent never
+   started, as when the agent isn't configured or isn't running, as well as one
+   it left partway.
+2. **It's safe to repeat.** Nebraska ignores the event when no update is in
+   progress, as when the agent already reported the failure, and an event never
+   takes a grant. So the service sends it whenever an update stops without
+   finishing, without needing to know what the agent reported.
+3. **It's recorded.** The state records the grant to end before the event is
+   sent, and keeps it through Idle and Held until Nebraska acknowledges the
+   event. The node gets no slot until then. Nebraska acknowledges every event
+   it reads, whether or not it changed anything, so the acknowledgment
+   confirms only that Nebraska knew the app and track.
+4. **An agent that starts late can't take a new grant.** An Idle or Held node
+   carries no request, so the agent finds nothing to do.
 
 The service ends a grant when:
 
-1. a drain misses its deadline;
-2. too little of the grant's time is left to restart (section 4.8);
-3. its update check finds "update in progress": an update that was interrupted,
-   or that started before a hold was cleared or a Node was rebuilt.
+1. a stage or finalize fails, or a drain misses its deadline;
+2. too little of the grant's time is left to finalize and restart
+   (section 4.8);
+3. the agent doesn't answer or finish a request in time, or the Node is
+   rebuilt or gone;
+4. it holds the node;
+5. its update check finds "update in progress", from an update interrupted
+   earlier, or gets no answer, in case the check reached Nebraska.
+
+Each ended grant is recorded in Nebraska as a failed update of that node
+(section 5.3).
 
 ### 4.8 Timing
 
-The service has one setting for this: Nebraska's update timeout, which must
-match the group's. Before writing `finalize`, the service checks that the
-time since the grant, plus the restart deadline, stays at least 10 minutes
-inside it. If not, it ends the grant instead. So every grant either finishes
-or is ended before Nebraska would count it as timed out. The agent's own limits
-bound the steps before that (20 minutes for a stage, 10 for a finalize, by
-default), and so does the drain deadline.
+An update holds its grant from the service's update check until the agent
+reports the update finished, after the restart. Each step has a deadline:
+
+| Step | Deadline | Default |
+|---|---|---|
+| Stage | The agent's stage timeout, 20 minutes, plus the status deadline | 25 minutes |
+| Drain | The drain deadline | 30 minutes |
+| Finalize | The agent's finalize timeout, 10 minutes, plus the status deadline | 15 minutes |
+| Restart | The restart deadline | 30 minutes |
+
+The host agent sets the agent's two timeouts, so they stay what the service
+expects. The Site's `updateTimeout` must be no longer than the update timeout
+of the nodes' Nebraska groups, and the four deadlines, plus 10 minutes, must
+fit in it: with the defaults, 100 minutes plus 10 fits the default of 2 hours.
+The Site's CRD refuses settings that don't fit, and the service gives a Site
+whose settings don't fit no slots.
+
+So every update ends its grant at least 10 minutes before Nebraska would count
+it as timed out. As a check, before writing `finalize`, the service confirms
+that the time since the grant, plus the finalize and restart deadlines, still
+fits. If not, it ends the grant and counts an attempt. With settings that fit,
+that happens only if the service itself stopped for a while.
 
 ### 4.9 Failures and holds
 
-| What happens | What the service does | Nebraska grant |
+| What happens | What the service does | Hold |
 |---|---|---|
-| `stage` reports `AlreadyAtTarget` | The update is done. | None was used |
-| `stage` reports `OperationFailed` or `AgentInternalError` | Back to Idle; counts an attempt. | Reported failed by the agent |
-| `stage` reports `InvalidRequest` | Checks Nebraska again. If the channel moved, so the grant is now for another version, stages that. Otherwise holds the node: the request is wrong. | Kept, or open until it times out |
-| `finalize` reports `OperationFailed` | Removes the taint, back to Idle; counts an attempt. | Reported failed by the agent |
-| `finalize` reports `AgentInternalError` or `InvalidRequest` | Holds the node and keeps the taint. After `AgentInternalError`, the node may be set to start from the new copy at its next restart. | Reported failed, or open |
-| `finalize` reports `NotStaged` | Stages again. | Kept |
-| No status within the status deadline | Writes the same request again; the agent treats a repeat as one. Holds after 3 tries. | Open until it times out |
-| The commit reports `TargetBootFailed` | Holds the node. | Reported failed by the agent |
-| The commit reports `Success`, but `agent-info` still shows another version at the restart deadline (microsoft/trident#956) | Holds the node. | Recorded as finished |
-| The Node isn't Ready, or no commit status arrives, by the restart deadline | Holds the node. | Open until the agent reports |
-| The moved workloads haven't recovered by the recovery deadline | Holds the node. | Finished |
+| `stage` reports `AlreadyAtTarget` | The node already runs V: back to Idle. The service's check took a grant with the older version `agent-info` showed, so it ends that grant. | |
+| `stage` reports `OperationFailed` or `AgentInternalError` | Back to Idle; counts an attempt. | The node, after 3 attempts |
+| `stage` reports `InvalidRequest` | Checks Nebraska again. If the channel moved, so the grant is now for another version, stages that, keeping the grant's time. Otherwise holds the node: the request is wrong. | The node |
+| `finalize` reports `OperationFailed` | Removes the taint, back to Idle; counts an attempt. | The node, after 3 attempts |
+| `finalize` reports `AgentInternalError` or `InvalidRequest` | Holds the node and keeps the taint. After `AgentInternalError`, the node may be set to start from the new copy at its next restart. | The node |
+| `finalize` reports `NotStaged` | Stages again. | |
+| `finalize` reports `AlreadyAtTarget` | The node already runs V, so no restart follows: it removes the taint, and waits for the workloads, as after a restart. Nothing reports the update to Nebraska, so it ends the grant. | |
+| No status within the status deadline | The agent isn't answering: holds the node. | The node |
+| `InProgress` past the stage or finalize deadline | The agent is stuck, or keeps restarting, since it writes `InProgress` again each time it starts: holds the node. | The node |
+| The Node is gone past the restart deadline, before the restart | Holds the node. | The node |
+| The commit reports `TargetBootFailed` | Holds the node. | The app |
+| The commit reports `Success`, but `agent-info` still shows another version at the restart deadline (microsoft/trident#956) | Holds the node. | The app |
+| The Node isn't Ready, or no commit status arrives, by the restart deadline | Holds the node. | The app |
+| The moved workloads haven't recovered by the recovery deadline | Holds the node. | The app |
 
 Holding a node means the service stops checking for it, removes its taint
-unless the node may be set to start from the new copy, records the reason in
-the Machine's `state`, and starts no new updates in the cluster until a person
-clears the hold, by removing the Machine's `state` annotation. The service's
-next attempt then uses new request IDs. It doesn't retry by itself because,
-after a fallback, Nebraska may already list the update as finished and would
-offer the same version again.
+unless the node may be set to start from the new copy, ends its grant, and
+records the reason in the Machine's `state`.
 
-The agent reports a failed boot to Nebraska, so Nebraska's own safe mode and
-statistics see it across clusters. The service never sends events to Nebraska.
+1. **A hold after the node restarted into the new version stops its app.** No
+   node of that app gets a slot, in any Site, since the version may be bad.
+2. **Any other hold keeps only its node from updating.** Its update stopped
+   before the restart, so nothing points at the version.
 
-To make a stop visible, the component's `CenterPivotReady` condition on each
-Site turns false with reason `UpdatesHeld`, naming a held node and why, and the
-service exports metrics: nodes per app and version (`centerpivot_nodes`),
-updates under way (`centerpivot_updating_nodes`), held nodes
-(`centerpivot_held_nodes`), and the reason updates are blocked
-(`centerpivot_updates_blocked`).
+A person clears a hold by removing the Machine's `state` annotation, and the
+service's next attempt uses new request IDs. It doesn't retry by itself: a
+node hold needs a person to fix what kept the update from running, and after a
+fallback, Nebraska may already list the update as finished and would offer the
+same version again.
+
+The agent reports a failed boot to Nebraska itself, so Nebraska's own safe
+mode and statistics see it across clusters.
+
+To make a stop visible:
+
+1. The component's `CenterPivotReady` condition on each Site turns false with
+   reason `UpdatesHeld` while a hold stops an app, naming the node and why. A
+   node held on its own is named in the condition's message.
+2. The service exports metrics: nodes per app and version
+   (`centerpivot_nodes`), updates under way (`centerpivot_updating_nodes`),
+   held nodes (`centerpivot_held_nodes`), and why a Site's due nodes can't
+   start (`centerpivot_updates_blocked`, by Site: `held`; `unavailable`, when
+   nodes that aren't updating use every slot; or `invalid_settings`).
 
 ### 4.10 Restarts, rebuilds, and other maintenance
 
@@ -405,10 +472,12 @@ updates under way (`centerpivot_updating_nodes`), held nodes
    stopped, and two overlapping leaders can't both write a request.
 2. **Rebuilds.** Deleting a Node rebuilds the node's nspawn machine. The
    Machine's `state` survives, and `trident-acl-agent` waits for the Node to
-   return. The service continues the update if the agent reports its commit,
-   and otherwise ends the grant and starts over at a later check. Labels the
-   service reads (section 6) should be set through the MachineConfiguration's
-   `nodeLabels`, so they survive too.
+   return. While the Node is gone, the Machine uses a slot. The service
+   continues the update if the agent reports its commit, and otherwise ends the
+   grant and starts over at a later check. If the Node isn't back by the
+   restart deadline, the service holds the node. Labels the service reads
+   should be set through the MachineConfiguration's `nodeLabels`, so they
+   survive too.
 3. **Other maintenance.** Unbounded has no shared way yet for components that
    restart or replace nodes to claim a node. Until it does, the service skips
    nodes whose Machine has an unfinished MachineOperation or is being rebuilt.
@@ -416,8 +485,8 @@ updates under way (`centerpivot_updating_nodes`), held nodes
    and Unbounded's Karpenter plugin should respect it.
 4. **Turning the component off.** Updates past `finalize` finish on the node.
    The service's taint stays on a node it was draining until the component is
-   turned on again or a person removes it, so turn it off when no update is
-   under way.
+   turned on again or a person removes it, and grants left to end are ended
+   then, so turn it off when no update is under way.
 
 ## 5. Work needed from other teams
 
@@ -449,28 +518,19 @@ whether the first version needs it.
      for example by a rollout limit, end the request with a final status.
    - Why: today the agent exits (`"Nebraska query failed"` in
      `annotations/orchestrator.rs`), and systemd restarts it, so the request
-     never gets a final status. The service writes it again at each status
-     deadline, and holds the node after three writes.
+     never gets a final status, and the service holds the node at the stage
+     deadline.
    - Until then: the service stages only right after its own check was
      granted, so a refusal in between is rare.
    - The first version needs it: no.
-4. **Keep, and document, the recovery that ends a grant.**
-   - The ask: confirm that a `stage` request for another version is meant to
-     end an update left in progress (the agent's `UpdateInProgress` recovery,
-     section 4.7), and document it in the annotation contract.
-   - Why: it's how the service ends grants it can't finish in time. If it
-     changed, those grants would stay open until Nebraska times them out, and
-     in safe mode enough timeouts turn updates off for the whole group.
-   - Until then: the service relies on the agent's current behavior.
-   - The first version needs it: no.
-5. **Fix [microsoft/trident#956](https://github.com/microsoft/trident/issues/956).**
+4. **Fix [microsoft/trident#956](https://github.com/microsoft/trident/issues/956).**
    - The problem: if the node falls back to the old copy during the restart,
      the agent still reports the commit as a success, and tells Nebraska the
      update finished.
    - Until then: the service accepts a commit only once `agent-info` shows the
      new version, and holds the node otherwise (section 4.9).
    - The first version needs it: no.
-6. **Fix [microsoft/trident#957](https://github.com/microsoft/trident/issues/957).**
+5. **Fix [microsoft/trident#957](https://github.com/microsoft/trident/issues/957).**
    - The problem: the agent writes no status for a request it can't parse,
      such as one with a field the contract doesn't define.
    - Until then: the service checks each request the way the agent does
@@ -507,17 +567,30 @@ whether the first version needs it.
      instances with separate databases, the agent's check could miss the
      grant, and the node would count twice against the group's limits.
    - The first version needs it: yes.
-3. **Each group's update timeout matches the Site's `updateTimeout`.**
-   - Why: the service ends every grant at least 10 minutes before that
-     timeout (section 4.8). If a group's timeout were shorter, Nebraska would
-     count updates as timed out, and in safe mode enough timeouts turn updates
-     off for the group, in every cluster.
+3. **Each group's update timeout is at least the Site's `updateTimeout`.**
+   - Why: the service ends every grant at least 10 minutes before the Site's
+     `updateTimeout` (section 4.8). If a group's timeout were shorter,
+     Nebraska would count updates as timed out, and in safe mode enough
+     timeouts turn updates off for the group, in every cluster.
+   - What we know: Nebraska's sample groups use 60 minutes, which the default
+     deadlines don't fit. The stage and finalize deadlines take 40 minutes,
+     leaving 10 for the drain and the restart together. The default
+     `updateTimeout` of 2 hours fits them.
    - The first version needs it: yes.
 4. **The Omaha secret.**
    - The ask: if Nebraska requires its Omaha secret, it's part of the update
      URL, so anyone who can read Sites or Node annotations can read it.
      Confirm that's acceptable, or offer another way to authenticate.
    - The first version needs it: only if the secret is used.
+5. **`disableUpdatesOnFailedRollout` stays off.**
+   - Why: with it on, Nebraska turns a group's updates off when the first node
+     to try a version reports a failure (`backend/pkg/api/runtime/events.go`).
+     The service reports every grant it ends as a failure, including drains
+     that miss their deadline, which say nothing about the version, so one
+     blocked drain could stop the group in every cluster.
+   - What we know: upstream Nebraska always leaves it off
+     (`runtime.Config{}` in `backend/cmd/nebraska/main.go`).
+   - The first version needs it: yes.
 
 ### 5.4 Unbounded host agent
 
@@ -533,8 +606,9 @@ whether the first version needs it.
 
 1. **Unit tests:** the state machine and the failure table, with a fake
    Kubernetes client and a fake Nebraska; counting slots; the drain rules with
-   each setting; the timing check; the request format against Trident's JSON
-   schemas (`annotations/protocol.rs`); the instance ID
+   each setting; the timing checks; the request format against Trident's JSON
+   schemas (`annotations/protocol.rs`); the update check and the failure
+   report against the agent's (`core/nebraska/wire.rs`); the instance ID
    (`34a267d412544d6a9e97b5ba6762f6e7` gives
    `ebb9a2bb-9365-d34e-133f-8da0664e7366`); and the admission policies' rules.
 2. **The AKSFlexNode harness**, which runs kubelet in an nspawn machine: the
@@ -556,6 +630,14 @@ whether the first version needs it.
    design change?
 5. **Claiming a node for maintenance:** what form should Unbounded's shared
    claim take?
+6. **Kubelet's renewed certificate (Trident):** `trident-acl-agent` reads
+   kubelet's client certificate once, when it starts (`annotations/k8s.rs`).
+   Kubelet renews the certificate before it expires, at the same path, so an
+   agent still running when the old one expires can't reach the API server,
+   and the service holds its node at the next update. The agent restarts with
+   the node at each update, so this affects only a node that goes without one
+   until then. Should the agent reload the certificate when it changes, or
+   rebuild its client after the API server refuses it?
 
 ## 8. Other approaches we considered
 
@@ -595,10 +677,10 @@ From the Site's `spec.components.centerPivot`. The component is off unless
 | `nebraskaURL` | none | Where to check. It must be `https`. |
 | `apps` | none | The Nebraska applications the Site's nodes run, one for each image flavor, such as ACL with NVIDIA drivers and ACL with AMD drivers. Each has a `name`, an `appID`, and an optional `defaultTrack` for its nodes without a track label. A node runs the app its `app` label names, or the only app when there is one. A node whose app can't be told isn't updated. |
 | `caConfigMap` | the image's certificates | A ConfigMap in Unbounded's namespace whose `ca.crt` signs Nebraska's certificate. |
-| `maxUnavailable` | 1 | Update slots per Site: a number, or a percentage of its managed nodes that gives at least 1. `0` stops updates. |
+| `maxUnavailable` | 1 | Update slots per Site: a number, or a percentage of its managed nodes that gives at least 1 unless it's `0%`. `0` and `0%` stop updates. |
 | `checkInterval` | 1 hour | How often each node is checked. |
-| `updateTimeout` | 2 hours | Must match each group's update timeout (section 4.8). |
-| `statusDeadline` | 5 minutes | How long to wait for a status before writing a request again. |
+| `updateTimeout` | 2 hours | No longer than each group's update timeout, and long enough for every step's deadline (section 4.8). |
+| `statusDeadline` | 5 minutes | How long the agent has to answer a request. It has 20 minutes more to finish a stage, and 10 to finish a finalize. |
 | `drainDeadline` | 30 minutes | How long one drain may take. |
 | `restartDeadline` | 30 minutes | How long a node has to come back after `finalize`. |
 | `recoveryDeadline` | 30 minutes | How long moved workloads have to recover. |
@@ -633,26 +715,37 @@ An example `state`, with the request the agent is carrying out:
   "since": "2026-11-18T10:31:00Z",
   "lastCheck": "2026-11-18T10:02:00Z",
   "nodeUid": "6f1c0a52-8d3e-4b7a-9c61-2f4e8a9b1d07",
-  "targetVersion": "20261106.1.0",
+  "targetVersion": "3.0.20261106",
   "attempts": 1,
-  "grantedAt": "2026-11-18T10:02:00Z",
+  "grant": {
+    "server": "https://nebraska.example.com/v1/update",
+    "appId": "11111111-2222-3333-4444-555555555555",
+    "track": "stable",
+    "machineId": "ebb9a2bb-9365-d34e-133f-8da0664e7366",
+    "version": "3.0.20261104",
+    "arch": "amd64",
+    "at": "2026-11-18T10:02:00Z"
+  },
   "request": {
     "schemaVersion": "1.0",
     "nodeUpdateId": "550e8400-e29b-41d4-a716-446655440000",
     "operationId": "c9d6f0a2-3b41-4e8d-9f27-1a5b6c7d8e90",
     "operation": "finalize",
-    "targetVersion": "20261106.1.0",
+    "targetVersion": "3.0.20261106",
     "server": "https://nebraska.example.com/v1/update",
     "appId": "11111111-2222-3333-4444-555555555555",
     "track": "stable"
   },
   "requestedAt": "2026-11-18T10:29:00Z",
-  "writes": 1,
   "workloads": [
     {"kind": "Deployment", "namespace": "shop", "name": "web", "available": 3}
   ]
 }
 ```
+
+`grant` is the update check that took the grant, which the event that ends it
+repeats. `endGrant`, in the same form, is a grant still to end, and `heldApp`
+is the app ID a hold stops.
 
 ### Permissions
 
@@ -687,7 +780,10 @@ On Azure Container Linux hosts, Unbounded's host agent:
       `/var/lib/machines/<slot>/var/lib/kubelet/pki/kubelet-client-current.pem`.
    2. `/etc/systemd/system/trident-acl-agent.service.d/50-unbounded-centerpivot.conf`
       sets annotation mode, the prefix, that kubeconfig, `kubelet-cert` to find
-      the Node's name, and `VERSION_ID`.
+      the Node's name, and `VERSION_ID`. It also sets the stage and finalize
+      timeouts the service's deadlines build on (section 4.8), and makes the
+      agent fail rather than report `0.0.0` when it can't read the version,
+      since Nebraska always offers that an update.
    3. It enables the agent, and restarts it when either file changed, as when
       the node moves to another slot.
 3. Undoes step 2 when the label goes or the node is reset, and turns the agent
