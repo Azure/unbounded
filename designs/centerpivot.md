@@ -1,4 +1,4 @@
-# Updating Azure Container Linux Nodes from Nebraska
+# Centerpivot: Updating Azure Container Linux Nodes from Nebraska
 
 | Field | Value |
 |---|---|
@@ -16,11 +16,11 @@ it isn't using, restarts into it, and keeps it if it boots. On each node,
 node's Node object. Something in the cluster has to decide when each node
 updates, and ask it. This document proposes that piece:
 
-1. `unbounded-acl-update`, a service in the cluster. For each ACL node, it asks
+1. `centerpivot`, a service in the cluster. For each ACL node, it asks
    Nebraska, the update server ACL uses, whether a new version is ready. When
    one is, it moves the node's workloads elsewhere, asks the agent to install
    the version, and checks that the node came back running it.
-2. `unbounded-acl-update-node-info`, a small temporary DaemonSet that publishes
+2. `centerpivot-node-info`, a small temporary DaemonSet that publishes
    two facts about each node the service needs, until Trident provides them.
 
 The service limits how many nodes in each Site update at once, drains nodes
@@ -28,6 +28,9 @@ with `kubectl drain`'s rules, and makes sure every update it starts in Nebraska
 either finishes or is ended before Nebraska would count it as timed out.
 Nebraska decides which version nodes get and how fast the fleet moves. When an
 update fails, the service stops updating the cluster until a person looks.
+
+The name comes from center-pivot irrigation, common on Nebraska's farms, which
+brings fresh water to a field one section at a time.
 
 ## 2. Background
 
@@ -125,12 +128,12 @@ rolling back automatically, and choosing versions.
 flowchart TB
     Nebraska[("Nebraska")]
     subgraph cluster["Kubernetes cluster"]
-        Service["unbounded-acl-update<br/>2 replicas, 1 active"]
+        Service["centerpivot<br/>2 replicas, 1 active"]
         API[("Kubernetes API<br/>Nodes and Machines")]
     end
     subgraph aclnode["Each ACL node"]
         Agent["trident-acl-agent<br/>on the host"]
-        Info["unbounded-acl-update-node-info<br/>temporary DaemonSet"]
+        Info["centerpivot-node-info<br/>temporary DaemonSet"]
         Trident["Trident"]
     end
 
@@ -143,13 +146,13 @@ flowchart TB
     Info -.->|"agent-info, until Trident provides it"| API
 ```
 
-1. **`unbounded-acl-update`** is an operator component, enabled per Site
+1. **`centerpivot`** is an operator component, enabled per Site
    through `Site.Spec.Components`, like token-refresher. It runs as a
    Deployment in `unbounded-system` with two replicas, one active through
    leader election, and reads its settings from the Site.
 2. **`trident-acl-agent`** ships with ACL and runs on each host. Unbounded's
    host agent configures it (section 5).
-3. **`unbounded-acl-update-node-info`** is a temporary DaemonSet (section 4.3).
+3. **`centerpivot-node-info`** is a temporary DaemonSet (section 4.3).
 
 This design covers ACL nodes that run kubelet in an nspawn machine, Unbounded's
 default and what its ACL tests run. Unbounded also documents `container`
@@ -196,7 +199,7 @@ series of quick checks.
 
 The service sends update checks as each node, so it needs two facts only the
 host knows: the node's Nebraska instance ID, and the version the agent reports.
-They are in one annotation on the Node, `acl-update.unbounded-cloud.io/agent-info`:
+They are in one annotation on the Node, `centerpivot.unbounded-cloud.io/agent-info`:
 
 ```json
 {
@@ -239,7 +242,7 @@ so the service waits for it rather than reading it once.
 4. **Stage.** With a grant for version V, it writes a `stage` request at once.
    The agent's own check gets the same grant, and it downloads V into the
    unused copy while the node keeps running.
-5. **Drain.** It taints the node with `acl-update.unbounded-cloud.io/updating`
+5. **Drain.** It taints the node with `centerpivot.unbounded-cloud.io/updating`
    (`NoSchedule`) and evicts its pods (section 4.6).
 6. **Finalize.** If enough of the grant's time is left for the restart
    (section 4.8), it writes `finalize`. Otherwise it ends the grant instead.
@@ -254,7 +257,7 @@ so the service waits for it rather than reading it once.
 
 ```mermaid
 sequenceDiagram
-    participant Service as unbounded-acl-update
+    participant Service as centerpivot
     participant API as Kubernetes API
     participant Agent as trident-acl-agent
     participant Nebraska
@@ -277,7 +280,7 @@ sequenceDiagram
 ### 4.5 States
 
 The service keeps each node's state in an annotation on its Machine,
-`acl-update.unbounded-cloud.io/state`, so it survives the Node being deleted to
+`centerpivot.unbounded-cloud.io/state`, so it survives the Node being deleted to
 rebuild it.
 
 ```mermaid
@@ -443,7 +446,7 @@ updates under way, held nodes, and the reason updates are blocked.
 | Trident | A final status when Nebraska refuses an update during `stage`. Today the agent exits, and systemd restarts it (`"Nebraska query failed"` in `annotations/orchestrator.rs`). | No | The service stages only after a grant, so this is rare. |
 | Trident | Confirm that the recovery the service uses to end a grant (section 4.7) is intended and will stay, and document it. | No | |
 | Trident | Fix microsoft/trident#956 and #957. | No | The version check after the restart, and the status deadline |
-| Unbounded host agent | A `trident-acl-agent` drop-in: the prefix `acl-update.unbounded-cloud.io`, kubelet's credentials, `kubelet-cert` to find the Node's name, and the version key. | Yes | |
+| Unbounded host agent | A `trident-acl-agent` drop-in: the prefix `centerpivot.unbounded-cloud.io`, kubelet's credentials, `kubelet-cert` to find the Node's name, and the version key. | Yes | |
 | Unbounded host agent | Mount the host's `/etc/machine-id` and `/etc/os-release` into the nspawn machine under `/run/unbounded/host/`. | Until Trident provides the identity | |
 | Unbounded host agent | Turn on kubelet's graceful node shutdown. | No | Pods left on the node stop at once. |
 | ACL images | An os-release key with a version that differs for every build, is valid semver, and doesn't vary only in build metadata (section 2.2). | Yes | |
@@ -537,15 +540,15 @@ From the component's spec on the Site:
 
 | Key | On | Written by | Meaning |
 |---|---|---|---|
-| `acl-update.unbounded-cloud.io/managed` | Node label | MachineConfiguration `nodeLabels` | The service updates this node. |
-| `acl-update.unbounded-cloud.io/track` | Node label | MachineConfiguration `nodeLabels` | The node's track, instead of the default. |
-| `acl-update.unbounded-cloud.io/canary` | Node label | MachineConfiguration `nodeLabels` | The node goes first among due nodes. |
-| `acl-update.unbounded-cloud.io/paused` | Node label | an administrator | Start no new updates on this node. |
-| `acl-update.unbounded-cloud.io/updating` | Node taint (`NoSchedule`) | the service | The node is being drained or updated. |
-| `acl-update.unbounded-cloud.io/update-request` | Node annotation | the service | Trident's contract |
-| `acl-update.unbounded-cloud.io/update-status`, `update-commit-status` | Node annotations | the agent | Trident's contract |
-| `acl-update.unbounded-cloud.io/agent-info` | Node annotation | the agent, or the temporary DaemonSet | Section 4.3 |
-| `acl-update.unbounded-cloud.io/state` | Machine annotation | the service | The node's state (section 4.5) |
+| `centerpivot.unbounded-cloud.io/managed` | Node label | MachineConfiguration `nodeLabels` | The service updates this node. |
+| `centerpivot.unbounded-cloud.io/track` | Node label | MachineConfiguration `nodeLabels` | The node's track, instead of the default. |
+| `centerpivot.unbounded-cloud.io/canary` | Node label | MachineConfiguration `nodeLabels` | The node goes first among due nodes. |
+| `centerpivot.unbounded-cloud.io/paused` | Node label | an administrator | Start no new updates on this node. |
+| `centerpivot.unbounded-cloud.io/updating` | Node taint (`NoSchedule`) | the service | The node is being drained or updated. |
+| `centerpivot.unbounded-cloud.io/update-request` | Node annotation | the service | Trident's contract |
+| `centerpivot.unbounded-cloud.io/update-status`, `update-commit-status` | Node annotations | the agent | Trident's contract |
+| `centerpivot.unbounded-cloud.io/agent-info` | Node annotation | the agent, or the temporary DaemonSet | Section 4.3 |
+| `centerpivot.unbounded-cloud.io/state` | Machine annotation | the service | The node's state (section 4.5) |
 
 An example `state`:
 
@@ -580,8 +583,8 @@ An example `state`:
 
 | Part | Where |
 |---|---|
-| Binary, with `controller` and `node-info` subcommands | `cmd/unbounded-acl-update` |
-| Shared code | `internal/aclupdate/...` |
-| Operator component | `internal/operator/components/aclupdate`, and a `Site.Spec.Components` field |
-| Manifests and admission policies | `deploy/acl-update/` |
-| Image | `images/unbounded-acl-update/` |
+| Binary, with `controller` and `node-info` subcommands | `cmd/centerpivot` |
+| Shared code | `internal/centerpivot/...` |
+| Operator component | `internal/operator/components/centerpivot`, and a `Site.Spec.Components` field |
+| Manifests and admission policies | `deploy/centerpivot/` |
+| Image | `images/centerpivot/` |
