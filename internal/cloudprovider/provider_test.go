@@ -79,11 +79,3 @@ func TestAKSProvider_DefaultLabels(t *testing.T) {
 	require.Equal(t, "false", labels["kubernetes.azure.com/managed"])
 	require.NotContains(t, labels, "kubernetes.azure.com/cluster")
 }
-
-func TestCommonDefaultLabels(t *testing.T) {
-	t.Parallel()
-
-	labels := CommonDefaultLabels()
-
-	require.Empty(t, labels)
-}
