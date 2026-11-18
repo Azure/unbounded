@@ -4196,7 +4196,7 @@ pub(crate) fn gpu_slot(
     let mode = config.enable_gpu;
     let options = crate::gpu::GpuOptions {
         staging_bytes: config.gpu_staging_bytes,
-        pci_p2pdma: config.gpu_pci_p2pdma,
+        pci_p2pdma: crate::gpu::pci_p2pdma(config.gpu_pci_p2pdma, &config.device_directory),
         peer: config.gpu_peer,
         ..crate::gpu::GpuOptions::default()
     };

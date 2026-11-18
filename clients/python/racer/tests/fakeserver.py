@@ -45,7 +45,8 @@ class FakeRacer:
     old=True mimics a dataplane that predates host-read/gpu-read: the new
     paths fail key parsing and get 400. gpu_status is the answer to gpu-read
     (501 by default, the "no usable GPU" case). gpu_write, when set, is
-    called as gpu_write(fd, dest_offset, bytes) to emulate the GPU write.
+    called as gpu_write(fd, dest_offset, bytes, allocation_size) to emulate
+    the GPU write.
     """
 
     def __init__(self, path: str) -> None:
@@ -264,7 +265,7 @@ class FakeRacer:
                 if mode == "host-read":
                     os.pwrite(fds[0], chunk, off + f.offset - first)
                 else:
-                    self.gpu_write(fds[0], off + f.offset - first, chunk)
+                    self.gpu_write(fds[0], off + f.offset - first, chunk, alloc)
                 conn.sendall(wire.encode_frame(f.kind, f.number, f.offset, f.length))
             if self.truncate:
                 return

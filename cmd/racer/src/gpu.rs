@@ -485,7 +485,7 @@ pub struct GpuCounters {
 /// Why cuFile was turned off.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CufileDisable {
-    /// The cuFile driver failed to open at startup.
+    /// The cuFile driver failed to open.
     DriverOpen,
     /// A staging buffer could not be registered with cuFile.
     StagingRegister,
@@ -553,6 +553,25 @@ impl Default for GpuOptions {
             queue_depth: QUEUE_DEPTH,
         }
     }
+}
+
+/// Resolve `RACER_GPU_PCI_P2PDMA`. `None` is `auto`: ask cuFile for PCI
+/// P2PDMA when `dev`, the device directory, has no `nvidia-fs*` device, since
+/// cuFile then has no nvidia-fs to use. A directory that cannot be read
+/// leaves it off.
+pub(crate) fn pci_p2pdma(setting: Option<bool>, dev: &std::path::Path) -> bool {
+    setting.unwrap_or_else(|| {
+        std::fs::read_dir(dev).is_ok_and(|mut entries| {
+            !entries.any(|entry| {
+                entry.is_ok_and(|entry| {
+                    entry
+                        .file_name()
+                        .as_encoded_bytes()
+                        .starts_with(b"nvidia-fs")
+                })
+            })
+        })
+    })
 }
 
 /// Per-GPU state shared with I/O threads.
@@ -1549,7 +1568,7 @@ fn coordinator_main(
                     readers.push(thread);
                 }
             }
-            let opener = open_cufile(&gpu, &state.cufile, &state.counters);
+            let opener = open_cufile(&gpu, &state.cufile, &state.counters, state.pci_p2pdma);
             let uuids = usable
                 .iter()
                 .map(|device: &DeviceInfo| device.uuid)
@@ -1664,6 +1683,7 @@ fn open_cufile(
     gpu: &racer_gpu::Gpu,
     cufile: &Arc<AtomicBool>,
     counters: &Arc<GpuCounters>,
+    pci_p2pdma: bool,
 ) -> Option<std::thread::JoinHandle<()>> {
     if !cufile.load(Ordering::Relaxed) {
         return None;
@@ -1673,14 +1693,58 @@ fn open_cufile(
     std::thread::Builder::new()
         .name("racer-gpu-cufile".into())
         .spawn(move || {
-            if let Err(error) = reader.open_driver()
-                && cufile.swap(false, Ordering::Relaxed)
-            {
-                counters.cufile_disabled(CufileDisable::DriverOpen);
-                eprintln!("racer: stage=gpu state=cufile-disabled reason={error}");
+            if let Err(error) = reader.open_driver() {
+                cufile_off(
+                    &cufile,
+                    &counters,
+                    CufileDisable::DriverOpen,
+                    error,
+                    pci_p2pdma,
+                );
             }
         })
         .ok()
+}
+
+/// Turn cuFile off for the node after `error` at `step`, unless it already
+/// is, and log why with what to check.
+fn cufile_off(
+    cufile: &AtomicBool,
+    counters: &GpuCounters,
+    step: CufileDisable,
+    error: racer_gpu::Error,
+    pci_p2pdma: bool,
+) {
+    if cufile.swap(false, Ordering::Relaxed) {
+        counters.cufile_disabled(step);
+        eprintln!(
+            "racer: stage=gpu state=cufile-disabled step={} reason={error} hint={}",
+            step.label(),
+            cufile_hint(error, pci_p2pdma)
+        );
+    }
+}
+
+/// What to check after cuFile fails with `error`, for the log.
+/// `pci_p2pdma` is whether Racer asked cuFile for PCI P2PDMA.
+fn cufile_hint(error: racer_gpu::Error, pci_p2pdma: bool) -> String {
+    use racer_gpu::Error::{Driver, Unavailable, Unsupported};
+    let cause = match error {
+        // CU_FILE_DRIVER_NOT_INITIALIZED
+        Driver(5001) if pci_p2pdma => {
+            "nvidia-fs.ko is not loaded and PCI P2PDMA did not start: it needs Linux 6.2 or later and the NVIDIA open kernel module. "
+        }
+        Driver(5001) => {
+            "nvidia-fs.ko is not loaded: set RACER_GPU_PCI_P2PDMA to auto or true to read NVMe over PCI P2PDMA, or install nvidia-fs. "
+        }
+        // CU_FILE_IO_NOT_SUPPORTED
+        Driver(5008) | Unsupported(5008) => {
+            "the filesystem is not eligible for GPUDirect Storage: mount ext4 with an explicit data=ordered option, and do not use RAID0 or NVMe multipath with PCI P2PDMA. "
+        }
+        Unavailable => "libcufile.so.0 is missing, or too old for PCI P2PDMA (needs cuFile 1.13). ",
+        _ => "",
+    };
+    format!("{cause}cuFile logs: /var/log/cufile/")
 }
 
 /// Enable peer access for every ordered pair of usable GPUs, unless `enabled`
@@ -2042,13 +2106,21 @@ impl Coordinator {
             Ok(staging) => staging,
             Err(error) => return Err((error, reply)),
         };
-        if let Err(error) = staging.register_cufile() {
+        // Open the driver on its own so its failure is not counted as the
+        // staging buffer's.
+        let registered = match self.engine.gpu.open_cufile() {
+            Ok(()) => staging
+                .register_cufile()
+                .map_err(|error| (error, CufileDisable::StagingRegister)),
+            Err(error) => Err((error, CufileDisable::DriverOpen)),
+        };
+        if let Err((error, step)) = registered {
             self.engine
                 .state
                 .counters
                 .file_failures
                 .fetch_add(1, Ordering::Relaxed);
-            self.disable_cufile(error, CufileDisable::StagingRegister);
+            self.disable_cufile(error, step);
             return Err((Error::Unavailable, reply));
         }
         let id = match self.files.get(&identity) {
@@ -2165,18 +2237,22 @@ impl Coordinator {
                 .fetch_add(1, Ordering::Relaxed);
             let (major, minor) = (libc::major(device), libc::minor(device));
             eprintln!(
-                "racer: stage=gpu state=cufile-unsupported dev={major}:{minor} reason={error}"
+                "racer: stage=gpu state=cufile-unsupported dev={major}:{minor} reason={error} hint={}",
+                cufile_hint(error, self.engine.state.pci_p2pdma)
             );
         }
     }
 
     /// Stop trying cuFile after a failure that is not about one read.
-    fn disable_cufile(&self, error: racer_gpu::Error, reason: CufileDisable) {
+    fn disable_cufile(&self, error: racer_gpu::Error, step: CufileDisable) {
         let state = &self.engine.state;
-        if state.cufile.swap(false, Ordering::Relaxed) {
-            state.counters.cufile_disabled(reason);
-            eprintln!("racer: stage=gpu state=cufile-disabled reason={error}");
-        }
+        cufile_off(
+            &state.cufile,
+            &state.counters,
+            step,
+            error,
+            state.pci_p2pdma,
+        );
     }
 }
 
@@ -3015,6 +3091,84 @@ pub(crate) mod testing {
         .unwrap()
     }
 
+    /// Metadata of a one-page object of `length` bytes.
+    pub(crate) fn metadata(length: u64) -> crate::model::ObjectMetadata {
+        use crate::model::*;
+        ObjectMetadata {
+            content_type: None,
+            version: ObjectVersion {
+                object: ObjectId {
+                    cache: racer_wire::control::CacheId(
+                        "00000000-0000-4000-8000-000000000001".into(),
+                    ),
+                    key: CacheKey([0; 32]),
+                },
+                etag: StrongEtag::test_value("v1"),
+            },
+            length,
+            expires_at: ExpiresAt::from_system_time(std::time::UNIX_EPOCH).unwrap(),
+        }
+    }
+
+    /// The envelope [`seal`] seals the page of `metadata` under.
+    pub(crate) fn envelope(metadata: &crate::model::ObjectMetadata) -> crate::model::PageEnvelope {
+        use crate::model::*;
+        PageEnvelope {
+            page_size: racer_wire::object::PageSize::DEFAULT,
+            cipher: PageCipher::Xaes256Gcm,
+            page: PageId {
+                version: metadata.version.clone(),
+                number: PageNumber(0),
+            },
+            key_id: key_id_from_generation(1, 1).unwrap(),
+            nonce: Nonce(crate::test_support::test_vector([2; 24])),
+            plaintext_length: metadata.length as u32,
+            ciphertext_length: metadata.length as u32 + 16,
+        }
+    }
+
+    /// Seal `plaintext`. Returns the ciphertext and tag, and a builder for
+    /// the sealed page given where that ciphertext is.
+    pub(crate) fn seal(
+        plaintext: &[u8],
+        tamper: bool,
+    ) -> (
+        Vec<u8>,
+        impl FnOnce(SealedSource) -> Box<SealedPage> + use<>,
+    ) {
+        let metadata = metadata(plaintext.len() as u64);
+        let envelope = envelope(&metadata);
+        let aad = crate::security::page_aad(&envelope).unwrap();
+        let mut sealed = vec![0; plaintext.len() + 16];
+        racer_crypto::seal(
+            &crate::test_support::test_vector([7; 32]),
+            &envelope.nonce.0,
+            &aad,
+            plaintext,
+            &mut sealed,
+        )
+        .unwrap();
+        if tamper {
+            sealed[3] ^= 1;
+        }
+        let build = move |source| {
+            let page = Box::new(SealedPage {
+                fused_store: None,
+                metadata,
+                aad,
+                key: racer_crypto::xaes_derive(
+                    &crate::test_support::test_vector([7; 32]),
+                    &envelope.nonce.0,
+                ),
+                source,
+                envelope,
+            });
+            page.validate_for(&page.envelope.page.clone()).unwrap();
+            page
+        };
+        (sealed, build)
+    }
+
     /// GPU `ordinal`'s landing buffer of `length` bytes, blocking.
     pub(crate) fn landing(
         helper: &GpuHelper,
@@ -3151,6 +3305,9 @@ pub(crate) mod testing {
     }
 }
 
+#[cfg(all(test, feature = "cuda"))]
+pub(crate) mod hardware;
+
 #[cfg(test)]
 mod tests {
     //! RDMA landing buffers on simulated GPUs: allocation, reuse, and
@@ -3201,23 +3358,6 @@ mod tests {
 
     const LENGTH: u64 = 2 * SLOT_BYTES;
 
-    fn metadata(length: u64) -> ObjectMetadata {
-        ObjectMetadata {
-            content_type: None,
-            version: ObjectVersion {
-                object: ObjectId {
-                    cache: racer_wire::control::CacheId(
-                        "00000000-0000-4000-8000-000000000001".into(),
-                    ),
-                    key: CacheKey([0; 32]),
-                },
-                etag: StrongEtag::test_value("v1"),
-            },
-            length,
-            expires_at: ExpiresAt::from_system_time(std::time::UNIX_EPOCH).unwrap(),
-        }
-    }
-
     /// A sealed page whose real ciphertext a NIC wrote at `at` in `landing`.
     fn landed(landing: &GpuLanding, at: u64, plaintext: &[u8], tamper: bool) -> Box<SealedPage> {
         let (sealed, page) = seal(plaintext, tamper);
@@ -3227,56 +3367,6 @@ mod tests {
             at,
             sealed.len() as u64,
         ))))
-    }
-
-    /// Seal `plaintext`. Returns the ciphertext and tag, and a builder for
-    /// the sealed page given where that ciphertext is.
-    fn seal(
-        plaintext: &[u8],
-        tamper: bool,
-    ) -> (Vec<u8>, impl FnOnce(SealedSource) -> Box<SealedPage>) {
-        let metadata = metadata(plaintext.len() as u64);
-        let envelope = PageEnvelope {
-            page_size: racer_wire::object::PageSize::DEFAULT,
-            cipher: PageCipher::Xaes256Gcm,
-            page: PageId {
-                version: metadata.version.clone(),
-                number: PageNumber(0),
-            },
-            key_id: key_id_from_generation(1, 1).unwrap(),
-            nonce: Nonce(crate::test_support::test_vector([2; 24])),
-            plaintext_length: plaintext.len() as u32,
-            ciphertext_length: plaintext.len() as u32 + 16,
-        };
-        let aad = crate::security::page_aad(&envelope).unwrap();
-        let mut sealed = vec![0; plaintext.len() + 16];
-        racer_crypto::seal(
-            &crate::test_support::test_vector([7; 32]),
-            &envelope.nonce.0,
-            &aad,
-            plaintext,
-            &mut sealed,
-        )
-        .unwrap();
-        if tamper {
-            sealed[3] ^= 1;
-        }
-        let build = move |source| {
-            let page = Box::new(SealedPage {
-                fused_store: None,
-                metadata,
-                aad,
-                key: racer_crypto::xaes_derive(
-                    &crate::test_support::test_vector([7; 32]),
-                    &envelope.nonce.0,
-                ),
-                source,
-                envelope,
-            });
-            page.validate_for(&page.envelope.page.clone()).unwrap();
-            page
-        };
-        (sealed, build)
     }
 
     #[test]
@@ -3614,6 +3704,89 @@ mod tests {
         });
         eventually(|| !helper.cufile());
         assert_eq!(helper.counters().staged.load(Ordering::Relaxed), 0);
+    }
+
+    fn disabled(helper: &GpuHelper, step: CufileDisable) -> u64 {
+        counter(&helper.counters().cufile_disabled[step as usize])
+    }
+
+    #[test]
+    /// A driver open that fails while a stage also waits for it is counted
+    /// as a driver open, whichever of the two turns cuFile off, and both see
+    /// the cuFile status.
+    fn driver_open_failure_during_a_stage_is_a_driver_open() {
+        use racer_gpu::simulation::Operation;
+        let helper = helper_with(&[None], |simulation| {
+            simulation.fail_file_open(5001);
+            simulation.hold(Operation::FileOpen, true);
+        });
+        let sim = helper.run(simulation);
+        // The startup open waits; a stage reaches the same open.
+        eventually(|| sim.waiting(Operation::FileOpen) == 1);
+        let stager = {
+            let (helper, fd) = (helper.clone(), slab(&[7; 4096]));
+            std::thread::spawn(move || stage(&helper, &fd, 0, 4096))
+        };
+        eventually(|| sim.waiting(Operation::FileOpen) == 2);
+        sim.hold(Operation::FileOpen, false);
+        assert_eq!(stager.join().unwrap().err(), Some(Error::Unavailable));
+        eventually(|| !helper.cufile());
+        assert_eq!(disabled(&helper, CufileDisable::DriverOpen), 1);
+        assert_eq!(disabled(&helper, CufileDisable::StagingRegister), 0);
+        assert_eq!(counter(&helper.counters().file_failures), 1);
+        assert_eq!(operations(&helper, Operation::StagingRegister), 0);
+        assert!(
+            sim.trace()
+                .iter()
+                .filter(|event| event.operation == Operation::FileOpen)
+                .all(|event| event.result == -5)
+        );
+    }
+
+    #[test]
+    /// Only a failed staging buffer registration is counted as one.
+    fn staging_register_failure_is_a_staging_register() {
+        use racer_gpu::simulation::Operation;
+        let helper = helper(&[None]);
+        eventually(|| operations(&helper, Operation::FileOpen) == 1);
+        helper.run(|| simulation().fault(Operation::StagingRegister, -5));
+        let fd = slab(&[7; 4096]);
+        assert_eq!(stage(&helper, &fd, 0, 4096).err(), Some(Error::Unavailable));
+        assert!(!helper.cufile());
+        assert_eq!(disabled(&helper, CufileDisable::StagingRegister), 1);
+        assert_eq!(disabled(&helper, CufileDisable::DriverOpen), 0);
+    }
+
+    #[test]
+    /// The disable log says what to check for the common cuFile failures.
+    fn cufile_hints_name_the_fix() {
+        use racer_gpu::Error::{Driver, Unavailable, Unsupported};
+        assert!(cufile_hint(Driver(5001), false).contains("RACER_GPU_PCI_P2PDMA"));
+        assert!(cufile_hint(Driver(5001), true).contains("Linux 6.2"));
+        assert!(cufile_hint(Unsupported(5008), true).contains("data=ordered"));
+        assert!(cufile_hint(Driver(5008), false).contains("data=ordered"));
+        assert!(cufile_hint(Unavailable, true).contains("libcufile.so.0"));
+        assert_eq!(
+            cufile_hint(Driver(999), false),
+            "cuFile logs: /var/log/cufile/"
+        );
+    }
+
+    #[test]
+    /// `auto` asks for PCI P2PDMA only when the device directory has no
+    /// nvidia-fs device; `true` and `false` are taken as set.
+    fn pci_p2pdma_auto_follows_nvidia_fs() {
+        let dev = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("../../tmp/racer-p2pdma-{}", std::process::id()));
+        std::fs::create_dir_all(&dev).unwrap();
+        std::fs::write(dev.join("nvidia0"), "").unwrap();
+        assert!(pci_p2pdma(None, &dev));
+        assert!(!pci_p2pdma(Some(false), &dev));
+        std::fs::write(dev.join("nvidia-fs0"), "").unwrap();
+        assert!(!pci_p2pdma(None, &dev));
+        assert!(pci_p2pdma(Some(true), &dev));
+        std::fs::remove_dir_all(&dev).unwrap();
+        assert!(!pci_p2pdma(None, &dev));
     }
 
     #[test]

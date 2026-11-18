@@ -447,9 +447,44 @@ fn device_alignment(file: &File) -> io::Result<Alignment> {
 /// Warn when full-page records leave at least this much of each segment unused.
 const TAIL_WARNING_PERCENT: u64 = 10;
 
+/// Segment size the tail warning recommends.
+const RECOMMENDED_SEGMENT_BYTES: u64 = 1 << 30;
+
 /// Percent of a segment left unused after packing whole `record`s.
 fn tail_percent(segment_bytes: u64, record: u64) -> u64 {
     (segment_bytes % record).saturating_mul(100) / segment_bytes
+}
+
+/// Device bytes one full page record occupies: the page, its largest header,
+/// and its AEAD tag, rounded up to `alignment`.
+fn page_record_bytes(alignment: Alignment) -> Result<u64> {
+    Ok(alignment
+        .extent(
+            0,
+            crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
+        )?
+        .length() as u64)
+}
+
+/// The startup warning when whole `record`s leave at least
+/// `TAIL_WARNING_PERCENT` of each of `segments` segments unused.
+fn tail_warning(segment_bytes: u64, record: u64, segments: u64) -> Option<String> {
+    if tail_percent(segment_bytes, record) < TAIL_WARNING_PERCENT {
+        return None;
+    }
+    let tail = segment_bytes % record;
+    let percent = |segment: u64| (segment % record) as f64 * 100.0 / segment as f64;
+    Some(format!(
+        "racer: RACER_SEGMENT_BYTES={segment_bytes} fits {} page records of {record} bytes; \
+         each segment leaves {tail} bytes ({:.1}%) unused, {} bytes across {segments} segments. \
+         RACER_SEGMENT_BYTES={RECOMMENDED_SEGMENT_BYTES} (1 GiB) leaves {:.1}% unused. Changing \
+         it discards cached data; upgrades keep the old value, so set it in the racer-settings \
+         ConfigMap",
+        segment_bytes / record,
+        percent(segment_bytes),
+        tail.saturating_mul(segments),
+        percent(RECOMMENDED_SEGMENT_BYTES),
+    ))
 }
 
 fn plan(mut devices: Vec<Device>, config: &Config, workers: usize) -> Result<Plan> {
@@ -495,23 +530,12 @@ fn plan(mut devices: Vec<Device>, config: &Config, workers: usize) -> Result<Pla
     for device in &devices {
         guarded_capacity(device.bytes, config.segment_bytes, alignment)?;
     }
-    let record = alignment
-        .extent(
-            0,
-            crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
-        )?
-        .length() as u64;
+    let record = page_record_bytes(alignment)?;
     if record > config.segment_bytes {
         return Err(Error::InvalidConfiguration);
     }
-    let tail = tail_percent(config.segment_bytes, record);
-    if tail >= TAIL_WARNING_PERCENT {
-        eprintln!(
-            "racer: RACER_SEGMENT_BYTES={} fits {} full pages per segment; {tail}% of device \
-             capacity is unusable segment tail. Use a larger segment, such as 1 GiB",
-            config.segment_bytes,
-            config.segment_bytes / record,
-        );
+    if let Some(warning) = tail_warning(config.segment_bytes, record, usable) {
+        eprintln!("{warning}");
     }
     let mut device_index = 0;
     let mut offset = GUARD_BYTES;
@@ -653,6 +677,29 @@ mod tests {
         assert_eq!(tail_percent(1 << 30, record), 1);
         // An exact multiple wastes nothing.
         assert_eq!(tail_percent(record * 4, record), 0);
+    }
+
+    #[test]
+    fn tail_warning_reports_waste_and_remedy() {
+        let record = page_record_bytes(Alignment::new(4096, 4096, 4096).unwrap()).unwrap();
+        assert_eq!(record, 16 * 1024 * 1024 + 24 * 1024);
+        // 64 MiB fits three records and leaves about a quarter unused.
+        let warning = tail_warning(64 << 20, record, 100).unwrap();
+        for part in [
+            "RACER_SEGMENT_BYTES=67108864 fits 3 page records of 16801792 bytes",
+            "each segment leaves 16703488 bytes (24.9%) unused",
+            "1670348800 bytes across 100 segments",
+            "RACER_SEGMENT_BYTES=1073741824 (1 GiB) leaves 1.4% unused",
+            "discards cached data",
+            "racer-settings",
+        ] {
+            assert!(warning.contains(part), "missing {part:?} in {warning}");
+        }
+        // 1 GiB fits 63 records: under the warning threshold.
+        assert_eq!(tail_warning(1 << 30, record, 100), None);
+        // An exact multiple wastes nothing.
+        assert_eq!(tail_percent(record * 4, record), 0);
+        assert_eq!(tail_warning(record * 4, record, 100), None);
     }
 
     struct FakeClock(Duration);

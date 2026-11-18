@@ -377,7 +377,7 @@ each worker and are never divided.
 | `RACER_ENABLE_GPU` | `auto` | Node | `auto`, `true`, `false` | `auto` turns GPU reads on at the first `gpu-read` if a usable GPU is found; `true` sets GPUs up at startup and fails without one; `false` turns them off. |
 | `RACER_GPU_STAGING_BYTES` | `268435456` (256 MiB) | Node | 2,097,152..2^64-1 bytes, multiple of 2,097,152 | Ciphertext staging memory per GPU. Below about 34 MiB the GPU does not decrypt and the CPU does. |
 | `RACER_GPU_LANDING_BYTES` | `268435456` (256 MiB) | Node | 0..2^64-1 bytes, multiple of 2,097,152 | GPU memory per GPU that peers' NICs write GPU-read pages into over RDMA; `0` turns landing off. |
-| `RACER_GPU_PCI_P2PDMA` | `false` | Node | `true`, `false` | `true` asks cuFile to read local NVMe into GPU memory over PCI P2PDMA instead of `nvidia-fs`. Needs cuFile 1.13 (CUDA 12.8) or later. |
+| `RACER_GPU_PCI_P2PDMA` | `auto` | Node | `auto`, `true`, `false` | `true` asks cuFile to read local NVMe into GPU memory over PCI P2PDMA instead of `nvidia-fs`; `auto` does so when `RACER_DEVICE_DIRECTORY` has no `nvidia-fs*` device. Needs cuFile 1.13 (CUDA 12.8) or later. |
 | `RACER_GPU_PEER` | `auto` | Node | `auto`, `off` | `auto` lets one GPU copy another GPU's encrypted page over NVLink or PCIe peer-to-peer where the driver allows it; `off` moves such pages through host memory. |
 
 #### Storage
@@ -639,6 +639,25 @@ checkpoint scratch, not just the configured admission budgets. The automatic
 checkpoint budget is not an RSS limit or a guarantee that a full cache can be
 checkpointed. Limit warnings explain discarded capacity and checkpoint pressure.
 
+Each segment holds only whole page records. A record is one 16 MiB page, the
+largest record header (20 KiB), and a 16-byte AEAD tag, rounded up to the
+devices' direct-I/O alignment: 16,801,792 bytes (16 MiB + 24 KiB) with 4 KiB
+alignment. The remaining `segment_bytes mod record_bytes` of every segment is
+unused tail (`racer_segment_tail_bytes`):
+
+| `RACER_SEGMENT_BYTES` | Records per segment | Tail per segment (4 KiB alignment) | Share of device |
+| --- | --- | --- | --- |
+| 64 MiB | 3 | 16,703,488 bytes | about 24.9% |
+| 1 GiB (default) | 63 | 15,228,928 bytes | about 1.4% |
+
+Only an exact multiple of the record size has no tail. That size is not a power
+of two and depends on device alignment, so Racer does not round the setting.
+When the tail is 10% or more, Racer logs a startup warning with the record
+size, the unused bytes per segment and across all segments, and the share
+1 GiB would leave. Changing `RACER_SEGMENT_BYTES` starts the cache cold; to
+move an upgraded cluster off 64 MiB, see
+[Upgrade and recovery](#upgrade-and-recovery).
+
 Checkpoints store the remaining time of each completed-page hold, measured
 on the monotonic clock, so a restart re-arms holds without consulting wall
 time. Time between the checkpoint and the restart does not count against a
@@ -832,6 +851,15 @@ Racer-Destination-Length: <length>
   page is complete.
 - When the read ends for any reason, the dataplane waits for its GPU work,
   then releases the memory. See [GPU reads](#gpu-reads).
+- `racer_gpu_read_request_nanoseconds_sum` and
+  `racer_gpu_read_request_nanoseconds_count` time each successful gpu-read
+  from the start of its delivery (after the request is parsed and the memory
+  imported on a GPU) to the final frame.
+  `racer_gpu_read_first_page_nanoseconds_sum` and
+  `racer_gpu_read_first_page_nanoseconds_count` time the same start to the
+  first page being ready, before the response head is sent, including reads
+  that fail later. The difference is time spent writing pages to the GPU and
+  sending frames. The host-read latency series do not include gpu-reads.
 
 ### Prefetch
 
@@ -1260,11 +1288,9 @@ one eighth of the worker's segments, because free segments hold no cached
 pages. Reclamation evicts whole low-value segments by metadata only: it copies,
 reads, and trims nothing.
 
-On raw devices, each segment holds only whole page records (the page plus a
-small header), so the rest of each segment is unused (`racer_segment_tail_bytes`).
-With 16 MiB pages, a 64 MiB segment fits three records and leaves about 25% of
-the device unused. Racer logs a warning at startup when the unused share is 10%
-or more. The 1 GiB default fits 63 records and leaves under 2% unused.
+On raw devices, the part of each segment after its last whole page record is
+unused (`racer_segment_tail_bytes`). See [Raw-device storage](#raw-device-storage)
+for the arithmetic and the startup warning.
 
 `reason` takes these values:
 
@@ -1680,6 +1706,8 @@ from the GPUs the dataplane found and the active RDMA rails.
 | Metric | Type | Meaning |
 |--------|------|---------|
 | `racer_gpu_read_requests_total{outcome}` | counter | `gpu-read` requests by how the dataplane opened them: `gpu` (imported on a GPU; the read can still fail later), `not_enabled` (501, `gpu-read` is off), `wrong_device` (501, the memory is on a GPU the dataplane cannot use, or the `Racer-Gpu-Uuid` header names a GPU it did not find), `busy` (503), `invalid` (400), or `failed`. Requests the parser rejects before it knows the mode are not counted. |
+| `racer_gpu_read_request_nanoseconds_sum`, `racer_gpu_read_request_nanoseconds_count` | counter | Time from the start of delivery to the final frame, and the count, of successful `gpu-read` requests. See [Host reads](#host-reads). |
+| `racer_gpu_read_first_page_nanoseconds_sum`, `racer_gpu_read_first_page_nanoseconds_count` | counter | Time from the start of delivery to the first page being ready, and the count, of `gpu-read` requests that reached their first page. |
 | `racer_gpu_enabled` | gauge | 1 when `gpu-read` is on and found a usable GPU, else 0. |
 | `racer_gpu_standby` | gauge | 1 while `auto` mode waits for the first `gpu-read` before it touches a GPU, else 0. |
 
@@ -1755,12 +1783,40 @@ saved.
 
 New installs seed `RACER_SEGMENT_BYTES` at 1 GiB and
 `RACER_SLAB_BYTES_PER_WORKER` at 4 GiB; earlier releases seeded 64 MiB and
-1 GiB, and an upgrade keeps those values. A 64 MiB segment holds only three
-16 MiB page records, wasting about a quarter of each device and leaving a small
-free-segment reserve. To adopt the new geometry on an existing install, edit
-both keys in `racer-settings`; this changes storage geometry and starts a cold
-cache. Keys absent from
+1 GiB, and an upgrade keeps those values. Keys absent from
 `racer-settings` take the dataplane defaults of the new release.
+
+A 64 MiB segment leaves about 24.9% of each raw device unused (see
+[Raw-device storage](#raw-device-storage)), and the dataplane logs a warning
+naming `RACER_SEGMENT_BYTES` at startup. To move a cluster still on 64 MiB to
+the new geometry:
+
+1. Confirm the current value:
+
+   ```bash
+   kubectl -n unbounded-system get configmap racer-settings \
+     -o jsonpath='{.data.RACER_SEGMENT_BYTES}{"\n"}'
+   ```
+
+2. Set both keys together. The slab must be a whole number of segments and
+   hold more of them than the free-segment reserve, so the dataplane rejects a
+   1 GiB segment with the old 1 GiB slab:
+
+   ```bash
+   kubectl -n unbounded-system patch configmap racer-settings --type merge \
+     -p '{"data":{"RACER_SEGMENT_BYTES":"1073741824","RACER_SLAB_BYTES_PER_WORKER":"4294967296"}}'
+   ```
+
+3. The ConfigMap hash change rolls DaemonSet `racer`. Wait for it:
+
+   ```bash
+   kubectl -n unbounded-system rollout status daemonset/racer
+   ```
+
+4. Each restarted node starts with a cold cache: its checkpoint no longer
+   matches the storage geometry, so cached pages refill from origins. To limit
+   how many nodes are cold at once, set the DaemonSet `updateStrategy` with a
+   workload override first.
 
 Expect a cold cache after changing device layout,
 worker count, or storage geometry. Recovery does not scan payloads to rebuild
@@ -1916,19 +1972,22 @@ Where the bytes come from decides who decrypts them:
 - A page on local disk is read straight from the disk into GPU memory with
   cuFile when it can be. Otherwise the CPU reads it and copies it to the GPU.
   This needs GPUDirect Storage on the host (`nvidia-fs`, or PCIe P2PDMA).
-  For PCI P2PDMA, set `RACER_GPU_PCI_P2PDMA=true`. cuFile then does not fall
-  back to `nvidia-fs`, and if it cannot turn P2PDMA on, the dataplane logs
-  `stage=gpu state=cufile-disabled` and reads through host memory. The
-  `stage=gpu state=enabled` line reports the setting as `pci_p2pdma=<bool>`.
+  `RACER_GPU_PCI_P2PDMA=auto`, the default, asks cuFile for PCI P2PDMA when
+  `RACER_DEVICE_DIRECTORY` has no `nvidia-fs*` device; `true` always asks, and
+  `false` leaves cuFile's own setting. With P2PDMA on, cuFile does not fall
+  back to `nvidia-fs`. The `stage=gpu state=enabled` line reports the result
+  as `pci_p2pdma=<bool>`.
   `racer_gpu_direct_disk_reads_total` and
   `racer_gpu_direct_disk_read_bytes_total` count these reads. After a cuFile
   driver or registration failure the dataplane logs
-  `stage=gpu state=cufile-disabled` and reads through host memory until it
-  restarts. When cuFile only rejects a file because its filesystem or device
-  is not supported, the dataplane logs
-  `stage=gpu state=cufile-unsupported dev=<major>:<minor> reason=<error>` once
+  `stage=gpu state=cufile-disabled step=<step> reason=<error> hint=<text>`
+  once, where `<step>` is the `racer_gpu_cufile_disabled_total` reason, and
+  reads through host memory until it restarts. When cuFile only rejects a
+  file because its filesystem or device is not supported, the dataplane logs
+  `stage=gpu state=cufile-unsupported dev=<major>:<minor> reason=<error> hint=<text>` once
   for that device, reads files on that device through host memory until it
-  restarts, and keeps cuFile on for other devices.
+  restarts, and keeps cuFile on for other devices. See
+  [cuFile troubleshooting](#cufile-troubleshooting).
 - When several `gpu-read` requests want the same page at once, such as every
   GPU loading the same model weights, the page is read from disk or a peer
   only once. A request for the same GPU, or for a GPU that can copy from it
@@ -1995,7 +2054,8 @@ The operator reads it and changes the DaemonSet:
 The dataplane image ships `/etc/racer/cufile.json` and sets
 `CUFILE_ENV_PATH_JSON` to it. It turns off cuFile compatibility mode, so
 cuFile fails instead of copying through host memory and Racer uses its own
-host read path, and it logs errors to `/var/log/cufile/cufile.log`. Other
+host read path, and it logs errors to one file per process,
+`/var/log/cufile/cufile_<pid>_<date>.log`. Other
 cuFile settings keep their built-in defaults. To use your own file, build an
 image from the dataplane image that adds it, and set `CUFILE_ENV_PATH_JSON`
 in `racer-settings`. Setting `CUFILE_ALLOW_COMPAT_MODE=true`
@@ -2004,6 +2064,33 @@ turns compatibility mode back on.
 On nodes set up by the unbounded agent, the NVIDIA runtime is the default
 containerd runtime and runs in CDI mode, so `env` is enough there. These env
 entries are operator wiring: workload overrides cannot change them.
+
+### cuFile troubleshooting
+
+When cuFile is turned off, the `reason=` of the `stage=gpu` line names the
+cuFile status, for example
+`cuFile call failed with status 5001 (CU_FILE_DRIVER_NOT_INITIALIZED)`, and
+`hint=` says what to check. cuFile's own log for the dataplane process is in
+`/var/log/cufile/` in the dataplane container.
+
+GB200 and other Grace hosts usually have no `nvidia-fs`, so cuFile reads local
+NVMe over PCI P2PDMA. That needs:
+
+- Linux 6.2 or later and the NVIDIA open kernel module.
+- `RACER_GPU_PCI_P2PDMA` set to `auto` (the default) or `true`.
+- GPU persistence mode on (`nvidia-smi -pm 1`).
+- An ext4 cache filesystem mounted with an explicit `data=ordered` option.
+  ext4 journals in ordered mode by default, but cuFile only accepts the
+  filesystem when the option is in the mount table.
+- No RAID0 or NVMe multipath under the cache filesystem. P2PDMA supports
+  neither.
+
+| Status | Step | Meaning and fix |
+|--------|------|-----------------|
+| 5001 `CU_FILE_DRIVER_NOT_INITIALIZED` | `driver_open` | `nvidia-fs.ko` is not loaded and P2PDMA is off or did not start. Set `RACER_GPU_PCI_P2PDMA` to `auto` or `true`, or install `nvidia-fs`. If P2PDMA is already on, check the kernel version and the open kernel module. |
+| 5008 `CU_FILE_IO_NOT_SUPPORTED` | file registration (`cufile-unsupported`) | The filesystem is not eligible for GPUDirect Storage. Mount ext4 with `data=ordered`, and remove RAID0 or NVMe multipath. |
+| 5009 `CU_FILE_DEVICE_NOT_SUPPORTED`, 5018 `CU_FILE_INVALID_FILE_TYPE` | file registration (`cufile-unsupported`) | cuFile does not support the device or file type. Files on that device are read through host memory. |
+| 5011 `CU_FILE_CUDA_DRIVER_ERROR` | any | A CUDA call inside cuFile failed. See the cuFile log. |
 
 ### Testing on GPUs
 
@@ -2017,11 +2104,30 @@ make racer-gpu-test
 
 This builds `libracer_gpu_cuda.so.1` with its kernels and runs the hardware
 tests in `cmd/racer/gpu/tests/hardware.rs`: shim load, device
-discovery, import of an exported client allocation, GPU decrypt checked
-against the CPU, and cuFile reads. It fails when no GPU is found; pass
-`RACER_GPU_TESTS=1` to skip instead. cuFile tests skip when cuFile cannot open
-or the directory does not support `O_DIRECT` (set `RACER_GPU_TEST_DIR`); set
-`RACER_GPU_TESTS_CUFILE=require` to make that a failure. To also test
+discovery, import of an exported client allocation, copies, fences and
+callbacks, GPU decrypt checked against the CPU, staging dma-buf export,
+copies between two GPUs, and cuFile driver open and reads. It fails when no
+GPU is found; pass `RACER_GPU_TESTS=1` to skip instead. cuFile tests skip when
+cuFile cannot open or the directory does not support `O_DIRECT` (set
+`RACER_GPU_TEST_DIR`); set `RACER_GPU_TESTS_CUFILE=require` to make that a
+failure. One test reruns the cuFile tests with PCI P2PDMA on. The dma-buf and
+two-GPU tests skip without driver support or a second GPU unless
+`RACER_GPU_TESTS_DMABUF` or `RACER_GPU_TESTS_MULTI` is `require`.
+
+Next it runs the dataplane's GPU tests (`gpu::hardware::` in the `racer`
+crate, built with the `cuda` feature) on the real shim: decrypting host and
+disk ciphertext into an exported allocation, requests sharing the executor
+streams, cuFile staging or the reason it is off, staged ciphertext crossing
+GPUs, and a `gpu-read` over the client socket from origin, memory, and disk,
+including its latency metrics. `RACER_GPU_PCI_P2PDMA` resolves as in the
+dataplane.
+
+It then runs the Python tests marked `gpu` in a separate virtual environment
+(`tmp/racer-python-gpu-venv`) with torch from `RACER_TORCH_INDEX` (CUDA 12.8
+wheels by default): Racer GPU allocations, exports, pinned host buffers,
+`read_into_gpu` in each delivery mode against a fake dataplane, and the vLLM
+loader reading safetensors into CUDA and CPU tensors. Without torch with CUDA
+these fail; pass `RACER_GPU_TORCH=1` to skip them instead. To also test
 `gpu-read` end to end from the Python client, set `RACER_GPU_E2E_SOCKET` to a
 running dataplane's client socket and `RACER_GPU_E2E_KEY` to the hex key of an
 object it can serve (`RACER_GPU_E2E_METADATA` and
@@ -2031,7 +2137,9 @@ skipped; set `RACER_GPU_E2E=require` to make it a failure.
 The `racer gpu` workflow (`.github/workflows/racer-gpu.yaml`) runs this target
 nightly and on demand. It runs only when the repository variable
 `RACER_GPU_RUNNER` holds the GPU runner labels as a JSON array, for example
-`["self-hosted", "linux", "gpu"]`.
+`["self-hosted", "linux", "gpu"]`. Set `RACER_GPU_CUFILE=require` on runners
+with GPUDirect Storage and `RACER_GPU_MULTI=require` on runners with two or more
+GPUs so those tests cannot pass by skipping.
 
 See [Load vLLM models from Racer]({{< relref "guides/racer-vllm" >}}).
 

@@ -327,7 +327,8 @@ func dataplaneVolumes(c Config) []corev1.Volume {
 	// database and refuses files it cannot classify.
 	if c.nvidiaMode() != NVIDIAOff {
 		volumes = append(volumes, corev1.Volume{Name: "udev", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/run/udev", Type: ptr.To(corev1.HostPathDirectoryOrCreate)}}})
-		// The root filesystem is read-only, so cuFile writes cufile.log here.
+		// The root filesystem is read-only, so cuFile writes its
+		// cufile_<pid>_<date>.log files here.
 		volumes = append(volumes, corev1.Volume{Name: "cufile-log", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr.To(resource.MustParse(CUFileLogSizeLimit))}}})
 	}
 

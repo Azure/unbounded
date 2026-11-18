@@ -16,7 +16,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define RACER_GPU_ABI_VERSION 3u
+#define RACER_GPU_ABI_VERSION 4u
 
 #define RACER_GPU_OK 0
 #define RACER_GPU_EINVAL (-1)       /* bad argument or handle type */
@@ -200,7 +200,11 @@ int racer_gpu_flush_rdma(void *context, uint32_t scope);
 #define RACER_GPU_FILE_PCI_P2PDMA 1u /* set cuFile use_pci_p2pdma before the driver opens */
 
 /* Open the cuFile driver (libcufile.so.0). Safe to call more than once;
- * `flags` take effect only on the call that opens the driver. */
+ * `flags` take effect only on the call that opens the driver. A failed open
+ * is final, and it and every later call, on any thread, return the same
+ * result: RACER_GPU_EDRIVER with the cuFile status (CUfileOpError) in
+ * racer_gpu_last_driver_error, or RACER_GPU_EUNAVAILABLE when cuFile or a
+ * function it needs is missing. */
 int racer_gpu_file_open(uint32_t flags);
 /* Register an O_DIRECT fd with cuFile. The fd stays owned by the caller. */
 int racer_gpu_file(int fd, void **out);

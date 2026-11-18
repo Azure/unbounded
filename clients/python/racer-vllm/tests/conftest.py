@@ -21,6 +21,9 @@ _fixtures = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_fixtures)
 server = _fixtures.server
 small_pages = _fixtures.small_pages
+gpu = _fixtures.gpu
+real_torch = _fixtures.real_torch
+cuda_torch = _fixtures.cuda_torch
 
 
 def make_safetensors(tensors, metadata=None, pad=0):
@@ -37,29 +40,31 @@ def make_safetensors(tensors, metadata=None, pad=0):
 
 
 class FakeTensor:
-    """Just enough of a torch tensor: bytes in a shared bytearray, a dtype and a shape."""
+    """Just enough of a torch tensor: bytes in a shared bytearray, a dtype, a shape and a device."""
 
-    def __init__(self, buf, off=0, n=None, dtype="uint8", shape=None):
+    def __init__(self, buf, off=0, n=None, dtype="uint8", shape=None, device="cuda:0"):
         self.buf = buf
         self.off = off
         self.n = len(buf) - off if n is None else n
         self.dtype = dtype
         self.shape = (self.n,) if shape is None else tuple(shape)
-        self.device = types.SimpleNamespace(index=0)
+        self.where = device
+        cpu = device in (None, "cpu")
+        self.device = types.SimpleNamespace(type="cpu" if cpu else "cuda", index=None if cpu else 0)
 
     def bytes(self):
         return bytes(self.buf[self.off : self.off + self.n])
 
     def __getitem__(self, s):
-        return FakeTensor(self.buf, self.off + s.start, s.stop - s.start)
+        return FakeTensor(self.buf, self.off + s.start, s.stop - s.start, device=self.where)
 
     def clone(self):
-        return FakeTensor(bytearray(self.bytes()), 0, self.n, self.dtype, self.shape)
+        return FakeTensor(bytearray(self.bytes()), 0, self.n, self.dtype, self.shape, self.where)
 
     def view(self, arg):
         if isinstance(arg, str):
-            return FakeTensor(self.buf, self.off, self.n, arg, self.shape)
-        return FakeTensor(self.buf, self.off, self.n, self.dtype, arg)
+            return FakeTensor(self.buf, self.off, self.n, arg, self.shape, self.where)
+        return FakeTensor(self.buf, self.off, self.n, self.dtype, arg, self.where)
 
     def copy_(self, src):
         if tuple(src.shape) != self.shape:
@@ -71,7 +76,7 @@ class FakeTensor:
         return self
 
     def narrow(self, dim, start, size):  # 1-D uint8 only
-        return FakeTensor(self.buf, self.off + start, size, self.dtype)
+        return FakeTensor(self.buf, self.off + start, size, self.dtype, device=self.where)
 
     def dim(self):
         return len(self.shape)
@@ -122,11 +127,11 @@ class FakeTorch(types.ModuleType):
 
     def empty(self, size, dtype="uint8", device=None):
         if isinstance(size, int):
-            return FakeTensor(bytearray(size), 0, size, dtype)
-        return FakeTensor(bytearray(), 0, 0, dtype, size if math.prod(size) == 0 else (0,))
+            return FakeTensor(bytearray(size), 0, size, dtype, device=device)
+        return FakeTensor(bytearray(), 0, 0, dtype, size if math.prod(size) == 0 else (0,), device)
 
     def frombuffer(self, mv, dtype="uint8"):
-        return FakeTensor(bytearray(mv))
+        return FakeTensor(bytearray(mv), device="cpu")
 
 
 @pytest.fixture

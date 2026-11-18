@@ -73,6 +73,11 @@ def range_reads(server):
     return out
 
 
+def object_key(seen):
+    """The object key hex of a request, such as /v1/objects/<key>/host-read."""
+    return seen.target.removeprefix("/v1/objects/").partition("/")[0]
+
+
 def prefetch_puts(server):
     out = []
     for s in server.seen:
@@ -142,10 +147,28 @@ def test_main(server, uri, tmp_path, monkeypatch, capsys):
     setup_model(server, uri)
     monkeypatch.setenv("RACER_SOCKET", server.path)
     assert rv.main([str(uri), str(tmp_path)]) == 0
-    assert "config.json" in capsys.readouterr().out.split()
+    out, err = capsys.readouterr()
+    assert "config.json" in out.split()
+    assert "weights:" not in out
+    assert "weights: regular layout, 2 files, 0.00 GiB" in err.splitlines()
     assert (tmp_path / rv.MARKER).exists()
     with pytest.raises(SystemExit):
         rv.main([str(uri)])
+
+
+def test_fetch_reports_layout(server, uri, tmp_path):
+    put(server, uri, "config.json", b"{}")
+    info = {}
+    rv.fetch(uri, str(tmp_path / "none"), client=client(server), info=info)
+    assert info == {"layout": "none", "files": 0, "bytes": 0}
+    put_sharded(server, uri)
+    rv.fetch(uri, str(tmp_path / "sharded"), client=client(server), info=info)
+    size = len(server.objects[uri.request("model-rank-0-part-0.safetensors").hex].data)
+    assert info == {"layout": "sharded_state", "files": 4, "bytes": 4 * size}
+    setup_model(server, uri)
+    rv.fetch(uri, str(tmp_path / "regular"), client=client(server), info=info)
+    sizes = [len(server.objects[uri.request(f).hex].data) for f in ("a.safetensors", "b.safetensors")]
+    assert info == {"layout": "regular", "files": 2, "bytes": sum(sizes)}
 
 
 def test_bad_pins_rejected(uri, tmp_path):
@@ -349,7 +372,24 @@ def test_iter_weights_falls_back_from_vmm(server, uri, torch, monkeypatch, caplo
     with caplog.at_level(logging.INFO, logger="vllm.racer_vllm.loader"):
         got = {n: t.bytes() for n, t in rv.iter_weights(c, uri, chunks_for(c, uri), 400, 2)}
     assert got == ALL
-    assert [r for r in caplog.records if "exportable GPU memory unavailable" in r.getMessage()]
+    fallback = [r for r in caplog.records if "exportable GPU memory unavailable" in r.getMessage()]
+    assert len(fallback) == 1 and fallback[0].levelno == logging.WARNING
+    # The underlying error is in the message.
+    assert "RacerError: no VMM" in fallback[0].getMessage()
+
+
+def test_iter_weights_on_cpu(server, uri, torch):
+    setup_model(server, uri)
+    stats = {"reads": dict.fromkeys((racer.GPU, racer.HOST, racer.STREAM), 0)}
+    stats["bytes"] = dict(stats["reads"])
+    c = client(server)
+    got = dict(rv.iter_weights(c, uri, chunks_for(c, uri), 400, 2, stats=stats, tensor_device="cpu"))
+    assert {n: t.bytes() for n, t in got.items()} == ALL
+    assert all(t.device.type == "cpu" for t in got.values())
+    # Each tensor is a copy, so none keeps a staging buffer.
+    assert got["w1"].buf is not got["w2"].buf
+    assert stats["reads"][racer.HOST] >= 2 and stats["reads"][racer.GPU] == 0
+    assert not torch.events
 
 
 def test_iter_weights_counts_reads(server, uri, torch):
@@ -403,7 +443,10 @@ def test_summary():
     text = rv.summary(stats, 2.0, "racer://c/b/p")
     assert "loaded 2 files, 1.50 GiB in 2.00s (0.75 GiB/s) from racer://c/b/p" in text
     assert "gpu=1 (1.00 GiB) host=0 (0.00 GiB) stream=1 (0.50 GiB)" in text
+    assert "skipped" not in text
     assert "(0.00 GiB/s)" in rv.summary(stats, 0.0, "x")
+    stats.update(skipped_tensors=3, skipped_bytes=1 << 31, skipped_files=1)
+    assert rv.summary(stats, 2.0, "x").endswith("; skipped 3 tensors (2.00 GiB) and 1 whole files by tensor selection")
 
 
 # sharded_state
@@ -498,6 +541,12 @@ def install_fake_vllm(monkeypatch, tp_rank=0, tp_size=1):
     class BaseModelLoader:
         def __init__(self, load_config):
             self.load_config = load_config
+
+        def load_model(self, vllm_config, model_config, prefix=""):
+            # As vLLM 0.30 and 0.33: create the model, then load_weights.
+            model = model_config.model_cls()
+            self.load_weights(model, model_config)
+            return model
 
     def register_model_loader(name):
         def wrap(cls):
@@ -777,7 +826,308 @@ def test_loader_sharded_state_reads_only_own_rank(server, uri, torch, monkeypatc
     assert params["w"].bytes() == bytes([rank]) * 4
     assert params["v"].bytes() == bytes([rank + 10]) * 2
     other = {uri.request(f"model-rank-{1 - rank}-part-{p}.safetensors").hex for p in (0, 1)}
-    assert not [s for s in server.seen if s.method == "POST" and s.target.split("/")[-1] in other]
+    assert not [s for s in server.seen if s.method == "POST" and object_key(s) in other]
+
+
+class StateDict:
+    def __init__(self, params):
+        self.params = params
+
+    def state_dict(self):
+        return self.params
+
+
+@pytest.mark.parametrize("sharded", [True, False])
+def test_loader_clones_only_regular_checkpoints(server, uri, torch, monkeypatch, sharded):
+    clones = []
+    real_clone = FakeTensor.clone
+    monkeypatch.setattr(FakeTensor, "clone", lambda self: clones.append(self) or real_clone(self))
+    mc = types.SimpleNamespace(model="/unused", quantization=None)
+    if not sharded:
+        setup_model(server, uri)
+        make_loader(monkeypatch, server, uri=str(uri)).load_weights(Model(), mc)
+        assert clones
+        return
+    put_sharded(server, uri)
+    inst = make_loader(monkeypatch, server, uri=str(uri), sharded_state=True)
+    install_fake_vllm(monkeypatch, tp_rank=1, tp_size=2)
+    params = {"w0": ft(b"\0" * 2), "w1": ft(b"\0" * 2)}
+    inst.load_weights(StateDict(params), mc)
+    assert params["w0"].bytes() == b"\x0a\x0a" and params["w1"].bytes() == b"\x0b\x0b"
+    # load_state copies each view out of staging before the next one, so nothing is cloned,
+    # and every buffer was fenced after those copies before its reuse or release.
+    assert clones == []
+    assert torch.events and all(e.synced for e in torch.events)
+
+
+def test_loader_tensor_device_cpu(server, uri, torch, monkeypatch, caplog):
+    setup_model(server, uri)
+    made = []
+    real_client = racer.Client
+    monkeypatch.setattr(racer, "Client", lambda **kw: made.append(kw) or real_client(**kw))
+    devices = {}
+
+    class Recorder(Model):
+        def load_weights(self, weights):
+            for name, t in weights:
+                devices[name] = t.device.type
+                self.got[name] = t.bytes()
+            return set(self.got)
+
+    inst = make_loader(monkeypatch, server, uri=str(uri), tensor_device="cpu")
+    m = Recorder()
+    with caplog.at_level(logging.INFO, logger="vllm.racer_vllm.loader"):
+        inst.load_weights(m, types.SimpleNamespace(model="/unused", quantization=None))
+    assert m.got == ALL and set(devices.values()) == {"cpu"}
+    loaded = [r.getMessage() for r in caplog.records if "loaded 2 files" in r.getMessage()]
+    assert "gpu=0 (0.00 GiB)" in loaded[0] and "stream=0 (0.00 GiB)" in loaded[0]
+    assert not torch.events
+    # Copies into CPU tensors need no page-locked staging on a GPU.
+    assert made[0]["pin_staging"] is False
+
+
+# Tensor selection and speculative decoding drafts
+
+MTP = {
+    "a.safetensors": [("embed", 300), ("layers.0.w", 50)],
+    "b.safetensors": [("layers.1.w", 200), ("mtp.0.w", 100), ("layers.2.w", 60), ("mtp.0.b", 40)],
+}
+
+
+def setup_mtp(server, uri):
+    """A checkpoint with draft (mtp.*) tensors among the target's. Returns {name: bytes}."""
+    data = {}
+    weight_map = {}
+    for f, tensors in MTP.items():
+        items = []
+        for name, n in tensors:
+            data[name] = bytes([len(data) + 1]) * n
+            weight_map[name] = f
+            items.append((name, "U8", (n,), data[name]))
+        put(server, uri, f, make_safetensors(items))
+    put(server, uri, "config.json", b"{}")
+    put(server, uri, rv.INDEX, json.dumps({"weight_map": weight_map}).encode())
+    return data
+
+
+def tensor_spans(server, uri, f, select):
+    """[start, end) of the tensors in file f that select accepts."""
+    raw = server.objects[uri.request(f).hex].data
+    return [(t.start, t.end) for t in rv.parse_header(raw[8 : 8 + rv.header_length(raw[:8])]) if select(t.name)]
+
+
+def data_reads(server, since=0):
+    """Range reads after the safetensors header reads, as (object key hex, start, end)."""
+    out = []
+    for s, first, last in range_reads(server)[since:]:
+        if first not in (0, 8):
+            out.append((object_key(s), first, last + 1))
+    return out
+
+
+class DSparkDeepseekV4ForCausalLM(Model):
+    """Named as vLLM's DeepSeek-V4 DSpark drafter, which loads only mtp.* tensors."""
+
+
+def model_config(path, cls, names, quantization=None):
+    return types.SimpleNamespace(model=path, quantization=quantization, model_cls=lambda: cls(names))
+
+
+def spec_config(target, draft, **spec):
+    """A VllmConfig with speculative decoding. vLLM 0.30 has no draft_load_config here."""
+    return types.SimpleNamespace(
+        model_config=target, speculative_config=types.SimpleNamespace(draft_model_config=draft, **spec)
+    )
+
+
+def loader_messages(caplog, text):
+    return [r.getMessage() for r in caplog.records if r.name == "vllm.racer_vllm.loader" and text in r.getMessage()]
+
+
+@pytest.mark.parametrize("spec", [{"draft_load_config": None}, {}], ids=["v0.33", "v0.30"])
+def test_dspark_draft_reads_only_mtp_tensors(server, uri, torch, monkeypatch, caplog, spec):
+    data = setup_mtp(server, uri)
+    target_loader = make_loader(monkeypatch, server, uri=str(uri))
+    # vLLM makes a new loader for each model, with the target's load config for the draft.
+    draft_loader = type(target_loader)(target_loader.load_config)
+    target = model_config("/models/m", Model, tuple(data))
+    draft = model_config("/models/m", DSparkDeepseekV4ForCausalLM, ("mtp.0.w", "mtp.0.b"))
+    vc = spec_config(target, draft, **spec)
+    assert target_loader.load_model(vllm_config=vc, model_config=target).got == data
+    before = len(range_reads(server))
+    with caplog.at_level(logging.INFO, logger="vllm.racer_vllm.loader"):
+        m = draft_loader.load_model(vllm_config=vc, model_config=draft)
+    assert m.got == {n: data[n] for n in ("mtp.0.w", "mtp.0.b")}
+    # One read per mtp.* tensor (layers.2.w lies between them), none in a.safetensors.
+    b = uri.request("b.safetensors").hex
+    mtp = tensor_spans(server, uri, "b.safetensors", lambda n: n.startswith("mtp."))
+    assert sorted(data_reads(server, before)) == [(b, start, end) for start, end in mtp]
+    (summary,) = loader_messages(caplog, "racer: loaded")
+    assert "loaded 1 files" in summary
+    assert summary.endswith("; skipped 4 tensors (0.00 GiB) and 1 whole files by tensor selection")
+    assert not loader_messages(caplog, "draft model reads all")
+    # The draft's prefetch ticket covers only the file with draft tensors.
+    _, body = prefetch_puts(server)[-1]
+    assert [r["key"] for r in body["refs"]] == [b]
+
+
+def test_loader_honors_is_unused_checkpoint_weight(server, uri, torch, monkeypatch, caplog):
+    setup_model(server, uri)
+
+    class SkipsW3(Model):
+        def is_unused_checkpoint_weight(self, name):
+            return name == "w3"
+
+    m = SkipsW3(("w1", "w2", "w4"))
+    with caplog.at_level(logging.INFO, logger="vllm.racer_vllm.loader"):
+        make_loader(monkeypatch, server, uri=str(uri)).load_weights(m, model_config("/unused", Model, ()))
+    assert m.got == {n: ALL[n] for n in ("w1", "w2", "w4")}
+    assert not [r for r in data_reads(server) if r[2] - r[1] == len(ALL["w3"])]
+    (summary,) = loader_messages(caplog, "racer: loaded")
+    assert "loaded 2 files" in summary and "skipped 1 tensors (0.00 GiB) and 0 whole files" in summary
+
+
+@pytest.mark.parametrize(
+    "extra,names",
+    [
+        ({"tensor_include": ["^w[12]$"]}, ("w1", "w2")),
+        ({"tensor_exclude": ["^w[34]$"]}, ("w1", "w2")),
+        ({"tensor_include": "w", "tensor_exclude": ["1", "4"]}, ("w2", "w3")),
+        ({"tensor_include": ["w4"]}, ("w4",)),
+    ],
+)
+def test_loader_tensor_include_and_exclude(server, uri, torch, monkeypatch, extra, names):
+    setup_model(server, uri)
+    m = Model(names)
+    make_loader(monkeypatch, server, uri=str(uri), **extra).load_weights(m, model_config("/unused", Model, ()))
+    assert m.got == {n: ALL[n] for n in names}
+    read = sum(end - start for _, start, end in data_reads(server))
+    assert read == sum(len(ALL[n]) for n in names)
+    if not {"w1", "w2"} & set(names):
+        assert not [r for r in data_reads(server) if r[0] == uri.request("a.safetensors").hex]
+
+
+def test_loader_rejects_selection_that_skips_everything(server, uri, torch, monkeypatch):
+    setup_model(server, uri)
+    inst = make_loader(monkeypatch, server, uri=str(uri), tensor_include=["^nothing$"])
+    with pytest.raises(ValueError, match="skips every tensor"):
+        inst.load_weights(Model(), model_config("/unused", Model, ()))
+    assert not data_reads(server)
+
+
+def test_tensor_filter_without_rules_reads_everything():
+    assert rv.tensor_filter([], [], Model(), draft=False) is None
+    assert rv.tensor_filter([], [], Model(), draft=True) is None
+    # The DSpark rule is for drafts only.
+    assert rv.tensor_filter([], [], DSparkDeepseekV4ForCausalLM(()), draft=False) is None
+    select = rv.tensor_filter([], [], DSparkDeepseekV4ForCausalLM(()), draft=True)
+    assert select("mtp.0.attn.wkv.weight") and not select("model.layers.0.attn.wkv.weight")
+
+
+def test_draft_without_a_rule_warns_about_duplicate_reads(server, uri, torch, monkeypatch, caplog):
+    data = setup_mtp(server, uri)
+    inst = make_loader(monkeypatch, server, uri=str(uri))
+    target = model_config("/models/m", Model, tuple(data))
+    draft = model_config("/models/m", Model, tuple(data))
+    vc = spec_config(target, draft, draft_load_config=None)
+    with caplog.at_level(logging.WARNING, logger="vllm.racer_vllm.loader"):
+        type(inst)(inst.load_config).load_model(vllm_config=vc, model_config=target)
+        assert not loader_messages(caplog, "draft")
+        type(inst)(inst.load_config).load_model(vllm_config=vc, model_config=draft)
+    (warning,) = loader_messages(caplog, "draft model reads all")
+    size = sum(len(server.objects[uri.request(f).hex].data) for f in MTP)
+    assert f"all {size / (1 << 30):.2f} GiB of {uri}" in warning
+    assert "tensor_include or tensor_exclude" in warning and "draft_load_config in --speculative-config" in warning
+    # A selection for the draft silences it.
+    caplog.clear()
+    picky = make_loader(monkeypatch, server, uri=str(uri), tensor_include=["^mtp\\."])
+    with caplog.at_level(logging.WARNING, logger="vllm.racer_vllm.loader"):
+        m = picky.load_model(vllm_config=vc, model_config=model_config("/models/m", Model, ("mtp.0.w", "mtp.0.b")))
+    assert set(m.got) == {"mtp.0.w", "mtp.0.b"}
+    assert not loader_messages(caplog, "draft model reads all")
+
+
+@pytest.mark.parametrize("spec", [{}, {"draft_load_config": "set"}], ids=["inherited", "own"])
+def test_draft_uri(server, uri, torch, monkeypatch, tmp_path, caplog, spec):
+    setup_model(server, uri)
+    draft_uri = rv.parse_uri("racer://cache1/models/org/draft")
+    put(server, draft_uri, "config.json", b"{}")
+    put(server, draft_uri, rv.SINGLE, make_safetensors([("d", "U8", (4,), b"dddd")]))
+    target = model_config("/models/target", Model, tuple(ALL))
+    if spec:
+        # draft_load_config is set, so its uri is the draft's own.
+        inst = make_loader(monkeypatch, server, uri=str(draft_uri))
+        draft = model_config("/models/draft", Model, ("d",))
+    else:
+        # The inherited uri is the target's; the draft directory has its own marker.
+        rv.fetch(draft_uri, str(tmp_path), client=client(server))
+        inst = make_loader(monkeypatch, server, uri=str(uri))
+        draft = model_config(str(tmp_path), Model, ("d",))
+    with caplog.at_level(logging.WARNING, logger="vllm.racer_vllm.loader"):
+        m = inst.load_model(vllm_config=spec_config(target, draft, **spec), model_config=draft)
+    assert m.got == {"d": b"dddd"}
+    target_keys = {uri.request(f).hex for f in ("a.safetensors", "b.safetensors", rv.INDEX)}
+    assert not [s for s in server.seen if object_key(s) in target_keys]
+    assert not loader_messages(caplog, "draft model reads all")
+
+
+@pytest.mark.parametrize("spec", [{"draft_load_config": None}, {}], ids=["v0.33", "v0.30"])
+def test_sharded_state_draft_needs_its_own_load_config(server, uri, torch, monkeypatch, spec):
+    put_sharded(server, uri)
+    inst = make_loader(monkeypatch, server, uri=str(uri), sharded_state=True)
+    install_fake_vllm(monkeypatch, tp_rank=0, tp_size=2)
+    target = model_config("/models/m", Model, ())
+    draft = model_config("/models/m", Model, ())
+    with pytest.raises(ValueError, match="draft_load_config in --speculative-config.*sharded_state"):
+        inst.load_model(vllm_config=spec_config(target, draft, **spec), model_config=draft)
+    assert not range_reads(server)
+
+
+def test_load_model_without_speculative_config(server, uri, torch, monkeypatch):
+    setup_model(server, uri)
+    inst = make_loader(monkeypatch, server, uri=str(uri))
+    target = model_config("/models/m", Model, tuple(ALL))
+    assert inst.load_model(vllm_config=types.SimpleNamespace(model_config=target), model_config=target).got == ALL
+    assert not inst.draft
+
+
+# Tensor parallelism
+
+
+@pytest.mark.parametrize("tp_size,sharded,warns", [(2, False, True), (1, False, False), (2, True, False)])
+def test_loader_warns_about_tp_read_amplification(server, uri, torch, monkeypatch, caplog, tp_size, sharded, warns):
+    monkeypatch.setattr(rv, "_tp_warned", False)
+    if sharded:
+        put_sharded(server, uri)
+    else:
+        setup_model(server, uri)
+    inst = make_loader(monkeypatch, server, uri=str(uri), sharded_state=sharded)
+    install_fake_vllm(monkeypatch, tp_rank=0, tp_size=tp_size)
+    mc = types.SimpleNamespace(model="/unused", quantization=None)
+    with caplog.at_level(logging.WARNING, logger="vllm.racer_vllm.loader"):
+        for _ in range(2):
+            inst.load_weights(StateDict({"w0": ft(b"\0" * 2), "w1": ft(b"\0" * 2)}) if sharded else Model(), mc)
+    messages = loader_messages(caplog, "regular checkpoint")
+    if not warns:
+        assert messages == []
+        return
+    # Once per process.
+    (message,) = messages
+    assert "tensor_parallel_size=2" in message and "sharded_state" in message and rv.SHARDED_STATE_SCRIPT in message
+
+
+def test_warn_tp_sizes(monkeypatch, caplog):
+    monkeypatch.setattr(rv, "_tp_warned", False)
+    with caplog.at_level(logging.WARNING, logger="vllm.racer_vllm.loader"):
+        rv.warn_tp(4, round(475.24 * (1 << 30)))
+    (message,) = loader_messages(caplog, "regular checkpoint")
+    assert "every rank reads all 475.24 GiB, so the node reads 1.86 TiB" in message
+    assert "cache hits but still cost client, dataplane and PCIe work" in message
+
+
+def test_tp_size_outside_vllm(monkeypatch):
+    monkeypatch.setitem(sys.modules, "vllm.distributed", None)
+    assert rv._tp_size() == 1
 
 
 def test_settings():
@@ -804,6 +1154,17 @@ def test_settings():
             rv.settings({"prefetch_ttl_seconds": bad})
     with pytest.raises(ValueError, match="prefetch_ttl_seconds"):
         rv.settings({"prefetch_ttl_seconds": -1})
+    assert s["tensor_device"] == "cuda" and s["tensor_include"] == [] and s["tensor_exclude"] == []
+    assert rv.settings({"tensor_device": "cpu"})["tensor_device"] == "cpu"
+    for bad in ("gpu", "CUDA", "cuda:0", None):
+        with pytest.raises(ValueError, match="tensor_device"):
+            rv.settings({"tensor_device": bad})
+    s = rv.settings({"tensor_include": ["^mtp\\.", "norm"], "tensor_exclude": "bias$"})
+    assert [p.pattern for p in s["tensor_include"]] == ["^mtp\\.", "norm"]
+    assert [p.pattern for p in s["tensor_exclude"]] == ["bias$"]
+    for bad in ("(", ["ok", "["], [1], {"a": 1}):
+        with pytest.raises(ValueError, match="tensor_include"):
+            rv.settings({"tensor_include": bad})
 
 
 # Packaging

@@ -201,8 +201,11 @@ open flavor supports Turing and later GPUs only.
   images do not install `nvidia-fs`; its repository has no package for it.
   The Ubuntu NVSwitch host image does not install it either; see
   [GPUDirect Storage]({{< relref "reference/gpu/nvswitch-host-image#gpudirect-storage" >}}).
-  cuFile uses P2PDMA only when asked: for Racer, set
-  `RACER_GPU_PCI_P2PDMA=true` in `racer-settings`.
+  cuFile uses P2PDMA only when asked. Racer asks by default when the node has
+  no `nvidia-fs*` device (`RACER_GPU_PCI_P2PDMA=auto` in `racer-settings`);
+  `true` always asks. On GB200 also mount an ext4 cache filesystem with an
+  explicit `data=ordered` option; see
+  [cuFile troubleshooting]({{< relref "reference/racer#cufile-troubleshooting" >}}).
 
 On Ubuntu Azure VMs, `hack/agent/azure-gpu-vm/install-nvidia-drivers.sh`
 installs `nvidia-fs` when you pass `--gds`:

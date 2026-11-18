@@ -725,8 +725,20 @@ impl Responses {
             .unwrap_or(u64::MAX)
         };
         let delivery = kind.direct().ok_or(Error::Internal)?;
-        // Stage timings are for host-read only; gpu-read shares this path.
-        let host = matches!(delivery, racer_wire::object::client::DirectDelivery::Host);
+        let (first_page_ns, first_page_count, request_ns, request_count) = match delivery {
+            racer_wire::object::client::DirectDelivery::Host => (
+                Event::HostReadFirstPageNs,
+                Event::HostReadFirstPageCount,
+                Event::HostReadRequestNs,
+                Event::HostReadRequestCount,
+            ),
+            racer_wire::object::client::DirectDelivery::Gpu => (
+                Event::GpuReadFirstPageNs,
+                Event::GpuReadFirstPageCount,
+                Event::GpuReadRequestNs,
+                Event::GpuReadRequestCount,
+            ),
+        };
         let destination = kind.destination().ok_or(Error::Internal)?;
         let head = racer_wire::object::client::direct_head(
             &response.metadata,
@@ -758,9 +770,9 @@ impl Responses {
         } else {
             None
         };
-        if host && first.is_some() {
-            observation.add(Event::HostReadFirstPageNs, elapsed(started));
-            observation.add(Event::HostReadFirstPageCount, 1);
+        if first.is_some() {
+            observation.add(first_page_ns, elapsed(started));
+            observation.add(first_page_count, 1);
         }
         connection.poison();
         connection = self.io.send_head(connection, head, scope).await?.connection;
@@ -941,10 +953,8 @@ impl Responses {
         connection =
             send_frame(&self.io, connection, frame(2, pages, sent, 0), &final_scope).await?;
         observation.success();
-        if host {
-            observation.add(Event::HostReadRequestNs, elapsed(started));
-            observation.add(Event::HostReadRequestCount, 1);
-        }
+        observation.add(request_ns, elapsed(started));
+        observation.add(request_count, 1);
         Ok(connection)
     }
 
