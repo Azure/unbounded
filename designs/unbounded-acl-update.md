@@ -10,206 +10,123 @@
 
 ## 1. Summary
 
-ACL nodes update their operating system with an A/B update: the node keeps two
-copies of the OS, writes the new version into the copy it isn't using, and
-restarts into it. A program on each ACL node, `trident-acl-agent`, performs the
-update when it is asked to through annotations on the node's Kubernetes Node
-object.
+ACL nodes update with an A/B update: the node writes the new OS into the copy
+it isn't using, restarts into it, and keeps it if it boots. On each node,
+`trident-acl-agent` runs the update when asked through annotations on the
+node's Node object. Something in the cluster has to decide when each node
+updates, and ask it. This document proposes that piece:
 
-Something in the cluster has to decide when each node updates, and ask it to.
-This document proposes that piece:
+1. `unbounded-acl-update`, a service in the cluster. For each ACL node, it asks
+   Nebraska, the update server ACL uses, whether a new version is ready. When
+   one is, it moves the node's workloads elsewhere, asks the agent to install
+   the version, and checks that the node came back running it.
+2. `unbounded-acl-update-node-info`, a small temporary DaemonSet that publishes
+   two facts about each node the service needs, until Trident provides them.
 
-1. `unbounded-acl-update`, one service in the cluster. For each ACL node, it
-   asks Nebraska, the update server ACL uses, whether a new version is ready
-   for that node. When one is, it moves the node's workloads to other nodes,
-   asks the node's agent to install the new version, and checks that the node
-   came back running it.
-2. `unbounded-acl-update-node-info`, a small temporary DaemonSet. It publishes
-   two facts about each node that the service needs, until `trident-acl-agent`
-   publishes them itself.
-
-The service never takes more than a set number of nodes in the cluster out of
-service at once, one by default, so workloads always have somewhere to run. It
-moves workloads with the same rules as `kubectl drain`, checks that a node can
-be drained before starting its update, and pauses an update whose drain is
-blocked rather than forcing pods off the node. Nebraska decides which version
-nodes get, and how fast the whole fleet moves. When an update fails, the
-service stops updating the cluster and waits for a person.
+The service limits how many nodes in each Site update at once, drains nodes
+with `kubectl drain`'s rules, and makes sure every update it starts in Nebraska
+either finishes or is ended before Nebraska would count it as timed out.
+Nebraska decides which version nodes get and how fast the fleet moves. When an
+update fails, the service stops updating the cluster until a person looks.
 
 ## 2. Background
 
-### 2.1 Words used in this document
+### 2.1 How an ACL node updates
 
-- **ACL**: Azure Container Linux, an OS image whose `/usr` is read-only.
-- **A/B update**: an update that writes the new OS into a second copy (slot A
-  or B), restarts into it, and keeps it only if it boots.
-- **Trident**: the program on ACL that writes OS images to disk and switches
-  between the two copies.
-- **`trident-acl-agent`**: runs on each ACL host. It watches its Node object for
-  update requests and runs Trident.
-- **Nebraska**: an update server from the Flatcar project
-  ([flatcar/nebraska](https://github.com/flatcar/nebraska)). It knows which OS
-  versions exist and decides which machines may update now.
-- **Update check**: a message a machine sends Nebraska that says who it is,
-  which version it runs, and which track it follows, and asks for an update.
-  Nebraska answers "no update" or describes an update to download. The format
-  is the Omaha protocol.
-- **Track and group**: a machine names a track in its update check. Nebraska
-  maps the track to a group. Each group points at one version and has rollout
-  settings, such as how many machines may update at a time.
-- **Grant**: when Nebraska answers an update check with an update, it records
-  that this machine is now updating. This is a grant.
-- **Instance ID**: the ID a machine sends in its update checks. Nebraska keeps
-  its records per instance ID.
-- **Cordon**: mark a node so that Kubernetes schedules no new pods on it.
-- **Drain**: move a node's pods to other nodes, by asking Kubernetes to evict
-  them one at a time.
-- **PodDisruptionBudget**: a rule an application sets, such as "keep at least 2
-  of my pods running". Kubernetes refuses an eviction that would break it.
-- **Place**: in this document, one of the slots that limit how many nodes the
-  service updates at once (section 7).
-- **nspawn machine**: on Unbounded ACL nodes, kubelet and its pods run inside a
-  container on the host, started with `systemd-nspawn`. Pods see that
-  container's files, not the host's.
+`trident-acl-agent` reads one annotation on its Node and writes two, all under
+a prefix set on the node
+([Trident's annotation contract](https://github.com/microsoft/trident/blob/main/docs/Explanation/Trident-ACL-Agent.md#the-annotation-contract)):
 
-### 2.2 How an ACL node updates
+1. `update-request`, written by the orchestrator, asks for `stage` (download the
+   target version into the unused copy) or `finalize` (restart into it).
+2. `update-status` reports the result of each request.
+3. `update-commit-status` reports, after the restart, whether the node is
+   running the new copy. The agent confirms this commit on its own.
 
-`trident-acl-agent` reads and writes three annotations on its Node, all under
-one prefix that is configured on the node
-([the annotation contract](https://github.com/microsoft/trident/blob/main/docs/Explanation/Trident-ACL-Agent.md#the-annotation-contract)):
+A request names the target version and the Nebraska server, app ID, and track
+to get it from. `nodeUpdateId` stays the same for one update's `stage`,
+`finalize`, and commit; `operationId` is new for each request.
 
-- `update-request`: written by whoever drives the update. It asks for
-  `stage`, `finalize`, or `rollback`.
-- `update-status`: written by the agent. It reports how the request went.
-- `update-commit-status`: written by the agent after the restart. It reports
-  whether the node is running the new version.
+### 2.2 How Nebraska grants updates
 
-An update goes like this:
+A machine sends Nebraska an update check: its instance ID, its current version,
+and a track, which Nebraska maps to a group. Each group follows a channel that
+points at a version, and has rollout settings (Nebraska's
+`backend/pkg/api/runtime/updates.go`, `GetUpdatePackage`):
 
-1. The driver writes a `stage` request. It names the target version and the
-   Nebraska server, app ID, and track to get it from.
-2. The agent sends Nebraska an update check, and makes sure the version offered
-   is the target version.
-3. The agent downloads the image and writes it into the unused copy. It reports
-   `Success` in `update-status`.
-4. The driver writes a `finalize` request for the same update.
-5. The agent tells Trident to start from the new copy next time, reports
-   `Success`, and restarts the node.
-6. After the restart, the agent confirms the node started from the new copy.
-   Trident calls this commit. The agent reports `Success` in
-   `update-commit-status`.
-7. The agent tells Nebraska the update is complete.
+1. **A check is a grant.** If the group's version is newer and its settings
+   allow it, Nebraska answers with the update and records a grant for that
+   instance. The grant counts against the group's limit until the machine
+   reports the update finished or failed.
+2. **A repeat check while granted** gets an update again, without using
+   another slot of the group's limit. But Nebraska works out the version again
+   from the group's current channel, so if the channel changed in between, the
+   repeat check gets the new version.
+3. **Once the machine reports download progress**, Nebraska answers further
+   checks with "update in progress" until the machine reports the update
+   finished or failed.
+4. **Floors.** If the channel has floor versions, a grant is the next floor
+   above the machine's version, not the channel's version. Reaching the
+   channel's version can take several updates.
+5. **Timeouts.** A grant that stays open longer than the group's update timeout
+   counts as timed out. In safe mode, enough timeouts turn updates off for the
+   whole group, in every cluster that uses it.
+6. **Versions must be semver.** Nebraska refuses a check whose version isn't
+   valid semver, and `trident-acl-agent` reports a version it can't parse as
+   `0.0.0`, which is always offered an update. Semver ignores build metadata
+   when comparing, so the part that changes with each build must be in the
+   main version or the prerelease, not after a `+`.
 
-```mermaid
-sequenceDiagram
-    participant Driver
-    participant API as Kubernetes API
-    participant Agent as trident-acl-agent
-    participant Nebraska
-    participant Trident
+So anyone who sends a check on a node's behalf must send exactly what the
+node's agent sends, and must act on a grant right away.
 
-    Driver->>API: 1. write stage request (target version)
-    API-->>Agent: the agent sees the request
-    Agent->>Nebraska: 2. update check
-    Nebraska-->>Agent: the update, with its download address
-    Agent->>Trident: 3. write the new image into the unused copy
-    Agent->>API: update-status: stage Success
-    Driver->>API: 4. write finalize request
-    Agent->>Trident: 5. start from the new copy next time
-    Agent->>API: update-status: finalize Success
-    Note over Agent,Trident: the node restarts
-    Agent->>Trident: 6. commit
-    Agent->>API: update-commit-status: Success
-    Agent->>Nebraska: 7. update complete
-```
-
-Trident leaves the driver to the cluster. Nothing in Unbounded drives these
-annotations today. This document adds the driver.
-
-### 2.3 How Nebraska decides which machines update
-
-1. A machine sends an update check with its instance ID, its current version,
-   and its track.
-2. Nebraska finds the group for the track. If the group's version is newer than
-   the machine's, and the group's rollout settings allow it, Nebraska answers
-   with the update and records a grant for that instance.
-3. The grant counts against the group's limit until the machine reports the
-   update complete, or until the group's update timeout passes. In safe mode,
-   too many timed-out grants turn updates off for the whole group.
-4. If the same instance asks again while its grant is open, Nebraska answers
-   with the same update. It doesn't count it twice or check the settings
-   again.
-
-So the update check is what grants the update. Two things follow for anyone
-who sends an update check on a node's behalf:
-
-- It must send exactly what the node's agent sends: the same instance ID,
-  version, track, and architecture. Otherwise Nebraska sees a second machine,
-  and gives it a grant that never finishes.
-- It must start the update right away after a grant, and finish it before the
-  group's update timeout. A grant left waiting uses up the group's limit, and
-  ends as a timeout.
-
-The details are in Nebraska's `backend/pkg/api/runtime/updates.go`
-(`GetUpdatePackage`).
-
-### 2.4 What testing showed
+### 2.3 What testing showed
 
 The ACL update harness in AKSFlexNode
-([Azure/AKSFlexNode#462](https://github.com/Azure/AKSFlexNode/pull/462),
-`hack/acl-abupdate`) drives updates through `trident-acl-agent` with a test
-Nebraska. These findings shape this design:
+([Azure/AKSFlexNode#462](https://github.com/Azure/AKSFlexNode/pull/462)) drives
+updates through `trident-acl-agent` with a test Nebraska:
 
 1. The agent's instance ID is the first 16 bytes of the SHA-384 hash of the
-   host's `/etc/machine-id`, written as a UUID
-   (`crates/osutils/src/machine_id.rs` in Trident). The harness confirmed it on
-   a test node.
-2. The agent ignores a request it can't parse, and writes no status for it
+   host's `/etc/machine-id`, written as a UUID (`crates/osutils/src/machine_id.rs`
+   in Trident). It stays the same across the A/B switch: the agent's checks
+   before and after the restart came from the same ID, since both copies share
+   the root partition.
+2. The agent writes no status for a request it can't parse, including one with
+   a field the protocol doesn't define
    ([microsoft/trident#957](https://github.com/microsoft/trident/issues/957)).
-   That includes a request with any field the protocol doesn't define. The
-   driver must write requests exactly to the schema, and must notice when no
-   status appears.
 3. If the node falls back to the old copy during the restart, the agent still
-   reports the commit as a success
+   reports the commit as a success, and tells Nebraska the update finished
    ([microsoft/trident#956](https://github.com/microsoft/trident/issues/956)).
-   The driver should check which version the node actually runs.
 4. ACL's `VERSION_ID`, such as `3.0.20261104`, can be the same for two builds,
-   so it can't be the version Nebraska compares. ACL images need a version
-   that is different for every build.
-5. On Unbounded ACL nodes, pods run inside the nspawn machine. They can't read
-   the host's `/etc/machine-id` or `/etc/os-release`.
+   so it can't be the version Nebraska compares.
+5. On Unbounded ACL nodes, kubelet and pods run inside an nspawn machine, so
+   pods can't read the host's `/etc/machine-id` or `/etc/os-release`.
 
-## 3. Goals
+## 3. Goals and non-goals
+
+Goals:
 
 1. Update ACL nodes automatically when Nebraska has a newer version for them.
-2. Never take more than a set number of the cluster's nodes out of service at
-   once, and move workloads off a node before it restarts, without breaking a
-   PodDisruptionBudget.
-3. Let Nebraska decide which version nodes get, and how fast the whole fleet
-   moves.
-4. Never create extra Nebraska instances, or grants that a node won't use.
-5. Notice failed updates, missing statuses, and nodes that don't come back, and
-   stop the cluster's updates for a person.
-6. Keep all state on the Node objects, so the service can restart at any time.
+2. Limit how many nodes in a Site update at once, and move workloads off a node
+   before it restarts, without breaking a PodDisruptionBudget.
+3. Let Nebraska decide which version nodes get, and how fast the fleet moves.
+4. End every grant the service starts: finished, or reported failed, before
+   Nebraska's timeout. Never create extra Nebraska instances.
+5. Notice failed updates, and stop the cluster's updates until a person looks.
 
-## 4. Not in the first version
+Not in the first version: maintenance windows beyond Nebraska's office hours,
+rolling back automatically, and choosing versions.
 
-1. Maintenance windows, beyond Nebraska's office hours setting.
-2. Separate limits per node pool or zone. The first version has one limit for
-   all the nodes it manages.
-3. Rolling back automatically.
-4. Choosing versions. Nebraska decides which version each group gets.
-5. Replacing, or depending on, the HostUpgrade design
-   ([host-upgrade.md](host-upgrade.md)). See section 17.
+## 4. Design
 
-## 5. Overview
+### 4.1 Parts
 
 ```mermaid
 flowchart TB
     Nebraska[("Nebraska")]
     subgraph cluster["Kubernetes cluster"]
         Service["unbounded-acl-update<br/>2 replicas, 1 active"]
-        API[("Kubernetes API<br/>Node objects")]
+        API[("Kubernetes API<br/>Nodes and Machines")]
     end
     subgraph aclnode["Each ACL node"]
         Agent["trident-acl-agent<br/>on the host"]
@@ -218,55 +135,68 @@ flowchart TB
     end
 
     Service -->|"1. update check, as the node"| Nebraska
-    Service -->|"2. cordon, drain, update request"| API
+    Service -->|"2. taint, drain, update request"| API
     API -->|"3. the agent reads the request"| Agent
     Agent -->|"4. update check, download"| Nebraska
     Agent -->|"5. stage, finalize, commit"| Trident
     Agent -->|"6. statuses, agent-info"| API
-    Info -.->|"agent-info, until the agent writes it"| API
+    Info -.->|"agent-info, until Trident provides it"| API
 ```
 
-There are three parts:
+1. **`unbounded-acl-update`** is an operator component, enabled per Site
+   through `Site.Spec.Components`, like token-refresher. It runs as a
+   Deployment in `unbounded-system` with two replicas, one active through
+   leader election, and reads its settings from the Site.
+2. **`trident-acl-agent`** ships with ACL and runs on each host. Unbounded's
+   host agent configures it (section 5).
+3. **`unbounded-acl-update-node-info`** is a temporary DaemonSet (section 4.3).
 
-1. **`unbounded-acl-update`** is a Deployment in `unbounded-system` with two
-   replicas. Leader election keeps one active. It watches the Nodes that carry
-   its `managed` label. It decides which of them may update now, sends their
-   update checks to Nebraska, moves their workloads, and writes their update
-   requests.
-2. **`trident-acl-agent`** ships with ACL and runs on each host. Unbounded
-   configures it (section 15).
-3. **`unbounded-acl-update-node-info`** is a temporary DaemonSet that writes
-   each node's `agent-info` annotation (section 6).
+This design covers ACL nodes that run kubelet in an nspawn machine, Unbounded's
+default and what its ACL tests run. Unbounded also documents `container`
+isolation for ACL. In that mode, the host's files in section 4.3 are mounted
+into the node stack's container instead, and graceful node shutdown
+(section 4.6) needs checking there too.
 
-### 5.1 Who controls what
+| Who | Controls |
+|---|---|
+| The service | How many nodes in each Site update at once, moving workloads first, and stopping after a failure. |
+| Nebraska | Which version each group gets, in which order groups get it, the pace across the fleet, and pausing. |
 
-| Control | Who | Why |
-|---|---|---|
-| How many of the cluster's nodes are out of service at once | the service: a limit, one node by default (section 7) | Workloads always have somewhere to run, however Nebraska is set up. |
-| Moving workloads off a node before it restarts | the service: cordon, then drain with `kubectl drain`'s rules (section 9.1) | Pods move first, within their PodDisruptionBudgets. |
-| Stopping after a failure | the service (section 10) | One failed node stops updates in this cluster until a person looks. |
-| Which version, in which order of groups, at what pace across the fleet, and pausing | Nebraska | Releases are managed in one place, across every cluster. |
+### 4.2 Update slots
 
-### 5.2 Where the code would live
+1. Each Site has `maxUnavailable` update slots: a number or a percentage of its
+   managed nodes, one by default. A node takes a slot just before its update
+   check, and keeps it until its update ends.
+2. Nodes already unavailable for other reasons use slots too, each counted
+   once: nodes that are not Ready, nodes someone else cordoned, and nodes whose
+   Machine has an unfinished MachineOperation or is being rebuilt.
+3. While any managed node is held after a failure, no slots are given out in
+   the cluster.
+4. Among the nodes due for a check, nodes labeled canary go first, then the
+   node checked longest ago.
 
-| Part | Where | Follows |
-|---|---|---|
-| Service and DaemonSet binary | `cmd/unbounded-acl-update`, with `controller` and `node-info` subcommands | `cmd/token-refresher` (leader election with controller-runtime) |
-| Shared code | `internal/aclupdate/...` | |
-| Manifests | `deploy/acl-update/` | `deploy/token-refresher/`, `deploy/net/node/` |
-| Admission policies | `deploy/acl-update/` | `deploy/net/controller/09-vap.yaml.tmpl` |
-| Image | `images/unbounded-acl-update/` | `images/token-refresher/` |
+```mermaid
+flowchart TB
+    Start(["a slot frees, or a node is due"]) --> Held{"any node held?"}
+    Held -->|yes| Wait(["give out no slots"])
+    Held -->|no| Count["free slots in the node's Site:<br/>maxUnavailable, minus nodes unavailable"]
+    Count --> Free{"a free slot?"}
+    Free -->|no| Wait2(["wait"])
+    Free -->|yes| Pick["give it to the next due node:<br/>canary nodes first"]
+    Pick --> Check["drain check, then update check (section 4.4)"]
+```
 
-## 6. Node information: `agent-info`
+A node takes its slot *before* the update check because the check is the grant
+(section 2.2). A node granted an update and then left waiting for a slot would
+keep the grant open until it timed out. When Nebraska has nothing new, the node
+gives the slot back at once, so a pass through the cluster with no update is a
+series of quick checks.
 
-The service sends update checks as each node, so it needs two facts that only
-the host knows:
+### 4.3 Node identity
 
-1. The node's Nebraska instance ID.
-2. The version the agent reports to Nebraska.
-
-They go in one annotation on the Node,
-`acl-update.unbounded-cloud.io/agent-info`:
+The service sends update checks as each node, so it needs two facts only the
+host knows: the node's Nebraska instance ID, and the version the agent reports.
+They are in one annotation on the Node, `acl-update.unbounded-cloud.io/agent-info`:
 
 ```json
 {
@@ -276,199 +206,51 @@ They go in one annotation on the Node,
 }
 ```
 
-The rules:
+1. `machineId` is the ID the agent sends Nebraska. The service can't use the
+   Node's `status.nodeInfo.machineID`: kubelet reads that inside the nspawn
+   machine, which has its own `/etc/machine-id`.
+2. `currentVersion` is the version the agent sends Nebraska, read from the
+   running OS, and is left out if the agent couldn't read one. The service
+   checks nothing for a node without it.
+3. It is written when the node starts, and again when the values change.
 
-1. It's written when the agent starts, before the agent finishes an update that
-   was waiting for the restart. So by the time a commit status appears,
-   `agent-info` describes the new boot.
-2. `machineId` is the ID the agent sends to Nebraska, the hash, not the raw
-   `/etc/machine-id`. systemd says to keep the raw ID private.
-3. `currentVersion` is exactly the version the agent sends to Nebraska, read
-   from the running OS. If the agent couldn't read it and would fall back to a
-   placeholder, the field is left out, and the service doesn't send update
-   checks for that node.
+Until Trident provides these (section 5), the DaemonSet writes the same
+annotation. Unbounded's host agent mounts the host's `/etc/machine-id` and
+`/etc/os-release` read-only into the nspawn machine at their own paths, under
+`/run/unbounded/host/`, not over the machine's own files. The DaemonSet's pod reads them,
+computes the ID the way the agent does, and reads the version with the agent's
+settings (`TRIDENT_ACL_AGENT_CURRENT_VERSION_PATH` and `_KEY`). After a
+restart, the pod may write the new version after the agent reports the commit,
+so the service waits for it rather than reading it once.
 
-The service gets everything else it needs from the Node itself:
+### 4.4 An update, step by step
 
-- The architecture, from the `kubernetes.io/arch` label. `arm64` is sent to
-  Nebraska as `aarch64`, as the agent does.
-- Whether the node restarted, from `status.nodeInfo.bootID`.
-- The agent's version, from `tridentVersion` in its status annotations.
-
-### 6.1 Until the agent writes it
-
-Writing `agent-info` is a change to `trident-acl-agent`, which we need to agree
-with the Trident team. Until it ships, the `node-info` DaemonSet writes the same
-annotation:
-
-1. Unbounded's host agent makes the host's `/etc/machine-id` and
-   `/etc/os-release` readable, read-only, inside the nspawn machine.
-2. The DaemonSet's pod reads both files through `hostPath` volumes.
-3. It computes the instance ID the same way the agent does: the SHA-384 hash of
-   the 16 bytes of the machine ID, cut to 16 bytes, written as a UUID.
-4. It reads the version with the same settings the agent uses
-   (`TRIDENT_ACL_AGENT_CURRENT_VERSION_PATH` and `_KEY`), which it gets from a
-   ConfigMap.
-5. It writes `agent-info` when it starts, and again whenever the values change.
-
-The DaemonSet and the agent read the same files the same way, so they write
-the same annotation. One difference: after a restart, the DaemonSet's pod may
-start after the agent has already reported the commit. So the service waits
-for `agent-info` to show the new version, rather than reading it once
-(section 9). Once the agent writes `agent-info` itself, we stop deploying the
-DaemonSet, and the service doesn't change.
-
-## 7. How many nodes update at once
-
-Updating a node takes it out of service: its pods move away, and it restarts.
-If many nodes did that at once, their workloads would have nowhere to run. So
-the service limits it in the cluster, whatever Nebraska allows.
-
-### 7.1 Places
-
-1. The service has a fixed number of places: the "nodes out of service at
-   once" setting, one by default.
-2. A node holds a place from just before its update check until its update is
-   done, which includes waiting for its workloads to recover (section 9). A
-   node whose drain is blocked gives its place back while it waits
-   (section 9.1).
-3. Nodes that are already out of service for other reasons use up places too:
-   managed nodes that are not Ready, or that someone else cordoned. So the
-   service never takes a node down while the cluster is already short.
-4. While any managed node is held after a failure (section 10), the service
-   gives out no places. Updates in the cluster stop until a person looks.
-5. While as many nodes are drain-blocked as the "blocked nodes at once"
-   setting, the service gives out no places either. Several blocked drains
-   point to a wider problem than one workload.
-6. Free places go first to drain-blocked nodes that can now be drained, since
-   their updates are already under way. Then they go to nodes with the canary
-   label, then to the node that was checked longest ago.
-
-```mermaid
-flowchart TB
-    Start(["a place frees, or the check interval"]) --> Count["count free places:<br/>limit, minus nodes updating,<br/>minus nodes not Ready or cordoned"]
-    Count --> Stop{"any node held, or too<br/>many drain-blocked?"}
-    Stop -->|yes| Wait(["give out no places"])
-    Stop -->|no| Free{"a free place?"}
-    Free -->|no| Wait2(["wait for a place"])
-    Free -->|yes| Pick["give it to the next node:<br/>drain-blocked nodes that can now be drained,<br/>then canary nodes, then the rest"]
-    Pick --> Check["drain check, then update check (section 8)"]
-```
-
-### 7.2 Why a node takes a place before its update check
-
-The update check is what grants the update (section 2.3). If a node were granted
-an update and then had to wait for a place, Nebraska's grant would stay open
-until it timed out, and in safe mode timeouts can turn updates off for the
-whole group. Taking the place first means the service acts on every grant
-right away.
-
-When Nebraska has nothing new, the node gives its place back at once. So when
-there's no update, a pass through the cluster is just a series of quick checks.
-
-### 7.3 Nebraska's part
-
-1. The two limits stack. A node updates only when it has a place and Nebraska
-   grants it an update.
-2. Nebraska's group settings still apply:
-   - Tracks give rings. Put canary nodes on their own track, and release a
-     version to that group's channel first.
-   - "Max updates per period" sets the pace across every cluster that uses the
-     track.
-   - Safe mode lets one machine try a new version first.
-   - "Updates enabled" pauses the group, and office hours limit updates to
-     working hours.
-3. If Nebraska refuses an update because a limit is reached or updates are
-   off, nothing was granted. The node gives its place back and is checked again
-   at the next interval.
-4. The group's update timeout must be longer than the release deadline plus
-   the restart deadline (section 12): 1.5 hours with the defaults, so we
-   suggest 2 hours. A grant then always ends, with the update finished or
-   released (section 9.1), before Nebraska would count it as timed out.
-
-## 8. Checking for updates
-
-1. Each managed node is due for a check once per check interval (one hour by
-   default). Whenever a place is free, the service gives it to the next node
-   that is due (section 7).
-2. It skips the node if any of these is true:
-   - The node is paused.
-   - The node is held after a failed update.
-   - The node is drain-blocked; it is retried as section 9.1 describes.
-   - Its `agent-info` is missing, or has no `currentVersion`.
-3. Before asking Nebraska, it checks that the node could be drained now: the
-   drain rules of section 9.1, and a dry-run eviction of each pod the drain
-   would move. A dry-run eviction asks Kubernetes whether the eviction would be
-   allowed, without evicting. If any pod couldn't be moved, the node gives its
-   place back, and the service records an Event naming the pods and why. No
-   update has started, so nothing in Nebraska is left open.
-4. It sends Nebraska one update check as the node: the node's instance ID and
-   version, its architecture, and the server, app ID, and track the request
-   will name. It never sends progress events or "ping" messages; those belong
-   to the agent.
-5. If Nebraska answers "no update", the node gives its place back. Nebraska now
-   lists the node with its current version.
-6. If Nebraska answers with version V, it has granted V to the node. The
-   service writes the `stage` request right away (section 9).
-7. If Nebraska answers with an error, such as "updates disabled" or "limit
-   reached", nothing was granted. The node gives its place back.
-
-```mermaid
-sequenceDiagram
-    participant Service as unbounded-acl-update
-    participant API as Kubernetes API
-    participant Nebraska
-
-    Service->>Service: 1. give a free place to the next node that is due
-    Service->>API: 3. drain check: drain rules, dry-run evictions
-    alt a pod couldn't be moved
-        Service->>API: record an Event, give the place back
-    else the node could be drained
-        Service->>Nebraska: 4. update check as the node (instance ID, version, track)
-        alt no update, or an error
-            Nebraska-->>Service: no update
-            Service->>Service: 5. give the place back
-        else update to version V
-            Nebraska-->>Service: version V (granted to this node)
-            Service->>API: 6. write stage request for V
-        end
-    end
-```
-
-## 9. Running an update
-
-1. The service writes a `stage` request for version V, with a new
-   `nodeUpdateId` and `operationId`. It records the update in its `state`
-   annotation. The node keeps running its workloads while it downloads.
-2. The agent sends its own update check. Nebraska returns the same grant. The
-   agent downloads V, writes it into the unused copy, and reports `stage`
-   `Success`.
-3. The service cordons the node, and records that it did.
-4. The service drains the node (section 9.1). If the drain can't finish by the
-   drain deadline, the update pauses as section 9.1 describes.
-5. The service writes a `finalize` request with the same `nodeUpdateId`, a new
-   `operationId`, and the same version.
-6. The agent prepares the new copy, reports `finalize` `Success`, and restarts
-   the node.
-7. The node starts from the new copy. The agent writes `agent-info`, commits,
-   writes `update-commit-status` `Success`, and tells Nebraska the update is
-   complete.
-8. The service waits until three things are true: the commit status is
-   `Success` for this `nodeUpdateId`, `agent-info` says the node runs V, and
-   the Node is Ready. If they aren't all true by the restart deadline, it holds
-   the node (section 10).
-9. The service uncordons the node, if it cordoned it.
-10. It waits for the workloads it moved to recover: every Deployment and
-    StatefulSet whose pods it evicted has all its pods available again, and the
-    settle time has passed. Then it gives the place back, and the next node can
-    start. The update is done.
-
-Whenever a node leaves an update early, because a step failed or the node was
-held, the service also uncordons it, if it cordoned it, and gives its place
-back.
-
-The service keeps watching while the node restarts. If the active replica runs
-on the node being drained, the drain moves it, and the other replica takes over.
+1. **Slot.** A due node gets a free slot (section 4.2).
+2. **Drain check.** The service checks that the node could be drained now: the
+   drain rules (section 4.6), and a dry-run eviction of each pod it would move.
+   If not, it gives the slot back and records why. No grant was taken.
+3. **Update check.** It sends Nebraska one check as the node: the instance ID
+   and version from `agent-info`, the node's architecture (`arm64` sent as
+   `aarch64`, as the agent does), and the server, app ID, and track the request
+   will name. It never sends progress events or pings. Nebraska records the
+   service's IP address for the node until the agent's next check. With no
+   update, or a refusal, it gives the slot back. With "update in progress", it
+   ends that update (section 4.7) and gives the slot back.
+4. **Stage.** With a grant for version V, it writes a `stage` request at once.
+   The agent's own check gets the same grant, and it downloads V into the
+   unused copy while the node keeps running.
+5. **Drain.** It taints the node with `acl-update.unbounded-cloud.io/updating`
+   (`NoSchedule`) and evicts its pods (section 4.6).
+6. **Finalize.** If enough of the grant's time is left for the restart
+   (section 4.8), it writes `finalize`. Otherwise it ends the grant instead.
+7. **Restart.** The agent restarts the node into V, commits, writes
+   `update-commit-status`, and tells Nebraska the update finished.
+8. **Check.** The service waits until the commit status is `Success`, the
+   node's `agent-info` shows V, and the Node is Ready.
+9. **Recover.** It removes its taint, then waits until the Deployments,
+   StatefulSets, and ReplicaSets whose pods it moved have as many pods
+   available as before the drain, plus a settle time, and gives the slot back.
+   Pods of other controllers aren't tracked.
 
 ```mermaid
 sequenceDiagram
@@ -477,411 +259,329 @@ sequenceDiagram
     participant Agent as trident-acl-agent
     participant Nebraska
 
-    Service->>API: 1. stage request (V)
-    Agent->>Nebraska: 2. update check (same grant)
-    Agent->>Agent: download V, write the unused copy
+    Service->>API: 2. drain check (dry-run evictions)
+    Service->>Nebraska: 3. update check as the node
+    Nebraska-->>Service: version V (granted)
+    Service->>API: 4. stage request (V)
+    Agent->>Nebraska: update check (same grant), download
     Agent->>API: stage Success
-    Service->>API: 3. cordon the node
-    Service->>API: 4. evict its pods (budgets apply)
-    Service->>API: 5. finalize request (V)
-    Agent->>API: 6. finalize Success
-    Note over Agent: the node restarts into V
-    Agent->>API: 7. agent-info (V), commit Success
-    Agent->>Nebraska: update complete
-    Service->>API: 8. check commit, version, and Ready
-    Service->>API: 9. uncordon
-    Service->>API: 10. wait for moved workloads, then give the place back
+    Service->>API: 5. taint the node, evict its pods
+    Service->>API: 6. finalize request (V)
+    Note over Agent: 7. the node restarts into V
+    Agent->>API: agent-info (V), commit Success
+    Agent->>Nebraska: update finished
+    Service->>API: 8. check commit, version, Ready
+    Service->>API: 9. remove the taint, wait for workloads, free the slot
 ```
 
-The service tracks each node in one of these states:
+### 4.5 States
+
+The service keeps each node's state in an annotation on its Machine,
+`acl-update.unbounded-cloud.io/state`, so it survives the Node being deleted to
+rebuild it.
 
 ```mermaid
 stateDiagram-v2
     [*] --> Idle
-    Idle --> Checking: a place is free
-    Checking --> Idle: can't drain now, no update, or Nebraska refused
+    Idle --> Checking: due, and a slot is free
+    Checking --> Idle: can't drain now, no update, refused, or in progress
     Checking --> Staging: Nebraska grants V
     Staging --> Draining: stage Success
-    Staging --> Idle: AlreadyAtTarget, or stage failed
-    Draining --> Finalizing: all pods moved
-    Draining --> DrainBlocked: drain deadline passed
-    DrainBlocked --> Draining: the node can now be drained, and a place is free
-    DrainBlocked --> Idle: release deadline passed, grant released
+    Staging --> Idle: already at V, or stage failed
+    Draining --> Finalizing: pods moved, and time left
+    Draining --> Idle: drain deadline, or no time left
     Finalizing --> Restarting: finalize Success
     Finalizing --> Staging: NotStaged
     Finalizing --> Idle: finalize failed
     Restarting --> Recovering: commit Success, runs V, Ready
-    Recovering --> Idle: moved workloads recovered, settle time passed
-    Restarting --> Held: boot failed, wrong version, or no answer by the deadline
-    Staging --> Held: no status after 3 tries
-    Finalizing --> Held: no status after 3 tries
+    Recovering --> Idle: workloads recovered, settle time passed
+    Staging --> Held: no status, or a bug
+    Finalizing --> Held: no status, or set to restart but didn't
+    Restarting --> Held: boot failed, wrong version, or deadline
+    Recovering --> Held: workloads didn't recover in time
     Held --> Idle: a person clears the hold
 ```
 
-### 9.1 Moving workloads
+| State | What the service does | Leaves when | Deadline, and what happens at it | Nebraska grant when it leaves |
+|---|---|---|---|---|
+| Idle | Nothing. | The node is due and gets a slot. | | None open |
+| Checking | The drain check, then the update check. | No update, a refusal, or a node it can't drain: back to Idle. A grant: Staging. "Update in progress": ends it, then Idle. | | None, granted, or ended |
+| Staging | Writes `stage`, and waits for its status. | `Success`: Draining. `AlreadyAtTarget`, or a failure: Idle. | Writes the request again if no status comes within the status deadline; holds after 3 tries. | Failures are reported by the agent. With no status, the grant stays open until Nebraska times it out: the agent isn't answering. |
+| Draining | Taints the node, and evicts its pods. | All pods moved and time left: Finalizing. | At the drain deadline, or with too little time left: ends the grant, removes the taint, and goes back to Idle. | Ended |
+| Finalizing | Writes `finalize`. | `Success`: Restarting. `NotStaged`: Staging. A failure: Idle. | Status deadline, as in Staging. | Failures are reported by the agent. |
+| Restarting | Waits for the commit, the version, and Ready. | All three: Recovering. | At the restart deadline: holds. | Finished, or reported failed by the agent |
+| Recovering | Removes its taint, and waits for the moved workloads, then the settle time. | Both: Idle, and the slot frees. | At the recovery deadline: holds. | Finished |
+| Held | Nothing; no new updates start in the cluster. | A person clears the hold. | | As the previous state left it |
 
-Without a drain, Kubernetes moves pods off a node only after it has been
-unreachable for 5 minutes, by default. A restart is often shorter, so the pods
-would wait for the node and come back on it, out of service the whole time. So
-the service moves them first.
+Every `stage` or `finalize` failure, and every drain that misses its deadline,
+counts as an attempt at V on that node. After 3 attempts, the node is held.
 
-The service drains with `k8s.io/kubectl/pkg/drain`, the code behind
-`kubectl drain`, and uses kubectl's rules for which pods move:
+### 4.6 Moving workloads
 
-| Pods | What the drain does |
+Without a drain, Kubernetes moves pods off an unreachable node only after
+5 minutes, by default, so they would wait out the restart on the node. The
+service drains with `k8s.io/kubectl/pkg/drain`, the code behind
+`kubectl drain`, and its rules:
+
+| Pods | The drain |
 |---|---|
-| Static pods, which kubelet runs from files on the node | Skips them. |
-| DaemonSet pods | Skips them, as `kubectl drain --ignore-daemonsets` does. They run on every node, so they stop and start again with the node. This is the one rule that differs from kubectl's default, which refuses to drain until told to ignore them. |
-| Pods that keep data in `emptyDir` volumes, scratch space on the node | Refuses to drain the node, unless the "delete `emptyDir` data" setting is on (`kubectl drain --delete-emptydir-data`). The data is lost when the pod moves. |
-| Pods with no controller, which nothing would create again | Refuses to drain the node, unless the "move pods with no controller" setting is on (`kubectl drain --force`). |
-| Every other pod | Evicts it through Kubernetes' eviction API, so PodDisruptionBudgets apply, and gives it its own grace period to stop. An eviction a budget refuses is tried again until the drain deadline. |
+| Static pods | Skips them. |
+| DaemonSet pods | Skips them, as `kubectl drain --ignore-daemonsets` does. They restart with the node. |
+| Pods with `emptyDir` data | Refuses, unless the "delete `emptyDir` data" setting is on (`--delete-emptydir-data`). |
+| Pods with no controller | Refuses, unless the "move pods with no controller" setting is on (`--force`). |
+| Every other pod | Evicts it through the eviction API, so PodDisruptionBudgets apply, with its own grace period. Refused evictions are tried again until the drain deadline. |
 
-The same rules, with a dry-run eviction of each pod, are the drain check that
-runs before each update check (section 8). So most nodes that can't be drained
-are skipped before any update starts.
+The service marks the node with its own `NoSchedule` taint rather than
+cordoning it, so it never removes a cordon someone else set.
 
-#### When a drain is blocked anyway
+A drain that misses its deadline, despite the drain check, ends the grant at
+once rather than waiting: the node starts again at a later check, and the
+update downloads again. Repeated blocked drains hold the node (section 4.5).
 
-Things can change between the drain check and the drain. For example, another
-pod of the same application may stop being ready, so its budget refuses the
-eviction. When the drain isn't done by the drain deadline:
+After the drain, only DaemonSet and static pods remain; they stop when the node
+restarts. Kubelet's graceful node shutdown lets them stop cleanly, once we've
+confirmed it works with kubelet inside the nspawn machine.
 
-1. The service uncordons the node, marks it drain-blocked in its `state`, and
-   records an Event naming the pod and its budget. The update stays staged.
-2. The node gives its place back. A blocked drain is a problem with one
-   workload, not with the update, so other nodes continue.
-3. Every 5 minutes, the service runs the drain check on the node again.
-4. When the check passes and a place is free, the node gets that place ahead
-   of nodes that haven't started an update (section 7.1). The service cordons
-   and drains the node again, then finalizes the same update. The update
-   continues at step 5 of section 9.
-5. If the release deadline passes first, counted from Nebraska's grant, the
-   service releases the grant. It writes a new `stage` request for the same
-   version. Nebraska answers the agent's update check with "update in progress",
-   so the agent tells Nebraska the update failed, which closes the grant, and
-   reports `OperationFailed` (`trident-acl-agent`'s recovery for an update left
-   in progress, in `annotations/orchestrator.rs`). The node keeps running its
-   current version, goes back to Idle, and is checked again at later intervals.
-   The staged copy is overwritten by its next update.
+For applications, this means:
 
-Releasing the grant before the group's update timeout means Nebraska never
-records a timeout, which in safe mode could turn updates off for the group
-(section 7.3).
+1. Two or more replicas and a PodDisruptionBudget keep an application available
+   through updates. With one replica, it is out of service while its pod starts
+   elsewhere, once per update of its node.
+2. Pods with `emptyDir` data or no controller keep their node from updating
+   until an administrator turns on the matching setting, and so does a budget
+   that never allows an eviction. The Site's condition and an Event name them.
 
-```mermaid
-sequenceDiagram
-    participant Service as unbounded-acl-update
-    participant API as Kubernetes API
-    participant Agent as trident-acl-agent
-    participant Nebraska
+### 4.7 Ending a grant
 
-    Note over Service: the drain deadline passes
-    Service->>API: 1. uncordon, mark drain-blocked, record an Event
-    Service->>Service: 2. give the place back
-    loop 3. every 5 minutes
-        Service->>API: drain check
-    end
-    alt 4. the check passes, and a place is free
-        Service->>API: cordon, drain, then finalize the same update
-    else 5. the release deadline passes first
-        Service->>API: new stage request (V)
-        Agent->>Nebraska: update check
-        Nebraska-->>Agent: update in progress
-        Agent->>Nebraska: update failed (closes the grant)
-        Agent->>API: stage OperationFailed
-    end
-```
+The service ends an update it can't finish by writing a new `stage` request.
+Nebraska answers the agent's update check with "update in progress", so the
+agent tells Nebraska the update failed, which closes the grant, and reports
+`OperationFailed`. This is the agent's recovery for an update left in
+progress (`UpdateInProgress` in `annotations/orchestrator.rs`). The node keeps
+running its current version, and the staged copy is overwritten by the next
+update.
 
-#### Pods left on the node
+The request must name a version other than the running one, because the agent
+compares the two before it asks Nebraska. The service uses the version it last
+tried for that node, or the running version with its patch number raised.
 
-After the drain, only DaemonSet pods and static pods are left on the node. They
-stop when the node restarts. Kubelet's graceful node shutdown gives them time to
-stop cleanly. Unbounded turns it on once we've confirmed it works with kubelet
-inside the nspawn machine (sections 15 and 17).
+The service ends a grant when:
 
-### 9.2 What this means for applications
+1. a drain misses its deadline;
+2. too little of the grant's time is left to restart (section 4.8);
+3. its update check finds "update in progress": an update that was interrupted,
+   or that started before a hold was cleared or a Node was rebuilt.
 
-1. An application with two or more replicas and a PodDisruptionBudget stays
-   available through updates. An application with one replica is out of
-   service while its pod starts again on another node, once per update of its
-   node.
-2. Pods that keep data in `emptyDir` volumes, or that have no controller, stop
-   their node from updating until an administrator turns on the matching
-   setting (section 12). The service records an Event on the node that names
-   them.
-3. A PodDisruptionBudget that never allows an eviction, such as
-   `maxUnavailable: 0`, stops the nodes running its pods from updating. The
-   Event names the budget.
-4. DaemonSet pods stay on the node, and restart with it.
+### 4.8 Timing
 
-## 10. When something goes wrong
+The service has one setting for this: Nebraska's update timeout, which must
+match the group's. Before writing `finalize`, the service checks that the
+time since the grant, plus the restart deadline, stays at least 10 minutes
+inside it. If not, it ends the grant instead. So every grant either finishes
+or is ended before Nebraska would count it as timed out. The agent's own limits
+bound the steps before that (20 minutes for a stage, 10 for a finalize, by
+default), and so does the drain deadline.
 
-| What happens | What the service does |
-|---|---|
-| `stage` reports `AlreadyAtTarget` | Marks the update done. The node already runs V. |
-| `stage` or `finalize` reports `OperationFailed` or `AgentInternalError` | Leaves the update. The next check decides again. |
-| A request gets `InvalidRequest` | Records an Event and leaves the update. This points to a bug in the request. |
-| `finalize` reports `NotStaged` | Starts again with `stage`. |
-| The drain check fails before the update check | Skips the node until the next interval, with an Event. No update starts. |
-| The drain isn't done by the drain deadline | Marks the node drain-blocked and pauses its update (section 9.1). Other nodes continue. |
-| A drain-blocked node can't be drained before the release deadline | Releases Nebraska's grant, and goes back to Idle (section 9.1). |
-| As many nodes are drain-blocked as the "blocked nodes at once" setting | Starts no new updates until fewer are blocked. |
-| The workloads it moved don't recover within 30 minutes | Keeps the place, so no other node starts, and records an Event. The place frees once they recover. |
-| The commit reports `TargetBootFailed` | Holds the node. |
-| The commit reports `Success`, but `agent-info` still shows another version at the restart deadline | Holds the node. This is the case in microsoft/trident#956. |
-| No status appears for a request within 5 minutes | Writes the same request again. The agent treats a repeated request as one. After 3 tries, holds the node. |
-| A status stays `InProgress`, but isn't refreshed for 5 minutes | Records an Event. If the step still isn't done by the step deadline, holds the node. |
-| After `finalize`, the Node isn't Ready, or there's no commit status, within 30 minutes | Holds the node. |
+### 4.9 Failures and holds
 
-Holding a node means:
+| What happens | What the service does | Nebraska grant |
+|---|---|---|
+| `stage` reports `AlreadyAtTarget` | The update is done. | None was used |
+| `stage` reports `OperationFailed` or `AgentInternalError` | Back to Idle; counts an attempt. | Reported failed by the agent |
+| `stage` reports `InvalidRequest` | Checks Nebraska again. If the channel moved, so the grant is now for another version, stages that. Otherwise holds the node: the request is wrong. | Kept, or open until it times out |
+| `finalize` reports `OperationFailed` | Removes the taint, back to Idle; counts an attempt. | Reported failed by the agent |
+| `finalize` reports `AgentInternalError` or `InvalidRequest` | Holds the node and keeps the taint. After `AgentInternalError`, the node may be set to start from the new copy at its next restart. | Reported failed, or open |
+| `finalize` reports `NotStaged` | Stages again. | Kept |
+| No status within the status deadline | Writes the same request again; the agent treats a repeat as one. Holds after 3 tries. | Open until it times out |
+| The commit reports `TargetBootFailed` | Holds the node. | Reported failed by the agent |
+| The commit reports `Success`, but `agent-info` still shows another version at the restart deadline (microsoft/trident#956) | Holds the node. | Recorded as finished |
+| The Node isn't Ready, or no commit status arrives, by the restart deadline | Holds the node. | Open until the agent reports |
+| The moved workloads haven't recovered by the recovery deadline | Holds the node. | Finished |
 
-1. The service stops sending update checks for the node.
-2. It writes the reason, and the version that failed, in the node's `state`
-   annotation.
-3. It records a Kubernetes Event on the Node.
-4. It uncordons the node, if it cordoned it, and gives its place back.
-5. While the node is held, the service starts no new updates anywhere in the
-   cluster (section 7.1).
-6. A person looks at the node, then removes the `state` annotation to let the
-   service continue.
+Holding a node means the service stops checking for it, removes its taint
+unless the node may be set to start from the new copy, records the reason in
+the Machine's `state`, and starts no new updates in the cluster until a person
+clears the hold, by removing the Machine's `state` annotation. The service's
+next attempt then uses new request IDs. It doesn't retry by itself because,
+after a fallback, Nebraska may already list the update as finished and would
+offer the same version again.
 
-The service holds the node instead of trying again because, after a failed
-restart, Nebraska may already list the update as complete (microsoft/trident#956).
-Nebraska would then offer the same version again, and the node would repeat the
-same failed update.
+The agent reports a failed boot to Nebraska, so Nebraska's own safe mode and
+statistics see it across clusters. The service never sends events to Nebraska.
 
-A drain-blocked node isn't held. Its problem is a workload that can't move yet,
-not the update, so the rest of the cluster keeps updating (section 9.1).
+To make a stop visible, the component's condition on the Site says why new
+updates aren't starting, and the service exports metrics: nodes per version,
+updates under way, held nodes, and the reason updates are blocked.
 
-## 11. Leader election and restarts
+### 4.10 Restarts, rebuilds, and other maintenance
 
-1. The service runs two replicas. A Lease keeps one active.
-2. All state is on the Node objects. A new leader continues where the old one
-   stopped, including counting places, a drain under way, and drain-blocked
-   nodes. Continuing a drain is safe: evicting a pod that's already gone does
-   nothing.
-3. The service writes every annotation change together with the Node's
-   `resourceVersion`. If two leaders overlap for a moment, only one write
-   succeeds, so a node never gets two different requests.
-4. The two replicas should run on different nodes. A PodDisruptionBudget keeps
-   one of them running while the service drains the node the other is on.
+1. **Leader changes.** All state is on Nodes and Machines, written with each
+   object's `resourceVersion`, so a new leader continues where the old one
+   stopped, and two overlapping leaders can't both write a request.
+2. **Rebuilds.** Deleting a Node rebuilds the node's nspawn machine. The
+   Machine's `state` survives, and `trident-acl-agent` waits for the Node to
+   return. The service continues the update if the agent reports its commit,
+   and otherwise ends the grant and starts over at a later check. Labels the
+   service reads (section 6) should be set through the MachineConfiguration's
+   `nodeLabels`, so they survive too.
+3. **Other maintenance.** Unbounded has no shared way yet for components that
+   restart or replace nodes to claim a node. Until it does, the service skips
+   nodes whose Machine has an unfinished MachineOperation or is being rebuilt.
+   When Unbounded defines such a claim, the service takes it for each update,
+   and Unbounded's Karpenter plugin should respect it.
+4. **Turning the component off.** Updates past `finalize` finish on the node.
+   The service's taint stays on a node it was draining until the component is
+   turned on again or a person removes it, so turn it off when no update is
+   under way.
 
-## 12. Settings
+## 5. Work needed from other teams
 
-The service reads its settings from a ConfigMap:
+| Team | Ask | Blocks v1? | Until then |
+|---|---|---|---|
+| Trident | **Preferred:** a `stage` without `targetVersion` that stages whatever Nebraska grants, with a final status for "no update". Only the agent would then talk to Nebraska; the service would stop sending checks, and `agent-info` would need only the version, for the check after a restart. | No | The service checks as the node, using `agent-info`. |
+| Trident | Otherwise: `agent-info` written by the agent (section 4.3). | No | The temporary DaemonSet |
+| Trident | A final status when Nebraska refuses an update during `stage`. Today the agent exits, and systemd restarts it (`"Nebraska query failed"` in `annotations/orchestrator.rs`). | No | The service stages only after a grant, so this is rare. |
+| Trident | Confirm that the recovery the service uses to end a grant (section 4.7) is intended and will stay, and document it. | No | |
+| Trident | Fix microsoft/trident#956 and #957. | No | The version check after the restart, and the status deadline |
+| Unbounded host agent | A `trident-acl-agent` drop-in: the prefix `acl-update.unbounded-cloud.io`, kubelet's credentials, `kubelet-cert` to find the Node's name, and the version key. | Yes | |
+| Unbounded host agent | Mount the host's `/etc/machine-id` and `/etc/os-release` into the nspawn machine under `/run/unbounded/host/`. | Until Trident provides the identity | |
+| Unbounded host agent | Turn on kubelet's graceful node shutdown. | No | Pods left on the node stop at once. |
+| ACL images | An os-release key with a version that differs for every build, is valid semver, and doesn't vary only in build metadata (section 2.2). | Yes | |
+| Nebraska | Package labels, or the agent's `TRIDENT_ACL_AGENT_COSI_SHA384_SOURCE=hash` option. Release 4.0.3 has no labels. | Yes, one of the two | |
+| Nebraska | One database behind the URL, so the service's grant and the agent's check reach the same Nebraska. | Yes | |
+| Nebraska | Each group's update timeout matches the service's setting. | Yes | |
+
+If Nebraska's Omaha secret is used, it is part of the URL path, so it is
+readable by anyone who can read Node annotations or the Site.
+
+## 6. Testing
+
+1. **Unit tests:** the state machine and the failure table, with a fake
+   Kubernetes client and a fake Nebraska; counting slots; the drain rules with
+   each setting; the timing check; the request format against Trident's JSON
+   schemas (`annotations/protocol.rs`); the instance ID
+   (`34a267d412544d6a9e97b5ba6762f6e7` gives
+   `ebb9a2bb-9365-d34e-133f-8da0664e7366`); and the admission policies' rules.
+2. **The AKSFlexNode harness**, which runs kubelet in an nspawn machine: the
+   service against its cluster, and graceful node shutdown.
+3. **Unbounded's ACL end-to-end tests**, with several nodes and a workload with
+   a PodDisruptionBudget: no more than `maxUnavailable` nodes update at once,
+   and the workload stays available.
+4. **A real Nebraska**, as Trident's tests use (`tools/storm/aclagent`): the
+   agent's check after the service's gets the same grant, no extra instances
+   appear, and ending a grant records a failure, not a timeout.
+
+## 7. Open questions
+
+1. **Trident:** a `stage` without `targetVersion`, or `agent-info`?
+2. **ACL's version:** which os-release key carries the per-build version?
+3. **The host's os-release:** does `systemd-nspawn` on ACL already provide it
+   at `/run/host/os-release`?
+4. **Graceful node shutdown:** does it work with kubelet in an nspawn machine,
+   and in a container?
+5. **`container` isolation on ACL:** when it's validated, which parts of this
+   design change?
+6. **Claiming a node for maintenance:** what form should Unbounded's shared
+   claim take?
+7. **The `managed` label:** set by Unbounded when the node joins, or by
+   administrators?
+
+## 8. Other approaches we considered
+
+1. **Letting Nebraska alone limit updates.** Its limits are shared by every
+   cluster on a track, can be set loosely, and know nothing about workloads.
+2. **Letting nodes stage on their own, and coordinating only restarts.** This
+   is how the closest prior art works:
+   [flatcar-linux-update-operator](https://github.com/flatcar/flatcar-linux-update-operator)
+   lets each node's updater take any grant Nebraska offers and download it,
+   then decides when nodes restart, and [kured](https://github.com/kubereboot/kured)
+   only coordinates restarts. A node that has staged then waits for its turn
+   to restart with its grant open, which can outlast Nebraska's timeout. That
+   is why this design takes a slot before the update check.
+3. **A DaemonSet that checks for its own node.** It can't notice its node not
+   coming back, since it restarts with it, and limits across the cluster would
+   have nowhere to live.
+4. **An instance ID made up by the service.** Nebraska would count every node
+   twice, and the made-up instance's grants would never finish.
+5. **Reading the group's version from Nebraska's admin API.** It needs a
+   login, and the agent's check at `stage` would still be the grant.
+6. **Draining before the update check, or forcing pods off after a deadline.**
+   The first moves workloads off every node checked, even with no update; the
+   second breaks the promise PodDisruptionBudgets make.
+7. **Annotations from other tools to protect pods.** They would tie the service
+   to those tools; PodDisruptionBudgets are Kubernetes' own way to say how many
+   pods may move.
+
+## Appendix: Interfaces
+
+### Settings
+
+From the component's spec on the Site:
 
 | Setting | Default | Meaning |
 |---|---|---|
-| Nebraska URL | none | The `https` address of Nebraska's update endpoint. |
-| App ID | none | Nebraska's app ID for ACL. |
-| CA certificates | the image's | Certificates to trust for Nebraska. |
+| Nebraska URL, app ID, CA certificates | none, none, the image's | Where to check, and whom to trust. |
 | Default track | none | The track for nodes without a track label. |
-| Nodes out of service at once | 1 | How many places there are (section 7). |
+| `maxUnavailable` | 1 | Update slots per Site: a number or a percentage. |
 | Check interval | 1 hour | How often each node is checked. |
+| Nebraska update timeout | 2 hours | Must match each group's update timeout (section 4.8). |
 | Status deadline | 5 minutes | How long to wait for a status before writing a request again. |
-| Step deadline | 1 hour | How long `stage` or `finalize` may stay `InProgress` before the service holds the node. |
-| Drain deadline | 30 minutes | How long one drain may take before the node's update pauses (section 9.1). |
-| Release deadline | 1 hour | How long after Nebraska's grant a node may take to reach `finalize`. After that, the service releases the grant (section 9.1). |
-| Blocked nodes at once | 2 | How many nodes may be drain-blocked before the service starts no new updates. |
-| Restart deadline | 30 minutes | How long to wait for a node to come back after `finalize`. |
-| Settle time | 5 minutes | How long to wait, after the workloads a drain moved have recovered, before the next node starts. |
-| Delete `emptyDir` data | off | Whether the drain may move pods that keep data in `emptyDir` volumes, losing the data (`kubectl drain --delete-emptydir-data`). |
-| Move pods with no controller | off | Whether the drain may evict pods that nothing would create again (`kubectl drain --force`). |
+| Drain deadline | 30 minutes | How long one drain may take. |
+| Restart deadline | 30 minutes | How long a node has to come back after `finalize`. |
+| Recovery deadline | 30 minutes | How long moved workloads have to recover. |
+| Settle time | 5 minutes | How long to wait after they recover. |
+| Delete `emptyDir` data | off | `kubectl drain --delete-emptydir-data` |
+| Move pods with no controller | off | `kubectl drain --force` |
 
-The annotation prefix is fixed: `acl-update.unbounded-cloud.io`.
-`trident-acl-agent` on each node must use the same prefix (section 15).
+### Labels, taints, and annotations
 
-## 13. Annotations and labels
-
-| Key | Kind | Written by | Meaning |
+| Key | On | Written by | Meaning |
 |---|---|---|---|
-| `acl-update.unbounded-cloud.io/managed` | label | Unbounded at join, or an administrator | The service updates this node. |
-| `acl-update.unbounded-cloud.io/track` | label | an administrator | The Nebraska track for this node, instead of the default. |
-| `acl-update.unbounded-cloud.io/canary` | label | an administrator | This node gets a place before the others. |
-| `acl-update.unbounded-cloud.io/paused` | label | an administrator | Don't start new updates on this node. |
-| `acl-update.unbounded-cloud.io/update-request` | annotation | the service | The request to the agent (Trident's contract). |
-| `acl-update.unbounded-cloud.io/update-status` | annotation | the agent | The result of a request (Trident's contract). |
-| `acl-update.unbounded-cloud.io/update-commit-status` | annotation | the agent | The result after the restart (Trident's contract). |
-| `acl-update.unbounded-cloud.io/agent-info` | annotation | the agent, or the temporary DaemonSet | The node's instance ID and version (section 6). |
-| `acl-update.unbounded-cloud.io/state` | annotation | the service | The node's update, when Nebraska granted it, whether the service cordoned the node, and why it's drain-blocked or held, if it is. |
+| `acl-update.unbounded-cloud.io/managed` | Node label | MachineConfiguration `nodeLabels` | The service updates this node. |
+| `acl-update.unbounded-cloud.io/track` | Node label | MachineConfiguration `nodeLabels` | The node's track, instead of the default. |
+| `acl-update.unbounded-cloud.io/canary` | Node label | MachineConfiguration `nodeLabels` | The node goes first among due nodes. |
+| `acl-update.unbounded-cloud.io/paused` | Node label | an administrator | Start no new updates on this node. |
+| `acl-update.unbounded-cloud.io/updating` | Node taint (`NoSchedule`) | the service | The node is being drained or updated. |
+| `acl-update.unbounded-cloud.io/update-request` | Node annotation | the service | Trident's contract |
+| `acl-update.unbounded-cloud.io/update-status`, `update-commit-status` | Node annotations | the agent | Trident's contract |
+| `acl-update.unbounded-cloud.io/agent-info` | Node annotation | the agent, or the temporary DaemonSet | Section 4.3 |
+| `acl-update.unbounded-cloud.io/state` | Machine annotation | the service | The node's state (section 4.5) |
 
-An example `state`, for a node whose drain is blocked:
+An example `state`:
 
 ```json
 {
-  "phase": "DrainBlocked",
+  "phase": "Restarting",
   "nodeUpdateId": "550e8400-e29b-41d4-a716-446655440000",
   "targetVersion": "20261106.1.0",
   "grantedAt": "2026-11-18T10:02:00Z",
-  "cordoned": false,
-  "reason": "evicting default/db-0 would break PodDisruptionBudget default/db",
-  "since": "2026-11-18T10:42:00Z"
+  "attempts": 1
 }
 ```
 
-## 14. Permissions and safety
+### Permissions
 
-1. The service's account can:
-   - get, list, watch, and patch Nodes;
-   - list Pods, and evict them, including dry-run evictions;
-   - get DaemonSets, ReplicaSets, Deployments, and StatefulSets, to apply the
-     drain rules and to see when moved workloads have recovered;
-   - create Events, and use a Lease for leader election.
-2. Patching Nodes is a broad permission, so two admission policies narrow what
-   can be written:
-   1. The service's account may change only the `update-request` and `state`
-      annotations, and whether the node is cordoned (`spec.unschedulable`). A
-      request must name the configured Nebraska URL and app ID, so a stolen
-      token can't point nodes at another server.
-   2. The DaemonSet's account may change only `agent-info`, and only on its own
-      Node. The policy checks the node name and UID in the pod's token, as
+1. The service's account can get, list, watch, and patch Nodes and Machines;
+   list and watch MachineOperations; list Pods and evict them, including dry-run
+   evictions; get DaemonSets, ReplicaSets, Deployments, and StatefulSets; create
+   Events; and use a Lease.
+2. Admission policies narrow what can be written:
+   1. The service's account may change only its taint and `update-request` on
+      Nodes, and `state` on Machines. A request must name the configured
+      Nebraska URL and app ID.
+   2. The DaemonSet's account may change only `agent-info`, on its own Node,
+      checked with the node name and UID in the pod's token, as
       `unbounded-net-node`'s policy does (`deploy/net/controller/09-vap.yaml.tmpl`).
-3. Every pod the drain moves goes through Kubernetes' eviction API, so
-   PodDisruptionBudgets always apply. That includes pods with no controller
-   when the setting allows them, as with `kubectl drain --force`. The service
-   never deletes pods directly.
-4. The agent writes its statuses and `agent-info` with the node's own
-   credentials, which can only change the node's own Node object.
-5. The agent only accepts an `https` Nebraska URL, and only `https` or `oci`
-   image addresses. It checks each image against a checksum from Nebraska.
-6. The DaemonSet runs unprivileged, with two read-only files from the host.
+3. The agent writes its statuses with the node's own credentials, which can
+   change only its own Node. It accepts only an `https` Nebraska URL, and checks
+   each image against a checksum from Nebraska.
 
-## 15. Work needed elsewhere
+### Code layout
 
-**Trident (`trident-acl-agent`):**
-
-1. Write `agent-info` (section 6).
-2. Report a final status when Nebraska refuses an update during `stage`.
-   Reading the code, the agent exits instead, and systemd restarts it; the
-   status stays `InProgress` and the agent asks Nebraska again each time
-   (`crates/trident-acl-agent/src/annotations/orchestrator.rs`, the
-   `"Nebraska query failed"` error). The service makes this rare, since it only
-   asks for `stage` after a grant, but it shouldn't happen at all.
-3. Confirm that the recovery the service uses to release a grant is intended,
-   and will stay: a new `stage` request while an update is in progress makes
-   the agent tell Nebraska the update failed (section 9.1). It is in the code,
-   with a comment saying why, but not in the contract's documentation. No code
-   change is needed.
-4. Fix microsoft/trident#956: a fallback to the old copy is reported as a
-   successful commit.
-5. Fix microsoft/trident#957: a request the agent can't parse gets no status.
-
-**Unbounded's host agent:**
-
-1. Configure `trident-acl-agent` on ACL hosts with a systemd drop-in:
-   - the annotation prefix, `acl-update.unbounded-cloud.io`;
-   - kubelet's credentials, and `kubelet-cert` to find the Node's name;
-   - where to read the version (see the ACL images item).
-2. Make the host's `/etc/machine-id` and `/etc/os-release` readable inside the
-   nspawn machine, for the temporary DaemonSet.
-3. Set the `managed` label when the node joins, if we choose to.
-4. Turn on kubelet's graceful node shutdown, once we've confirmed it works with
-   kubelet inside the nspawn machine (section 9.1).
-
-**ACL images:**
-
-1. Carry a version in `/etc/os-release` that is different for every build and
-   matches the versions in Nebraska. Trident's documentation uses
-   `IMAGE_VERSION` as its example.
-
-**Nebraska:**
-
-1. Run a release with package labels. 4.0.3 has none, and the agent reads the
-   image's checksum from a label by default.
-2. Keep every server behind the URL on one database, so the service's grant
-   and the agent's update check are seen by the same Nebraska.
-3. Set each group's update timeout longer than the release deadline plus the
-   restart deadline (section 7.3).
-
-## 16. Testing
-
-1. Unit tests:
-   - the state machine, with a fake Kubernetes client and a fake Nebraska;
-   - counting places: nodes that are updating, recovering, not Ready, or
-     cordoned by someone else, and no places while a node is held or too many
-     are drain-blocked;
-   - the drain check and the drain: static, DaemonSet, `emptyDir`, and
-     no-controller pods with each setting, evictions a PodDisruptionBudget
-     refuses, and the drain deadline;
-   - a blocked drain: retrying, finalizing the same update, and releasing the
-     grant at the release deadline;
-   - the request format, against the JSON schemas in Trident's
-     `annotations/protocol.rs`;
-   - the instance ID: `/etc/machine-id` `34a267d412544d6a9e97b5ba6762f6e7`
-     gives `ebb9a2bb-9365-d34e-133f-8da0664e7366`;
-   - the admission policies' rules, as
-     `internal/operator/components/net/vap_test.go` tests unbounded-net's.
-2. The AKSFlexNode harness: its test Nebraska and annotation scenarios, with
-   the service running against the harness's cluster. The harness's nodes run
-   kubelet inside an nspawn machine, so it also checks:
-   - a staged update survives a pause, a restart of the agent, and an
-     unrelated restart of the node, and then finalizes;
-   - graceful node shutdown with kubelet inside the nspawn machine.
-3. Unbounded's ACL end-to-end tests (`agent-e2e-kind`, host `acl`), with
-   several ACL nodes and a workload with a PodDisruptionBudget, to show that
-   only one node is out of service at a time and the workload keeps running.
-4. A real Nebraska, to confirm:
-   - the agent's update check after the service's gets the same grant, and no
-     extra instances appear;
-   - releasing a grant with a new `stage` request makes Nebraska record the
-     update as failed, not timed out, and a later update succeeds.
-
-   Trident's own tests run a real Nebraska the same way
-   (`tools/storm/aclagent`).
-
-## 17. Open questions
-
-1. **HostUpgrade.** [host-upgrade.md](host-upgrade.md) proposes driving Trident
-   from Unbounded's host agent instead. Both can't drive the same node. Should
-   this be a separate path for ACL nodes that use `trident-acl-agent`, or should
-   the service create HostUpgrade operations instead of writing annotations?
-   host-upgrade.md expects "the caller or a separate rollout controller" to
-   drain nodes, which this service now does.
-2. **`agent-info` in Trident.** Will the Trident team add it, under this name
-   and format?
-3. **ACL's version.** Which os-release key will carry the per-build version?
-4. **The host's os-release.** Does `systemd-nspawn` on ACL already show it at
-   `/run/host/os-release`?
-5. **Graceful node shutdown.** Does it work with kubelet inside the nspawn
-   machine?
-6. **The `managed` label.** Should Unbounded set it when the node joins, or
-   should administrators?
-7. **Later versions.** Separate limits per node pool or zone, and maintenance
-   windows: in this service, or in a shared rollout controller?
-
-## 18. Other approaches we considered
-
-1. **Letting Nebraska alone limit updates.** Its limits are shared by every
-   cluster that uses a track, can be set loosely, and know nothing about
-   workloads. A cluster could lose all its nodes at once.
-2. **Taking a place after the grant.** Granted nodes would wait for places with
-   their grants open, and those grants would time out.
-3. **Draining before the update check.** No grant would be open while a drain
-   waits. But it would move workloads off every node it checks, even when
-   there's no update.
-4. **A `cancel` operation in `trident-acl-agent`.** Not needed: the agent's
-   existing recovery releases a grant (section 9.1).
-5. **Forcing pods off after a deadline, ignoring their budgets.** It breaks the
-   promise a PodDisruptionBudget makes to its application.
-6. **Annotations from other tools to protect pods.** It would tie the service
-   to those tools. PodDisruptionBudgets are Kubernetes' own way for an
-   application to say how many of its pods may be moved.
-7. **Running the `kubectl` binary for drains.** It behaves the same, but the
-   service would parse text output and ship a second binary. The Go package
-   gives the same rules with structured results.
-8. **A DaemonSet that checks for its own node.** It could read the host's files
-   directly. But a pod restarts with its node, so it can't notice a node that
-   doesn't come back. Each pod would need its own narrow permissions, and
-   decisions about the whole cluster, such as places and draining, would have
-   nowhere to live.
-9. **An instance ID made up by the service.** Nebraska would count every node
-   twice. The made-up instance's grants would never finish, and in safe mode
-   their timeouts can turn updates off for the group.
-10. **Reading the group's version from Nebraska's admin API.** Only the agent's
-    update check would then ask for the update. But the admin API needs a
-    login, and when Nebraska refuses an update, the agent currently exits
-    instead of reporting it (section 15).
-11. **A fixed target version in the cluster's settings.** This is simple, and
-    is how Trident's example works (a track named `pin-<version>`). But someone
-    has to change the setting for every release.
-12. **Using `VERSION_ID` as the version.** Several builds can share it.
+| Part | Where |
+|---|---|
+| Binary, with `controller` and `node-info` subcommands | `cmd/unbounded-acl-update` |
+| Shared code | `internal/aclupdate/...` |
+| Operator component | `internal/operator/components/aclupdate`, and a `Site.Spec.Components` field |
+| Manifests and admission policies | `deploy/acl-update/` |
+| Image | `images/unbounded-acl-update/` |
