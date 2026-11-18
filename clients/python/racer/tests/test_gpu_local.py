@@ -21,8 +21,7 @@ import realcuda
 from fakeserver import Obj
 from test_host import mapped, memfds
 
-import racer
-from racer import HostBuffer, cuda, tensors
+from racer import GPU, HOST, STREAM, Client, HostBuffer, RacerError, Request, cuda, object_request, tensors
 
 pytestmark = pytest.mark.gpu
 
@@ -33,23 +32,23 @@ FILL = 0xA5
 
 
 def add(server, data=DATA):
-    req = racer.Request(racer.object_request("bucket", "gpu-object").key)
+    req = Request(object_request("bucket", "gpu-object").key)
     server.objects[req.hex] = Obj(data)
     return req
 
 
 def deliver(server, mode, device=0):
     """Make the fake server's reads end in delivery mode."""
-    if mode == racer.GPU:
+    if mode == GPU:
         server.gpu_status = 200
         server.gpu_write = realcuda.gpu_writer(device)
-    elif mode == racer.STREAM:
+    elif mode == STREAM:
         server.host_status = 501
 
 
 def client(server):
     # Smaller than DATA, so host-read fallback takes several chunks.
-    return racer.Client(socket_path=server.path, staging_bytes=2 * PAGE)
+    return Client(socket_path=server.path, staging_bytes=2 * PAGE)
 
 
 def contents(alloc, offset=0, n=None):
@@ -71,7 +70,7 @@ def test_allocation_size_rounds_up_to_granularity(gpu):
             assert a.__cuda_array_interface__["shape"] == (want,)
             assert a.__cuda_array_interface__["data"] == (a.ptr, False)
             assert a.gpu_uuid() == cuda.device_uuid(0)
-    with pytest.raises(racer.RacerError):
+    with pytest.raises(RacerError):
         cuda.GpuAllocation(0)
 
 
@@ -97,9 +96,9 @@ def test_copies_at_offsets_and_across_granules(gpu):
         a.copy_to_host(g - 7, memoryview(out)[3:-3])
         assert out == b"\0" * 3 + expect[g - 7 : g - 7 + len(data)] + b"\0" * 3
         for offset, n in [(a.size - 1, 2), (-1, 1)]:
-            with pytest.raises(racer.RacerError):
+            with pytest.raises(RacerError):
                 a.copy_from_host(offset, b"x" * n)
-            with pytest.raises(racer.RacerError):
+            with pytest.raises(RacerError):
                 a.copy_to_host(offset, bytearray(n))
 
 
@@ -136,7 +135,7 @@ def test_close_and_collection_free_device_memory(gpu, server):
     size = 128 * MiB
     slack = 64 * MiB
     req = add(server)
-    deliver(server, racer.GPU)
+    deliver(server, GPU)
     cuda.GpuAllocation(size).close()  # the driver's own first-use allocations
     baseline, _ = realcuda.mem_get_info()
     with cuda.GpuAllocation(size):
@@ -153,7 +152,7 @@ def test_close_and_collection_free_device_memory(gpu, server):
             del b
             with cuda.GpuAllocation(size) as d:
                 # gpu-read sends an exported fd; the client must close its copy.
-                assert c.read_into_gpu(req, d, 7).delivery == racer.GPU
+                assert c.read_into_gpu(req, d, 7).delivery == GPU
     # The fake server may still hold its copy of the last fd for a moment.
     free = wait_for_free(baseline, slack)
     assert free >= baseline - slack, f"{(baseline - free) / MiB:.0f} MiB of device memory not freed"
@@ -171,7 +170,7 @@ def test_host_register_pins_and_unpins(gpu):
         reg.close()
         reg.close()
         assert not realcuda.registered(addr, MiB)
-    with pytest.raises(racer.RacerError, match="writable"):
+    with pytest.raises(RacerError, match="writable"):
         cuda.host_register(b"read-only")
 
 
@@ -221,7 +220,7 @@ def test_pinned_host_buffer_unpins_before_unmapping(gpu, monkeypatch, release):
 # Reads into GPU memory
 
 
-@pytest.mark.parametrize("mode", [racer.GPU, racer.HOST, racer.STREAM])
+@pytest.mark.parametrize("mode", [GPU, HOST, STREAM])
 @pytest.mark.parametrize(
     "dest_offset,offset,length",
     [
@@ -250,7 +249,7 @@ def test_read_into_gpu(gpu, server, mode, dest_offset, offset, length):
         lo = max(0, dest_offset - 64)
         got = contents(a, lo, dest_offset - lo + len(want) + 64)
         assert got == bytes([FILL]) * (dest_offset - lo) + want + bytes([FILL]) * 64
-        if mode == racer.GPU:
+        if mode == GPU:
             (rpc,) = [s for s in server.seen if s.target.endswith("/gpu-read")]
             assert rpc.headers["racer-allocation-size"] == str(a.size)
             assert rpc.headers["racer-gpu-uuid"] == a.gpu_uuid()
@@ -262,7 +261,7 @@ def test_read_into_gpu(gpu, server, mode, dest_offset, offset, length):
     assert pos == offset + len(want)
 
 
-@pytest.mark.parametrize("mode", [racer.GPU, racer.HOST])
+@pytest.mark.parametrize("mode", [GPU, HOST])
 def test_read_into_second_gpu(gpu, server, mode):
     if realcuda.device_count() < 2:
         pytest.skip("needs two GPUs")
@@ -304,7 +303,7 @@ def test_as_tensor_shares_memory_and_keeps_the_allocation(cuda_torch):
     assert ref() is None
 
 
-@pytest.mark.parametrize("mode", [racer.HOST, racer.STREAM])
+@pytest.mark.parametrize("mode", [HOST, STREAM])
 def test_tensor_target(cuda_torch, server, mode):
     torch = cuda_torch
     req = add(server)
