@@ -5,6 +5,7 @@ package healthcheck
 
 import (
 	"context"
+	"errors"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -32,6 +33,8 @@ const flapWindowDuration = 5 * time.Minute
 // if the peer is up.
 type session struct {
 	peerHostname   string
+	remoteHostname string
+	ownsConn       bool
 	overlayIP      net.IP
 	port           int
 	localHost      string
@@ -109,12 +112,23 @@ func (s *session) start(ctx context.Context) {
 	go s.probeLoop(ctx)
 	go s.detectLoop(ctx)
 	go s.callbackLoop(ctx)
+
+	if s.ownsConn {
+		s.wg.Add(1)
+		go s.receiveScopedReplies()
+	}
 }
 
 // stop halts probe sending and detection.
 func (s *session) stop() {
 	if s.cancel != nil {
 		s.cancel()
+	}
+
+	if s.ownsConn {
+		if err := s.conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			klog.V(4).Infof("healthcheck: close scoped socket for %s: %v", s.peerHostname, err)
+		}
 	}
 
 	if s.started {
@@ -382,9 +396,15 @@ func (s *session) detectTimeout() time.Duration {
 
 func (s *session) sendProbe() {
 	seq := s.seqNum.Add(1)
+
+	destination := s.remoteHostname
+	if destination == "" {
+		destination = s.peerHostname
+	}
+
 	pkt := &pb.HealthCheckPacket{
 		SourceHostname:      s.localHost,
-		DestinationHostname: s.peerHostname,
+		DestinationHostname: destination,
 		SequenceNumber:      seq,
 		TimestampNs:         time.Now().UnixNano(),
 		Type:                pb.PacketType_REQUEST,
@@ -411,6 +431,36 @@ func (s *session) sendProbe() {
 	s.packetsSent++
 	s.mu.Unlock()
 	metricPacketsSent.Inc()
+}
+
+// Scoped sessions use separate UDP sockets so replies cannot satisfy a
+// different relationship's probe to the same node.
+func (s *session) receiveScopedReplies() {
+	defer s.wg.Done()
+
+	buffer := make([]byte, 4096)
+	for {
+		n, from, err := s.conn.ReadFrom(buffer)
+		if err != nil {
+			return
+		}
+
+		address, ok := from.(*net.UDPAddr)
+		if !ok || address.Port != s.port {
+			continue
+		}
+
+		// A multihomed peer can reply from its CNI router IP. The dedicated
+		// socket and packet hostnames keep relationship replies separate.
+		packet := &pb.HealthCheckPacket{}
+		if err := proto.Unmarshal(buffer[:n], packet); err != nil {
+			continue
+		}
+
+		if packet.Type == pb.PacketType_REPLY && packet.SourceHostname == s.remoteHostname && packet.DestinationHostname == s.localHost {
+			s.receiveReply(packet)
+		}
+	}
 }
 
 func (s *session) setState(newState SessionState) {

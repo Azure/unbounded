@@ -4,9 +4,63 @@
 package ebpf
 
 import (
+	"errors"
 	"net"
 	"testing"
+
+	"github.com/vishvananda/netlink"
 )
+
+func TestResolveNativeNexthops(t *testing.T) {
+	t.Parallel()
+
+	ep := TunnelEndpoint{Nexthops: []TunnelNexthop{
+		{RemoteIP: net.ParseIP("198.51.100.2"), IfIndex: 7, Protocol: TunnelProtoNone, Healthy: true, PeerName: "native"},
+		{RemoteIP: net.ParseIP("198.51.100.3"), IfIndex: 8, Protocol: TunnelProtoWireGuard, Healthy: true, PeerName: "tunnel"},
+	}}
+	gateway := net.ParseIP("192.0.2.1")
+	injected := errors.New("route lookup failed")
+
+	for _, tc := range []struct {
+		name   string
+		routes []netlink.Route
+		err    error
+		fail   bool
+	}{
+		{name: "routed", routes: []netlink.Route{{LinkIndex: 7, Gw: gateway}}},
+		{name: "on-link", routes: []netlink.Route{{LinkIndex: 7}}},
+		{name: "lookup failure", err: injected, fail: true},
+		{name: "missing route", fail: true},
+		{name: "wrong interface", routes: []netlink.Route{{LinkIndex: 9, Gw: gateway}}, fail: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := resolveNativeNexthops(ep, func(ip net.IP, options *netlink.RouteGetOptions) ([]netlink.Route, error) {
+				if !ip.Equal(ep.Nexthops[0].RemoteIP) || options.OifIndex != 7 {
+					t.Fatalf("unexpected native lookup: %s %+v", ip, options)
+				}
+
+				return tc.routes, tc.err
+			})
+			if (err != nil) != tc.fail || tc.err != nil && !errors.Is(err, tc.err) {
+				t.Fatalf("unexpected lookup error: %v", err)
+			}
+
+			if tc.fail {
+				return
+			}
+
+			want := ep.Nexthops[0].RemoteIP
+			if tc.name == "routed" {
+				want = gateway
+			}
+
+			if !got.Nexthops[0].RemoteIP.Equal(want) || !got.Nexthops[1].RemoteIP.Equal(ep.Nexthops[1].RemoteIP) ||
+				!ep.Nexthops[0].RemoteIP.Equal(net.ParseIP("198.51.100.2")) {
+				t.Fatalf("native resolution changed tunnel or caller state: %+v", got)
+			}
+		})
+	}
+}
 
 // TestCidrToKey validates that v4 CIDRs round-trip through IPv4-mapped
 // IPv6 form and that prefix lengths are correctly biased.
@@ -93,6 +147,159 @@ func TestCidrToKey(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestEndpointDistanceSelectionAndFailover(t *testing.T) {
+	t.Parallel()
+
+	endpoint := TunnelEndpoint{Nexthops: []TunnelNexthop{
+		{IfIndex: 1, Healthy: true, RouteDistance: 3},
+		{IfIndex: 2, Healthy: true, RouteDistance: 2},
+		{IfIndex: 3, Healthy: true, RouteDistance: 2},
+		{IfIndex: 4, Healthy: false, RouteDistance: 1},
+	}}
+	assertEligible := func(want map[uint32]bool) {
+		t.Helper()
+
+		value := endpointToC(endpoint)
+		if value.Count != 4 {
+			t.Fatalf("lost standby nexthops: %+v", value)
+		}
+
+		for i, next := range value.Nexthops[:value.Count] {
+			if next.Ifindex != endpoint.Nexthops[i].IfIndex {
+				t.Fatalf("distance selection reordered HRW slots: %+v", value)
+			}
+
+			if (next.Healthy != 0) != want[next.Ifindex] {
+				t.Fatalf("unexpected eligibility: %+v, want %v", value, want)
+			}
+		}
+	}
+
+	assertEligible(map[uint32]bool{2: true, 3: true})
+
+	endpoint.Nexthops[1].Healthy = false
+	endpoint.Nexthops[2].Healthy = false
+
+	assertEligible(map[uint32]bool{1: true})
+
+	endpoint.Nexthops[2].Healthy = true
+
+	assertEligible(map[uint32]bool{3: true})
+
+	if endpoint.Nexthops[0].IfIndex != 1 || !endpoint.Nexthops[0].Healthy {
+		t.Fatal("serialization mutated the standby state")
+	}
+}
+
+func TestEndpointHealthPreservesHRWSlots(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name  string
+		count int
+	}{
+		{"three gateways", 3},
+		{"over capacity", MaxNexthops + 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			endpoint := TunnelEndpoint{}
+			for i := range tc.count {
+				endpoint.Nexthops = append(endpoint.Nexthops, TunnelNexthop{IfIndex: uint32(i + 1), Healthy: true})
+			}
+
+			before := endpointToC(endpoint)
+			for failed := range int(before.Count) {
+				endpoint.Nexthops[failed].Healthy = false
+
+				after := endpointToC(endpoint)
+				for i := range int(before.Count) {
+					next := after.Nexthops[i]
+					if i != failed && (next.Ifindex != before.Nexthops[i].Ifindex || next.Healthy != 1) {
+						t.Fatalf("failure of slot %d moved a healthy gateway at slot %d: %+v", failed, i, after)
+					}
+
+					if i == failed && tc.count <= MaxNexthops && next.Healthy != 0 {
+						t.Fatalf("failed gateway remained eligible: %+v", after)
+					}
+
+					if i == failed && tc.count > MaxNexthops && (next.Ifindex != uint32(tc.count) || next.Healthy != 1) {
+						t.Fatalf("unused capacity candidate did not replace the failed slot: %+v", after)
+					}
+				}
+
+				endpoint.Nexthops[failed].Healthy = true
+				if got := endpointToC(endpoint); got != before {
+					t.Fatalf("recovery failed to restore the original HRW slots: %+v", got)
+				}
+			}
+		})
+	}
+}
+
+func TestOverflowSlotsSurviveOverlappingRecovery(t *testing.T) {
+	t.Parallel()
+
+	endpoint := TunnelEndpoint{}
+	for i := range MaxNexthops + 1 {
+		endpoint.Nexthops = append(endpoint.Nexthops, TunnelNexthop{IfIndex: uint32(i + 1), Healthy: true})
+	}
+
+	var previous TunnelEndpoint
+
+	for _, step := range []struct {
+		peer    int
+		healthy bool
+		want    [MaxNexthops]uint32
+	}{
+		{-1, true, [MaxNexthops]uint32{1, 2, 3, 4}},
+		{0, false, [MaxNexthops]uint32{5, 2, 3, 4}},
+		{1, false, [MaxNexthops]uint32{5, 2, 3, 4}},
+		{0, true, [MaxNexthops]uint32{5, 1, 3, 4}},
+		{1, true, [MaxNexthops]uint32{5, 1, 3, 4}},
+		{4, false, [MaxNexthops]uint32{2, 1, 3, 4}},
+		{4, true, [MaxNexthops]uint32{2, 1, 3, 4}},
+	} {
+		if step.peer >= 0 {
+			endpoint.Nexthops[step.peer].Healthy = step.healthy
+		}
+
+		selected := selectNexthopSlots(endpoint, previous)
+
+		value := endpointToC(selected)
+		for slot, index := range step.want {
+			if value.Nexthops[slot].Ifindex != index {
+				t.Fatalf("health transition peer=%d healthy=%v moved slot %d: %+v, want %v", step.peer, step.healthy, slot, value, step.want)
+			}
+		}
+
+		previous = selected
+	}
+
+	endpoint.Nexthops[1].RouteDistance = 2
+	selected := selectNexthopSlots(endpoint, previous)
+
+	value := endpointToC(selected)
+	if value.Nexthops[0].Ifindex != 5 || value.Nexthops[0].Healthy != 1 {
+		t.Fatalf("lower-cost overflow candidate did not replace an ineligible slot: %+v", value)
+	}
+
+	if len(endpoint.Nexthops) != MaxNexthops+1 || endpoint.Nexthops[0].IfIndex != 1 {
+		t.Fatal("slot selection modified the desired candidates")
+	}
+}
+
+func TestEndpointDistanceSelectionBeforeNexthopLimit(t *testing.T) {
+	t.Parallel()
+
+	endpoint := TunnelEndpoint{Nexthops: make([]TunnelNexthop, MaxNexthops)}
+	endpoint.Nexthops = append(endpoint.Nexthops, TunnelNexthop{IfIndex: 9, Healthy: true, RouteDistance: 2})
+
+	value := endpointToC(endpoint)
+	if value.Count != MaxNexthops || value.Nexthops[0].Ifindex != 9 || value.Nexthops[0].Healthy != 1 {
+		t.Fatalf("healthy fallback was lost to the nexthop limit: %+v", value)
 	}
 }
 

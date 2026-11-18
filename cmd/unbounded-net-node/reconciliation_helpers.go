@@ -183,23 +183,14 @@ func mergeAssignmentHealthCheckState(
 
 // resolveMeshPeerHealthCheckProfileName resolves health check profile for mesh (node-to-node) links.
 //
-// Health check profile precedence (most specific association wins):
-//  1. Explicit peer override (peer.HealthCheckProfileName): always wins if set.
-//     Same-pool gateway peers have this set from GatewayPool settings.
-//     Cross-pool gateway peers have this set from GatewayPoolPeering settings.
-//  2. SiteGatewayPoolAssignment: connects a particular site to a particular pool
-//  3. SitePeering: connects two specific sites
-//  4. Site: least specific -- default for all peers in the site
-//
-// GatewayPool and GatewayPoolPeering settings are resolved at peer construction
-// time and baked into peer.HealthCheckProfileName, so they always have highest priority.
-// This ordering applies uniformly to all node types (gateway and non-gateway).
+// Explicit overrides win. Assignment downlinks use their assignment profile;
+// ordinary mesh links use the SitePeering or Site profile, regardless of role.
 func resolveMeshPeerHealthCheckProfileName(isGatewayNode bool, peer meshPeerInfo, mySiteName string, siteHealthCheckProfileNames, peeringSiteHealthCheckProfileNames, assignmentSiteHealthCheckProfileNames map[string]string) string {
 	if peer.HealthCheckProfileName != "" {
 		return peer.HealthCheckProfileName
 	}
 
-	if profileName := assignmentSiteHealthCheckProfileNames[peer.SiteName]; profileName != "" {
+	if profileName := assignmentSiteHealthCheckProfileNames[peer.SiteName]; peer.TransitPoolName != "" && profileName != "" {
 		return profileName
 	}
 
@@ -451,6 +442,7 @@ func (index *peeringMTUIndex) between(a, b string) int {
 
 func applyPublishedGatewayMTUs(peers []gatewayPeerInfo, pools map[string]*unboundednetv1alpha1.GatewayPool, nodes map[string]*unboundednetv1alpha1.GatewayPoolNode) {
 	nodeMTU := func(name string) int {
+		name, _, _ = strings.Cut(name, "/")
 		if node := nodes[name]; node != nil && node.Status.ForwardingMTU != nil {
 			return int(*node.Status.ForwardingMTU)
 		}
@@ -806,6 +798,9 @@ func meshPeersEqual(a, b []meshPeerInfo) bool {
 
 	for i := range a {
 		if a[i].Name != b[i].Name ||
+			a[i].TransitPoolName != b[i].TransitPoolName ||
+			a[i].TransitPoolType != b[i].TransitPoolType ||
+			a[i].TransitWireguardPort != b[i].TransitWireguardPort ||
 			a[i].SiteName != b[i].SiteName ||
 			a[i].HealthCheckProfileName != b[i].HealthCheckProfileName ||
 			a[i].WireGuardPublicKey != b[i].WireGuardPublicKey ||
@@ -840,6 +835,7 @@ func gatewayPeersEqual(a, b []gatewayPeerInfo) bool {
 			!strSliceEqual(a[i].ExternalIPs, b[i].ExternalIPs) ||
 			!strSliceEqual(a[i].HealthEndpoints, b[i].HealthEndpoints) ||
 			!strSliceEqual(a[i].RoutedCidrs, b[i].RoutedCidrs) ||
+			!strSliceEqual(a[i].SourceCIDRs, b[i].SourceCIDRs) ||
 			!intMapEqual(a[i].RouteDistances, b[i].RouteDistances) ||
 			!strSliceEqual(a[i].PodCIDRs, b[i].PodCIDRs) ||
 			a[i].SkipPodCIDRRoutes != b[i].SkipPodCIDRRoutes ||
@@ -1007,15 +1003,7 @@ func removeUnmanagedWireGuardInterfaces(cfg *config, state *wireGuardState, desi
 			state.notrackManager.RemoveInterface(name)
 		}
 
-		delete(state.gatewayLinkManagers, name)
-		delete(state.gatewayWireguardManagers, name)
-		delete(state.gatewayHealthEndpoints, name)
-		delete(state.gatewayRoutes, name)
-		delete(state.gatewayRouteDistances, name)
-		delete(state.gatewaySiteCIDRs, name)
-		delete(state.gatewayPodCIDRs, name)
-		delete(state.gatewayNames, name)
-		delete(state.gatewaySiteNames, name)
+		state.removeGatewayInterfaceState(name)
 	}
 
 	return cleanupErr

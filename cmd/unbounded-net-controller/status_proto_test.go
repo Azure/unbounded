@@ -23,6 +23,7 @@ func TestProtoToNodeStatus(t *testing.T) {
 		},
 		Peers: []*statusproto.PeerStatus{
 			{
+				PeerId:   "peer-1/assignment/pool",
 				Name:     "peer-1",
 				PeerType: "remote",
 				Tunnel: &statusproto.PeerTunnelStatus{
@@ -98,6 +99,10 @@ func TestProtoToNodeStatus(t *testing.T) {
 
 	if len(resp.Peers) != 1 || resp.Peers[0].Name != "peer-1" {
 		t.Fatalf("unexpected peers: %+v", resp.Peers)
+	}
+
+	if resp.Peers[0].PeerID != "peer-1/assignment/pool" {
+		t.Fatalf("relationship identity lost during controller conversion: %+v", resp.Peers)
 	}
 
 	if resp.Peers[0].Tunnel.RxBytes != 1000 {

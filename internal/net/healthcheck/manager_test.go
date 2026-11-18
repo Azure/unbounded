@@ -196,6 +196,84 @@ type stateEvt struct {
 	oldState SessionState
 }
 
+func TestScopedPeersUseRemoteHostnameAndIndependentReplies(t *testing.T) {
+	port := freePort(t)
+
+	server, err := NewManager("node-b", port, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := server.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	defer server.Stop()
+
+	changes := make(chan stateEvt, 20)
+
+	client, err := NewManager("node-a", freePort(t), func(peer string, state, old SessionState) {
+		changes <- stateEvt{peer, state, old}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Stop()
+
+	settings := HealthCheckSettings{TransmitInterval: 50 * time.Millisecond, ReceiveInterval: 50 * time.Millisecond, DetectMultiplier: 3}
+	for _, peer := range []string{"node-b/assignment/pool-a", "node-b/transit/pool-b"} {
+		if err := client.AddScopedPeer(peer, "node-b", net.ParseIP("127.0.0.1"), settings); err != nil {
+			t.Fatal(err)
+		}
+
+		client.sessions[peer].port = port
+	}
+	// Registration before Start must retain the separate sockets.
+	if err := client.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	first := "node-b/assignment/pool-a"
+	second := "node-b/transit/pool-b"
+
+	waitForState(t, changes, first, StateUp, 5*time.Second)
+	deadline := time.After(5 * time.Second)
+
+	for {
+		status, err := client.GetPeerStatus(second)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if status.State == StateUp {
+			break
+		}
+
+		select {
+		case <-deadline:
+			t.Fatal("second scoped session did not receive its own replies")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	client.sessions[first].stop()
+	// A reply to another socket must not refresh the stopped session.
+	before, err := client.GetPeerStatus(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	after, err := client.GetPeerStatus(first)
+	if err != nil || after.PacketsReceived != before.PacketsReceived {
+		t.Fatalf("another relationship satisfied the stopped session: %v, %v", after, err)
+	}
+}
+
 func waitForState(t *testing.T, ch chan stateEvt, peer string, want SessionState, timeout time.Duration) {
 	t.Helper()
 

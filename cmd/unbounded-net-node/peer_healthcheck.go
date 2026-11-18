@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 
 	"k8s.io/klog/v2"
@@ -98,11 +99,12 @@ func registerPeersWithHealthCheck(
 		desiredHCPeers[peer.Name] = true
 		if peer.WireGuardPublicKey != "" {
 			state.mu.Lock()
-			state.meshPeerHealthCheckEnabled[peer.WireGuardPublicKey] = true
+			state.meshPeerHealthCheckEnabled[peer.Name] = true
 			state.mu.Unlock()
 		}
 
-		if err := state.healthCheckManager.AddPeer(peer.Name, net.ParseIP(overlayIP), settings); err != nil {
+		hostname, _, _ := strings.Cut(peer.Name, "/")
+		if err := state.healthCheckManager.AddScopedPeer(peer.Name, hostname, net.ParseIP(overlayIP), settings); err != nil {
 			registrationErrors = append(registrationErrors, fmt.Errorf("register mesh peer %s at %s: %w", peer.Name, overlayIP, err))
 		} else {
 			klog.V(4).Infof("Healthcheck: registered mesh peer %s at %s", peer.Name, overlayIP)
@@ -145,7 +147,8 @@ func registerPeersWithHealthCheck(
 		state.gatewayPeerHealthCheckEnabled[ifName] = true
 		state.mu.Unlock()
 
-		if err := state.healthCheckManager.AddPeer(gwPeer.Name, net.ParseIP(overlayIP), settings); err != nil {
+		hostname, _, _ := strings.Cut(gwPeer.Name, "/")
+		if err := state.healthCheckManager.AddScopedPeer(gwPeer.Name, hostname, net.ParseIP(overlayIP), settings); err != nil {
 			registrationErrors = append(registrationErrors, fmt.Errorf("register gateway peer %s at %s: %w", gwPeer.Name, overlayIP, err))
 		} else {
 			klog.V(4).Infof("Healthcheck: registered gateway peer %s at %s (iface %s)", gwPeer.Name, overlayIP, ifName)

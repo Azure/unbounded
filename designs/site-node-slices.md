@@ -2,7 +2,7 @@
 
 ## Purpose
 
-The site controller publishes non-gateway node connectivity data in
+The site controller publishes all Site member nodes' connectivity data in
 `SiteNodeSlice` resources. Kubernetes remains the authoritative persisted
 state. Informer caches are used to avoid API reads when cached desired and
 observed state already match.
@@ -22,7 +22,10 @@ Changes with broad matching effects use a global fallback:
 - Events whose resource type cannot be decoded safely
 
 This preserves correctness when a change can move nodes between Sites or
-change which nodes are excluded as gateways.
+change which nodes match gateway pools. Gateway selection is additive: it does
+not remove a node from its SiteNodeSlice or change its ordinary mesh links.
+SiteNodeSlices provide each node's own PodCIDRs; GatewayPoolNodes advertise
+transit prefixes and do not independently add their own PodCIDRs.
 
 ## Cache and API Authority
 

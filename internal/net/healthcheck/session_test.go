@@ -10,8 +10,75 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/protobuf/proto"
+
 	pb "github.com/Azure/unbounded/internal/net/healthcheck/proto"
 )
+
+func TestScopedSessionMultihomedReplies(t *testing.T) {
+	for _, tc := range []struct {
+		name, source, destination string
+		wrongPort                 bool
+		kind                      pb.PacketType
+		wantReceived              uint64
+	}{
+		{name: "multihomed reply", source: "remote", destination: "local", kind: pb.PacketType_REPLY, wantReceived: 1},
+		{name: "wrong source hostname", source: "other", destination: "local", kind: pb.PacketType_REPLY},
+		{name: "wrong destination hostname", source: "remote", destination: "other", kind: pb.PacketType_REPLY},
+		{name: "request", source: "remote", destination: "local", kind: pb.PacketType_REQUEST},
+		{name: "wrong source port", source: "remote", destination: "local", kind: pb.PacketType_REPLY, wrongPort: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = conn.Close() }()
+
+			remote, err := net.ListenPacket("udp4", "127.0.0.2:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = remote.Close() }()
+
+			port := remote.LocalAddr().(*net.UDPAddr).Port
+			if tc.wrongPort {
+				port++
+			}
+
+			s := newSession(sessionConfig{
+				peerHostname: "remote/assignment/pool", overlayIP: net.ParseIP("127.0.0.1"),
+				port: port, localHostname: "local", settings: DefaultSettings(), conn: conn,
+			})
+			s.remoteHostname = "remote"
+
+			packet, err := proto.Marshal(&pb.HealthCheckPacket{
+				SourceHostname: tc.source, DestinationHostname: tc.destination,
+				Type: tc.kind, TimestampNs: time.Now().UnixNano(),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := remote.WriteTo(packet, conn.LocalAddr()); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+				t.Fatal(err)
+			}
+
+			s.wg.Add(1)
+			go s.receiveScopedReplies()
+
+			s.wg.Wait()
+
+			if received := s.status().PacketsReceived; received != tc.wantReceived {
+				t.Fatalf("received %d replies, want %d", received, tc.wantReceived)
+			}
+		})
+	}
+}
 
 func TestSessionGoesUpOnReply(t *testing.T) {
 	conn, err := net.ListenPacket("udp", "127.0.0.1:0")

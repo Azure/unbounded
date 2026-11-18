@@ -2226,7 +2226,11 @@ func TestGatewayNodesIncludedInSiteStatusCount(t *testing.T) {
 
 	nodeIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
 	if err := nodeIndexer.Add(&corev1.Node{
-		ObjectMeta: metav1.ObjectMeta{Name: "gateway-a", Labels: map[string]string{"role": "gateway"}},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "gateway-a", Labels: map[string]string{"role": "gateway"},
+			Annotations: map[string]string{WireGuardPubKeyAnnotation: "gateway-key"},
+		},
+		Spec: corev1.NodeSpec{PodCIDRs: []string{"10.244.0.0/24"}},
 		Status: corev1.NodeStatus{Addresses: []corev1.NodeAddress{{
 			Type:    corev1.NodeInternalIP,
 			Address: "10.0.0.10",
@@ -2249,8 +2253,28 @@ func TestGatewayNodesIncludedInSiteStatusCount(t *testing.T) {
 		t.Fatalf("updateAllSiteSlices: %v", err)
 	}
 
-	if statusNodeCount != 1 || statusSliceCount != 0 {
-		t.Fatalf("site status counts = nodes %d, slices %d; want 1, 0", statusNodeCount, statusSliceCount)
+	if statusNodeCount != 1 || statusSliceCount != 1 {
+		t.Fatalf("site status counts = nodes %d, slices %d; want 1, 1", statusNodeCount, statusSliceCount)
+	}
+
+	slices, err := dynamicClient.Resource(siteNodeSliceGVR).List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(slices.Items) != 1 {
+		t.Fatalf("gateway-only Site lost its slice: %v", slices.Items)
+	}
+
+	var published unboundednetv1alpha1.SiteNodeSlice
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(slices.Items[0].Object, &published); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(published.Nodes) != 1 || published.Nodes[0].Name != "gateway-a" ||
+		published.Nodes[0].WireGuardPublicKey != "gateway-key" ||
+		!reflect.DeepEqual(published.Nodes[0].PodCIDRs, []string{"10.244.0.0/24"}) {
+		t.Fatalf("gateway slice lost direct connectivity data: %+v", published.Nodes)
 	}
 }
 

@@ -251,7 +251,7 @@ func TestGatewayForwardingMTUPublishedAfterConfiguration(t *testing.T) {
 }
 
 func TestMissingGatewayNodeHasNoFallbackRoutes(t *testing.T) {
-	routes, distances, learned := routedCIDRsForGatewayPeer(nil, []string{"10.0.0.0/16"}, "local", nil, nil, time.Time{}, time.Minute)
+	routes, distances, learned, _ := routedCIDRsForGatewayPeer(nil, []string{"10.0.0.0/16"}, "local", nil, nil, nil, time.Time{}, time.Minute)
 	if len(routes) != 0 || len(distances) != 0 || len(learned) != 0 {
 		t.Fatalf("missing gateway retained routes: %v %v %v", routes, distances, learned)
 	}
