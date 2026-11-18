@@ -1537,6 +1537,8 @@ func TestGeneratedCRDSetContainsAllCertificationResources(t *testing.T) {
 	t.Parallel()
 
 	want := []string{
+		"signal.unbounded-cloud.io_certificationcampaignpolicies.yaml",
+		"signal.unbounded-cloud.io_certificationcampaigns.yaml",
 		"signal.unbounded-cloud.io_certificationpolicies.yaml",
 		"signal.unbounded-cloud.io_certificationprofiles.yaml",
 		"signal.unbounded-cloud.io_certificationruns.yaml",

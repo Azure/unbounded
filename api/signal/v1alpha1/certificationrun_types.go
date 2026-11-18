@@ -303,6 +303,7 @@ type ExecutionPlanProvenance struct {
 
 // +kubebuilder:validation:XValidation:rule="self.profile == oldSelf.profile",message="profile is immutable"
 // +kubebuilder:validation:XValidation:rule="self.suite == oldSelf.suite",message="suite is immutable"
+// +kubebuilder:validation:XValidation:rule="has(self.campaign) == has(oldSelf.campaign) && (!has(self.campaign) || self.campaign == oldSelf.campaign)",message="campaign is immutable"
 // +kubebuilder:validation:XValidation:rule="self.participants == oldSelf.participants",message="participants are immutable"
 // +kubebuilder:validation:XValidation:rule="has(self.scriptBundle) == has(oldSelf.scriptBundle) && (!has(self.scriptBundle) || self.scriptBundle == oldSelf.scriptBundle)",message="scriptBundle is immutable"
 // +kubebuilder:validation:XValidation:rule="has(self.checks) == has(oldSelf.checks) && (!has(self.checks) || self.checks == oldSelf.checks)",message="checks are immutable"
@@ -322,6 +323,8 @@ type ExecutionPlanProvenance struct {
 type CertificationRunSpec struct {
 	Profile PinnedProfile `json:"profile"`
 	Suite   PinnedSuite   `json:"suite"`
+	// Campaign identifies the optional bounded campaign that requested this Run.
+	Campaign *CampaignRunIdentity `json:"campaign,omitempty"`
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=8
 	Participants []Participant `json:"participants"`
@@ -345,6 +348,12 @@ type CertificationRunSpec struct {
 	PlanProvenance *ExecutionPlanProvenance `json:"planProvenance,omitempty"`
 	Cancel         bool                     `json:"cancel,omitempty"`
 	Release        bool                     `json:"release,omitempty"`
+}
+
+type CampaignRunIdentity struct {
+	Name     string    `json:"name"`
+	UID      types.UID `json:"uid"`
+	Sequence int32     `json:"sequence"`
 }
 
 type WorkflowStatus struct {

@@ -165,6 +165,24 @@ func run(ctx context.Context, cfg config) error {
 		return fmt.Errorf("argo Workflows is required but Workflow.argoproj.io/v1alpha1 is unavailable: %w", err)
 	}
 
+	campaignEnrollment := &projectsignal.CampaignEnrollmentReconciler{
+		Client:    mgr.GetClient(),
+		Namespace: cfg.namespace,
+		Recorder:  mgr.GetEventRecorder(controllerName),
+	}
+	if err := campaignEnrollment.SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("register campaign enrollment reconciler: %w", err)
+	}
+
+	campaigns := &projectsignal.CampaignReconciler{
+		Client:    mgr.GetClient(),
+		Namespace: cfg.namespace,
+		Recorder:  mgr.GetEventRecorder(controllerName),
+	}
+	if err := campaigns.SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("register campaign reconciler: %w", err)
+	}
+
 	admission := &projectsignal.AdmissionReconciler{
 		Client:              mgr.GetClient(),
 		APIReader:           mgr.GetAPIReader(),

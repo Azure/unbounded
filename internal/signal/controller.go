@@ -54,6 +54,11 @@ const (
 	RunTriggerAnnotation       = "signal.unbounded-cloud.io/trigger"
 	RunAdmissionAnnotation     = "signal.unbounded-cloud.io/admission"
 	RunStartIdentityAnnotation = "signal.unbounded-cloud.io/start-fingerprints"
+	CampaignRequestName        = "signal.unbounded-cloud.io/campaign"
+	CampaignRequestUID         = "signal.unbounded-cloud.io/campaign-uid"
+	CampaignRequestSequence    = "signal.unbounded-cloud.io/campaign-sequence"
+	RunCampaignLabel           = "signal.unbounded-cloud.io/campaign"
+	RunCampaignUIDLabel        = "signal.unbounded-cloud.io/campaign-uid"
 	ExecutionAuthorityName     = "project-signal-execution-authority"
 	ExecutionStateName         = "project-signal-execution-state"
 	RunFinalizer               = "signal.unbounded-cloud.io/cleanup"
@@ -728,6 +733,19 @@ func (r *AdmissionReconciler) admitNode(ctx context.Context, node *corev1.Node, 
 		return err
 	}
 
+	campaignIdentity, err := campaignIdentityFromNode(
+		ctx,
+		r.APIReader,
+		r.Namespace,
+		node,
+		&profile,
+		suite,
+		r.now(),
+	)
+	if err != nil {
+		return err
+	}
+
 	participants, err := r.selectParticipants(ctx, node, &profile, checks)
 	if err != nil {
 		return err
@@ -870,6 +888,13 @@ func (r *AdmissionReconciler) admitNode(ctx context.Context, node *corev1.Node, 
 
 	if err != nil {
 		return fmt.Errorf("build immutable CertificationRun execution plan: %w", err)
+	}
+
+	if campaignIdentity != nil {
+		run.Spec.Campaign = campaignIdentity
+		run.Labels[RunCampaignLabel] = campaignIdentity.Name
+		run.Labels[RunCampaignUIDLabel] = string(campaignIdentity.UID)
+		run.Annotations[RunTriggerAnnotation] = "campaign"
 	}
 
 	if _, err := buildWorkflow(run); err != nil {
@@ -6327,6 +6352,9 @@ func (r *RunReconciler) clearRequest(ctx context.Context, run *signalv1.Certific
 
 	before := node.DeepCopy()
 	delete(node.Labels, RequestLabel)
+	delete(node.Annotations, CampaignRequestName)
+	delete(node.Annotations, CampaignRequestUID)
+	delete(node.Annotations, CampaignRequestSequence)
 
 	return r.Patch(ctx, &node, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
 }
