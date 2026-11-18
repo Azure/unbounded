@@ -135,6 +135,9 @@ func TestHostOperationUnfinishedOn(t *testing.T) {
 		return op
 	}
 
+	completed := outOfBandOperation("op", "machine-1", v1alpha3.OperationHostHardReboot)
+	completed.Status.Phase = v1alpha3.OperationPhaseComplete
+
 	tests := []struct {
 		name string
 		op   *v1alpha3.MachineOperation
@@ -152,12 +155,7 @@ func TestHostOperationUnfinishedOn(t *testing.T) {
 		},
 		{
 			name: "operation complete",
-			op: func() *v1alpha3.MachineOperation {
-				op := outOfBandOperation("op", "machine-1", v1alpha3.OperationHostHardReboot)
-				op.Status.Phase = v1alpha3.OperationPhaseComplete
-
-				return op
-			}(),
+			op:   completed,
 			want: false,
 		},
 		{
