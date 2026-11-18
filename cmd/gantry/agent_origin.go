@@ -68,6 +68,14 @@ func buildOriginClients(
 
 	puller, err = origin.New(c,
 		origin.WithLogger(logger),
+		origin.WithTransferMetrics(
+			func(kind string, bytes int64) {
+				inst.transfers.bytes.WithLabelValues("origin", kind).Add(float64(bytes))
+			},
+			func(kind string, delta int) {
+				inst.transfers.active.WithLabelValues("origin", kind).Add(float64(delta))
+			},
+		),
 		origin.WithByteMetrics(func(kind string, bytes int64) {
 			inst.originBytes.WithLabelValues(kind).Add(float64(bytes))
 		}),
@@ -105,6 +113,15 @@ func buildOriginClients(
 
 	mirror, err = origin.New(c,
 		origin.WithLogger(logger),
+		origin.WithMetrics(nil, func(_, class string) { inst.originFailureTotal.WithLabelValues(class).Inc() }),
+		origin.WithTransferMetrics(
+			func(kind string, bytes int64) {
+				inst.transfers.bytes.WithLabelValues("origin", kind).Add(float64(bytes))
+			},
+			func(kind string, delta int) {
+				inst.transfers.active.WithLabelValues("origin", kind).Add(float64(delta))
+			},
+		),
 		origin.WithByteMetrics(func(kind string, bytes int64) {
 			inst.originBytes.WithLabelValues(kind).Add(float64(bytes))
 		}),

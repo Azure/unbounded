@@ -1,0 +1,2 @@
+# Only used by `make unbounded-operator-manifests`; not part of the packaged chart.
+values-static.yaml

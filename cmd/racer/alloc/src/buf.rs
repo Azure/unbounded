@@ -21,9 +21,21 @@
 //! never an undercount). A failed idle charge frees the storage instead.
 //!
 //! Non-wiped storage is pooled dirty: returns do not zero or discard it.
-//! `MADV_DONTNEED` is applied only by [`Pool::shed`], which the owner calls
-//! under memory pressure; discarded mappings stay pooled "cold" and uncharged.
 //! Storage of at least 2 MiB still comes from the huge-page mmap path.
+//!
+//! # Sizing
+//!
+//! Each size class counts its checked-out buffers (taken on the owner,
+//! returned from any thread) and feeds that count to a [`Provision`]
+//! controller. [`Pool::maintain`] ticks the controllers: idle storage above a
+//! class's target is "cooled": mappings are discarded with `MADV_DONTNEED`
+//! and kept cold (uncharged, no resident pages), heap storage is freed. Cold
+//! mappings are reused after warm ones and unmapped once they stay unused for
+//! [`COLD_HOLDS`] hold times. A take served from cold storage counts as a
+//! shortfall, so a class trimmed too eagerly keeps more next time. The hold
+//! time of a class follows the cost of faulting in its capacity, so large
+//! buffers are kept longer than small ones. [`Pool::shed`] cools idle storage
+//! at once, and [`Pressure::Critical`] refuses returns.
 //! Disk reads should land in pooled buffers taken from the worker's pool so a
 //! hit reuses storage instead of mapping and unmapping a fresh page.
 //!
@@ -37,7 +49,7 @@
 //! | `AlignedBuffer<C>`, slab `BufferPool`, `Slab::allocate` free lists (except disk write staging) | [`Buf<C>`] from [`Pool::take`] |
 //! | `FrozenBuffer<C>` | `Arc<Buf<C>>` |
 //! | `WorkerBufferPool`, `SharedPool`, `DetachedBuffer`, `give_back` | [`Pool`] with its cross-thread return stacks; a `Buf` is already `Send` |
-//! | flow `Recycler`/`Buffers`, `Charge::buffer`, `Charge::recycle`, `PoolDemand` sizing | [`Pool::take`] with the request's charge; [`Pool::shed`] for pressure |
+//! | flow `Recycler`/`Buffers`, `Charge::buffer`, `Charge::recycle`, `PoolDemand` sizing | [`Pool::take`] with the request's charge; [`Pool::maintain`] and [`Pool::shed`] for sizing |
 //! | `PoolCharge`, `AlignedBody`, `ChargedBytes`, `ChargedBuffer` (flow and `src`) | [`Buf<Charge<P>>`]; the charge rides in the buffer |
 //! | per-allocation `Charge::requires_wipe` | the `wipe` flag at [`Pool::take`] |
 //! | recycler bytes, shared budget | one [`PoolAccount`] class for idle bytes; idle write staging buffers (slab pool) still keep their primary admission charge |
@@ -53,14 +65,19 @@
 //! the root crate. `Owned(Vec)` and slab variants fold into `Aligned`.
 
 use crate::sync::{Arc, AtomicBool, AtomicPtr, AtomicUsize, Ordering};
-use crate::{Charge, Error, Release, Result, allocate_zeroed};
+use crate::{
+    Charge, Error, Plan, PoolStats, Pressure, Provision, ProvisionConfig, Release, Result,
+    allocate_zeroed,
+};
 use std::alloc::{Layout, dealloc};
 use std::fmt;
 use std::ops::{Deref, DerefMut};
+use std::time::{Duration, Instant};
 
 /// Number of distinct capacities a pool keeps at once. When every class is
 /// in use, a new size takes over the least recently used class with no idle
-/// storage; if every class holds idle storage, the new size is unpooled.
+/// or checked-out storage; if every class holds storage, the new size is
+/// unpooled.
 pub const MAX_CLASSES: usize = 16;
 
 /// Capacity granule. Capacities round up to this or the alignment, whichever
@@ -68,6 +85,18 @@ pub const MAX_CLASSES: usize = 16;
 pub const GRANULE: usize = 4096;
 
 const NO_CLASS: u8 = u8::MAX;
+
+/// Hold times a cold mapping stays unused before it is unmapped.
+pub const COLD_HOLDS: u32 = 4;
+
+/// Estimated cost of faulting in and zeroing one MiB of new storage (about
+/// 8 GiB/s), the acquire cost each class's hold time is derived from.
+const ACQUIRE_PER_MIB: Duration = Duration::from_micros(125);
+
+fn acquire_cost(capacity: usize) -> Duration {
+    let nanos = (capacity as u128 * ACQUIRE_PER_MIB.as_nanos()) >> 20;
+    Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
+}
 
 /// Accounting for idle pooled bytes, shared by every thread that returns
 /// buffers. Implementations must be cheap and must not block.
@@ -202,6 +231,9 @@ struct Region {
     // mapped it with that policy. Pages keep the policy across discards.
     node: Option<u16>,
 
+    // When the owner discarded the pages of this idle mapping, so it is cold.
+    cooled: Option<Instant>,
+
     next: AtomicPtr<Region>,
 }
 
@@ -219,6 +251,7 @@ impl Region {
             charged: false,
             class,
             node: None,
+            cooled: None,
             next: AtomicPtr::new(std::ptr::null_mut()),
         }))
     }
@@ -306,8 +339,11 @@ struct Class {
 
     head: AtomicPtr<Region>,
 
-    // Regions idle in this class, in the owner's list or the return stack.
+    // Regions idle in this class, in the owner's lists or the return stack.
     idle: AtomicUsize,
+
+    // Pooled buffers of this class checked out and not yet returned.
+    out: AtomicUsize,
 }
 
 impl Class {
@@ -316,6 +352,7 @@ impl Class {
             capacity: AtomicUsize::new(0),
             head: AtomicPtr::new(std::ptr::null_mut()),
             idle: AtomicUsize::new(0),
+            out: AtomicUsize::new(0),
         }
     }
 
@@ -354,12 +391,15 @@ struct Shared {
 
     closed: AtomicBool,
 
+    // Critical memory pressure: returns are freed instead of pooled.
+    refusing: AtomicBool,
+
     // Charged idle bytes.
     idle_bytes: AtomicUsize,
 
     max_idle: usize,
 
-    // Returns refused (cap, budget, or closed pool) and freed instead.
+    // Returns refused (cap, budget, pressure, or closed pool) and freed instead.
     rejects: AtomicUsize,
 
     classes: [Class; MAX_CLASSES],
@@ -378,15 +418,21 @@ impl Shared {
     /// Pool a returning region, or hand it back to be freed.
     fn give_back(&self, mut region: Box<Region>) -> Option<Box<Region>> {
         let class = self.classes.get(usize::from(region.class))?;
+        class.out.fetch_sub(1, Ordering::AcqRel);
         if self.closed.load(Ordering::Acquire) {
+            return Some(region);
+        }
+        if self.refusing.load(Ordering::Acquire) {
+            self.rejects.fetch_add(1, Ordering::Relaxed);
             return Some(region);
         }
         if class.idle.fetch_add(1, Ordering::AcqRel) >= self.max_idle
             || class.capacity.load(Ordering::Acquire) != region.capacity
         {
-            // Full, or the owner reassigned this class to another size while
-            // the buffer was out. The owner also drops mismatched regions on
-            // drain, which covers a reassignment racing this check.
+            // Full, or the owner reassigned this class to another size once
+            // the decrement above left it with nothing out. The owner also
+            // drops mismatched regions on drain, which covers a reassignment
+            // racing this check.
             class.idle.fetch_sub(1, Ordering::AcqRel);
             self.rejects.fetch_add(1, Ordering::Relaxed);
             return Some(region);
@@ -419,7 +465,8 @@ pub struct PoolConfig {
     /// Memory alignment of every buffer; a power of two.
     pub alignment: usize,
 
-    /// Idle buffers kept per capacity class.
+    /// Idle buffers kept per capacity class, warm or cold. A ceiling only;
+    /// [`Pool::maintain`] sizes each class to its demand.
     pub max_idle_per_class: usize,
 }
 
@@ -427,21 +474,41 @@ pub struct PoolConfig {
 pub struct Pool {
     shared: Arc<Shared>,
 
-    // Boxed: regions are intrusive stack nodes whose address must not change.
+    // Charged idle storage, most recently returned last. Boxed: regions are
+    // intrusive stack nodes whose address must not change.
     #[allow(clippy::vec_box)]
     local: [Vec<Box<Region>>; MAX_CLASSES],
+
+    // Discarded (cold) mappings, most recently cooled last.
+    #[allow(clippy::vec_box)]
+    cold: [Vec<Box<Region>>; MAX_CLASSES],
+
+    // Sizing controller of each assigned class.
+    demand: [Option<Provision>; MAX_CLASSES],
+
+    pressure: Pressure,
+
+    // Time of the latest `maintain`. Sizing runs on the owner's clock only, so
+    // a virtual clock keeps it deterministic.
+    clock: Option<Instant>,
 
     alignment: usize,
 
     granule: usize,
 
-    // Buffers checked out since creation, for demand-driven idle trimming.
+    // Buffers checked out since creation.
     takes: u64,
 
     // Checkouts that allocated (mapped) new storage.
     misses: u64,
 
-    // Checkouts unpooled because every class held idle storage.
+    // Checkouts served from cold storage.
+    cold_hits: u64,
+
+    // Idle regions cooled or freed by sizing.
+    trimmed: u64,
+
+    // Checkouts unpooled because every class held storage.
     unpooled: u64,
 
     // Value of `takes` at each class's last checkout, to reassign the least
@@ -456,15 +523,23 @@ pub struct Pool {
 /// Lifetime counters of a [`Pool`].
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PoolCounters {
-    /// Checkouts served from idle storage.
+    /// Checkouts served from idle storage, warm or cold.
     pub hits: u64,
     /// Checkouts that allocated new storage (an `mmap` for large buffers).
     pub misses: u64,
+    /// Checkouts served from cold storage: their pages fault in again. Each
+    /// one also counts as a hit.
+    pub cold_hits: u64,
     /// Returned buffers the pool refused and freed (an `munmap` for large
-    /// buffers): its idle cap or idle budget was full, or it was closed.
+    /// buffers): its idle cap or idle budget was full, memory pressure was
+    /// critical, or it was closed.
     pub rejects: u64,
+    /// Idle buffers cooled or freed because they exceeded their class's
+    /// target.
+    pub trimmed: u64,
     /// Checkouts that could not be pooled because every size class held idle
-    /// storage of another size. Each one also counts as a miss.
+    /// or checked-out storage of another size. Each one also counts as a
+    /// miss.
     pub unpooled: u64,
 }
 
@@ -487,34 +562,148 @@ impl Pool {
             shared: Arc::new(Shared {
                 account: Box::new(account),
                 closed: AtomicBool::new(false),
+                refusing: AtomicBool::new(false),
                 idle_bytes: AtomicUsize::new(0),
                 max_idle: config.max_idle_per_class,
                 rejects: AtomicUsize::new(0),
                 classes: std::array::from_fn(|_| Class::new()),
             }),
             local: std::array::from_fn(|_| Vec::new()),
+            cold: std::array::from_fn(|_| Vec::new()),
+            demand: std::array::from_fn(|_| None),
+            pressure: Pressure::Normal,
             alignment: config.alignment,
             granule: config.alignment.max(GRANULE),
             takes: 0,
             misses: 0,
+            cold_hits: 0,
+            trimmed: 0,
             unpooled: 0,
             last_take: [0; MAX_CLASSES],
+            clock: None,
             bind_refused: false,
         })
     }
 
-    /// Lifetime hit, miss, and reject counters.
+    /// Lifetime hit, miss, reject, and trim counters.
     pub fn counters(&self) -> PoolCounters {
         PoolCounters {
             hits: self.takes.wrapping_sub(self.misses),
             misses: self.misses,
+            cold_hits: self.cold_hits,
             rejects: self.shared.rejects.load(Ordering::Relaxed) as u64,
+            trimmed: self.trimmed,
             unpooled: self.unpooled,
         }
     }
 
-    /// Buffers checked out since creation. Owners compare samples across a
-    /// maintenance window to tell an idle pool from one in use.
+    /// Sizing snapshot: idle, cold, in-use, and target bytes plus counters.
+    /// `hold` is the longest hold time of any class.
+    pub fn stats(&self) -> PoolStats {
+        let counters = self.counters();
+        let mut stats = PoolStats {
+            bytes: self.idle_bytes(),
+            hits: counters.hits,
+            misses: counters.misses,
+            cold_hits: counters.cold_hits,
+            rejects: counters.rejects,
+            trimmed: counters.trimmed,
+            unpooled: counters.unpooled,
+            constrained: self.pressure != Pressure::Normal,
+            ..PoolStats::default()
+        };
+        for (index, class) in self.shared.classes.iter().enumerate() {
+            let capacity = class.capacity.load(Ordering::Relaxed);
+            stats.entries += class.idle.load(Ordering::Relaxed);
+            stats.in_use += class.out.load(Ordering::Relaxed) * capacity;
+            stats.cold += self.cold[index].len() * capacity;
+            if let Some(demand) = &self.demand[index] {
+                stats.target += demand.target() * capacity;
+                stats.hold = stats.hold.max(demand.effective_hold());
+            }
+        }
+        stats
+    }
+
+    /// Set the memory pressure sizing responds to. Elevated pressure keeps at
+    /// most one idle buffer per class above use and shortens hold times;
+    /// critical pressure cools all idle storage at the next
+    /// [`Self::maintain`] and frees returns instead of pooling them.
+    pub fn set_pressure(&mut self, pressure: Pressure) {
+        self.pressure = pressure;
+        self.shared
+            .refusing
+            .store(pressure == Pressure::Critical, Ordering::Release);
+    }
+
+    /// Current memory pressure.
+    pub fn pressure(&self) -> Pressure {
+        self.pressure
+    }
+
+    /// Size every class to its demand: cool idle storage above its target and
+    /// unmap cold storage unused for [`COLD_HOLDS`] hold times. Cheap between
+    /// controller samples. Returns resident bytes released.
+    pub fn maintain(&mut self, now: Instant) -> usize {
+        self.clock = Some(now);
+        let mut released = 0;
+        for index in 0..MAX_CLASSES {
+            if self.demand[index].is_none() {
+                continue;
+            }
+            self.drain_class(index);
+            let out = self.shared.classes[index].out.load(Ordering::Acquire);
+            let warm = self.local[index].len();
+            let Some(demand) = self.demand[index].as_mut() else {
+                continue;
+            };
+            demand.observe(out);
+            let plan = demand.tick(now, out + warm, 0, self.pressure);
+            let expiry = demand.effective_hold().saturating_mul(COLD_HOLDS);
+            if let Plan::Release(count) = plan {
+                released += self.cool(index, count);
+            }
+            self.expire_cold(index, now, expiry);
+        }
+        released
+    }
+
+    /// Cool up to `count` of class `index`'s least recently returned warm
+    /// regions. Returns resident bytes released.
+    fn cool(&mut self, index: usize, count: usize) -> usize {
+        let count = count.min(self.local[index].len());
+        let mut released = 0;
+        for mut region in self.local[index].drain(..count) {
+            released += region.capacity;
+            self.shared.uncharge(&mut region);
+            if region.discard() {
+                region.cooled = self.clock;
+                self.cold[index].push(region);
+            } else {
+                self.shared.classes[index]
+                    .idle
+                    .fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        self.trimmed = self.trimmed.wrapping_add(count as u64);
+        released
+    }
+
+    /// Unmap class `index`'s cold regions cooled at least `expiry` ago.
+    /// Regions cooled before the first `maintain` start their wait now.
+    fn expire_cold(&mut self, index: usize, now: Instant, expiry: Duration) {
+        let class = &self.shared.classes[index];
+        self.cold[index].retain_mut(|region| {
+            let cooled = *region.cooled.get_or_insert(now);
+            let fresh = now.saturating_duration_since(cooled) < expiry;
+            if !fresh {
+                class.idle.fetch_sub(1, Ordering::AcqRel);
+            }
+            fresh
+        });
+    }
+
+    /// Buffers checked out since creation.
     pub fn takes(&self) -> u64 {
         self.takes
     }
@@ -546,12 +735,19 @@ impl Pool {
                 _ => {}
             }
         }
-        // Reassign the least recently used class without idle storage, so
-        // arrival order cannot pin the classes to stale sizes. Buffers of the
-        // old size still out are freed when they return.
+        // Reassign the least recently used class without idle or checked-out
+        // storage, so arrival order cannot pin the classes to stale sizes.
+        // Only the owner increments `out`, so a class seen with nothing out
+        // stays that way here, and its counts and demand start clean for the
+        // new size. A return that already decremented `out` may still be
+        // pooling its region; it is refused or dropped on drain.
         let free = free.or_else(|| {
             (0..MAX_CLASSES)
-                .filter(|&index| self.shared.classes[index].idle.load(Ordering::Acquire) == 0)
+                .filter(|&index| {
+                    let class = &self.shared.classes[index];
+                    class.out.load(Ordering::Acquire) == 0
+                        && class.idle.load(Ordering::Acquire) == 0
+                })
                 .min_by_key(|&index| self.last_take[index])
         });
         let Some(index) = free else {
@@ -561,6 +757,12 @@ impl Pool {
         self.shared.classes[index]
             .capacity
             .store(capacity, Ordering::Release);
+        self.demand[index] = Some(Provision::new(ProvisionConfig {
+            unit: 1,
+            floor: 0,
+            ceiling: usize::MAX / capacity,
+            acquire: acquire_cost(capacity),
+        }));
         index as u8
     }
 
@@ -577,14 +779,16 @@ impl Pool {
         let class = &self.shared.classes[index];
         let capacity = class.capacity.load(Ordering::Relaxed);
         let shared = &self.shared;
-        self.local[index].retain_mut(|region| {
+        let mut keep = |region: &mut Box<Region>| {
             if region.capacity == capacity {
                 return true;
             }
             class.idle.fetch_sub(1, Ordering::AcqRel);
             shared.uncharge(region);
             false
-        });
+        };
+        self.local[index].retain_mut(&mut keep);
+        self.cold[index].retain_mut(keep);
     }
 
     fn pop(&mut self, class: u8, node: Option<u16>) -> Option<Box<Region>> {
@@ -593,15 +797,17 @@ impl Pool {
         if self.local[index].is_empty() || node.is_some() {
             self.drain_class(index);
         }
-        let mut region = match node {
-            None => self.local[index].pop()?,
-            Some(node) => {
-                // Only storage already bound to `node`; the caller maps new
-                // storage there rather than reuse pages on another node.
-                let position = self.local[index]
-                    .iter()
-                    .rposition(|region| region.node == Some(node))?;
-                self.local[index].swap_remove(position)
+        let mut region = match Self::pick(&mut self.local[index], node) {
+            Some(region) => region,
+            None => {
+                let mut region = Self::pick(&mut self.cold[index], node)?;
+                region.cooled = None;
+                self.cold_hits = self.cold_hits.wrapping_add(1);
+                // Sizing gave up storage that was needed after all: keep more.
+                if let (Some(demand), Some(now)) = (self.demand[index].as_mut(), self.clock) {
+                    demand.shortfall(now, 1);
+                }
+                region
             }
         };
         self.shared.classes[index]
@@ -609,6 +815,20 @@ impl Pool {
             .fetch_sub(1, Ordering::AcqRel);
         self.shared.uncharge(&mut region);
         Some(region)
+    }
+
+    /// The most recently pooled region of `list`; with `node`, only one
+    /// already bound to it (the caller maps new storage there rather than
+    /// reuse pages on another node).
+    #[allow(clippy::vec_box)]
+    fn pick(list: &mut Vec<Box<Region>>, node: Option<u16>) -> Option<Box<Region>> {
+        match node {
+            None => list.pop(),
+            Some(node) => {
+                let position = list.iter().rposition(|region| region.node == Some(node))?;
+                Some(list.swap_remove(position))
+            }
+        }
     }
 
     /// Take a buffer of `len` bytes bound to `charge`, which must cover the
@@ -658,6 +878,16 @@ impl Pool {
                 region
             }
         };
+        if class != NO_CLASS {
+            let index = usize::from(class);
+            let out = self.shared.classes[index]
+                .out
+                .fetch_add(1, Ordering::AcqRel)
+                + 1;
+            if let Some(demand) = self.demand[index].as_mut() {
+                demand.observe(out);
+            }
+        }
         Ok(Buf {
             region: Some(region),
             len,
@@ -680,32 +910,23 @@ impl Pool {
         }
     }
 
-    /// Under memory pressure, release at least `bytes` of charged idle memory
-    /// where possible. Mappings are discarded with `MADV_DONTNEED` and kept
-    /// cold (uncharged); heap storage is freed. Returns bytes released.
+    /// Release at least `bytes` of charged idle memory now where possible,
+    /// least recently returned first. Mappings are discarded with
+    /// `MADV_DONTNEED` and kept cold (uncharged); heap storage is freed.
+    /// Returns bytes released.
     pub fn shed(&mut self, bytes: usize) -> usize {
         self.drain_returns();
         let mut shed = 0;
         for index in 0..MAX_CLASSES {
-            let mut position = 0;
-            while shed < bytes && position < self.local[index].len() {
-                let region = &mut self.local[index][position];
-                if !region.charged {
-                    position += 1;
-                    continue;
+            let mut count = 0;
+            for region in &self.local[index] {
+                if shed >= bytes {
+                    break;
                 }
                 shed += region.capacity;
-                if region.discard() {
-                    self.shared.uncharge(region);
-                    position += 1;
-                } else {
-                    let mut region = self.local[index].swap_remove(position);
-                    self.shared.classes[index]
-                        .idle
-                        .fetch_sub(1, Ordering::AcqRel);
-                    self.shared.uncharge(&mut region);
-                }
+                count += 1;
             }
+            self.cool(index, count);
         }
         shed
     }
@@ -713,8 +934,11 @@ impl Pool {
     /// Free every idle buffer.
     pub fn clear(&mut self) {
         self.drain_returns();
-        for (index, local) in self.local.iter_mut().enumerate() {
-            for mut region in local.drain(..) {
+        for index in 0..MAX_CLASSES {
+            let regions = self.local[index]
+                .drain(..)
+                .chain(self.cold[index].drain(..));
+            for mut region in regions {
                 self.shared.classes[index]
                     .idle
                     .fetch_sub(1, Ordering::AcqRel);
@@ -1140,7 +1364,7 @@ mod tests {
                 hits: 0,
                 misses: 3,
                 rejects: 1,
-                unpooled: 0,
+                ..PoolCounters::default()
             }
         );
         // Steady reuse within the idle budget allocates nothing new.
@@ -1155,7 +1379,7 @@ mod tests {
                 hits: 20,
                 misses: 3,
                 rejects: 1,
-                unpooled: 0,
+                ..PoolCounters::default()
             }
         );
         // The per-class cap refuses past four idle buffers.
@@ -1204,24 +1428,65 @@ mod tests {
     #[test]
     fn reclaim_takes_least_recently_used_class() {
         let mut pool = plain_pool();
-        let held: Vec<_> = (0..MAX_CLASSES)
-            .map(|i| pool.take(1000 + i * GRANULE, (), false).unwrap())
-            .collect();
-        // All classes are empty while buffers are out; class 0 is oldest.
-        let keep = pool
-            .take(1000 + (MAX_CLASSES - 1) * GRANULE, (), false)
-            .unwrap();
+        for i in 0..MAX_CLASSES {
+            drop(pool.take(1000 + i * GRANULE, (), false).unwrap());
+        }
+        // Use class 0 again, so class 1 is the oldest; then empty them all.
+        drop(pool.take(1000, (), false).unwrap());
+        pool.clear();
         let fresh = pool.take(100 * GRANULE, (), false).unwrap();
-        assert_eq!(fresh.region().class, 0);
-        // The buffer of the old size returns to a reassigned class and is freed.
-        let rejects = pool.counters().rejects;
-        drop(held);
-        assert_eq!(pool.counters().rejects, rejects + 1);
-        drop((keep, fresh));
+        assert_eq!(fresh.region().class, 1);
+        drop(fresh);
         // The reassigned class serves its new size.
         let before = pool.counters().misses;
         drop(pool.take(100 * GRANULE, (), false).unwrap());
         assert_eq!(pool.counters().misses, before);
+        assert_eq!(pool.counters().unpooled, 0);
+    }
+
+    #[test]
+    fn checked_out_class_is_not_reassigned() {
+        let mut pool = plain_pool();
+        let mut held: Vec<_> = (0..MAX_CLASSES)
+            .map(|i| pool.take(1000 + i * GRANULE, (), false).unwrap())
+            .collect();
+        let held_bytes: usize = held.iter().map(|buf| buf.capacity()).sum();
+        // Every class has a buffer out and nothing idle: a new size is unpooled.
+        let big = 100 * GRANULE;
+        let fresh = pool.take(big, (), false).unwrap();
+        assert!(!fresh.is_pooled());
+        assert_eq!(pool.counters().unpooled, 1);
+        assert_eq!(pool.stats().in_use, held_bytes);
+        drop(fresh);
+        // The old buffer returns to its own class, unchanged.
+        let first = held.remove(0);
+        let first_bytes = first.capacity();
+        drop(first);
+        assert_eq!(pool.counters().rejects, 0);
+        assert_eq!(pool.stats().in_use, held_bytes - first_bytes);
+        // Still idle storage there: the new size remains unpooled.
+        let fresh = pool.take(big, (), false).unwrap();
+        assert!(!fresh.is_pooled());
+        drop(fresh);
+        // Once class 0 holds nothing, the new size takes it over.
+        pool.clear();
+        let fresh = pool.take(big, (), false).unwrap();
+        assert!(fresh.is_pooled());
+        assert_eq!(fresh.region().class, 0);
+        assert_eq!(pool.counters().unpooled, 2);
+        assert_eq!(pool.stats().in_use, held_bytes - first_bytes + big);
+        // The other classes keep their sizes: their buffers pool on return.
+        drop(held);
+        assert_eq!(pool.counters().rejects, 0);
+        assert_eq!(pool.stats().in_use, big);
+        drop(fresh);
+        assert_eq!(pool.stats().in_use, 0);
+        assert!(
+            pool.shared
+                .classes
+                .iter()
+                .all(|class| class.out.load(Ordering::Acquire) == 0)
+        );
     }
 
     #[test]
@@ -1464,6 +1729,135 @@ mod tests {
         assert_eq!(limit.used(), 0);
     }
 
+    /// Steps `pool` through `steps` controller samples from `start`, taking
+    /// and returning `trickle` buffers of `len` bytes at each.
+    fn run(pool: &mut Pool, start: Instant, steps: u32, len: usize, trickle: usize) -> Instant {
+        let mut now = start;
+        for _ in 0..steps {
+            now += crate::SAMPLE_PERIOD;
+            let held: Vec<_> = (0..trickle)
+                .map(|_| pool.take(len, (), false).unwrap())
+                .collect();
+            drop(held);
+            pool.maintain(now);
+        }
+        now
+    }
+
+    #[test]
+    fn maintain_trims_a_spike_under_trickle_traffic() {
+        let limit = std::sync::Arc::new(IdleLimit::new(1 << 30));
+        let mut pool = pool(&limit);
+        let start = Instant::now();
+        let spike: Vec<_> = (0..4)
+            .map(|_| pool.take(4096, (), false).unwrap())
+            .collect();
+        drop(spike);
+        assert_eq!(pool.stats().bytes, 4 * 4096);
+        // Within the hold time the spike's storage stays warm.
+        let now = run(&mut pool, start, 5, 4096, 1);
+        assert_eq!(pool.stats().bytes, 4 * 4096);
+        assert_eq!(pool.counters().trimmed, 0);
+        // A trickle of one buffer at a time keeps one, not the spike.
+        run(&mut pool, now, 100, 4096, 1);
+        let stats = pool.stats();
+        assert_eq!(stats.bytes, 4096);
+        assert_eq!(stats.target, 4096);
+        assert_eq!(stats.in_use, 0);
+        assert_eq!(stats.cold, 0, "heap storage is freed, not kept cold");
+        assert_eq!(pool.counters().trimmed, 3);
+        assert_eq!(limit.used(), 4096);
+        assert_eq!(pool.counters().misses, 4);
+    }
+
+    #[test]
+    fn maintain_keeps_steady_demand_without_churn() {
+        let limit = std::sync::Arc::new(IdleLimit::new(1 << 30));
+        let mut pool = pool(&limit);
+        run(&mut pool, Instant::now(), 200, 4096, 3);
+        let counters = pool.counters();
+        assert_eq!(counters.misses, 3);
+        assert_eq!(counters.trimmed, 0);
+        assert_eq!(pool.stats().bytes, 3 * 4096);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn cooled_mappings_are_reused_then_unmapped() {
+        let limit = std::sync::Arc::new(IdleLimit::new(1 << 30));
+        let mut pool = pool(&limit);
+        let len = crate::HUGE_PAGE_BYTES;
+        let start = Instant::now();
+        let spike: Vec<_> = (0..2).map(|_| pool.take(len, (), false).unwrap()).collect();
+        let addresses: Vec<_> = spike.iter().map(|buf| buf.as_ptr() as usize).collect();
+        drop(spike);
+        // Idle past the hold time: both mappings are discarded but kept.
+        let now = run(&mut pool, start, 50, len, 0);
+        let stats = pool.stats();
+        assert_eq!(stats.bytes, 0);
+        assert_eq!(stats.cold, 2 * len);
+        assert_eq!(stats.entries, 2);
+        assert_eq!(limit.used(), 0);
+        assert_eq!(pool.counters().trimmed, 2);
+        // A take reuses a cold mapping and counts it as a shortfall.
+        let buf = pool.take(len, (), false).unwrap();
+        assert!(addresses.contains(&(buf.as_ptr() as usize)));
+        assert!(buf.iter().all(|b| *b == 0));
+        let counters = pool.counters();
+        assert_eq!(
+            (counters.hits, counters.cold_hits, counters.misses),
+            (1, 1, 2)
+        );
+        drop(buf);
+        // Once demand is gone again, cold storage unused for COLD_HOLDS hold
+        // times is unmapped.
+        let hold = pool.stats().hold;
+        let steps = (hold * (COLD_HOLDS + 8)).as_millis() / crate::SAMPLE_PERIOD.as_millis();
+        run(&mut pool, now, u32::try_from(steps).unwrap(), len, 0);
+        let stats = pool.stats();
+        assert_eq!((stats.bytes, stats.cold, stats.entries), (0, 0, 0));
+    }
+
+    #[test]
+    fn critical_pressure_refuses_returns_and_cools_idle() {
+        let limit = std::sync::Arc::new(IdleLimit::new(1 << 30));
+        let mut pool = pool(&limit);
+        let first = pool.take(4096, (), false).unwrap();
+        let second = pool.take(4096, (), false).unwrap();
+        drop(first);
+        assert_eq!(pool.stats().bytes, 4096);
+        pool.set_pressure(Pressure::Critical);
+        assert_eq!(pool.pressure(), Pressure::Critical);
+        assert!(pool.stats().constrained);
+        drop(second);
+        assert_eq!(pool.counters().rejects, 1);
+        pool.maintain(Instant::now() + crate::SAMPLE_PERIOD);
+        assert_eq!(pool.stats().bytes, 0);
+        assert_eq!(limit.used(), 0);
+        pool.set_pressure(Pressure::Normal);
+        assert!(!pool.stats().constrained);
+        drop(pool.take(4096, (), false).unwrap());
+        assert_eq!(pool.stats().bytes, 4096);
+    }
+
+    #[test]
+    fn stats_count_buffers_out_across_threads() {
+        let limit = std::sync::Arc::new(IdleLimit::new(1 << 30));
+        let mut pool = pool(&limit);
+        let mut held: Vec<_> = (0..3)
+            .map(|_| pool.take(4096, (), false).unwrap())
+            .collect();
+        let unpooled = Buf::unpooled(4096, 512, (), false).unwrap();
+        assert_eq!(pool.stats().in_use, 3 * 4096);
+        let buf = held.pop().unwrap();
+        std::thread::spawn(move || drop(buf)).join().unwrap();
+        let stats = pool.stats();
+        assert_eq!(stats.in_use, 2 * 4096);
+        assert_eq!(stats.bytes, 4096);
+        drop((held, unpooled));
+        assert_eq!(pool.stats().in_use, 0);
+    }
+
     #[test]
     fn set_len_and_rebind() {
         let mut buf = Buf::unpooled(10, 64, Bytes(4096), false).unwrap();
@@ -1577,6 +1971,34 @@ mod loom_tests {
             drop(pool);
             t.join().unwrap();
             assert_eq!(limit.used(), 0);
+        });
+    }
+
+    #[test]
+    fn return_races_reassignment() {
+        // Scanning every class takes more branches than the default allows.
+        let mut builder = loom::model::Builder::new();
+        builder.max_branches = 20_000;
+        builder.check(|| {
+            let limit = std::sync::Arc::new(IdleLimit::new(1 << 30));
+            let mut pool = pool(&limit, 1);
+            // Class 0 has one buffer out; every other class holds idle storage.
+            let a = pool.take(GRANULE, (), false).unwrap();
+            for class in 1..MAX_CLASSES {
+                drop(pool.take((class + 1) * GRANULE, (), false).unwrap());
+            }
+            let t = loom::thread::spawn(move || drop(a));
+            let big = (MAX_CLASSES + 1) * GRANULE;
+            let fresh = pool.take(big, (), false).unwrap();
+            t.join().unwrap();
+            let in_use = if fresh.is_pooled() { big } else { 0 };
+            assert_eq!(pool.stats().in_use, in_use);
+            drop(fresh);
+            assert_eq!(pool.stats().in_use, 0);
+            pool.clear();
+            assert_eq!(pool.stats().entries, 0);
+            assert_eq!(limit.used(), 0);
+            assert_eq!(pool.idle_bytes(), 0);
         });
     }
 }

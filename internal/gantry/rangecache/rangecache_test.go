@@ -79,6 +79,31 @@ func TestPutThenOpenRangeReturnsExactBytes(t *testing.T) {
 	}
 }
 
+func TestCoverageUnionsRangesAndIngestPrefix(t *testing.T) {
+	cache := newTestCache(t, 0)
+
+	d := testDigest(t, "coverage")
+	for _, write := range []struct {
+		start int64
+		bytes string
+	}{{10, "abcdefghij"}, {15, "abcdefghij"}, {40, "abcde"}, {10, "abcdefghij"}} {
+		if _, err := cache.Put(d, 100, write.start, bytes.NewBufferString(write.bytes)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for _, tc := range []struct{ prefix, want int64 }{{0, 20}, {15, 30}, {45, 45}} {
+		got, total := cache.Coverage(d, tc.prefix)
+		if got != tc.want || total != 100 {
+			t.Errorf("Coverage(prefix=%d) = %d/%d, want %d/100", tc.prefix, got, total, tc.want)
+		}
+	}
+
+	if got, total := cache.Coverage(testDigest(t, "absent"), 8); got != 8 || total != -1 {
+		t.Fatalf("missing range cache should preserve ingest prefix, got %d/%d", got, total)
+	}
+}
+
 func TestOpenRangeMissesWhenOnlyPartiallyCovered(t *testing.T) {
 	c := newTestCache(t, 0)
 	d := testDigest(t, "layer")

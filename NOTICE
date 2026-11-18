@@ -156,7 +156,7 @@ notices:
       - Copyright (c) Microsoft Corporation.
     license:
       - name: MIT License
-        link: https://github.com/Azure/azure-sdk-for-go/blob/sdk/azcore/v1.23.3/LICENSE.txt
+        link: https://github.com/Azure/azure-sdk-for-go/blob/sdk/azcore/v1.24.0/LICENSE.txt
   - dependency: github.com/Azure/azure-sdk-for-go/sdk/azidentity
     ecosystem: go
     copyright:
@@ -261,7 +261,7 @@ notices:
       - Copyright (c) Microsoft Corporation. All rights reserved.
     license:
       - name: MIT License
-        link: https://github.com/Azure/azure-sdk-for-go/blob/sdk/storage/azblob/v1.8.2/LICENSE.txt
+        link: https://github.com/Azure/azure-sdk-for-go/blob/sdk/storage/azblob/v1.8.3/LICENSE.txt
   - dependency: github.com/DATA-DOG/go-sqlmock
     ecosystem: go
     copyright:
@@ -670,6 +670,14 @@ notices:
     license:
       - name: Apache License, Version 2.0
         link: https://github.com/prometheus/common/blob/v0.73.1/LICENSE
+  - dependency: github.com/shirou/gopsutil/v4
+    ecosystem: go
+    copyright:
+      - Copyright (c) 2014, WAKAYAMA Shirou
+      - Copyright (c) 2009 The Go Authors. All rights reserved.
+    license:
+      - name: BSD 3-Clause License
+        link: https://github.com/shirou/gopsutil/blob/v4.26.6/LICENSE
   - dependency: github.com/spf13/cobra
     ecosystem: go
     copyright:

@@ -71,15 +71,17 @@ exists, can be mutably borrowed, and admits it; otherwise its storage is freed
 (see the `Drop` implementations for `AlignedBuffer` and `Allocation` in
 `alloc/src/lib.rs`).
 
-The pool depth is not fixed. A `PoolDemand` controller (`alloc/src/demand.rs`)
-holds a target depth between 0 and 8, starting at 2. Returns beyond the target
-are refused. `Slab::maintain_idle` runs one observation window (1 s) at a time:
-when allocations missed and returns were refused for depth, the target grows by
-half the misses (at least 1); entries that stayed unused for the whole window
-are halved, oldest first; after 10 miss-free windows the target drops by 1.
-`Slab::constrain_idle` refuses returns and trims to the minimum depth, which
-defaults to zero. Workers drive it from `poll_services`. Idle slab buffers keep
-their admission charges.
+The pool is sized by a `Provision` controller (`alloc/src/demand.rs`, see
+`designs/racer-pool-control.md`) over 64 KiB granules of checked-out plus idle
+storage. Returns are kept while idle storage fits the 128 MiB budget.
+`Slab::maintain_idle` ticks the controller and frees surplus idle buffers,
+oldest first, once demand has stayed below them for the hold time. Only whole
+buffers are freed; without pressure a buffer stays while freeing it would leave
+less than the target, and under pressure it goes anyway.
+`Slab::set_idle_pressure` caps idle storage under memory pressure: at
+`Elevated` one granule above what is in use, at `Critical` none, and then
+returns are refused. Workers drive it from `poll_services`. Idle slab buffers
+keep their admission charges.
 
 ### Cross-thread buffer pool
 
@@ -87,8 +89,9 @@ their admission charges.
 ciphertext, pooled plaintext, copied ciphertext, and peer receives. Idle bytes
 are charged to a dedicated admission class through `PoolAccount`
 (`flow_control::QuotaPoolAccount`), so admission sees them; a failed idle
-charge frees the storage instead. `Pool::shed` releases idle storage under
-memory pressure. A checkout must bring a charge covering the full capacity,
+charge frees the storage instead. `Pool::maintain` sizes each capacity class
+to its recent demand (see `designs/racer-pool-control.md`), and `Pool::shed`
+releases idle storage at once under memory pressure. A checkout must bring a charge covering the full capacity,
 and the charge rides in the `Buf`.
 
 Capacities round up to 4 KiB (or the alignment, if larger). A pool keeps up to
@@ -97,9 +100,14 @@ that any thread pushes to and only the owner drains. When a new capacity
 arrives and every class is assigned, it takes over the least recently used
 class that holds no idle storage. Buffers of the old capacity that return
 later are freed. If every class holds idle storage, the buffer is unpooled
-(counted as `unpooled`). `Pool::shed` discards idle mappings with
-`MADV_DONTNEED` and keeps them pooled "cold" and uncharged. Heap storage is
-freed. A node-targeted take reuses only storage bound to that node, except for
+(counted as `unpooled`). Each class counts its buffers out (taken and not
+yet returned, from any thread) and feeds the owner's per-class `Provision`.
+Idle storage above the class's target is cooled: `MADV_DONTNEED` discards a
+mapping's pages and the mapping stays pooled "cold" and uncharged, while heap
+storage is freed. A take reuses warm storage first, then cold storage (counted
+as a cold hit and as a shortfall, so the target rises), and cold storage unused
+for `COLD_HOLDS` hold times is unmapped. `Pool::shed` cools idle storage at
+once, and `Pressure::Critical` refuses returns. A node-targeted take reuses only storage bound to that node, except for
 storage that cannot be bound (under 2 MiB, or after `mbind` was refused),
 where any idle storage is reused.
 

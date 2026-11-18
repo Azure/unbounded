@@ -201,7 +201,7 @@ YAML layer would not apply to `metalman`.
 `apiVersion` and `kind` (`env.go:241`) and performs no kind assertion. The
 operator's ClusterRole grants `escalate` and `bind` on `roles`, `rolebindings`,
 `clusterroles`, and `clusterrolebindings`
-(`deploy/unbounded-operator/02-rbac.yaml.tmpl:60-66`), deliberately, so it can
+(`deploy/unbounded-operator/chart/templates/02-rbac.yaml:85-92`), deliberately, so it can
 install component RBAC granting permissions it does not itself hold. Any
 mechanism that can influence the GVK of an applied object can therefore mint a
 cluster-admin binding. GVK containment is not optional.
@@ -1133,7 +1133,7 @@ Dropping the operations instead leaves those workloads exactly as they are. The
 cluster holds the last good state because the operator does not write, which
 makes the behavior **restart-safe by construction**. This matters concretely:
 the operator runs `replicas: 1` with `strategy: Recreate`
-(`deploy/unbounded-operator/04-deployment.yaml.tmpl:13-16`), so it restarts on
+(`deploy/unbounded-operator/chart/templates/04-deployment.yaml:11-13`), so it restarts on
 every upgrade. An earlier revision cached last-known-good in memory, which that
 restart discards; the next apply would then have stripped every override. There
 is now no in-memory state to lose.
@@ -1780,7 +1780,7 @@ images survive upgrades indefinitely and are the most likely cause of an install
 that behaves unlike its reported version.
 
 The operator restarts on every upgrade: it runs `replicas: 1` with
-`strategy: Recreate` (`deploy/unbounded-operator/04-deployment.yaml.tmpl:13-16`).
+`strategy: Recreate` (`deploy/unbounded-operator/chart/templates/04-deployment.yaml:11-13`).
 Because the failure model holds no in-memory state
 ([§9.3](#93-invalid-overrides-skip-they-do-not-revert)), that restart changes
 nothing about override behavior.

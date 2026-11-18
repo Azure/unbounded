@@ -1,0 +1,41 @@
+# Full image-repository prefix (registry host plus org/namespace) for the
+# operator and every operator-managed first-party component image. The operator
+# resolves components as <imageRegistry>/<component>:<operator version>, so the
+# operator and its components always come from the same registry.
+imageRegistry: ghcr.io/azure
+
+image:
+  # Full operator image reference; overrides name, tag and digest. Only
+  # `make unbounded-operator-manifests` sets it (UNBOUNDED_OPERATOR_IMAGE may be
+  # a locally built image). The schema pins it, and name, for Helm and AKS
+  # extension installs: the operator runs its own image as
+  # <imageRegistry>/unbounded-operator:<version> (gantry registry auth), so it
+  # must come from imageRegistry like every component.
+  reference: ""
+  name: unbounded-operator
+  # Defaults to the chart appVersion.
+  tag: ""
+  # Optional digest (sha256:...). Takes precedence over tag.
+  digest: ""
+  pullPolicy: Always
+
+# External Kubernetes API endpoint advertised to provisioned machines. Empty
+# lets the operator discover it from kube-public/cluster-info, or from the
+# KUBERNETES_SERVICE_HOST FQDN on AKS.
+apiServerEndpoint: ""
+
+# Translate legacy net-group Sites, migrate state into the release namespace,
+# and reap the pre-consolidation namespaces.
+reapLegacyResources: true
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+
+namespace:
+  # Only `make unbounded-operator-manifests` sets this (values-static.yaml) to
+  # put a Namespace in the static `kubectl apply` manifests. The schema pins it
+  # to false for Helm and AKS extension installs: if a release owned the
+  # namespace, `helm uninstall` would delete every component in it.
+  create: false

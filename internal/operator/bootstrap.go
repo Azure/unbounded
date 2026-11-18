@@ -40,7 +40,7 @@ const (
 // CRDBootstrapTimeout bounds the complete CRD bootstrap, including manifest
 // applies and waiting for every CRD to be served by the apiserver. The operator
 // health server only binds after bootstrap, so the startupProbe budget in
-// deploy/unbounded-operator/04-deployment.yaml.tmpl must exceed this timeout.
+// deploy/unbounded-operator/chart/templates/04-deployment.yaml must exceed this timeout.
 const CRDBootstrapTimeout = 4 * time.Minute
 
 // RequiredCRDNames is the complete set of CRDs owned and bootstrapped by the

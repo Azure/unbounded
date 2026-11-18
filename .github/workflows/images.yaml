@@ -59,12 +59,6 @@ jobs:
 
           file="images/${name}/Containerfile"
 
-          if [[ ( "$name" == playpen || "$name" == playpen-* ) && "${{ github.event_name }}" != "workflow_dispatch" ]]; then
-            echo "::notice::Skipping ${name}; playpen images are manual-only. Dispatch this workflow with image=${name}."
-            echo "should_build=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
           if [[ ! -f "$file" ]]; then
             echo "::error::No Containerfile found at ${file}"
             exit 1
@@ -74,6 +68,9 @@ jobs:
             platforms="$INPUT_PLATFORMS"
           elif [[ "$name" == host-azurelinux3-mshv ]]; then
             # The Microsoft Hypervisor packages are x86_64 only.
+            platforms="linux/amd64"
+          elif [[ "$name" == host-ubuntu2404-nvidia ]]; then
+            # The NVIDIA HGX image targets x86_64 servers only.
             platforms="linux/amd64"
           else
             platforms="linux/amd64,linux/arm64"

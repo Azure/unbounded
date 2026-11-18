@@ -454,7 +454,11 @@ pub(crate) struct Link {
     /// [`InFlight`] record until it completes or the QP stops.
     qp: Rc<NativeQueuePair<InFlight>>,
 
-    windows: Vec<Rc<MemoryWindow>>,
+    /// Memory windows by index. `None` slots are spare, listed in
+    /// `spare_windows` for reuse.
+    windows: Vec<Option<Rc<MemoryWindow>>>,
+
+    spare_windows: Vec<usize>,
 
     /// The device, for windows over a device pool, made on first use.
     device: Rc<NativeDevice>,
@@ -486,7 +490,14 @@ pub(crate) struct Link {
 
     next_tag: u32,
 
+    /// Free windows of the first host block: one per grant, made with the
+    /// link.
     free_windows: Vec<usize>,
+
+    /// Free windows tied to each later host block, by block id, made on
+    /// first use. A window stays tied to the first region it binds, so each
+    /// block keeps its own; a draining block's windows are freed.
+    free_block_windows: BTreeMap<u32, Vec<usize>>,
 
     /// Free windows tied to each device pool, by pool id. A window stays
     /// tied to the first region it binds, so device grants never reuse host
@@ -593,8 +604,10 @@ impl Link {
         Ok(Self {
             qp,
             free_windows: (0..windows.len()).rev().collect(),
-            windows,
+            windows: windows.into_iter().map(Some).collect(),
+            spare_windows: Vec::new(),
             device: device.clone(),
+            free_block_windows: BTreeMap::new(),
             free_device_windows: BTreeMap::new(),
             control,
             epoch,
@@ -716,7 +729,12 @@ impl Link {
 
     /// True while every grant slot of the link is held.
     pub(crate) fn grants_full(&self) -> bool {
-        self.grants.len() >= self.grant_cap as usize
+        self.free_grant_slots() == 0
+    }
+
+    /// Grant slots of the link not held.
+    pub(crate) fn free_grant_slots(&self) -> usize {
+        (self.grant_cap as usize).saturating_sub(self.grants.len())
     }
 
     /// Bind a window over a free buffer and queue a `Grant`. `done` gets the
@@ -760,35 +778,34 @@ impl Link {
             return None;
         }
 
-        let window = if let Some(id) = device {
-            match self.free_device_windows.get_mut(&id).and_then(Vec::pop) {
-                Some(window) => window,
-                None => match MemoryWindow::new(&self.device) {
-                    // At most one device window per concurrent grant per
-                    // device pool, so each pool's windows never exceed the
-                    // grant cap.
-                    Ok(window) => {
-                        self.windows.push(window);
-                        self.windows.len() - 1
-                    }
-                    Err(error) => {
-                        let _ = done.complete(Err(error));
-                        return None;
-                    }
-                },
-            }
-        } else {
-            self.free_windows.pop().expect("a window per grant")
-        };
-
         let taken = if let Some(id) = device {
             pool.take_device(id, BufferState::Binding)
         } else {
             pool.take(BufferState::Binding)
         };
         let Some(buffer) = taken else {
-            self.free_window(device, window);
             return Some(done);
+        };
+
+        let free = match device {
+            Some(id) => self.free_device_windows.get_mut(&id).and_then(Vec::pop),
+            None if buffer.block() == 0 => {
+                Some(self.free_windows.pop().expect("a window per grant"))
+            }
+            None => self
+                .free_block_windows
+                .get_mut(&buffer.block())
+                .and_then(Vec::pop),
+        };
+        // At most one window per concurrent grant per block or device pool,
+        // so each one's windows never exceed the grant cap.
+        let window = match free.map_or_else(|| self.new_window(), Ok) {
+            Ok(window) => window,
+            Err(error) => {
+                pool.release(buffer);
+                let _ = done.complete(Err(error));
+                return None;
+            }
         };
 
         let tag = self.allocate_tag();
@@ -812,12 +829,54 @@ impl Link {
         None
     }
 
-    /// Return `window` to its free list.
-    fn free_window(&mut self, device: Option<u32>, window: usize) {
-        if let Some(id) = device {
-            self.free_device_windows.entry(id).or_default().push(window);
-        } else {
-            self.free_windows.push(window);
+    /// Make a window in a spare slot or a new one.
+    fn new_window(&mut self) -> Result<usize> {
+        let window = MemoryWindow::new(&self.device)?;
+        Ok(match self.spare_windows.pop() {
+            Some(index) => {
+                self.windows[index] = Some(window);
+                index
+            }
+            None => {
+                self.windows.push(Some(window));
+                self.windows.len() - 1
+            }
+        })
+    }
+
+    /// Return `window`, used for `buffer`, to its free list. A window of a
+    /// draining block is freed, releasing its hold on the block's region.
+    fn free_window(&mut self, pool: &Pool, buffer: &Buffer, window: usize) {
+        match buffer.device() {
+            Some(id) => self.free_device_windows.entry(id).or_default().push(window),
+            None if buffer.block() == 0 => self.free_windows.push(window),
+            None if pool.block_active(buffer.block()) => self
+                .free_block_windows
+                .entry(buffer.block())
+                .or_default()
+                .push(window),
+            None => self.drop_window(window),
+        }
+    }
+
+    fn drop_window(&mut self, window: usize) {
+        self.windows[window] = None;
+        self.spare_windows.push(window);
+    }
+
+    /// Free the idle windows of host blocks that are draining or gone, so
+    /// those blocks can deregister.
+    pub(crate) fn retire_windows(&mut self, pool: &Pool) {
+        let retired: Vec<u32> = self
+            .free_block_windows
+            .keys()
+            .copied()
+            .filter(|&block| !pool.block_active(block))
+            .collect();
+        for block in retired {
+            for window in self.free_block_windows.remove(&block).unwrap_or_default() {
+                self.drop_window(window);
+            }
         }
     }
 
@@ -1138,7 +1197,7 @@ impl Link {
             InFlight::Invalidate(tag) => {
                 let mut entry = self.grants.remove(&tag).ok_or(Break::Error)?;
                 let buffer = entry.buffer.take().ok_or(Break::Error)?;
-                self.free_window(buffer.device(), entry.window);
+                self.free_window(pool, &buffer, entry.window);
                 let GrantState::Invalidating(outcome) = entry.state else {
                     return Err(Break::Error);
                 };
@@ -1480,7 +1539,7 @@ impl Link {
                 let buffer = entry.buffer.as_ref().ok_or(Error::Io)?;
                 let key = self.qp.bind_window(
                     wr(BIND, tag),
-                    &self.windows[entry.window],
+                    self.windows[entry.window].as_ref().ok_or(Error::Io)?,
                     pool.region_of(buffer),
                     pool.offset(buffer),
                     entry.length,
@@ -1493,7 +1552,7 @@ impl Link {
                 let entry = self.grants.get(&tag).ok_or(Error::Io)?;
                 self.qp.invalidate_window(
                     wr(INVALIDATE, tag),
-                    &self.windows[entry.window],
+                    self.windows[entry.window].as_ref().ok_or(Error::Io)?,
                     entry.key,
                 )?;
                 self.track(wr(INVALIDATE, tag), InFlight::Invalidate(tag));

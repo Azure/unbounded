@@ -166,7 +166,7 @@ const LIMITS: [[Var; 2]; 16] = [
         "RACER_REGISTERED_BYTES_PER_WORKER",
         uint(1, MAX_BYTES, BYTES),
         "402653184",
-        "Native RDMA page-buffer pool, used only when RDMA is enabled; then at least one page plus 16 bytes. One native thread owns the whole pool, so it is never divided. When neither variable is set, the scaled default is capped at 8 GiB node-wide. The pool is split evenly over RDMA rails, and a rail without a whole buffer is not used. Each grant holds one 18 MiB buffer until its page is consumed; `racer_rdma_free_buffers` shows what is left."
+        "Most memory the native RDMA page-buffer pool may register, used only when RDMA is enabled; then at least one page plus 16 bytes. One native thread owns the whole pool, so it is never divided. When neither variable is set, the scaled default is capped at 8 GiB node-wide. The pool is split evenly over RDMA rails, and a rail without a whole buffer is not used. Each rail registers one block of buffers (an eighth of its share, 2 to 32 buffers) at activation, registers more blocks as receive demand grows, and deregisters them again some time after demand falls; `racer_rdma_pool_registered_bytes` shows what is registered now. Each grant holds one 18 MiB buffer until its page is consumed; `racer_rdma_free_buffers` shows what is left."
     ),
     shared_budget!(
         "RACER_REQUEST_CONTEXT_BYTES",

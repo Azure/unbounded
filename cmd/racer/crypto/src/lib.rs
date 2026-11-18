@@ -133,9 +133,10 @@ pub fn seal(
 ///
 /// Only the master AES-256 key schedule and the CMAC subkey K1 are retained.
 /// Each call derives the per-nonce AES-256-GCM key and runs the bulk AEAD
-/// through aws-lc-rs, whose AES-GCM uses AES-NI/VAES and carry-less multiply
-/// and opens out of place, so a page decrypts from its source buffer into its
-/// destination in one pass.
+/// through aws-lc-rs, whose AES-GCM runtime-dispatches to AES-NI/VAES and
+/// carry-less multiply on x86_64 and to the ARMv8 AES and PMULL extensions on
+/// aarch64. It opens out of place, so a page decrypts from its source buffer
+/// into its destination in one pass.
 /// The output is byte-identical to the reference construction.
 pub(crate) struct PageCipher {
     // aes is built with its zeroize feature, so the schedule is wiped on drop.
@@ -369,12 +370,15 @@ impl PageCipher {
     }
 }
 
-/// GHASH with an aggregated PCLMULQDQ/VPCLMULQDQ path on x86_64 and the
-/// portable `ghash` crate everywhere else (or when the CPU lacks CLMUL).
+/// GHASH with an aggregated carry-less-multiply path on x86_64, and the
+/// RustCrypto `ghash` crate everywhere else. The fallback is not scalar: it
+/// runtime-dispatches to PMULL on aarch64 and PCLMULQDQ on x86, but keeps the
+/// crate's four-block aggregation. The custom path exists because wider
+/// aggregation keeps tag-only page verification closer to memory bandwidth.
 enum PageGhash {
     #[cfg(target_arch = "x86_64")]
     Fast(ghash_x86::Ghash),
-    Portable(ghash::GHash),
+    RustCrypto(ghash::GHash),
 }
 
 impl PageGhash {
@@ -383,7 +387,7 @@ impl PageGhash {
         if let Some(fast) = ghash_x86::Ghash::new(h) {
             return Self::Fast(fast);
         }
-        Self::Portable(ghash::GHash::new(h.into()))
+        Self::RustCrypto(ghash::GHash::new(h.into()))
     }
 
     fn update_padded(&mut self, data: &[u8]) {
@@ -391,7 +395,7 @@ impl PageGhash {
         match self {
             #[cfg(target_arch = "x86_64")]
             Self::Fast(g) => g.update_padded(data),
-            Self::Portable(g) => g.update_padded(data),
+            Self::RustCrypto(g) => g.update_padded(data),
         }
     }
 
@@ -400,7 +404,7 @@ impl PageGhash {
         match self {
             #[cfg(target_arch = "x86_64")]
             Self::Fast(g) => g.finalize(),
-            Self::Portable(g) => g.finalize().into(),
+            Self::RustCrypto(g) => g.finalize().into(),
         }
     }
 }

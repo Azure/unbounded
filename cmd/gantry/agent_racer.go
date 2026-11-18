@@ -113,7 +113,7 @@ func serveRacerAgent(ctx context.Context, c *config.Config, logger *slog.Logger,
 	go func() { mirrorErrors <- mirrorHTTP.Serve(listener) }()
 
 	readyCheck := racerReadiness(ctx, &ready, originDone)
-	opsHTTP, opsErrors := startOpsEndpoint(c.MetricsListen, reg, readyCheck, logger)
+	opsHTTP, opsErrors := startOpsEndpoint(c.MetricsListen, reg, readyCheck, logger, nil)
 	servers = append(servers, opsHTTP)
 
 	var pprofErrors <-chan error

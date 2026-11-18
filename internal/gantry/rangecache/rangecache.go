@@ -181,6 +181,29 @@ func (c *Cache) HasAny(d digest.Digest) bool {
 	return len(e.have) > 0
 }
 
+// Coverage counts unique cached bytes unioned with an in-flight ingest's
+// contiguous prefix. Overlapping ranges and repeated reads count only once.
+func (c *Cache) Coverage(d digest.Digest, prefix int64) (available, total int64) {
+	available, total = max(prefix, 0), -1
+
+	e := c.lookup(d)
+	if e == nil {
+		return available, total
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	for _, sp := range e.have {
+		start := max(sp.start, prefix)
+		if sp.end >= start {
+			available += sp.end - start + 1
+		}
+	}
+
+	return available, e.total
+}
+
 // Put stores data read from r at start. total is the blob's full size, used for
 // Content-Range on later reads. Put reports the number of bytes stored; a
 // truncated read still records what landed. ErrFull means no bytes were read

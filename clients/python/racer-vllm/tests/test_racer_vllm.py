@@ -73,6 +73,14 @@ def range_reads(server):
     return out
 
 
+def prefetch_puts(server):
+    out = []
+    for s in server.seen:
+        if s.method == "PUT" and s.target.startswith("/v1/prefetches/"):
+            out.append((s, json.loads(s.body)))
+    return out
+
+
 # URIs and racer-model.json
 
 
@@ -547,11 +555,16 @@ def test_loader_loads_logs_and_uses_pins(server, uri, torch, monkeypatch, tmp_pa
     mc = types.SimpleNamespace(model=str(tmp_path), quantization=None)
     inst.download_model(mc)
     m = Model()
-    with caplog.at_level(logging.INFO, logger="vllm.racer_vllm.loader"):
+    with caplog.at_level(logging.DEBUG, logger="vllm.racer_vllm.loader"):
         inst.load_weights(m, mc)
     assert m.got == ALL
-    msgs = [r.getMessage() for r in caplog.records if r.name == "vllm.racer_vllm.loader"]
-    assert len(msgs) == 1 and "loaded 2 files" in msgs[0] and "host=" in msgs[0] and str(uri) in msgs[0]
+    recs = [r for r in caplog.records if r.name == "vllm.racer_vllm.loader"]
+    loaded = [r for r in recs if "loaded 2 files" in r.getMessage()]
+    assert len(loaded) == 1
+    assert "host=" in loaded[0].getMessage() and str(uri) in loaded[0].getMessage()
+    assert loaded[0].levelno == logging.INFO
+    prefetch = [r for r in recs if r.getMessage().startswith("racer: prefetch ")]
+    assert prefetch and all(r.levelno == logging.DEBUG for r in prefetch)
 
     with pytest.raises(ValueError, match="w5"):
         inst.load_weights(Model(tuple(ALL) + ("w5",)), mc)
@@ -575,6 +588,131 @@ def test_loader_stats_every_file_before_data_reads(server, uri, torch, monkeypat
     posts = [i for i, s in enumerate(server.seen) if s.method == "POST" and (a in s.target or b in s.target)]
     assert len(heads) == 2 and max(heads) < min(posts)
     assert all(server.seen[i].headers.get("if-match") == '"v1"' for i in posts)
+
+
+def test_loader_prefetches_weight_pages(server, uri, torch, monkeypatch):
+    setup_model(server, uri)
+    inst = make_loader(monkeypatch, server, uri=str(uri))
+    inst.load_weights(Model(), types.SimpleNamespace(model="/unused", quantization=None))
+    puts = prefetch_puts(server)
+    assert len(puts) == 1
+    seen, body = puts[0]
+    assert seen.target.startswith("/v1/prefetches/racer-vllm-")
+    assert body["priority"] == "high" and body["ttl_seconds"] == 3600
+    # A new ticket starts at (0, 0).
+    assert (body["generation"], body["sequence"]) == (0, 0)
+    refs = {r["key"]: r for r in body["refs"]}
+    assert set(refs) == {uri.request("a.safetensors").hex, uri.request("b.safetensors").hex}
+    for name in ("a.safetensors", "b.safetensors"):
+        req = uri.request(name)
+        assert refs[req.hex]["etag"] == '"v1"'
+        assert refs[req.hex]["metadata"] == req.metadata
+        assert "offset" not in refs[req.hex] and "length" not in refs[req.hex]
+    # The ticket is accepted before the loader reads any weight data.
+    first_read = min(i for i, s in enumerate(server.seen) if s.method == "POST" and "range" in s.headers)
+    assert server.seen.index(seen) < first_read
+
+
+def test_loader_prefetch_messages_are_not_info(server, uri, torch, monkeypatch, caplog):
+    setup_model(server, uri)
+    inst = make_loader(monkeypatch, server, uri=str(uri))
+    with caplog.at_level(logging.INFO, logger="vllm.racer_vllm.loader"):
+        inst.load_weights(Model(), types.SimpleNamespace(model="/unused", quantization=None))
+    msgs = [r.getMessage() for r in caplog.records if r.name == "vllm.racer_vllm.loader"]
+    assert any("loaded 2 files" in m for m in msgs)
+    assert not any(m.startswith("racer: prefetch ") for m in msgs)
+
+
+def test_loader_prefetch_restarts_completed_ticket(server, uri, torch, monkeypatch):
+    setup_model(server, uri)
+    inst = make_loader(monkeypatch, server, uri=str(uri))
+    mc = types.SimpleNamespace(model="/unused", quantization=None)
+    inst.load_weights(Model(), mc)
+    first, _ = prefetch_puts(server)[0]
+    ticket = first.target.rsplit("/", 1)[1]
+    # Make the retained ticket terminal, so a replay would show up as CANCELLED.
+    c = client(server)
+    assert c.cancel_prefetch(ticket).state == "CANCELLED"
+    inst.load_weights(Model(), mc)
+    puts = prefetch_puts(server)
+    assert len(puts) == 2
+    second, body = puts[1]
+    assert second.target == first.target
+    assert (body["generation"], body["sequence"]) == (0, 1)
+    status = c.prefetch_status(ticket)
+    assert status.state == "SUCCEEDED" and status.sequence == 1 and status.reason is None
+    c.close()
+
+
+def test_loader_prefetch_ttl_change_updates_ticket(server, uri, torch, monkeypatch):
+    setup_model(server, uri)
+    mc = types.SimpleNamespace(model="/unused", quantization=None)
+    make_loader(monkeypatch, server, uri=str(uri)).load_weights(Model(), mc)
+    inst = make_loader(monkeypatch, server, uri=str(uri), prefetch_ttl_seconds=60)
+    inst.load_weights(Model(), mc)
+    puts = prefetch_puts(server)
+    assert len(puts) == 2
+    assert puts[0][0].target == puts[1][0].target
+    assert [(b["generation"], b["sequence"]) for _, b in puts] == [(0, 0), (0, 1)]
+    assert [b["ttl_seconds"] for _, b in puts] == [3600, 60]
+    assert server.prefetches.tickets[puts[1][0].target.rsplit("/", 1)[1]].ttl == 60
+
+
+def test_next_prefetch_position_rolls_over_at_the_maximum():
+    def status(generation, sequence):
+        return racer.PrefetchStatus(id="t", state="SUCCEEDED", generation=generation, sequence=sequence)
+
+    assert rv.next_prefetch_position(status(0, 0)) == (0, 1)
+    assert rv.next_prefetch_position(status(3, rv.MAX_PREFETCH_COUNTER)) == (4, 0)
+    with pytest.raises(racer.RacerError, match="exhausted"):
+        rv.next_prefetch_position(status(rv.MAX_PREFETCH_COUNTER, rv.MAX_PREFETCH_COUNTER))
+
+
+def test_loader_prefetch_is_best_effort(server, uri, torch, monkeypatch, caplog):
+    setup_model(server, uri)
+    server.prefetches.passthrough = True
+    inst = make_loader(monkeypatch, server, uri=str(uri))
+    m = Model()
+    with caplog.at_level(logging.DEBUG, logger="vllm.racer_vllm.loader"):
+        inst.load_weights(m, types.SimpleNamespace(model="/unused", quantization=None))
+    assert m.got == ALL
+    assert any("prefetch unavailable" in r.getMessage() for r in caplog.records)
+    assert not any("prefetch unavailable" in r.getMessage() and r.levelno == logging.INFO for r in caplog.records)
+
+
+@pytest.mark.parametrize("error", [ConnectionResetError, TimeoutError])
+def test_loader_prefetch_transport_error_is_best_effort(server, uri, torch, monkeypatch, caplog, error):
+    setup_model(server, uri)
+    inst = make_loader(monkeypatch, server, uri=str(uri))
+
+    def fails(*a, **kw):
+        raise error("prefetch transport failed")
+
+    monkeypatch.setattr(rv, "prefetch_weights", fails)
+    m = Model()
+    with caplog.at_level(logging.DEBUG, logger="vllm.racer_vllm.loader"):
+        inst.load_weights(m, types.SimpleNamespace(model="/unused", quantization=None))
+    assert m.got == ALL
+    assert any("prefetch unavailable" in r.getMessage() for r in caplog.records)
+    assert not any("prefetch unavailable" in r.getMessage() and r.levelno == logging.INFO for r in caplog.records)
+
+
+def test_loader_prefetch_can_be_disabled(server, uri, torch, monkeypatch):
+    setup_model(server, uri)
+    inst = make_loader(monkeypatch, server, uri=str(uri), prefetch=False)
+    inst.load_weights(Model(), types.SimpleNamespace(model="/unused", quantization=None))
+    assert not prefetch_puts(server)
+
+
+def test_prefetch_id_is_stable_per_version(uri):
+    a = types.SimpleNamespace(etag='"v1"')
+    b = types.SimpleNamespace(etag='"v2"')
+    assert rv.prefetch_id(uri, [("a", a)]) == rv.prefetch_id(uri, [("a", a)])
+    assert rv.prefetch_id(uri, [("a", a)]) != rv.prefetch_id(uri, [("a", types.SimpleNamespace(etag='"v2"'))])
+    # The same set of files gives the same id whatever order it is in.
+    forward = rv.prefetch_id(uri, [("a", a), ("b", b)])
+    assert forward == rv.prefetch_id(uri, [("b", b), ("a", a)])
+    assert forward != rv.prefetch_id(uri, [("a", b), ("b", a)])
 
 
 @pytest.mark.parametrize("fail", [True, False])
@@ -651,9 +789,21 @@ def test_settings():
         True,
         False,
     )
+    assert s["prefetch"] is True and s["prefetch_ttl_seconds"] == 3600
     assert s["mode_retry_seconds"] == racer.DEFAULT_MODE_RETRY_SECONDS
     assert rv.settings({"mode_retry_seconds": None})["mode_retry_seconds"] is None
     assert rv.settings({"mode_retry_seconds": "30"})["mode_retry_seconds"] == 30.0
+    assert rv.settings({"prefetch": False, "prefetch_ttl_seconds": 0})["prefetch"] is False
+    assert rv.settings({"prefetch": "false"})["prefetch"] is False
+    assert rv.settings({"prefetch": " TRUE "})["prefetch"] is True
+    with pytest.raises(ValueError, match="prefetch"):
+        rv.settings({"prefetch": "yes"})
+    assert rv.settings({"prefetch_ttl_seconds": "60"})["prefetch_ttl_seconds"] == 60
+    for bad in (None, "abc", True):
+        with pytest.raises(ValueError, match="prefetch_ttl_seconds"):
+            rv.settings({"prefetch_ttl_seconds": bad})
+    with pytest.raises(ValueError, match="prefetch_ttl_seconds"):
+        rv.settings({"prefetch_ttl_seconds": -1})
 
 
 # Packaging

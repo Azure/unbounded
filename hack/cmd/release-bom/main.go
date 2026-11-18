@@ -34,6 +34,7 @@ var releaseImageNames = []string{
 	"host-azurelinux3-mshv",
 	"host-azurelinux3-nvidia",
 	"host-ubuntu2404",
+	"host-ubuntu2404-nvidia",
 	"inventory-aggregator",
 	"inventory-inspector",
 	"inventory-viewer",

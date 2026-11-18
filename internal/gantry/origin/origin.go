@@ -54,6 +54,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/oci"
 	"github.com/Azure/unbounded/internal/gantry/registryauth"
+	"github.com/Azure/unbounded/internal/gantry/streamcopy"
 	"github.com/Azure/unbounded/internal/gantry/tracing"
 )
 
@@ -87,6 +88,8 @@ type metricsHooks struct {
 	onPullFailure func(kind, class string) // any non-success terminal status
 	onBytesRead   func(kind string, bytes int64)
 	onRequest     func(method string, statusCode int)
+	onLiveBytes   func(kind string, bytes int64)
+	onActivity    func(kind string, delta int)
 }
 
 // Option configures a Client.
@@ -139,6 +142,14 @@ func WithByteMetrics(onBytesRead func(kind string, bytes int64)) Option {
 // concurrency-safe. This is independent of the logical pull hooks in WithMetrics.
 func WithRequestMetrics(onRequest func(method string, statusCode int)) Option {
 	return func(c *Client) { c.metrics.onRequest = onRequest }
+}
+
+// WithTransferMetrics observes live received bytes and the lifetime of logical
+// pulls, including request setup, through a terminal body read or Close.
+func WithTransferMetrics(bytes func(string, int64), activity func(string, int)) Option {
+	return func(c *Client) {
+		c.metrics.onLiveBytes, c.metrics.onActivity = bytes, activity
+	}
 }
 
 type meteredTransport struct {
@@ -244,6 +255,19 @@ func (c *Client) PullRange(ctx context.Context, ref ifaces.OriginRef, length int
 
 func (c *Client) pull(ctx context.Context, ref ifaces.OriginRef, length int64) (io.ReadCloser, int64, string, error) {
 	kind := ref.Kind.MetricLabel()
+	finish := streamcopy.BeginActivity(func(delta int) {
+		if c.metrics.onActivity != nil {
+			c.metrics.onActivity(kind, delta)
+		}
+	})
+
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			finish()
+		}
+	}()
+
 	if c.metrics.onPullStart != nil {
 		c.metrics.onPullStart(kind)
 	}
@@ -292,6 +316,13 @@ func (c *Client) pull(ctx context.Context, ref ifaces.OriginRef, length int64) (
 			},
 		}
 	}
+
+	rc = streamcopy.Observe(rc, func(n int64) {
+		if c.metrics.onLiveBytes != nil {
+			c.metrics.onLiveBytes(kind, n)
+		}
+	}, finish)
+	handedOff = true
 
 	return rc, size, contentType, nil
 }

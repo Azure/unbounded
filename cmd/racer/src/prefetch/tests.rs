@@ -502,6 +502,39 @@ fn delete_cancels_and_restart_needs_higher_sequence() {
 }
 
 #[test]
+fn restart_of_settled_ticket_replans_admitted_pages() {
+    let mut r = rig(Config::default());
+    r.put("t", spec("", &[&pages(KEY_A, 0, 2)])).unwrap();
+    r.drain(|_| UnitOutcome::Admitted);
+    let status = r.status("t");
+    assert_eq!(status.state, State::Succeeded);
+    assert_eq!(status.bytes.admitted, 2 * PAGE_BYTES);
+    // A repeated load restarts the settled ticket without canceling it. Its
+    // admitted pages may have been evicted, so they are planned again.
+    let (code, status) = r
+        .put("t", spec("\"sequence\":1,", &[&pages(KEY_A, 0, 2)]))
+        .unwrap();
+    assert_eq!(code, 200);
+    assert_eq!(status.state, State::Queued);
+    assert_eq!(status.bytes.admitted, 0);
+    assert_eq!(status.bytes.queued, 2 * PAGE_BYTES);
+    let batch = r.registry.next_batch(r.now, 256).unwrap();
+    assert_eq!(batch.pages, vec![0, 1]);
+    for page in batch.pages {
+        let unit = UnitKey {
+            version: batch.metadata.version.clone(),
+            page,
+        };
+        r.registry
+            .complete(&unit, UnitOutcome::Resident, Some(node("owner")), r.now);
+    }
+    // Resident pages are probed and reported without an origin fetch.
+    let status = r.status("t");
+    assert_eq!(status.state, State::Succeeded);
+    assert_eq!(status.bytes.already_resident, 2 * PAGE_BYTES);
+}
+
+#[test]
 fn retries_back_off_then_fail_with_the_mapped_error() {
     for (kind, error) in [
         (RetryKind::Deferred, RefError::BudgetTimeout),
@@ -1215,13 +1248,17 @@ fn rotated_token_reopens_a_unit_whose_only_credential_was_refused() {
     assert_eq!(r.outcome("t").0, RefOutcome::Succeeded);
     assert!(r.status("t").settled);
     assert_eq!(r.registry.pending_bytes(), 0);
-    // The refused token itself does not reopen the unit.
+    // A restart re-plans the settled page, so the refused token is tried
+    // again. It is refused again rather than reported as satisfied.
     let mut r = rig(Config::default());
     r.put_with("t", body.clone(), token("Bearer old")).unwrap();
     r.fill_once(UnitOutcome::Failed(RefError::Forbidden));
     let again = auth_spec("\"generation\":1,\"sequence\":2,", &[&page]);
     r.put_with("t", again, token("Bearer old")).unwrap();
-    assert!(r.fill_once(UnitOutcome::Admitted).is_none());
+    assert_eq!(
+        r.fill_once(UnitOutcome::Failed(RefError::Forbidden)),
+        Some(Some(b"Bearer old".to_vec()))
+    );
     assert_eq!(r.outcome("t").1, Some(RefError::Forbidden));
 }
 

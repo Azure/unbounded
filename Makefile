@@ -109,9 +109,6 @@ METALMAN_BIN=bin/metalman
 METALMAN_CMD=./cmd/metalman
 NETBOOT_IMAGE ?= $(CONTAINER_REGISTRY)/netboot:$(VERSION_TAG)
 
-PLAYPEN_TAG ?= $(VERSION_TAG)
-PLAYPEN_IMAGE ?= $(CONTAINER_REGISTRY)/playpen:$(PLAYPEN_TAG)
-
 UNBOUNDED_OPERATOR_BIN=bin/unbounded-operator
 UNBOUNDED_OPERATOR_CMD=./cmd/unbounded-operator
 UNBOUNDED_OPERATOR_IMAGE ?= $(CONTAINER_REGISTRY)/unbounded-operator:$(VERSION_TAG)
@@ -124,8 +121,11 @@ UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT ?=
 UNBOUNDED_OPERATOR_IMAGE_REGISTRY ?= $(CONTAINER_REGISTRY)
 UNBOUNDED_OPERATOR_REAP_LEGACY_RESOURCES ?= true
 export UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT
-UNBOUNDED_OPERATOR_MANIFEST_TEMPLATES_DIR := deploy/unbounded-operator
 UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR  := deploy/unbounded-operator/rendered
+UNBOUNDED_OPERATOR_CHART_DIR             := deploy/unbounded-operator/chart
+UNBOUNDED_OPERATOR_RENDER_DIR            := tmp/unbounded-operator-render
+UNBOUNDED_OPERATOR_CHART_VERSION         ?= 0.0.0-dev
+UNBOUNDED_OPERATOR_CHART_APP_VERSION     ?= $(VERSION_TAG)
 
 TOKEN_REFRESHER_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
 TOKEN_REFRESHER_MANIFEST_TEMPLATES_DIR := deploy/token-refresher
@@ -247,10 +247,10 @@ NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
 # Frontend build toggle (dev builds produce unminified output with sourcemaps).
 REACT_DEV ?= false
 
-.PHONY: all help fmt lint lint-actions test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc install-helm install-kind generate kubectl-unbounded forge relctl relctl-build agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-gantry e2e-playpen e2e-racer gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build license-check notice notice-check gantry gantry-build gantry-manifests inventory-manifests
-.PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests gantry-chart-lint gantry-chart-package release-bom release-manifests unbounded-operator-release-manifest
+.PHONY: all help fmt lint lint-actions test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc install-helm install-kind generate kubectl-unbounded forge relctl relctl-build agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests e2e-gantry e2e-racer gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build license-check notice notice-check gantry gantry-build gantry-manifests inventory-manifests
+.PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests gantry-chart-lint gantry-chart-package unbounded-operator-chart-lint unbounded-operator-chart-package release-bom release-manifests unbounded-operator-release-manifest
 .PHONY: karpenter karpenter-fmt karpenter-lint karpenter-test karpenter-test-ci karpenter-build karpenter-manifests image-karpenter-local
-.PHONY: image-machina-local image-token-refresher-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-unbounded-operator-push image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
+.PHONY: image-machina-local image-token-refresher-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-unbounded-operator-push image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
 
 ##@ General
@@ -283,7 +283,6 @@ help: ## Show this help
 	@echo "  vulncheck                        Run govulncheck; fails only on vulnerabilities with final fixes"
 	@echo "  gomod                            go mod tidy"
 	@echo "  e2e-gantry                       Run the kind-based Gantry e2e suite"
-	@echo "  e2e-playpen                      Run the kind-based playpen e2e suite"
 	@echo "  e2e-racer                        Run the kind-based Racer object caching e2e suite"
 	@echo "  license-check                    Verify project-owned license declarations"
 	@echo "  notice                           Regenerate NOTICE from Go and npm dependencies"
@@ -336,7 +335,6 @@ help: ## Show this help
 	@echo "  image-metalman-local             Build metalman image"
 	@echo "  image-unbounded-operator-local   Build unbounded-operator image"
 	@echo "  image-unbounded-operator-push    Build and push unbounded-operator image"
-	@echo "  image-playpen-local              Build playpen image"
 	@echo "  image-net-controller-local       Build unbounded-net-controller image"
 	@echo "  image-net-controller-push        Build and push unbounded-net-controller image"
 	@echo "  image-net-node-local             Build unbounded-net-node image"
@@ -367,6 +365,8 @@ help: ## Show this help
 	@echo "  unbounded-operator-manifests     Render unbounded-operator manifests into deploy/unbounded-operator/rendered"
 	@echo "  gantry-chart-lint                Validate the standalone Gantry Helm chart"
 	@echo "  gantry-chart-package             Package the standalone Gantry Helm chart"
+	@echo "  unbounded-operator-chart-lint    Validate the unbounded-operator Helm chart"
+	@echo "  unbounded-operator-chart-package Package the unbounded-operator Helm chart"
 	@echo "  unbounded-operator-release-manifest Build a versioned, directly applicable operator manifest under build/"
 	@echo ""
 	@echo "Net Kubernetes (apply to current kubectl context):"
@@ -586,16 +586,16 @@ lint-actions: ## Run actionlint over .github/workflows
 ifdef CI
 # In CI each job is independent; skip chained prerequisites.
 
-test: machina-manifests token-refresher-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-operator-manifests gantry-manifests ## Run all tests with race detector
+test: machina-manifests token-refresher-manifests machine-ops-manifests net-manifests unbounded-operator-manifests gantry-manifests ## Run all tests with race detector
 	@mkdir -p $(dir $(GO_TEST_REPORT))
-	$(GOTESTSUM) -- -race ./...
+	HELM=$(HELM) $(GOTESTSUM) -- -race ./...
 
 else
 # Locally, chain test -> lint for convenience.
 
-test: lint machina-manifests token-refresher-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-operator-manifests gantry-manifests ## Run all tests (implies lint)
+test: lint machina-manifests token-refresher-manifests machine-ops-manifests net-manifests unbounded-operator-manifests gantry-manifests ## Run all tests (implies lint)
 	@mkdir -p $(dir $(GO_TEST_REPORT))
-	$(GOTESTSUM) -- ./...
+	HELM=$(HELM) $(GOTESTSUM) -- ./...
 
 endif
 
@@ -612,9 +612,6 @@ e2e-gantry: $(HELM) $(KIND) ## Run the kind-based Gantry e2e suite
 
 e2e-racer: ## Run the kind-based Racer e2e suite (object caching and the Gantry Racer backend)
 	timeout --signal=TERM --kill-after=30s 7200s $(GOTEST) -tags=e2e -count=1 -timeout=110m -v ./e2e/racer
-
-e2e-playpen: ## Run the kind-based playpen e2e suite
-	$(GOTEST) -tags=e2e ./e2e/playpen -v -timeout=10m
 
 .PHONY: racer-test racer-go-test racer-rust-test racer-envtest racer-envtest-ci racer-generate
 racer-go-test: ## Lint and race-test the Go Racer API and workload packages
@@ -774,13 +771,13 @@ image-racer-object-local: ## Build the racer-object container image locally (sin
 		-f ./images/racer-object/Containerfile .
 	$(call trivy-maybe,$(RACER_OBJECT_IMAGE))
 
-build: machina-manifests token-refresher-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-operator-manifests gantry-manifests ## Build all Go packages
+build: machina-manifests token-refresher-manifests machine-ops-manifests net-manifests unbounded-operator-manifests gantry-manifests ## Build all Go packages
 	$(GOBUILD) ./...
 
 generate: install-protoc ## Run go generate for API types (deepcopy, CRDs) and protobuf
 	PATH="$(PROTOC_DIR)/bin:$$PATH" $(GOCMD) generate $(GO_PACKAGES)
 
-vulncheck: machina-manifests token-refresher-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-operator-manifests gantry-manifests ## Run govulncheck; fails only on reachable vulnerabilities that have a final-release fix
+vulncheck: machina-manifests token-refresher-manifests machine-ops-manifests net-manifests unbounded-operator-manifests gantry-manifests ## Run govulncheck; fails only on reachable vulnerabilities that have a final-release fix
 	@# The JSON stream is the documented programmatic interface. The gate owns
 	@# the verdict, so govulncheck is not asked for one: in JSON mode it exits 0
 	@# whether or not it found anything, and a non-zero exit here means the scan
@@ -1139,6 +1136,9 @@ resources/cni-plugins-linux-%-$(CNI_PLUGINS_VERSION).tgz:
 		"https://github.com/containernetworking/plugins/releases/download/$(CNI_PLUGINS_VERSION)/cni-plugins-linux-$*-$(CNI_PLUGINS_VERSION).tgz" \
 		-o $@
 
+.PHONY: net-image-resources
+net-image-resources: net-frontend resources/cni-plugins-linux-amd64-$(CNI_PLUGINS_VERSION).tgz resources/cni-plugins-linux-arm64-$(CNI_PLUGINS_VERSION).tgz ## Prepare frontend and CNI plugins for multiarch net image builds
+
 .PHONY: image-inventory-all-local
 image-inventory-all-local: image-inventory-aggregator-local image-inventory-inspector-local image-inventory-viewer-local
 
@@ -1235,18 +1235,6 @@ MACHINE_OPS_API_SERVER_ENDPOINT ?=
 MACHINE_OPS_EXPERIMENTAL_CONTAINER_ISOLATION ?= false
 MACHINE_OPS_MANIFEST_TEMPLATES_DIR := deploy/machine-ops
 MACHINE_OPS_MANIFEST_RENDERED_DIR  := deploy/machine-ops/rendered
-PLAYPEN_NAMESPACE ?= playpen
-PLAYPEN_AMD64_RUNNERS ?= 2
-PLAYPEN_ARM64_RUNNERS ?= 2
-PLAYPEN_RUNNER_WIREGUARD_HOST_PORT_START ?= 51820
-PLAYPEN_RUNNER_WIREGUARD_HOST_PORT_END ?= 51899
-PLAYPEN_CONTROL_PLANE_COUNT ?= 1
-PLAYPEN_CONTROL_PLANE_VERSIONS ?= v1.33.0
-PLAYPEN_CONTROL_PLANE_IMAGE ?= rancher/k3s:{version}-k3s1
-PLAYPEN_CONTROL_PLANE_API_SERVER_HOST_PORT_START ?= 16443
-PLAYPEN_CONTROL_PLANE_API_SERVER_HOST_PORT_END ?= 16499
-PLAYPEN_MANIFEST_TEMPLATES_DIR := deploy/playpen
-PLAYPEN_MANIFEST_RENDERED_DIR  := deploy/playpen/rendered
 
 machina-manifests: ## Render machina deployment manifests into deploy/machina/rendered
 	@mkdir -p $(MACHINA_MANIFEST_RENDERED_DIR)
@@ -1273,18 +1261,36 @@ token-refresher-manifests: ## Render token-refresher manifests into deploy/token
 		--set Image=$(TOKEN_REFRESHER_IMAGE)
 	@echo "Rendered token-refresher manifests into $(TOKEN_REFRESHER_MANIFEST_RENDERED_DIR) (image: $(TOKEN_REFRESHER_IMAGE))"
 
-unbounded-operator-manifests: ## Render unbounded-operator manifests into deploy/unbounded-operator/rendered
+unbounded-operator-manifests: $(HELM) ## Render unbounded-operator manifests into deploy/unbounded-operator/rendered
 	@mkdir -p $(UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR)
 	@find $(UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR) -mindepth 1 -not -name .gitignore -delete
-	$(GOCMD) run ./hack/cmd/render-manifests \
-		--templates-dir $(UNBOUNDED_OPERATOR_MANIFEST_TEMPLATES_DIR) \
-		--output-dir $(UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR) \
-		--set Namespace=$(UNBOUNDED_OPERATOR_NAMESPACE) \
-		--set OperatorImage=$(UNBOUNDED_OPERATOR_IMAGE) \
-		--set ImageRegistry=$(UNBOUNDED_OPERATOR_IMAGE_REGISTRY) \
-		--set "APIServerEndpoint=$${UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT}" \
-		--set ReapLegacyResources=$(UNBOUNDED_OPERATOR_REAP_LEGACY_RESOURCES)
+	@rm -rf $(UNBOUNDED_OPERATOR_RENDER_DIR)
+	@mkdir -p $(UNBOUNDED_OPERATOR_RENDER_DIR)
+	@# --set-file passes the endpoint verbatim; --set-string would split on commas.
+	@printf '%s' "$${UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT}" > $(UNBOUNDED_OPERATOR_RENDER_DIR)/api-server-endpoint
+	$(HELM) template unbounded-operator $(UNBOUNDED_OPERATOR_CHART_DIR) \
+		--namespace $(UNBOUNDED_OPERATOR_NAMESPACE) \
+		--values $(UNBOUNDED_OPERATOR_CHART_DIR)/values-static.yaml \
+		--skip-schema-validation \
+		--set-string image.reference=$(UNBOUNDED_OPERATOR_IMAGE) \
+		--set-string imageRegistry=$(UNBOUNDED_OPERATOR_IMAGE_REGISTRY) \
+		--set-file apiServerEndpoint=$(UNBOUNDED_OPERATOR_RENDER_DIR)/api-server-endpoint \
+		--set reapLegacyResources=$(UNBOUNDED_OPERATOR_REAP_LEGACY_RESOURCES) \
+		--output-dir $(UNBOUNDED_OPERATOR_RENDER_DIR)/out
+	@cp $(UNBOUNDED_OPERATOR_RENDER_DIR)/out/unbounded-operator/templates/*.yaml $(UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR)/
+	@rm -rf $(UNBOUNDED_OPERATOR_RENDER_DIR)
 	@echo "Rendered unbounded-operator manifests into $(UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR) (image: $(UNBOUNDED_OPERATOR_IMAGE))"
+
+unbounded-operator-chart-lint: $(HELM) ## Validate the unbounded-operator Helm chart
+	$(HELM) lint --strict $(UNBOUNDED_OPERATOR_CHART_DIR) --namespace $(UNBOUNDED_OPERATOR_NAMESPACE)
+
+unbounded-operator-chart-package: unbounded-operator-chart-lint ## Package the unbounded-operator Helm chart
+	@mkdir -p $(GANTRY_CHART_PACKAGE_DIR)
+	@rm -f $(GANTRY_CHART_PACKAGE_DIR)/unbounded-operator-$(UNBOUNDED_OPERATOR_CHART_VERSION).tgz
+	$(HELM) package $(UNBOUNDED_OPERATOR_CHART_DIR) \
+		--version $(UNBOUNDED_OPERATOR_CHART_VERSION) \
+		--app-version $(UNBOUNDED_OPERATOR_CHART_APP_VERSION) \
+		--destination $(GANTRY_CHART_PACKAGE_DIR)
 
 machine-ops-manifests: ## Render machine-ops-controller manifests into deploy/machine-ops/rendered
 	@mkdir -p $(MACHINE_OPS_MANIFEST_RENDERED_DIR)
@@ -1300,25 +1306,6 @@ machine-ops-manifests: ## Render machine-ops-controller manifests into deploy/ma
 		--set APIServerEndpoint=$(MACHINE_OPS_API_SERVER_ENDPOINT) \
 		--set ExperimentalContainerIsolation=$(MACHINE_OPS_EXPERIMENTAL_CONTAINER_ISOLATION)
 	@echo "Rendered machine-ops manifests into $(MACHINE_OPS_MANIFEST_RENDERED_DIR) (image: $(MACHINE_OPS_CONTROLLER_IMAGE))"
-
-playpen-manifests: ## Render playpen operator and runner manifests into deploy/playpen/rendered
-	@mkdir -p $(PLAYPEN_MANIFEST_RENDERED_DIR)
-	@find $(PLAYPEN_MANIFEST_RENDERED_DIR) -mindepth 1 -not -name .gitignore -delete
-	$(GOCMD) run ./hack/cmd/render-manifests \
-		--templates-dir $(PLAYPEN_MANIFEST_TEMPLATES_DIR) \
-		--output-dir $(PLAYPEN_MANIFEST_RENDERED_DIR) \
-		--set Namespace=$(PLAYPEN_NAMESPACE) \
-		--set PlaypenImage=$(PLAYPEN_IMAGE) \
-		--set RunnerAMD64Count=$(PLAYPEN_AMD64_RUNNERS) \
-		--set RunnerARM64Count=$(PLAYPEN_ARM64_RUNNERS) \
-		--set RunnerWireGuardHostPortStart=$(PLAYPEN_RUNNER_WIREGUARD_HOST_PORT_START) \
-		--set RunnerWireGuardHostPortEnd=$(PLAYPEN_RUNNER_WIREGUARD_HOST_PORT_END) \
-		--set ControlPlaneCount=$(PLAYPEN_CONTROL_PLANE_COUNT) \
-		--set ControlPlaneVersions=$(PLAYPEN_CONTROL_PLANE_VERSIONS) \
-		--set ControlPlaneImage=$(PLAYPEN_CONTROL_PLANE_IMAGE) \
-		--set ControlPlaneAPIServerHostPortStart=$(PLAYPEN_CONTROL_PLANE_API_SERVER_HOST_PORT_START) \
-		--set ControlPlaneAPIServerHostPortEnd=$(PLAYPEN_CONTROL_PLANE_API_SERVER_HOST_PORT_END)
-	@echo "Rendered playpen manifests into $(PLAYPEN_MANIFEST_RENDERED_DIR) (image: $(PLAYPEN_IMAGE))"
 
 machina-run: machina ## Replace the in-cluster machina with a locally built binary
 	kubectl scale deployment/machina-controller --replicas=0 -n $(MACHINA_NAMESPACE)
@@ -1351,15 +1338,6 @@ image-unbounded-operator-local: ## Build the unbounded-operator container image 
 
 image-unbounded-operator-push: image-unbounded-operator-local ## Build and push the unbounded-operator image
 	$(CONTAINER_ENGINE) push $(UNBOUNDED_OPERATOR_IMAGE)
-
-image-playpen-local: ## Build the playpen container image locally (single-arch)
-	$(CONTAINER_ENGINE) build \
-		--build-arg VERSION=$(VERSION) \
-		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
-		--build-arg BUILD_TIME=$(BUILD_TIME) \
-		-t playpen:$(PLAYPEN_TAG) -t $(PLAYPEN_IMAGE) \
-		-f ./images/playpen/Containerfile .
-	$(call trivy-maybe,$(PLAYPEN_IMAGE))
 
 image-gantry-local: ## Build the gantry container image locally (single-arch)
 	$(CONTAINER_ENGINE) build \
