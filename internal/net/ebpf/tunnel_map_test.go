@@ -239,6 +239,58 @@ func TestEndpointHealthPreservesHRWSlots(t *testing.T) {
 	}
 }
 
+func TestOverflowSlotsSurviveOverlappingRecovery(t *testing.T) {
+	t.Parallel()
+
+	endpoint := TunnelEndpoint{}
+	for i := range MaxNexthops + 1 {
+		endpoint.Nexthops = append(endpoint.Nexthops, TunnelNexthop{IfIndex: uint32(i + 1), Healthy: true})
+	}
+
+	var previous TunnelEndpoint
+
+	for _, step := range []struct {
+		peer    int
+		healthy bool
+		want    [MaxNexthops]uint32
+	}{
+		{-1, true, [MaxNexthops]uint32{1, 2, 3, 4}},
+		{0, false, [MaxNexthops]uint32{5, 2, 3, 4}},
+		{1, false, [MaxNexthops]uint32{5, 2, 3, 4}},
+		{0, true, [MaxNexthops]uint32{5, 1, 3, 4}},
+		{1, true, [MaxNexthops]uint32{5, 1, 3, 4}},
+		{4, false, [MaxNexthops]uint32{2, 1, 3, 4}},
+		{4, true, [MaxNexthops]uint32{2, 1, 3, 4}},
+	} {
+		if step.peer >= 0 {
+			endpoint.Nexthops[step.peer].Healthy = step.healthy
+		}
+
+		selected := selectNexthopSlots(endpoint, previous)
+
+		value := endpointToC(selected)
+		for slot, index := range step.want {
+			if value.Nexthops[slot].Ifindex != index {
+				t.Fatalf("health transition peer=%d healthy=%v moved slot %d: %+v, want %v", step.peer, step.healthy, slot, value, step.want)
+			}
+		}
+
+		previous = selected
+	}
+
+	endpoint.Nexthops[1].RouteDistance = 2
+	selected := selectNexthopSlots(endpoint, previous)
+
+	value := endpointToC(selected)
+	if value.Nexthops[0].Ifindex != 5 || value.Nexthops[0].Healthy != 1 {
+		t.Fatalf("lower-cost overflow candidate did not replace an ineligible slot: %+v", value)
+	}
+
+	if len(endpoint.Nexthops) != MaxNexthops+1 || endpoint.Nexthops[0].IfIndex != 1 {
+		t.Fatal("slot selection modified the desired candidates")
+	}
+}
+
 func TestEndpointDistanceSelectionBeforeNexthopLimit(t *testing.T) {
 	t.Parallel()
 

@@ -114,6 +114,7 @@ type TunnelMap struct {
 	lastReconciled map[string]TunnelEndpoint
 	// Preserve applied routers so lookup failures cannot prevent withdrawal.
 	lastResolved map[string]TunnelEndpoint
+	lastApplied  map[lpmKey]TunnelEndpoint
 }
 
 // TunnelMapOptions configures TunnelMap creation.
@@ -241,7 +242,8 @@ func (tm *TunnelMap) UpdateEndpoint(cidr *net.IPNet, ep TunnelEndpoint) error {
 		return err
 	}
 
-	val := endpointToC(resolved)
+	selected := selectNexthopSlots(resolved, tm.lastApplied[key])
+	val := endpointToC(selected)
 
 	if err := tm.endpoints.Update(key, val, ebpf.UpdateAny); err != nil {
 		return err
@@ -259,6 +261,11 @@ func (tm *TunnelMap) UpdateEndpoint(cidr *net.IPNet, ep TunnelEndpoint) error {
 	}
 
 	tm.lastResolved[cidr.String()] = resolved
+	if tm.lastApplied == nil {
+		tm.lastApplied = make(map[lpmKey]TunnelEndpoint)
+	}
+
+	tm.lastApplied[key] = selected
 
 	return nil
 }
@@ -278,6 +285,7 @@ func (tm *TunnelMap) DeleteEndpoint(cidr *net.IPNet) error {
 	if err == nil || errors.Is(err, ebpf.ErrKeyNotExist) {
 		delete(tm.lastReconciled, cidr.String())
 		delete(tm.lastResolved, cidr.String())
+		delete(tm.lastApplied, key)
 
 		return nil
 	}
@@ -297,6 +305,8 @@ func (tm *TunnelMap) Reconcile(desired map[string]TunnelEndpoint) error {
 	originalDesired := make(map[string]TunnelEndpoint, len(desired))
 
 	resolvedDesired := make(map[string]TunnelEndpoint, len(desired))
+
+	appliedDesired := make(map[lpmKey]TunnelEndpoint, len(desired))
 	for cidrStr, ep := range desired {
 		_, cidr, err := net.ParseCIDR(cidrStr)
 		if err != nil {
@@ -313,7 +323,8 @@ func (tm *TunnelMap) Reconcile(desired map[string]TunnelEndpoint) error {
 			return fmt.Errorf("resolve native nexthops for %s: %w", cidrStr, err)
 		}
 
-		desiredByKey[key] = resolved
+		selected := selectNexthopSlots(resolved, tm.lastApplied[key])
+		desiredByKey[key] = selected
 		ep.Nexthops = slices.Clone(ep.Nexthops)
 		originalDesired[cidrStr] = ep
 		resolvedDesired[cidrStr] = resolved
@@ -345,7 +356,15 @@ func (tm *TunnelMap) Reconcile(desired map[string]TunnelEndpoint) error {
 	for key, ep := range desiredByKey {
 		if err := tm.endpoints.Update(key, endpointToC(ep), ebpf.UpdateAny); err != nil {
 			klog.Warningf("eBPF reconcile: update failed: %v", err)
+
+			if previous, exists := tm.lastApplied[key]; exists {
+				appliedDesired[key] = previous
+			}
+
+			continue
 		}
+
+		appliedDesired[key] = ep
 	}
 
 	klog.V(2).Infof("eBPF tunnel map reconciled: %d entries (%d stale removed)",
@@ -353,6 +372,7 @@ func (tm *TunnelMap) Reconcile(desired map[string]TunnelEndpoint) error {
 
 	tm.lastReconciled = originalDesired
 	tm.lastResolved = resolvedDesired
+	tm.lastApplied = appliedDesired
 
 	return nil
 }
@@ -388,12 +408,14 @@ func (tm *TunnelMap) RefreshNativeNexthops() error {
 			continue
 		}
 
-		if err := tm.endpoints.Update(key, endpointToC(resolved), ebpf.UpdateAny); err != nil {
+		selected := selectNexthopSlots(resolved, tm.lastApplied[key])
+		if err := tm.endpoints.Update(key, endpointToC(selected), ebpf.UpdateAny); err != nil {
 			failures = append(failures, fmt.Errorf("refresh native endpoint %s: %w", cidrStr, err))
 			continue
 		}
 
 		tm.lastResolved[cidrStr] = resolved
+		tm.lastApplied[key] = selected
 	}
 
 	return errors.Join(failures...)
@@ -462,13 +484,15 @@ func (tm *TunnelMap) SetPeerHealth(peerName string, healthy bool) int {
 			}
 		}
 
-		if err := tm.endpoints.Update(key, endpointToC(resolved), ebpf.UpdateAny); err != nil {
+		selected := selectNexthopSlots(resolved, tm.lastApplied[key])
+		if err := tm.endpoints.Update(key, endpointToC(selected), ebpf.UpdateAny); err != nil {
 			klog.Warningf("eBPF SetPeerHealth %s: %v", cidrStr, err)
 			continue
 		}
 
 		updated++
 		tm.lastResolved[cidrStr] = resolved
+		tm.lastApplied[key] = selected
 	}
 
 	return updated
@@ -613,15 +637,11 @@ func resolveNativeNexthops(ep TunnelEndpoint, routeGet func(net.IP, *netlink.Rou
 	return resolved, nil
 }
 
-// endpointToC converts a TunnelEndpoint to the bpf2go-generated value
-// type. The remote endpoint is stored in IPv4-mapped IPv6 form for v4
-// underlays (via net.IP.To16, which already returns ::ffff:<v4> for
-// 4-byte addresses) and natively for v6 underlays.
-func endpointToC(ep TunnelEndpoint) tunnelEndpointC {
-	var c tunnelEndpointC
+func selectNexthopSlots(ep, previous TunnelEndpoint) TunnelEndpoint {
+	if len(ep.Nexthops) <= MaxNexthops {
+		return ep
+	}
 
-	// ECMP across unequal path lengths can loop between gateways. Keep
-	// standby paths in Go so health changes can select the next best cost.
 	bestDistance := 0
 
 	for _, nh := range ep.Nexthops {
@@ -631,27 +651,84 @@ func endpointToC(ep TunnelEndpoint) tunnelEndpointC {
 		}
 	}
 
-	// HRW hashes slot indices. Only replace ineligible slots when over capacity.
-	nexthops := ep.Nexthops
-	if len(nexthops) > MaxNexthops {
-		nexthops = slices.Clone(ep.Nexthops[:MaxNexthops])
-		for _, candidate := range ep.Nexthops[MaxNexthops:] {
-			if !candidate.Healthy || max(1, candidate.RouteDistance) != bestDistance {
-				continue
-			}
+	indices := [MaxNexthops]int{}
+	used := make([]bool, len(ep.Nexthops))
 
-			slot := slices.IndexFunc(nexthops, func(nh TunnelNexthop) bool {
-				return !nh.Healthy || max(1, nh.RouteDistance) != bestDistance
-			})
-			if slot == -1 {
+	for slot := range MaxNexthops {
+		indices[slot] = -1
+		if slot >= len(previous.Nexthops) {
+			continue
+		}
+
+		old := previous.Nexthops[slot]
+		for i, nh := range ep.Nexthops {
+			if !used[i] && nh.PeerName == old.PeerName && nh.IfIndex == old.IfIndex &&
+				nh.Protocol == old.Protocol && nh.VNI == old.VNI &&
+				(nh.PeerName != "" || nh.RemoteIP.Equal(old.RemoteIP)) {
+				indices[slot], used[i] = i, true
 				break
 			}
-
-			nexthops[slot] = candidate
 		}
 	}
 
-	for i, nh := range nexthops {
+	for slot, index := range indices {
+		if index != -1 {
+			continue
+		}
+
+		for i := range ep.Nexthops {
+			if !used[i] {
+				indices[slot], used[i] = i, true
+				break
+			}
+		}
+	}
+
+	// A recovered primary must not move a continuously eligible overflow peer.
+	for i, candidate := range ep.Nexthops {
+		if used[i] || !candidate.Healthy || max(1, candidate.RouteDistance) != bestDistance {
+			continue
+		}
+
+		for slot, index := range indices {
+			nh := ep.Nexthops[index]
+			if !nh.Healthy || max(1, nh.RouteDistance) != bestDistance {
+				used[index] = false
+				indices[slot], used[i] = i, true
+
+				break
+			}
+		}
+	}
+
+	selected := ep
+
+	selected.Nexthops = make([]TunnelNexthop, MaxNexthops)
+	for slot, index := range indices {
+		selected.Nexthops[slot] = ep.Nexthops[index]
+	}
+
+	return selected
+}
+
+// endpointToC converts a TunnelEndpoint to the bpf2go-generated value
+// type. The remote endpoint is stored in IPv4-mapped IPv6 form for v4
+// underlays (via net.IP.To16, which already returns ::ffff:<v4> for
+// 4-byte addresses) and natively for v6 underlays.
+func endpointToC(ep TunnelEndpoint) tunnelEndpointC {
+	var c tunnelEndpointC
+
+	ep = selectNexthopSlots(ep, TunnelEndpoint{})
+	bestDistance := 0
+
+	for _, nh := range ep.Nexthops {
+		distance := max(1, nh.RouteDistance)
+		if nh.Healthy && (bestDistance == 0 || distance < bestDistance) {
+			bestDistance = distance
+		}
+	}
+
+	for i, nh := range ep.Nexthops {
 		if i >= MaxNexthops {
 			break
 		}

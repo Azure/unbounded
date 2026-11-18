@@ -8,6 +8,7 @@ package ebpf
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
 	"runtime"
 	"testing"
@@ -102,6 +103,72 @@ func TestNoneProtocolNativeNeighborResolution(t *testing.T) {
 	if err := tunnelMap.AttachToInterface(overlay.Name); err != nil {
 		t.Fatal(err)
 	}
+
+	t.Run("overflow slots survive all update paths", func(t *testing.T) {
+		const prefix = "10.247.0.0/16"
+
+		_, cidr, _ := net.ParseCIDR(prefix)
+
+		key, err := cidrToKey(cidr)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		endpoint := TunnelEndpoint{}
+		for i := range MaxNexthops + 1 {
+			endpoint.Nexthops = append(endpoint.Nexthops, TunnelNexthop{
+				PeerName: fmt.Sprintf("overflow-%d", i), RemoteIP: net.ParseIP(fmt.Sprintf("192.0.2.%d", i+11)),
+				IfIndex: uint32(fabric.Index), Protocol: TunnelProtoNone, VNI: uint32(i + 1), Healthy: true,
+			})
+		}
+
+		if err := tunnelMap.UpdateEndpoint(cidr, endpoint); err != nil {
+			t.Fatal(err)
+		}
+
+		for _, step := range []struct {
+			peer    string
+			healthy bool
+		}{{"overflow-0", false}, {"overflow-1", false}, {"overflow-0", true}} {
+			if updated := tunnelMap.SetPeerHealth(step.peer, step.healthy); updated != 1 {
+				t.Fatalf("health transition updated %d entries", updated)
+			}
+		}
+
+		for _, update := range []func() error{
+			func() error { return tunnelMap.Reconcile(tunnelMap.lastReconciled) },
+			func() error { return tunnelMap.UpdateEndpoint(cidr, tunnelMap.lastReconciled[prefix]) },
+			tunnelMap.RefreshNativeNexthops,
+		} {
+			if err := update(); err != nil {
+				t.Fatal(err)
+			}
+
+			var value tunnelEndpointC
+			if err := tunnelMap.endpoints.Lookup(key, &value); err != nil {
+				t.Fatal(err)
+			}
+
+			for slot, want := range []uint32{5, 1, 3, 4} {
+				if value.Nexthops[slot].Vni != want || value.Nexthops[slot].Healthy != 1 {
+					t.Fatalf("continuously healthy overflow moved during an update: %+v", value)
+				}
+			}
+
+			if len(tunnelMap.lastReconciled[prefix].Nexthops) != MaxNexthops+1 ||
+				len(tunnelMap.lastResolved[prefix].Nexthops) != MaxNexthops+1 {
+				t.Fatal("slot selection lost overflow or native-resolution candidates")
+			}
+		}
+
+		if err := tunnelMap.DeleteEndpoint(cidr); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, exists := tunnelMap.lastApplied[key]; exists {
+			t.Fatal("deleted endpoint retained applied overflow slots")
+		}
+	})
 
 	for _, tc := range []struct {
 		name, source, destination, prefix, endpoint string
