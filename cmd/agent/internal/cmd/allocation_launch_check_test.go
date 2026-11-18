@@ -14,9 +14,9 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/Azure/unbounded/cmd/agent/internal/daemon"
-	"github.com/Azure/unbounded/cmd/agent/internal/noneops"
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/noneops"
 )
 
 func TestAuthorizeNoneStart(t *testing.T) {

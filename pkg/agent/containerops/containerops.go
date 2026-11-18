@@ -40,10 +40,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Azure/unbounded/cmd/agent/internal/hostnode"
 	"github.com/Azure/unbounded/pkg/agent/config"
 	"github.com/Azure/unbounded/pkg/agent/confsnap"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/hostnode"
 	"github.com/Azure/unbounded/pkg/agent/isolation"
 	"github.com/Azure/unbounded/pkg/agent/isolation/container"
 	"github.com/Azure/unbounded/pkg/agent/phases"
