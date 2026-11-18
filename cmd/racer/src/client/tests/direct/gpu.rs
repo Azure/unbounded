@@ -11,6 +11,9 @@ use racer_gpu::simulation::SimDevice;
 use racer_gpu::simulation::Simulation;
 use racer_gpu::simulation::read_allocation;
 
+#[cfg(feature = "cuda")]
+mod hardware;
+
 const GRANULE: u64 = racer_gpu::simulation::GRANULARITY;
 
 thread_local! {

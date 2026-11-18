@@ -3091,6 +3091,84 @@ pub(crate) mod testing {
         .unwrap()
     }
 
+    /// Metadata of a one-page object of `length` bytes.
+    pub(crate) fn metadata(length: u64) -> crate::model::ObjectMetadata {
+        use crate::model::*;
+        ObjectMetadata {
+            content_type: None,
+            version: ObjectVersion {
+                object: ObjectId {
+                    cache: racer_wire::control::CacheId(
+                        "00000000-0000-4000-8000-000000000001".into(),
+                    ),
+                    key: CacheKey([0; 32]),
+                },
+                etag: StrongEtag::test_value("v1"),
+            },
+            length,
+            expires_at: ExpiresAt::from_system_time(std::time::UNIX_EPOCH).unwrap(),
+        }
+    }
+
+    /// The envelope [`seal`] seals the page of `metadata` under.
+    pub(crate) fn envelope(metadata: &crate::model::ObjectMetadata) -> crate::model::PageEnvelope {
+        use crate::model::*;
+        PageEnvelope {
+            page_size: racer_wire::object::PageSize::DEFAULT,
+            cipher: PageCipher::Xaes256Gcm,
+            page: PageId {
+                version: metadata.version.clone(),
+                number: PageNumber(0),
+            },
+            key_id: key_id_from_generation(1, 1).unwrap(),
+            nonce: Nonce(crate::test_support::test_vector([2; 24])),
+            plaintext_length: metadata.length as u32,
+            ciphertext_length: metadata.length as u32 + 16,
+        }
+    }
+
+    /// Seal `plaintext`. Returns the ciphertext and tag, and a builder for
+    /// the sealed page given where that ciphertext is.
+    pub(crate) fn seal(
+        plaintext: &[u8],
+        tamper: bool,
+    ) -> (
+        Vec<u8>,
+        impl FnOnce(SealedSource) -> Box<SealedPage> + use<>,
+    ) {
+        let metadata = metadata(plaintext.len() as u64);
+        let envelope = envelope(&metadata);
+        let aad = crate::security::page_aad(&envelope).unwrap();
+        let mut sealed = vec![0; plaintext.len() + 16];
+        racer_crypto::seal(
+            &crate::test_support::test_vector([7; 32]),
+            &envelope.nonce.0,
+            &aad,
+            plaintext,
+            &mut sealed,
+        )
+        .unwrap();
+        if tamper {
+            sealed[3] ^= 1;
+        }
+        let build = move |source| {
+            let page = Box::new(SealedPage {
+                fused_store: None,
+                metadata,
+                aad,
+                key: racer_crypto::xaes_derive(
+                    &crate::test_support::test_vector([7; 32]),
+                    &envelope.nonce.0,
+                ),
+                source,
+                envelope,
+            });
+            page.validate_for(&page.envelope.page.clone()).unwrap();
+            page
+        };
+        (sealed, build)
+    }
+
     /// GPU `ordinal`'s landing buffer of `length` bytes, blocking.
     pub(crate) fn landing(
         helper: &GpuHelper,
@@ -3227,6 +3305,9 @@ pub(crate) mod testing {
     }
 }
 
+#[cfg(all(test, feature = "cuda"))]
+pub(crate) mod hardware;
+
 #[cfg(test)]
 mod tests {
     //! RDMA landing buffers on simulated GPUs: allocation, reuse, and
@@ -3277,23 +3358,6 @@ mod tests {
 
     const LENGTH: u64 = 2 * SLOT_BYTES;
 
-    fn metadata(length: u64) -> ObjectMetadata {
-        ObjectMetadata {
-            content_type: None,
-            version: ObjectVersion {
-                object: ObjectId {
-                    cache: racer_wire::control::CacheId(
-                        "00000000-0000-4000-8000-000000000001".into(),
-                    ),
-                    key: CacheKey([0; 32]),
-                },
-                etag: StrongEtag::test_value("v1"),
-            },
-            length,
-            expires_at: ExpiresAt::from_system_time(std::time::UNIX_EPOCH).unwrap(),
-        }
-    }
-
     /// A sealed page whose real ciphertext a NIC wrote at `at` in `landing`.
     fn landed(landing: &GpuLanding, at: u64, plaintext: &[u8], tamper: bool) -> Box<SealedPage> {
         let (sealed, page) = seal(plaintext, tamper);
@@ -3303,56 +3367,6 @@ mod tests {
             at,
             sealed.len() as u64,
         ))))
-    }
-
-    /// Seal `plaintext`. Returns the ciphertext and tag, and a builder for
-    /// the sealed page given where that ciphertext is.
-    fn seal(
-        plaintext: &[u8],
-        tamper: bool,
-    ) -> (Vec<u8>, impl FnOnce(SealedSource) -> Box<SealedPage>) {
-        let metadata = metadata(plaintext.len() as u64);
-        let envelope = PageEnvelope {
-            page_size: racer_wire::object::PageSize::DEFAULT,
-            cipher: PageCipher::Xaes256Gcm,
-            page: PageId {
-                version: metadata.version.clone(),
-                number: PageNumber(0),
-            },
-            key_id: key_id_from_generation(1, 1).unwrap(),
-            nonce: Nonce(crate::test_support::test_vector([2; 24])),
-            plaintext_length: plaintext.len() as u32,
-            ciphertext_length: plaintext.len() as u32 + 16,
-        };
-        let aad = crate::security::page_aad(&envelope).unwrap();
-        let mut sealed = vec![0; plaintext.len() + 16];
-        racer_crypto::seal(
-            &crate::test_support::test_vector([7; 32]),
-            &envelope.nonce.0,
-            &aad,
-            plaintext,
-            &mut sealed,
-        )
-        .unwrap();
-        if tamper {
-            sealed[3] ^= 1;
-        }
-        let build = move |source| {
-            let page = Box::new(SealedPage {
-                fused_store: None,
-                metadata,
-                aad,
-                key: racer_crypto::xaes_derive(
-                    &crate::test_support::test_vector([7; 32]),
-                    &envelope.nonce.0,
-                ),
-                source,
-                envelope,
-            });
-            page.validate_for(&page.envelope.page.clone()).unwrap();
-            page
-        };
-        (sealed, build)
     }
 
     #[test]
