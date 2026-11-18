@@ -27,7 +27,8 @@ import (
 	"github.com/Azure/unbounded/internal/unbounded"
 )
 
-// schedulerInterval is how often the scheduler hands out update slots.
+// schedulerInterval is how often the scheduler hands out update slots, besides
+// when a slot frees.
 const schedulerInterval = 30 * time.Second
 
 // Config is the controller's configuration file.
@@ -107,6 +108,8 @@ func runController(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("index Machines by Node: %w", err)
 	}
 
+	wake := controller.NewWakeup()
+
 	if err := (&controller.Reconciler{
 		Client:    mgr.GetClient(),
 		Reader:    mgr.GetAPIReader(),
@@ -115,11 +118,12 @@ func runController(ctx context.Context, cfg Config) error {
 		Drainer:   &drain.Drainer{Client: clientset},
 		Clock:     clock.RealClock{},
 		Recorder:  mgr.GetEventRecorder("centerpivot"),
+		Wake:      wake,
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("set up the node reconciler: %w", err)
 	}
 
-	if err := mgr.Add(&controller.Scheduler{Client: mgr.GetClient(), Clock: clock.RealClock{}, Interval: schedulerInterval}); err != nil {
+	if err := mgr.Add(&controller.Scheduler{Client: mgr.GetClient(), Clock: clock.RealClock{}, Interval: schedulerInterval, Wake: wake}); err != nil {
 		return fmt.Errorf("add the scheduler: %w", err)
 	}
 

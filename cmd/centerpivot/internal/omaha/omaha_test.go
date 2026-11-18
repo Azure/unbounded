@@ -98,7 +98,97 @@ func TestUpdateCheckSendsWhatTheAgentSends(t *testing.T) {
 	assert.Equal(t, "ebb9a2bb-9365-d34e-133f-8da0664e7366", app.MachineID)
 	assert.NotNil(t, app.UpdateCheck)
 	assert.Nil(t, app.Ping, "pings belong to the agent")
-	assert.Empty(t, app.Events, "events belong to the agent")
+	assert.Empty(t, app.Events, "an update check carries no events")
+}
+
+func TestReportFailureSendsTheAgentsFailedEvent(t *testing.T) {
+	t.Parallel()
+
+	var received []byte
+
+	server := serve(t, http.StatusOK, nebraskaResponse(`<app appid="`+appID+`" status="ok"><event status="ok"></event></app>`), &received)
+	client := &Client{HTTP: server.Client()}
+
+	require.NoError(t, client.ReportFailure(t.Context(), check(server.URL)))
+
+	// The agent's report_failure: the same app, with one event, update
+	// complete with an error result, and no update check, so it never takes
+	// a grant.
+	var got struct {
+		Apps []struct {
+			AppID       string    `xml:"appid,attr"`
+			Version     string    `xml:"version,attr"`
+			Track       string    `xml:"track,attr"`
+			MachineID   string    `xml:"machineid,attr"`
+			UpdateCheck *struct{} `xml:"updatecheck"`
+			Events      []struct {
+				Type            string `xml:"eventtype,attr"`
+				Result          string `xml:"eventresult,attr"`
+				PreviousVersion string `xml:"previousversion,attr"`
+			} `xml:"event"`
+		} `xml:"app"`
+	}
+	require.NoError(t, xml.Unmarshal(received, &got))
+	require.Len(t, got.Apps, 1)
+
+	app := got.Apps[0]
+	assert.Equal(t, appID, app.AppID)
+	assert.Equal(t, "202606.15.0", app.Version)
+	assert.Equal(t, "stable", app.Track)
+	assert.Equal(t, "ebb9a2bb-9365-d34e-133f-8da0664e7366", app.MachineID)
+	assert.Nil(t, app.UpdateCheck)
+	require.Len(t, app.Events, 1)
+	assert.Equal(t, "3", app.Events[0].Type)
+	assert.Equal(t, "0", app.Events[0].Result)
+	assert.Equal(t, "202606.15.0", app.Events[0].PreviousVersion)
+}
+
+func TestReportFailureAnswers(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		app     string
+		wantErr bool
+	}{
+		{
+			name: "acknowledged",
+			app:  `<app appid="` + appID + `" status="ok"><event status="ok"></event></app>`,
+		},
+		{
+			name: "acknowledged with an update in progress",
+			app:  `<app appid="` + appID + `" status="error-updateInProgressOnInstance"><event status="ok"></event></app>`,
+		},
+		{
+			name:    "skipped, for a track Nebraska doesn't know",
+			app:     `<app appid="` + appID + `" status="error-unknownApplicationOrGroup"></app>`,
+			wantErr: true,
+		},
+		{
+			name:    "rejected",
+			app:     `<app appid="` + appID + `" status="ok"><event status="error-internal"></event></app>`,
+			wantErr: true,
+		},
+		{
+			name:    "not acknowledged",
+			app:     `<app appid="` + appID + `" status="ok"></app>`,
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			server := serve(t, http.StatusOK, nebraskaResponse(tt.app), nil)
+			err := (&Client{HTTP: server.Client()}).ReportFailure(t.Context(), check(server.URL))
+
+			if tt.wantErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
 }
 
 func TestUpdateCheckAnswers(t *testing.T) {

@@ -52,6 +52,24 @@ func TestCenterPivotCRDValidation(t *testing.T) {
 			want:        []string{"spec.components.centerPivot.apps[1]", "Duplicate value"},
 		},
 		{
+			name:        "the default deadlines fit the default update timeout",
+			centerPivot: `{enabled: true, nebraskaURL: "https://nebraska.example.com/v1/update", apps: [{name: acl, appID: app}]}`,
+		},
+		{
+			name:        "an hour, with the default deadlines",
+			centerPivot: `{enabled: true, nebraskaURL: "https://nebraska.example.com/v1/update", apps: [{name: acl, appID: app}], updateTimeout: 1h}`,
+			want:        []string{"updateTimeout must fit staging"},
+		},
+		{
+			name: "an hour, with deadlines that fit it",
+			centerPivot: `{enabled: true, nebraskaURL: "https://nebraska.example.com/v1/update", apps: [{name: acl, appID: app}],
+        updateTimeout: 1h, drainDeadline: 5m, restartDeadline: 5m}`,
+		},
+		{
+			name:        "disabled isn't checked",
+			centerPivot: `{enabled: false, updateTimeout: 1h}`,
+		},
+		{
 			name:        "an app without an ID",
 			centerPivot: `{apps: [{name: acl}]}`,
 			want:        []string{"spec.components.centerPivot.apps[0].appID"},

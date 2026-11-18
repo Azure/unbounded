@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package operatorcomponent is centerpivot's component in the Unbounded
-// operator: it installs centerpivot while any Site enables it, and reports a
-// held node in the Site's CenterPivotReady condition. It is one of the two
+// operator: it installs centerpivot while any Site enables it, and reports
+// held nodes in the Site's CenterPivotReady condition. It is one of the two
 // packages cmd/centerpivot exports; see ../AGENTS.md.
 package operatorcomponent
 
@@ -38,7 +38,8 @@ const (
 	nodePolicyName       = "centerpivot-node-restriction"
 	configHashAnnotation = "unbounded-cloud.io/centerpivot-config-hash"
 
-	// ReasonUpdatesHeld reports that no update starts while a node is held.
+	// ReasonUpdatesHeld reports that no update of an app starts while a node
+	// that restarted into a new version of it is held.
 	ReasonUpdatesHeld = "UpdatesHeld"
 )
 
@@ -93,7 +94,7 @@ func (c Component) Plan(ctx context.Context, env *component.Env, sites []unbound
 		return nil, component.Result{}, err
 	}
 
-	result, err := heldResult(ctx, env)
+	result, err := heldResult(ctx, env, sites)
 	if err != nil {
 		return nil, component.Result{}, err
 	}
@@ -192,9 +193,19 @@ func sourcesExpression(sources [][2]string) string {
 	return "[" + strings.Join(pairs, ", ") + "]"
 }
 
-// heldResult reports any node held after a failed update: until a person
-// clears it, no update starts.
-func heldResult(ctx context.Context, env *component.Env) (component.Result, error) {
+// heldResult reports the nodes held in Sites that enable centerpivot. A hold
+// that stops an app, because a node restarted into a version that may be bad,
+// makes the condition false; one that holds only its node is named in the
+// message.
+func heldResult(ctx context.Context, env *component.Env, sites []unboundedv1alpha3.Site) (component.Result, error) {
+	enabled := map[string]bool{}
+
+	for i := range sites {
+		if EnabledFor(&sites[i]) {
+			enabled[sites[i].Name] = true
+		}
+	}
+
 	machines := &metav1.PartialObjectMetadataList{}
 	machines.SetGroupVersionKind(unboundedv1alpha3.GroupVersion.WithKind("MachineList"))
 
@@ -202,45 +213,76 @@ func heldResult(ctx context.Context, env *component.Env) (component.Result, erro
 		return component.Result{}, fmt.Errorf("list Machines: %w", err)
 	}
 
-	var held []string
-
-	reasons := map[string]string{}
+	var holds []hold
 
 	for _, machine := range machines.Items {
-		if reason, ok := heldReason(machine.Annotations); ok {
-			held = append(held, machine.Name)
-			reasons[machine.Name] = reason
+		if !enabled[machine.Labels[unboundedv1alpha3.MachineSiteLabelKey]] {
+			continue
+		}
+
+		if h, ok := holdOf(machine.Annotations); ok {
+			h.machine = machine.Name
+			holds = append(holds, h)
 		}
 	}
 
-	if len(held) == 0 {
+	if len(holds) == 0 {
 		return component.Reconciled(), nil
 	}
 
-	slices.Sort(held)
+	// App holds first, then by Machine.
+	slices.SortFunc(holds, func(a, b hold) int {
+		if (a.app == "") != (b.app == "") {
+			if a.app != "" {
+				return -1
+			}
 
-	return component.NotReady(ReasonUpdatesHeld, fmt.Sprintf(
-		"no update starts while Machine %s is held (%d held): %s. Remove its %s annotation to clear the hold",
-		held[0], len(held), reasons[held[0]], names.StateAnnotation,
-	)), nil
+			return 1
+		}
+
+		return strings.Compare(a.machine, b.machine)
+	})
+
+	first := holds[0]
+	clearHold := fmt.Sprintf("Remove its %s annotation to clear the hold", names.StateAnnotation)
+
+	if first.app != "" {
+		return component.NotReady(ReasonUpdatesHeld, fmt.Sprintf(
+			"no update of app %s starts while Machine %s is held (%d held): %s. %s",
+			first.app, first.machine, len(holds), first.reason, clearHold,
+		)), nil
+	}
+
+	return component.Result{
+		Ready:  true,
+		Reason: component.ReasonReconciled,
+		Message: fmt.Sprintf("Machine %s isn't updated while it's held (%d held): %s. %s",
+			first.machine, len(holds), first.reason, clearHold),
+	}, nil
 }
 
-// heldReason returns why a Machine's node is held, if it is.
-func heldReason(annotations map[string]string) (string, bool) {
+// hold is a held node: its Machine, why, and the app it stops, if any.
+type hold struct {
+	machine, reason, app string
+}
+
+// holdOf returns the hold in a Machine's state annotation, if any.
+func holdOf(annotations map[string]string) (hold, bool) {
 	value, ok := annotations[names.StateAnnotation]
 	if !ok {
-		return "", false
+		return hold{}, false
 	}
 
 	var state struct {
-		Phase  string `json:"phase"`
-		Reason string `json:"reason"`
+		Phase   string `json:"phase"`
+		Reason  string `json:"reason"`
+		HeldApp string `json:"heldApp"`
 	}
 	if err := json.Unmarshal([]byte(value), &state); err != nil {
-		return "its state can't be read", true
+		return hold{reason: "its state can't be read"}, true
 	}
 
-	return state.Reason, state.Phase == "Held"
+	return hold{reason: state.Reason, app: state.HeldApp}, state.Phase == "Held"
 }
 
 func cleanupPlan(namespace string) *component.Plan {
@@ -295,12 +337,12 @@ func (Component) SetupWatches(b *builder.Builder, env *component.Env) {
 // held.
 func heldChanged() predicate.Predicate {
 	held := func(obj client.Object) string {
-		reason, ok := heldReason(obj.GetAnnotations())
+		h, ok := holdOf(obj.GetAnnotations())
 		if !ok {
 			return ""
 		}
 
-		return "held: " + reason
+		return "held: " + h.app + ": " + h.reason
 	}
 
 	return predicate.Funcs{

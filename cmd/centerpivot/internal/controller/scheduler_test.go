@@ -91,6 +91,9 @@ func TestScheduleCountsUnavailableNodes(t *testing.T) {
 		"updating":  {testNode(t, "busy", "edge", running), testMachine(t, "busy", &State{Phase: PhaseRestarting})},
 		"cordoned":  {cordoned, testMachine(t, "cordoned", nil)},
 		"operation": {testNode(t, "busy", "edge", running), testMachine(t, "busy", nil), machineOperation("busy")},
+		// A Machine whose Node is gone, as while it's rebuilt.
+		"no Node":             {testMachine(t, "gone", nil)},
+		"no Node, mid-update": {testMachine(t, "gone", &State{Phase: PhaseDraining})},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -103,17 +106,80 @@ func TestScheduleCountsUnavailableNodes(t *testing.T) {
 	}
 }
 
-func TestScheduleStopsWhileANodeIsHeld(t *testing.T) {
+func TestHolds(t *testing.T) {
 	t.Parallel()
 
-	c := schedule(
-		t,
-		testSite("edge", nil), testSite("core", nil),
-		testNode(t, "due", "edge", running), testMachine(t, "due", nil),
-		testNode(t, "held", "core", running), testMachine(t, "held", &State{Phase: PhaseHeld, Reason: "boot failed"}),
-	)
+	appHold := &State{Phase: PhaseHeld, Reason: "the node didn't boot", HeldApp: aclApp}
 
-	assert.Empty(t, checking(t, c, "due"), "a node held in any Site stops every Site")
+	// Each subtest builds its own Sites, since the fake client changes the
+	// objects it's given.
+	otherSite := func() *unboundedv1alpha3.Site { return testSite("core", nil) }
+	disabledSite := func() *unboundedv1alpha3.Site {
+		site := testSite("core", nil)
+		site.Spec.Components.CenterPivot.Enabled = ptr.To(false)
+
+		return site
+	}
+
+	tests := []struct {
+		name string
+		held *State
+		// site is the held node's Site, other than edge.
+		site    func() *unboundedv1alpha3.Site
+		checked bool
+	}{
+		{name: "a hold on the app, in another Site", held: appHold, site: otherSite},
+		{name: "a hold on the node only", held: &State{Phase: PhaseHeld, Reason: "3 attempts failed"}, checked: true},
+		{name: "a hold on another app", held: &State{Phase: PhaseHeld, HeldApp: nvidiaApp}, site: otherSite, checked: true},
+		{name: "a hold in a Site without centerpivot", held: appHold, site: disabledSite, checked: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			heldSite := "edge"
+			objects := []client.Object{
+				testSite("edge", ptr.To(intstr.FromInt32(2))),
+				testNode(t, "due", "edge", running), testMachine(t, "due", nil),
+			}
+
+			if tt.site != nil {
+				site := tt.site()
+				heldSite = site.Name
+				objects = append(objects, site)
+			}
+
+			objects = append(objects, testNode(t, "held", heldSite, running), testMachine(t, "held", tt.held))
+
+			c := schedule(t, objects...)
+
+			if tt.checked {
+				assert.Equal(t, []string{"due"}, checking(t, c, "due"))
+			} else {
+				assert.Empty(t, checking(t, c, "due"))
+			}
+		})
+	}
+}
+
+func TestScheduleWaitsForAGrantToEnd(t *testing.T) {
+	t.Parallel()
+
+	c := schedule(t, testSite("edge", nil),
+		testNode(t, "due", "edge", running), testMachine(t, "due", &State{Phase: PhaseIdle, EndGrant: &Grant{AppID: aclApp}}))
+
+	assert.Empty(t, checking(t, c, "due"))
+}
+
+func TestScheduleGivesNoSlotsWithSettingsThatDontFit(t *testing.T) {
+	t.Parallel()
+
+	site := testSite("edge", nil)
+	site.Spec.Components.CenterPivot.UpdateTimeout = &metav1.Duration{Duration: time.Hour}
+
+	c := schedule(t, site, testNode(t, "due", "edge", running), testMachine(t, "due", nil))
+
+	assert.Empty(t, checking(t, c, "due"))
 }
 
 func TestScheduleIgnoresSitesWithoutCenterPivot(t *testing.T) {

@@ -58,19 +58,71 @@ func TestSlots(t *testing.T) {
 		{maxUnavailable: intstr.FromInt32(0), managed: 10, want: 0},
 		{maxUnavailable: intstr.FromString("25%"), managed: 10, want: 2},
 		{maxUnavailable: intstr.FromString("25%"), managed: 2, want: 1},
+		{maxUnavailable: intstr.FromString("0%"), managed: 10, want: 0},
 	} {
 		assert.Equal(t, tt.want, Settings{MaxUnavailable: tt.maxUnavailable}.Slots(tt.managed), "%s of %d", tt.maxUnavailable.String(), tt.managed)
 	}
 }
 
-func TestTimeLeftToRestart(t *testing.T) {
+func TestTimeLeftToFinalize(t *testing.T) {
 	t.Parallel()
 
-	settings := Settings{UpdateTimeout: 2 * time.Hour, RestartDeadline: 30 * time.Minute}
-	granted := time.Date(2026, 11, 18, 10, 0, 0, 0, time.UTC)
+	settings, _ := SettingsFor(testSite("edge", nil))
 
-	assert.True(t, settings.TimeLeftToRestart(granted, granted.Add(80*time.Minute)), "30 minutes to restart, and 10 to spare")
-	assert.False(t, settings.TimeLeftToRestart(granted, granted.Add(81*time.Minute)))
+	assert.True(t, settings.TimeLeftToFinalize(start, start.Add(65*time.Minute)), "15 minutes to finalize, 30 to restart, and 10 to spare")
+	assert.False(t, settings.TimeLeftToFinalize(start, start.Add(66*time.Minute)))
+}
+
+func TestValidate(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		change  func(*unboundedv1alpha3.CenterPivotComponentSpec)
+		wantErr string
+	}{
+		{name: "the defaults fit", change: func(*unboundedv1alpha3.CenterPivotComponentSpec) {}},
+		{
+			name: "deadlines shortened to fit an hour",
+			change: func(spec *unboundedv1alpha3.CenterPivotComponentSpec) {
+				spec.UpdateTimeout = &metav1.Duration{Duration: time.Hour}
+				spec.DrainDeadline = &metav1.Duration{Duration: 5 * time.Minute}
+				spec.RestartDeadline = &metav1.Duration{Duration: 5 * time.Minute}
+			},
+		},
+		{
+			name: "an hour, with the default deadlines",
+			change: func(spec *unboundedv1alpha3.CenterPivotComponentSpec) {
+				spec.UpdateTimeout = &metav1.Duration{Duration: time.Hour}
+			},
+			wantErr: "updateTimeout 1h0m0s is shorter than the 1h40m0s an update may hold its grant",
+		},
+		{
+			name: "a percentage that isn't one",
+			change: func(spec *unboundedv1alpha3.CenterPivotComponentSpec) {
+				spec.MaxUnavailable = ptr.To(intstr.FromString("half"))
+			},
+			wantErr: "maxUnavailable",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			site := testSite("edge", nil)
+			tt.change(site.Spec.Components.CenterPivot)
+
+			settings, ok := SettingsFor(site)
+			require.True(t, ok)
+
+			err := settings.Validate()
+			if tt.wantErr == "" {
+				assert.NoError(t, err)
+			} else {
+				assert.ErrorContains(t, err, tt.wantErr)
+			}
+		})
+	}
 }
 
 func TestAppFor(t *testing.T) {

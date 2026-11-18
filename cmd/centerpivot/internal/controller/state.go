@@ -16,6 +16,7 @@ import (
 	"github.com/Azure/unbounded/cmd/centerpivot/internal/contract"
 	"github.com/Azure/unbounded/cmd/centerpivot/internal/drain"
 	"github.com/Azure/unbounded/cmd/centerpivot/internal/names"
+	"github.com/Azure/unbounded/cmd/centerpivot/internal/omaha"
 )
 
 // Phase is where a node is in its update (designs/centerpivot.md, section
@@ -57,14 +58,17 @@ type State struct {
 	TargetVersion string `json:"targetVersion,omitempty"`
 	// Attempts counts the failed attempts at TargetVersion.
 	Attempts int `json:"attempts,omitempty"`
-	// GrantedAt is when Nebraska granted the update.
-	GrantedAt time.Time `json:"grantedAt,omitzero"`
+	// Grant is the Nebraska grant the update holds, until the agent reports
+	// the update finished.
+	Grant *Grant `json:"grant,omitempty"`
+	// EndGrant is a grant the service still has to end, by reporting its
+	// update failed. Every update that stops without finishing leaves one.
+	// The node gets no slot until it is ended.
+	EndGrant *Grant `json:"endGrant,omitempty"`
 	// Request is the request the node's agent is asked to carry out.
 	Request *contract.Request `json:"request,omitempty"`
-	// RequestedAt is when Request was last written, and Writes how many
-	// times, for the status deadline.
+	// RequestedAt is when Request was written, for the status deadlines.
 	RequestedAt time.Time `json:"requestedAt,omitzero"`
-	Writes      int       `json:"writes,omitempty"`
 	// Workloads are the workloads whose pods the drain moved.
 	Workloads []drain.Workload `json:"workloads,omitempty"`
 	// RecoveredAt is when the moved workloads recovered.
@@ -72,8 +76,37 @@ type State struct {
 	// KeepTaint keeps a held node tainted, because it may start from the new
 	// version at its next restart.
 	KeepTaint bool `json:"keepTaint,omitempty"`
+	// HeldApp is the Nebraska app ID a hold stops in every Site, because the
+	// node restarted into a version that may be bad. A hold without it holds
+	// only its node.
+	HeldApp string `json:"heldApp,omitempty"`
 	// Reason says why the node is held, or what its last check found.
 	Reason string `json:"reason,omitempty"`
+}
+
+// Grant is a Nebraska grant of an update to the node: the check that took it,
+// which the report that ends it repeats, and when. Nebraska's update timeout
+// counts from then.
+type Grant struct {
+	Server    string    `json:"server"`
+	AppID     string    `json:"appId"`
+	Track     string    `json:"track"`
+	MachineID string    `json:"machineId"`
+	Version   string    `json:"version"`
+	Arch      string    `json:"arch"`
+	At        time.Time `json:"at"`
+}
+
+func grantOf(check omaha.Check, at time.Time) *Grant {
+	return &Grant{
+		Server: check.Server, AppID: check.AppID, Track: check.Track,
+		MachineID: check.MachineID, Version: check.Version, Arch: check.Arch, At: at,
+	}
+}
+
+// check returns the check that took the grant.
+func (g Grant) check() omaha.Check {
+	return omaha.Check{Server: g.Server, AppID: g.AppID, Track: g.Track, MachineID: g.MachineID, Version: g.Version, Arch: g.Arch}
 }
 
 // StateOf returns the Machine's state. A Machine without one is Idle; one
@@ -114,7 +147,8 @@ func (s State) RequestToWrite() *contract.Request {
 	return nil
 }
 
-// idle returns the state with the node back in Idle, its slot given back.
+// idle returns the state with the node back in Idle, its slot given back. A
+// grant the update still holds is left to end.
 func (s State) idle(now time.Time, reason string) State {
 	return State{
 		Phase:         PhaseIdle,
@@ -122,18 +156,52 @@ func (s State) idle(now time.Time, reason string) State {
 		LastCheck:     s.LastCheck,
 		TargetVersion: s.TargetVersion,
 		Attempts:      s.Attempts,
+		EndGrant:      s.grantToEnd(),
 		Reason:        reason,
 	}
 }
 
-// held returns the state with the node held until a person clears it.
+// held returns the state with only the node held, until a person clears it:
+// its update stopped before it restarted, so nothing says the version is bad.
+// A grant the update still holds is left to end.
 func (s State) held(now time.Time, reason string, keepTaint bool) State {
 	s.Phase = PhaseHeld
 	s.Since = now
 	s.Reason = reason
 	s.KeepTaint = keepTaint
+	s.HeldApp = ""
+	s.EndGrant, s.Grant = s.grantToEnd(), nil
 
 	return s
+}
+
+// heldApp holds the node, and stops its app in every Site: the node restarted
+// into the new version, which may be bad.
+func (s State) heldApp(now time.Time, reason string) State {
+	s = s.held(now, reason, false)
+	if s.Request != nil {
+		s.HeldApp = s.Request.AppID
+	}
+
+	return s
+}
+
+func (s State) grantToEnd() *Grant {
+	if s.Grant != nil {
+		return s.Grant
+	}
+
+	return s.EndGrant
+}
+
+// grantedAt returns when the update's grant was taken, or the zero time,
+// which leaves it no time, if it has none.
+func (s State) grantedAt() time.Time {
+	if s.Grant == nil {
+		return time.Time{}
+	}
+
+	return s.Grant.At
 }
 
 // failed counts a failed attempt at the target version, and holds the node
@@ -153,7 +221,6 @@ func (s State) request(phase Phase, now time.Time, request contract.Request) Sta
 	s.Since = now
 	s.Request = &request
 	s.RequestedAt = now
-	s.Writes = 1
 
 	return s
 }

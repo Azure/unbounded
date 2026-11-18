@@ -24,8 +24,10 @@ var (
 	})
 	blockedGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "centerpivot_updates_blocked",
-		Help: "1 when no new update starts, by reason: held, while a node is held.",
-	}, []string{"reason"})
+		Help: "1 when a Site's due nodes can't start updating, by Site and reason: held, while a hold stops their app; " +
+			"unavailable, while nodes that aren't updating use every slot; invalid_settings, while the Site's settings " +
+			"don't fit Nebraska's update timeout.",
+	}, []string{"site", "reason"})
 )
 
 func init() {

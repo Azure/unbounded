@@ -49,19 +49,59 @@ func newHarness(t *testing.T) *harness {
 	h.r = &Reconciler{
 		Client: h.client, Reader: h.client, Namespace: "unbounded-system",
 		Nebraska: h.nebraska, Drainer: h.drainer, Clock: h.clock, Recorder: events.NewFakeRecorder(100),
+		Wake: NewWakeup(),
 	}
 
 	return h
+}
+
+// settings returns Site edge's settings.
+func (h *harness) settings() Settings {
+	h.t.Helper()
+
+	var site unboundedv1alpha3.Site
+	require.NoError(h.t, h.client.Get(h.t.Context(), client.ObjectKey{Name: "edge"}, &site))
+
+	settings, ok := SettingsFor(&site)
+	require.True(h.t, ok)
+
+	return settings
 }
 
 // reconcile runs one pass, and returns the node's state after it.
 func (h *harness) reconcile() State {
 	h.t.Helper()
 
-	_, err := h.r.Reconcile(h.t.Context(), reconcile.Request{NamespacedName: types.NamespacedName{Name: "acl-1"}})
-	require.NoError(h.t, err)
+	require.NoError(h.t, h.tryReconcile())
 
 	return stateOf(h.t, h.client, "acl-1")
+}
+
+func (h *harness) tryReconcile() error {
+	_, err := h.r.Reconcile(h.t.Context(), reconcile.Request{NamespacedName: types.NamespacedName{Name: "acl-1"}})
+
+	return err
+}
+
+// deleteNode deletes the node's Node, as a rebuild does.
+func (h *harness) deleteNode() {
+	h.t.Helper()
+
+	require.NoError(h.t, h.client.Delete(h.t.Context(), h.node()))
+}
+
+// rebuildNode replaces the node's Node, if it exists, with a new one.
+func (h *harness) rebuildNode() {
+	h.t.Helper()
+
+	var old corev1.Node
+	if err := h.client.Get(h.t.Context(), client.ObjectKey{Name: "acl-1"}, &old); err == nil {
+		require.NoError(h.t, h.client.Delete(h.t.Context(), &old))
+	}
+
+	node := testNode(h.t, "acl-1", "edge", running)
+	node.UID = "acl-1-rebuilt"
+	require.NoError(h.t, h.client.Create(h.t.Context(), node))
 }
 
 func (h *harness) node() *corev1.Node {
@@ -187,7 +227,8 @@ func TestAnUpdateFromCheckToIdle(t *testing.T) {
 
 	state := h.runTo(PhaseStaging)
 	assert.Equal(t, newer, state.TargetVersion)
-	assert.Equal(t, start, state.GrantedAt)
+	require.NotNil(t, state.Grant)
+	assert.Equal(t, start, state.Grant.At)
 	assert.Equal(t, contract.OperationStage, h.request().Operation)
 	assert.Equal(t, newer, h.request().TargetVersion)
 	assert.Equal(t, "stable", h.request().Track)
@@ -218,8 +259,10 @@ func TestAnUpdateFromCheckToIdle(t *testing.T) {
 	h.agentAnswers(Keys.CommitStatus, contract.CodeSuccess)
 	assert.Equal(t, PhaseRestarting, h.reconcile().Phase)
 
-	h.runTo(PhaseRecovering)
+	state = h.runTo(PhaseRecovering)
 	assert.False(t, h.tainted(), "the taint goes before the workloads recover")
+	assert.Nil(t, state.Grant, "the agent's commit ended the grant")
+	assert.Empty(t, h.r.Wake, "the node still uses its slot")
 
 	assert.Equal(t, PhaseRecovering, h.reconcile().Phase, "the workloads haven't recovered")
 
@@ -234,6 +277,10 @@ func TestAnUpdateFromCheckToIdle(t *testing.T) {
 	assert.Equal(t, PhaseIdle, state.Phase)
 	assert.Equal(t, start, state.LastCheck)
 	assert.Zero(t, state.Attempts)
+	assert.Nil(t, state.EndGrant)
+	assert.Empty(t, h.nebraska.failures, "a finished update leaves no grant to end")
+	assert.NotContains(t, h.node().Annotations, Keys.Request, "an Idle node carries no request")
+	assert.Len(t, h.r.Wake, 1, "the freed slot wakes the scheduler")
 }
 
 func TestCheckingGivesTheSlotBack(t *testing.T) {
@@ -264,15 +311,30 @@ func TestCheckingGivesTheSlotBack(t *testing.T) {
 		assert.NotContains(t, h.node().Annotations, Keys.Request)
 	})
 
+	t.Run("a check whose answer is lost ends any grant it took", func(t *testing.T) {
+		t.Parallel()
+
+		h := newHarness(t)
+		h.nebraska.err = assert.AnError
+
+		state := h.reconcile()
+		assert.Equal(t, PhaseIdle, state.Phase)
+		assert.NotNil(t, state.EndGrant)
+	})
+
 	t.Run("an update in progress is ended", func(t *testing.T) {
 		t.Parallel()
 
 		h := newHarness(t)
 		h.nebraska.result = omaha.Result{Kind: omaha.InProgress}
 
-		assert.Equal(t, PhaseIdle, h.reconcile().Phase)
-		assert.Equal(t, contract.OperationStage, h.request().Operation)
-		assert.Equal(t, "202606.15.1", h.request().TargetVersion, "a version other than the one the node runs")
+		state := h.reconcile()
+		assert.Equal(t, PhaseIdle, state.Phase)
+		require.NotNil(t, state.EndGrant)
+
+		assert.Nil(t, h.reconcile().EndGrant)
+		require.Len(t, h.nebraska.failures, 1)
+		assert.Equal(t, h.nebraska.checks[0], h.nebraska.failures[0], "the report repeats the check")
 	})
 }
 
@@ -280,25 +342,29 @@ func TestFailures(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name      string
-		at        Phase
-		fail      func(h *harness)
-		want      Phase
-		tainted   bool
-		attempts  int
+		name     string
+		at       Phase
+		fail     func(h *harness)
+		want     Phase
+		tainted  bool
+		attempts int
+		// endsGrant is set when the update stops holding a grant it
+		// has to end.
 		endsGrant bool
+		// holdsApp is set when the hold stops the node's app.
+		holdsApp bool
 	}{
 		{
 			name: "stage fails",
 			at:   PhaseStaging,
 			fail: func(h *harness) { h.agentAnswers(Keys.Status, contract.CodeOperationFailed) },
-			want: PhaseIdle, attempts: 1,
+			want: PhaseIdle, attempts: 1, endsGrant: true,
 		},
 		{
 			name: "already at the target",
 			at:   PhaseStaging,
 			fail: func(h *harness) { h.agentAnswers(Keys.Status, contract.CodeAlreadyAtTarget) },
-			want: PhaseIdle,
+			want: PhaseIdle, endsGrant: true,
 		},
 		{
 			name: "the drain misses its deadline",
@@ -310,19 +376,19 @@ func TestFailures(t *testing.T) {
 			name: "too little of the grant's time is left",
 			at:   PhaseDraining,
 			fail: func(h *harness) { h.setUpdateTimeout(DefaultRestartDeadline) },
-			want: PhaseIdle, endsGrant: true,
+			want: PhaseIdle, attempts: 1, endsGrant: true,
 		},
 		{
 			name: "finalize fails",
 			at:   PhaseFinalizing,
 			fail: func(h *harness) { h.agentAnswers(Keys.Status, contract.CodeOperationFailed) },
-			want: PhaseIdle, attempts: 1,
+			want: PhaseIdle, attempts: 1, endsGrant: true,
 		},
 		{
 			name: "finalize fails inside the agent",
 			at:   PhaseFinalizing,
 			fail: func(h *harness) { h.agentAnswers(Keys.Status, contract.CodeAgentInternalError) },
-			want: PhaseHeld, tainted: true,
+			want: PhaseHeld, tainted: true, endsGrant: true,
 		},
 		{
 			name: "finalize finds nothing staged",
@@ -331,10 +397,16 @@ func TestFailures(t *testing.T) {
 			want: PhaseStaging,
 		},
 		{
+			name: "finalize finds the node already at the target",
+			at:   PhaseFinalizing,
+			fail: func(h *harness) { h.agentAnswers(Keys.Status, contract.CodeAlreadyAtTarget) },
+			want: PhaseRecovering, endsGrant: true,
+		},
+		{
 			name: "the new version doesn't boot",
 			at:   PhaseRestarting,
 			fail: func(h *harness) { h.agentRestartsInto(running, contract.CodeTargetBootFailed) },
-			want: PhaseHeld,
+			want: PhaseHeld, endsGrant: true, holdsApp: true,
 		},
 		{
 			name: "the node doesn't come back Ready",
@@ -346,13 +418,13 @@ func TestFailures(t *testing.T) {
 				require.NoError(h.t, h.client.Status().Update(h.t.Context(), node))
 				h.wait(DefaultRestartDeadline + time.Second)
 			},
-			want: PhaseHeld,
+			want: PhaseHeld, endsGrant: true, holdsApp: true,
 		},
 		{
 			name: "the workloads don't recover",
 			at:   PhaseRecovering,
 			fail: func(h *harness) { h.wait(DefaultRecoveryDeadline + time.Second) },
-			want: PhaseHeld,
+			want: PhaseHeld, holdsApp: true,
 		},
 	}
 	for _, tt := range tests {
@@ -361,7 +433,6 @@ func TestFailures(t *testing.T) {
 
 			h := newHarness(t)
 			before := h.runTo(tt.at)
-			request := h.request()
 
 			tt.fail(h)
 
@@ -370,12 +441,29 @@ func TestFailures(t *testing.T) {
 			assert.Equal(t, tt.tainted, h.tainted(), "tainted")
 			assert.Equal(t, tt.attempts, state.Attempts, "attempts")
 
-			if tt.endsGrant {
-				ending := h.request()
-				assert.Equal(t, contract.OperationStage, ending.Operation, "a new stage request ends the grant")
-				assert.NotEqual(t, request.NodeUpdateID, ending.NodeUpdateID)
-				assert.Equal(t, before.TargetVersion, ending.TargetVersion)
+			if tt.holdsApp {
+				assert.Equal(t, aclApp, state.HeldApp)
+			} else {
+				assert.Empty(t, state.HeldApp, "only the node is held")
 			}
+
+			if !tt.endsGrant {
+				assert.Nil(t, state.EndGrant)
+
+				return
+			}
+
+			require.NotNil(t, state.EndGrant)
+			assert.Nil(t, state.Grant)
+			assert.Equal(t, before.Grant, state.EndGrant)
+
+			if state.Phase == PhaseIdle || state.Phase == PhaseHeld {
+				assert.NotContains(t, h.node().Annotations, Keys.Request, "an agent that starts late finds no request")
+			}
+
+			assert.Nil(t, h.reconcile().EndGrant)
+			require.Len(t, h.nebraska.failures, 1)
+			assert.Equal(t, before.Grant.check(), h.nebraska.failures[0])
 		})
 	}
 }
@@ -405,22 +493,174 @@ func TestThreeFailedAttemptsHoldTheNode(t *testing.T) {
 	}
 }
 
-func TestAnUnansweredRequestIsWrittenAgainThenHeld(t *testing.T) {
+func TestStatusDeadlines(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		at   Phase
+		// inProgress has the agent answer InProgress.
+		inProgress bool
+		deadline   func(Settings) time.Duration
+		reason     string
+		tainted    bool
+	}{
+		{
+			name:     "no answer to the stage",
+			at:       PhaseStaging,
+			deadline: func(s Settings) time.Duration { return s.StatusDeadline },
+			reason:   "didn't answer the stage request",
+		},
+		{
+			name: "a slow stage", at: PhaseStaging, inProgress: true,
+			deadline: Settings.StageDeadline,
+			reason:   "didn't finish the stage request",
+		},
+		{
+			name:     "no answer to the finalize",
+			at:       PhaseFinalizing,
+			deadline: func(s Settings) time.Duration { return s.StatusDeadline },
+			reason:   "didn't answer the finalize request",
+			tainted:  true,
+		},
+		{
+			name: "a slow finalize", at: PhaseFinalizing, inProgress: true,
+			deadline: Settings.FinalizeDeadline,
+			reason:   "didn't finish the finalize request",
+			tainted:  true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			h := newHarness(t)
+			h.runTo(tt.at)
+
+			if tt.inProgress {
+				h.agentAnswers(Keys.Status, contract.CodeInProgress)
+			}
+
+			deadline := tt.deadline(h.settings())
+			assert.Greater(t, deadline, h.settings().StatusDeadline-time.Second)
+
+			h.wait(deadline - time.Second)
+			require.Equal(t, tt.at, h.reconcile().Phase, "the agent has until the deadline")
+
+			h.wait(time.Second)
+
+			state := h.reconcile()
+			assert.Equal(t, PhaseHeld, state.Phase)
+			assert.Contains(t, state.Reason, tt.reason)
+			assert.Empty(t, state.HeldApp, "only the node is held")
+			assert.NotNil(t, state.EndGrant)
+			assert.Equal(t, tt.tainted, h.tainted())
+		})
+	}
+}
+
+func TestEndingAGrantIsTriedUntilNebraskaAcknowledgesIt(t *testing.T) {
 	t.Parallel()
 
 	h := newHarness(t)
 	h.runTo(PhaseStaging)
+	h.agentAnswers(Keys.Status, contract.CodeOperationFailed)
+	require.NotNil(t, h.reconcile().EndGrant)
 
-	for writes := 2; writes <= maxAttempts; writes++ {
-		h.wait(DefaultStatusDeadline)
+	h.nebraska.reportErr = assert.AnError
+	require.Error(t, h.tryReconcile())
+	assert.NotNil(t, stateOf(t, h.client, "acl-1").EndGrant)
+
+	h.nebraska.reportErr = nil
+	assert.Nil(t, h.reconcile().EndGrant)
+	assert.Len(t, h.nebraska.failures, 2)
+}
+
+func TestRebuilds(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a Node rebuilt during the stage ends the update", func(t *testing.T) {
+		t.Parallel()
+
+		h := newHarness(t)
+		h.runTo(PhaseStaging)
+
+		h.deleteNode()
+		assert.Equal(t, PhaseStaging, h.reconcile().Phase, "waiting for the Node")
+
+		h.rebuildNode()
 
 		state := h.reconcile()
-		require.Equal(t, PhaseStaging, state.Phase)
-		assert.Equal(t, writes, state.Writes)
-	}
+		assert.Equal(t, PhaseIdle, state.Phase)
+		assert.Contains(t, state.Reason, "rebuilt")
+		assert.NotNil(t, state.EndGrant)
+	})
 
-	h.wait(DefaultStatusDeadline)
-	assert.Equal(t, PhaseHeld, h.reconcile().Phase)
+	t.Run("a Node that doesn't come back holds the node", func(t *testing.T) {
+		t.Parallel()
+
+		h := newHarness(t)
+		h.runTo(PhaseDraining)
+
+		h.deleteNode()
+		h.wait(DefaultRestartDeadline + time.Second)
+
+		state := h.reconcile()
+		assert.Equal(t, PhaseHeld, state.Phase)
+		assert.Empty(t, state.HeldApp)
+
+		assert.Nil(t, h.reconcile().EndGrant, "a grant is ended without the Node")
+		assert.Len(t, h.nebraska.failures, 1)
+	})
+
+	t.Run("a commit on the rebuilt Node continues the update", func(t *testing.T) {
+		t.Parallel()
+
+		h := newHarness(t)
+		h.runTo(PhaseFinalizing)
+		finalize := h.request()
+
+		h.rebuildNode()
+		h.updateNode(func(node *corev1.Node) { node.Annotations[Keys.Request] = mustMarshal(t, finalize) })
+		h.agentRestartsInto(newer, contract.CodeSuccess)
+
+		assert.Equal(t, PhaseRestarting, h.reconcile().Phase)
+		assert.Equal(t, PhaseRecovering, h.reconcile().Phase)
+	})
+}
+
+func TestARefusedStageChecksNebraskaAgain(t *testing.T) {
+	t.Parallel()
+
+	t.Run("the channel moved", func(t *testing.T) {
+		t.Parallel()
+
+		h := newHarness(t)
+		h.runTo(PhaseStaging)
+		h.wait(time.Minute)
+
+		h.nebraska.result = omaha.Result{Kind: omaha.Granted, Version: "202607.13.0"}
+		h.agentAnswers(Keys.Status, contract.CodeInvalidRequest)
+
+		state := h.reconcile()
+		assert.Equal(t, PhaseStaging, state.Phase)
+		assert.Equal(t, "202607.13.0", state.TargetVersion)
+		assert.Equal(t, "202607.13.0", h.request().TargetVersion)
+		assert.Equal(t, start, state.Grant.At, "a repeat check doesn't restart Nebraska's clock for the grant")
+	})
+
+	t.Run("the request is wrong", func(t *testing.T) {
+		t.Parallel()
+
+		h := newHarness(t)
+		h.runTo(PhaseStaging)
+		h.agentAnswers(Keys.Status, contract.CodeInvalidRequest)
+
+		state := h.reconcile()
+		assert.Equal(t, PhaseHeld, state.Phase)
+		assert.Contains(t, state.Reason, "refused the stage request")
+		assert.NotNil(t, state.EndGrant)
+	})
 }
 
 func TestClearingAHoldRemovesTheTaint(t *testing.T) {
@@ -492,4 +732,13 @@ func nodeOf(t *testing.T, c client.Client, name string) *corev1.Node {
 	require.NoError(t, c.Get(t.Context(), client.ObjectKey{Name: name}, &node))
 
 	return &node
+}
+
+func mustMarshal(t *testing.T, request contract.Request) string {
+	t.Helper()
+
+	value, err := request.Marshal()
+	require.NoError(t, err)
+
+	return value
 }

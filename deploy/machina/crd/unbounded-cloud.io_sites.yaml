@@ -160,7 +160,8 @@ spec:
                         - type: string
                         description: |-
                           MaxUnavailable is how many of the Site's managed nodes may be updating
-                          or unavailable at once: a number, or a percentage of the managed nodes.
+                          or unavailable at once: a number, or a percentage of the managed nodes,
+                          which gives at least one unless it is 0%. 0 and 0% stop updates.
                           Defaults to 1.
                         x-kubernetes-int-or-string: true
                       movePodsWithNoController:
@@ -191,14 +192,17 @@ spec:
                         type: string
                       statusDeadline:
                         description: |-
-                          StatusDeadline is how long to wait for the node's agent to answer a
-                          request before writing it again. Defaults to 5m.
+                          StatusDeadline is how long the node's agent has to answer a request.
+                          It has its own timeout plus this to finish it: 20m for a stage, and
+                          10m for a finalize. A node whose agent misses either is held.
+                          Defaults to 5m.
                         type: string
                       updateTimeout:
                         description: |-
-                          UpdateTimeout must match the update timeout of the nodes' Nebraska
-                          groups. An update that couldn't restart well within it is ended
-                          instead. Defaults to 2h.
+                          UpdateTimeout must be no longer than the update timeout of the nodes'
+                          Nebraska groups. Every update ends its Nebraska grant at least 10m
+                          before it, so staging, the drain, finalizing, and the restart, each
+                          to its deadline, must fit in it, with 10m to spare. Defaults to 2h.
                         type: string
                     type: object
                     x-kubernetes-validations:
@@ -206,6 +210,15 @@ spec:
                         is enabled
                       rule: '!has(self.enabled) || !self.enabled || (has(self.nebraskaURL)
                         && has(self.apps) && size(self.apps) > 0)'
+                    - message: updateTimeout must fit staging (20m plus statusDeadline),
+                        drainDeadline, finalizing (10m plus statusDeadline), restartDeadline,
+                        and 10m to spare
+                      rule: '!has(self.enabled) || !self.enabled || duration(has(self.updateTimeout)
+                        ? self.updateTimeout : ''2h'') >= duration(''40m'') + duration(has(self.statusDeadline)
+                        ? self.statusDeadline : ''5m'') + duration(has(self.statusDeadline)
+                        ? self.statusDeadline : ''5m'') + duration(has(self.drainDeadline)
+                        ? self.drainDeadline : ''30m'') + duration(has(self.restartDeadline)
+                        ? self.restartDeadline : ''30m'')'
                   gantry:
                     default:
                       enabled: true

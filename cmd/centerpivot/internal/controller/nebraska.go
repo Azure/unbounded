@@ -15,17 +15,19 @@ import (
 	"github.com/Azure/unbounded/cmd/centerpivot/internal/omaha"
 )
 
-// Nebraska sends update checks. ca holds the PEM certificates that sign
-// Nebraska's; with none, the system's are used.
+// Nebraska sends update checks, and reports failed updates to end their
+// grants. ca holds the PEM certificates that sign Nebraska's; with none, the
+// system's are used.
 type Nebraska interface {
 	UpdateCheck(ctx context.Context, ca string, check omaha.Check) (omaha.Result, error)
+	ReportFailure(ctx context.Context, ca string, check omaha.Check) error
 }
 
-// nebraskaTimeout bounds one update check.
+// nebraskaTimeout bounds one request.
 const nebraskaTimeout = 30 * time.Second
 
-// HTTPNebraska sends update checks over HTTPS, with one client per set of
-// CA certificates.
+// HTTPNebraska talks to Nebraska over HTTPS, with one client per set of CA
+// certificates.
 type HTTPNebraska struct {
 	mu      sync.Mutex
 	clients map[string]*omaha.Client
@@ -39,6 +41,16 @@ func (n *HTTPNebraska) UpdateCheck(ctx context.Context, ca string, check omaha.C
 	}
 
 	return client.UpdateCheck(ctx, check)
+}
+
+// ReportFailure implements Nebraska.
+func (n *HTTPNebraska) ReportFailure(ctx context.Context, ca string, check omaha.Check) error {
+	client, err := n.client(ca)
+	if err != nil {
+		return err
+	}
+
+	return client.ReportFailure(ctx, check)
 }
 
 func (n *HTTPNebraska) client(ca string) (*omaha.Client, error) {

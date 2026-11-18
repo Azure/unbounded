@@ -30,7 +30,7 @@ the agent's own packages, `internal/names`, two small helpers from the repo's
 | `internal/cmd` | The command line: `controller`, `node-info`, and `version`. |
 | `internal/controller` | The scheduler that hands out update slots, and the node reconciler, which takes one step for one node per pass. |
 | `internal/drain` | `kubectl drain`'s rules, a step at a time, and whether the workloads moved off a node have recovered. |
-| `internal/omaha` | One Nebraska update check, shaped like trident-acl-agent's own. |
+| `internal/omaha` | Nebraska's update check, and the failure report that ends a grant, both shaped like trident-acl-agent's own. |
 | `internal/identity` | The agent's Nebraska instance ID, os-release parsing, and the `agent-info` annotation. |
 | `internal/nodeinfo` | The node-info DaemonSet, which publishes `agent-info` until Trident does. |
 | `internal/contract` | trident-acl-agent's annotation contract: requests and statuses. |
@@ -75,7 +75,10 @@ the repository.
    refuses unknown ones. They're written as compact JSON, and the admission
    policy matches `"server":"..."` and `"appId":"..."` in that text, so change
    how requests are encoded only together with the policy.
-4. Nebraska and the drain are behind the `Nebraska` and `Drainer` interfaces, so
+4. Every update that stops without finishing ends its Nebraska grant: `idle()`
+   and `held()` hand the update's grant to `EndGrant`, and the next pass
+   reports it failed. New ways for an update to stop go through them.
+5. Nebraska and the drain are behind the `Nebraska` and `Drainer` interfaces, so
    tests use fakes. The controller's tests have a harness that plays the node's
    agent.
-5. Tests cover the core behavior, table-driven, with `t.Parallel()`.
+6. Tests cover the core behavior, table-driven, with `t.Parallel()`.

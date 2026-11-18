@@ -1,13 +1,13 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package omaha sends Nebraska an update check on a node's behalf. The check
-// is shaped exactly like trident-acl-agent's own (its core/nebraska/wire.rs),
-// so Nebraska sees one instance per node, whichever of the two sends it.
+// Package omaha talks to Nebraska on a node's behalf. Its requests are shaped
+// exactly like trident-acl-agent's own (its core/nebraska/wire.rs), so
+// Nebraska sees one instance per node, whichever of the two sends them.
 //
-// It only ever sends an update check: never a ping or an event, which belong
-// to the agent. In Nebraska, an update check that offers an update is a grant
-// of that update to the node.
+// It sends two requests: an update check, which in Nebraska grants the node
+// an update when there is one, and the agent's report that an update failed,
+// which ends that grant. Pings and progress events belong to the agent.
 package omaha
 
 import (
@@ -32,7 +32,8 @@ const (
 )
 
 // Check is one node's update check: the node's identity as the agent reports
-// it, and the server, application, and track to check.
+// it, and the server, application, and track to check. ReportFailure takes
+// the check that took the grant it ends.
 type Check struct {
 	// Server is the Nebraska update endpoint, such as
 	// https://nebraska.example.com/v1/update.
@@ -80,34 +81,79 @@ type Client struct {
 
 // UpdateCheck sends one update check and returns Nebraska's answer.
 func (c *Client) UpdateCheck(ctx context.Context, check Check) (Result, error) {
-	body, err := requestBody(check)
+	body, err := requestBody(check, nil)
 	if err != nil {
 		return Result{}, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, check.Server, bytes.NewReader(body))
+	data, err := c.post(ctx, check.Server, body)
 	if err != nil {
-		return Result{}, fmt.Errorf("build update check: %w", err)
+		return Result{}, fmt.Errorf("update check: %w", err)
+	}
+
+	return interpret(data, check.AppID)
+}
+
+// ReportFailure tells Nebraska that the update the check's grant started
+// failed, as the agent does (report_failure in its core/nebraska/client.rs).
+// That ends the grant: the node is no longer counted as updating, and its
+// next check may be granted again.
+//
+// Nebraska records the report only while the node has an update in progress,
+// from the grant until the update finishes or fails, and acknowledges it
+// either way. So a report for a grant already ended does nothing, and an
+// acknowledgment confirms only that Nebraska knew the app and track.
+func (c *Client) ReportFailure(ctx context.Context, check Check) error {
+	body, err := requestBody(check, &event{Type: eventTypeUpdateComplete, Result: eventResultError, PreviousVersion: check.Version})
+	if err != nil {
+		return err
+	}
+
+	data, err := c.post(ctx, check.Server, body)
+	if err != nil {
+		return fmt.Errorf("report a failed update: %w", err)
+	}
+
+	return acknowledged(data, check.AppID)
+}
+
+func (c *Client) post(ctx context.Context, server string, body []byte) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, server, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("build request: %w", err)
 	}
 
 	req.Header.Set("Content-Type", "application/xml")
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return Result{}, fmt.Errorf("send update check: %w", err)
+		return nil, fmt.Errorf("send request: %w", err)
 	}
 	defer resp.Body.Close() //nolint:errcheck // Best-effort close of HTTP response body.
 
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return Result{}, fmt.Errorf("update check: HTTP %d", resp.StatusCode)
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if err != nil {
-		return Result{}, fmt.Errorf("read update check response: %w", err)
+		return nil, fmt.Errorf("read response: %w", err)
 	}
 
-	return interpret(data, check.AppID)
+	return data, nil
+}
+
+// The Omaha event that reports a failed update: update complete, with an
+// error result.
+const (
+	eventTypeUpdateComplete = "3"
+	eventResultError        = "0"
+)
+
+type event struct {
+	Type            string `xml:"eventtype,attr"`
+	Result          string `xml:"eventresult,attr"`
+	PreviousVersion string `xml:"previousversion,attr"`
 }
 
 type request struct {
@@ -121,24 +167,25 @@ type request struct {
 		Arch     string `xml:"arch,attr"`
 	} `xml:"os"`
 	App struct {
-		AppID       string   `xml:"appid,attr"`
-		Version     string   `xml:"version,attr"`
-		Track       string   `xml:"track,attr"`
-		MachineID   string   `xml:"machineid,attr"`
-		UpdateCheck struct{} `xml:"updatecheck"`
+		AppID       string    `xml:"appid,attr"`
+		Version     string    `xml:"version,attr"`
+		Track       string    `xml:"track,attr"`
+		MachineID   string    `xml:"machineid,attr"`
+		Event       *event    `xml:"event"`
+		UpdateCheck *struct{} `xml:"updatecheck"`
 	} `xml:"app"`
 }
 
-// requestBody returns the check as the agent writes it: a request with a new
-// session ID, the os element carrying the app's version, and one app with an
-// updatecheck.
-func requestBody(check Check) ([]byte, error) {
+// requestBody returns a request as the agent writes it: a new session ID, the
+// os element carrying the app's version, and one app with either an
+// updatecheck or, without one, the event.
+func requestBody(check Check, ev *event) ([]byte, error) {
 	if check.Server == "" || check.AppID == "" || check.Track == "" || check.MachineID == "" || check.Version == "" {
-		return nil, errors.New("update check needs a server, app ID, track, machine ID, and version")
+		return nil, errors.New("a request to Nebraska needs a server, app ID, track, machine ID, and version")
 	}
 
 	if check.Arch != "amd64" && check.Arch != "aarch64" {
-		return nil, fmt.Errorf("update check architecture %q isn't amd64 or aarch64", check.Arch)
+		return nil, fmt.Errorf("architecture %q isn't amd64 or aarch64", check.Arch)
 	}
 
 	var r request
@@ -154,40 +201,45 @@ func requestBody(check Check) ([]byte, error) {
 	r.App.Track = check.Track
 	r.App.MachineID = check.MachineID
 
+	if ev != nil {
+		r.App.Event = ev
+	} else {
+		r.App.UpdateCheck = &struct{}{}
+	}
+
 	data, err := xml.Marshal(r)
 	if err != nil {
-		return nil, fmt.Errorf("encode update check: %w", err)
+		return nil, fmt.Errorf("encode the request: %w", err)
 	}
 
 	return append([]byte(xml.Header), data...), nil
 }
 
 type response struct {
-	Apps []struct {
-		AppID       string `xml:"appid,attr"`
-		Status      string `xml:"status,attr"`
-		UpdateCheck *struct {
-			Status   string `xml:"status,attr"`
-			Manifest *struct {
-				Version string `xml:"version,attr"`
-			} `xml:"manifest"`
-		} `xml:"updatecheck"`
-	} `xml:"app"`
+	Apps []appResponse `xml:"app"`
+}
+
+type appResponse struct {
+	AppID  string `xml:"appid,attr"`
+	Status string `xml:"status,attr"`
+	Events []struct {
+		Status string `xml:"status,attr"`
+	} `xml:"event"`
+	UpdateCheck *struct {
+		Status   string `xml:"status,attr"`
+		Manifest *struct {
+			Version string `xml:"version,attr"`
+		} `xml:"manifest"`
+	} `xml:"updatecheck"`
 }
 
 // interpret reads Nebraska's answer as the agent does (interpret_check in its
 // core/nebraska/client.rs).
 func interpret(data []byte, appID string) (Result, error) {
-	var resp response
-	if err := xml.Unmarshal(data, &resp); err != nil {
-		return Result{}, fmt.Errorf("decode update check response: %w", err)
+	app, err := appOf(data, appID)
+	if err != nil {
+		return Result{}, err
 	}
-
-	if len(resp.Apps) != 1 || !strings.EqualFold(resp.Apps[0].AppID, appID) {
-		return Result{}, fmt.Errorf("update check response doesn't have exactly one app %s", appID)
-	}
-
-	app := resp.Apps[0]
 
 	switch app.Status {
 	case "ok":
@@ -213,6 +265,46 @@ func interpret(data []byte, appID string) (Result, error) {
 	default:
 		return Result{Kind: Refused, Status: app.UpdateCheck.Status}, nil
 	}
+}
+
+// acknowledged checks that Nebraska acknowledged the event, as the agent does
+// (require_events_accepted in its core/nebraska/client.rs). Nebraska skips the
+// events of an app or track it doesn't know, and says why in the app's status.
+func acknowledged(data []byte, appID string) error {
+	app, err := appOf(data, appID)
+	if err != nil {
+		return err
+	}
+
+	for _, ev := range app.Events {
+		if ev.Status != "ok" {
+			return fmt.Errorf("the event was rejected: %s", ev.Status)
+		}
+	}
+
+	if len(app.Events) > 0 {
+		return nil
+	}
+
+	if app.Status != "ok" && app.Status != statusUpdateInProgress {
+		return fmt.Errorf("the event was skipped: %s", app.Status)
+	}
+
+	return errors.New("the event wasn't acknowledged")
+}
+
+// appOf returns the response's one app, which must be appID.
+func appOf(data []byte, appID string) (appResponse, error) {
+	var resp response
+	if err := xml.Unmarshal(data, &resp); err != nil {
+		return appResponse{}, fmt.Errorf("decode the response: %w", err)
+	}
+
+	if len(resp.Apps) != 1 || !strings.EqualFold(resp.Apps[0].AppID, appID) {
+		return appResponse{}, fmt.Errorf("the response doesn't have exactly one app %s", appID)
+	}
+
+	return resp.Apps[0], nil
 }
 
 // Arch returns Nebraska's spelling of a Node's kubernetes.io/arch label, as the

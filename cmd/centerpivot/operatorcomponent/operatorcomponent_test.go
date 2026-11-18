@@ -122,20 +122,61 @@ func TestPlanRemovesEverythingWhenNoSiteEnablesIt(t *testing.T) {
 	assert.Equal(t, applied, deleted, "cleanup deletes exactly what install applies")
 }
 
-func TestPlanReportsAHeldNode(t *testing.T) {
+func TestPlanReportsHolds(t *testing.T) {
 	t.Parallel()
 
-	held, err := controller.State{Phase: controller.PhaseHeld, Reason: "the node didn't boot 202606.29.0"}.Marshal()
-	require.NoError(t, err)
+	tests := []struct {
+		name      string
+		state     controller.State
+		site      string
+		wantReady bool
+		want      []string
+	}{
+		{
+			name:  "a hold on the app",
+			state: controller.State{Phase: controller.PhaseHeld, Reason: "the node didn't boot 3.0.20261106", HeldApp: "acl-app"},
+			site:  "edge",
+			want:  []string{"no update of app acl-app starts", "acl-1", "didn't boot"},
+		},
+		{
+			name:      "a hold on the node only",
+			state:     controller.State{Phase: controller.PhaseHeld, Reason: "3 attempts failed"},
+			site:      "edge",
+			wantReady: true,
+			want:      []string{"Machine acl-1 isn't updated", "3 attempts failed"},
+		},
+		{
+			name:      "a hold in a Site without centerpivot",
+			state:     controller.State{Phase: controller.PhaseHeld, Reason: "the node didn't boot", HeldApp: "acl-app"},
+			site:      "core",
+			wantReady: true,
+			want:      []string{"component reconciled"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-	machine := &unboundedv1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{
-		Name: "acl-1", Annotations: map[string]string{names.StateAnnotation: held},
-	}}
+			state, err := tt.state.Marshal()
+			require.NoError(t, err)
 
-	_, result, err := (Component{}).Plan(t.Context(), testEnv(t, machine), []unboundedv1alpha3.Site{site("edge", true)})
-	require.NoError(t, err)
-	assert.False(t, result.Ready)
-	assert.Equal(t, ReasonUpdatesHeld, result.Reason)
-	assert.Contains(t, result.Message, "acl-1")
-	assert.Contains(t, result.Message, "didn't boot")
+			machine := &unboundedv1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{
+				Name:        "acl-1",
+				Labels:      map[string]string{unboundedv1alpha3.MachineSiteLabelKey: tt.site},
+				Annotations: map[string]string{names.StateAnnotation: state},
+			}}
+
+			_, result, err := (Component{}).Plan(t.Context(), testEnv(t, machine), []unboundedv1alpha3.Site{site("edge", true), site("core", false)})
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantReady, result.Ready)
+
+			if !tt.wantReady {
+				assert.Equal(t, ReasonUpdatesHeld, result.Reason)
+			}
+
+			for _, want := range tt.want {
+				assert.Contains(t, result.Message, want)
+			}
+		})
+	}
 }

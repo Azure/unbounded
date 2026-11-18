@@ -105,6 +105,9 @@ func TestConfigureTridentACLAgent(t *testing.T) {
 		"Environment=TRIDENT_ACL_AGENT_KUBERNETES_NODE_NAME_SOURCE=kubelet-cert",
 		"Environment=TRIDENT_ACL_AGENT_KUBERNETES_KUBELET_CERT_PATH=" + cert,
 		"Environment=TRIDENT_ACL_AGENT_CURRENT_VERSION_KEY=VERSION_ID",
+		"Environment=TRIDENT_ACL_AGENT_CURRENT_VERSION_FALLBACK=error",
+		"Environment=TRIDENT_ACL_AGENT_ORCHESTRATION_STAGE_TIMEOUT=20m",
+		"Environment=TRIDENT_ACL_AGENT_ORCHESTRATION_FINALIZE_TIMEOUT=10m",
 	} {
 		assert.Contains(t, string(dropIn), line+"\n")
 	}

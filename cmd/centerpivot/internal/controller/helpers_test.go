@@ -98,10 +98,16 @@ func testNode(t *testing.T, name, site, version string) *corev1.Node {
 	}
 }
 
+// testMachine returns the Machine of a managed node in Site edge.
 func testMachine(t *testing.T, name string, state *State) *unboundedv1alpha3.Machine {
 	t.Helper()
 
-	machine := &unboundedv1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: name}}
+	machine := &unboundedv1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Labels: map[string]string{unboundedv1alpha3.MachineSiteLabelKey: "edge"}},
+		Spec: unboundedv1alpha3.MachineSpec{Kubernetes: &unboundedv1alpha3.KubernetesSpec{
+			NodeLabels: map[string]string{names.ManagedLabel: "true"},
+		}},
+	}
 
 	if state != nil {
 		value, err := state.Marshal()
@@ -128,17 +134,26 @@ func stateOf(t *testing.T, c client.Client, name string) State {
 	return StateOf(machineOf(t, c, name))
 }
 
-// fakeNebraska answers every update check with result.
+// fakeNebraska answers every update check with result, and every report of a
+// failed update with reportErr.
 type fakeNebraska struct {
-	result omaha.Result
-	err    error
-	checks []omaha.Check
+	result    omaha.Result
+	err       error
+	checks    []omaha.Check
+	reportErr error
+	failures  []omaha.Check
 }
 
 func (f *fakeNebraska) UpdateCheck(_ context.Context, _ string, check omaha.Check) (omaha.Result, error) {
 	f.checks = append(f.checks, check)
 
 	return f.result, f.err
+}
+
+func (f *fakeNebraska) ReportFailure(_ context.Context, _ string, check omaha.Check) error {
+	f.failures = append(f.failures, check)
+
+	return f.reportErr
 }
 
 // fakeDrainer drains as told.

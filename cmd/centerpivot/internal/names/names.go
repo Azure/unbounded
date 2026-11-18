@@ -3,8 +3,11 @@
 
 // Package names holds the labels, taints, annotations, and paths centerpivot's
 // parts agree on: the service, node-info, the operator component, and the host
-// agent's part. It has no dependencies, since the host agent links it.
+// agent's part. It uses only the standard library, since the host agent links
+// it.
 package names
+
+import "time"
 
 // Prefix is the prefix of every label, taint, and annotation centerpivot uses,
 // including trident-acl-agent's annotation contract.
@@ -43,6 +46,16 @@ const (
 // VERSION_ID=3.0.20261106. trident-acl-agent reports it to Nebraska, and
 // node-info publishes it, so the two must read the same key.
 const VersionKey = "VERSION_ID"
+
+// The timeouts the host agent sets for trident-acl-agent's Trident calls, its
+// own defaults, so the service's deadlines build on the agent's real ones.
+const (
+	// AgentStageTimeout bounds the agent's stage, which downloads the image.
+	AgentStageTimeout = 20 * time.Minute
+	// AgentFinalizeTimeout bounds the agent's finalize, and its commit after
+	// the restart.
+	AgentFinalizeTimeout = 10 * time.Minute
+)
 
 // Where a pod on an ACL node finds the host's files.
 const (

@@ -26,6 +26,10 @@ const (
 	DefaultSettleTime       = 5 * time.Minute
 )
 
+// grantMargin is how long before Nebraska's update timeout every grant must
+// have ended.
+const grantMargin = 10 * time.Minute
+
 // App is a Nebraska application a Site's nodes may run.
 type App struct {
 	Name         string
@@ -108,25 +112,59 @@ func (s Settings) AppFor(labels map[string]string) (App, error) {
 }
 
 // Slots returns how many of managed nodes may be unavailable at once. A
-// percentage gives at least one, so a small Site's nodes still update.
+// percentage other than 0% gives at least one, so a small Site's nodes still
+// update.
 func (s Settings) Slots(managed int) int {
 	if s.MaxUnavailable.Type == intstr.Int {
 		return max(0, s.MaxUnavailable.IntValue())
 	}
 
-	slots, err := intstr.GetScaledValueFromIntOrPercent(&s.MaxUnavailable, managed, false)
-	if err != nil || slots < 1 {
-		return 1
+	percent, err := intstr.GetScaledValueFromIntOrPercent(&s.MaxUnavailable, 100, false)
+	if err != nil || percent <= 0 {
+		return 0
 	}
 
-	return slots
+	slots, err := intstr.GetScaledValueFromIntOrPercent(&s.MaxUnavailable, managed, false)
+	if err != nil {
+		return 0
+	}
+
+	return max(1, slots)
 }
 
-// TimeLeftToRestart reports whether a grant from grantedAt still has time to
-// restart before Nebraska's update timeout, with 10 minutes to spare
-// (designs/centerpivot.md, section 4.8).
-func (s Settings) TimeLeftToRestart(grantedAt, now time.Time) bool {
-	return now.Sub(grantedAt)+s.RestartDeadline <= s.UpdateTimeout-10*time.Minute
+// StageDeadline is how long the agent has to stage a version: its own timeout
+// for the download, and the status deadline for the rest.
+func (s Settings) StageDeadline() time.Duration {
+	return names.AgentStageTimeout + s.StatusDeadline
+}
+
+// FinalizeDeadline is how long the agent has to finalize: its own timeout,
+// and the status deadline for the rest.
+func (s Settings) FinalizeDeadline() time.Duration {
+	return names.AgentFinalizeTimeout + s.StatusDeadline
+}
+
+// Validate checks that every update can end its grant in time: staging, the
+// drain, finalizing, and the restart, each to its deadline, and grantMargin,
+// must fit in the update timeout (designs/centerpivot.md, section 4.8). The
+// Site's CRD checks the same.
+func (s Settings) Validate() error {
+	if _, err := intstr.GetScaledValueFromIntOrPercent(&s.MaxUnavailable, 100, false); err != nil {
+		return fmt.Errorf("maxUnavailable: %w", err)
+	}
+
+	if need := s.StageDeadline() + s.DrainDeadline + s.FinalizeDeadline() + s.RestartDeadline + grantMargin; need > s.UpdateTimeout {
+		return fmt.Errorf("updateTimeout %s is shorter than the %s an update may hold its grant, with %s to spare", s.UpdateTimeout, need-grantMargin, grantMargin)
+	}
+
+	return nil
+}
+
+// TimeLeftToFinalize reports whether a grant from grantedAt still has time
+// for the finalize and the restart, each to its deadline, with grantMargin to
+// spare (designs/centerpivot.md, section 4.8).
+func (s Settings) TimeLeftToFinalize(grantedAt, now time.Time) bool {
+	return now.Sub(grantedAt)+s.FinalizeDeadline()+s.RestartDeadline <= s.UpdateTimeout-grantMargin
 }
 
 func duration(value *metav1.Duration, fallback time.Duration) time.Duration {

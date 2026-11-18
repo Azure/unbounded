@@ -10,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Masterminds/semver/v3"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -72,6 +71,8 @@ type Reconciler struct {
 	Drainer   Drainer
 	Clock     clock.PassiveClock
 	Recorder  events.EventRecorder
+	// Wake runs the scheduler when a slot frees.
+	Wake Wakeup
 }
 
 // SetupWithManager runs the reconciler for every Node, and for the Node of
@@ -125,7 +126,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		return reconcile.Result{}, err
 	}
 
-	p := &pass{node: node, machine: machine, state: StateOf(machine), settings: settings, now: r.now()}
+	before := StateOf(machine)
+	p := &pass{node: node, machine: machine, state: before, settings: settings, now: r.now()}
 
 	// The Node catches up with the state first, in case the last pass ended
 	// before it did.
@@ -133,17 +135,21 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		return reconcile.Result{}, err
 	}
 
+	// A grant left to end is ended first, and again at each pass until
+	// Nebraska acknowledges it. The node's next step doesn't wait for it.
+	endErr := r.endGrant(ctx, p)
+
 	next, after, err := r.advance(ctx, p)
 	if err != nil {
 		return reconcile.Result{}, err
 	}
 
-	if next.Phase != p.state.Phase {
-		log.FromContext(ctx).Info("Node moved to a new phase", "from", p.state.Phase, "to", next.Phase,
+	if next.Phase != before.Phase {
+		log.FromContext(ctx).Info("Node moved to a new phase", "from", before.Phase, "to", next.Phase,
 			"targetVersion", next.TargetVersion, "reason", next.Reason)
 	}
 
-	changed, err := differs(p.state, next)
+	changed, err := differs(before, next)
 	if err != nil {
 		return reconcile.Result{}, err
 	}
@@ -155,8 +161,16 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		}
 	}
 
+	if before.Phase.Updating() && !next.Phase.Updating() {
+		r.Wake.Signal()
+	}
+
 	if err := r.syncNode(ctx, p.node, next); err != nil {
 		return reconcile.Result{}, err
+	}
+
+	if endErr != nil {
+		return reconcile.Result{}, endErr
 	}
 
 	return reconcile.Result{RequeueAfter: after}, nil
@@ -240,22 +254,28 @@ func (r *Reconciler) checking(ctx context.Context, p *pass) (State, time.Duratio
 
 	result, err := r.updateCheck(ctx, p, check)
 	if err != nil {
+		// The check may have reached Nebraska and taken a grant, though its
+		// answer was lost. Ending a grant that wasn't taken does nothing.
+		s.Grant = grantOf(check, p.now)
+
 		return s.idle(p.now, "the update check failed: "+err.Error()), 0, nil
 	}
 
 	switch result.Kind {
 	case omaha.Granted:
 		if result.Version == check.Version {
-			return s.idle(p.now, ""), 0, nil
+			s.Grant = grantOf(check, p.now)
+
+			return s.idle(p.now, "Nebraska offered the version the node runs"), 0, nil
 		}
 
-		return r.grant(p, s, check, result.Version), 0, nil
+		return r.grant(p, s, check, result.Version, p.now), 0, nil
 	case omaha.InProgress:
-		if err := r.endGrant(ctx, p, sourceOf(check)); err != nil {
-			return s, 0, err
-		}
+		// An update that was interrupted, or that started before a hold
+		// was cleared.
+		s.Grant = grantOf(check, p.now)
 
-		return s.idle(p.now, "ended an update Nebraska had in progress for the node"), 0, nil
+		return s.idle(p.now, "Nebraska had an update in progress for the node, which is ended"), 0, nil
 	case omaha.Refused:
 		return s.idle(p.now, "Nebraska refused the update check: "+result.Status), 0, nil
 	default:
@@ -263,14 +283,15 @@ func (r *Reconciler) checking(ctx context.Context, p *pass) (State, time.Duratio
 	}
 }
 
-// grant starts the update Nebraska granted: it asks the agent to stage it.
-func (r *Reconciler) grant(p *pass, s State, check omaha.Check, version string) State {
+// grant starts the update Nebraska granted at grantedAt: it asks the agent to
+// stage it.
+func (r *Reconciler) grant(p *pass, s State, check omaha.Check, version string, grantedAt time.Time) State {
 	if version != s.TargetVersion {
 		s.Attempts = 0
 	}
 
 	s.TargetVersion = version
-	s.GrantedAt = p.now
+	s.Grant = grantOf(check, grantedAt)
 	s.NodeUID = p.node.UID
 	s.Workloads = nil
 	s.RecoveredAt = time.Time{}
@@ -288,12 +309,12 @@ func (r *Reconciler) staging(ctx context.Context, p *pass) (State, time.Duration
 	s := p.state
 
 	if p.node == nil || p.node.UID != s.NodeUID {
-		return r.rebuilt(ctx, p)
+		return rebuilt(p)
 	}
 
 	status := answer(p.node, Keys.Status, s.Request)
 	if status == nil || !status.Code.Final() {
-		return waitForStatus(p, false), pollInterval, nil
+		return waitForStatus(p, status, p.settings.StageDeadline(), false), pollInterval, nil
 	}
 
 	switch status.Code {
@@ -321,7 +342,8 @@ func (r *Reconciler) staging(ctx context.Context, p *pass) (State, time.Duration
 
 		result, err := r.updateCheck(ctx, p, check)
 		if err == nil && result.Kind == omaha.Granted && result.Version != s.TargetVersion && result.Version != check.Version {
-			return r.grant(p, s, check, result.Version), 0, nil
+			// A repeat check doesn't restart Nebraska's clock for the grant.
+			return r.grant(p, s, check, result.Version, s.grantedAt()), 0, nil
 		}
 
 		return s.held(p.now, "the agent refused the stage request: "+status.Message, false), 0, nil
@@ -331,31 +353,23 @@ func (r *Reconciler) staging(ctx context.Context, p *pass) (State, time.Duration
 }
 
 // draining taints the node and evicts its pods, then asks the agent to
-// finalize, if the grant still has time for the restart.
+// finalize, if the grant still has time for the finalize and the restart.
 func (r *Reconciler) draining(ctx context.Context, p *pass) (State, time.Duration, error) {
 	s := p.state
 
 	if p.node == nil || p.node.UID != s.NodeUID {
-		return r.rebuilt(ctx, p)
+		return rebuilt(p)
 	}
 
 	if p.now.Sub(s.Since) > p.settings.DrainDeadline {
-		if err := r.endGrant(ctx, p, requestSource(s.Request)); err != nil {
-			return s, 0, err
-		}
-
 		reason := "the drain missed its deadline: " + s.Reason
 		r.event(p, corev1.EventTypeWarning, "DrainDeadline", reason)
 
 		return s.failed(p.now, reason), 0, nil
 	}
 
-	if !p.settings.TimeLeftToRestart(s.GrantedAt, p.now) {
-		if err := r.endGrant(ctx, p, requestSource(s.Request)); err != nil {
-			return s, 0, err
-		}
-
-		return s.idle(p.now, "too little of the grant's time was left to restart"), 0, nil
+	if !p.settings.TimeLeftToFinalize(s.grantedAt(), p.now) {
+		return s.failed(p.now, "too little of the grant's time was left to finalize and restart"), 0, nil
 	}
 
 	left, err := r.Drainer.Evict(ctx, p.node.Name, p.settings.Drain)
@@ -379,7 +393,7 @@ func (r *Reconciler) draining(ctx context.Context, p *pass) (State, time.Duratio
 
 // finalizing waits for the agent to set the node to start from the new
 // version, and to restart it.
-func (r *Reconciler) finalizing(ctx context.Context, p *pass) (State, time.Duration, error) {
+func (r *Reconciler) finalizing(_ context.Context, p *pass) (State, time.Duration, error) {
 	s := p.state
 
 	// The node may restart before its finalize status is seen.
@@ -390,25 +404,39 @@ func (r *Reconciler) finalizing(ctx context.Context, p *pass) (State, time.Durat
 		return s, 0, nil
 	}
 
-	if p.node == nil || p.node.UID != s.NodeUID {
+	if p.node == nil {
+		return rebuilt(p)
+	}
+
+	if p.node.UID != s.NodeUID {
 		// A node that restarted into the new version before its Node was
 		// rebuilt reports its commit on the new Node.
-		if p.node == nil || p.now.Sub(s.RequestedAt) < p.settings.StatusDeadline {
+		if p.now.Sub(s.RequestedAt) < p.settings.FinalizeDeadline()+p.settings.RestartDeadline {
 			return s, pollInterval, nil
 		}
 
-		return r.rebuilt(ctx, p)
+		return rebuilt(p)
 	}
 
 	status := answer(p.node, Keys.Status, s.Request)
 	if status == nil || !status.Code.Final() {
-		return waitForStatus(p, true), pollInterval, nil
+		return waitForStatus(p, status, p.settings.FinalizeDeadline(), true), pollInterval, nil
 	}
 
 	switch status.Code {
 	case contract.CodeSuccess:
 		s.Phase = PhaseRestarting
 		s.Since = p.now
+
+		return s, 0, nil
+	case contract.CodeAlreadyAtTarget:
+		// The node already runs the version, so no restart or commit
+		// follows, and nothing reports the update to Nebraska.
+		r.event(p, corev1.EventTypeNormal, "Updated", "the node already runs "+s.TargetVersion)
+
+		s.Phase = PhaseRecovering
+		s.Since = p.now
+		s.EndGrant, s.Grant = s.Grant, nil
 
 		return s, 0, nil
 	case contract.CodeNotStaged:
@@ -424,7 +452,8 @@ func (r *Reconciler) finalizing(ctx context.Context, p *pass) (State, time.Durat
 }
 
 // restarting waits for the node to come back committed, running the new
-// version, and Ready.
+// version, and Ready. A node that doesn't stops its app: the version may be
+// bad.
 func (r *Reconciler) restarting(p *pass) (State, time.Duration, error) {
 	s := p.state
 
@@ -439,9 +468,9 @@ func (r *Reconciler) restarting(p *pass) (State, time.Duration, error) {
 		case commit == nil || !commit.Code.Final():
 			missing = append(missing, "the commit status")
 		case commit.Code == contract.CodeTargetBootFailed:
-			return s.held(p.now, fmt.Sprintf("the node didn't boot %s, and went back to its old version: %s", s.TargetVersion, commit.Message), false), 0, nil
+			return s.heldApp(p.now, fmt.Sprintf("the node didn't boot %s, and went back to its old version: %s", s.TargetVersion, commit.Message)), 0, nil
 		case commit.Code != contract.CodeSuccess:
-			return s.held(p.now, fmt.Sprintf("committing %s failed: %s: %s", s.TargetVersion, commit.Code, commit.Message), false), 0, nil
+			return s.heldApp(p.now, fmt.Sprintf("committing %s failed: %s: %s", s.TargetVersion, commit.Code, commit.Message)), 0, nil
 		}
 
 		if info, err := agentInfoOf(p.node); err != nil || info.CurrentVersion != s.TargetVersion {
@@ -456,15 +485,17 @@ func (r *Reconciler) restarting(p *pass) (State, time.Duration, error) {
 	if len(missing) == 0 {
 		r.event(p, corev1.EventTypeNormal, "Updated", "the node runs "+s.TargetVersion)
 
+		// The agent reported the update finished, which ended the grant.
 		s.Phase = PhaseRecovering
 		s.Since = p.now
+		s.Grant = nil
 		s.Reason = ""
 
 		return s, 0, nil
 	}
 
 	if p.now.Sub(s.Since) > p.settings.RestartDeadline {
-		return s.held(p.now, "the node didn't come back in time, without "+strings.Join(missing, ", "), false), 0, nil
+		return s.heldApp(p.now, "the node didn't come back in time, without "+strings.Join(missing, ", ")), 0, nil
 	}
 
 	return s, pollInterval, nil
@@ -482,7 +513,7 @@ func (r *Reconciler) recovering(ctx context.Context, p *pass) (State, time.Durat
 
 	if !recovered {
 		if p.now.Sub(s.Since) > p.settings.RecoveryDeadline {
-			return s.held(p.now, "the workloads moved off the node didn't recover in time", false), 0, nil
+			return s.heldApp(p.now, "the workloads moved off the node didn't recover in time"), 0, nil
 		}
 
 		return s, pollInterval, nil
@@ -501,69 +532,60 @@ func (r *Reconciler) recovering(ctx context.Context, p *pass) (State, time.Durat
 	return s.idle(p.now, "updated to "+s.TargetVersion), 0, nil
 }
 
-// rebuilt ends an update whose Node was rebuilt before it restarted. The
-// update starts again at a later check. While the Node doesn't exist, it
-// waits for it to return.
-func (r *Reconciler) rebuilt(ctx context.Context, p *pass) (State, time.Duration, error) {
-	if p.node == nil {
-		return p.state, pollInterval, nil
+// rebuilt ends an update whose Node was rebuilt before it restarted: the
+// update starts again at a later check. While the Node doesn't exist, it waits
+// for it, until the restart deadline, and then holds the node.
+func rebuilt(p *pass) (State, time.Duration, error) {
+	if p.node != nil {
+		return p.state.idle(p.now, "the Node was rebuilt during the update"), 0, nil
 	}
 
-	if err := r.endGrant(ctx, p, requestSource(p.state.Request)); err != nil {
-		return p.state, 0, err
+	if p.now.Sub(p.state.Since) > p.settings.RestartDeadline {
+		return p.state.held(p.now, "the Node is gone, and didn't come back in time", false), 0, nil
 	}
 
-	return p.state.idle(p.now, "the Node was rebuilt during the update"), 0, nil
+	return p.state, pollInterval, nil
 }
 
-// waitForStatus waits for the agent's status until the status deadline, then
-// writes the request again, and holds the node after maxAttempts writes.
-func waitForStatus(p *pass, keepTaint bool) State {
+// waitForStatus waits for the agent to carry out the request. It must answer
+// within the status deadline, with InProgress at least, and finish within the
+// operation's deadline. An agent that misses either isn't working, so the node
+// is held. InProgress alone doesn't prove the agent is working: one that
+// keeps crashing writes it again each time it starts.
+func waitForStatus(p *pass, status *contract.Status, deadline time.Duration, keepTaint bool) State {
 	s := p.state
-	if p.now.Sub(s.RequestedAt) < p.settings.StatusDeadline {
+	waited := p.now.Sub(s.RequestedAt)
+
+	switch {
+	case status == nil && waited >= p.settings.StatusDeadline:
+		return s.held(p.now, fmt.Sprintf("the agent didn't answer the %s request within %s", s.Request.Operation, p.settings.StatusDeadline), keepTaint)
+	case waited >= deadline:
+		return s.held(p.now, fmt.Sprintf("the agent didn't finish the %s request within %s", s.Request.Operation, deadline), keepTaint)
+	default:
 		return s
 	}
-
-	if s.Writes >= maxAttempts {
-		return s.held(p.now, fmt.Sprintf("the agent didn't answer the %s request, written %d times", s.Request.Operation, s.Writes), keepTaint)
-	}
-
-	s.Writes++
-	s.RequestedAt = p.now
-
-	return s
 }
 
-// endGrant ends the node's open grant from source in Nebraska: a stage
-// request for a version other than the one it runs makes the agent tell
-// Nebraska the update in progress failed (designs/centerpivot.md, section
-// 4.7).
-func (r *Reconciler) endGrant(ctx context.Context, p *pass, source contract.Source) error {
-	if p.node == nil {
+// endGrant ends the grant the state has left to end, by telling Nebraska its
+// update failed, as the node (designs/centerpivot.md, section 4.7).
+func (r *Reconciler) endGrant(ctx context.Context, p *pass) error {
+	grant := p.state.EndGrant
+	if grant == nil {
 		return nil
 	}
 
-	var current string
-	if info, err := agentInfoOf(p.node); err == nil {
-		current = info.CurrentVersion
-	}
-
-	version := p.state.TargetVersion
-	if version == "" || version == current {
-		running, err := semver.StrictNewVersion(current)
-		if err != nil {
-			return fmt.Errorf("end the grant of Node %s: no version other than the one it runs: %w", p.node.Name, err)
-		}
-
-		version = running.IncPatch().String()
-	}
-
-	request := contract.NewRequest(contract.OperationStage, "", version, source)
-	if err := r.writeRequest(ctx, p.node, request); err != nil {
+	ca, err := r.ca(ctx, p.settings)
+	if err != nil {
 		return err
 	}
 
-	r.event(p, corev1.EventTypeNormal, "UpdateEnded", "ended the node's update in Nebraska")
+	if err := r.Nebraska.ReportFailure(ctx, ca, grant.check()); err != nil {
+		return fmt.Errorf("end the update grant of Machine %s: %w", p.machine.Name, err)
+	}
+
+	p.state.EndGrant = nil
+
+	r.event(p, corev1.EventTypeNormal, "UpdateEnded", "reported the node's update to Nebraska as failed, which ends its grant")
 
 	return nil
 }
@@ -605,22 +627,33 @@ func (r *Reconciler) checkFor(p *pass) (omaha.Check, error) {
 }
 
 func (r *Reconciler) updateCheck(ctx context.Context, p *pass, check omaha.Check) (omaha.Result, error) {
-	var ca string
-
-	if p.settings.CAConfigMap != "" {
-		var configMap corev1.ConfigMap
-		if err := r.Reader.Get(ctx, client.ObjectKey{Namespace: r.Namespace, Name: p.settings.CAConfigMap}, &configMap); err != nil {
-			return omaha.Result{}, fmt.Errorf("get CA ConfigMap %s: %w", p.settings.CAConfigMap, err)
-		}
-
-		ca = configMap.Data["ca.crt"]
+	ca, err := r.ca(ctx, p.settings)
+	if err != nil {
+		return omaha.Result{}, err
 	}
 
 	return r.Nebraska.UpdateCheck(ctx, ca, check)
 }
 
-// syncNode gives the Node the taint and request its state calls for. It
-// never removes a request: the agent's statuses refer to it.
+// ca returns the certificates that sign Nebraska's, from the Site's CA
+// ConfigMap, or none, for the system's.
+func (r *Reconciler) ca(ctx context.Context, settings Settings) (string, error) {
+	if settings.CAConfigMap == "" {
+		return "", nil
+	}
+
+	var configMap corev1.ConfigMap
+	if err := r.Reader.Get(ctx, client.ObjectKey{Namespace: r.Namespace, Name: settings.CAConfigMap}, &configMap); err != nil {
+		return "", fmt.Errorf("get CA ConfigMap %s: %w", settings.CAConfigMap, err)
+	}
+
+	return configMap.Data["ca.crt"], nil
+}
+
+// syncNode gives the Node the taint and request its state calls for. An Idle
+// or Held node carries no request, so an agent that starts late can't act on
+// an old one, and take a grant nothing ends. Otherwise a request stays until
+// the next: the agent's statuses refer to it.
 func (r *Reconciler) syncNode(ctx context.Context, node *corev1.Node, state State) error {
 	if node == nil {
 		return nil
@@ -629,7 +662,8 @@ func (r *Reconciler) syncNode(ctx context.Context, node *corev1.Node, state Stat
 	patched := node.DeepCopy()
 	setTaint(patched, state.Tainted())
 
-	if request := state.RequestToWrite(); request != nil {
+	switch request := state.RequestToWrite(); {
+	case request != nil:
 		value, err := request.Marshal()
 		if err != nil {
 			return err
@@ -640,23 +674,9 @@ func (r *Reconciler) syncNode(ctx context.Context, node *corev1.Node, state Stat
 		}
 
 		patched.Annotations[Keys.Request] = value
+	case state.Phase == PhaseIdle || state.Phase == PhaseHeld:
+		delete(patched.Annotations, Keys.Request)
 	}
-
-	return r.patchNode(ctx, node, patched)
-}
-
-func (r *Reconciler) writeRequest(ctx context.Context, node *corev1.Node, request contract.Request) error {
-	value, err := request.Marshal()
-	if err != nil {
-		return err
-	}
-
-	patched := node.DeepCopy()
-	if patched.Annotations == nil {
-		patched.Annotations = map[string]string{}
-	}
-
-	patched.Annotations[Keys.Request] = value
 
 	return r.patchNode(ctx, node, patched)
 }

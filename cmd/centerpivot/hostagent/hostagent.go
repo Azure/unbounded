@@ -16,7 +16,9 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
@@ -197,6 +199,12 @@ func (h tridentACLAgentHost) configure(ctx context.Context, gs *goalstates.NodeS
 		"Environment=TRIDENT_ACL_AGENT_KUBERNETES_NODE_NAME_SOURCE=kubelet-cert",
 		"Environment=TRIDENT_ACL_AGENT_KUBERNETES_KUBELET_CERT_PATH=" + cert,
 		"Environment=TRIDENT_ACL_AGENT_CURRENT_VERSION_KEY=" + names.VersionKey,
+		// Without a version, the agent would report 0.0.0, which Nebraska
+		// always offers an update to.
+		"Environment=TRIDENT_ACL_AGENT_CURRENT_VERSION_FALLBACK=error",
+		// centerpivot's deadlines build on these.
+		"Environment=TRIDENT_ACL_AGENT_ORCHESTRATION_STAGE_TIMEOUT=" + minutes(names.AgentStageTimeout),
+		"Environment=TRIDENT_ACL_AGENT_ORCHESTRATION_FINALIZE_TIMEOUT=" + minutes(names.AgentFinalizeTimeout),
 		"",
 	}, "\n")
 
@@ -255,6 +263,12 @@ func (h tridentACLAgentHost) remove(ctx context.Context) error {
 	h.log.Info("Removed trident-acl-agent's configuration for centerpivot", "disabled", enabledByAgent)
 
 	return nil
+}
+
+// minutes writes a whole number of minutes as the agent's humantime
+// durations read them, such as 20m.
+func minutes(d time.Duration) string {
+	return strconv.Itoa(int(d/time.Minute)) + "m"
 }
 
 // writeIfChanged writes content to path, durably, unless path already holds
