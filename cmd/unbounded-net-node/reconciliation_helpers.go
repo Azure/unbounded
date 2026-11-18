@@ -835,6 +835,7 @@ func gatewayPeersEqual(a, b []gatewayPeerInfo) bool {
 			!strSliceEqual(a[i].ExternalIPs, b[i].ExternalIPs) ||
 			!strSliceEqual(a[i].HealthEndpoints, b[i].HealthEndpoints) ||
 			!strSliceEqual(a[i].RoutedCidrs, b[i].RoutedCidrs) ||
+			!strSliceEqual(a[i].SourceCIDRs, b[i].SourceCIDRs) ||
 			!intMapEqual(a[i].RouteDistances, b[i].RouteDistances) ||
 			!strSliceEqual(a[i].PodCIDRs, b[i].PodCIDRs) ||
 			a[i].SkipPodCIDRRoutes != b[i].SkipPodCIDRRoutes ||

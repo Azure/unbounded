@@ -537,9 +537,9 @@ func routedCIDRsForGatewayPeer(
 	excludedTransitSites map[string]bool,
 	now time.Time,
 	staleAfter time.Duration,
-) ([]string, map[string]int, map[string]unboundednetv1alpha1.GatewayNodeRoute) {
+) ([]string, map[string]int, map[string]unboundednetv1alpha1.GatewayNodeRoute, []string) {
 	if gatewayNode == nil {
-		return nil, map[string]int{}, map[string]unboundednetv1alpha1.GatewayNodeRoute{}
+		return nil, map[string]int{}, map[string]unboundednetv1alpha1.GatewayNodeRoute{}, nil
 	}
 
 	planRoutes := make(map[string]routeplan.LearnedRoute, len(gatewayNode.Status.Routes))
@@ -570,6 +570,8 @@ func routedCIDRsForGatewayPeer(
 		staleAfter,
 	)
 
+	var sourceCIDRs []string
+
 	if len(excludedNodeCIDRSites) > 0 || len(excludedTransitSites) > 0 {
 		for cidr, route := range selectedPlan {
 			baseRoute := gatewayNode.Status.Routes[cidr]
@@ -582,12 +584,24 @@ func routedCIDRsForGatewayPeer(
 			}
 
 			filteredPaths := make([][]routeplan.PathHop, 0, len(route.Paths))
+			sourceAllowed := false
+
 			for _, path := range route.Paths {
-				if pathHasSiteInSet(path, excludedTransitSites) || (nodeRoute && pathHasSiteInSet(path, excludedNodeCIDRSites)) {
+				if nodeRoute && pathHasSiteInSet(path, excludedNodeCIDRSites) {
+					continue
+				}
+
+				sourceAllowed = true
+
+				if pathHasSiteInSet(path, excludedTransitSites) {
 					continue
 				}
 
 				filteredPaths = append(filteredPaths, path)
+			}
+
+			if sourceAllowed && len(excludedTransitSites) > 0 {
+				sourceCIDRs = append(sourceCIDRs, cidr)
 			}
 
 			if len(filteredPaths) == 0 {
@@ -637,8 +651,9 @@ func routedCIDRsForGatewayPeer(
 	}
 
 	sort.Strings(routes)
+	sort.Strings(sourceCIDRs)
 
-	return routes, distances, selected
+	return routes, distances, selected, sourceCIDRs
 }
 
 func pathHasSiteInSet(path []routeplan.PathHop, sites map[string]bool) bool {

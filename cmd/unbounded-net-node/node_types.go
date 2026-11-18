@@ -193,6 +193,7 @@ type gatewayPeerInfo struct {
 	ExternalIPs            []string // For cross-site connections
 	HealthEndpoints        []string // Full health check URLs (e.g., http://10.0.1.1:9998/healthz)
 	RoutedCidrs            []string // CIDRs that should be routed through this gateway (includes global podCIDR pools)
+	SourceCIDRs            []string // Additional source authorization, not forwarding destinations
 	RouteDistances         map[string]int
 	LearnedRoutes          map[string]unboundednetv1alpha1.GatewayNodeRoute
 	PodCIDRs               []string // Gateway node's podCIDRs for specific routing

@@ -499,7 +499,8 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 			klog.V(3).Infof("Gateway %s is in different site (%s), internal pool, no endpoint (WireGuard learns)", gwPeer.Name, gwPeer.SiteName)
 		}
 
-		allowedIPs := pruneCoveredAllowedCIDRs(gatewayBPFPrefixes(gwPeer, state.siteRouting.localCIDRs))
+		// Source authorization must not restore loop-prone transit destinations.
+		allowedIPs := pruneCoveredAllowedCIDRs(append(gatewayBPFPrefixes(gwPeer, state.siteRouting.localCIDRs), gwPeer.SourceCIDRs...))
 
 		// ECMP can send routed health probes over a different gateway. Keep each
 		// direct WireGuard link active so NAT-only gateways establish endpoints.

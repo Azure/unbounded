@@ -1866,7 +1866,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 					excludedTransitSites = assignedSiteSet
 				}
 
-				routedCidrs, routeDistances, learnedRoutes := routedCIDRsForGatewayPeer(peerGatewayNode, fallbackRoutedCIDRs, mySiteName, localGatewayPools, excludedNodeCIDRSites, excludedTransitSites, now, staleAfter)
+				routedCidrs, routeDistances, learnedRoutes, sourceCIDRs := routedCIDRsForGatewayPeer(peerGatewayNode, fallbackRoutedCIDRs, mySiteName, localGatewayPools, excludedNodeCIDRSites, excludedTransitSites, now, staleAfter)
 				// Assigned gateway pods use the gateway mesh instead of a worker downlink.
 				if assignedSiteSet[gwNode.SiteName] {
 					routedCidrs = dedupeStrings(slices.Concat(routedCidrs, gwNode.PodCIDRs))
@@ -1916,6 +1916,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 					ExternalIPs:            gwNode.ExternalIPs,
 					HealthEndpoints:        gwNode.HealthEndpoints,
 					RoutedCidrs:            routedCidrs,
+					SourceCIDRs:            sourceCIDRs,
 					RouteDistances:         routeDistances,
 					LearnedRoutes:          learnedRoutes,
 					PodCIDRs:               gwNode.PodCIDRs,

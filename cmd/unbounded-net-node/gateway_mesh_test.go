@@ -287,6 +287,14 @@ func TestSamePoolGatewaysAcrossNonMeshedSites(t *testing.T) {
 				}
 
 				for _, aggregate := range []string{"10.245.0.0/16", "fd45::/48"} {
+					if step.assigned && !slices.Contains(peer.SourceCIDRs, aggregate) {
+						t.Fatalf("destination pruning removed authorized transit sources: %+v", peer)
+					}
+
+					if slices.Contains(gatewayBPFPrefixes(peer, nil), aggregate) {
+						t.Fatalf("source authorization restored a loop-prone destination: %+v", peer)
+					}
+
 					if _, exists := peer.RouteDistances[aggregate]; exists {
 						t.Fatalf("served-Site aggregate retained a distance: %+v", peer)
 					}

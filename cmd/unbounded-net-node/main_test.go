@@ -199,7 +199,7 @@ func TestRoutedCIDRsForGatewayPeer_FiltersInvalidPathsKeepsValidAlternatives(t *
 		},
 	}
 
-	routes, distances, selected := routedCIDRsForGatewayPeer(
+	routes, distances, selected, _ := routedCIDRsForGatewayPeer(
 		gatewayNode,
 		[]string{"10.0.0.0/8"},
 		mySite,
@@ -284,7 +284,7 @@ func TestRoutedCIDRsForGatewayPeer_ExcludesNodeCIDRsForLocalAndPeeredSites(t *te
 		},
 	}
 
-	routes, distances, selected := routedCIDRsForGatewayPeer(
+	routes, distances, selected, _ := routedCIDRsForGatewayPeer(
 		gatewayNode,
 		nil,
 		"site1",
@@ -350,7 +350,7 @@ func TestRoutedCIDRsForGatewayPeer_DropsNodeCIDRsForNetworkPeeredSite(t *testing
 		},
 	}
 
-	routes, _, selected := routedCIDRsForGatewayPeer(
+	routes, _, selected, _ := routedCIDRsForGatewayPeer(
 		gatewayNode,
 		nil,
 		"site1",
