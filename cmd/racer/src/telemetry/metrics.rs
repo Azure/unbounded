@@ -110,28 +110,37 @@ const ADMISSION_CLASSES: [(crate::admission::ResourceClass, &str); 17] = {
     ]
 };
 
+const POOL_SERIES: usize = 11;
+
 /// Node-wide idle pool series: name suffix, Prometheus kind, and value.
-/// `target` is a per-worker value, so its node-wide sum is the sum of the
-/// workers' caps.
-fn pool_series(stats: &flow_control::PoolStats) -> [(&'static str, &'static str, u64); 8] {
+/// `target` is the bytes in use plus idle that the pools' sizing aims to keep.
+fn pool_series(
+    stats: &flow_control::PoolStats,
+) -> [(&'static str, &'static str, u64); POOL_SERIES] {
     [
         ("entries", "gauge", stats.entries as u64),
         ("bytes", "gauge", stats.bytes as u64),
+        ("in_use_bytes", "gauge", stats.in_use as u64),
         ("target", "gauge", stats.target as u64),
+        ("cold_bytes", "gauge", stats.cold as u64),
         ("hits_total", "counter", stats.hits),
         ("misses_total", "counter", stats.misses),
+        ("cold_hits_total", "counter", stats.cold_hits),
         ("rejects_total", "counter", stats.rejects),
         ("trimmed_total", "counter", stats.trimmed),
         ("unpooled_total", "counter", stats.unpooled),
     ]
 }
 
-/// Whether `family` tracks the series `suffix`: the buffer pool does not
-/// count entries, and the staging pool has no size classes.
+/// Whether `family` tracks the series `suffix`: the staging pool has no size
+/// classes and frees what it trims instead of keeping it cold.
 fn pool_tracks(family: &str, suffix: &str) -> bool {
     !matches!(
         (family, suffix),
-        ("buffer_pool", "entries") | ("staging_pool", "unpooled_total")
+        (
+            "staging_pool",
+            "unpooled_total" | "cold_bytes" | "cold_hits_total"
+        )
     )
 }
 
@@ -146,7 +155,7 @@ fn write_pools(
     if samples.is_empty() {
         return Ok(());
     }
-    let mut totals = [0u64; 8];
+    let mut totals = [0u64; POOL_SERIES];
     for (_, stats) in samples {
         for (total, (_, _, value)) in totals.iter_mut().zip(pool_series(stats)) {
             *total = total.saturating_add(value);
@@ -363,6 +372,8 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::RdmaGrantAheadDeferred => "racer_rdma_grant_ahead_deferred_total",
             Self::RdmaOwnerPasses => "racer_rdma_owner_passes_total",
             Self::RdmaOwnerCommands => "racer_rdma_owner_commands_total",
+            Self::RdmaPoolRegistrations => "racer_rdma_pool_registrations_total",
+            Self::RdmaPoolDeregistrations => "racer_rdma_pool_deregistrations_total",
             Self::RdmaOwnerWakeCommands => "racer_rdma_owner_immediate_wakes_total" { "reason=\"commands\"" },
             Self::RdmaOwnerWakeCompletions => "racer_rdma_owner_immediate_wakes_total" { "reason=\"completions\"" },
             Self::RdmaBreakerTripLinkDown => "racer_rdma_breaker_trips_total" { "reason=\"link_down\"" },
@@ -563,6 +574,14 @@ metrics! { Gauge, GAUGES, GAUGE_COUNT;
             Self::CheckpointSequence => "racer_checkpoint_sequence",
             Self::MemoryPressureLevel => "racer_memory_pressure_level",
             Self::RdmaFreeBuffers => "racer_rdma_free_buffers",
+            Self::RdmaPoolCapacityBytes => "racer_rdma_pool_capacity_bytes",
+            Self::RdmaPoolRegisteredBytes => "racer_rdma_pool_registered_bytes",
+            Self::RdmaPoolTargetBytes => "racer_rdma_pool_target_bytes",
+            Self::RdmaPoolInUseBytes => "racer_rdma_pool_in_use_bytes",
+            Self::RdmaPoolBlocks => "racer_rdma_pool_blocks",
+            Self::RdmaPoolDrainingBlocks => "racer_rdma_pool_draining_blocks",
+            Self::RdmaPoolRegisterNanoseconds => "racer_rdma_pool_register_nanoseconds",
+            Self::RdmaPoolHoldSeconds => "racer_rdma_pool_hold_seconds",
             Self::RdmaActive => "racer_rdma_active",
             Self::RdmaLinksReady => "racer_rdma_links_ready",
             Self::RdmaLinksConnecting => "racer_rdma_links_connecting",
@@ -1871,14 +1890,16 @@ mod tests {
             let staging = |entries, bytes, counter| flow_control::PoolStats {
                 entries,
                 bytes,
+                in_use: 7,
                 target: 3,
-                max_depth: 8,
+                cold: 9,
                 hits: counter,
                 misses: counter + 1,
+                cold_hits: counter + 5,
                 rejects: counter + 2,
                 trimmed: counter + 3,
-                constrained: false,
                 unpooled: counter + 4,
+                ..Default::default()
             };
             metrics[0].observe_staging_pool(WorkerId(3), staging(2, 4096, 5));
             metrics[1].observe_staging_pool(WorkerId(4), staging(1, 1024, 10));
@@ -1915,6 +1936,11 @@ mod tests {
                 "racer_worker_staging_pool_bytes{worker=\"3\"} 4096\n".to_string(),
                 "racer_worker_staging_pool_bytes{worker=\"4\"} 1024\n".to_string(),
                 "racer_buffer_pool_bytes 12288\n".to_string(),
+                "racer_buffer_pool_entries 0\n".to_string(),
+                "racer_buffer_pool_in_use_bytes 14\n".to_string(),
+                "racer_buffer_pool_cold_bytes 18\n".to_string(),
+                "# TYPE racer_buffer_pool_cold_hits_total counter\nracer_buffer_pool_cold_hits_total 310\n"
+                    .to_string(),
                 "# TYPE racer_buffer_pool_misses_total counter\nracer_buffer_pool_misses_total 302\n"
                     .to_string(),
                 "racer_buffer_pool_rejects_total 304\n".to_string(),
@@ -1928,8 +1954,8 @@ mod tests {
             }
             assert!(!output.contains("recycler"));
             // Series a family does not track are not exported.
-            assert!(!output.contains("racer_buffer_pool_entries"));
             assert!(!output.contains("racer_staging_pool_unpooled_total"));
+            assert!(!output.contains("racer_staging_pool_cold"));
             assert_eq!(
                 output
                     .lines()

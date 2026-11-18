@@ -73,7 +73,7 @@ pub struct Slab<C: Charge> {
 
     writes: Rc<WriteState>,
 
-    idle_buffer: Rc<RefCell<crate::BufferPool<C>>>,
+    idle_buffer: Rc<crate::StagingPool<C>>,
 }
 
 impl<C: Charge> Slab<C> {
@@ -93,7 +93,7 @@ impl<C: Charge> Slab<C> {
             sim: RefCell::new(None),
             opened: RefCell::new(None),
             writes: Rc::new(WriteState::default()),
-            idle_buffer: Rc::new(RefCell::new(crate::BufferPool::default())),
+            idle_buffer: Rc::new(crate::StagingPool::default()),
         }
     }
 
@@ -252,8 +252,10 @@ impl<C: Charge> Slab<C> {
         idle.iter().map(|b| b.allocation().layout.size()).sum()
     }
 
-    /// Run demand maintenance at `now`, freeing idle entries the controller
-    /// releases oldest first. Returns released bytes; O(1) between windows.
+    /// Run demand maintenance at `now`, freeing whole idle entries the
+    /// controller releases, oldest first, or every idle entry under critical
+    /// pressure. Without pressure an entry stays while freeing it would leave
+    /// less than the target. Returns released bytes.
     pub fn maintain_idle(&self, now: std::time::Instant) -> usize {
         let Ok(mut pool) = self.idle_buffer.try_borrow_mut() else {
             return 0;
@@ -263,9 +265,11 @@ impl<C: Charge> Slab<C> {
         released.iter().map(|b| b.allocation().layout.size()).sum()
     }
 
-    /// Hold the idle pool at its minimum depth and refuse returns while constrained.
-    pub fn constrain_idle(&self, constrained: bool) {
-        self.idle_buffer.borrow_mut().set_constrained(constrained);
+    /// Apply memory pressure to the idle pool. Elevated pressure keeps only
+    /// what the controller still targets, critical pressure keeps no returns,
+    /// and maintenance releases the rest, or all idle entries when critical.
+    pub fn set_idle_pressure(&self, pressure: crate::Pressure) {
+        self.idle_buffer.borrow_mut().set_pressure(pressure);
     }
 
     /// Current idle pool size, target, and cumulative counters.

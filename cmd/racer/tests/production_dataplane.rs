@@ -1247,11 +1247,12 @@ fn idle_staging_is_sized_by_demand_and_released_when_constrained() {
     assert!(retained > 0, "writeback must leave idle staging");
     let stats = rig.writer.staging_pool_stats();
     assert_eq!(stats.bytes, retained);
-    assert!(stats.entries <= stats.target && stats.target <= stats.max_depth);
+    assert_eq!(stats.in_use, 0);
     let start = std::time::Instant::now();
     assert_eq!(rig.writer.maintain_staging(start), 0);
     let charged = rig.admission.used(ResourceClass::Ciphertext);
-    rig.writer.constrain_staging(true);
+    rig.writer
+        .set_staging_pressure(page_alloc::Pressure::Critical);
     assert_eq!(rig.writer.maintain_staging(start), retained);
     assert_eq!(rig.writer.retained_staging_bytes(), 0);
     assert_eq!(
@@ -1261,7 +1262,8 @@ fn idle_staging_is_sized_by_demand_and_released_when_constrained() {
     let stats = rig.writer.staging_pool_stats();
     assert!(stats.constrained);
     assert!(stats.trimmed >= 1);
-    rig.writer.constrain_staging(false);
+    rig.writer
+        .set_staging_pressure(page_alloc::Pressure::Normal);
     assert!(!rig.writer.staging_pool_stats().constrained);
 }
 

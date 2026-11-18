@@ -260,6 +260,7 @@ fn activate(
         grants_per_link: 1,
         idle: std::time::Duration::from_secs(1),
         guard,
+        growth: None,
     });
     owner.poll_budgeted(2).unwrap();
     let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());

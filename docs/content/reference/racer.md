@@ -419,8 +419,8 @@ each worker and are never divided.
 | `RACER_CIPHERTEXT_BYTES_PER_WORKER` | `134217728` (128 MiB) | Per I/O worker | 1..68,719,476,736 bytes | Ciphertext admission budget, including the memory cache. Each worker's share must fit the range window plus one stored record. Multiplied by the final I/O worker count. |
 | `RACER_DIRTY_BYTES` | Unset: `RACER_DIRTY_BYTES_PER_WORKER` applies | Node | 16,777,232..68,719,476,736 bytes | Budget for pages waiting to be written to disk. Node-wide total, divided among I/O workers. |
 | `RACER_DIRTY_BYTES_PER_WORKER` | `167772160` (160 MiB) | Per I/O worker | 16,777,232..68,719,476,736 bytes | Budget for pages waiting to be written to disk. Multiplied by the final I/O worker count. |
-| `RACER_REGISTERED_BYTES` | Unset: `RACER_REGISTERED_BYTES_PER_WORKER` applies | Node | 1..68,719,476,736 bytes | Native RDMA page-buffer pool, used only when RDMA is enabled; then at least one page plus 16 bytes. One native thread owns the whole pool, so it is never divided. When neither variable is set, the scaled default is capped at 8 GiB node-wide. The pool is split evenly over RDMA rails, and a rail without a whole buffer is not used. Each grant holds one 18 MiB buffer until its page is consumed; `racer_rdma_free_buffers` shows what is left. Node-wide total, divided among I/O workers. |
-| `RACER_REGISTERED_BYTES_PER_WORKER` | `402653184` (384 MiB) | Per I/O worker | 1..68,719,476,736 bytes | Native RDMA page-buffer pool, used only when RDMA is enabled; then at least one page plus 16 bytes. One native thread owns the whole pool, so it is never divided. When neither variable is set, the scaled default is capped at 8 GiB node-wide. The pool is split evenly over RDMA rails, and a rail without a whole buffer is not used. Each grant holds one 18 MiB buffer until its page is consumed; `racer_rdma_free_buffers` shows what is left. Multiplied by the final I/O worker count. |
+| `RACER_REGISTERED_BYTES` | Unset: `RACER_REGISTERED_BYTES_PER_WORKER` applies | Node | 1..68,719,476,736 bytes | Most memory the native RDMA page-buffer pool may register, used only when RDMA is enabled; then at least one page plus 16 bytes. One native thread owns the whole pool, so it is never divided. When neither variable is set, the scaled default is capped at 8 GiB node-wide. The pool is split evenly over RDMA rails, and a rail without a whole buffer is not used. Each rail registers one block of buffers (an eighth of its share, 2 to 32 buffers) at activation, registers more blocks as receive demand grows, and deregisters them again some time after demand falls; `racer_rdma_pool_registered_bytes` shows what is registered now. Each grant holds one 18 MiB buffer until its page is consumed; `racer_rdma_free_buffers` shows what is left. Node-wide total, divided among I/O workers. |
+| `RACER_REGISTERED_BYTES_PER_WORKER` | `402653184` (384 MiB) | Per I/O worker | 1..68,719,476,736 bytes | Most memory the native RDMA page-buffer pool may register, used only when RDMA is enabled; then at least one page plus 16 bytes. One native thread owns the whole pool, so it is never divided. When neither variable is set, the scaled default is capped at 8 GiB node-wide. The pool is split evenly over RDMA rails, and a rail without a whole buffer is not used. Each rail registers one block of buffers (an eighth of its share, 2 to 32 buffers) at activation, registers more blocks as receive demand grows, and deregisters them again some time after demand falls; `racer_rdma_pool_registered_bytes` shows what is registered now. Each grant holds one 18 MiB buffer until its page is consumed; `racer_rdma_free_buffers` shows what is left. Multiplied by the final I/O worker count. |
 | `RACER_REQUEST_CONTEXT_BYTES` | Unset: `RACER_REQUEST_CONTEXT_BYTES_PER_WORKER` applies | Node | 131,072..68,719,476,736 bytes | Request-context budget. Node-wide total, divided among I/O workers. |
 | `RACER_REQUEST_CONTEXT_BYTES_PER_WORKER` | `33554432` (32 MiB) | Per I/O worker | 131,072..68,719,476,736 bytes | Request-context budget. Multiplied by the final I/O worker count. |
 | `RACER_FLIGHTS` | Unset: `RACER_FLIGHTS_PER_WORKER` applies | Node | 1..65,536 | Concurrent single-flight page fetches. Node-wide total, divided among I/O workers. |
@@ -752,7 +752,12 @@ Racer-Destination-Length: <length>
   an eighth of the buffers of that rail's pool are free. These pages count
   as `pool_low`, and that copy costs an extra pass over the page in memory,
   so a `pool_low` count that keeps growing means the grant reserve is not
-  keeping up. If ciphertext admission also refuses
+  keeping up. Both checks count the buffers the pool may still register as
+  free and part of the pool: up to the rail's share of
+  `RACER_REGISTERED_BYTES` without memory pressure, at most one block above
+  the buffers in use under `Elevated` pressure, and none under `Critical`
+  pressure, when the pool does not grow, or while a refused or failed block
+  registration waits to retry. If ciphertext admission also refuses
   that copy, the page is dropped, which frees its buffer, and the window
   fetches it again later; `racer_host_read_ahead_registered_dropped_total`
   counts these drops.
@@ -1574,18 +1579,32 @@ second:
 
 | Metric | Type | Meaning |
 |--------|------|---------|
-| `racer_buffer_pool_bytes` | gauge | Idle buffer bytes kept for reuse, charged to the `pool` admission class |
-| `racer_buffer_pool_target` | gauge | Sum over workers of each worker's cap on idle buffers of one size |
+| `racer_buffer_pool_entries` | gauge | Idle buffers kept for reuse, warm or cold |
+| `racer_buffer_pool_bytes` | gauge | Warm idle buffer bytes kept for reuse, charged to the `pool` admission class |
+| `racer_buffer_pool_in_use_bytes` | gauge | Pooled buffer bytes checked out now |
+| `racer_buffer_pool_target` | gauge | Bytes of buffers, in use and idle, the pools size themselves to |
+| `racer_buffer_pool_cold_bytes` | gauge | Idle buffer bytes whose memory was returned to the kernel but whose mappings are kept for reuse; not charged |
 | `racer_buffer_pool_hits_total` | counter | Buffers taken from idle storage |
 | `racer_buffer_pool_misses_total` | counter | Buffers that needed new memory (an `mmap` for page-sized buffers) |
+| `racer_buffer_pool_cold_hits_total` | counter | Hits that reused a cold buffer and so faulted its memory back in |
 | `racer_buffer_pool_rejects_total` | counter | Returned buffers freed instead of kept (an `munmap` for page-sized buffers) |
-| `racer_buffer_pool_trimmed_total` | counter | Times idle buffers were released after an idle window or under memory pressure |
+| `racer_buffer_pool_trimmed_total` | counter | Idle buffers released because demand fell or memory is under pressure |
 | `racer_buffer_pool_unpooled_total` | counter | Buffers that could not be pooled because every size class held idle buffers of other sizes; each is also a miss |
 | `racer_worker_buffer_pool_bytes` | gauge | `racer_buffer_pool_bytes` per worker, labeled `worker` |
 
-While load is steady, misses and
-rejects should stay flat. If they keep rising, idle buffers do not fit the
-`pool` class budget, which equals the worker's ciphertext budget. A rising
+Each pool sizes itself to its recent demand: it keeps the most buffers in use
+at once over the last hold time (1 s for small buffers, about 2 s for 16 MiB
+pages), and releases the rest a step at a time once demand stays lower for that
+long. Released page buffers first go cold, and are unmapped after four more hold
+times unused. Under `Elevated` memory pressure a pool keeps at most one idle
+buffer above what is in use; under `Critical` it keeps none and frees returned
+buffers. The `racer_staging_pool_*` series follow the same rules for disk-write
+staging, without the cold stage.
+
+While load is steady, misses, cold hits, and rejects should stay flat. Misses
+and cold hits that rise with each burst mean bursts come further apart than the
+hold time. Rising rejects mean idle buffers do not fit the `pool` class budget,
+which equals the worker's ciphertext budget. A rising
 `racer_buffer_pool_unpooled_total` means more buffer sizes are in use at
 once than a worker's pool has size classes.
 
@@ -2084,7 +2103,33 @@ Native activation registers the page-buffer pool within 5 s plus 1 s per GiB of
 `stage=rdma-activation state=failed`, counts `racer_rdma_activation_failures_total`,
 reports no RDMA rails (so peers stop planning RDMA to it), and retries; it
 advertises its rails again once activation succeeds. `racer_rdma_active` is 1
-while rails are active, and `racer_rdma_free_buffers` counts free page buffers.
+while rails are active, and `racer_rdma_free_buffers` counts free page buffers
+registered now, in blocks that still hand out buffers; it does not count the
+buffers the pool may still register.
+
+Activation registers only the first block of each rail's pool (an eighth of the
+rail's share of `RACER_REGISTERED_BYTES`, 2 to 32 buffers). The native thread
+then sizes each rail to its recent receive demand, in whole blocks: it registers
+another block on a helper thread as soon as a grant finds the rail empty or
+demand climbs, and stops handing out buffers from the newest block once demand
+has stayed below it for the hold time, deregistering the block when its last
+buffer returns. The hold time is 1000 times the measured time to register one
+block, between 1 s and 300 s, so slow registration is repaid before a block is
+dropped. Under memory pressure a rail keeps at most one block above use
+(`Elevated`) or none (`Critical`). `racer_rdma_pool_registered_bytes` shows
+the bytes registered across rails, draining blocks included: a draining block
+stays registered and charged until it is deregistered.
+`racer_rdma_pool_capacity_bytes` shows the bytes in blocks still handing out
+buffers, which sizing compares with `racer_rdma_pool_target_bytes`, the bytes
+wanted; `racer_rdma_pool_in_use_bytes` shows the bytes in use, draining blocks
+included. `racer_rdma_pool_blocks` and `racer_rdma_pool_draining_blocks` count
+blocks; `racer_rdma_pool_registrations_total`
+and `racer_rdma_pool_deregistrations_total` count blocks added and dropped after
+activation; `racer_rdma_pool_register_nanoseconds` and
+`racer_rdma_pool_hold_seconds` report the slowest rail's registration time and
+hold time. Registrations that rise with every burst mean bursts come further
+apart than the hold time.
+
 `racer_rdma_receive_buffer_hold_nanoseconds_sum` and `_count` time each received
 page's buffer from its grant until it returns to the pool. A received page is
 copied out of its buffer before it is decrypted, delivered, or persisted, so

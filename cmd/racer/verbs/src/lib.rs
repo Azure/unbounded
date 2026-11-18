@@ -104,6 +104,7 @@ mod node;
 mod pool;
 mod reaper;
 mod role;
+mod sizing;
 
 pub use channel::Op;
 pub use ffi::Endpoint;
@@ -115,6 +116,7 @@ pub use node::{
 };
 pub use pool::{BufferState, DevicePage, RegisteredPage};
 pub use role::{DRAIN_REPORT, OwnerRole, OwnerStop};
+pub use sizing::{BlockCharge, Growth, PoolSizing, PoolSizings};
 
 #[cfg(any(test, feature = "simulation"))]
 pub use ffi::simulation;

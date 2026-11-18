@@ -281,17 +281,13 @@ fn buffer_pool_keeps_only_zeroed_accounted_storage_and_rejects_undercharging() {
     let larger = slab.allocate(size * 2, charge(size * 2)).unwrap();
     assert_eq!(larger.len(), size * 2);
     assert_eq!(live.get(), size * 4);
-    // The initial demand target holds two entries, so a third return is freed.
+    // Returns within the idle budget are kept until maintenance trims them.
     drop(larger);
-    assert_eq!(slab.idle_bytes(), size * 2);
-    assert_eq!(live.get(), size * 2);
+    assert_eq!(slab.idle_bytes(), size * 4);
+    assert_eq!(live.get(), size * 4);
     let stats = slab.idle_pool_stats();
-    assert_eq!(
-        (stats.entries, stats.target),
-        (2, page_alloc::DEFAULT_INITIAL_TARGET)
-    );
-    assert!(stats.entries <= page_alloc::DEFAULT_MAX_DEPTH);
-    assert_eq!(slab.reclaim_idle(), size * 2);
+    assert_eq!((stats.entries, stats.in_use), (3, 0));
+    assert_eq!(slab.reclaim_idle(), size * 4);
     assert_eq!(slab.reclaim_idle(), 0);
     assert_eq!(live.get(), 0);
 
@@ -306,10 +302,10 @@ fn buffer_pool_keeps_only_zeroed_accounted_storage_and_rejects_undercharging() {
     assert_eq!(live.get(), 0);
 }
 
-/// Demand maintenance grows under miss pressure, trims idle storage oldest
-/// first, releases its accounting, and holds a constrained pool empty.
+/// Demand maintenance keeps a recent burst for the hold time, then releases it
+/// and its accounting, and pressure keeps returns out of the pool.
 #[test]
-fn idle_pool_adapts_to_demand_and_constraint() {
+fn idle_pool_adapts_to_demand_and_pressure() {
     let simulation = racer_io::sim::SimOs::new();
     let env = racer_io::Env::sim(&simulation, racer_io::WorkerCtx::host());
     let slab = slab_new(&env, "/alloc-workflows/demand".into(), 8192, 4096, 1024);
@@ -318,11 +314,11 @@ fn idle_pool_adapts_to_demand_and_constraint() {
     let size = alignment.extent(0, 31).unwrap().length();
     let live = Rc::new(Cell::new(0));
     let charge = |bytes| CountingCharge::new(&live, bytes);
-    let window = page_alloc::DEFAULT_WINDOW;
+    let tick = page_alloc::SAMPLE_PERIOD;
     let mut now = std::time::Instant::now();
     assert_eq!(slab.maintain_idle(now), 0);
 
-    // Four concurrent buffers miss; only the initial target of two is retained.
+    // Four concurrent buffers miss, and every return is kept for reuse.
     let burst = |slab: &Slab<CountingCharge>| {
         let held: Vec<_> = (0..4)
             .map(|_| slab.allocate(size, charge(size)).unwrap())
@@ -331,34 +327,46 @@ fn idle_pool_adapts_to_demand_and_constraint() {
     };
     burst(&slab);
     let stats = slab.idle_pool_stats();
-    assert_eq!((stats.entries, stats.misses), (2, 4));
-    assert_eq!(stats.rejects, 2);
-    now += window;
+    assert_eq!((stats.entries, stats.misses, stats.rejects), (4, 4, 0));
+    assert_eq!(stats.in_use, 0);
+    now += tick;
     assert_eq!(slab.maintain_idle(now), 0);
-    assert_eq!(slab.idle_pool_stats().target, 4);
+    assert!(slab.idle_pool_stats().target >= 4 * size);
     burst(&slab);
-    assert_eq!(slab.idle_pool_stats().entries, 4);
-    assert!(slab.idle_pool_stats().target <= page_alloc::DEFAULT_MAX_DEPTH);
+    let stats = slab.idle_pool_stats();
+    assert_eq!((stats.entries, stats.hits, stats.misses), (4, 4, 4));
 
-    // Untouched windows halve the idle surplus and release its accounting.
-    now += window;
-    slab.maintain_idle(now);
-    now += window;
-    assert_eq!(slab.maintain_idle(now), size * 2);
-    assert_eq!(slab.idle_pool_stats().entries, 2);
-    assert_eq!(live.get(), size * 2);
-    assert_eq!(slab.maintain_idle(now), 0);
+    // The burst is held for the hold time, then released with its accounting.
+    let hold = slab.idle_pool_stats().hold;
+    assert_eq!(hold, page_alloc::MIN_HOLD);
+    let mut released = 0;
+    let quiet = now;
+    while now - quiet < hold / 2 {
+        now += tick;
+        released += slab.maintain_idle(now);
+    }
+    assert_eq!(released, 0);
+    for _ in 0..100 {
+        now += tick;
+        released += slab.maintain_idle(now);
+    }
+    assert_eq!(released, size * 4);
+    assert_eq!(slab.idle_pool_stats().entries, 0);
+    assert_eq!(live.get(), 0);
+    assert_eq!(slab.idle_pool_stats().trimmed, 4);
 
-    slab.constrain_idle(true);
-    assert_eq!(slab.maintain_idle(now), size * 2);
+    burst(&slab);
+    slab.set_idle_pressure(page_alloc::Pressure::Critical);
+    now += tick;
+    assert_eq!(slab.maintain_idle(now), size * 4);
     assert_eq!(live.get(), 0);
     drop(slab.allocate(size, charge(size)).unwrap());
     assert_eq!(slab.idle_bytes(), 0);
     assert!(slab.idle_pool_stats().constrained);
-    slab.constrain_idle(false);
+    slab.set_idle_pressure(page_alloc::Pressure::Normal);
     drop(slab.allocate(size, charge(size)).unwrap());
     assert_eq!(slab.idle_bytes(), size);
-    assert!(slab.idle_pool_stats().trimmed >= 4);
+    assert!(!slab.idle_pool_stats().constrained);
 }
 
 /// Bound submissions reject foreign identity and bytes beyond the captured prefix.
