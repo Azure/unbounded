@@ -4,8 +4,82 @@
 package netlink
 
 import (
+	"errors"
+	"fmt"
 	"testing"
 )
+
+type fakeNativeNotrackIPTables struct {
+	*fakeForwardIPTables
+	stage    string
+	failure  error
+	deleted  int
+	inserted int
+}
+
+func (f *fakeNativeNotrackIPTables) List(_, _ string) ([]string, error) {
+	if f.stage == "list" {
+		return nil, f.failure
+	}
+
+	return []string{fmt.Sprintf("-A PREROUTING -i oldeth0 -m comment --comment %q -j %s", notrackComment, notrackChain)}, nil
+}
+
+func (f *fakeNativeNotrackIPTables) DeleteIfExists(_, _ string, _ ...string) error {
+	f.deleted++
+	if f.stage == "delete" {
+		return f.failure
+	}
+
+	return nil
+}
+
+func (f *fakeNativeNotrackIPTables) Exists(_, _ string, _ ...string) (bool, error) {
+	if f.stage == "exists" {
+		return false, f.failure
+	}
+
+	return false, nil
+}
+
+func (f *fakeNativeNotrackIPTables) Insert(_, _ string, _ int, _ ...string) error {
+	f.inserted++
+	if f.stage == "insert" {
+		return f.failure
+	}
+
+	return nil
+}
+
+func TestNativeNotrackReconciliationFailures(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		stage    string
+		deleted  int
+		inserted int
+	}{
+		{"list", 0, 0}, {"delete", 1, 0}, {"exists", 1, 0}, {"insert", 1, 1}, {"", 1, 1},
+	} {
+		t.Run(tc.stage, func(t *testing.T) {
+			failure := errors.New("iptables failure")
+			ipv4 := &fakeNativeNotrackIPTables{
+				fakeForwardIPTables: &fakeForwardIPTables{fakeIPTables: &fakeIPTables{}}, stage: tc.stage, failure: failure,
+			}
+			ipv6 := &fakeNativeNotrackIPTables{stage: "list", failure: failure}
+			manager := &NotrackManager{ipt4: ipv4, ipt6: ipv6, ctSupported4: true}
+
+			err := manager.ReconcileNativeInterface("eth1", true)
+			if (tc.stage == "" && err != nil) || (tc.stage != "" && !errors.Is(err, failure)) {
+				t.Fatalf("required failure hidden or unsupported IPv6 blocked IPv4: %v", err)
+			}
+
+			if ipv4.deleted != tc.deleted || ipv4.inserted != tc.inserted {
+				t.Fatalf("unexpected downstream operations after %q: deleted=%d inserted=%d", tc.stage, ipv4.deleted, ipv4.inserted)
+			}
+		})
+	}
+}
 
 func TestSplitByFamily(t *testing.T) {
 	t.Parallel()

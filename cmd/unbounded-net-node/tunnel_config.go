@@ -1137,12 +1137,8 @@ func reapplyRPFilterOnActiveTunnels(cfg *config, meshPeers []meshPeerInfo, gatew
 	}
 
 	native, _, err := unboundednetnetlink.DetectDefaultRouteInterfaceFromCache(nlCache)
-	if err != nil {
-		if usesNative {
-			return fmt.Errorf("detect native forwarding interface: %w", err)
-		}
-
-		return nil
+	if err != nil && usesNative {
+		return fmt.Errorf("detect native forwarding interface: %w", err)
 	}
 
 	if usesNative {
@@ -1173,10 +1169,8 @@ func reapplyRPFilterOnActiveTunnels(cfg *config, meshPeers []meshPeerInfo, gatew
 	// Native ingress and tunnel ingress must agree about transit conntrack,
 	// or a tracked SYN followed by an untracked SYN-ACK makes ACKs INVALID.
 	if notrackMgr != nil {
-		if usesNative && isGateway {
-			notrackMgr.EnsureInterface(native)
-		} else {
-			notrackMgr.RemoveInterface(native)
+		if err := notrackMgr.ReconcileNativeInterface(native, usesNative && isGateway); err != nil {
+			return fmt.Errorf("reconcile native notrack ingress: %w", err)
 		}
 	}
 

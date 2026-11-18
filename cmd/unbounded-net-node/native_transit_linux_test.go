@@ -88,7 +88,18 @@ func TestNativeTransitInterfaceRules(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	for _, iface := range []string{"fabric0", "oldfabric0", "tunnel0"} {
+		notrack.EnsureInterface(iface)
+	}
+
+	notrack, err = unboundednetnetlink.NewNotrackManager()
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer notrack.Cleanup()
+
+	notrack.EnsureInterface("tunnel0")
 
 	if err := notrack.ReconcileCIDRs(
 		[]string{"10.246.1.0/24", "fd46:0:0:1::/64"},
@@ -145,6 +156,10 @@ func TestNativeTransitInterfaceRules(t *testing.T) {
 				"-o", "tunnel0", "-m", "comment", "--comment", "unbounded-net: forward between managed tunnels", "-j", "ACCEPT")
 			checkRule(ipt, tc.notrack, "raw", "PREROUTING",
 				"-i", "fabric0", "-m", "comment", "--comment", "unbounded-net: skip conntrack for tunnel transit", "-j", "UNBOUNDED-NOTRACK")
+			checkRule(ipt, false, "raw", "PREROUTING",
+				"-i", "oldfabric0", "-m", "comment", "--comment", "unbounded-net: skip conntrack for tunnel transit", "-j", "UNBOUNDED-NOTRACK")
+			checkRule(ipt, true, "raw", "PREROUTING",
+				"-i", "tunnel0", "-m", "comment", "--comment", "unbounded-net: skip conntrack for tunnel transit", "-j", "UNBOUNDED-NOTRACK")
 			checkRule(ipt, true, "raw", "UNBOUNDED-NOTRACK",
 				"-m", "addrtype", "--dst-type", "LOCAL", "-m", "comment", "--comment", "unbounded-net: skip conntrack for tunnel transit", "-j", "RETURN")
 
@@ -168,7 +183,78 @@ func TestNativeTransitInterfaceRules(t *testing.T) {
 		}
 	}
 
+	checkNativeNotrackMigration(t, forward, notrack)
 	checkAssignmentListenerReuse(t)
+}
+
+func checkNativeNotrackMigration(t *testing.T, forward *unboundednetnetlink.ForwardManager, notrack *unboundednetnetlink.NotrackManager) {
+	t.Helper()
+	t.Log("migrating native NOTRACK ingress across NICs, restart, and withdrawal")
+
+	apply := func(active bool, expected string) {
+		t.Helper()
+
+		var peers []meshPeerInfo
+		if active {
+			peers = []meshPeerInfo{{TunnelProtocol: "None", PodCIDRs: []string{"10.246.1.0/24", "fd46:0:0:1::/64"}}}
+		}
+
+		if err := reapplyRPFilterOnActiveTunnels(&config{}, peers, nil, nil, forward, true, notrack, nil); err != nil {
+			t.Fatal(err)
+		}
+
+		for _, protocol := range []iptables.Protocol{iptables.ProtocolIPv4, iptables.ProtocolIPv6} {
+			ipt, err := iptables.NewWithProtocol(protocol)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			for _, iface := range []string{"fabric0", "fabric1", "tunnel0"} {
+				exists, err := ipt.Exists("raw", "PREROUTING", "-i", iface, "-m", "comment",
+					"--comment", "unbounded-net: skip conntrack for tunnel transit", "-j", "UNBOUNDED-NOTRACK")
+
+				want := iface == expected || iface == "tunnel0"
+				if err != nil || exists != want {
+					t.Fatalf("IPv%d NOTRACK on %s: exists=%t want=%t err=%v", protocol, iface, exists, want, err)
+				}
+			}
+		}
+	}
+	apply(true, "fabric0")
+
+	fabric := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "fabric1"}}
+	if err := netlink.LinkAdd(fabric); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := netlink.LinkSetUp(fabric); err != nil {
+		t.Fatal(err)
+	}
+
+	defaultRoute := &netlink.Route{LinkIndex: fabric.Index, Dst: &net.IPNet{IP: net.IPv4zero, Mask: net.CIDRMask(0, 32)}}
+	if err := netlink.RouteReplace(defaultRoute); err != nil {
+		t.Fatal(err)
+	}
+
+	apply(true, "fabric1")
+
+	var err error
+
+	notrack, err = unboundednetnetlink.NewNotrackManager()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	notrack.EnsureInterface("tunnel0")
+	apply(true, "fabric1")
+	apply(false, "")
+	apply(true, "fabric1")
+
+	if err := netlink.RouteDel(defaultRoute); err != nil {
+		t.Fatal(err)
+	}
+
+	apply(false, "")
 }
 
 func checkAssignmentListenerReuse(t *testing.T) {
