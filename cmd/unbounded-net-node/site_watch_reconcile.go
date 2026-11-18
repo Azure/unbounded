@@ -1788,7 +1788,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 
 	// Collect gateway peers from gateway pools for dedicated gateway interfaces.
 	// Non-gateway nodes: connect to pools from peerings involving their site
-	// Gateway nodes: connect only to peered pools (other pools in the same Peering)
+	// Gateway nodes: connect to peered pools and authorized same-pool transit peers.
 	var gatewayPeers []gatewayPeerInfo
 
 	var (
@@ -1799,8 +1799,11 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 	{
 		var poolsToIterate map[string]*unboundednetv1alpha1.GatewayPool
 		if isGatewayNode {
-			// Gateway nodes only connect to peered pools (not their own pool)
-			poolsToIterate = make(map[string]*unboundednetv1alpha1.GatewayPool, len(peeredPoolSet))
+			poolsToIterate = make(map[string]*unboundednetv1alpha1.GatewayPool, len(peeredPoolSet)+len(gatewayPoolsForNode))
+			for poolName, pool := range gatewayPoolsForNode {
+				poolsToIterate[poolName] = pool
+			}
+
 			for poolName := range peeredPoolSet {
 				if pool := gatewayPoolMap[poolName]; pool != nil {
 					poolsToIterate[poolName] = pool
@@ -1866,7 +1869,11 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 				filteredRoutes := excludeLocalGatewayRoutes(gatewayPeerInfo{
 					RoutedCidrs: routedCidrs, RouteDistances: routeDistances, LearnedRoutes: learnedRoutes,
 				}, siteRouting.localCIDRs)
+
 				routedCidrs, routeDistances, learnedRoutes = filteredRoutes.RoutedCidrs, filteredRoutes.RouteDistances, filteredRoutes.LearnedRoutes
+				if _, localPool := localGatewayPoolSet[pool.Name]; localPool && len(routedCidrs) == 0 {
+					continue
+				}
 
 				if len(learnedRoutes) > 0 && peeringEdgeMTUs == nil {
 					assignmentEdgeMTUs = assignmentEdgeTunnelMTUs(assignments)

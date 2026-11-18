@@ -145,6 +145,7 @@ func TestPinnedGatewayPoolAcknowledgmentWaitsForTaint(t *testing.T) {
 
 type poolPeeringProtocolFixture struct {
 	dynamicClient  dynamic.Interface
+	sites          cache.SharedIndexInformer
 	peerings       cache.SharedIndexInformer
 	pools          cache.SharedIndexInformer
 	nodes          cache.SharedIndexInformer
@@ -187,6 +188,7 @@ func newPoolPeeringProtocolFixture(t *testing.T, gateway bool) *poolPeeringProto
 	remote.PodCIDRs = []string{"10.244.3.0/24"}
 
 	f := &poolPeeringProtocolFixture{
+		sites:    siteInformer,
 		peerings: newInformerWithObjects(),
 		pools:    newInformerWithObjects(),
 		state: &wireGuardState{

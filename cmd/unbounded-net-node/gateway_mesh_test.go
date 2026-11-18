@@ -17,6 +17,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
@@ -175,6 +176,114 @@ func TestGatewayPromotionPreservesFullSiteMesh(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestSamePoolGatewaysAcrossNonMeshedSites(t *testing.T) {
+	f := newPoolPeeringProtocolFixture(t, true)
+	if err := f.sites.GetStore().Add(toUnstructured(t, &unboundedv1alpha3.Site{
+		ObjectMeta: metav1.ObjectMeta{Name: "far"},
+	})); err != nil {
+		t.Fatal(err)
+	}
+
+	object, exists, err := f.pools.GetStore().GetByKey("local-a")
+	if err != nil || !exists {
+		t.Fatalf("local pool exists=%v err=%v", exists, err)
+	}
+
+	pool := &netv1.GatewayPool{}
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(object.(*unstructured.Unstructured).Object, pool); err != nil {
+		t.Fatal(err)
+	}
+
+	prefixes := []string{"10.244.3.0/24", "fd46:3::/64"}
+
+	pool.Status.Nodes = append(pool.Status.Nodes, netv1.GatewayNodeInfo{
+		Name: "remote", SiteName: "far", WireGuardPublicKey: "pub-remote",
+		InternalIPs: []string{"10.0.0.3"}, PodCIDRs: prefixes, GatewayWireguardPort: 51821,
+	})
+	if err := f.pools.GetStore().Update(toUnstructured(t, pool)); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, step := range []struct {
+		name       string
+		assigned   bool
+		advertised bool
+	}{
+		{"unassigned", false, false},
+		{"assigned", true, false},
+		{"assignment withdrawn", false, false},
+		{"advertised", false, true},
+		{"advertisement withdrawn", false, false},
+	} {
+		t.Run(step.name, func(t *testing.T) {
+			assignedPool := "unrelated"
+			if step.assigned {
+				assignedPool = "local-a"
+			}
+
+			assignment := &netv1.SiteGatewayPoolAssignment{
+				ObjectMeta: metav1.ObjectMeta{Name: "far-to-local"},
+				Spec:       netv1.SiteGatewayPoolAssignmentSpec{Sites: []string{"far"}, GatewayPools: []string{assignedPool}},
+			}
+			if err := f.assignments.GetStore().Update(toUnstructured(t, assignment)); err != nil {
+				t.Fatal(err)
+			}
+
+			node := &netv1.GatewayPoolNode{
+				ObjectMeta: metav1.ObjectMeta{Name: "remote"},
+			}
+
+			node.Status.LastUpdated = metav1.Now()
+			if step.advertised {
+				node.Status.Routes = make(map[string]netv1.GatewayNodeRoute)
+				for _, prefix := range prefixes {
+					node.Status.Routes[prefix] = netv1.GatewayNodeRoute{
+						Type: "PodCIDR", Paths: [][]netv1.GatewayNodePathHop{{
+							{Type: "Site", Name: "far"}, {Type: "GatewayPool", Name: "upstream"},
+						}},
+					}
+				}
+			}
+
+			if err := f.nodes.GetStore().Update(toUnstructured(t, node)); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := f.update(); err != nil {
+				t.Fatal(err)
+			}
+
+			want := 0
+			if step.assigned || step.advertised {
+				want = 1
+			}
+
+			if len(f.gateways) != want {
+				t.Fatalf("authorized same-pool relationships=%+v, want %d", f.gateways, want)
+			}
+
+			if want == 1 {
+				peer := f.gateways[0]
+				if peer.Name != "remote/transit/local-a" || len(peer.RoutedCidrs) != len(prefixes) {
+					t.Fatalf("same-pool transit scope changed: %+v", peer)
+				}
+
+				for _, prefix := range prefixes {
+					if !slices.Contains(peer.RoutedCidrs, prefix) {
+						t.Fatalf("authorized gateway prefix %s was lost: %+v", prefix, peer)
+					}
+				}
+			}
+
+			for _, peer := range f.mesh {
+				if peer.SiteName == "far" && peer.TransitPoolName == "" {
+					t.Fatalf("transit authorization changed ordinary mesh membership: %+v", peer)
+				}
+			}
+		})
 	}
 }
 
