@@ -52,5 +52,6 @@ func StartNode(log *slog.Logger, gs *goalstates.NodeStart) phases.Task {
 			containerd:   containerd,
 			kubelet:      kubelet,
 		},
+		ConfigureTridentACLAgent(log, gs),
 	)
 }

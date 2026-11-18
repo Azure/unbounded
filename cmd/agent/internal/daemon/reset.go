@@ -23,6 +23,7 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/isolation/none"
 	"github.com/Azure/unbounded/pkg/agent/phases"
+	"github.com/Azure/unbounded/pkg/agent/phases/nodestart"
 	"github.com/Azure/unbounded/pkg/agent/phases/reset"
 )
 
@@ -291,6 +292,7 @@ func resetResourcesOn(log *slog.Logger, h resetHost) phases.Task {
 		// every boot, so it is host-global rather than part of a mode's
 		// teardown. reload-systemd below picks up the removal.
 		reset.RemoveNFTablesFlush(log),
+		nodestart.RemoveTridentACLAgentConfig(log),
 		// Before the artifacts, so a failure stops the reset while the host is
 		// still recognizably installed.
 		RemoveFirstBootBootstrapUnit(log),

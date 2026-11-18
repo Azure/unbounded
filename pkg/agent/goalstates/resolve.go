@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/Azure/unbounded/internal/centerpivot"
 	"github.com/Azure/unbounded/pkg/agent/config"
 )
 
@@ -66,6 +67,8 @@ func resolveNSpawnConfig(
 	if err != nil {
 		return nil, err
 	}
+
+	additionalHostMounts = append(additionalHostMounts, hostIdentityMounts(detectHostDistro())...)
 
 	nvidia, err := resolveNVIDIA(runtime.GOARCH)
 	if err != nil {
@@ -472,6 +475,12 @@ func HostIsImageManaged() bool {
 	return HostDistroIsImageManaged(detectHostDistro())
 }
 
+// HostIsAzureContainerLinux reports whether the host runs Azure Container
+// Linux, whose A/B updates trident-acl-agent performs.
+func HostIsAzureContainerLinux() bool {
+	return detectHostDistro() == hostDistroAzureContainerLinux
+}
+
 // HostDistroIsImageManaged reports whether a detected host distro is
 // image-managed. Split out from HostIsImageManaged so it can be tested without
 // a real /etc/os-release.
@@ -521,6 +530,20 @@ func normalizeOSReleaseValue(value string) string {
 // resolveAdditionalHostMounts validates the supplied mount entries, clones the
 // slice so the caller's config is not mutated, and defaults any empty Target to
 // the corresponding Source.
+// hostIdentityMounts returns the mounts an Azure Container Linux machine needs
+// so centerpivot can update its host: the host's machine ID, read-only, from
+// which centerpivot's node-info DaemonSet works out the host's Nebraska
+// instance ID. The machine has its own /etc/machine-id, and systemd-nspawn
+// already binds the host's os-release at /run/host/os-release. See
+// designs/centerpivot.md, section 4.3.
+func hostIdentityMounts(hostDistro string) []config.AdditionalHostMount {
+	if hostDistro != hostDistroAzureContainerLinux {
+		return nil
+	}
+
+	return []config.AdditionalHostMount{{Source: "/etc/machine-id", Target: centerpivot.HostMachineIDPath, ReadOnly: true}}
+}
+
 func resolveAdditionalHostMounts(mounts []config.AdditionalHostMount) ([]config.AdditionalHostMount, error) {
 	if err := config.ValidateAdditionalHostMounts(mounts); err != nil {
 		return nil, err
