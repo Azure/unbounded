@@ -199,6 +199,31 @@ func TestRelationshipPeerDiagnostics(t *testing.T) {
 	}
 }
 
+func TestStatusDuringGatewayManagerPublication(t *testing.T) {
+	server := summaryRouteFixture()
+	server.state.peers = []meshPeerInfo{{
+		Name: "worker/assignment/pool", SiteName: "remote", TransitPoolName: "pool",
+		TransitWireguardPort: 51830, TunnelProtocol: "WireGuard", WireGuardPublicKey: wgtypes.Key{1}.String(),
+	}}
+	server.wireGuardDevice = func(*unboundednetnetlink.WireGuardManager) (*wgtypes.Device, error) {
+		return &wgtypes.Device{}, nil
+	}
+
+	var writers sync.WaitGroup
+	writers.Go(func() {
+		for range 1000 {
+			server.state.storeGatewayWireGuardManager("wg51830", &unboundednetnetlink.WireGuardManager{})
+			server.state.removeGatewayInterfaceState("wg51830")
+		}
+	})
+
+	for range 1000 {
+		server.inspectNodePeers(func(WireGuardPeerStatus) {})
+	}
+
+	writers.Wait()
+}
+
 func TestNodeSummaryParityAndNoBPF(t *testing.T) {
 	for _, deviceFailure := range []bool{false, true} {
 		t.Run(map[bool]string{false: "device success", true: "device failure"}[deviceFailure], func(t *testing.T) {

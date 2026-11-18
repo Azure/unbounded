@@ -323,11 +323,14 @@ func reconcileAssignmentReturnRules(desired []netlink.Rule) error {
 }
 
 func configureAssignmentWireGuard(cfg *config, state *wireGuardState, iface string, port int, privateKey string, peers []unboundednetnetlink.WireGuardPeer, addresses []string, mtu int) error {
+	state.mu.Lock()
+
 	link := state.gatewayLinkManagers[iface]
 	if link == nil {
 		link = unboundednetnetlink.NewLinkManager(iface)
 		state.gatewayLinkManagers[iface] = link
 	}
+	state.mu.Unlock()
 
 	if err := link.EnsureWireGuardInterface(); err != nil {
 		return fmt.Errorf("ensure assignment interface %s: %w", iface, err)
@@ -339,7 +342,7 @@ func configureAssignmentWireGuard(cfg *config, state *wireGuardState, iface stri
 		}
 	}
 
-	manager := state.gatewayWireguardManagers[iface]
+	manager := state.gatewayWireGuardManager(iface)
 	if manager == nil {
 		var err error
 
@@ -348,7 +351,7 @@ func configureAssignmentWireGuard(cfg *config, state *wireGuardState, iface stri
 			return fmt.Errorf("create assignment WireGuard manager for %s: %w", iface, err)
 		}
 
-		state.gatewayWireguardManagers[iface] = manager
+		state.storeGatewayWireGuardManager(iface, manager)
 	}
 
 	if err := manager.Configure(privateKey, port, peers); err != nil {

@@ -1002,15 +1002,7 @@ func removeUnmanagedWireGuardInterfaces(cfg *config, state *wireGuardState, desi
 			state.notrackManager.RemoveInterface(name)
 		}
 
-		delete(state.gatewayLinkManagers, name)
-		delete(state.gatewayWireguardManagers, name)
-		delete(state.gatewayHealthEndpoints, name)
-		delete(state.gatewayRoutes, name)
-		delete(state.gatewayRouteDistances, name)
-		delete(state.gatewaySiteCIDRs, name)
-		delete(state.gatewayPodCIDRs, name)
-		delete(state.gatewayNames, name)
-		delete(state.gatewaySiteNames, name)
+		state.removeGatewayInterfaceState(name)
 	}
 
 	return cleanupErr
