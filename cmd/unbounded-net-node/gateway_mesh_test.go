@@ -246,6 +246,15 @@ func TestSamePoolGatewaysAcrossNonMeshedSites(t *testing.T) {
 						}},
 					}
 				}
+			} else if step.assigned {
+				node.Status.Routes = make(map[string]netv1.GatewayNodeRoute)
+				for _, prefix := range slices.Concat(prefixes, []string{"10.245.0.0/16", "fd45::/48"}) {
+					node.Status.Routes[prefix] = netv1.GatewayNodeRoute{
+						Type: "PodCIDR", Paths: [][]netv1.GatewayNodePathHop{{
+							{Type: "Site", Name: "far"}, {Type: "GatewayPool", Name: "local-a"},
+						}},
+					}
+				}
 			}
 
 			if err := f.nodes.GetStore().Update(toUnstructured(t, node)); err != nil {
@@ -274,6 +283,16 @@ func TestSamePoolGatewaysAcrossNonMeshedSites(t *testing.T) {
 				for _, prefix := range prefixes {
 					if !slices.Contains(peer.RoutedCidrs, prefix) {
 						t.Fatalf("authorized gateway prefix %s was lost: %+v", prefix, peer)
+					}
+				}
+
+				for _, aggregate := range []string{"10.245.0.0/16", "fd45::/48"} {
+					if _, exists := peer.RouteDistances[aggregate]; exists {
+						t.Fatalf("served-Site aggregate retained a distance: %+v", peer)
+					}
+
+					if _, exists := peer.LearnedRoutes[aggregate]; exists {
+						t.Fatalf("served-Site aggregate retained learned paths: %+v", peer)
 					}
 				}
 			}

@@ -205,6 +205,7 @@ func TestRoutedCIDRsForGatewayPeer_FiltersInvalidPathsKeepsValidAlternatives(t *
 		mySite,
 		localPools,
 		nil,
+		nil,
 		now,
 		gatewayNodeHeartbeatInterval*4,
 	)
@@ -289,6 +290,7 @@ func TestRoutedCIDRsForGatewayPeer_ExcludesNodeCIDRsForLocalAndPeeredSites(t *te
 		"site1",
 		nil,
 		map[string]bool{"site1": true, "site2": true},
+		nil,
 		now,
 		gatewayNodeHeartbeatInterval*4,
 	)
@@ -354,6 +356,7 @@ func TestRoutedCIDRsForGatewayPeer_DropsNodeCIDRsForNetworkPeeredSite(t *testing
 		"site1",
 		nil,
 		map[string]bool{"site1": true, "site2": true},
+		nil,
 		now,
 		gatewayNodeHeartbeatInterval*4,
 	)

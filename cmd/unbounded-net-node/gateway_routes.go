@@ -534,6 +534,7 @@ func routedCIDRsForGatewayPeer(
 	mySiteName string,
 	localGatewayPools []string,
 	excludedNodeCIDRSites map[string]bool,
+	excludedTransitSites map[string]bool,
 	now time.Time,
 	staleAfter time.Duration,
 ) ([]string, map[string]int, map[string]unboundednetv1alpha1.GatewayNodeRoute) {
@@ -569,18 +570,20 @@ func routedCIDRsForGatewayPeer(
 		staleAfter,
 	)
 
-	if len(excludedNodeCIDRSites) > 0 {
+	if len(excludedNodeCIDRSites) > 0 || len(excludedTransitSites) > 0 {
 		for cidr, route := range selectedPlan {
 			baseRoute := gatewayNode.Status.Routes[cidr]
 
 			baseRouteType := strings.ToLower(strings.TrimSpace(baseRoute.Type))
-			if baseRouteType != "nodecidr" && baseRouteType != "routedcidr" {
+
+			nodeRoute := baseRouteType == "nodecidr" || baseRouteType == "routedcidr"
+			if !nodeRoute && len(excludedTransitSites) == 0 {
 				continue
 			}
 
 			filteredPaths := make([][]routeplan.PathHop, 0, len(route.Paths))
 			for _, path := range route.Paths {
-				if pathHasSiteInSet(path, excludedNodeCIDRSites) {
+				if pathHasSiteInSet(path, excludedTransitSites) || (nodeRoute && pathHasSiteInSet(path, excludedNodeCIDRSites)) {
 					continue
 				}
 
