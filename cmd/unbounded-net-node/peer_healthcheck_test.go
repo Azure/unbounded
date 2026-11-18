@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"errors"
+	"net/netip"
 	"testing"
 	"time"
 
@@ -244,5 +245,121 @@ func TestReconciliationPassesFreshHealthProfilesBeforeStateCommit(t *testing.T) 
 	got, err := manager.GetPeerSettings("peer")
 	if err != nil || got.TransmitInterval != 60*time.Second || got.ReceiveInterval != 15*time.Second {
 		t.Fatalf("registration used stale state: %+v %v", got, err)
+	}
+}
+
+func TestGatewayHealthTarget(t *testing.T) {
+	routed := []string{"10.32.130.0/23"}
+	v4Overlay := []string{"192.168.20.0/25"}
+
+	cases := map[string]struct {
+		peer       gatewayPeerInfo
+		local      []string
+		wantIP     string
+		wantViaDev string
+	}{
+		"overlay address from pod CIDR": {
+			peer:   gatewayPeerInfo{InternalIPs: []string{"10.0.0.4"}, PodCIDRs: []string{"10.244.1.0/24"}},
+			wantIP: "10.244.1.1",
+		},
+		"unmanaged gateway probed at its IPv4 address through the tunnel": {
+			peer:       gatewayPeerInfo{InternalIPs: []string{"fd00::4", "10.0.0.4"}, RoutedCidrs: routed, UnmanagedCNISite: true},
+			local:      v4Overlay,
+			wantIP:     "10.0.0.4",
+			wantViaDev: unbounded0DeviceName,
+		},
+		"unmanaged IPv6-only gateway is not probed": {
+			peer:  gatewayPeerInfo{InternalIPs: []string{"fd00::4"}, RoutedCidrs: routed, UnmanagedCNISite: true},
+			local: v4Overlay,
+		},
+		"no IPv4 overlay address on this node to probe from": {
+			peer:  gatewayPeerInfo{InternalIPs: []string{"10.0.0.4"}, RoutedCidrs: routed, UnmanagedCNISite: true},
+			local: []string{"fd10::/64"},
+		},
+		"managed gateway still waiting for its pod CIDR": {
+			peer:  gatewayPeerInfo{InternalIPs: []string{"10.0.0.4"}, RoutedCidrs: routed},
+			local: v4Overlay,
+		},
+		"unmanaged gateway over WireGuard": {
+			peer:  gatewayPeerInfo{InternalIPs: []string{"10.0.0.4"}, RoutedCidrs: routed, UnmanagedCNISite: true, TunnelProtocol: "WireGuard"},
+			local: v4Overlay,
+		},
+		"unmanaged gateway without routed CIDRs": {
+			peer:  gatewayPeerInfo{InternalIPs: []string{"10.0.0.4"}, UnmanagedCNISite: true},
+			local: v4Overlay,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			ip, via := gatewayHealthTarget(tc.peer, tc.local)
+			if ip != tc.wantIP || via != tc.wantViaDev {
+				t.Fatalf("gatewayHealthTarget() = (%q, %q), want (%q, %q)", ip, via, tc.wantIP, tc.wantViaDev)
+			}
+		})
+	}
+}
+
+// TestGatewayProbePins checks that the probe target gets exactly one BPF
+// entry: pinned when localCidrs exclude it, and not added a second time when
+// gatewayBPFPrefixes already has it (two nexthops would be health-filtered).
+func TestGatewayProbePins(t *testing.T) {
+	peer := gatewayPeerInfo{InternalIPs: []string{"10.0.0.4"}, RoutedCidrs: []string{"10.32.130.0/23"}, UnmanagedCNISite: true}
+	local := []string{"192.168.20.0/25"}
+
+	excluded := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/27")}
+	if got := gatewayProbePins(peer, excluded, local); len(got) != 1 || got[0] != "10.0.0.4/32" {
+		t.Fatalf("pins with the gateway IP in localCidrs = %v, want [10.0.0.4/32]", got)
+	}
+
+	if got := gatewayProbePins(peer, nil, local); len(got) != 0 {
+		t.Fatalf("pins without localCidrs = %v, want none (gatewayBPFPrefixes has the /32)", got)
+	}
+
+	managed := peer
+	managed.UnmanagedCNISite = false
+
+	if got := gatewayProbePins(managed, excluded, local); len(got) != 0 {
+		t.Fatalf("pins for a managed gateway = %v, want none", got)
+	}
+}
+
+// TestRegisterUnmanagedGatewayHealthCheck covers a gateway in a Site with
+// manageCniPlugin=false: it has no pod CIDR, and used to be skipped, so its
+// BPF entries were never health-checked or failed over.
+func TestRegisterUnmanagedGatewayHealthCheck(t *testing.T) {
+	manager, err := healthcheck.NewManager("local", 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Stop()
+
+	state := &wireGuardState{
+		healthCheckManager:            manager,
+		meshPeerHealthCheckEnabled:    make(map[string]bool),
+		gatewayPeerHealthCheckEnabled: make(map[string]bool),
+		nodePodCIDRs:                  []string{"192.168.20.0/25"},
+	}
+	gateways := []gatewayPeerInfo{{
+		Name:             "gw",
+		PoolName:         "pool",
+		InternalIPs:      []string{"10.0.0.4"},
+		RoutedCidrs:      []string{"10.32.130.0/23"},
+		UnmanagedCNISite: true,
+	}}
+
+	desired, err := registerPeersWithHealthCheck(nil, gateways, "remote", false, map[string]string{"remote": "site"}, nil, nil, nil, nil,
+		map[string]healthcheck.HealthCheckSettings{"site": healthcheck.DefaultSettings()}, state,
+		func(gatewayPeerInfo) string { return "geneve0" }, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !desired["gw"] {
+		t.Fatalf("unmanaged gateway was not registered for health checks: %v", desired)
+	}
+
+	if _, err := manager.GetPeerSettings("gw"); err != nil {
+		t.Fatalf("no health check session for the unmanaged gateway: %v", err)
 	}
 }

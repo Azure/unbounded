@@ -111,7 +111,7 @@ func registerPeersWithHealthCheck(
 
 	// Gateway peers.
 	for _, gwPeer := range gatewayPeers {
-		overlayIP := getHealthIPFromPodCIDRs(gwPeer.PodCIDRs)
+		overlayIP, viaIf := gatewayHealthTarget(gwPeer, state.nodePodCIDRs)
 		if overlayIP == "" {
 			continue
 		}
@@ -145,10 +145,10 @@ func registerPeersWithHealthCheck(
 		state.gatewayPeerHealthCheckEnabled[ifName] = true
 		state.mu.Unlock()
 
-		if err := state.healthCheckManager.AddPeer(gwPeer.Name, net.ParseIP(overlayIP), settings); err != nil {
+		if err := state.healthCheckManager.AddPeerVia(gwPeer.Name, net.ParseIP(overlayIP), viaIf, settings); err != nil {
 			registrationErrors = append(registrationErrors, fmt.Errorf("register gateway peer %s at %s: %w", gwPeer.Name, overlayIP, err))
 		} else {
-			klog.V(4).Infof("Healthcheck: registered gateway peer %s at %s (iface %s)", gwPeer.Name, overlayIP, ifName)
+			klog.V(4).Infof("Healthcheck: registered gateway peer %s at %s (iface %s, via %q)", gwPeer.Name, overlayIP, ifName, viaIf)
 		}
 	}
 
