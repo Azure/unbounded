@@ -13,12 +13,6 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 )
 
-// CommonDefaultLabels returns labels that must be applied to every node
-// provisioned by unbounded, regardless of the detected cloud provider.
-func CommonDefaultLabels() map[string]string {
-	return map[string]string{}
-}
-
 // Provider represents a Kubernetes cluster provider and its default
 // node configuration for unbounded machines.
 type Provider interface {

@@ -10,9 +10,12 @@ import (
 
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/isolation/nspawn"
-	"github.com/Azure/unbounded/pkg/agent/phases"
 )
 
+// startNSpawnMachine is a task that starts the systemd-nspawn machine and waits
+// until D-Bus is responsive inside the machine so that subsequent phases can
+// safely use nspawn.Exec(). StartNode builds it directly so it can tell whether
+// the configuration it wrote differed.
 type startNSpawnMachine struct {
 	log       *slog.Logger
 	goalState *goalstates.NodeStart
@@ -25,21 +28,6 @@ type startNSpawnMachine struct {
 	// whose configuration it changed, because those are read at start; on a
 	// machine this task boots, the services read the new files anyway.
 	wasRunning bool
-}
-
-// StartNSpawnMachine returns a task that starts the systemd-nspawn machine and
-// waits until D-Bus is responsive inside the machine so that subsequent phases
-// can safely use nspawn.Exec().
-//
-// The agent reaches this work through StartNode, which builds the task directly
-// so it can tell whether the configuration it wrote differed. This entry point
-// remains for callers outside the agent that compose phases themselves.
-func StartNSpawnMachine(log *slog.Logger, goalState *goalstates.NodeStart) phases.Task {
-	return &startNSpawnMachine{
-		log:       log,
-		goalState: goalState,
-		runner:    nspawn.NewRunner(log),
-	}
 }
 
 func (s *startNSpawnMachine) Name() string { return "start-nspawn-machine" }

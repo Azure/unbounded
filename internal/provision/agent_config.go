@@ -9,7 +9,6 @@ import (
 	"strings"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	"github.com/Azure/unbounded/internal/cloudprovider"
 	"github.com/Azure/unbounded/pkg/agent/config"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
@@ -143,8 +142,7 @@ type BuildAgentConfigParams struct {
 //
 // Label priority (lowest to highest):
 //  1. User-defined labels from Machine.Spec.Kubernetes.NodeLabels.
-//  2. Common labels applied unconditionally (e.g. cloud provider exclusion).
-//  3. Provider-injected labels from params.ProviderLabels.
+//  2. Provider-injected labels from params.ProviderLabels.
 func BuildAgentConfig(params BuildAgentConfigParams) UnboundedAgentConfig {
 	machine := params.Machine
 
@@ -164,10 +162,6 @@ func BuildAgentConfig(params BuildAgentConfigParams) UnboundedAgentConfig {
 	if machine.Spec.Kubernetes != nil {
 		maps.Copy(labels, machine.Spec.Kubernetes.NodeLabels)
 	}
-
-	// Common labels are applied unconditionally to every node provisioned
-	// by unbounded, regardless of the detected cloud provider.
-	maps.Copy(labels, cloudprovider.CommonDefaultLabels())
 
 	maps.Copy(labels, params.ProviderLabels)
 
@@ -313,12 +307,8 @@ func ResolveDownloadOverridesWithOfflineArtifacts(ctx context.Context, cfg *Unbo
 	return goalstates.ResolveDownloadOverridesWithOfflineArtifacts(ctx, &cfg.AgentConfig, resolveDownloadOverrides(cfg.Downloads))
 }
 
-// ResolveDownloadOverrides converts the provision AgentDownloads into the
+// resolveDownloadOverrides converts the provision AgentDownloads into the
 // goalstates.DownloadOverrides shape that rootfs phase tasks consume.
-func ResolveDownloadOverrides(d *AgentDownloads) *goalstates.DownloadOverrides {
-	return resolveDownloadOverrides(d)
-}
-
 func resolveDownloadOverrides(d *AgentDownloads) *goalstates.DownloadOverrides {
 	if d == nil {
 		return nil
