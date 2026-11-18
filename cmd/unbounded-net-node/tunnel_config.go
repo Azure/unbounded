@@ -773,6 +773,10 @@ func collectSupernets(state *wireGuardState, meshPeers []meshPeerInfo, gatewayPe
 	}
 
 	for _, peer := range allGatewayPeers {
+		if peer.SkipPodCIDRRoutes {
+			continue
+		}
+
 		for _, prefix := range gatewayHealthPrefixes(peer) {
 			addIfUncovered(prefix)
 		}
