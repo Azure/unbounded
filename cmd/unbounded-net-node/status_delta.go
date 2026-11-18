@@ -158,7 +158,12 @@ func criticalStatus(prev, curr *NodeStatusResponse) *NodeStatusResponse {
 	type identity struct{ name, protocol, iface, key string }
 
 	key := func(peer WireGuardPeerStatus) identity {
-		return identity{peer.Name, peer.Tunnel.Protocol, peer.Tunnel.Interface, peer.Tunnel.PublicKey}
+		id := peer.PeerID
+		if id == "" {
+			id = peer.Name
+		}
+
+		return identity{id, peer.Tunnel.Protocol, peer.Tunnel.Interface, peer.Tunnel.PublicKey}
 	}
 
 	previous := make(map[identity]WireGuardPeerStatus, len(prev.Peers))
