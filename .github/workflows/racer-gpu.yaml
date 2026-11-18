@@ -5,14 +5,18 @@ name: racer gpu
 
 # Runs `make racer-gpu-test` on a GPU runner: the CUDA shim with its decrypt
 # kernels, device discovery, client allocation import, GPU decrypt against the
-# CPU result, and cuFile reads. Hosted runners have no GPU, so this runs only
-# when the repository variable RACER_GPU_RUNNER holds the runner labels as a
-# JSON array, for example ["self-hosted", "linux", "gpu"]. Without it the job
-# is skipped instead of queuing forever (forks, repos without GPU runners).
+# CPU result, cuFile reads, the dataplane GPU helper, and the Python client and
+# vLLM loader on real GPU memory with torch. Hosted runners have no GPU, so this
+# runs only when the repository variable RACER_GPU_RUNNER holds the runner
+# labels as a JSON array, for example ["self-hosted", "linux", "gpu"]. Without
+# it the job is skipped instead of queuing forever (forks, repos without GPU
+# runners).
 #
-# The runner needs an NVIDIA driver, gcc, curl and sudo apt access (for nvcc
-# if it is not installed). Set RACER_GPU_CUFILE=require to fail when cuFile
-# cannot open, on runners with GPUDirect Storage.
+# The runner needs an NVIDIA driver (570 or later for the CUDA 12.8 torch
+# wheels), gcc, curl, python3 with venv, and sudo apt access (for nvcc if it is
+# not installed). Set RACER_GPU_CUFILE=require to fail when cuFile cannot open,
+# on runners with GPUDirect Storage, and RACER_GPU_MULTI=require on runners with
+# two or more GPUs.
 on:
   workflow_dispatch:
   schedule:
@@ -30,10 +34,11 @@ jobs:
     name: Racer GPU hardware tests
     if: vars.RACER_GPU_RUNNER != ''
     runs-on: ${{ fromJSON(vars.RACER_GPU_RUNNER || '["ubuntu-24.04"]') }}
-    timeout-minutes: 45
+    timeout-minutes: 90
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/bin/racer-gpu-cargo
       RACER_GPU_TESTS_CUFILE: ${{ vars.RACER_GPU_CUFILE }}
+      RACER_GPU_TESTS_MULTI: ${{ vars.RACER_GPU_MULTI }}
       RACER_GPU_TEST_DIR: ${{ github.workspace }}/tmp/racer-gpu
     steps:
       - name: Checkout
@@ -70,4 +75,4 @@ jobs:
       - name: Run GPU hardware tests
         run: |
           mkdir -p "$RACER_GPU_TEST_DIR"
-          timeout --signal=TERM --kill-after=30s 2400s make racer-gpu-test RACER_GPU_TESTS=require
+          timeout --signal=TERM --kill-after=30s 4800s make racer-gpu-test RACER_GPU_TESTS=require

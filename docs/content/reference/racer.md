@@ -2104,11 +2104,30 @@ make racer-gpu-test
 
 This builds `libracer_gpu_cuda.so.1` with its kernels and runs the hardware
 tests in `cmd/racer/gpu/tests/hardware.rs`: shim load, device
-discovery, import of an exported client allocation, GPU decrypt checked
-against the CPU, and cuFile reads. It fails when no GPU is found; pass
-`RACER_GPU_TESTS=1` to skip instead. cuFile tests skip when cuFile cannot open
-or the directory does not support `O_DIRECT` (set `RACER_GPU_TEST_DIR`); set
-`RACER_GPU_TESTS_CUFILE=require` to make that a failure. To also test
+discovery, import of an exported client allocation, copies, fences and
+callbacks, GPU decrypt checked against the CPU, staging dma-buf export,
+copies between two GPUs, and cuFile driver open and reads. It fails when no
+GPU is found; pass `RACER_GPU_TESTS=1` to skip instead. cuFile tests skip when
+cuFile cannot open or the directory does not support `O_DIRECT` (set
+`RACER_GPU_TEST_DIR`); set `RACER_GPU_TESTS_CUFILE=require` to make that a
+failure. One test reruns the cuFile tests with PCI P2PDMA on. The dma-buf and
+two-GPU tests skip without driver support or a second GPU unless
+`RACER_GPU_TESTS_DMABUF` or `RACER_GPU_TESTS_MULTI` is `require`.
+
+Next it runs the dataplane's GPU tests (`gpu::hardware::` in the `racer`
+crate, built with the `cuda` feature) on the real shim: decrypting host and
+disk ciphertext into an exported allocation, requests sharing the executor
+streams, cuFile staging or the reason it is off, staged ciphertext crossing
+GPUs, and a `gpu-read` over the client socket from origin, memory, and disk,
+including its latency metrics. `RACER_GPU_PCI_P2PDMA` resolves as in the
+dataplane.
+
+It then runs the Python tests marked `gpu` in a separate virtual environment
+(`tmp/racer-python-gpu-venv`) with torch from `RACER_TORCH_INDEX` (CUDA 12.8
+wheels by default): Racer GPU allocations, exports, pinned host buffers,
+`read_into_gpu` in each delivery mode against a fake dataplane, and the vLLM
+loader reading safetensors into CUDA and CPU tensors. Without torch with CUDA
+these fail; pass `RACER_GPU_TORCH=1` to skip them instead. To also test
 `gpu-read` end to end from the Python client, set `RACER_GPU_E2E_SOCKET` to a
 running dataplane's client socket and `RACER_GPU_E2E_KEY` to the hex key of an
 object it can serve (`RACER_GPU_E2E_METADATA` and
@@ -2118,7 +2137,9 @@ skipped; set `RACER_GPU_E2E=require` to make it a failure.
 The `racer gpu` workflow (`.github/workflows/racer-gpu.yaml`) runs this target
 nightly and on demand. It runs only when the repository variable
 `RACER_GPU_RUNNER` holds the GPU runner labels as a JSON array, for example
-`["self-hosted", "linux", "gpu"]`.
+`["self-hosted", "linux", "gpu"]`. Set `RACER_GPU_CUFILE=require` on runners
+with GPUDirect Storage and `RACER_GPU_MULTI=require` on runners with two or more
+GPUs so those tests cannot pass by skipping.
 
 See [Load vLLM models from Racer]({{< relref "guides/racer-vllm" >}}).
 
