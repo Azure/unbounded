@@ -133,6 +133,16 @@ func (h *HostSoftRebootHandler) Reconcile(ctx context.Context, op MachineOperati
 		return ctrl.Result{}, nil
 	}
 
+	var latest v1alpha3.MachineOperation
+	if err := h.reader.Get(ctx, client.ObjectKey{Name: op.Name}, &latest); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	matches, err := h.pendingMatch(ctx, &latest)
+	if err != nil || !matches {
+		return ctrl.Result{}, err
+	}
+
 	blocker, err := h.unfinishedOutOfBandHostOperation(ctx)
 	if err != nil {
 		return ctrl.Result{}, err

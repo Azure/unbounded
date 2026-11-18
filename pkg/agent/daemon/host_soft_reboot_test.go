@@ -47,13 +47,23 @@ func (nodeRebootTarget) MatchSelector(ctx context.Context, r client.Reader, _ v1
 }
 
 type fakeHostRebooter struct {
-	bootID  string
-	bootErr error
-	reboot  func(context.Context) error
-	calls   int
+	bootID     string
+	bootErr    error
+	bootCalls  int
+	bootDuring func()
+	reboot     func(context.Context) error
+	calls      int
 }
 
-func (h *fakeHostRebooter) BootID() (string, error) { return h.bootID, h.bootErr }
+func (h *fakeHostRebooter) BootID() (string, error) {
+	h.bootCalls++
+	if h.bootDuring != nil {
+		h.bootDuring()
+	}
+
+	return h.bootID, h.bootErr
+}
+
 func (h *fakeHostRebooter) RebootHost(ctx context.Context, _ *slog.Logger) error {
 	h.calls++
 	if h.reboot != nil {

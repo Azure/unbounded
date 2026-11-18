@@ -227,8 +227,9 @@ func TestReconcileHostSoftReboot_ReadsMachineFromAPIReader(t *testing.T) {
 	outOfBand.Spec.MachineSelector = &metav1.LabelSelector{MatchLabels: map[string]string{"rack": "a"}}
 
 	op := &fakeNodeOperator{bootID: "boot-1"}
-	c := fakeStatusClient(cached, hostSoftRebootOperation("op-soft"))
+	cache := fakeStatusClient(cached, hostSoftRebootOperation("op-soft"))
 	apiReader := fakeStatusClient(fresh, outOfBand, hostSoftRebootOperation("op-soft"))
+	c := staleHostReadClient{Client: apiReader, reader: cache}
 	reconciler := newTestMachinaMachineOperationReconcilerWithLockPath(
 		t, c, op, filepath.Join(t.TempDir(), "agent-upgrade.lock"), apiReader,
 	)
@@ -238,7 +239,7 @@ func TestReconcileHostSoftReboot_ReadsMachineFromAPIReader(t *testing.T) {
 	assert.Zero(t, op.rebootCalls, "the host must not reboot while an out-of-band operation is pending")
 	assert.Equal(t, hostSoftRebootWaitInterval, result.RequeueAfter)
 
-	waiting := getMachineOperation(t, c, "op-soft")
+	waiting := getMachineOperation(t, apiReader, "op-soft")
 	assert.Equal(t, v1alpha3.OperationPhasePending, waiting.Status.Phase)
 	assert.Equal(t, "waiting for out-of-band host operation op-oob", waiting.Status.Message)
 }
@@ -471,7 +472,26 @@ func TestHostOperationUnfinishedOn(t *testing.T) {
 func TestMarkHostSoftRebootWaiting_LeavesStartedOperation(t *testing.T) {
 	started := issuedHostSoftRebootOperation("op-soft", "test-machine", "boot-1")
 	started.Status.Message = hostSoftRebootMessage
-	c := fakeStatusClient(started)
+	c := fake.NewClientBuilder().
+		WithScheme(fakeScheme()).
+		WithStatusSubresource(&v1alpha3.MachineOperation{}).
+		WithObjects(hostSoftRebootOperation("op-soft")).
+		WithInterceptorFuncs(interceptor.Funcs{
+			List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+				if err := c.List(ctx, list, opts...); err != nil {
+					return err
+				}
+
+				var latest v1alpha3.MachineOperation
+				if err := c.Get(ctx, client.ObjectKey{Name: "op-soft"}, &latest); err != nil {
+					return err
+				}
+
+				latest.Status = started.Status
+
+				return c.Status().Update(ctx, &latest)
+			},
+		}).Build()
 
 	require.NoError(t, markHostSoftRebootWaiting(context.Background(), c, "op-soft", "waiting for out-of-band host operation op-oob"))
 
@@ -481,7 +501,19 @@ func TestMarkHostSoftRebootWaiting_LeavesStartedOperation(t *testing.T) {
 }
 
 func TestMarkHostSoftRebootWaiting_IgnoresDeletedOperation(t *testing.T) {
-	c := fakeStatusClient()
+	c := fake.NewClientBuilder().
+		WithScheme(fakeScheme()).
+		WithStatusSubresource(&v1alpha3.MachineOperation{}).
+		WithObjects(hostSoftRebootOperation("op-soft")).
+		WithInterceptorFuncs(interceptor.Funcs{
+			List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+				if err := c.List(ctx, list, opts...); err != nil {
+					return err
+				}
+
+				return c.Delete(ctx, hostSoftRebootOperation("op-soft"))
+			},
+		}).Build()
 
 	require.NoError(t, markHostSoftRebootWaiting(context.Background(), c, "op-soft", "waiting"))
 }

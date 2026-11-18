@@ -185,6 +185,105 @@ func TestHostSoftRebootPublicSelectorReadErrorDoesNotReboot(t *testing.T) {
 	assert.Empty(t, publicOperation(t, c).Status.Phase)
 }
 
+func TestHostSoftRebootPublicCanceledUncertainWriteNeverReplays(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	writes := 0
+	c := fake.NewClientBuilder().WithScheme(fakeMachineOperationClient().Scheme()).
+		WithStatusSubresource(&v1alpha3.MachineOperation{}).
+		WithObjects(publicSoftOp()).WithInterceptorFuncs(interceptor.Funcs{
+		SubResourceUpdate: func(ctx context.Context, c client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			writes++
+
+			if err := c.SubResource(sub).Update(ctx, obj, opts...); err != nil {
+				return err
+			}
+
+			if writes == 1 {
+				cancel()
+				return errors.New("response lost")
+			}
+
+			return nil
+		},
+	}).Build()
+	host := &fakeHostRebooter{bootID: "boot-1"}
+	h := publicHandler(t, c, c, host, &atomic.Bool{})
+
+	_, err := h.Reconcile(ctx, MachineOperation{Name: "soft"})
+	require.ErrorContains(t, err, "response lost")
+	_, err = h.Reconcile(t.Context(), MachineOperation{Name: "soft"})
+	require.NoError(t, err)
+	assert.Zero(t, host.calls)
+	assert.Equal(t, 1, writes)
+	assert.Equal(t, v1alpha3.OperationPhaseInProgress, publicOperation(t, c).Status.Phase)
+
+	require.NoError(t, h.PublishStartup(t.Context()))
+	assert.Equal(t, v1alpha3.OperationPhaseFailed, publicOperation(t, c).Status.Phase)
+	assert.Equal(t, 2, writes)
+}
+
+func TestHostSoftRebootPublicBootFailureDoesNotOverwriteConcurrentStart(t *testing.T) {
+	for _, phase := range []v1alpha3.OperationPhase{v1alpha3.OperationPhaseInProgress, v1alpha3.OperationPhaseComplete} {
+		t.Run(string(phase), func(t *testing.T) {
+			c := fakeMachineOperationClient(publicSoftOp())
+			host := &fakeHostRebooter{bootErr: errors.New("boot failed")}
+			host.bootDuring = func() {
+				op := publicOperation(t, c)
+				op.Status.Phase = phase
+				require.NoError(t, c.Status().Update(t.Context(), &op))
+			}
+			h := publicHandler(t, c, c, host, &atomic.Bool{})
+
+			_, err := h.Reconcile(t.Context(), MachineOperation{Name: "soft"})
+			require.NoError(t, err)
+			assert.Equal(t, phase, publicOperation(t, c).Status.Phase)
+			assert.Zero(t, host.calls)
+		})
+	}
+}
+
+func TestHostSoftRebootPublicStartupContinuesAfterWriteError(t *testing.T) {
+	issued := func(name string) *v1alpha3.MachineOperation {
+		op := publicSoftOp()
+		op.Name = name
+		op.Status.Phase = v1alpha3.OperationPhaseInProgress
+		op.Status.Targets = []v1alpha3.MachineOperationTargetStatus{
+			{
+				MachineRef: "machine-1",
+				Phase:      v1alpha3.OperationPhaseInProgress,
+				BootID:     "boot-1",
+			},
+		}
+
+		return op
+	}
+
+	writeErr := errors.New("one operation failed")
+	c := fake.NewClientBuilder().WithScheme(fakeMachineOperationClient().Scheme()).
+		WithStatusSubresource(&v1alpha3.MachineOperation{}).
+		WithObjects(issued("soft"), issued("second")).WithInterceptorFuncs(interceptor.Funcs{
+		SubResourceUpdate: func(ctx context.Context, c client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			if obj.GetName() == "soft" {
+				return writeErr
+			}
+
+			return c.SubResource(sub).Update(ctx, obj, opts...)
+		},
+	}).Build()
+	host := &fakeHostRebooter{bootID: "boot-2"}
+	h := publicHandler(t, c, c, host, &atomic.Bool{})
+
+	require.ErrorIs(t, h.PublishStartup(t.Context()), writeErr)
+	assert.Equal(t, 1, host.bootCalls)
+	assert.Equal(t, v1alpha3.OperationPhaseInProgress, publicOperation(t, c).Status.Phase)
+
+	var second v1alpha3.MachineOperation
+	require.NoError(t, c.Get(t.Context(), client.ObjectKey{Name: "second"}, &second))
+	assert.Equal(t, v1alpha3.OperationPhaseComplete, second.Status.Phase)
+}
+
 func TestHostSoftRebootPublicStartupReadAndWriteErrors(t *testing.T) {
 	for _, failure := range []string{"list", "boot", "write"} {
 		t.Run(failure, func(t *testing.T) {

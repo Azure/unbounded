@@ -30,6 +30,19 @@ type testHostRebooter struct {
 	bootID func() (string, error)
 }
 
+type staleHostReadClient struct {
+	client.Client
+	reader client.Reader
+}
+
+func (c staleHostReadClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	return c.reader.Get(ctx, key, obj, opts...)
+}
+
+func (c staleHostReadClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	return c.reader.List(ctx, list, opts...)
+}
+
 func (h testHostRebooter) BootID() (string, error)                      { return h.bootID() }
 func (testHostRebooter) RebootHost(context.Context, *slog.Logger) error { return nil }
 
