@@ -21,6 +21,9 @@ _fixtures = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_fixtures)
 server = _fixtures.server
 small_pages = _fixtures.small_pages
+gpu = _fixtures.gpu
+real_torch = _fixtures.real_torch
+cuda_torch = _fixtures.cuda_torch
 
 
 def make_safetensors(tensors, metadata=None, pad=0):

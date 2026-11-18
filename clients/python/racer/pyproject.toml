@@ -40,4 +40,6 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["gpu: needs a GPU and a live dataplane (see tests/test_gpu_e2e.py)"]
+markers = [
+    "gpu: needs a real GPU, and torch with CUDA for tensor tests (see the gpu fixtures in tests/conftest.py); tests/test_gpu_e2e.py also needs a live dataplane",
+]

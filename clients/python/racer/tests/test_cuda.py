@@ -36,8 +36,8 @@ def test_host_buffer_pin_without_cuda(monkeypatch):
         assert bytes(b.view[:3]) == b"abc"
 
 
-@pytest.mark.skipif(not cuda.available(), reason="needs a GPU")
-def test_gpu_allocation_roundtrip():
+@pytest.mark.gpu
+def test_gpu_allocation_roundtrip(gpu):
     with cuda.GpuAllocation(1000) as g:
         assert g.size >= 1000
         g.copy_from_host(0, b"hello")
