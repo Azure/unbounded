@@ -295,11 +295,11 @@ must still hold the window plus one page; see
 | `concurrency`, `staging_bytes`, `use_vmm` | The loader settings of the run. `staging_bytes` is in bytes. |
 | `status` | `ok`, `exited` if vLLM exited before every rank loaded, or `timeout`. The end of `vllm.log` is printed for the last two. |
 | `wall_s` | Seconds from starting `vllm serve` to the last load line, including vLLM startup. |
-| `ranks` | Load lines found, at most `RANKS`. |
-| `load_s` | The slowest rank's load time from its load line. |
+| `ranks` | Workers that logged a load, from the first `RANKS` load lines. A worker's draft load adds to its time and data rather than counting as another rank. |
+| `load_s` | The slowest rank's load time, summed over its load lines. |
 | `total_gib` | Tensor data that all ranks read. Each rank reads every file of a regular checkpoint, so this is the checkpoint size times the number of ranks. With `sharded_state`, it is the checkpoint size. |
 | `agg_gibps` | `total_gib` divided by `load_s`. |
-| `min_rank_gibps`, `max_rank_gibps` | The slowest and fastest rank's throughput from the load lines. |
+| `min_rank_gibps`, `max_rank_gibps` | The slowest and fastest rank's throughput: its data over its load time. |
 | `reads` | Range reads by all ranks. |
 | `gpu_gib`, `host_gib`, `stream_gib` | Data by delivery mode: the delivery mix. |
 | `peak_gpu_mib` | Highest `memory.used` that `nvidia-smi` reported for any one GPU of the pod, sampled every 500 ms. It includes memory other processes hold, such as the dataplane's GPU staging. |

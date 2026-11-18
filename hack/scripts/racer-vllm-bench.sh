@@ -144,19 +144,22 @@ EOF
 # parse_summary log -> ranks,load_s,total_gib,agg_gibps,min_rank_gibps,
 # max_rank_gibps,reads,gpu_gib,host_gib,stream_gib from the first $RANKS
 # "racer: loaded N files, X GiB in Ys (Z GiB/s) from ...; reads by delivery
-# mode: gpu=.. (.. GiB) host=.. (.. GiB) stream=.. (.. GiB)" lines.
+# mode: gpu=.. (.. GiB) host=.. (.. GiB) stream=.. (.. GiB)" lines. A worker
+# loads the draft after its target, so lines with the same pid= add up as one
+# rank. Lines without a pid count as ranks of their own.
 parse_summary() {
     awk -v want="$RANKS" '
         /racer: loaded / && n < want {
+            key = "line" n
+            if (match($0, /pid=[0-9]+/)) key = substr($0, RSTART, RLENGTH)
             sub(/.*racer: loaded /, "")
             if ($2 != "files,") next
-            s = $6; sub(/s$/, "", s); s += 0
-            r = $7; sub(/^\(/, "", r); r += 0
+            s = $6; sub(/s$/, "", s)
             n++
+            if (!(key in secs)) ranks++
+            secs[key] += s
+            gib[key] += $3
             total += $3
-            if (s > load) load = s
-            if (n == 1 || r < lo) lo = r
-            if (r > hi) hi = r
             for (i = 8; i < NF; i++) {
                 if ($i ~ /^(gpu|host|stream)=[0-9]+$/) {
                     split($i, kv, "=")
@@ -168,8 +171,16 @@ parse_summary() {
         }
         END {
             if (n == 0) { print ",,,,,,,,,"; exit }
+            first = 1
+            for (k in secs) {
+                if (secs[k] > load) load = secs[k]
+                r = secs[k] > 0 ? gib[k] / secs[k] : 0
+                if (first || r < lo) lo = r
+                if (r > hi) hi = r
+                first = 0
+            }
             agg = load > 0 ? total / load : 0
-            printf "%d,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%.2f,%.2f,%.2f\n", n, load, total, agg, lo, hi, reads, mode["gpu"], mode["host"], mode["stream"]
+            printf "%d,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%.2f,%.2f,%.2f\n", ranks, load, total, agg, lo, hi, reads, mode["gpu"], mode["host"], mode["stream"]
         }' "$1"
 }
 
