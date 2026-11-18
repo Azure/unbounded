@@ -71,11 +71,12 @@ func TestRelationshipPeerDiagnostics(t *testing.T) {
 			workerKey, otherKey, gatewayKey := wgtypes.Key{1}, wgtypes.Key{2}, wgtypes.Key{3}
 			server.state.healthCheckManager = manager
 			server.state.meshPeerHealthCheckEnabled = map[string]bool{
-				"worker/assignment/pool": true, "other/assignment/pool": true,
+				"worker/assignment/pool": true, "worker/assignment/other-pool": true, "other/assignment/pool": true,
 			}
 			server.state.peers = []meshPeerInfo{
 				{Name: "worker", SiteName: "remote", TunnelProtocol: protocol, WireGuardPublicKey: workerKey.String(), InternalIPs: []string{"192.0.2.2"}, PodCIDRs: []string{"10.42.1.0/24"}},
 				{Name: "worker/assignment/pool", SiteName: "remote", TransitPoolName: "pool", TransitWireguardPort: 51830, TunnelProtocol: protocol, WireGuardPublicKey: workerKey.String(), InternalIPs: []string{"192.0.2.2"}, PodCIDRs: []string{"10.42.1.0/24"}},
+				{Name: "worker/assignment/other-pool", SiteName: "remote", TransitPoolName: "other-pool", TransitWireguardPort: 51830, TunnelProtocol: protocol, WireGuardPublicKey: workerKey.String(), InternalIPs: []string{"192.0.2.2"}, PodCIDRs: []string{"10.42.1.0/24"}},
 				{Name: "other/assignment/pool", SiteName: "remote", TransitPoolName: "pool", TransitWireguardPort: 51830, TunnelProtocol: protocol, WireGuardPublicKey: otherKey.String(), InternalIPs: []string{"192.0.2.3"}, PodCIDRs: []string{"10.42.2.0/24"}},
 			}
 			server.state.gatewayPeers = []gatewayPeerInfo{{
@@ -83,9 +84,11 @@ func TestRelationshipPeerDiagnostics(t *testing.T) {
 				InternalIPs: []string{"192.0.2.4"}, PodCIDRs: []string{"10.42.3.0/24"},
 			}}
 
-			for index, name := range []string{"worker/assignment/pool", "other/assignment/pool", "gateway/transit/pool"} {
+			for _, name := range []string{"worker/assignment/pool", "worker/assignment/other-pool", "other/assignment/pool", "gateway/transit/pool"} {
 				hostname, _, _ := strings.Cut(name, "/")
-				if err := manager.AddScopedPeer(name, hostname, net.ParseIP(fmt.Sprintf("10.42.%d.1", index+1)), healthcheck.DefaultSettings()); err != nil {
+
+				octet := map[string]int{"worker": 1, "other": 2, "gateway": 3}[hostname]
+				if err := manager.AddScopedPeer(name, hostname, net.ParseIP(fmt.Sprintf("10.42.%d.1", octet)), healthcheck.DefaultSettings()); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -138,7 +141,7 @@ func TestRelationshipPeerDiagnostics(t *testing.T) {
 			var peers []WireGuardPeerStatus
 
 			facts := server.inspectNodePeers(func(peer WireGuardPeerStatus) { peers = append(peers, peer) })
-			if len(peers) != 4 || facts.HealthCheck == nil || facts.HealthCheck.PeerCount != 3 {
+			if len(peers) != 5 || facts.HealthCheck == nil || facts.HealthCheck.PeerCount != 4 {
 				t.Fatalf("relationships missing from diagnostics: peers=%+v, health=%+v", peers, facts.HealthCheck)
 			}
 
@@ -192,7 +195,7 @@ func TestRelationshipPeerDiagnostics(t *testing.T) {
 				}
 			}
 
-			if ordinary != 1 || assigned != 1 || other != 1 || transit != 1 {
+			if ordinary != 1 || assigned != 2 || other != 1 || transit != 1 {
 				t.Fatalf("ordinary and relationship entries were merged: %+v", peers)
 			}
 		})

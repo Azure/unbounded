@@ -2716,7 +2716,7 @@ func (s *nodeStatusServer) inspectNodePeers(visit func(WireGuardPeerStatus)) *no
 
 	type assignmentSnapshot struct {
 		manager       *unboundednetnetlink.WireGuardManager
-		peers         map[string]meshPeerInfo
+		peers         map[string][]meshPeerInfo
 		healthEnabled map[string]bool
 	}
 
@@ -2731,13 +2731,13 @@ func (s *nodeStatusServer) inspectNodePeers(visit func(WireGuardPeerStatus)) *no
 				if snapshot == nil {
 					snapshot = &assignmentSnapshot{
 						manager:       s.state.gatewayWireguardManagers[ifaceName],
-						peers:         make(map[string]meshPeerInfo),
+						peers:         make(map[string][]meshPeerInfo),
 						healthEnabled: make(map[string]bool),
 					}
 					assignments[ifaceName] = snapshot
 				}
 
-				snapshot.peers[p.WireGuardPublicKey] = p
+				snapshot.peers[p.WireGuardPublicKey] = append(snapshot.peers[p.WireGuardPublicKey], p)
 				snapshot.healthEnabled[p.Name] = s.state.meshPeerHealthCheckEnabled[p.Name]
 			}
 
@@ -2934,43 +2934,40 @@ func (s *nodeStatusServer) inspectNodePeers(visit func(WireGuardPeerStatus)) *no
 		}
 
 		for _, wgPeer := range device.Peers {
-			info, exists := assignment.peers[wgPeer.PublicKey.String()]
-			if !exists {
-				continue
-			}
+			for _, info := range assignment.peers[wgPeer.PublicKey.String()] {
+				name, _, _ := strings.Cut(info.Name, "/")
 
-			name, _, _ := strings.Cut(info.Name, "/")
-
-			peer := WireGuardPeerStatus{
-				PeerID: info.Name,
-				Name:   name, PeerType: "site", SiteName: info.SiteName,
-				SkipPodCIDRRoutes: info.SkipPodCIDRRoutes,
-				PodCIDRGateways:   getHealthIPsFromPodCIDRs(info.PodCIDRs),
-				Tunnel: PeerTunnelStatus{
-					Protocol: "WireGuard", Interface: ifaceName, PublicKey: wgPeer.PublicKey.String(),
-					LastHandshake: wgPeer.LastHandshakeTime, RxBytes: wgPeer.ReceiveBytes, TxBytes: wgPeer.TransmitBytes,
-				},
-			}
-			if wgPeer.Endpoint != nil {
-				peer.Tunnel.Endpoint = wgPeer.Endpoint.String()
-			}
-
-			for _, prefix := range wgPeer.AllowedIPs {
-				peer.Tunnel.AllowedIPs = append(peer.Tunnel.AllowedIPs, prefix.String())
-			}
-
-			if assignment.healthEnabled[info.Name] && healthCheckMgr != nil {
-				if ps, err := healthCheckMgr.GetPeerStatus(info.Name); err == nil && ps != nil {
-					peer.HealthCheck = &HealthCheckPeerStatus{
-						Enabled: true, Status: ps.State.String(),
-						Uptime: formatDuration(time.Since(ps.Since)), RTT: formatRTTMillis(ps.LastRTT),
-					}
-				} else {
-					peer.HealthCheck = &HealthCheckPeerStatus{Enabled: true, Status: "down"}
+				peer := WireGuardPeerStatus{
+					PeerID: info.Name,
+					Name:   name, PeerType: "site", SiteName: info.SiteName,
+					SkipPodCIDRRoutes: info.SkipPodCIDRRoutes,
+					PodCIDRGateways:   getHealthIPsFromPodCIDRs(info.PodCIDRs),
+					Tunnel: PeerTunnelStatus{
+						Protocol: "WireGuard", Interface: ifaceName, PublicKey: wgPeer.PublicKey.String(),
+						LastHandshake: wgPeer.LastHandshakeTime, RxBytes: wgPeer.ReceiveBytes, TxBytes: wgPeer.TransmitBytes,
+					},
 				}
-			}
+				if wgPeer.Endpoint != nil {
+					peer.Tunnel.Endpoint = wgPeer.Endpoint.String()
+				}
 
-			visit(peer)
+				for _, prefix := range wgPeer.AllowedIPs {
+					peer.Tunnel.AllowedIPs = append(peer.Tunnel.AllowedIPs, prefix.String())
+				}
+
+				if assignment.healthEnabled[info.Name] && healthCheckMgr != nil {
+					if ps, err := healthCheckMgr.GetPeerStatus(info.Name); err == nil && ps != nil {
+						peer.HealthCheck = &HealthCheckPeerStatus{
+							Enabled: true, Status: ps.State.String(),
+							Uptime: formatDuration(time.Since(ps.Since)), RTT: formatRTTMillis(ps.LastRTT),
+						}
+					} else {
+						peer.HealthCheck = &HealthCheckPeerStatus{Enabled: true, Status: "down"}
+					}
+				}
+
+				visit(peer)
+			}
 		}
 	}
 
