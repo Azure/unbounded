@@ -7,9 +7,9 @@
 package controller
 
 import (
-	"github.com/Azure/unbounded/internal/centerpivot"
-	"github.com/Azure/unbounded/internal/centerpivot/contract"
+	"github.com/Azure/unbounded/cmd/centerpivot/internal/contract"
+	"github.com/Azure/unbounded/cmd/centerpivot/internal/names"
 )
 
 // Keys are the agent's annotation contract under centerpivot's prefix.
-var Keys = contract.KeysFor(centerpivot.Prefix)
+var Keys = contract.KeysFor(names.Prefix)

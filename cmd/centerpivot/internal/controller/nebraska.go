@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Azure/unbounded/internal/centerpivot/omaha"
+	"github.com/Azure/unbounded/cmd/centerpivot/internal/omaha"
 )
 
 // Nebraska sends update checks. ca holds the PEM certificates that sign

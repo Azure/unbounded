@@ -3,8 +3,8 @@
 
 package main
 
-import "github.com/Azure/unbounded/cmd/centerpivot/centerpivot"
+import "github.com/Azure/unbounded/cmd/centerpivot/internal/cmd"
 
 func main() {
-	centerpivot.Run()
+	cmd.Run()
 }

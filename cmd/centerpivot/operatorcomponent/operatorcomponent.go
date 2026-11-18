@@ -1,10 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package centerpivot implements the centerpivot cluster component, which
-// updates Azure Container Linux nodes from Nebraska. See
-// designs/centerpivot.md.
-package centerpivot
+// Package operatorcomponent is centerpivot's component in the Unbounded
+// operator: it installs centerpivot while any Site enables it, and reports a
+// held node in the Site's CenterPivotReady condition. It is one of the two
+// packages cmd/centerpivot exports; see ../AGENTS.md.
+package operatorcomponent
 
 import (
 	"context"
@@ -26,8 +27,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/cmd/centerpivot/internal/names"
 	centerpivotmanifests "github.com/Azure/unbounded/deploy/centerpivot"
-	cp "github.com/Azure/unbounded/internal/centerpivot"
 	"github.com/Azure/unbounded/internal/operator/component"
 )
 
@@ -220,13 +221,13 @@ func heldResult(ctx context.Context, env *component.Env) (component.Result, erro
 
 	return component.NotReady(ReasonUpdatesHeld, fmt.Sprintf(
 		"no update starts while Machine %s is held (%d held): %s. Remove its %s annotation to clear the hold",
-		held[0], len(held), reasons[held[0]], cp.StateAnnotation,
+		held[0], len(held), reasons[held[0]], names.StateAnnotation,
 	)), nil
 }
 
 // heldReason returns why a Machine's node is held, if it is.
 func heldReason(annotations map[string]string) (string, bool) {
-	value, ok := annotations[cp.StateAnnotation]
+	value, ok := annotations[names.StateAnnotation]
 	if !ok {
 		return "", false
 	}

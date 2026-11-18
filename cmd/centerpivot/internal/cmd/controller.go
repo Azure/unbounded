@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package centerpivot
+package cmd
 
 import (
 	"context"
@@ -22,8 +22,8 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	"github.com/Azure/unbounded/internal/centerpivot/controller"
-	"github.com/Azure/unbounded/internal/centerpivot/drain"
+	"github.com/Azure/unbounded/cmd/centerpivot/internal/controller"
+	"github.com/Azure/unbounded/cmd/centerpivot/internal/drain"
 	"github.com/Azure/unbounded/internal/unbounded"
 )
 

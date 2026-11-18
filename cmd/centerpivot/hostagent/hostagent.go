@@ -1,9 +1,15 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package nodestart
+// Package hostagent is the part of centerpivot that runs in Unbounded's host
+// agent, on Azure Container Linux hosts. It binds the host's machine ID into
+// the node's nspawn machine, and configures trident-acl-agent, which performs
+// the A/B updates centerpivot asks for. The agent binary links it, so it stays
+// small. See ../AGENTS.md.
+package hostagent
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -15,15 +21,41 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 
-	"github.com/Azure/unbounded/internal/centerpivot"
+	"github.com/Azure/unbounded/cmd/centerpivot/internal/names"
 	"github.com/Azure/unbounded/internal/executil"
+	"github.com/Azure/unbounded/internal/fsutil"
+	"github.com/Azure/unbounded/pkg/agent/config"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
 
-// kubeletClientCertPath is kubelet's client certificate and key after TLS
-// bootstrap, inside the node's root. Its subject is system:node:<Node name>.
-const kubeletClientCertPath = "/var/lib/kubelet/pki/kubelet-client-current.pem"
+const (
+	// unit performs Azure Container Linux's A/B updates.
+	unit = "trident-acl-agent.service"
+	// configDir holds the kubeconfig written for trident-acl-agent, and the
+	// marker that the host agent enabled it.
+	configDir = "/etc/unbounded/trident-acl-agent"
+	// kubeletClientCertPath is kubelet's client certificate and key after TLS
+	// bootstrap, inside the node's root. Its subject is system:node:<Node name>.
+	kubeletClientCertPath = "/var/lib/kubelet/pki/kubelet-client-current.pem"
+)
+
+// HostMounts returns the host paths centerpivot needs bound into this host's
+// nspawn machines: on Azure Container Linux, the host's /etc/machine-id,
+// read-only, from which centerpivot's node-info DaemonSet works out the host's
+// Nebraska instance ID. The machine has its own /etc/machine-id, and
+// systemd-nspawn already binds the host's os-release at /run/host/os-release.
+func HostMounts() []config.AdditionalHostMount {
+	return hostMounts(goalstates.HostIsAzureContainerLinux())
+}
+
+func hostMounts(isACL bool) []config.AdditionalHostMount {
+	if !isACL {
+		return nil
+	}
+
+	return []config.AdditionalHostMount{{Source: "/etc/machine-id", Target: names.HostMachineIDPath, ReadOnly: true}}
+}
 
 // tridentACLAgentHost is trident-acl-agent's configuration on an Azure
 // Container Linux host: a systemd drop-in and the kubeconfig it names.
@@ -40,8 +72,8 @@ type tridentACLAgentHost struct {
 func realTridentACLAgentHost(log *slog.Logger) tridentACLAgentHost {
 	return tridentACLAgentHost{
 		log:    log,
-		dir:    goalstates.TridentACLAgentDir,
-		dropIn: filepath.Join(goalstates.SystemdSystemDir, goalstates.TridentACLAgentUnit+".d", "50-unbounded-centerpivot.conf"),
+		dir:    configDir,
+		dropIn: filepath.Join(goalstates.SystemdSystemDir, unit+".d", "50-unbounded-centerpivot.conf"),
 		systemctl: func(ctx context.Context, args ...string) (string, error) {
 			return executil.OutputCmd(ctx, log, "systemctl", args...)
 		},
@@ -63,12 +95,12 @@ type configureTridentACLAgent struct {
 	isACL func() bool
 }
 
-// ConfigureTridentACLAgent configures trident-acl-agent, which performs Azure
-// Container Linux's A/B updates, so centerpivot can update the node: it watches
-// the Node's centerpivot.unbounded-cloud.io annotations with kubelet's
-// credentials, and reports the version in os-release's VERSION_ID. It runs only
-// on an ACL host whose MachineConfiguration labels the node managed, and undoes
-// its configuration when the label goes. See designs/centerpivot.md, section 5.
+// ConfigureTridentACLAgent configures trident-acl-agent so centerpivot can
+// update the node: it watches the Node's centerpivot.unbounded-cloud.io
+// annotations with kubelet's credentials, and reports the version in
+// os-release's VERSION_ID. It runs only on an ACL host whose
+// MachineConfiguration labels the node managed, and undoes its configuration
+// when the label goes. See the appendix of designs/centerpivot.md.
 func ConfigureTridentACLAgent(log *slog.Logger, goalState *goalstates.NodeStart) phases.Task {
 	return &configureTridentACLAgent{log: log, goalState: goalState}
 }
@@ -101,7 +133,7 @@ func (t *configureTridentACLAgent) reconcile(ctx context.Context) error {
 	}
 
 	kubelet := t.goalState.Kubelet
-	if kubelet.NodeLabels[centerpivot.ManagedLabel] != "true" {
+	if kubelet.NodeLabels[names.ManagedLabel] != "true" {
 		return host.remove(ctx)
 	}
 
@@ -119,8 +151,6 @@ func (t *configureTridentACLAgent) reconcile(ctx context.Context) error {
 // restarts the agent only when they changed, as when the node moves to another
 // slot.
 func (h tridentACLAgentHost) configure(ctx context.Context, gs *goalstates.NodeStart) error {
-	unit := goalstates.TridentACLAgentUnit
-
 	if out, err := h.systemctl(ctx, "list-unit-files", "--no-legend", unit); err != nil || !strings.Contains(out, unit) {
 		h.log.Warn("trident-acl-agent isn't installed, so centerpivot can't update this node", "unit", unit)
 
@@ -129,12 +159,12 @@ func (h tridentACLAgentHost) configure(ctx context.Context, gs *goalstates.NodeS
 
 	// Record whether the agent turns the unit on, so removing the
 	// configuration turns it off only then.
+	if err := os.MkdirAll(h.dir, 0o700); err != nil {
+		return fmt.Errorf("create %s: %w", h.dir, err)
+	}
+
 	if _, err := os.Stat(h.enabledMarker()); errors.Is(err, os.ErrNotExist) {
 		if state, _ := h.systemctl(ctx, "is-enabled", unit); strings.TrimSpace(state) != "enabled" { //nolint:errcheck // is-enabled exits non-zero for a disabled unit.
-			if err := os.MkdirAll(h.dir, 0o700); err != nil {
-				return fmt.Errorf("create %s: %w", h.dir, err)
-			}
-
 			if err := os.WriteFile(h.enabledMarker(), nil, 0o600); err != nil {
 				return fmt.Errorf("record that the agent enabled trident-acl-agent: %w", err)
 			}
@@ -162,24 +192,25 @@ func (h tridentACLAgentHost) configure(ctx context.Context, gs *goalstates.NodeS
 		"# its Node's annotations. See designs/centerpivot.md in Azure/unbounded.",
 		"[Service]",
 		"Environment=TRIDENT_ACL_AGENT_ORCHESTRATION_MODE=annotations",
-		"Environment=TRIDENT_ACL_AGENT_KUBERNETES_ANNOTATION_PREFIX=" + centerpivot.Prefix,
+		"Environment=TRIDENT_ACL_AGENT_KUBERNETES_ANNOTATION_PREFIX=" + names.Prefix,
 		"Environment=TRIDENT_ACL_AGENT_KUBERNETES_KUBECONFIG=" + h.kubeconfig(),
 		"Environment=TRIDENT_ACL_AGENT_KUBERNETES_NODE_NAME_SOURCE=kubelet-cert",
 		"Environment=TRIDENT_ACL_AGENT_KUBERNETES_KUBELET_CERT_PATH=" + cert,
-		"Environment=TRIDENT_ACL_AGENT_CURRENT_VERSION_KEY=" + centerpivot.VersionKey,
+		"Environment=TRIDENT_ACL_AGENT_CURRENT_VERSION_KEY=" + names.VersionKey,
 		"",
 	}, "\n")
 
-	var files changeTracker
-	if err := files.write(h.kubeconfig(), kubeconfig, 0o600); err != nil {
+	wroteKubeconfig, err := writeIfChanged(h.kubeconfig(), kubeconfig, 0o600)
+	if err != nil {
 		return fmt.Errorf("write trident-acl-agent kubeconfig: %w", err)
 	}
 
-	if err := files.write(h.dropIn, []byte(dropIn), 0o644); err != nil {
+	wroteDropIn, err := writeIfChanged(h.dropIn, []byte(dropIn), 0o644)
+	if err != nil {
 		return fmt.Errorf("write trident-acl-agent drop-in: %w", err)
 	}
 
-	if !files.changed {
+	if !wroteKubeconfig && !wroteDropIn {
 		return h.run(ctx, "enable", "--now", unit)
 	}
 
@@ -210,8 +241,6 @@ func (h tridentACLAgentHost) remove(ctx context.Context) error {
 		}
 	}
 
-	unit := goalstates.TridentACLAgentUnit
-
 	next := []string{"try-restart", unit}
 	if enabledByAgent {
 		next = []string{"disable", "--now", unit}
@@ -226,6 +255,21 @@ func (h tridentACLAgentHost) remove(ctx context.Context) error {
 	h.log.Info("Removed trident-acl-agent's configuration for centerpivot", "disabled", enabledByAgent)
 
 	return nil
+}
+
+// writeIfChanged writes content to path, durably, unless path already holds
+// it, and reports whether it wrote. trident-acl-agent reads both files only
+// when it starts, so only a write needs a restart.
+func writeIfChanged(path string, content []byte, perm os.FileMode) (bool, error) {
+	if existing, err := os.ReadFile(path); err == nil && bytes.Equal(existing, content) {
+		return false, nil
+	}
+
+	if err := fsutil.WriteFileAtomic(path, content, perm); err != nil {
+		return false, err
+	}
+
+	return true, nil
 }
 
 func (h tridentACLAgentHost) run(ctx context.Context, args ...string) error {

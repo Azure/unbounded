@@ -18,7 +18,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 
-	"github.com/Azure/unbounded/internal/centerpivot/identity"
+	"github.com/Azure/unbounded/cmd/centerpivot/internal/identity"
 )
 
 // Publisher keeps one Node's agent-info annotation current.

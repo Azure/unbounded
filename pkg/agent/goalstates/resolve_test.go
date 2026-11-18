@@ -781,15 +781,3 @@ func TestHostDistroIsImageManaged(t *testing.T) {
 		assert.False(t, HostDistroIsImageManaged(distro), "distro %q", distro)
 	}
 }
-
-func TestHostIdentityMountsBindTheMachineIDOnAzureContainerLinux(t *testing.T) {
-	t.Parallel()
-
-	assert.Equal(t, []config.AdditionalHostMount{{
-		Source: "/etc/machine-id", Target: "/run/unbounded/host/machine-id", ReadOnly: true,
-	}}, hostIdentityMounts(hostDistroAzureContainerLinux))
-
-	for _, distro := range []string{hostDistroUbuntu2404, hostDistroUbuntu2604, hostDistroAzureLinux3} {
-		assert.Empty(t, hostIdentityMounts(distro), distro)
-	}
-}

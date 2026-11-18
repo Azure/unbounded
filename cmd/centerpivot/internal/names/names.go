@@ -1,12 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package centerpivot holds the names centerpivot's parts share: the service,
-// the node-info DaemonSet, the operator component, and Unbounded's host agent,
-// which configures trident-acl-agent and binds the host's machine ID into the
-// node's nspawn machine. It has no dependencies, so the host agent can use it.
-// See designs/centerpivot.md.
-package centerpivot
+// Package names holds the labels, taints, annotations, and paths centerpivot's
+// parts agree on: the service, node-info, the operator component, and the host
+// agent's part. It has no dependencies, since the host agent links it.
+package names
 
 // Prefix is the prefix of every label, taint, and annotation centerpivot uses,
 // including trident-acl-agent's annotation contract.

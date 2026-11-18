@@ -14,7 +14,7 @@ import (
 	"k8s.io/utils/ptr"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	"github.com/Azure/unbounded/internal/centerpivot"
+	"github.com/Azure/unbounded/cmd/centerpivot/internal/names"
 )
 
 func TestSettingsFor(t *testing.T) {
@@ -96,7 +96,7 @@ func TestAppFor(t *testing.T) {
 
 			labels := map[string]string{}
 			if tt.label != "" {
-				labels[centerpivot.AppLabel] = tt.label
+				labels[names.AppLabel] = tt.label
 			}
 
 			got, err := Settings{Apps: tt.apps}.AppFor(labels)

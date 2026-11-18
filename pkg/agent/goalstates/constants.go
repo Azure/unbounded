@@ -23,14 +23,6 @@ const (
 	// DaemonUnit is the systemd unit name for the unbounded-agent daemon.
 	DaemonUnit = "unbounded-agent-daemon.service"
 
-	// TridentACLAgentUnit performs Azure Container Linux's A/B updates. The
-	// agent configures it on the nodes centerpivot updates.
-	TridentACLAgentUnit = "trident-acl-agent.service"
-
-	// TridentACLAgentDir holds the kubeconfig the agent writes for
-	// trident-acl-agent, and the marker that the agent enabled it.
-	TridentACLAgentDir = "/etc/unbounded/trident-acl-agent"
-
 	// DaemonRecoveryUnit is the systemd recovery unit for the agent daemon.
 	DaemonRecoveryUnit = "unbounded-agent-daemon-recovery.service"
 

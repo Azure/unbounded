@@ -17,7 +17,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	"github.com/Azure/unbounded/internal/centerpivot"
+	"github.com/Azure/unbounded/cmd/centerpivot/internal/names"
 )
 
 // checking returns the nodes the scheduler gave a slot.
@@ -55,13 +55,13 @@ func TestScheduleGivesFreeSlotsCanariesFirst(t *testing.T) {
 	notReady.Status.Conditions[0].Status = corev1.ConditionFalse
 
 	canary := testNode(t, "canary", "edge", running)
-	canary.Labels[centerpivot.CanaryLabel] = "true"
+	canary.Labels[names.CanaryLabel] = "true"
 
 	paused := testNode(t, "paused", "edge", running)
-	paused.Labels[centerpivot.PausedLabel] = "true"
+	paused.Labels[names.PausedLabel] = "true"
 
 	unmanaged := testNode(t, "unmanaged", "edge", running)
-	delete(unmanaged.Labels, centerpivot.ManagedLabel)
+	delete(unmanaged.Labels, names.ManagedLabel)
 
 	// 50% of 6 managed nodes is 3 slots. The node that isn't Ready uses one,
 	// so two are free: the canary first, then the node checked longest ago.

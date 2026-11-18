@@ -13,9 +13,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	"github.com/Azure/unbounded/internal/centerpivot"
-	"github.com/Azure/unbounded/internal/centerpivot/contract"
-	"github.com/Azure/unbounded/internal/centerpivot/drain"
+	"github.com/Azure/unbounded/cmd/centerpivot/internal/contract"
+	"github.com/Azure/unbounded/cmd/centerpivot/internal/drain"
+	"github.com/Azure/unbounded/cmd/centerpivot/internal/names"
 )
 
 // Phase is where a node is in its update (designs/centerpivot.md, section
@@ -79,7 +79,7 @@ type State struct {
 // StateOf returns the Machine's state. A Machine without one is Idle; one
 // whose state can't be read is held, so a person looks.
 func StateOf(machine *unboundedv1alpha3.Machine) State {
-	value, ok := machine.Annotations[centerpivot.StateAnnotation]
+	value, ok := machine.Annotations[names.StateAnnotation]
 	if !ok {
 		return State{Phase: PhaseIdle}
 	}
@@ -191,7 +191,7 @@ func writeState(ctx context.Context, c client.Client, machine *unboundedv1alpha3
 		return err
 	}
 
-	if machine.Annotations[centerpivot.StateAnnotation] == value {
+	if machine.Annotations[names.StateAnnotation] == value {
 		return nil
 	}
 
@@ -200,7 +200,7 @@ func writeState(ctx context.Context, c client.Client, machine *unboundedv1alpha3
 		patched.Annotations = map[string]string{}
 	}
 
-	patched.Annotations[centerpivot.StateAnnotation] = value
+	patched.Annotations[names.StateAnnotation] = value
 
 	if err := c.Patch(ctx, patched, client.MergeFromWithOptions(machine, client.MergeFromWithOptimisticLock{})); err != nil {
 		return fmt.Errorf("write the state of Machine %s: %w", machine.Name, err)

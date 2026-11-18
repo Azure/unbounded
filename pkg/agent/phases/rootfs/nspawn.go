@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/Azure/unbounded/cmd/centerpivot/hostagent"
 	"github.com/Azure/unbounded/pkg/agent/config"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
@@ -139,6 +140,7 @@ func writeNSpawnConfigs(log *slog.Logger, goalState *goalstates.RootFS) error {
 	}
 
 	templateData.ApplyGrants(goalState.Grants())
+	templateData.ApplyGrants(goalstates.AdditionalHostMountGrants(hostagent.HostMounts()))
 
 	if n := len(templateData.HostDevicePaths); n > 0 {
 		log.Info("host devices detected, configuring nspawn bind-mounts",

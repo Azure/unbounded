@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package centerpivot
+package operatorcomponent
 
 import (
 	"slices"
@@ -17,8 +17,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	cp "github.com/Azure/unbounded/internal/centerpivot"
-	"github.com/Azure/unbounded/internal/centerpivot/controller"
+	"github.com/Azure/unbounded/cmd/centerpivot/internal/controller"
+	"github.com/Azure/unbounded/cmd/centerpivot/internal/names"
 	"github.com/Azure/unbounded/internal/operator/component"
 )
 
@@ -129,7 +129,7 @@ func TestPlanReportsAHeldNode(t *testing.T) {
 	require.NoError(t, err)
 
 	machine := &unboundedv1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{
-		Name: "acl-1", Annotations: map[string]string{cp.StateAnnotation: held},
+		Name: "acl-1", Annotations: map[string]string{names.StateAnnotation: held},
 	}}
 
 	_, result, err := (Component{}).Plan(t.Context(), testEnv(t, machine), []unboundedv1alpha3.Site{site("edge", true)})

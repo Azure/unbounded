@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package nodestart
+package hostagent
 
 import (
 	"context"
@@ -16,7 +16,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"k8s.io/client-go/tools/clientcmd"
 
-	"github.com/Azure/unbounded/internal/centerpivot"
+	"github.com/Azure/unbounded/cmd/centerpivot/internal/names"
+	"github.com/Azure/unbounded/pkg/agent/config"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
 
@@ -32,7 +33,7 @@ func (f *fakeSystemctl) run(_ context.Context, args ...string) (string, error) {
 	switch args[0] {
 	case "list-unit-files":
 		if f.installed {
-			return goalstates.TridentACLAgentUnit + " disabled enabled\n", nil
+			return unit + " disabled enabled\n", nil
 		}
 
 		return "", errors.New("exit status 1")
@@ -57,7 +58,7 @@ func managedNode(slot string) *goalstates.NodeStart {
 			APIServer:      "https://api.example.com:6443",
 			CACertData:     []byte("-----BEGIN CERTIFICATE-----\n"),
 			BootstrapToken: "abcdef.0123456789abcdef",
-			NodeLabels:     map[string]string{centerpivot.ManagedLabel: "true"},
+			NodeLabels:     map[string]string{names.ManagedLabel: "true"},
 		},
 	}
 }
@@ -202,7 +203,7 @@ func TestUnmanagingANodeUndoesTheConfiguration(t *testing.T) {
 			require.NoError(t, configure(managedNode("kube1")))
 
 			unmanaged := managedNode("kube1")
-			delete(unmanaged.Kubelet.NodeLabels, centerpivot.ManagedLabel)
+			delete(unmanaged.Kubelet.NodeLabels, names.ManagedLabel)
 
 			systemctl.calls = nil
 
@@ -219,4 +220,13 @@ func TestUnmanagingANodeUndoesTheConfiguration(t *testing.T) {
 			assert.Empty(t, systemctl.calls, "nothing left to undo")
 		})
 	}
+}
+
+func TestHostMountsBindTheMachineIDOnAzureContainerLinux(t *testing.T) {
+	t.Parallel()
+
+	assert.Equal(t, []config.AdditionalHostMount{{
+		Source: "/etc/machine-id", Target: "/run/unbounded/host/machine-id", ReadOnly: true,
+	}}, hostMounts(true))
+	assert.Empty(t, hostMounts(false))
 }

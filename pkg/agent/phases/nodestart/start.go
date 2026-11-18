@@ -6,6 +6,7 @@ package nodestart
 import (
 	"log/slog"
 
+	"github.com/Azure/unbounded/cmd/centerpivot/hostagent"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/isolation/nspawn"
 	"github.com/Azure/unbounded/pkg/agent/phases"
@@ -52,6 +53,6 @@ func StartNode(log *slog.Logger, gs *goalstates.NodeStart) phases.Task {
 			containerd:   containerd,
 			kubelet:      kubelet,
 		},
-		ConfigureTridentACLAgent(log, gs),
+		hostagent.ConfigureTridentACLAgent(log, gs),
 	)
 }

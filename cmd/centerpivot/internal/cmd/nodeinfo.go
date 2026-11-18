@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package centerpivot
+package cmd
 
 import (
 	"errors"
@@ -14,12 +14,12 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
-	cp "github.com/Azure/unbounded/internal/centerpivot"
-	"github.com/Azure/unbounded/internal/centerpivot/nodeinfo"
+	"github.com/Azure/unbounded/cmd/centerpivot/internal/names"
+	"github.com/Azure/unbounded/cmd/centerpivot/internal/nodeinfo"
 )
 
 func nodeInfoCommand() *cobra.Command {
-	publisher := &nodeinfo.Publisher{Annotation: cp.AgentInfoAnnotation}
+	publisher := &nodeinfo.Publisher{Annotation: names.AgentInfoAnnotation}
 
 	var interval time.Duration
 
@@ -47,11 +47,11 @@ func nodeInfoCommand() *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&publisher.NodeName, "node-name", os.Getenv("NODE_NAME"), "The node's name")
-	cmd.Flags().StringVar(&publisher.MachineIDPath, "machine-id-path", cp.HostMachineIDPath,
+	cmd.Flags().StringVar(&publisher.MachineIDPath, "machine-id-path", names.HostMachineIDPath,
 		"The host's /etc/machine-id, as the node sees it")
-	cmd.Flags().StringVar(&publisher.OSReleasePath, "os-release-path", cp.HostOSReleasePath,
+	cmd.Flags().StringVar(&publisher.OSReleasePath, "os-release-path", names.HostOSReleasePath,
 		"The host's os-release, as the node sees it")
-	cmd.Flags().StringVar(&publisher.VersionKey, "version-key", cp.VersionKey,
+	cmd.Flags().StringVar(&publisher.VersionKey, "version-key", names.VersionKey,
 		"The os-release key trident-acl-agent reads its version from")
 	cmd.Flags().DurationVar(&interval, "interval", time.Minute, "How often to check the host's files")
 

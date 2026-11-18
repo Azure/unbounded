@@ -24,11 +24,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	"github.com/Azure/unbounded/internal/centerpivot"
-	"github.com/Azure/unbounded/internal/centerpivot/contract"
-	"github.com/Azure/unbounded/internal/centerpivot/drain"
-	"github.com/Azure/unbounded/internal/centerpivot/identity"
-	"github.com/Azure/unbounded/internal/centerpivot/omaha"
+	"github.com/Azure/unbounded/cmd/centerpivot/internal/contract"
+	"github.com/Azure/unbounded/cmd/centerpivot/internal/drain"
+	"github.com/Azure/unbounded/cmd/centerpivot/internal/identity"
+	"github.com/Azure/unbounded/cmd/centerpivot/internal/names"
+	"github.com/Azure/unbounded/cmd/centerpivot/internal/omaha"
 )
 
 // MachineNodeIndex indexes Machines by the name of their Node.
@@ -580,7 +580,7 @@ func (r *Reconciler) checkFor(p *pass) (omaha.Check, error) {
 		return omaha.Check{}, err
 	}
 
-	track := p.node.Labels[centerpivot.TrackLabel]
+	track := p.node.Labels[names.TrackLabel]
 	if track == "" {
 		track = app.DefaultTrack
 	}
@@ -711,7 +711,7 @@ func answer(node *corev1.Node, key string, request *contract.Request) *contract.
 
 // agentInfoOf returns the node's agent-info, which must have a version.
 func agentInfoOf(node *corev1.Node) (identity.AgentInfo, error) {
-	value, ok := node.Annotations[centerpivot.AgentInfoAnnotation]
+	value, ok := node.Annotations[names.AgentInfoAnnotation]
 	if !ok {
 		return identity.AgentInfo{}, errors.New("the node has no agent-info")
 	}
@@ -759,7 +759,7 @@ func ready(node *corev1.Node) bool {
 
 func hasTaint(node *corev1.Node) bool {
 	for _, taint := range node.Spec.Taints {
-		if taint.Key == centerpivot.UpdatingTaint {
+		if taint.Key == names.UpdatingTaint {
 			return true
 		}
 	}
@@ -774,14 +774,14 @@ func setTaint(node *corev1.Node, tainted bool) {
 	}
 
 	if tainted {
-		node.Spec.Taints = append(node.Spec.Taints, corev1.Taint{Key: centerpivot.UpdatingTaint, Effect: corev1.TaintEffectNoSchedule})
+		node.Spec.Taints = append(node.Spec.Taints, corev1.Taint{Key: names.UpdatingTaint, Effect: corev1.TaintEffectNoSchedule})
 
 		return
 	}
 
 	taints := node.Spec.Taints[:0:0]
 	for _, taint := range node.Spec.Taints {
-		if taint.Key != centerpivot.UpdatingTaint {
+		if taint.Key != names.UpdatingTaint {
 			taints = append(taints, taint)
 		}
 	}

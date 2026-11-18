@@ -1,10 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package centerpivot is the centerpivot binary: the controller that updates
-// Azure Container Linux nodes from Nebraska, and the node-info DaemonSet that
-// publishes each node's Nebraska identity. See designs/centerpivot.md.
-package centerpivot
+// Package cmd is the centerpivot binary's command line: the controller that
+// updates Azure Container Linux nodes from Nebraska, and the node-info
+// DaemonSet that publishes each node's Nebraska identity.
+package cmd
 
 import (
 	"fmt"
