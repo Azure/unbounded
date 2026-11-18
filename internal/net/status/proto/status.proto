@@ -124,6 +124,7 @@ message PeerStatus {
   PeerTunnelStatus tunnel = 7;
   repeated string route_destinations = 8;
   HealthCheckPeerStatus health_check = 9;
+  string peer_id = 10;
 }
 
 // PeerTunnelStatus contains per-link tunnel transport metrics.

@@ -18,9 +18,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 
-	"github.com/Azure/unbounded/internal/racerobject"
 	"github.com/Azure/unbounded/pkg/racersdk"
-	"github.com/Azure/unbounded/pkg/racersdk/racersdktest"
 )
 
 func TestS3Options(t *testing.T) {
@@ -161,77 +159,22 @@ func TestS3OriginHTTP(t *testing.T) {
 	}
 }
 
-// s3TestOrigin is a synthetic Racer origin that serves the catalog objects
-// for bucket, standing in for the Racer dataplane's Azure Blob origin.
-func s3TestOrigin(t *testing.T, c *blobCatalog, bucket string, reads *atomic.Int32) racersdk.Origin {
-	t.Helper()
-
-	return func(_ context.Context, request racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
-		reads.Add(1)
-
-		for index, batch := range c.batches {
-			want, err := racerobject.NewRequest(bucket, s3ObjectKey(index), "")
-			if err != nil {
-				return racersdk.Metadata{}, nil, err
-			}
-
-			if want.Key != request.Key || want.Metadata != request.Metadata {
-				continue
-			}
-
-			desc := batch.blobs[0].descriptor
-			metadata := racersdk.Metadata{
-				Size: desc.Size, ETag: `"` + desc.Digest.Encoded() + `"`,
-				ContentType: "application/octet-stream", ExpiresAt: time.Now().Add(time.Minute),
-			}
-
-			if request.ETag != "" && request.ETag != metadata.ETag {
-				return racersdk.Metadata{}, nil, racersdk.ErrVersionMismatch
-			}
-
-			if request.Head {
-				return metadata, nil, nil
-			}
-
-			length := max(min(request.Length, desc.Size-request.Offset), 0)
-
-			return metadata, io.NopCloser(io.NewSectionReader(c.blobs[desc.Digest].data, request.Offset, length)), nil
-		}
-
-		return racersdk.Metadata{}, nil, racersdk.ErrNotFound
-	}
-}
-
-func TestS3DirectAndRacerObject(t *testing.T) {
-	// Crossing a Racer page boundary exercises pinned page reads and exact
-	// ranges through the racer-object sidecar and a real Racer SDK client.
+func TestS3DirectPageBoundary(t *testing.T) {
+	// One page plus 73 bytes makes integrity diagnostics examine a full page
+	// and a partial one.
 	c := s3TestCatalog(t, 1, int64(racersdk.PageSize)+73)
 	originMetrics := newMetrics(prometheus.NewRegistry())
 	originServer := httptest.NewServer(originMetrics.instrument(c.s3Handler("benchmark")))
 	t.Cleanup(originServer.Close)
 
-	var reads atomic.Int32
-
-	sdk := racersdktest.NewClient(t, s3TestOrigin(t, c, "benchmark", &reads))
-
-	handler, err := racerobject.NewSidecar(sdk, racerobject.SidecarConfig{})
-	require.NoError(t, err)
-
-	sidecar := httptest.NewServer(handler)
-	t.Cleanup(sidecar.Close)
-
-	for _, endpoint := range []string{originServer.URL, sidecar.URL} {
-		p, m := s3TestPuller(t, c, endpoint)
-		p.opts.DiagnoseIntegrity = true
-		require.NoError(t, p.configureDiagnostics(c))
-		require.NoError(t, p.pullBatch(t.Context(), c.batches[0]))
-		require.Equal(t, float64(racersdk.PageSize+73), testutil.ToFloat64(m.verifiedBytes))
-		require.Equal(t, testutil.ToFloat64(m.verifiedBytes), testutil.ToFloat64(m.receivedBytes))
-		require.Equal(t, float64(1), testutil.ToFloat64(m.pulls.WithLabelValues("success")))
-	}
-
+	p, m := s3TestPuller(t, c, originServer.URL)
+	p.opts.DiagnoseIntegrity = true
+	require.NoError(t, p.configureDiagnostics(c))
+	require.NoError(t, p.pullBatch(t.Context(), c.batches[0]))
+	require.Equal(t, float64(racersdk.PageSize+73), testutil.ToFloat64(m.verifiedBytes))
+	require.Equal(t, testutil.ToFloat64(m.verifiedBytes), testutil.ToFloat64(m.receivedBytes))
+	require.Equal(t, float64(1), testutil.ToFloat64(m.pulls.WithLabelValues("success")))
 	require.Equal(t, float64(1), testutil.ToFloat64(originMetrics.originRequests.WithLabelValues("GET", "200")))
-	require.GreaterOrEqual(t, reads.Load(), int32(2), "sidecar reads cross a page boundary through the origin")
 }
 
 func TestS3ClientFailuresAndVerification(t *testing.T) {

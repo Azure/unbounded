@@ -146,11 +146,9 @@ func checkIsPrivilegedUser(log *slog.Logger, deps hostCheckDeps) preflight.Check
 	}}
 }
 
-// CheckHostPackages verifies all required host packages are already installed.
-func CheckHostPackages(log *slog.Logger) preflight.Checker {
-	return checkHostPackages(log, false, defaultHostCheckDeps())
-}
-
+// checkHostPackages verifies all required host packages are already installed.
+// A missing package is a warning, because bootstrap may install it, unless
+// failMissing is set.
 func checkHostPackages(log *slog.Logger, failMissing bool, deps hostCheckDeps) preflight.Checker {
 	return simpleHostChecker{name: checkHostPackagesName, check: func(ctx context.Context) []preflight.Result {
 		pm, err := deps.detectPackageManager(deps.lookupPath)

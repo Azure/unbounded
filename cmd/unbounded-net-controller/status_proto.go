@@ -111,6 +111,7 @@ func protoToPeers(pbs []*statusproto.PeerStatus) []statusv1alpha1.PeerStatus {
 // protoToPeerStatus converts a single protobuf PeerStatus to the Go type.
 func protoToPeerStatus(pb *statusproto.PeerStatus) statusv1alpha1.PeerStatus {
 	ps := statusv1alpha1.PeerStatus{
+		PeerID:            pb.PeerId,
 		Name:              pb.Name,
 		PeerType:          pb.PeerType,
 		SiteName:          pb.SiteName,

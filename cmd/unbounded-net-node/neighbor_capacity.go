@@ -119,6 +119,8 @@ func (state *wireGuardState) reconcileNeighborCapacity(cfg *config, peers []mesh
 	endpoints := meshNeighborEndpoints(cfg, peers, gateways, mySite, peeredSites, networkPeeredSites)
 
 	sources := make(map[string]neighborWireGuardPeerSource)
+
+	state.mu.Lock()
 	if state.wireguardManager != nil {
 		sources[wireGuardInterfaceName(cfg, cfg.WireGuardPort)] = state.wireguardManager
 	}
@@ -128,6 +130,7 @@ func (state *wireGuardState) reconcileNeighborCapacity(cfg *config, peers []mesh
 			sources[name] = manager
 		}
 	}
+	state.mu.Unlock()
 
 	liveEndpoints, err := liveWireGuardNeighborEndpoints(peers, gateways, sources)
 	if err != nil {

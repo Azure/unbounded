@@ -62,6 +62,7 @@ export type WireguardStatus = {
 };
 
 export type WireguardPeer = {
+  peerId?: string;
   tunnel?: {
     protocol?: string;
     interface?: string;

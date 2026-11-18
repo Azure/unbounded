@@ -4,8 +4,72 @@
 package netlink
 
 import (
+	"errors"
 	"testing"
 )
+
+type fakeForwardIPTables struct {
+	*fakeIPTables
+	chainErr error
+	listed   int
+}
+
+func (f *fakeForwardIPTables) ChainExists(_, _ string) (bool, error) {
+	return true, f.chainErr
+}
+
+func (f *fakeForwardIPTables) List(_, _ string) ([]string, error) {
+	f.listed++
+	return nil, nil
+}
+
+func (f *fakeForwardIPTables) Insert(_, _ string, _ int, _ ...string) error {
+	return nil
+}
+
+func TestNativeForwardingWithoutIPv6(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name         string
+		prefixes     []string
+		failedFamily int
+		missing      bool
+		wantError    bool
+	}{
+		{"IPv4 only", []string{"10.244.0.0/16"}, 6, false, false},
+		{"withdrawal", nil, 6, false, false},
+		{"required IPv6", []string{"fd44::/64"}, 6, false, true},
+		{"required IPv4", []string{"10.244.0.0/16"}, 4, false, true},
+		{"missing required IPv6", []string{"fd44::/64"}, 6, true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ipv4 := &fakeForwardIPTables{fakeIPTables: &fakeIPTables{}}
+			ipv6 := &fakeForwardIPTables{fakeIPTables: &fakeIPTables{}}
+
+			failure := errors.New("filter table unavailable")
+			if tc.failedFamily == 4 {
+				ipv4.chainErr = failure
+			} else {
+				ipv6.chainErr = failure
+			}
+
+			manager := &ForwardManager{ipt4: ipv4}
+			if !tc.missing {
+				manager.ipt6 = ipv6
+			}
+
+			err := manager.ReconcileNativeInterface("eth0", tc.prefixes)
+			if tc.wantError {
+				if err == nil || (!tc.missing && !errors.Is(err, failure)) {
+					t.Fatalf("required forwarding error was hidden: %v", err)
+				}
+			} else if err != nil || ipv4.listed == 0 {
+				t.Fatalf("unused IPv6 family blocked IPv4 forwarding: %v, listed=%d", err, ipv4.listed)
+			}
+		})
+	}
+}
 
 func TestParseInterfaceFromRule(t *testing.T) {
 	t.Parallel()

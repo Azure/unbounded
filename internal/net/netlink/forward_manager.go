@@ -5,6 +5,8 @@ package netlink
 
 import (
 	"fmt"
+	"net/netip"
+	"slices"
 	"strings"
 	"sync"
 
@@ -20,6 +22,7 @@ const (
 	// legacyForwardComment identifies old per-interface FORWARD ACCEPT rules
 	// from previous agent versions that should be cleaned up.
 	legacyForwardComment = "unbounded-net: accept tunnel traffic"
+	nativeForwardComment = "unbounded-net: forward native cluster traffic"
 )
 
 // ForwardManager manages iptables FORWARD rules that restrict forwarded
@@ -32,9 +35,16 @@ const (
 // This gives 2*N rules instead of N^2 and ensures only traffic between
 // managed tunnel interfaces bypasses KUBE-FORWARD's conntrack checks.
 type ForwardManager struct {
-	ipt4 *iptables.IPTables
-	ipt6 *iptables.IPTables
-	mu   sync.Mutex
+	ipt4       forwardIPTables
+	ipt6       forwardIPTables
+	mu         sync.Mutex
+	interfaces map[string]bool
+}
+
+type forwardIPTables interface {
+	iptablesClient
+	Insert(table, chain string, position int, rulespec ...string) error
+	List(table, chain string) ([]string, error)
 }
 
 // NewForwardManager creates a ForwardManager, ensures the UNBOUNDED-FORWARD
@@ -53,7 +63,10 @@ func NewForwardManager() (*ForwardManager, error) {
 		ipt6 = nil
 	}
 
-	m := &ForwardManager{ipt4: ipt4, ipt6: ipt6}
+	m := &ForwardManager{ipt4: ipt4, interfaces: make(map[string]bool)}
+	if ipt6 != nil {
+		m.ipt6 = ipt6
+	}
 
 	if err := m.ensureChain(ipt4, "IPv4"); err != nil {
 		return nil, fmt.Errorf("failed to create IPv4 forward chain: %w", err)
@@ -77,7 +90,7 @@ func NewForwardManager() (*ForwardManager, error) {
 // ensureChain creates the UNBOUNDED-FORWARD chain if it does not exist.
 // It does NOT insert a jump rule in FORWARD here; jump rules are per-interface
 // and managed by EnsureInterface.
-func (m *ForwardManager) ensureChain(ipt *iptables.IPTables, family string) error {
+func (m *ForwardManager) ensureChain(ipt forwardIPTables, family string) error {
 	exists, err := ipt.ChainExists("filter", forwardChain)
 	if err != nil {
 		return fmt.Errorf("failed to check if chain exists: %w", err)
@@ -104,6 +117,150 @@ func acceptRule(ifName string) []string {
 	return []string{"-o", ifName, "-m", "comment", "--comment", forwardComment, "-j", "ACCEPT"}
 }
 
+func nativeForwardRule(ifName, prefix string, ingress bool) []string {
+	if ingress {
+		return []string{"-i", ifName, "-s", prefix, "-m", "comment", "--comment", nativeForwardComment, "-j", forwardChain}
+	}
+
+	return []string{"-o", ifName, "-d", prefix, "-m", "comment", "--comment", nativeForwardComment, "-j", "ACCEPT"}
+}
+
+// ReconcileNativeInterface trusts only cluster prefixes on a shared physical NIC.
+func (m *ForwardManager) ReconcileNativeInterface(ifName string, prefixes []string) error {
+	desired := make(map[int]map[string]bool)
+
+	for _, value := range prefixes {
+		prefix, err := netip.ParsePrefix(value)
+		if err != nil {
+			return fmt.Errorf("invalid native forwarding prefix %q: %w", value, err)
+		}
+
+		family := 6
+		if prefix.Addr().Is4() {
+			family = 4
+		}
+
+		if desired[family] == nil {
+			desired[family] = make(map[string]bool)
+		}
+
+		desired[family][prefix.Masked().String()] = true
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	delete(m.interfaces, ifName)
+
+	for _, family := range []struct {
+		ipt    forwardIPTables
+		number int
+	}{{m.ipt4, 4}, {m.ipt6, 6}} {
+		if family.ipt == nil {
+			if len(desired[family.number]) > 0 {
+				return fmt.Errorf("IPv%d native forwarding is unavailable", family.number)
+			}
+
+			continue
+		}
+
+		if err := m.ensureChain(family.ipt, fmt.Sprint(family.number)); err != nil {
+			if family.number == 6 && len(desired[6]) == 0 {
+				klog.V(2).Infof("Skipping unused IPv6 native forwarding: %v", err)
+				continue
+			}
+
+			return err
+		}
+
+		for _, ingress := range []bool{true, false} {
+			chain, ifaceFlag, prefixFlag := forwardChain, "-o", "-d"
+			if ingress {
+				chain, ifaceFlag, prefixFlag = "FORWARD", "-i", "-s"
+			}
+
+			rules, err := family.ipt.List("filter", chain)
+			if err != nil {
+				return err
+			}
+
+			for _, rule := range rules {
+				existingName := parseInterfaceFromRule(rule, ifaceFlag)
+				if strings.Contains(rule, forwardComment) {
+					// Only current tunnel registrations can retain broad rules.
+					// This also removes a previous default NIC after a restart.
+					if m.interfaces[existingName] {
+						continue
+					}
+
+					spec := acceptRule(existingName)
+					if ingress {
+						spec = jumpRule(existingName)
+					}
+
+					if err := family.ipt.DeleteIfExists("filter", chain, spec...); err != nil {
+						return err
+					}
+
+					continue
+				}
+
+				if !strings.Contains(rule, nativeForwardComment) {
+					continue
+				}
+
+				prefix := parseInterfaceFromRule(rule, prefixFlag)
+				if prefix == "" {
+					prefix = "0.0.0.0/0"
+					if family.number == 6 {
+						prefix = "::/0"
+					}
+				}
+
+				if existingName == ifName && desired[family.number][prefix] {
+					continue
+				}
+
+				if err := family.ipt.DeleteIfExists("filter", chain, nativeForwardRule(existingName, prefix, ingress)...); err != nil {
+					return err
+				}
+			}
+
+			var sorted []string
+			for prefix := range desired[family.number] {
+				sorted = append(sorted, prefix)
+			}
+
+			slices.Sort(sorted)
+
+			for _, prefix := range sorted {
+				rule := nativeForwardRule(ifName, prefix, ingress)
+
+				exists, err := family.ipt.Exists("filter", chain, rule...)
+				if err != nil {
+					return err
+				}
+
+				if exists {
+					continue
+				}
+
+				if ingress {
+					err = family.ipt.Insert("filter", chain, 1, rule...)
+				} else {
+					err = family.ipt.Append("filter", chain, rule...)
+				}
+
+				if err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
 // EnsureInterface adds the jump rule in FORWARD (-i ifName) and the accept
 // rule in UNBOUNDED-FORWARD (-o ifName) if they do not already exist. The
 // jump rule is inserted at position 1 so it is evaluated before KUBE-FORWARD.
@@ -111,6 +268,7 @@ func (m *ForwardManager) EnsureInterface(ifName string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	m.interfaces[ifName] = true
 	m.ensureInterfaceForFamily(m.ipt4, "IPv4", ifName)
 
 	if m.ipt6 != nil {
@@ -118,7 +276,7 @@ func (m *ForwardManager) EnsureInterface(ifName string) {
 	}
 }
 
-func (m *ForwardManager) ensureInterfaceForFamily(ipt *iptables.IPTables, family, ifName string) {
+func (m *ForwardManager) ensureInterfaceForFamily(ipt forwardIPTables, family, ifName string) {
 	// Ensure the chain still exists (self-healing if someone flushed it).
 	if err := m.ensureChain(ipt, family); err != nil {
 		klog.Warningf("ForwardManager: failed to ensure %s chain for %s: %v", family, ifName, err)
@@ -161,6 +319,7 @@ func (m *ForwardManager) RemoveInterface(ifName string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	delete(m.interfaces, ifName)
 	m.removeInterfaceForFamily(m.ipt4, "IPv4", ifName)
 
 	if m.ipt6 != nil {
@@ -168,7 +327,7 @@ func (m *ForwardManager) RemoveInterface(ifName string) {
 	}
 }
 
-func (m *ForwardManager) removeInterfaceForFamily(ipt *iptables.IPTables, family, ifName string) {
+func (m *ForwardManager) removeInterfaceForFamily(ipt forwardIPTables, family, ifName string) {
 	jRule := jumpRule(ifName)
 	if err := ipt.DeleteIfExists("filter", "FORWARD", jRule...); err != nil {
 		klog.V(4).Infof("ForwardManager: failed to remove %s FORWARD jump for %s: %v", family, ifName, err)
@@ -199,14 +358,14 @@ func (m *ForwardManager) Cleanup() {
 	klog.V(2).Info("ForwardManager: cleaned up forward chain and rules")
 }
 
-func (m *ForwardManager) cleanupFamily(ipt *iptables.IPTables, family string) {
+func (m *ForwardManager) cleanupFamily(ipt forwardIPTables, family string) {
 	// Remove all jump rules from FORWARD that reference our chain.
 	rules, err := ipt.List("filter", "FORWARD")
 	if err != nil {
 		klog.Warningf("ForwardManager: failed to list %s FORWARD rules for cleanup: %v", family, err)
 	} else {
 		for _, rule := range rules {
-			if !strings.Contains(rule, forwardChain) || !strings.Contains(rule, forwardComment) {
+			if !strings.Contains(rule, forwardChain) || (!strings.Contains(rule, forwardComment) && !strings.Contains(rule, nativeForwardComment)) {
 				continue
 			}
 
@@ -214,6 +373,19 @@ func (m *ForwardManager) cleanupFamily(ipt *iptables.IPTables, family string) {
 			ifName := parseInterfaceFromRule(rule, "-i")
 			if ifName != "" {
 				jRule := jumpRule(ifName)
+
+				if strings.Contains(rule, nativeForwardComment) {
+					prefix := parseInterfaceFromRule(rule, "-s")
+					if prefix == "" {
+						prefix = "0.0.0.0/0"
+						if family == "IPv6" {
+							prefix = "::/0"
+						}
+					}
+
+					jRule = nativeForwardRule(ifName, prefix, true)
+				}
+
 				if delErr := ipt.DeleteIfExists("filter", "FORWARD", jRule...); delErr != nil {
 					klog.V(4).Infof("ForwardManager: failed to remove %s FORWARD jump for %s during cleanup: %v", family, ifName, delErr)
 				}
@@ -243,7 +415,7 @@ func (m *ForwardManager) cleanupFamily(ipt *iptables.IPTables, family string) {
 // cleanupLegacyRules removes old-style per-interface FORWARD ACCEPT rules
 // from previous agent versions. These rules have the comment
 // "unbounded-net: accept tunnel traffic".
-func (m *ForwardManager) cleanupLegacyRules(ipt *iptables.IPTables, family string) {
+func (m *ForwardManager) cleanupLegacyRules(ipt forwardIPTables, family string) {
 	rules, err := ipt.List("filter", "FORWARD")
 	if err != nil {
 		klog.V(4).Infof("ForwardManager: failed to list %s FORWARD rules for legacy cleanup: %v", family, err)

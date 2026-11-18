@@ -78,7 +78,10 @@ func (m *Manager) Start(ctx context.Context) error {
 	m.mu.RLock()
 
 	for _, s := range m.sessions {
-		s.conn = conn
+		if !s.ownsConn {
+			s.conn = conn
+		}
+
 		s.start(ctx)
 	}
 
@@ -118,6 +121,14 @@ func (m *Manager) Stop() {
 // AddPeer registers a new peer for health checking. If the manager is
 // already running, the session starts immediately.
 func (m *Manager) AddPeer(peerHostname string, overlayIP net.IP, settings HealthCheckSettings) error {
+	return m.AddScopedPeer(peerHostname, peerHostname, overlayIP, settings)
+}
+
+// AddScopedPeer keeps relationship-specific settings and probe replies separate
+// while addressing the remote node by its actual hostname on the wire.
+func (m *Manager) AddScopedPeer(peerID, remoteHostname string, overlayIP net.IP, settings HealthCheckSettings) error {
+	peerHostname := peerID
+
 	if err := settings.validate(); err != nil {
 		return err
 	}
@@ -127,7 +138,7 @@ func (m *Manager) AddPeer(peerHostname string, overlayIP net.IP, settings Health
 
 	m.mu.Lock()
 	if existing, exists := m.sessions[peerHostname]; exists {
-		if existing.overlayIP.Equal(overlayIP) {
+		if existing.overlayIP.Equal(overlayIP) && existing.remoteHostname == remoteHostname {
 			existing.updateSettings(settings)
 			m.mu.Unlock()
 
@@ -152,11 +163,26 @@ func (m *Manager) AddPeer(peerHostname string, overlayIP net.IP, settings Health
 		onChange:      m.onStateChange,
 		conn:          m.conn,
 	})
+
+	s.remoteHostname = remoteHostname
+	if peerID != remoteHostname {
+		conn, err := net.ListenPacket("udp", ":0")
+		if err != nil {
+			return fmt.Errorf("open scoped health check socket: %w", err)
+		}
+
+		s.conn = conn
+		s.ownsConn = true
+	}
+
 	m.sessions[peerHostname] = s
 
 	// If manager is already running (conn is set), start the session now.
 	if m.conn != nil {
-		s.conn = m.conn
+		if !s.ownsConn {
+			s.conn = m.conn
+		}
+
 		s.start(m.ctx)
 	}
 

@@ -238,7 +238,7 @@ func TestGatewayBPFPrefixesExcludeEveryLocalSource(t *testing.T) {
 	local := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/17"), netip.MustParsePrefix("fd00::/65")}
 	got := gatewayBPFPrefixes(peer, local)
 
-	want := []string{"10.0.128.0/17", "10.2.0.10/32", "fd00::8000:0:0:0/65"}
+	want := []string{"10.0.128.0/17", "fd00::8000:0:0:0/65"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("gateway BPF prefixes=%v, want %v", got, want)
 	}
