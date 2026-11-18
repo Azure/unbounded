@@ -11,7 +11,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -26,9 +25,12 @@ import (
 type Publisher struct {
 	Client   kubernetes.Interface
 	NodeName string
-	// HostDir holds the host's machine-id and os-release, which Unbounded's
-	// host agent mounts read-only into the node's nspawn machine.
-	HostDir string
+	// MachineIDPath is the host's /etc/machine-id, which Unbounded's host
+	// agent binds read-only into the node's nspawn machine.
+	MachineIDPath string
+	// OSReleasePath is the host's os-release, which systemd-nspawn binds
+	// into every machine.
+	OSReleasePath string
 	// VersionKey is the os-release key the agent reads its version from.
 	VersionKey string
 	// Annotation is the agent-info annotation's key.
@@ -39,12 +41,12 @@ type Publisher struct {
 // Read returns the agent-info for the host's files: the instance ID the agent
 // sends Nebraska, and the version it reports.
 func (p *Publisher) Read() (identity.AgentInfo, error) {
-	machineID, err := os.ReadFile(filepath.Join(p.HostDir, "machine-id"))
+	machineID, err := os.ReadFile(p.MachineIDPath)
 	if err != nil {
 		return identity.AgentInfo{}, fmt.Errorf("read the host's machine ID: %w", err)
 	}
 
-	osRelease, err := os.ReadFile(filepath.Join(p.HostDir, "os-release"))
+	osRelease, err := os.ReadFile(p.OSReleasePath)
 	if err != nil {
 		return identity.AgentInfo{}, fmt.Errorf("read the host's os-release: %w", err)
 	}

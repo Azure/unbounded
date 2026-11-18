@@ -17,6 +17,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/centerpivot"
 )
 
 // Scheduler hands out update slots (designs/centerpivot.md, section 4.2). It
@@ -110,7 +111,7 @@ func (s *Scheduler) Schedule(ctx context.Context) error {
 		siteName := siteOf(node, machine)
 
 		slots := sites[siteName]
-		if slots == nil || (node.Labels[ManagedLabel] != "true" && !state.Phase.Updating()) {
+		if slots == nil || (node.Labels[centerpivot.ManagedLabel] != "true" && !state.Phase.Updating()) {
 			continue
 		}
 
@@ -132,8 +133,8 @@ func (s *Scheduler) Schedule(ctx context.Context) error {
 			continue
 		}
 
-		if state.Phase == PhaseIdle && node.Labels[PausedLabel] != "true" && due(node, state, slots.settings, now) {
-			slots.due = append(slots.due, candidate{machine: machine, state: state, canary: node.Labels[CanaryLabel] == "true", name: node.Name})
+		if state.Phase == PhaseIdle && node.Labels[centerpivot.PausedLabel] != "true" && due(node, state, slots.settings, now) {
+			slots.due = append(slots.due, candidate{machine: machine, state: state, canary: node.Labels[centerpivot.CanaryLabel] == "true", name: node.Name})
 		}
 	}
 

@@ -27,6 +27,7 @@ import (
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	centerpivotmanifests "github.com/Azure/unbounded/deploy/centerpivot"
+	cp "github.com/Azure/unbounded/internal/centerpivot"
 	"github.com/Azure/unbounded/internal/operator/component"
 )
 
@@ -35,10 +36,6 @@ const (
 	nodeInfoName         = "centerpivot-node-info"
 	nodePolicyName       = "centerpivot-node-restriction"
 	configHashAnnotation = "unbounded-cloud.io/centerpivot-config-hash"
-
-	// stateAnnotation is the Machine annotation centerpivot keeps each node's
-	// state in (controller.StateAnnotation in internal/centerpivot).
-	stateAnnotation = "centerpivot.unbounded-cloud.io/state"
 
 	// ReasonUpdatesHeld reports that no update starts while a node is held.
 	ReasonUpdatesHeld = "UpdatesHeld"
@@ -223,13 +220,13 @@ func heldResult(ctx context.Context, env *component.Env) (component.Result, erro
 
 	return component.NotReady(ReasonUpdatesHeld, fmt.Sprintf(
 		"no update starts while Machine %s is held (%d held): %s. Remove its %s annotation to clear the hold",
-		held[0], len(held), reasons[held[0]], stateAnnotation,
+		held[0], len(held), reasons[held[0]], cp.StateAnnotation,
 	)), nil
 }
 
 // heldReason returns why a Machine's node is held, if it is.
 func heldReason(annotations map[string]string) (string, bool) {
-	value, ok := annotations[stateAnnotation]
+	value, ok := annotations[cp.StateAnnotation]
 	if !ok {
 		return "", false
 	}

@@ -19,25 +19,28 @@ import (
 
 const annotation = "centerpivot.unbounded-cloud.io/agent-info"
 
-func hostFiles(t *testing.T, version string) string {
+// hostFiles writes a host's machine-id and os-release, and returns a
+// publisher reading them.
+func hostFiles(t *testing.T, client *fake.Clientset, version string) *Publisher {
 	t.Helper()
 
 	dir := t.TempDir()
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "machine-id"), []byte("34a267d412544d6a9e97b5ba6762f6e7\n"), 0o600))
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "os-release"),
-		[]byte("NAME=\"Microsoft Azure Container Linux\"\nIMAGE_VERSION="+version+"\n"), 0o600))
+	machineID, osRelease := filepath.Join(dir, "machine-id"), filepath.Join(dir, "os-release")
+	require.NoError(t, os.WriteFile(machineID, []byte("34a267d412544d6a9e97b5ba6762f6e7\n"), 0o600))
+	require.NoError(t, os.WriteFile(osRelease,
+		[]byte("NAME=\"Microsoft Azure Container Linux\"\nVERSION_ID="+version+"\nBUILD_ID=1247604\n"), 0o600))
 
-	return dir
+	return &Publisher{
+		Client: client, NodeName: "acl-1", MachineIDPath: machineID, OSReleasePath: osRelease,
+		VersionKey: "VERSION_ID", Annotation: annotation, Log: logr.Discard(),
+	}
 }
 
 func TestPublish(t *testing.T) {
 	t.Parallel()
 
 	client := fake.NewClientset(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "acl-1"}})
-	publisher := &Publisher{
-		Client: client, NodeName: "acl-1", HostDir: hostFiles(t, "202606.29.0"),
-		VersionKey: "IMAGE_VERSION", Annotation: annotation, Log: logr.Discard(),
-	}
+	publisher := hostFiles(t, client, "3.0.20261104")
 
 	require.NoError(t, publisher.Publish(t.Context()))
 
@@ -46,7 +49,7 @@ func TestPublish(t *testing.T) {
 	assert.JSONEq(t, `{
 		"schemaVersion": "1.0",
 		"machineId": "ebb9a2bb-9365-d34e-133f-8da0664e7366",
-		"currentVersion": "202606.29.0"
+		"currentVersion": "3.0.20261104"
 	}`, node.Annotations[annotation])
 
 	client.ClearActions()
@@ -57,22 +60,20 @@ func TestPublish(t *testing.T) {
 		assert.False(t, patched, "an unchanged agent-info isn't written again")
 	}
 
-	publisher.HostDir = hostFiles(t, "202607.13.0")
+	publisher = hostFiles(t, client, "3.0.20261106")
 	require.NoError(t, publisher.Publish(t.Context()))
 
 	node, err = client.CoreV1().Nodes().Get(t.Context(), "acl-1", metav1.GetOptions{})
 	require.NoError(t, err)
-	assert.Contains(t, node.Annotations[annotation], `"currentVersion":"202607.13.0"`, "a new version after a restart")
+	assert.Contains(t, node.Annotations[annotation], `"currentVersion":"3.0.20261106"`, "a new version after a restart")
 }
 
 func TestPublishNeedsTheHostsFiles(t *testing.T) {
 	t.Parallel()
 
 	client := fake.NewClientset(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "acl-1"}})
-	publisher := &Publisher{
-		Client: client, NodeName: "acl-1", HostDir: t.TempDir(),
-		VersionKey: "IMAGE_VERSION", Annotation: annotation, Log: logr.Discard(),
-	}
+	publisher := hostFiles(t, client, "3.0.20261104")
+	publisher.MachineIDPath = filepath.Join(t.TempDir(), "machine-id")
 
-	assert.Error(t, publisher.Publish(t.Context()), "the host agent hasn't mounted them")
+	assert.Error(t, publisher.Publish(t.Context()), "the host agent hasn't bound the machine ID")
 }

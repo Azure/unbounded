@@ -1,8 +1,9 @@
 # Publishes each managed node's Nebraska identity in its agent-info
-# annotation, until trident-acl-agent does. Unbounded's host agent mounts the
-# host's machine-id and os-release into the node's nspawn machine under
-# /run/unbounded/host. It tolerates every taint, so it runs while the node
-# restarts with centerpivot's updating taint.
+# annotation, until trident-acl-agent does. Unbounded's host agent binds the
+# host's /etc/machine-id into the node's nspawn machine at
+# /run/unbounded/host/machine-id, and systemd-nspawn binds the host's
+# os-release at /run/host/os-release. It tolerates every taint, so it runs
+# while the node restarts with centerpivot's updating taint.
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -30,7 +31,8 @@ spec:
           imagePullPolicy: Always
           args:
             - node-info
-            - --host-dir=/run/unbounded/host
+            - --machine-id-path=/run/unbounded/host/machine-id
+            - --os-release-path=/run/host/os-release
             - --version-key=VERSION_ID
           env:
             - name: NODE_NAME
@@ -52,11 +54,18 @@ spec:
             capabilities:
               drop: ["ALL"]
           volumeMounts:
-            - name: host
-              mountPath: /run/unbounded/host
+            - name: machine-id
+              mountPath: /run/unbounded/host/machine-id
+              readOnly: true
+            - name: os-release
+              mountPath: /run/host/os-release
               readOnly: true
       volumes:
-        - name: host
+        - name: machine-id
           hostPath:
-            path: /run/unbounded/host
-            type: Directory
+            path: /run/unbounded/host/machine-id
+            type: File
+        - name: os-release
+          hostPath:
+            path: /run/host/os-release
+            type: File

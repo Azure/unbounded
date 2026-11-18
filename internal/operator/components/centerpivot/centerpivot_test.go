@@ -17,6 +17,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	cp "github.com/Azure/unbounded/internal/centerpivot"
 	"github.com/Azure/unbounded/internal/centerpivot/controller"
 	"github.com/Azure/unbounded/internal/operator/component"
 )
@@ -124,13 +125,11 @@ func TestPlanRemovesEverythingWhenNoSiteEnablesIt(t *testing.T) {
 func TestPlanReportsAHeldNode(t *testing.T) {
 	t.Parallel()
 
-	require.Equal(t, controller.StateAnnotation, stateAnnotation)
-
 	held, err := controller.State{Phase: controller.PhaseHeld, Reason: "the node didn't boot 202606.29.0"}.Marshal()
 	require.NoError(t, err)
 
 	machine := &unboundedv1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{
-		Name: "acl-1", Annotations: map[string]string{controller.StateAnnotation: held},
+		Name: "acl-1", Annotations: map[string]string{cp.StateAnnotation: held},
 	}}
 
 	_, result, err := (Component{}).Plan(t.Context(), testEnv(t, machine), []unboundedv1alpha3.Site{site("edge", true)})

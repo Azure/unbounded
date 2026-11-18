@@ -13,6 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	cp "github.com/Azure/unbounded/internal/centerpivot"
 	"github.com/Azure/unbounded/internal/centerpivot/contract"
 	"github.com/Azure/unbounded/internal/centerpivot/controller"
 )
@@ -126,7 +127,7 @@ func node(annotations map[string]any, taints ...any) map[string]any {
 }
 
 func updating(effect string) map[string]any {
-	return map[string]any{"key": controller.UpdatingTaint, "effect": effect}
+	return map[string]any{"key": cp.UpdatingTaint, "effect": effect}
 }
 
 func request(t *testing.T, server, appID string) string {
@@ -144,10 +145,10 @@ func TestNodePolicy(t *testing.T) {
 
 	policy := plannedPolicy(t, nodePolicyName)
 	gpu := map[string]any{"key": "gpu", "effect": "NoSchedule"}
-	info := map[string]any{controller.AgentInfoAnnotation: "{}"}
+	info := map[string]any{cp.AgentInfoAnnotation: "{}"}
 
 	withRequest := func(value string) map[string]any {
-		return map[string]any{controller.AgentInfoAnnotation: "{}", controller.Keys.Request: value}
+		return map[string]any{cp.AgentInfoAnnotation: "{}", controller.Keys.Request: value}
 	}
 
 	tests := []struct {
@@ -171,7 +172,7 @@ func TestNodePolicy(t *testing.T) {
 		{name: "a request to another Nebraska", before: node(info), after: node(withRequest(request(t, "https://evil.example.com/v1/update", appID)))},
 		{name: "a request mixing two Sites' Nebraska", before: node(info), after: node(withRequest(request(t, server, "99999999-2222-3333-4444-555555555555")))},
 		{name: "a request to a lookalike URL", before: node(info), after: node(withRequest(request(t, server+".evil.example.com", appID)))},
-		{name: "another annotation", before: node(info), after: node(map[string]any{controller.AgentInfoAnnotation: "forged"})},
+		{name: "another annotation", before: node(info), after: node(map[string]any{cp.AgentInfoAnnotation: "forged"})},
 		{
 			name: "a label", before: node(info), after: node(info),
 			changeMetadata: func(metadata map[string]any) { metadata["labels"] = map[string]any{"kubernetes.io/arch": "arm64"} },
@@ -209,7 +210,7 @@ func TestMachinePolicy(t *testing.T) {
 	}
 	before := machine(map[string]any{"owner": "machina"}, "acl")
 
-	assert.True(t, admits(t, policy, serviceUser, "", before, machine(map[string]any{"owner": "machina", controller.StateAnnotation: "{}"}, "acl")))
+	assert.True(t, admits(t, policy, serviceUser, "", before, machine(map[string]any{"owner": "machina", cp.StateAnnotation: "{}"}, "acl")))
 	assert.False(t, admits(t, policy, serviceUser, "", before, machine(map[string]any{"owner": "centerpivot"}, "acl")))
 	assert.False(t, admits(t, policy, serviceUser, "", before, machine(map[string]any{"owner": "machina"}, "ubuntu")))
 }
@@ -220,7 +221,7 @@ func TestNodeInfoPolicy(t *testing.T) {
 	policy := plannedPolicy(t, "centerpivot-node-info-restriction")
 	before := node(map[string]any{"other": "x"})
 
-	withInfo := node(map[string]any{"other": "x", controller.AgentInfoAnnotation: "{}"})
+	withInfo := node(map[string]any{"other": "x", cp.AgentInfoAnnotation: "{}"})
 	assert.True(t, admits(t, policy, nodeInfoUser, "acl-1", before, withInfo), "its own Node's agent-info")
 	assert.False(t, admits(t, policy, nodeInfoUser, "acl-2", before, withInfo), "another Node")
 	assert.False(t, admits(t, policy, nodeInfoUser, "acl-1", before, node(map[string]any{"other": "y"})), "another annotation")

@@ -11,6 +11,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/centerpivot"
 	"github.com/Azure/unbounded/internal/centerpivot/drain"
 )
 
@@ -88,13 +89,13 @@ func SettingsFor(site *unboundedv1alpha3.Site) (Settings, bool) {
 // AppFor returns the app a node with these labels runs: the one its app label
 // names, or the Site's only app.
 func (s Settings) AppFor(labels map[string]string) (App, error) {
-	name, labeled := labels[AppLabel]
+	name, labeled := labels[centerpivot.AppLabel]
 	if !labeled {
 		if len(s.Apps) == 1 {
 			return s.Apps[0], nil
 		}
 
-		return App{}, fmt.Errorf("the node has no %s label, and the Site has %d apps", AppLabel, len(s.Apps))
+		return App{}, fmt.Errorf("the node has no %s label, and the Site has %d apps", centerpivot.AppLabel, len(s.Apps))
 	}
 
 	for _, app := range s.Apps {
@@ -103,7 +104,7 @@ func (s Settings) AppFor(labels map[string]string) (App, error) {
 		}
 	}
 
-	return App{}, fmt.Errorf("the Site has no app %q, which the node's %s label names", name, AppLabel)
+	return App{}, fmt.Errorf("the Site has no app %q, which the node's %s label names", name, centerpivot.AppLabel)
 }
 
 // Slots returns how many of managed nodes may be unavailable at once. A

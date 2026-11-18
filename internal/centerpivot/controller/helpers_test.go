@@ -20,6 +20,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/centerpivot"
 	"github.com/Azure/unbounded/internal/centerpivot/drain"
 	"github.com/Azure/unbounded/internal/centerpivot/identity"
 	"github.com/Azure/unbounded/internal/centerpivot/omaha"
@@ -87,11 +88,11 @@ func testNode(t *testing.T, name, site, version string) *corev1.Node {
 			Name: name,
 			UID:  types.UID(name + "-uid"),
 			Labels: map[string]string{
-				ManagedLabel:                          "true",
+				centerpivot.ManagedLabel:              "true",
 				unboundedv1alpha3.MachineSiteLabelKey: site,
 				corev1.LabelArchStable:                "amd64",
 			},
-			Annotations: map[string]string{AgentInfoAnnotation: value},
+			Annotations: map[string]string{centerpivot.AgentInfoAnnotation: value},
 		},
 		Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}},
 	}
@@ -106,7 +107,7 @@ func testMachine(t *testing.T, name string, state *State) *unboundedv1alpha3.Mac
 		value, err := state.Marshal()
 		require.NoError(t, err)
 
-		machine.Annotations = map[string]string{StateAnnotation: value}
+		machine.Annotations = map[string]string{centerpivot.StateAnnotation: value}
 	}
 
 	return machine

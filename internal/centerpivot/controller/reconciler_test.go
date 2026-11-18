@@ -19,6 +19,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/centerpivot"
 	"github.com/Azure/unbounded/internal/centerpivot/contract"
 	"github.com/Azure/unbounded/internal/centerpivot/drain"
 	"github.com/Azure/unbounded/internal/centerpivot/omaha"
@@ -113,7 +114,7 @@ func (h *harness) agentRestartsInto(version string, code contract.Code) {
 
 	h.agentAnswers(Keys.CommitStatus, code)
 	h.updateNode(func(node *corev1.Node) {
-		node.Annotations[AgentInfoAnnotation] = testNode(h.t, "acl-1", "edge", version).Annotations[AgentInfoAnnotation]
+		node.Annotations[centerpivot.AgentInfoAnnotation] = testNode(h.t, "acl-1", "edge", version).Annotations[centerpivot.AgentInfoAnnotation]
 	})
 }
 
@@ -432,7 +433,7 @@ func TestClearingAHoldRemovesTheTaint(t *testing.T) {
 	require.True(t, h.tainted())
 
 	machine := machineOf(t, h.client, "acl-1")
-	delete(machine.Annotations, StateAnnotation)
+	delete(machine.Annotations, centerpivot.StateAnnotation)
 	require.NoError(t, h.client.Update(t.Context(), machine))
 
 	assert.Equal(t, PhaseIdle, h.reconcile().Phase)
@@ -447,7 +448,7 @@ func TestANodeNeverGivenASlotKeepsNoState(t *testing.T) {
 
 	_, err := r.Reconcile(t.Context(), reconcile.Request{NamespacedName: types.NamespacedName{Name: "acl-1"}})
 	require.NoError(t, err)
-	assert.NotContains(t, machineOf(t, c, "acl-1").Annotations, StateAnnotation)
+	assert.NotContains(t, machineOf(t, c, "acl-1").Annotations, centerpivot.StateAnnotation)
 }
 
 func TestTheNodesAppLabelChoosesItsApp(t *testing.T) {
@@ -458,7 +459,7 @@ func TestTheNodesAppLabelChoosesItsApp(t *testing.T) {
 		unboundedv1alpha3.CenterPivotApp{Name: "acl-nvidia", AppID: nvidiaApp, DefaultTrack: "gpu-stable"})
 
 	gpu := testNode(t, "gpu-1", "edge", running)
-	gpu.Labels[AppLabel] = "acl-nvidia"
+	gpu.Labels[centerpivot.AppLabel] = "acl-nvidia"
 
 	c := testClient(t, site,
 		gpu, testMachine(t, "gpu-1", &State{Phase: PhaseChecking}),
