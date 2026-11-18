@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -191,7 +192,12 @@ func run(ctx context.Context, log *slog.Logger, opts runOptions) error {
 		log.Warn("failed to publish and clear AgentUpgrade daemon signals", "error", err)
 	}
 
-	if err := publishHostSoftReboots(ctx, log, kubeClient, active.Config.MachineName, runOpts.NodeOperator.BootID); err != nil {
+	rebootHandler, err := newHostSoftRebootHandler(kubeClient, kubeClient, log, active.Config.MachineName, active.Config.NodeName, runOpts.NodeOperator, &atomic.Bool{})
+	if err != nil {
+		return fmt.Errorf("create HostSoftReboot handler: %w", err)
+	}
+
+	if err := rebootHandler.PublishStartup(ctx); err != nil {
 		log.Warn("failed to report HostSoftReboot operations", "error", err)
 	}
 

@@ -228,7 +228,7 @@ func TestReconcileHostSoftReboot_ReadsMachineFromAPIReader(t *testing.T) {
 
 	op := &fakeNodeOperator{bootID: "boot-1"}
 	c := fakeStatusClient(cached, hostSoftRebootOperation("op-soft"))
-	apiReader := fakeStatusClient(fresh, outOfBand)
+	apiReader := fakeStatusClient(fresh, outOfBand, hostSoftRebootOperation("op-soft"))
 	reconciler := newTestMachinaMachineOperationReconcilerWithLockPath(
 		t, c, op, filepath.Join(t.TempDir(), "agent-upgrade.lock"), apiReader,
 	)
@@ -280,7 +280,7 @@ func TestIsOutOfBandHostOperation(t *testing.T) {
 	}
 
 	for kind, want := range tests {
-		assert.Equal(t, want, isOutOfBandHostOperation(kind), kind)
+		assert.Equal(t, want, isOutOfBandHostOperation(t, kind), kind)
 	}
 }
 
@@ -463,7 +463,7 @@ func TestHostOperationUnfinishedOn(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, hostOperationUnfinishedOn(tt.op, machine))
+			assert.Equal(t, tt.want, hostOperationUnfinishedOn(t, tt.op, machine))
 		})
 	}
 }

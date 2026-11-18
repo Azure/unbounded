@@ -306,7 +306,7 @@ func (hostOperator) StopDaemon(ctx context.Context, log *slog.Logger) error {
 }
 
 func (hostOperator) BootID() (string, error) {
-	return readBootID()
+	return daemon.ReadBootID()
 }
 
 func (hostOperator) RebootHost(ctx context.Context, log *slog.Logger) error {
