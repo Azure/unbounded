@@ -37,6 +37,46 @@ func getGatewayIPFromCIDR(cidr string) net.IP {
 	return result
 }
 
+func managedPodCIDRAddresses(cidrs []string, manageCniPlugin bool) []string {
+	if !manageCniPlugin {
+		return nil
+	}
+
+	var addresses []string
+
+	for _, cidr := range cidrs {
+		if ip := getGatewayIPFromCIDR(cidr); ip != nil {
+			addresses = append(addresses, ipToHostCIDR(ip.String()))
+		}
+	}
+
+	return addresses
+}
+
+func syncPodCIDRAddresses(manager interface {
+	SyncAddresses([]string, bool) (int, int, error)
+}, cidrs []string, manageCniPlugin bool,
+) error {
+	_, _, err := manager.SyncAddresses(managedPodCIDRAddresses(cidrs, manageCniPlugin), false)
+	return err
+}
+
+func peerHealthIPs(podCIDRs, internalIPs []string, unmanagedCNI bool) []string {
+	if !unmanagedCNI {
+		return getHealthIPsFromPodCIDRs(podCIDRs)
+	}
+
+	var result []string
+
+	for _, address := range internalIPs {
+		if ip := net.ParseIP(address); ip != nil {
+			result = append(result, ip.String())
+		}
+	}
+
+	return dedupeStrings(result)
+}
+
 // ipToHostCIDR converts an IP address to a host CIDR (/32 for IPv4, /128 for IPv6)
 func ipToHostCIDR(ipStr string) string {
 	ip := net.ParseIP(ipStr)

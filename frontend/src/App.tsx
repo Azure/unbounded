@@ -273,6 +273,7 @@ export default function App() {
             onLoad={loadNodeDetail}
             allNodeNames={allNodeNames}
             gatewayByNode={gatewayByNode}
+            sites={sites}
             nodeK8sStatusMap={nodeK8sStatusMap}
             azureTenantId={summary?.azureTenantId}
             pullEnabled={effectivePullEnabled}
@@ -495,6 +496,7 @@ export default function App() {
             onLoad={loadNodeDetail}
             allNodeNames={allNodeNames}
             gatewayByNode={gatewayByNode}
+            sites={sites}
             nodeK8sStatusMap={nodeK8sStatusMap}
             azureTenantId={summary?.azureTenantId}
             pullEnabled={effectivePullEnabled}

@@ -20,13 +20,12 @@ import (
 	unboundednetnetlink "github.com/Azure/unbounded/internal/net/netlink"
 )
 
-// unbounded0DeviceName is the dedicated dummy interface for the eBPF tunnel
-// dataplane. It has NOARP set so the kernel sends packets directly without
-// neighbor resolution. TC egress BPF intercepts and redirects to the tunnel.
-// This name is fixed (not configurable); the agent owns the device end to
-// end and validateTunnelInterfaceNames refuses any tunnel-interface flag
-// that collides with it.
-const unbounded0DeviceName = "unbounded0"
+// The frontend owns routes and addresses so an external CNI can process
+// packets before normal MACVLAN transmission reaches the backend's BPF hook.
+const (
+	unbounded0DeviceName = "unbounded0"
+	unbounded1DeviceName = "unbounded1"
+)
 
 // buildSupernetRoutes returns the unbounded0 routes that attract overlay
 // traffic into the eBPF dataplane. One route per CIDR is emitted regardless
@@ -74,7 +73,7 @@ func buildSupernetRoutes(cfg *config, state *wireGuardState, meshPeers []meshPee
 	return routes
 }
 
-// unbounded0 dummy device with TC egress for tunnel encapsulation.
+// ensureTunnelMap separates external-CNI processing from encapsulation.
 func ensureTunnelMap(cfg *config, state *wireGuardState) (*ebpfpkg.TunnelMap, error) {
 	if state.tunnelMap == nil {
 		tm, err := ebpfpkg.NewTunnelMap(ebpfpkg.TunnelMapOptions{
@@ -89,50 +88,39 @@ func ensureTunnelMap(cfg *config, state *wireGuardState) (*ebpfpkg.TunnelMap, er
 
 	tm := state.tunnelMap
 
-	if !tm.Attached() {
-		// Create unbounded0 dummy interface with NOARP.
-		// NOARP means the kernel sends packets directly without ARP/neighbor
-		// resolution -- no static neighbor entries needed.
-		devLM := unboundednetnetlink.NewLinkManager(unbounded0DeviceName)
-		if err := devLM.EnsureDummyInterface(); err != nil {
-			klog.V(2).Infof("eBPF: could not create %s (will retry): %v", unbounded0DeviceName, err)
-			return tm, nil
-		}
+	backend := unboundednetnetlink.NewLinkManager(unbounded1DeviceName)
+	if link, err := netlink.LinkByName(unbounded1DeviceName); err == nil && link.Type() != "dummy" {
+		return nil, fmt.Errorf("%s must be a dummy interface, got %s", unbounded1DeviceName, link.Type())
+	}
 
-		// Load TC egress (unbounded_encap) on unbounded0.
-		// No ARP responder needed -- NOARP bypasses neighbor resolution.
-		if attachErr := tm.AttachToInterface(unbounded0DeviceName); attachErr != nil {
-			klog.V(2).Infof("eBPF TC not yet on %s (will retry): %v", unbounded0DeviceName, attachErr)
+	if err := backend.EnsureDummyInterface(); err != nil {
+		return nil, err
+	}
+
+	if err := backend.EnsureUnnumbered(); err != nil {
+		return nil, fmt.Errorf("clear backend addresses: %w", err)
+	}
+
+	// Migrate the previous single-device datapath. The reserved dummy
+	// belongs to this agent; reject other unexpected frontend types.
+	if link, err := netlink.LinkByName(unbounded0DeviceName); err == nil && link.Type() == "dummy" {
+		if err := netlink.LinkDel(link); err != nil {
+			return nil, fmt.Errorf("replace legacy %s: %w", unbounded0DeviceName, err)
 		}
 	}
 
-	// Assign podCIDR gateway IPs to unbounded0 as /32 addresses.
-	// These serve as source IPs for overlay-destined traffic.
-	// This runs on every reconcile (not just first attach) so that
-	// transient address sync failures are retried.
-	{
-		devLM := unboundednetnetlink.NewLinkManager(unbounded0DeviceName)
+	if err := unboundednetnetlink.NewLinkManager(unbounded0DeviceName).EnsurePrivateMACVLANInterface(unbounded1DeviceName); err != nil {
+		return nil, err
+	}
 
-		var devAddrs []string
+	if err := tm.AttachToInterface(unbounded1DeviceName); err != nil {
+		return nil, err
+	}
 
-		for _, cidr := range state.nodePodCIDRs {
-			gwIP := getGatewayIPFromCIDR(cidr)
-			if gwIP == nil {
-				continue
-			}
-
-			if gwIP.To4() != nil {
-				devAddrs = append(devAddrs, gwIP.String()+"/32")
-			} else {
-				devAddrs = append(devAddrs, gwIP.String()+"/128")
-			}
-		}
-
-		if len(devAddrs) > 0 {
-			if _, _, err := devLM.SyncAddresses(devAddrs, false); err != nil {
-				klog.Warningf("eBPF: failed to sync addresses on %s: %v", unbounded0DeviceName, err)
-			}
-		}
+	// External CNI ranges do not reserve gateway addresses for Unbounded.
+	devLM := unboundednetnetlink.NewLinkManager(unbounded0DeviceName)
+	if err := syncPodCIDRAddresses(devLM, state.nodePodCIDRs, state.manageCniPlugin); err != nil {
+		klog.Warningf("eBPF: failed to sync addresses on %s: %v", unbounded0DeviceName, err)
 	}
 
 	return tm, nil
@@ -208,7 +196,7 @@ func configureTunnelPeers(
 	// Do NOT early-return when both peer lists are empty. Even when
 	// there are no tunnel-protocol peers (e.g. WG-only gateway
 	// assignment), this function must still:
-	//   1. Create the unbounded0 dummy interface + load the TC BPF program
+	//   1. Create the MACVLAN frontend and dummy backend with TC BPF
 	//   2. Build supernet routes on unbounded0 (from collectSupernets)
 	//   3. Clean up stale tunnel interfaces from previous runs
 	// Without this, WG-only remote nodes never get the eBPF
@@ -448,7 +436,7 @@ func configureTunnelPeers(
 		}
 	}
 
-	// Ensure shared eBPF tunnel map + TC on unbounded0.
+	// Ensure shared eBPF tunnel map + TC on unbounded1.
 	_, err := ensureTunnelMap(cfg, state)
 	if err != nil {
 		return nil, nil, err
@@ -814,7 +802,7 @@ func reconcilePendingBPFEntries(state *wireGuardState) {
 
 // peerIfaceName returns the shared tunnel interface name for any gateway
 // peer based on its tunnel protocol. All peers using the same protocol
-// share one flow-based interface; the BPF program on unbounded0 selects
+// share one flow-based interface; the BPF program on unbounded1 selects
 // the per-peer underlay endpoint from the LPM trie.
 func peerIfaceName(cfg *config, gwPeer gatewayPeerInfo) string {
 	switch gwPeer.TunnelProtocol {
@@ -1043,7 +1031,7 @@ func filterPeersByTunnelProtocol(meshPeers []meshPeerInfo, gatewayPeers []gatewa
 // Without this sweep, renaming via --geneve-interface or --vxlan-interface
 // would fail to fully take effect: the old device would remain bound to
 // the configured port and would interfere with the new device, including
-// the flow-based dispatch by the BPF program on unbounded0.
+// the flow-based dispatch by the BPF program on unbounded1.
 //
 // CRITICAL: we deliberately key on the configured UDP port (Dport for
 // GENEVE, Port for VXLAN). The whole motivation for letting operators

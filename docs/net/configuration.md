@@ -409,10 +409,10 @@ The three shared tunnel device names (`geneve0`, `vxlan0`, `ipip0`) and the per-
 
 Constraints (enforced at startup; the agent fails to start otherwise):
 
-* Shared tunnel names (`--geneve-interface`, `--vxlan-interface`, `--ipip-interface`): non-empty, at most 15 bytes (Linux IFNAMSIZ limit), pairwise distinct, must not equal `unbounded0`.
-* WireGuard prefix (`--wireguard-interface-prefix`): non-empty, at most 10 bytes (so that `prefix + 5-digit UDP port` still fits in IFNAMSIZ), must not contain `/`, must not equal `unbounded0`.
+* Shared tunnel names (`--geneve-interface`, `--vxlan-interface`, `--ipip-interface`): non-empty, at most 15 bytes (Linux IFNAMSIZ limit), pairwise distinct, must not equal `unbounded0` or `unbounded1`.
+* WireGuard prefix (`--wireguard-interface-prefix`): non-empty, at most 10 bytes (so that `prefix + 5-digit UDP port` still fits in IFNAMSIZ), must not contain `/`, must not equal `unbounded0` or `unbounded1`.
 
-The dedicated `unbounded0` dummy interface used by the eBPF dataplane is not configurable.
+The dedicated `unbounded0` MACVLAN frontend and `unbounded1` dummy backend are not configurable.
 
 **Renaming an existing deployment**: when the agent starts and detects that a previously-managed device exists under a different name, it cleans up that device automatically, but only for devices it can confidently identify as having been created by a previous unbounded-net agent run:
 
@@ -422,7 +422,7 @@ The dedicated `unbounded0` dummy interface used by the eBPF dataplane is not con
 
 ### Tunnel Dataplane
 
-The node agent uses an eBPF dataplane: a single `unbounded0` interface with TC egress programs and an LPM trie that maps destination CIDRs to tunnel endpoints (GENEVE, IPIP, VXLAN, or WireGuard).
+The node agent routes traffic to private MACVLAN `unbounded0`. After external-CNI frontend processing, normal transmission reaches unnumbered dummy `unbounded1`, whose TC egress program uses an LPM trie to select tunnel endpoints (GENEVE, IPIP, VXLAN, or WireGuard).
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
@@ -756,9 +756,13 @@ have Unbounded manage same-site PodCIDR routes without managing the CNI
 configuration. The default remains false for unmanaged CNI sites. A Site
 with `tunnelProtocol: None` requires an underlay that routes unencapsulated
 PodCIDR traffic between peers. Otherwise, select an encapsulated transport.
-For delegated Cilium with Unbounded-managed routes, limit Cilium's managed
-devices to its underlay interface (for example, Helm `devices=eth0`), so it
-does not replace the TC programs on Unbounded's tunnel interfaces.
+Unbounded separates CNI processing from encapsulation: routes and, for
+managed-CNI Sites only, gateway addresses live on private MACVLAN `unbounded0`,
+whose lower device is the unnumbered dummy `unbounded1`. Cilium can process frontend egress before normal
+MACVLAN transmission reaches Unbounded's backend TC program. WireGuard devices
+are also unnumbered; managed-CNI gateway source addresses remain on `unbounded0`.
+Keep Cilium's device autodetection enabled rather than explicitly selecting
+`unbounded1` or transport devices. No shared-hook TC priority ordering is needed.
 
 **Migration:** The allocation gate only applies after the runtime loads a
 conflist that invokes `unbounded-ipam`. Install the binary, replace the active
@@ -766,6 +770,13 @@ configuration, and verify your runtime has reloaded it; follow your runtime's
 reload/restart procedure when necessary. A cached legacy conflist invoking
 host-local directly still bypasses the gate. The agent does not restart the
 runtime or evict existing pods.
+
+For managed Cilium integration, the staged
+`unbounded0`/`unbounded1` datapath gives Cilium and Unbounded separate egress
+hooks. The agent replaces its legacy `unbounded0` dummy with the private MACVLAN
+on upgrade, then reconciles addresses and routes. This briefly interrupts the
+old datapath; unexpected existing interface types or MACVLAN parents are
+rejected instead of replaced.
 
 **Scope:** Verification is performed at startup, not before each ADD. An agent
 restart requires verification again, but a temporary API outage after verified

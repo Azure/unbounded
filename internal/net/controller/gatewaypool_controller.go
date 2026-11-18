@@ -79,6 +79,8 @@ type GatewayPoolController struct {
 	gatewayNodeInformer cache.SharedIndexInformer
 	gatewayNodeSynced   cache.InformerSynced
 
+	siteInformer cache.SharedIndexInformer
+
 	// workqueue for gateway pool reconciliation
 	workqueue workqueue.TypedRateLimitingInterface[string]
 
@@ -104,6 +106,7 @@ func NewGatewayPoolController(
 ) (*GatewayPoolController, error) {
 	gatewayPoolInformer := dynamicInformerFactory.ForResource(gatewayPoolGVR).Informer()
 	gatewayNodeInformer := dynamicInformerFactory.ForResource(gatewayNodeGVR).Informer()
+	siteInformer := dynamicInformerFactory.ForResource(siteGVR).Informer()
 
 	nodeInformer := nodeInformerFactory.Core().V1().Nodes()
 
@@ -116,6 +119,7 @@ func NewGatewayPoolController(
 		gatewayPoolSynced:   gatewayPoolInformer.HasSynced,
 		gatewayNodeInformer: gatewayNodeInformer,
 		gatewayNodeSynced:   gatewayNodeInformer.HasSynced,
+		siteInformer:        siteInformer,
 		workqueue:           workqueue.NewTypedRateLimitingQueueWithConfig(workqueue.DefaultTypedControllerRateLimiter[string](), workqueue.TypedRateLimitingQueueConfig[string]{Name: "GatewayPools"}),
 		gwPortAllocated:     make(map[int32]string),
 		gwPortByNode:        make(map[string]int32),
@@ -173,7 +177,32 @@ func NewGatewayPoolController(
 		return nil, fmt.Errorf("failed to add gateway pool event handler: %w", err)
 	}
 
+	if _, err := siteInformer.AddEventHandler(gc.siteEventHandler()); err != nil {
+		return nil, fmt.Errorf("failed to add site event handler: %w", err)
+	}
+
 	return gc, nil
+}
+
+func (gc *GatewayPoolController) siteEventHandler() cache.ResourceEventHandlerFuncs {
+	enqueuePools := func(interface{}) {
+		for _, pool := range gc.gatewayPoolInformer.GetStore().List() {
+			gc.enqueuePool(pool)
+		}
+	}
+
+	return cache.ResourceEventHandlerFuncs{
+		AddFunc: enqueuePools,
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			oldSite, oldOK := oldObj.(*unstructured.Unstructured)
+
+			newSite, newOK := newObj.(*unstructured.Unstructured)
+			if oldOK && newOK && !reflect.DeepEqual(oldSite.Object["spec"], newSite.Object["spec"]) {
+				enqueuePools(newObj)
+			}
+		},
+		DeleteFunc: enqueuePools,
+	}
 }
 
 func nodeFromDeleteEvent(obj interface{}) *corev1.Node {
@@ -204,7 +233,7 @@ func (gc *GatewayPoolController) Run(ctx context.Context, workers int) error {
 	// Wait for caches to sync
 	klog.Info("Waiting for GatewayPool informer caches to sync")
 
-	if ok := cache.WaitForCacheSync(ctx.Done(), gc.nodeSynced, gc.gatewayPoolSynced, gc.gatewayNodeSynced); !ok {
+	if ok := cache.WaitForCacheSync(ctx.Done(), gc.nodeSynced, gc.gatewayPoolSynced, gc.gatewayNodeSynced, gc.siteInformer.HasSynced); !ok {
 		return fmt.Errorf("failed to wait for caches to sync")
 	}
 
@@ -541,8 +570,10 @@ func (gc *GatewayPoolController) syncPool(ctx context.Context, poolName string) 
 		// Get site name from node label
 		siteName := NodeSiteLabel(node)
 
-		// Calculate health endpoint IPs from podCIDRs (first IP of each CIDR is the gateway IP)
-		healthEndpoints := getHealthIPsFromPodCIDRs(node.Spec.PodCIDRs)
+		healthEndpoints, err := gc.healthEndpointsForNode(node)
+		if err != nil {
+			return err
+		}
 
 		matchingNodes = append(matchingNodes, unboundednetv1alpha1.GatewayNodeInfo{
 			Name:                 node.Name,
@@ -1088,6 +1119,36 @@ func gatewayNodesEqual(a, b []unboundednetv1alpha1.GatewayNodeInfo) bool {
 	}
 
 	return true
+}
+
+func (gc *GatewayPoolController) healthEndpointsForNode(node *corev1.Node) ([]string, error) {
+	siteName := NodeSiteLabel(node)
+	if gc.siteInformer != nil && siteName != "" {
+		obj, exists, err := gc.siteInformer.GetStore().GetByKey(siteName)
+		if err != nil {
+			return nil, fmt.Errorf("get Site %s for gateway health endpoints: %w", siteName, err)
+		}
+
+		if !exists {
+			return nil, fmt.Errorf("site %s is missing for gateway node %s", siteName, node.Name)
+		}
+
+		site, ok := obj.(*unstructured.Unstructured)
+		if !ok {
+			return nil, fmt.Errorf("unexpected Site type %T", obj)
+		}
+
+		managed, found, err := unstructured.NestedBool(site.Object, "spec", "manageCniPlugin")
+		if err != nil {
+			return nil, fmt.Errorf("read CNI ownership for Site %s: %w", siteName, err)
+		}
+
+		if found && !managed {
+			return getNodeInternalIPs(node), nil
+		}
+	}
+
+	return getHealthIPsFromPodCIDRs(node.Spec.PodCIDRs), nil
 }
 
 // getHealthIPsFromPodCIDRs returns health check IP addresses for each podCIDR.

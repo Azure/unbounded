@@ -114,7 +114,7 @@ type wireGuardState struct {
 	// Notrack manager for skipping conntrack on transit traffic (gateway nodes only)
 	notrackManager *unboundednetnetlink.NotrackManager
 
-	// tunnelMap is the eBPF LPM trie on unbounded0 that holds per-CIDR
+	// tunnelMap is the eBPF LPM trie on unbounded1 that holds per-CIDR
 	// tunnel endpoint entries for every peer (GENEVE/VXLAN/IPIP/WG/None).
 	tunnelMap *ebpfpkg.TunnelMap
 
@@ -194,7 +194,7 @@ type gatewayPeerInfo struct {
 	LearnedRoutes          map[string]unboundednetv1alpha1.GatewayNodeRoute
 	PodCIDRs               []string // Gateway node's podCIDRs for specific routing
 	SkipPodCIDRRoutes      bool     // Keep tunnel reachability host routes but skip explicit PodCIDR routes
-	UnmanagedCNISite       bool     // Gateway's Site has manageCniPlugin=false, so it never gets a podCIDR
+	UnmanagedCNISite       bool     // Gateway's Site delegates pod address ownership to an external CNI
 	TunnelProtocol         string   // Resolved tunnel protocol for this peer (WireGuard or GENEVE)
 	TunnelMTU              int      // Effective MTU after route, encapsulation, and CRD limits
 	TransitTunnelMTU       int      // MTU imposed by an actual downstream GatewayPoolPeering path
@@ -212,6 +212,7 @@ type meshPeerInfo struct {
 	InternalIPs            []string
 	PodCIDRs               []string
 	SkipPodCIDRRoutes      bool   // Keep tunnel reachability host routes but skip explicit PodCIDR routes
+	UnmanagedCNISite       bool   // Peer's Site delegates pod address ownership to an external CNI
 	TunnelProtocol         string // Resolved tunnel protocol for this peer (WireGuard or GENEVE)
 	TunnelMTU              int    // Effective MTU after route, encapsulation, and CRD limits
 }

@@ -66,6 +66,11 @@ func TestValidateTunnelInterfaceNames(t *testing.T) {
 			wantErrSub: "reserved device name",
 		},
 		{
+			name:   "collide-unbounded1",
+			geneve: "geneve0", vxlan: "unbounded1", ipip: "ipip0",
+			wantErrSub: "reserved device name",
+		},
+		{
 			name:   "duplicate-geneve-vxlan",
 			geneve: "shared", vxlan: "shared", ipip: "ipip0",
 			wantErrSub: "--geneve-interface and --vxlan-interface cannot both be",
@@ -129,6 +134,10 @@ func TestValidateWireGuardInterfacePrefix(t *testing.T) {
 		{
 			name: "contains-slash", prefix: "w/g",
 			wantErrSub: "must not contain '/'",
+		},
+		{
+			name: "collide-unbounded1", prefix: "unbounded1",
+			wantErrSub: "reserved device name",
 		},
 		{
 			name: "collide-unbounded0", prefix: "unbounded0",

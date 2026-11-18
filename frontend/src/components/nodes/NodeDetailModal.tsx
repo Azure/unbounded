@@ -12,7 +12,7 @@ import {
   SortingState,
   useReactTable
 } from '@tanstack/react-table';
-import { NodeStatus, NodeSummary } from '../../types';
+import { NodeStatus, NodeSummary, SiteStatus } from '../../types';
 import {
   CloseXIcon,
   TableFilterButton,
@@ -49,6 +49,7 @@ function NodeDetailModal({
   node,
   allNodeNames,
   gatewayByNode,
+  sites = [],
   nodeK8sStatusMap,
   azureTenantId,
   pullEnabled,
@@ -65,6 +66,7 @@ function NodeDetailModal({
   node: NodeStatus | null;
   allNodeNames: string[];
   gatewayByNode: Map<string, string>;
+  sites?: SiteStatus[];
   nodeK8sStatusMap?: Map<string, string>;
   azureTenantId?: string;
   pullEnabled?: boolean;
@@ -162,9 +164,9 @@ function NodeDetailModal({
   })();
   const podCidrs = nodeInfo?.podCIDRs || [];
   const externalIps = nodeInfo?.externalIPs || [];
-  const podCidrFirstIps = podCidrs
-    .map((cidr) => firstUsableIpFromCidr(cidr))
-    .filter((ip) => Boolean(ip));
+  const podCidrGateways = sites.find((site) => site.name === nodeInfo?.siteName)?.manageCniPlugin === false
+    ? 'Externally managed'
+    : podCidrs.map((cidr) => firstUsableIpFromCidr(cidr)).filter((ip) => Boolean(ip)).join(', ');
   const instanceType = nodeLabels['node.kubernetes.io/instance-type'] || '-';
   const region = nodeLabels['topology.kubernetes.io/region'] || '-';
   const zoneRaw = nodeLabels['topology.kubernetes.io/zone'] || '';
@@ -1721,7 +1723,7 @@ function NodeDetailModal({
               nodeInfo={nodeInfo}
               externalIps={externalIps}
               podCidrs={podCidrs}
-              podCidrFirstIps={podCidrFirstIps}
+              podCidrGateways={podCidrGateways}
               nodeImage={nodeImage}
               instanceType={instanceType}
               region={region}

@@ -89,12 +89,10 @@ type (
 	RawTraceEvent = unboundedEncapUnbTraceEvent
 )
 
-// filterHandle, filterPriority match the values used historically for the
-// single egress filter. They are unique inside the clsact ingress/egress
-// pair; we never attach more than one program at this slot.
+// Leave the priority-1, handle-1 slot to providers such as Cilium.
 const (
-	filterHandle   uint32 = 1
-	filterPriority uint16 = 1
+	filterHandle   uint32 = 0x554e
+	filterPriority uint16 = 10
 )
 
 // TunnelMap manages the unbounded_encap eBPF program and its LPM trie.
@@ -189,10 +187,6 @@ func (tm *TunnelMap) AttachToInterface(ifName string) error {
 	}
 
 	ifIdx := iface.Attrs().Index
-	if _, already := tm.attachedIfs[ifIdx]; already {
-		return nil
-	}
-
 	if err := ensureClsactQdisc(ifIdx, ifName); err != nil {
 		return err
 	}
@@ -366,7 +360,7 @@ func (tm *TunnelMap) Close() error {
 	defer tm.mu.Unlock()
 
 	for ifIdx := range tm.attachedIfs {
-		detachEgressFilter(ifIdx)
+		detachEgressFilter(ifIdx, tm.prog)
 	}
 
 	if tm.prog != nil {
@@ -408,6 +402,38 @@ func ensureClsactQdisc(ifIdx int, ifName string) error {
 }
 
 func attachEgressFilter(ifIdx int, ifName string, prog *ebpf.Program) error {
+	link, err := netlink.LinkByIndex(ifIdx)
+	if err != nil {
+		return err
+	}
+
+	filters, err := netlink.FilterList(link, netlink.HANDLE_MIN_EGRESS)
+	if err != nil {
+		return fmt.Errorf("list %s egress filters: %w", ifName, err)
+	}
+
+	info, err := prog.Info()
+	if err != nil {
+		return err
+	}
+
+	programID, _ := info.ID()
+	attached := false
+
+	for _, existing := range filters {
+		attrs := existing.Attrs()
+		if attrs.Priority != filterPriority || attrs.Handle != filterHandle {
+			continue
+		}
+
+		bpf, ok := existing.(*netlink.BpfFilter)
+		if !ok || bpf.Name != ProgramName {
+			return fmt.Errorf("%s egress filter slot is owned by another program", ifName)
+		}
+
+		attached = bpf.Id == int(programID)
+	}
+
 	filter := &netlink.BpfFilter{
 		FilterAttrs: netlink.FilterAttrs{
 			LinkIndex: ifIdx,
@@ -421,25 +447,55 @@ func attachEgressFilter(ifIdx int, ifName string, prog *ebpf.Program) error {
 		DirectAction: true,
 	}
 
-	_ = netlink.FilterDel(filter) //nolint:errcheck
-	if err := netlink.FilterAdd(filter); err != nil {
-		return fmt.Errorf("add %s to %s egress: %w", ProgramName, ifName, err)
+	if !attached {
+		if err := netlink.FilterReplace(filter); err != nil {
+			return fmt.Errorf("attach %s to %s egress: %w", ProgramName, ifName, err)
+		}
+	}
+
+	for _, existing := range filters {
+		bpf, ok := existing.(*netlink.BpfFilter)
+		if ok && bpf.Priority == 1 && bpf.Handle == 1 && bpf.Name == ProgramName {
+			if err := netlink.FilterDel(existing); err != nil {
+				return fmt.Errorf("remove legacy %s filter on %s: %w", ProgramName, ifName, err)
+			}
+		}
 	}
 
 	return nil
 }
 
-func detachEgressFilter(ifIdx int) {
-	filter := &netlink.BpfFilter{
-		FilterAttrs: netlink.FilterAttrs{
-			LinkIndex: ifIdx,
-			Handle:    filterHandle,
-			Parent:    netlink.HANDLE_MIN_EGRESS,
-			Priority:  filterPriority,
-			Protocol:  unix.ETH_P_ALL,
-		},
+func detachEgressFilter(ifIdx int, prog *ebpf.Program) {
+	if prog == nil {
+		return
 	}
-	_ = netlink.FilterDel(filter) //nolint:errcheck
+
+	info, err := prog.Info()
+	if err != nil {
+		return
+	}
+
+	programID, _ := info.ID()
+
+	link, err := netlink.LinkByIndex(ifIdx)
+	if err != nil {
+		return
+	}
+
+	filters, err := netlink.FilterList(link, netlink.HANDLE_MIN_EGRESS)
+	if err != nil {
+		return
+	}
+
+	for _, existing := range filters {
+		bpf, ok := existing.(*netlink.BpfFilter)
+		if ok && bpf.Priority == filterPriority && bpf.Handle == filterHandle &&
+			bpf.Name == ProgramName && bpf.Id == int(programID) {
+			if err := netlink.FilterDel(existing); err != nil {
+				klog.Warningf("detach %s egress filter on %d: %v", ProgramName, ifIdx, err)
+			}
+		}
+	}
 }
 
 // cidrToKey builds an LPM trie key from a destination CIDR. The address

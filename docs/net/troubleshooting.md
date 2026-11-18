@@ -116,7 +116,7 @@ explicit requests.
 
 ### Peers showing Down / 0 online
 
-1. Check BPF program attachment: `tc filter show dev unbounded0 egress`
+1. Check backend BPF program attachment: `tc filter show dev unbounded1 egress`
 2. Check rp_filter: `cat /proc/sys/net/ipv4/conf/all/rp_filter` (must be 0)
 3. Check tunnel interface MAC: `ip link show geneve0` -- MAC must be `02:<underlay_ip_bytes>:FF`
 4. Verify BPF map has entries: `unroute` should show peer entries

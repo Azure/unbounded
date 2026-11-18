@@ -95,7 +95,7 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 	state.routeManager = routeManager
 	state.routeTableID = cfg.RouteTableID
 
-	setPodCIDRPreferredSources(routeManager, nodePodCIDRs)
+	setPodCIDRPreferredSources(routeManager, nodePodCIDRs, manageCniPlugin)
 
 	// Initialize healthcheck manager for peer health monitoring.
 	healthCheckMgr, err := healthcheck.NewManager(cfg.NodeName, cfg.HealthCheckPort, func(peerHostname string, newState, oldState healthcheck.SessionState) {
@@ -2057,6 +2057,14 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 	nonMasqCIDRs = dedupeStrings(nonMasqCIDRs)
 	sitePodCIDRPools = dedupeStrings(sitePodCIDRPools)
 
+	for i := range peers {
+		peers[i].UnmanagedCNISite = siteHasUnmanagedCNI(siteMap[peers[i].SiteName])
+	}
+
+	for i := range gatewayPeers {
+		gatewayPeers[i].HealthEndpoints = peerHealthIPs(gatewayPeers[i].PodCIDRs, gatewayPeers[i].InternalIPs, gatewayPeers[i].UnmanagedCNISite)
+	}
+
 	// Resolve derived peer fields before differential comparison so the fresh
 	// peer set and the previously stored peer set have the same representation.
 	resolveTunnelProtocolsOnPeers(peers, gatewayPeers, mySiteName, peeredSites, networkPeeredSites,
@@ -2223,7 +2231,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 	state.mu.Unlock()
 
 	if state.routeManager != nil {
-		setPodCIDRPreferredSources(state.routeManager, nodePodCIDRs)
+		setPodCIDRPreferredSources(state.routeManager, nodePodCIDRs, manageCniPlugin)
 	}
 
 	committed := false
@@ -2246,7 +2254,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 		state.mu.Unlock()
 
 		if state.routeManager != nil {
-			setPodCIDRPreferredSources(state.routeManager, prevNodePodCIDRs)
+			setPodCIDRPreferredSources(state.routeManager, prevNodePodCIDRs, manageCniPlugin)
 		}
 	}()
 
@@ -2304,8 +2312,15 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 		unboundedMTU := resolveCNIConfigMTU(cfg.MTU, localScopeMTU, peers, gatewayPeers,
 			unboundednetnetlink.DetectDefaultRouteMTUFromCache(state.netlinkCache))
 		if unboundedMTU > 0 {
+			// Raise the lower device first; a MACVLAN cannot exceed its
+			// parent's MTU. Both hooks must accept the fabric packet size.
+			backend := unboundednetnetlink.NewLinkManager(unbounded1DeviceName)
+			if err := backend.EnsureMTU(unboundedMTU); err != nil {
+				return fmt.Errorf("set backend MTU: %w", err)
+			}
+
 			unboundedLinkManager := unboundednetnetlink.NewLinkManager(unbounded0DeviceName)
-			if err := unboundedLinkManager.EnsureMTUWithCache(state.netlinkCache, unboundedMTU); err != nil {
+			if err := unboundedLinkManager.EnsureMTU(unboundedMTU); err != nil {
 				klog.Warningf("Failed to set MTU on %s: %v", unbounded0DeviceName, err)
 			}
 		}

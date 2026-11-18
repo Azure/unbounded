@@ -528,24 +528,24 @@ ip route | grep 'wg'
 
 ### eBPF Dataplane Verification
 
-Traffic is forwarded by a TC eBPF program attached to the `unbounded0` dummy
-interface. The following checks verify the dataplane independently of the
+Traffic is forwarded by a TC eBPF program attached to the `unbounded1` dummy
+backend, after routing through private MACVLAN `unbounded0`. The following checks verify the dataplane independently of the
 selected tunnel protocol.
 
 #### Verifying BPF Program Attachment
 
 The eBPF encapsulation program (`unbounded_encap`) is attached as a TC egress filter
-on the `unbounded0` interface:
+on the `unbounded1` interface:
 
 ```bash
 # Verify BPF program is attached
-tc filter show dev unbounded0 egress
+tc filter show dev unbounded1 egress
 ```
 
 Expected output should show a `bpf` filter with `direct-action` on the `clsact` qdisc:
 ```
-filter protocol all pref 49152 bpf chain 0
-filter protocol all pref 49152 bpf chain 0 handle 0x1 unbounded_encap direct-action ...
+filter protocol all pref 10 bpf chain 0
+filter protocol all pref 10 bpf chain 0 handle 0x554e unbounded_encap direct-action ...
 ```
 
 If no filter is shown, the eBPF program failed to load or attach. Check node agent logs:

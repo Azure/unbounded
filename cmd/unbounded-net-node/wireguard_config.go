@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"sort"
 
 	"k8s.io/klog/v2"
@@ -18,12 +19,37 @@ import (
 	"github.com/Azure/unbounded/internal/net/routeplan"
 )
 
+func gatewayWireGuardAllowedIPs(peer gatewayPeerInfo, localCIDRs []netip.Prefix) []string {
+	cidrs := append(append([]string{}, peer.RoutedCidrs...), peer.PodCIDRs...)
+	if peer.UnmanagedCNISite {
+		cidrs = append(cidrs, ipsToHostCIDRs(peer.InternalIPs)...)
+	}
+
+	return pruneCoveredAllowedCIDRs(excludeLocalCIDRs(cidrs, localCIDRs))
+}
+
+func meshWireGuardAllowedIPs(peer meshPeerInfo, peeredSite bool) []string {
+	allowedIPs := make([]string, 0, len(peer.PodCIDRs)+len(peer.InternalIPs))
+	for _, cidr := range peer.PodCIDRs {
+		if normalized := routeplan.NormalizeCIDR(cidr); normalized != "" {
+			allowedIPs = append(allowedIPs, normalized)
+		}
+	}
+
+	// AllowedIPs also authorizes decrypted packet sources; it does not install
+	// underlay routes. External CNI nodes originate traffic from their node IPs.
+	if !peeredSite || peer.UnmanagedCNISite {
+		allowedIPs = append(allowedIPs, ipsToHostCIDRs(peer.InternalIPs)...)
+	}
+
+	return dedupeStrings(allowedIPs)
+}
+
 // configureWireGuard sets up WireGuard interfaces and configures peers
 // - wg<port>: Main mesh interface for all mesh peers (intra-site, remote, same-pool gateways)
 // - wg<gwPort>: Separate interfaces for each gateway peer (for ECMP routing)
 // Endpoint and routing decisions are driven by peer.SiteName and peeredSites membership.
 func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers []meshPeerInfo, gatewayPeers []gatewayPeerInfo, mySiteName string, peeredSites, networkPeeredSites, gatewayNodePubKeys map[string]bool, siteHealthCheckProfileNames, peeringSiteHealthCheckProfileNames, assignmentSiteHealthCheckProfileNames, assignmentPoolHealthCheckProfileNames, poolHealthCheckProfileNames map[string]string, siteTunnelMTUs, peeringSiteTunnelMTUs, assignmentSiteTunnelMTUs, assignmentPoolTunnelMTUs, poolTunnelMTUs map[string]int, additionalRoutes []unboundednetnetlink.DesiredRoute, geneveHCPeers map[string]bool, state *wireGuardState, profiles map[string]healthcheck.HealthCheckSettings) error {
-	nodePodCIDRs := state.nodePodCIDRs
 	isGatewayNode := state.isGatewayNode
 	myGatewayPort := state.myGatewayPort
 
@@ -195,30 +221,10 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 		}
 		// Non-peered sites: no endpoint, WireGuard learns it from incoming packets
 
-		normalizedPeerPodCIDRs := make([]string, 0, len(peer.PodCIDRs))
-		for _, podCIDR := range peer.PodCIDRs {
-			normalizedCIDR := routeplan.NormalizeCIDR(podCIDR)
-			if normalizedCIDR == "" {
-				continue
-			}
-
-			normalizedPeerPodCIDRs = append(normalizedPeerPodCIDRs, normalizedCIDR)
-		}
-
-		// AllowedIPs policy on mesh interface:
-		// - Always include peer podCIDRs.
-		// - Include peer internal IP host routes only for non-peered sites.
-		//   Same-site and directly peered-site nodes are directly reachable, so
-		//   internal host /32-/128 prefixes are intentionally excluded.
-		allowedIPs := append([]string{}, normalizedPeerPodCIDRs...)
-		if !peeredSites[peer.SiteName] {
-			allowedIPs = append(allowedIPs, ipsToHostCIDRs(peer.InternalIPs)...)
-		}
-
 		desiredPeer := unboundednetnetlink.WireGuardPeer{
 			PublicKey:  peer.WireGuardPublicKey,
 			Endpoint:   endpoint,
-			AllowedIPs: dedupeStrings(allowedIPs),
+			AllowedIPs: meshWireGuardAllowedIPs(peer, peeredSites[peer.SiteName]),
 		}
 
 		if existingPeer, exists := wgPeerByPublicKey[peer.WireGuardPublicKey]; exists {
@@ -252,25 +258,10 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 		return fmt.Errorf("failed to configure WireGuard: %w", err)
 	}
 
-	// Calculate cbr0 gateway IPs for WireGuard address assignment
-	var wgAddresses []string
-
-	for _, cidr := range nodePodCIDRs {
-		gatewayIP := getGatewayIPFromCIDR(cidr)
-		if gatewayIP == nil {
-			continue
-		}
-
-		if gatewayIP.To4() != nil {
-			wgAddresses = append(wgAddresses, gatewayIP.String()+"/32")
-		} else {
-			wgAddresses = append(wgAddresses, gatewayIP.String()+"/128")
-		}
-	}
-
-	// Sync addresses on mesh interface
-	if _, _, err := state.linkManager.SyncAddresses(wgAddresses, false); err != nil {
-		return fmt.Errorf("failed to sync addresses on WireGuard interface: %w", err)
+	// Gateway source addresses live on unbounded0. Keeping transport devices
+	// unnumbered also prevents external-CNI device autodetection on them.
+	if err := state.linkManager.EnsureUnnumbered(); err != nil {
+		return fmt.Errorf("clear addresses on WireGuard interface: %w", err)
 	}
 
 	// Bring mesh interface up
@@ -457,8 +448,7 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 		// Including podCIDRs ensures packets destined to the gateway node's pod ranges
 		// are accepted on this peer even when routed supernets are narrowed,
 		// except for destinations explicitly excluded by the local Site.
-		allowedIPs := pruneCoveredAllowedCIDRs(excludeLocalCIDRs(
-			append(append([]string{}, gwPeer.RoutedCidrs...), gwPeer.PodCIDRs...), state.siteRouting.localCIDRs))
+		allowedIPs := gatewayWireGuardAllowedIPs(gwPeer, state.siteRouting.localCIDRs)
 
 		// Configure this gateway interface with a single peer
 		// No PersistentKeepalive needed - we rely on health checks for connectivity monitoring
@@ -475,9 +465,8 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 			continue
 		}
 
-		// Add the same addresses to gateway interfaces for source IP selection
-		if _, _, err := gwLinkManager.SyncAddresses(wgAddresses, false); err != nil {
-			klog.Warningf("Failed to sync addresses on gateway interface %s: %v", gwIfaceName, err)
+		if err := gwLinkManager.EnsureUnnumbered(); err != nil {
+			return fmt.Errorf("clear addresses on gateway interface %s: %w", gwIfaceName, err)
 		}
 
 		// Bring gateway interface up

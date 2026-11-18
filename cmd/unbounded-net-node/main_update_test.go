@@ -747,7 +747,10 @@ func TestUpdateWireGuardFromSlices_ManageCniPluginFalseKeepsRemotePeeredMeshPeer
 
 	siteInformer := newInformerWithObjects(
 		toUnstructured(t, &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "site1"}}),
-		toUnstructured(t, &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "site2"}}),
+		toUnstructured(t, &unboundedv1alpha3.Site{
+			ObjectMeta: metav1.ObjectMeta{Name: "site2"},
+			Spec:       unboundedv1alpha3.SiteSpec{ManageCniPlugin: new(false)},
+		}),
 	)
 	sliceInformer := newInformerWithObjects(
 		toUnstructured(t, &unboundednetv1alpha1.SiteNodeSlice{
@@ -818,6 +821,9 @@ func TestUpdateWireGuardFromSlices_ManageCniPluginFalseKeepsRemotePeeredMeshPeer
 	peerNames := map[string]bool{}
 	for _, peer := range gotPeers {
 		peerNames[peer.Name] = true
+		if peer.SiteName == "site2" && !peer.UnmanagedCNISite {
+			t.Fatal("remote CNI ownership was not passed to peer health checks")
+		}
 	}
 
 	if !peerNames["worker-site2"] {
@@ -826,6 +832,30 @@ func TestUpdateWireGuardFromSlices_ManageCniPluginFalseKeepsRemotePeeredMeshPeer
 
 	if peerNames["worker-site1"] {
 		t.Fatalf("expected same-site worker to be skipped when manageCniPlugin=false, got peers %#v", gotPeers)
+	}
+
+	site, _, err := siteInformer.GetStore().GetByKey("site2")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	managedSite := site.(*unstructured.Unstructured).DeepCopy()
+	if err := unstructured.SetNestedField(managedSite.Object, true, "spec", "manageCniPlugin"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := siteInformer.GetStore().Update(managedSite); err != nil {
+		t.Fatal(err)
+	}
+
+	gotPeers = nil
+
+	if err := updateWireGuardFromSlices(context.Background(), nil, siteInformer, sliceInformer, gatewayPoolInformer, gatewayNodeInformer, sitePeeringInformer, assignmentInformer, poolPeeringInformer, cfg, mySiteName, "priv", myPubKey, false, state); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(gotPeers) != 1 || gotPeers[0].UnmanagedCNISite {
+		t.Fatalf("remote CNI ownership change did not reconcile: %+v", gotPeers)
 	}
 }
 

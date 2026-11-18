@@ -9,15 +9,17 @@ reply-path symmetry, and protocol selection.
 ## eBPF Dataplane
 
 The eBPF dataplane uses a single TC egress BPF program (`unbounded_encap`)
-attached to the `unbounded0` dummy interface. All overlay traffic is attracted
-to `unbounded0` via kernel routes and then steered to the correct tunnel
-interface by BPF LPM lookups.
+attached to the `unbounded1` dummy backend. Overlay traffic is attracted
+to private MACVLAN `unbounded0` via kernel routes. Normal frontend transmission
+reaches the backend and is steered to the correct tunnel by BPF LPM lookups.
+An external CNI can process frontend egress without sharing Unbounded's TC hook.
 
 ### Key Interfaces
 
 ```
-unbounded0   Dummy interface. Holds pod-CIDR gateway IPs and supernet routes.
-             TC egress BPF (unbounded_encap) is attached here.
+unbounded0   Private MACVLAN frontend. Holds supernet routes and, only for
+             managed-CNI Sites, pod-CIDR gateway IPs.
+unbounded1   Unnumbered dummy lower device. Holds TC egress unbounded_encap.
 geneve0      Flow-based GENEVE interface (UDP port 6081 by default, VNI per-packet).
 vxlan0       Flow-based VXLAN interface (lightweight tunnel encap).
 ipip0        Shared IPIP tunnel interface.
@@ -45,6 +47,8 @@ GENEVE encapsulation via the eBPF dataplane.
   |   |             |                          |  unbounded0)    |
   |   v             |                          |   ^             |
   | unbounded0      |                          | unbounded0      |
+  |   v             |                          |                 |
+  | unbounded1      |                          |                 |
   | TC egress BPF   |                          |   ^             |
   | (unbounded_encap)|                         |   |             |
   |   |             |                          |   |             |
@@ -80,8 +84,8 @@ GENEVE encapsulation via the eBPF dataplane.
    (e.g. `100.64.0.0/16 dev unbounded0 scope global`) attracts the packet to
    `unbounded0`.
 
-3. **TC egress BPF**: The `unbounded_encap` program runs on TC egress of
-   `unbounded0`. It parses the Ethernet and IP headers.
+3. **TC egress BPF**: Normal MACVLAN transmission after frontend CNI processing
+   reaches `unbounded1`. Its `unbounded_encap` program parses Ethernet and IP.
 
 4. **LPM lookup**: The BPF program performs a longest-prefix-match lookup in
    the unified `unb_endpts` trie. The key is a 16-byte address with
@@ -136,6 +140,7 @@ WireGuard-encrypted gateway nodes.
   |  |         |        |               |      |               |      |  ^         |
   |  v         |        |               |      |               |      |  |         |
   | unbounded0 |        | wg51821       |      | wg51822       |      | unbounded0 |
+  | unbounded1 |        |               |      |               |      | unbounded1 |
   | TC egress  |        | (WG decrypt)  |      | (WG decrypt)  |      | TC egress  |
   | BPF        |        |  |            |      |  |            |      | BPF        |
   |  |         |        |  v            |      |  v            |      |  ^         |
@@ -143,6 +148,7 @@ WireGuard-encrypted gateway nodes.
   |  | lookup  |        |  |            |      |  |            |      |  | LPM     |
   |  |         |        |  v            |      |  v            |      |  | lookup  |
   |  v         |        | unbounded0    |      | unbounded0    |      |  |         |
+  |            |        | unbounded1    |      | unbounded1    |      |            |
   | bpf_redir  |        | TC egress BPF |      | TC egress BPF |      | bpf_redir |
   | (wg51821)  |        |  |            |      |  |            |      | (geneve0) |
   |  |         |        |  | LPM lookup |      |  | LPM lookup |      |  ^         |
@@ -179,8 +185,8 @@ WireGuard-encrypted gateway nodes.
    packet.
 
 5. **Gateway forwarding (site 1)**: The kernel forwards the decrypted packet.
-   The supernet route on `unbounded0` (scope global) attracts it. The TC egress
-   BPF program runs again, performs an LPM lookup, and finds an entry pointing
+   The supernet route on `unbounded0` (scope global) attracts it. Normal
+   transmission reaches `unbounded1`, whose TC egress BPF performs an LPM lookup and finds an entry pointing
    to `wg51822` (the gateway-to-gateway WireGuard interface for site 2).
 
 6. **Cross-site WireGuard**: The packet is encrypted again and sent over the
@@ -188,7 +194,7 @@ WireGuard-encrypted gateway nodes.
 
 7. **Gateway ingress (site 2)**: The site 2 gateway decrypts on its own
    `wg<port>` interface. The kernel forwards the packet, and the BPF LPM lookup
-   on `unbounded0` now resolves the destination to a local site 2 worker via
+   on `unbounded1` now resolves the destination to a local site 2 worker via
    GENEVE.
 
 8. **GENEVE encap to worker**: `set_tunnel_key` + `bpf_redirect(geneve0)`
