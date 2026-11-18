@@ -125,8 +125,8 @@ func nilDependency(value any) bool {
 	}
 }
 
-// Reconcile handles one HostSoftReboot. The caller must hold its mutation lock.
-// Acknowledged status recording is required before the host command runs.
+// Reconcile handles a HostSoftReboot routed to this target. The caller must
+// hold its mutation lock. Status recording is required before the host command runs.
 func (h *HostSoftRebootHandler) Reconcile(ctx context.Context, store MachineOperationStore[int64], op MachineOperation) (ctrl.Result, error) {
 	if h.requested.Load() {
 		h.log.Info("not starting a HostSoftReboot: this host is already rebooting", "operation", op.Name)
