@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,6 +22,19 @@ import (
 	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
 	agentdaemon "github.com/Azure/unbounded/pkg/agent/daemon"
 )
+
+type staleHostReadClient struct {
+	client.Client
+	reader client.Reader
+}
+
+func (c staleHostReadClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	return c.reader.Get(ctx, key, obj, opts...)
+}
+
+func (c staleHostReadClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	return c.reader.List(ctx, list, opts...)
+}
 
 func outOfBandOperation(name, machineRef string, kind v1alpha3.OperationKind) *v1alpha3.MachineOperation {
 	return &v1alpha3.MachineOperation{
@@ -58,7 +72,7 @@ func TestReconcileHostSoftReboot_WaitsForOutOfBandOperation(t *testing.T) {
 			result, err := reconciler.ReconcileMachineOperation(context.Background(), "op-soft")
 			require.NoError(t, err)
 			assert.Zero(t, op.rebootCalls, "the host must not reboot while an out-of-band operation runs")
-			assert.Equal(t, hostSoftRebootWaitInterval, result.RequeueAfter)
+			assert.Equal(t, 10*time.Second, result.RequeueAfter)
 
 			waiting := getMachineOperation(t, c, "op-soft")
 			assert.Equal(t, v1alpha3.OperationPhasePending, waiting.Status.Phase)
@@ -94,7 +108,7 @@ func TestReconcileHostSoftReboot_WaitsForFailedReplaceMediaCleanup(t *testing.T)
 	result, err := reconciler.ReconcileMachineOperation(context.Background(), "op-soft")
 	require.NoError(t, err)
 	assert.Zero(t, op.rebootCalls, "the host must not reboot while HostReplace boot media is outstanding")
-	assert.Equal(t, hostSoftRebootWaitInterval, result.RequeueAfter)
+	assert.Equal(t, 10*time.Second, result.RequeueAfter)
 
 	// Media cleanup finishes and the installed OS reports cloud-init.
 	current := getMachineOperation(t, c, "op-oob")
@@ -127,7 +141,7 @@ func TestReconcileHostSoftReboot_WaitsForNewerOutOfBandOperation(t *testing.T) {
 	result, err := reconciler.ReconcileMachineOperation(context.Background(), "op-soft")
 	require.NoError(t, err)
 	assert.Zero(t, op.rebootCalls)
-	assert.Equal(t, hostSoftRebootWaitInterval, result.RequeueAfter)
+	assert.Equal(t, 10*time.Second, result.RequeueAfter)
 }
 
 func TestReconcileHostSoftReboot_WaitingDoesNotRewriteStatus(t *testing.T) {
@@ -206,15 +220,23 @@ func TestReconcileHostSoftReboot_UsesAPIReader(t *testing.T) {
 	c := fakeStatusClient(machine, hostSoftRebootOperation("op-soft"))
 	apiReader := fakeStatusClient(machine, hostSoftRebootOperation("op-soft"), outOfBandOperation("op-oob", "test-machine", v1alpha3.OperationHostHardReboot))
 	target := &machineOperationTarget{Client: c, apiReader: apiReader, log: discardLogger()}
-
-	blocker, err := unfinishedOutOfBandHostOperation(context.Background(), target.reader(), machine)
+	host := &fakeNodeOperator{bootID: "boot-1"}
+	handler, err := newHostSoftRebootHandler(c, target.reader(), target.log, machine.Name, "test-node", host, &atomic.Bool{})
 	require.NoError(t, err)
-	assert.Equal(t, "op-oob", blocker)
+
+	result, err := handler.Reconcile(context.Background(), agentdaemon.MachineOperation{Name: "op-soft"})
+	require.NoError(t, err)
+	assert.Equal(t, 10*time.Second, result.RequeueAfter)
+	assert.Equal(t, "waiting for out-of-band host operation op-oob", getMachineOperation(t, c, "op-soft").Status.Message)
+	assert.Zero(t, host.rebootCalls)
 
 	target.apiReader = nil
-	blocker, err = unfinishedOutOfBandHostOperation(context.Background(), target.reader(), machine)
+	handler, err = newHostSoftRebootHandler(c, target.reader(), target.log, machine.Name, "test-node", host, &atomic.Bool{})
 	require.NoError(t, err)
-	assert.Empty(t, blocker)
+	result, err = handler.Reconcile(context.Background(), agentdaemon.MachineOperation{Name: "op-soft"})
+	require.NoError(t, err)
+	assert.Zero(t, result.RequeueAfter)
+	assert.Equal(t, 1, host.rebootCalls)
 }
 
 func TestReconcileHostSoftReboot_ReadsMachineFromAPIReader(t *testing.T) {
@@ -237,52 +259,11 @@ func TestReconcileHostSoftReboot_ReadsMachineFromAPIReader(t *testing.T) {
 	result, err := reconciler.ReconcileMachineOperation(context.Background(), "op-soft")
 	require.NoError(t, err)
 	assert.Zero(t, op.rebootCalls, "the host must not reboot while an out-of-band operation is pending")
-	assert.Equal(t, hostSoftRebootWaitInterval, result.RequeueAfter)
+	assert.Equal(t, 10*time.Second, result.RequeueAfter)
 
 	waiting := getMachineOperation(t, apiReader, "op-soft")
 	assert.Equal(t, v1alpha3.OperationPhasePending, waiting.Status.Phase)
 	assert.Equal(t, "waiting for out-of-band host operation op-oob", waiting.Status.Message)
-}
-
-func TestUnfinishedOutOfBandHostOperation_ReturnsOldest(t *testing.T) {
-	machine := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "test-machine"}}
-	newer := outOfBandOperation("op-a-newer", "test-machine", v1alpha3.OperationHostPowerOn)
-	newer.CreationTimestamp = metav1.NewTime(time.Unix(300, 0))
-	older := outOfBandOperation("op-z-older", "test-machine", v1alpha3.OperationHostPowerOff)
-	older.CreationTimestamp = metav1.NewTime(time.Unix(100, 0))
-	tieB := outOfBandOperation("op-tie-b", "test-machine", v1alpha3.OperationHostHardReboot)
-	tieB.CreationTimestamp = metav1.NewTime(time.Unix(50, 0))
-	tieA := outOfBandOperation("op-tie-a", "test-machine", v1alpha3.OperationHostHardReboot)
-	tieA.CreationTimestamp = metav1.NewTime(time.Unix(50, 0))
-
-	c := fakeStatusClient(newer, older)
-	blocker, err := unfinishedOutOfBandHostOperation(context.Background(), c, machine)
-	require.NoError(t, err)
-	assert.Equal(t, "op-z-older", blocker)
-
-	c = fakeStatusClient(newer, older, tieB, tieA)
-	blocker, err = unfinishedOutOfBandHostOperation(context.Background(), c, machine)
-	require.NoError(t, err)
-	assert.Equal(t, "op-tie-a", blocker, "operations created at the same time are ordered by name")
-}
-
-func TestIsOutOfBandHostOperation(t *testing.T) {
-	tests := map[v1alpha3.OperationKind]bool{
-		v1alpha3.OperationHostHardReboot: true,
-		v1alpha3.OperationHostPowerOff:   true,
-		v1alpha3.OperationHostPowerOn:    true,
-		v1alpha3.OperationHostReplace:    true,
-		v1alpha3.OperationHostSoftReboot: false,
-		v1alpha3.OperationNodeReboot:     false,
-		v1alpha3.OperationAgentUpgrade:   false,
-		v1alpha3.OperationAgentReset:     false,
-		v1alpha3.OperationHostAllocate:   false,
-		v1alpha3.OperationHostRelease:    false,
-	}
-
-	for kind, want := range tests {
-		assert.Equal(t, want, isOutOfBandHostOperation(t, kind), kind)
-	}
 }
 
 func TestReconcileHostSoftReboot_IgnoresAllocationOperations(t *testing.T) {
@@ -318,204 +299,6 @@ func TestReconcileHostSoftReboot_IgnoresAllocationOperations(t *testing.T) {
 			})
 		}
 	}
-}
-
-func TestUnfinishedOutOfBandHostOperation_IgnoresAllocationOperations(t *testing.T) {
-	machine := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "test-machine"}}
-
-	for _, kind := range []v1alpha3.OperationKind{v1alpha3.OperationHostAllocate, v1alpha3.OperationHostRelease} {
-		t.Run(string(kind), func(t *testing.T) {
-			allocation := outOfBandOperation("op-allocation", "test-machine", kind)
-			allocation.Spec.AllocationRef = &v1alpha3.UIDReference{Name: "alloc-1", UID: "alloc-1-uid"}
-			allocation.CreationTimestamp = metav1.NewTime(time.Unix(100, 0))
-
-			blocker, err := unfinishedOutOfBandHostOperation(context.Background(), fakeStatusClient(allocation), machine)
-			require.NoError(t, err)
-			assert.Empty(t, blocker)
-
-			powerOff := outOfBandOperation("op-power-off", "test-machine", v1alpha3.OperationHostPowerOff)
-			powerOff.CreationTimestamp = metav1.NewTime(time.Unix(200, 0))
-
-			blocker, err = unfinishedOutOfBandHostOperation(context.Background(), fakeStatusClient(allocation, powerOff), machine)
-			require.NoError(t, err)
-			assert.Equal(t, "op-power-off", blocker)
-		})
-	}
-}
-
-func TestHostOperationUnfinishedOn(t *testing.T) {
-	machine := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{
-		Name:   "test-machine",
-		Labels: map[string]string{"unbounded-cloud.io/site": "lab", "rack": "a"},
-	}}
-	selectorOperation := func(selector *metav1.LabelSelector) *v1alpha3.MachineOperation {
-		op := outOfBandOperation("op", "", v1alpha3.OperationHostHardReboot)
-		op.Spec.MachineSelector = selector
-
-		return op
-	}
-	withTargets := func(op *v1alpha3.MachineOperation, targets ...v1alpha3.MachineOperationTargetStatus) *v1alpha3.MachineOperation {
-		op.Status.Phase = v1alpha3.OperationPhaseInProgress
-		op.Status.Targets = targets
-
-		return op
-	}
-	siteSelector := &metav1.LabelSelector{MatchLabels: map[string]string{"unbounded-cloud.io/site": "lab"}}
-	failedReplace := func(targets ...v1alpha3.MachineOperationTargetStatus) *v1alpha3.MachineOperation {
-		op := outOfBandOperation("op", "test-machine", v1alpha3.OperationHostReplace)
-		op.Status.Phase = v1alpha3.OperationPhaseFailed
-		op.Status.Targets = targets
-
-		return op
-	}
-
-	tests := []struct {
-		name string
-		op   *v1alpha3.MachineOperation
-		want bool
-	}{
-		{name: "machineRef pending", op: outOfBandOperation("op", "test-machine", v1alpha3.OperationHostHardReboot), want: true},
-		{name: "machineRef other machine", op: outOfBandOperation("op", "other-machine", v1alpha3.OperationHostHardReboot), want: false},
-		{
-			name: "operation complete",
-			op: func() *v1alpha3.MachineOperation {
-				op := outOfBandOperation("op", "test-machine", v1alpha3.OperationHostHardReboot)
-				op.Status.Phase = v1alpha3.OperationPhaseComplete
-
-				return op
-			}(),
-			want: false,
-		},
-		{name: "selector matches", op: selectorOperation(siteSelector), want: true},
-		{name: "selector does not match", op: selectorOperation(&metav1.LabelSelector{MatchLabels: map[string]string{"rack": "b"}}), want: false},
-		{
-			name: "invalid selector",
-			op: selectorOperation(&metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{{
-				Key: "rack", Operator: "Bogus",
-			}}}),
-			want: false,
-		},
-		{name: "no machineRef or selector", op: outOfBandOperation("op", "", v1alpha3.OperationHostHardReboot), want: false},
-		{
-			name: "target for machine in progress",
-			op: withTargets(selectorOperation(siteSelector),
-				v1alpha3.MachineOperationTargetStatus{MachineRef: "test-machine", Phase: v1alpha3.OperationPhaseInProgress}),
-			want: true,
-		},
-		{
-			name: "target for machine pending",
-			op: withTargets(selectorOperation(siteSelector),
-				v1alpha3.MachineOperationTargetStatus{MachineRef: "test-machine"}),
-			want: true,
-		},
-		{
-			name: "target for machine finished while others run",
-			op: withTargets(selectorOperation(siteSelector),
-				v1alpha3.MachineOperationTargetStatus{MachineRef: "test-machine", Phase: v1alpha3.OperationPhaseComplete},
-				v1alpha3.MachineOperationTargetStatus{MachineRef: "other-machine", Phase: v1alpha3.OperationPhaseInProgress}),
-			want: false,
-		},
-		{
-			name: "target for machine failed",
-			op: withTargets(outOfBandOperation("op", "test-machine", v1alpha3.OperationHostReplace),
-				v1alpha3.MachineOperationTargetStatus{MachineRef: "test-machine", Phase: v1alpha3.OperationPhaseFailed}),
-			want: false,
-		},
-		{
-			name: "failed replace with unreleased media",
-			op: failedReplace(v1alpha3.MachineOperationTargetStatus{
-				MachineRef: "test-machine", Phase: v1alpha3.OperationPhaseFailed,
-				BootMedia: &v1alpha3.MachineOperationBootMediaStatus{Phase: "Installing"},
-			}),
-			want: true,
-		},
-		{
-			name: "failed replace with released media and confirmed boot",
-			op: failedReplace(v1alpha3.MachineOperationTargetStatus{
-				MachineRef: "test-machine", Phase: v1alpha3.OperationPhaseFailed,
-				BootMedia:  &v1alpha3.MachineOperationBootMediaStatus{ImageWritten: true, Cleaned: true, Released: true},
-				Conditions: []metav1.Condition{{Type: v1alpha3.MachineOperationConditionCloudInitDone, Status: metav1.ConditionTrue}},
-			}),
-			want: false,
-		},
-		{
-			name: "terminal replace with released media and unconfirmed boot",
-			op: failedReplace(v1alpha3.MachineOperationTargetStatus{
-				MachineRef: "test-machine", Phase: v1alpha3.OperationPhaseFailed,
-				BootMedia: &v1alpha3.MachineOperationBootMediaStatus{ImageWritten: true, Cleaned: true, Released: true},
-			}),
-			want: true,
-		},
-		{
-			name: "outstanding media on another machine",
-			op: failedReplace(v1alpha3.MachineOperationTargetStatus{
-				MachineRef: "other-machine", Phase: v1alpha3.OperationPhaseFailed,
-				BootMedia: &v1alpha3.MachineOperationBootMediaStatus{Phase: "Installing"},
-			}),
-			want: false,
-		},
-		{
-			name: "targets resolved without machine",
-			op: withTargets(selectorOperation(siteSelector),
-				v1alpha3.MachineOperationTargetStatus{MachineRef: "other-machine", Phase: v1alpha3.OperationPhaseInProgress}),
-			want: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, hostOperationUnfinishedOn(t, tt.op, machine))
-		})
-	}
-}
-
-func TestMarkHostSoftRebootWaiting_LeavesStartedOperation(t *testing.T) {
-	started := issuedHostSoftRebootOperation("op-soft", "test-machine", "boot-1")
-	started.Status.Message = hostSoftRebootMessage
-	c := fake.NewClientBuilder().
-		WithScheme(fakeScheme()).
-		WithStatusSubresource(&v1alpha3.MachineOperation{}).
-		WithObjects(hostSoftRebootOperation("op-soft")).
-		WithInterceptorFuncs(interceptor.Funcs{
-			List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
-				if err := c.List(ctx, list, opts...); err != nil {
-					return err
-				}
-
-				var latest v1alpha3.MachineOperation
-				if err := c.Get(ctx, client.ObjectKey{Name: "op-soft"}, &latest); err != nil {
-					return err
-				}
-
-				latest.Status = started.Status
-
-				return c.Status().Update(ctx, &latest)
-			},
-		}).Build()
-
-	require.NoError(t, markHostSoftRebootWaiting(context.Background(), c, "op-soft", "waiting for out-of-band host operation op-oob"))
-
-	unchanged := getMachineOperation(t, c, "op-soft")
-	assert.Equal(t, v1alpha3.OperationPhaseInProgress, unchanged.Status.Phase)
-	assert.Equal(t, hostSoftRebootMessage, unchanged.Status.Message)
-}
-
-func TestMarkHostSoftRebootWaiting_IgnoresDeletedOperation(t *testing.T) {
-	c := fake.NewClientBuilder().
-		WithScheme(fakeScheme()).
-		WithStatusSubresource(&v1alpha3.MachineOperation{}).
-		WithObjects(hostSoftRebootOperation("op-soft")).
-		WithInterceptorFuncs(interceptor.Funcs{
-			List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
-				if err := c.List(ctx, list, opts...); err != nil {
-					return err
-				}
-
-				return c.Delete(ctx, hostSoftRebootOperation("op-soft"))
-			},
-		}).Build()
-
-	require.NoError(t, markHostSoftRebootWaiting(context.Background(), c, "op-soft", "waiting"))
 }
 
 // A reprovision handoff defers every MachineOperation before its handler runs,
@@ -555,7 +338,7 @@ func TestReconcileHostSoftReboot_AHandoffDefersItBeforeTheOutOfBandCheck(t *test
 
 	result, err = target.handlers()[v1alpha3.OperationHostSoftReboot](context.Background(), nil, agentdaemon.MachineOperation{Name: "op-soft", Kind: v1alpha3.OperationHostSoftReboot})
 	require.NoError(t, err)
-	assert.Equal(t, hostSoftRebootWaitInterval, result.RequeueAfter)
+	assert.Equal(t, 10*time.Second, result.RequeueAfter)
 	assert.Zero(t, op.rebootCalls)
 	assert.Equal(t, "waiting for out-of-band host operation op-oob", getMachineOperation(t, c, "op-soft").Status.Message)
 }

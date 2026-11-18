@@ -6,6 +6,7 @@ package daemon
 import (
 	"context"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -98,14 +99,18 @@ func TestNativeSelectorPublishesEachIssuedTarget(t *testing.T) {
 	})
 	c := fakeStatusClient(op)
 
-	require.NoError(t, publishHostSoftReboots(context.Background(), discardLogger(), c, "machine-a", staticBootID("boot-a2")))
+	handlerA, err := newHostSoftRebootHandler(c, c, discardLogger(), "machine-a", "test-node", &fakeNodeOperator{bootID: "boot-a2"}, &atomic.Bool{})
+	require.NoError(t, err)
+	require.NoError(t, handlerA.PublishStartup(context.Background()))
 	first := getMachineOperation(t, c, "soft").Status
 	require.Equal(t, v1alpha3.OperationPhaseComplete, first.Phase)
 	require.NotNil(t, first.CompletedAt)
 	require.Equal(t, v1alpha3.OperationPhaseComplete, first.Targets[0].Phase)
 	require.Equal(t, v1alpha3.OperationPhaseInProgress, first.Targets[1].Phase)
 
-	require.NoError(t, publishHostSoftReboots(context.Background(), discardLogger(), c, "machine-b", staticBootID("boot-b2")))
+	handlerB, err := newHostSoftRebootHandler(c, c, discardLogger(), "machine-b", "test-node", &fakeNodeOperator{bootID: "boot-b2"}, &atomic.Bool{})
+	require.NoError(t, err)
+	require.NoError(t, handlerB.PublishStartup(context.Background()))
 	second := getMachineOperation(t, c, "soft").Status
 	require.Equal(t, v1alpha3.OperationPhaseComplete, second.Targets[0].Phase)
 	require.Equal(t, v1alpha3.OperationPhaseComplete, second.Targets[1].Phase)
@@ -116,6 +121,6 @@ func TestNativeSelectorPublishesEachIssuedTarget(t *testing.T) {
 	require.Equal(t, first.StartedAt, second.StartedAt)
 	require.Equal(t, first.Targets[0], second.Targets[0])
 
-	require.NoError(t, publishHostSoftReboots(context.Background(), discardLogger(), c, "machine-b", staticBootID("boot-b2")))
+	require.NoError(t, handlerB.PublishStartup(context.Background()))
 	require.Equal(t, second, getMachineOperation(t, c, "soft").Status)
 }
