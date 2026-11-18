@@ -916,6 +916,14 @@ static int file_error(CUfileError_t e) {
     return RACER_GPU_EDRIVER;
 }
 
+/* A shim loaded again in the same process finds the driver that its earlier
+ * load left open. cuFile then answers parameter changes and the open with
+ * CU_FILE_DRIVER_ALREADY_OPEN, and the open driver is usable as it is. */
+static int open_error(CUfileError_t e) {
+    if (e.err == CU_FILE_DRIVER_ALREADY_OPEN) return RACER_GPU_OK;
+    return file_error(e);
+}
+
 /* Set once cuFile fails to load or open. Opening the driver probes every GPU
  * for P2PDMA, which can take most of a second, so a failure is not retried.
  * cf_status keeps the cuFile status of the failure, or 0 when the library or
@@ -979,12 +987,12 @@ int racer_gpu_file_open(uint32_t flags) {
                 rc = cf_fail(table.lib, 0);
                 goto out;
             }
-            if (file_error(set_bool(CUFILE_PARAM_USE_PCIP2PDMA, true))) {
+            if (open_error(set_bool(CUFILE_PARAM_USE_PCIP2PDMA, true))) {
                 rc = cf_fail(table.lib, last_error);
                 goto out;
             }
         }
-        if (file_error(table.cuFileDriverOpen())) {
+        if (open_error(table.cuFileDriverOpen())) {
             rc = cf_fail(table.lib, last_error);
             goto out;
         }
