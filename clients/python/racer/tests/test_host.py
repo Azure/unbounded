@@ -102,17 +102,27 @@ def test_exported_view_does_not_keep_the_fd(collect):
     assert not mapped("racer-test-export")
 
 
-def test_unclosed_pinned_buffer_is_unpinned(monkeypatch):
+@pytest.mark.parametrize("keep", [False, True])
+def test_unclosed_pinned_buffer_is_unpinned(monkeypatch, keep):
     unpinned = []
 
     class Registration:
         def close(self):
+            # Unpinning must come before unmapping.
+            assert mapped("racer-test-pin")
             unpinned.append(True)
 
     monkeypatch.setattr(cuda, "host_register", lambda view, device: Registration())
     b = HostBuffer(4096, "racer-test-pin")
     assert b.pin() and b.pinned and b.pin()
+    view = b.view if keep else None
     del b
     gc.collect()
+    if keep:
+        # A tensor over the view may still copy from the pinned mapping.
+        assert unpinned == [] and mapped("racer-test-pin")
+        del view
+        gc.collect()
     assert unpinned == [True]
     assert memfds("racer-test-pin") == []
+    assert not mapped("racer-test-pin")

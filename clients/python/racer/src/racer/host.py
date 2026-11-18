@@ -36,7 +36,8 @@ class HostBuffer:
     positional writes. Writes are not sealed. ``view`` is a writable memoryview over the mapping, so the
     buffer also works as a stream-mode destination. Call ``pin()`` to register
     the mapping with CUDA for faster host-to-device copies. A buffer dropped
-    without ``close()`` is released when it is garbage collected.
+    without ``close()`` closes its memfd when it is garbage collected, and is
+    unpinned and unmapped once nothing references ``view``.
     """
 
     def __init__(self, size: int, name: str = "racer-host") -> None:
@@ -53,7 +54,7 @@ class HostBuffer:
             raise
         self.view = memoryview(self._map)
         self._pins = []
-        self._finalizer = weakref.finalize(self, _release, self._fd, self._pins)
+        self._finalizer = weakref.finalize(self, _collect, self._fd, self._pins, self._map, self.view)
 
     def fileno(self) -> int:
         if self._fd < 0:
@@ -78,17 +79,11 @@ class HostBuffer:
 
     def close(self) -> None:
         """Release the buffer. Safe to call more than once."""
-        if not self._finalizer.alive:
+        if self._finalizer.detach() is None:
             return
+        os.close(self._fd)
         self._fd = -1
-        self._finalizer()
-        try:
-            self.view.release()
-            self._map.close()
-        except BufferError:
-            # A view of the mapping (such as a ctypes array) still holds an
-            # export, so the mapping stays until it goes.
-            pass
+        _unmap(self._pins, self._map, self.view)
 
     def __enter__(self) -> "HostBuffer":
         return self
@@ -97,15 +92,26 @@ class HostBuffer:
         self.close()
 
 
-def _release(fd: int, pins: list) -> None:
-    """Unpin and close a HostBuffer's memfd. Runs once, from close() or garbage collection.
+def _collect(fd: int, pins: list, mapping: mmap.mmap, view: memoryview) -> None:
+    """Release a HostBuffer that was garbage collected without close().
 
-    It does not unmap: torch.frombuffer keeps the memoryview without holding a
-    buffer export, so after garbage collection the mapping must live until the
-    last reference to the view goes.
+    The memfd closes now. Unpinning and unmapping wait until the last
+    reference to view goes: torch.frombuffer keeps the view without holding a
+    buffer export, so the tensor may still read the mapping or copy from it.
     """
+    os.close(fd)
+    weakref.finalize(view, _unmap, pins, mapping)
+
+
+def _unmap(pins: list, mapping: mmap.mmap, view: memoryview | None = None) -> None:
+    """Unpin, then unmap. A mapping that still has a buffer export stays mapped until the export goes."""
+    while pins:
+        pins.pop().close()
     try:
-        while pins:
-            pins.pop().close()
-    finally:
-        os.close(fd)
+        if view is not None:
+            view.release()
+        mapping.close()
+    except BufferError:
+        # A view of the mapping (such as a ctypes array) still holds an
+        # export, so the mapping stays until it goes.
+        pass
