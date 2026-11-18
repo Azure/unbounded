@@ -1,0 +1,463 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "description": "Project Signal fleet overview. Use this dashboard to assess cluster-wide certification health and identify nodes that need drilldown.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": true,
+  "panels": [
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 3,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "id": 200,
+      "options": {
+        "code": {
+          "language": "plaintext",
+          "showLineNumbers": false,
+          "showMiniMap": false
+        },
+        "content": "## Cluster health\n\n1. Select a **Cluster** and leave the other filters broad.\n2. **Current node outcomes** answers how the fleet is doing now.\n3. **Running 24-hour campaigns** and **Terminal Runs - past 24 hours** show certification activity and recent reliability.\n4. Use the **Cluster node attention queue** to identify the node that needs investigation, then open the node dashboard.",
+        "mode": "markdown"
+      },
+      "pluginVersion": "11.0.0",
+      "title": "How to use this dashboard",
+      "type": "text"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 3
+      },
+      "id": 201,
+      "panels": [],
+      "title": "Cluster health - all nodes",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Current certification state for every node in the selected cluster. This is the cluster-level answer to: how many nodes are active, failed, passed, inconclusive, or canceled?",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "fixedColor": "blue",
+            "mode": "fixedColor"
+          },
+          "decimals": 0,
+          "mappings": [],
+          "noValue": "No data",
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 0,
+        "y": 4
+      },
+      "id": 1,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "value_and_name",
+        "wideLayout": true
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "count(project_signal_node_certification_status{cluster=~\"${cluster:regex}\", namespace=~\"${namespace:regex}\", phase=~\"(?i)running|pending|releasing\"}) or vector(0)",
+          "instant": true,
+          "legendFormat": "Active",
+          "range": false,
+          "refId": "A"
+        },
+        {
+          "editorMode": "code",
+          "expr": "count(project_signal_node_certification_status{cluster=~\"${cluster:regex}\", namespace=~\"${namespace:regex}\", phase=~\"(?i)failed\"}) or vector(0)",
+          "instant": true,
+          "legendFormat": "Failed",
+          "range": false,
+          "refId": "B"
+        },
+        {
+          "editorMode": "code",
+          "expr": "count(project_signal_node_certification_status{cluster=~\"${cluster:regex}\", namespace=~\"${namespace:regex}\", phase=~\"(?i)succeeded\"}) or vector(0)",
+          "instant": true,
+          "legendFormat": "Succeeded",
+          "range": false,
+          "refId": "C"
+        },
+        {
+          "editorMode": "code",
+          "expr": "count(project_signal_node_certification_status{cluster=~\"${cluster:regex}\", namespace=~\"${namespace:regex}\", phase=~\"(?i)inconclusive\"}) or vector(0)",
+          "instant": true,
+          "legendFormat": "Inconclusive",
+          "range": false,
+          "refId": "D"
+        },
+        {
+          "editorMode": "code",
+          "expr": "count(project_signal_node_certification_status{cluster=~\"${cluster:regex}\", namespace=~\"${namespace:regex}\", phase=~\"(?i)canceled|cancelled\"}) or vector(0)",
+          "instant": true,
+          "legendFormat": "Canceled",
+          "range": false,
+          "refId": "E"
+        }
+      ],
+      "title": "Current node outcomes",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Number of bounded certification campaigns currently running in the selected cluster.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "fixedColor": "blue",
+            "mode": "fixedColor"
+          },
+          "decimals": 0,
+          "mappings": [],
+          "noValue": "0",
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 12,
+        "y": 4
+      },
+      "id": 2,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "value_and_name",
+        "wideLayout": true
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "count(project_signal_certification_campaign_info{cluster=~\"${cluster:regex}\", namespace=~\"${namespace:regex}\", phase=~\"Running|running\"}) or vector(0)",
+          "instant": true,
+          "legendFormat": "Running",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Running 24-hour campaigns",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Cluster-wide terminal certification Runs in the last 24 hours, grouped by exact outcome.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "fixedColor": "blue",
+            "mode": "fixedColor"
+          },
+          "decimals": 0,
+          "mappings": [],
+          "noValue": "No data",
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 18,
+        "y": 4
+      },
+      "id": 13,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "value_and_name",
+        "wideLayout": true
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "count by (phase) (project_signal_fleet_certification_run_finished_timestamp_seconds{cluster=~\"${cluster:regex}\", namespace=~\"${namespace:regex}\"} > time() - 86400)",
+          "instant": true,
+          "legendFormat": "{{phase}}",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Terminal Runs - past 24 hours",
+      "type": "stat"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 10
+      },
+      "id": 202,
+      "panels": [],
+      "title": "Nodes requiring attention",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Every node's newest certification state. Sort or scan for failed, inconclusive, canceled, or stalled active nodes before drilling into the node dashboard.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "inspect": false
+          },
+          "mappings": [],
+          "noValue": "-",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 13,
+        "w": 24,
+        "x": 0,
+        "y": 11
+      },
+      "id": 18,
+      "options": {
+        "cellHeight": "sm",
+        "footer": {
+          "countRows": false,
+          "fields": "",
+          "reducer": [
+            "sum"
+          ],
+          "show": false
+        },
+        "showHeader": true
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "max by (node, node_uid, profile, suite, status, phase, stage, stage_index, stage_total) (project_signal_node_certification_status{cluster=~\"${cluster:regex}\", namespace=~\"${namespace:regex}\"})",
+          "instant": true,
+          "legendFormat": "",
+          "range": false,
+          "refId": "A",
+          "format": "table",
+          "maxDataPoints": 5000
+        }
+      ],
+      "title": "Cluster node attention queue",
+      "transformations": [
+        {
+          "id": "labelsToFields",
+          "options": {
+            "mode": "columns"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "Value": true,
+              "__name__": true,
+              "cluster": true,
+              "job": true,
+              "instance": true
+            },
+            "indexByName": {
+              "node": 0,
+              "status": 1,
+              "phase": 2,
+              "stage_index": 3,
+              "stage_total": 4,
+              "stage": 5,
+              "profile": 6,
+              "suite": 7,
+              "node_uid": 8
+            },
+            "renameByName": {
+              "campaign": "Campaign",
+              "node": "Node",
+              "outcome": "Outcome",
+              "phase": "Phase",
+              "profile": "Profile",
+              "run": "Run",
+              "stage": "Current stage",
+              "stage_index": "Stage",
+              "stage_total": "Total",
+              "suite": "Suite"
+            }
+          }
+        }
+      ],
+      "type": "table"
+    }
+  ],
+  "refresh": "15s",
+  "schemaVersion": 39,
+  "tags": [
+    "project-signal",
+    "certification",
+    "fleet",
+    "campaign"
+  ],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "label": "Data source",
+        "multi": false,
+        "name": "datasource",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "regex": "",
+        "type": "datasource"
+      },
+      {
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "definition": "label_values(project_signal_node_certification_status, cluster)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Cluster",
+        "multi": true,
+        "name": "cluster",
+        "options": [],
+        "query": {
+          "query": "label_values(project_signal_node_certification_status, cluster)",
+          "refId": "PrometheusVariableQueryEditor-cluster"
+        },
+        "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "definition": "label_values(project_signal_node_certification_status{cluster=~\"${cluster:regex}\"}, namespace)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Namespace",
+        "multi": true,
+        "name": "namespace",
+        "options": [],
+        "query": {
+          "query": "label_values(project_signal_node_certification_status{cluster=~\"${cluster:regex}\"}, namespace)",
+          "refId": "PrometheusVariableQueryEditor-namespace"
+        },
+        "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Project Signal fleet overview",
+  "uid": "project-signal-fleet-certification",
+  "version": 1,
+  "weekStart": ""
+}

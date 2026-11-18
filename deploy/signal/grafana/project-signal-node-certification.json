@@ -1,0 +1,1992 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "description": "Project Signal node certification and 24-hour soak dashboard. Select one node, then inspect its current Run, campaign outcomes, and retained evidence.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": true,
+  "panels": [
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "id": 303,
+      "options": {
+        "code": {
+          "language": "plaintext",
+          "showLineNumbers": false,
+          "showMiniMap": false
+        },
+        "content": "## One node, three answers\n\n- **Selected node state**: how the node is doing right now.\n- **Current Run verdicts**: which R01-R21 checks passed or failed in the active execution.\n- **24-hour soak summary**: whether repeated Runs over the campaign are succeeding, failing, or still in progress.\n\nSelect exactly one **Node**. The **Active Run** selector drives live R01-R21 verdicts. The **Node soak campaign** selector drives the soak summary. The **Retained Run** selector drives immutable measurement evidence.",
+        "mode": "markdown"
+      },
+      "pluginVersion": "11.0.0",
+      "title": "How to read this node dashboard",
+      "type": "text"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 4
+      },
+      "id": 304,
+      "panels": [],
+      "title": "1. Selected node - current state",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "The newest certification phase for the selected node. This answers how the node is doing now, independent of its prior Runs.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "fixedColor": "blue",
+            "mode": "fixedColor"
+          },
+          "decimals": 0,
+          "mappings": [],
+          "noValue": "No data",
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 0,
+        "y": 5
+      },
+      "id": 300,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "value_and_name",
+        "wideLayout": true
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (phase) (project_signal_node_certification_status{cluster=~\"${cluster:regex}\", namespace=~\"${namespace:regex}\", node=~\"${node:regex}\"})",
+          "instant": true,
+          "legendFormat": "{{phase}}",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Selected node state",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Current stage number and stage name for the selected node's active Run. This is execution progress, not the 24-hour soak result.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "inspect": false
+          },
+          "mappings": [],
+          "noValue": "-",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 9,
+        "x": 6,
+        "y": 5
+      },
+      "id": 5,
+      "options": {
+        "cellHeight": "sm",
+        "footer": {
+          "countRows": false,
+          "fields": "",
+          "reducer": [
+            "sum"
+          ],
+          "show": false
+        },
+        "showHeader": true
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "max by (node, profile, suite, phase, stage, stage_index, stage_total) (project_signal_node_certification_status{cluster=~\"${cluster:regex}\", namespace=~\"${namespace:regex}\", node=~\"${node:regex}\", status=\"certifying\", stage=~\"${stage:regex}\"})",
+          "instant": true,
+          "legendFormat": "",
+          "range": false,
+          "refId": "A",
+          "format": "table",
+          "maxDataPoints": 5000
+        }
+      ],
+      "title": "Current Run progress",
+      "transformations": [
+        {
+          "id": "labelsToFields",
+          "options": {
+            "mode": "columns"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "Value": true,
+              "__name__": true,
+              "cluster": true,
+              "job": true,
+              "instance": true
+            },
+            "indexByName": {
+              "node": 0,
+              "stage_index": 1,
+              "stage_total": 2,
+              "stage": 3,
+              "phase": 4,
+              "profile": 5,
+              "suite": 6
+            },
+            "renameByName": {
+              "campaign": "Campaign",
+              "node": "Node",
+              "outcome": "Outcome",
+              "phase": "Phase",
+              "profile": "Profile",
+              "run": "Run",
+              "stage": "Current stage",
+              "stage_index": "Stage",
+              "stage_total": "Total",
+              "suite": "Suite"
+            }
+          }
+        }
+      ],
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "The selected node's current execution stage. Yellow means active work, not pass or failure.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 0,
+          "mappings": [],
+          "min": 0,
+          "noValue": "No active certification",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "yellow",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 9,
+        "x": 15,
+        "y": 5
+      },
+      "id": 6,
+      "options": {
+        "displayMode": "gradient",
+        "minVizHeight": 16,
+        "minVizWidth": 8,
+        "namePlacement": "left",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showUnfilled": true,
+        "sizing": "auto",
+        "valueMode": "color"
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (stage, stage_index, stage_total) (project_signal_node_certification_status{cluster=~\"${cluster:regex}\", namespace=~\"${namespace:regex}\", node=~\"${node:regex}\", status=\"certifying\", stage=~\"${stage:regex}\"})",
+          "instant": true,
+          "legendFormat": "{{stage_index}}/{{stage_total}} · {{stage}}",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Current stage",
+      "type": "bargauge"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 12
+      },
+      "id": 100,
+      "panels": [],
+      "title": "Current Run verdicts - R01-R21",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Live validated verdicts only. Empty means the selected active Run has not published a verdict for this stage; it is not a pass or a zero.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "custom": {
+            "fillOpacity": 78,
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineWidth": 0,
+            "spanNulls": false
+          },
+          "mappings": [],
+          "noValue": "Not reached",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "gray",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/Passed|passed/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "green",
+                  "mode": "fixedColor"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/Failed|failed/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "red",
+                  "mode": "fixedColor"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/Inconclusive|inconclusive/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "orange",
+                  "mode": "fixedColor"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/Canceled|canceled|Skipped|skipped/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "gray",
+                  "mode": "fixedColor"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 13
+      },
+      "id": 7,
+      "options": {
+        "alignValue": "left",
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "mergeValues": true,
+        "rowHeight": 0.9,
+        "showValue": "never",
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "max by (stage, verdict) (project_signal_fleet_certification_live_stage_verdict{cluster=~\"${cluster:regex}\", namespace=~\"${namespace:regex}\", run=~\"${active_run:regex}\", stage=~\"r01-hardware-preflight|r02-gpu-identity|r03-gpu-identity-mpi|r04-gpu-full-node|r05-gpu-full-node-mpi|r06-gpu-health\"})",
+          "instant": false,
+          "legendFormat": "{{stage}} · {{verdict}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Foundation and inventory - R01-R06",
+      "type": "state-timeline"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Live validated verdicts only. Empty means the selected active Run has not published a verdict for this stage; it is not a pass or a zero.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "custom": {
+            "fillOpacity": 78,
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineWidth": 0,
+            "spanNulls": false
+          },
+          "mappings": [],
+          "noValue": "Not reached",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "gray",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/Passed|passed/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "green",
+                  "mode": "fixedColor"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/Failed|failed/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "red",
+                  "mode": "fixedColor"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/Inconclusive|inconclusive/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "orange",
+                  "mode": "fixedColor"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/Canceled|canceled|Skipped|skipped/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "gray",
+                  "mode": "fixedColor"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 13
+      },
+      "id": 8,
+      "options": {
+        "alignValue": "left",
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "mergeValues": true,
+        "rowHeight": 0.9,
+        "showValue": "never",
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "max by (stage, verdict) (project_signal_fleet_certification_live_stage_verdict{cluster=~\"${cluster:regex}\", namespace=~\"${namespace:regex}\", run=~\"${active_run:regex}\", stage=~\"r07-gpu-gemm-bf16|r08-gpu-gemm-fp8|r09-softmax-determinism\"})",
+          "instant": false,
+          "legendFormat": "{{stage}} · {{verdict}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Compute correctness - R07-R09",
+      "type": "state-timeline"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Live validated verdicts only. Empty means the selected active Run has not published a verdict for this stage; it is not a pass or a zero.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "custom": {
+            "fillOpacity": 78,
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineWidth": 0,
+            "spanNulls": false
+          },
+          "mappings": [],
+          "noValue": "Not reached",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "gray",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/Passed|passed/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "green",
+                  "mode": "fixedColor"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/Failed|failed/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "red",
+                  "mode": "fixedColor"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/Inconclusive|inconclusive/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "orange",
+                  "mode": "fixedColor"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/Canceled|canceled|Skipped|skipped/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "gray",
+                  "mode": "fixedColor"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 13
+      },
+      "id": 9,
+      "options": {
+        "alignValue": "left",
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "mergeValues": true,
+        "rowHeight": 0.9,
+        "showValue": "never",
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "max by (stage, verdict) (project_signal_fleet_certification_live_stage_verdict{cluster=~\"${cluster:regex}\", namespace=~\"${namespace:regex}\", run=~\"${active_run:regex}\", stage=~\"r10-nvbandwidth|r11-nccl-nvlink|r12-nccl-backend\"})",
+          "instant": false,
+          "legendFormat": "{{stage}} · {{verdict}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Fabric and collectives - R10-R12",
+      "type": "state-timeline"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Live validated verdicts only. Empty means the selected active Run has not published a verdict for this stage; it is not a pass or a zero.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "custom": {
+            "fillOpacity": 78,
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineWidth": 0,
+            "spanNulls": false
+          },
+          "mappings": [],
+          "noValue": "Not reached",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "gray",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/Passed|passed/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "green",
+                  "mode": "fixedColor"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/Failed|failed/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "red",
+                  "mode": "fixedColor"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/Inconclusive|inconclusive/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "orange",
+                  "mode": "fixedColor"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/Canceled|canceled|Skipped|skipped/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "gray",
+                  "mode": "fixedColor"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 20
+      },
+      "id": 10,
+      "options": {
+        "alignValue": "left",
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "mergeValues": true,
+        "rowHeight": 0.9,
+        "showValue": "never",
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "max by (stage, verdict) (project_signal_fleet_certification_live_stage_verdict{cluster=~\"${cluster:regex}\", namespace=~\"${namespace:regex}\", run=~\"${active_run:regex}\", stage=~\"r13-cpu-stream|r14-fio-storage|r17-scratch-contract\"})",
+          "instant": false,
+          "legendFormat": "{{stage}} · {{verdict}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Host and storage - R13-R14, R17",
+      "type": "state-timeline"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Live validated verdicts only. Empty means the selected active Run has not published a verdict for this stage; it is not a pass or a zero.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "custom": {
+            "fillOpacity": 78,
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineWidth": 0,
+            "spanNulls": false
+          },
+          "mappings": [],
+          "noValue": "Not reached",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "gray",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/Passed|passed/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "green",
+                  "mode": "fixedColor"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/Failed|failed/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "red",
+                  "mode": "fixedColor"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/Inconclusive|inconclusive/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "orange",
+                  "mode": "fixedColor"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/Canceled|canceled|Skipped|skipped/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "gray",
+                  "mode": "fixedColor"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 20
+      },
+      "id": 11,
+      "options": {
+        "alignValue": "left",
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "mergeValues": true,
+        "rowHeight": 0.9,
+        "showValue": "never",
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "max by (stage, verdict) (project_signal_fleet_certification_live_stage_verdict{cluster=~\"${cluster:regex}\", namespace=~\"${namespace:regex}\", run=~\"${active_run:regex}\", stage=~\"r15-gpu-burn|r16-gpu-one-device|r18-dcgm-telemetry|r21-hbm-correctness\"})",
+          "instant": false,
+          "legendFormat": "{{stage}} · {{verdict}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Runtime, burn-in, telemetry - R15-R16, R18, R21",
+      "type": "state-timeline"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Live validated verdicts only. Empty means the selected active Run has not published a verdict for this stage; it is not a pass or a zero.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "custom": {
+            "fillOpacity": 78,
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineWidth": 0,
+            "spanNulls": false
+          },
+          "mappings": [],
+          "noValue": "Not reached",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "gray",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/Passed|passed/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "green",
+                  "mode": "fixedColor"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/Failed|failed/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "red",
+                  "mode": "fixedColor"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/Inconclusive|inconclusive/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "orange",
+                  "mode": "fixedColor"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/Canceled|canceled|Skipped|skipped/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "gray",
+                  "mode": "fixedColor"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 20
+      },
+      "id": 12,
+      "options": {
+        "alignValue": "left",
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "mergeValues": true,
+        "rowHeight": 0.9,
+        "showValue": "never",
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "max by (stage, verdict) (project_signal_fleet_certification_live_stage_verdict{cluster=~\"${cluster:regex}\", namespace=~\"${namespace:regex}\", run=~\"${active_run:regex}\", stage=~\"r19-qwen38-flash-vllm|r20-deepseek-v41-flash-vllm\"})",
+          "instant": false,
+          "legendFormat": "{{stage}} · {{verdict}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Inference serving - R19-R20",
+      "type": "state-timeline"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 40
+      },
+      "id": 305,
+      "panels": [],
+      "title": "2. Selected node - 24-hour soak",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Current phase of the selected node's 24-hour certification campaign.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "fixedColor": "blue",
+            "mode": "fixedColor"
+          },
+          "decimals": 0,
+          "mappings": [],
+          "noValue": "No data",
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 5,
+        "x": 0,
+        "y": 41
+      },
+      "id": 301,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "value_and_name",
+        "wideLayout": true
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (phase) (project_signal_certification_campaign_info{cluster=~\"${cluster:regex}\", namespace=~\"${namespace:regex}\", campaign=~\"${campaign:regex}\", node=~\"${node:regex}\"})",
+          "instant": true,
+          "legendFormat": "{{phase}}",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Soak campaign state",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Seconds until the selected 24-hour campaign stops admitting new Runs. No campaign means no campaign series matches the selected node.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "fixedColor": "blue",
+            "mode": "fixedColor"
+          },
+          "decimals": 0,
+          "mappings": [],
+          "noValue": "No campaign",
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 5,
+        "x": 5,
+        "y": 41
+      },
+      "id": 3,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "value_and_name",
+        "wideLayout": true
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "clamp_min(min(project_signal_certification_campaign_deadline_timestamp_seconds{cluster=~\"${cluster:regex}\", namespace=~\"${namespace:regex}\", campaign=~\"${campaign:regex}\"}) - time(), 0)",
+          "instant": true,
+          "legendFormat": "Earliest deadline",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Soak time remaining",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "All persisted Run outcomes for the selected node's campaign. This is the primary summary of how the 24-hour soak performed.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "fixedColor": "yellow",
+            "mode": "fixedColor"
+          },
+          "decimals": 0,
+          "mappings": [],
+          "min": 0,
+          "noValue": "No active work",
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/Failed|failed/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "red",
+                  "mode": "fixedColor"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/Succeeded|succeeded|passed/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "green",
+                  "mode": "fixedColor"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/Running|running|Pending|pending|certifying/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "yellow",
+                  "mode": "fixedColor"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 8,
+        "x": 10,
+        "y": 41
+      },
+      "id": 4,
+      "options": {
+        "displayMode": "gradient",
+        "minVizHeight": 16,
+        "minVizWidth": 8,
+        "namePlacement": "left",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showUnfilled": true,
+        "sizing": "auto",
+        "valueMode": "color"
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (outcome) (project_signal_certification_campaign_runs{cluster=~\"${cluster:regex}\", namespace=~\"${namespace:regex}\", campaign=~\"${campaign:regex}\"})",
+          "instant": true,
+          "legendFormat": "{{outcome}}",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Soak Run outcomes",
+      "type": "bargauge"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Succeeded Runs divided by all terminal Runs in the selected campaign. A campaign can still be running while this rate evolves.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 1,
+          "mappings": [],
+          "noValue": "No completed Runs",
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 80
+              },
+              {
+                "color": "green",
+                "value": 100
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 18,
+        "y": 41
+      },
+      "id": 302,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "value_and_name",
+        "wideLayout": true
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "100 * sum(project_signal_certification_campaign_runs{cluster=~\"${cluster:regex}\", namespace=~\"${namespace:regex}\", campaign=~\"${campaign:regex}\", outcome=~\"Succeeded|succeeded\"}) / clamp_min(sum(project_signal_certification_campaign_runs{cluster=~\"${cluster:regex}\", namespace=~\"${namespace:regex}\", campaign=~\"${campaign:regex}\", outcome=~\"Succeeded|succeeded|Failed|failed|Inconclusive|inconclusive|Canceled|canceled\"}), 1)",
+          "instant": true,
+          "legendFormat": "Pass rate",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Soak Run pass rate",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "All terminal Runs retained for the selected node. Leave Retained Run on All to compare the node's Run history, or select one Run to inspect its immutable measurements below.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "inspect": false
+          },
+          "mappings": [],
+          "noValue": "-",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 47
+      },
+      "id": 14,
+      "options": {
+        "cellHeight": "sm",
+        "footer": {
+          "countRows": false,
+          "fields": "",
+          "reducer": [
+            "sum"
+          ],
+          "show": false
+        },
+        "showHeader": true
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "max by (run, run_uid, node, node_uid, campaign, profile, suite, phase) ((project_signal_fleet_certification_run_finished_timestamp_seconds{cluster=~\"${cluster:regex}\", namespace=~\"${namespace:regex}\", run=~\"${run:regex}\"} > time() - 86400) * on (namespace, run, run_uid, profile, suite) group_left (node, node_uid, campaign) project_signal_fleet_certification_run_participant_info{cluster=~\"${cluster:regex}\", namespace=~\"${namespace:regex}\", node=~\"${node:regex}\", campaign=~\"${campaign:regex}\"})",
+          "instant": true,
+          "legendFormat": "",
+          "range": false,
+          "refId": "A",
+          "format": "table"
+        }
+      ],
+      "title": "Retained Run evidence",
+      "transformations": [
+        {
+          "id": "labelsToFields",
+          "options": {
+            "mode": "columns"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "Value": true,
+              "__name__": true,
+              "cluster": true,
+              "job": true,
+              "instance": true
+            },
+            "indexByName": {
+              "run": 0,
+              "phase": 1,
+              "campaign": 2,
+              "profile": 3,
+              "suite": 4,
+              "run_uid": 5,
+              "node": 6,
+              "node_uid": 7
+            },
+            "renameByName": {
+              "campaign": "Campaign",
+              "node": "Node",
+              "outcome": "Outcome",
+              "phase": "Phase",
+              "profile": "Profile",
+              "run": "Run",
+              "stage": "Current stage",
+              "stage_index": "Stage",
+              "stage_total": "Total",
+              "suite": "Suite"
+            }
+          }
+        }
+      ],
+      "type": "table"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 56
+      },
+      "id": 102,
+      "panels": [],
+      "title": "Selected retained Run - immutable measurements",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Retained AIPerf output throughput for R19-R20. Zero is shown rather than discarded.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 16,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "noValue": "No retained throughput evidence",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 57
+      },
+      "id": 15,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "project_signal_fleet_certification_measurement{cluster=~\"${cluster:regex}\", namespace=~\"${namespace:regex}\", run=~\"${run:regex}\", stage=~\"r19-qwen38-flash-vllm|r20-deepseek-v41-flash-vllm\", metric_id=\"outputTokensPerSecond\"}",
+          "instant": false,
+          "legendFormat": "{{run}} · {{stage}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Output throughput",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Retained AIPerf TTFT for R19-R20. Lower is better; zero is shown rather than discarded.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 16,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "noValue": "No retained TTFT evidence",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 57
+      },
+      "id": 16,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "project_signal_fleet_certification_measurement{cluster=~\"${cluster:regex}\", namespace=~\"${namespace:regex}\", run=~\"${run:regex}\", stage=~\"r19-qwen38-flash-vllm|r20-deepseek-v41-flash-vllm\", metric_id=\"timeToFirstToken\"}",
+          "instant": false,
+          "legendFormat": "{{run}} · {{stage}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Time to first token",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Minimum retained R07 BF16 assertion value by Run. Use this beside the qualification threshold defined by the certification Test.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 16,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "noValue": "No retained R07 evidence",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "tflops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 57
+      },
+      "id": 17,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "project_signal_fleet_certification_r07_assertion_decimal{cluster=~\"${cluster:regex}\", namespace=~\"${namespace:regex}\", run=~\"${run:regex}\"}",
+          "instant": false,
+          "legendFormat": "{{run}} · {{assertion}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "R07 BF16 minimum",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "15s",
+  "schemaVersion": 39,
+  "tags": [
+    "project-signal",
+    "certification",
+    "fleet",
+    "campaign"
+  ],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "label": "Data source",
+        "multi": false,
+        "name": "datasource",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "regex": "",
+        "type": "datasource"
+      },
+      {
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "definition": "label_values(project_signal_node_certification_status, cluster)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Cluster",
+        "multi": true,
+        "name": "cluster",
+        "options": [],
+        "query": {
+          "query": "label_values(project_signal_node_certification_status, cluster)",
+          "refId": "PrometheusVariableQueryEditor-cluster"
+        },
+        "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "definition": "label_values(project_signal_node_certification_status{cluster=~\"${cluster:regex}\"}, namespace)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Namespace",
+        "multi": true,
+        "name": "namespace",
+        "options": [],
+        "query": {
+          "query": "label_values(project_signal_node_certification_status{cluster=~\"${cluster:regex}\"}, namespace)",
+          "refId": "PrometheusVariableQueryEditor-namespace"
+        },
+        "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "allValue": ".*",
+        "current": {},
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "definition": "label_values(project_signal_node_certification_status{cluster=~\"${cluster:regex}\", namespace=~\"${namespace:regex}\"}, node)",
+        "hide": 0,
+        "includeAll": false,
+        "label": "Node",
+        "multi": false,
+        "name": "node",
+        "options": [],
+        "query": {
+          "query": "label_values(project_signal_node_certification_status{cluster=~\"${cluster:regex}\", namespace=~\"${namespace:regex}\"}, node)",
+          "refId": "PrometheusVariableQueryEditor-node"
+        },
+        "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "definition": "label_values(project_signal_certification_campaign_info{cluster=~\"${cluster:regex}\", namespace=~\"${namespace:regex}\", node=~\"${node:regex}\"}, campaign)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Node soak campaign",
+        "multi": true,
+        "name": "campaign",
+        "options": [],
+        "query": {
+          "query": "label_values(project_signal_certification_campaign_info{cluster=~\"${cluster:regex}\", namespace=~\"${namespace:regex}\", node=~\"${node:regex}\"}, campaign)",
+          "refId": "PrometheusVariableQueryEditor-campaign"
+        },
+        "refresh": 2,
+        "regex": "",
+        "sort": 3,
+        "type": "query"
+      },
+      {
+        "allValue": ".*",
+        "current": {},
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "definition": "query_result(sort_desc(max by (run) ((timestamp(project_signal_fleet_certification_live_stage_verdict{cluster=~\"${cluster:regex}\", namespace=~\"${namespace:regex}\"}) and on (namespace, run, run_uid) (project_signal_fleet_certification_run_phase{cluster=~\"${cluster:regex}\", namespace=~\"${namespace:regex}\", phase=~\"pending|running\"} == 1)) * on (namespace, run, run_uid) group_left (node) project_signal_fleet_certification_run_participant_info{cluster=~\"${cluster:regex}\", namespace=~\"${namespace:regex}\", node=~\"${node:regex}\"})))",
+        "hide": 0,
+        "includeAll": false,
+        "label": "Active Run",
+        "multi": false,
+        "name": "active_run",
+        "options": [],
+        "query": {
+          "query": "query_result(sort_desc(max by (run) ((timestamp(project_signal_fleet_certification_live_stage_verdict{cluster=~\"${cluster:regex}\", namespace=~\"${namespace:regex}\"}) and on (namespace, run, run_uid) (project_signal_fleet_certification_run_phase{cluster=~\"${cluster:regex}\", namespace=~\"${namespace:regex}\", phase=~\"pending|running\"} == 1)) * on (namespace, run, run_uid) group_left (node) project_signal_fleet_certification_run_participant_info{cluster=~\"${cluster:regex}\", namespace=~\"${namespace:regex}\", node=~\"${node:regex}\"})))",
+          "refId": "PrometheusVariableQueryEditor-active_run"
+        },
+        "refresh": 2,
+        "regex": "/run=\"([^\"]+)\"/",
+        "sort": 0,
+        "type": "query"
+      },
+      {
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "definition": "query_result(sort_desc(max by (run) ((project_signal_fleet_certification_run_finished_timestamp_seconds{cluster=~\"${cluster:regex}\", namespace=~\"${namespace:regex}\"} > 0) * on (namespace, run, run_uid, profile, suite) group_left (node, campaign) project_signal_fleet_certification_run_participant_info{cluster=~\"${cluster:regex}\", namespace=~\"${namespace:regex}\", node=~\"${node:regex}\", campaign=~\"${campaign:regex}\"})))",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Retained Run",
+        "multi": true,
+        "name": "run",
+        "options": [],
+        "query": {
+          "query": "query_result(sort_desc(max by (run) ((project_signal_fleet_certification_run_finished_timestamp_seconds{cluster=~\"${cluster:regex}\", namespace=~\"${namespace:regex}\"} > 0) * on (namespace, run, run_uid, profile, suite) group_left (node, campaign) project_signal_fleet_certification_run_participant_info{cluster=~\"${cluster:regex}\", namespace=~\"${namespace:regex}\", node=~\"${node:regex}\", campaign=~\"${campaign:regex}\"})))",
+          "refId": "PrometheusVariableQueryEditor-run"
+        },
+        "refresh": 2,
+        "regex": "/run=\"([^\"]+)\"/",
+        "sort": 3,
+        "type": "query"
+      },
+      {
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "definition": "label_values(project_signal_node_certification_status{cluster=~\"${cluster:regex}\", namespace=~\"${namespace:regex}\"}, stage)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Stage",
+        "multi": true,
+        "name": "stage",
+        "options": [],
+        "query": {
+          "query": "label_values(project_signal_node_certification_status{cluster=~\"${cluster:regex}\", namespace=~\"${namespace:regex}\"}, stage)",
+          "refId": "PrometheusVariableQueryEditor-stage"
+        },
+        "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Project Signal node certification and soak",
+  "uid": "project-signal-node-certification",
+  "version": 1,
+  "weekStart": ""
+}
