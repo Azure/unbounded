@@ -62,12 +62,13 @@ page records and leaves 24.9 percent unused.
 
 All in `clients/python/racer-vllm/src/racer_vllm.py` unless noted.
 
-- `HostBuffer` (`clients/python/racer/src/racer/host.py`) unpins and closes
-  its memfd with `weakref.finalize`, and its mapping goes with the last
-  reference to its view, so an unclosed buffer no longer leaks shared memory
-  until process exit. This was the cause of the node OOM that killed the
-  dataplane. Collection does not unmap, because `torch.frombuffer` keeps the
-  view without holding a buffer export.
+- `HostBuffer` (`clients/python/racer/src/racer/host.py`) closes its memfd
+  with `weakref.finalize` when it is collected without `close()`, and unpins
+  and unmaps once the last reference to its view goes, so an unclosed buffer
+  no longer leaks shared memory until process exit. This was the cause of the
+  node OOM that killed the dataplane. Unpinning and unmapping wait for the
+  view because `torch.frombuffer` keeps the view without holding a buffer
+  export, so a tensor may still read or copy from the mapping.
 - `sharded_state` loads copy each tensor into its parameter immediately, so
   they no longer clone out of the staging buffer.
 - `tensor_device: "cpu"` reads into host memory and yields CPU tensors. It is
