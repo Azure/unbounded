@@ -104,7 +104,9 @@ func TestNoneProtocolNativeNeighborResolution(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	t.Run("overflow slots survive all update paths", func(t *testing.T) {
+	func() {
+		t.Log("overflow slots survive all update paths")
+
 		const prefix = "10.247.0.0/16"
 
 		_, cidr, _ := net.ParseCIDR(prefix)
@@ -168,7 +170,7 @@ func TestNoneProtocolNativeNeighborResolution(t *testing.T) {
 		if _, exists := tunnelMap.lastApplied[key]; exists {
 			t.Fatal("deleted endpoint retained applied overflow slots")
 		}
-	})
+	}()
 
 	for _, tc := range []struct {
 		name, source, destination, prefix, endpoint string

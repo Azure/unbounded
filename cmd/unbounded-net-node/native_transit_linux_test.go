@@ -15,6 +15,7 @@ import (
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
 	"golang.org/x/sys/unix"
+	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 
 	unboundednetnetlink "github.com/Azure/unbounded/internal/net/netlink"
 )
@@ -165,6 +166,63 @@ func TestNativeTransitInterfaceRules(t *testing.T) {
 			checkRule(ipt, true, "raw", "UNBOUNDED-NOTRACK", "-d", supernet,
 				"-m", "comment", "--comment", "unbounded-net: skip conntrack for tunnel transit", "-j", "CT", "--notrack")
 		}
+	}
+
+	checkAssignmentListenerReuse(t)
+}
+
+func checkAssignmentListenerReuse(t *testing.T) {
+	t.Helper()
+	t.Log("reusing a remote gateway interface as an assignment listener")
+
+	privateKey, err := wgtypes.GeneratePrivateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	workerKey, err := wgtypes.GeneratePrivateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const iface = "wg51830"
+
+	server := summaryRouteFixture()
+	server.state.gatewayLinkManagers = make(map[string]*unboundednetnetlink.LinkManager)
+	server.state.gatewayNames = map[string]string{iface: "old-gateway/transit/old"}
+	server.state.gatewaySiteNames = map[string]string{iface: "old"}
+	server.state.gatewayHealthEndpoints = map[string]string{iface: "10.245.0.1"}
+	server.state.gatewayRoutes = map[string][]string{iface: {"10.245.0.0/16"}}
+	server.state.gatewayRouteDistances = map[string]map[string]int{iface: {"10.245.0.0/16": 2}}
+	server.state.gatewaySiteCIDRs = map[string][]string{iface: {"10.245.0.0/16"}}
+	server.state.gatewayPodCIDRs = map[string][]string{iface: {"10.245.0.0/24"}}
+	server.state.gatewayPeerHealthCheckEnabled = map[string]bool{iface: true}
+	server.state.peers = []meshPeerInfo{{
+		Name: "worker/assignment/pool", SiteName: "remote", TransitPoolName: "pool",
+		TransitWireguardPort: 51830, TunnelProtocol: "WireGuard", WireGuardPublicKey: workerKey.PublicKey().String(),
+		PodCIDRs: []string{"10.246.1.0/24"},
+	}}
+
+	if err := configureAssignmentWireGuard(server.cfg, server.state, iface, 51830, privateKey.String(),
+		[]unboundednetnetlink.WireGuardPeer{{PublicKey: workerKey.PublicKey().String(), AllowedIPs: []string{"10.246.1.0/24"}}},
+		[]string{"10.246.0.1/32"}, 1400); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = server.state.gatewayWireGuardManager(iface).Close() }()
+
+	var peers []WireGuardPeerStatus
+
+	server.inspectNodePeers(func(peer WireGuardPeerStatus) { peers = append(peers, peer) })
+
+	if len(peers) != 1 || peers[0].Name != "worker" || peers[0].PeerID != "worker/assignment/pool" ||
+		peers[0].Tunnel.Interface != iface {
+		t.Fatalf("reused listener retained a remote gateway or lost assignment diagnostics: %+v", peers)
+	}
+
+	if len(server.state.gatewayNames)+len(server.state.gatewaySiteNames)+len(server.state.gatewayHealthEndpoints)+
+		len(server.state.gatewayRoutes)+len(server.state.gatewayRouteDistances)+len(server.state.gatewaySiteCIDRs)+
+		len(server.state.gatewayPodCIDRs)+len(server.state.gatewayPeerHealthCheckEnabled) != 0 {
+		t.Fatal("assignment listener retained remote gateway metadata")
 	}
 }
 

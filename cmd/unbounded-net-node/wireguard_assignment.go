@@ -358,6 +358,10 @@ func configureAssignmentWireGuard(cfg *config, state *wireGuardState, iface stri
 		return fmt.Errorf("configure assignment WireGuard peers on %s: %w", iface, err)
 	}
 
+	state.mu.Lock()
+	state.clearGatewayPeerMetadataLocked(iface)
+	state.mu.Unlock()
+
 	if _, _, err := link.SyncAddresses(addresses, false); err != nil {
 		return fmt.Errorf("configure assignment addresses on %s: %w", iface, err)
 	}
