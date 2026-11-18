@@ -211,6 +211,7 @@ type meshPeerInfo struct {
 	Name                   string
 	SiteName               string // Site this peer belongs to -- drives endpoint/routing logic
 	TransitPoolName        string // Nonempty for an assignment downlink, not an ordinary mesh link
+	TransitPoolType        string
 	TransitWireguardPort   int32
 	HealthCheckProfileName string // Optional resolved healthcheck profile for this specific link
 	WireGuardPublicKey     string

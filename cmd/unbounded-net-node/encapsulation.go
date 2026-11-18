@@ -130,6 +130,9 @@ func resolveTunnelProtocolsOnPeers(
 		var scope *unboundednetv1alpha1.TunnelProtocol
 
 		if peer.TransitPoolName != "" {
+			usesExternal = normalizeGatewayPoolType(peer.TransitPoolType) == "External" &&
+				peer.SiteName != mySiteName && !networkPeeredSites[peer.SiteName]
+
 			scope = tunnelProtoPtr(assignmentPoolTunnelProtos, peer.SiteName+"|"+peer.TransitPoolName)
 			if (scope == nil || *scope == unboundednetv1alpha1.TunnelProtocolAuto) && peer.SiteName == mySiteName {
 				scope = tunnelProtoPtr(siteTunnelProtos, mySiteName)

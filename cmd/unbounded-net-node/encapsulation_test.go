@@ -178,6 +178,51 @@ func TestResolveTunnelProtocolsOnPeers_GatewayMixedPoolTypes(t *testing.T) {
 	}
 }
 
+func TestAssignmentAutoTransportMatchesBothDirections(t *testing.T) {
+	t.Parallel()
+
+	for _, scope := range []string{"", "Auto"} {
+		for _, tc := range []struct {
+			name          string
+			poolType      string
+			peered        bool
+			networkPeered bool
+			sameSite      bool
+			want          string
+		}{
+			{"Internal without peering", "Internal", false, false, false, "GENEVE"},
+			{"External without peering", "External", false, false, false, "WireGuard"},
+			{"External with Site peering", "External", true, false, false, "WireGuard"},
+			{"External with network peering", "External", false, true, false, "GENEVE"},
+			{"same-Site fallback", "Internal", false, false, true, "VXLAN"},
+		} {
+			t.Run(scope+"/"+tc.name, func(t *testing.T) {
+				workerSite, gatewaySite := "worker", "hub"
+				if tc.sameSite {
+					workerSite = gatewaySite
+				}
+
+				assignments := map[string]string{workerSite + "|pool": scope}
+				sites := map[string]string{gatewaySite: "VXLAN"}
+				downlink := []meshPeerInfo{{
+					Name: "worker/assignment/pool", SiteName: workerSite, TransitPoolName: "pool", TransitPoolType: tc.poolType,
+				}}
+				resolveTunnelProtocolsOnPeers(downlink, nil, gatewaySite,
+					map[string]bool{workerSite: tc.peered}, map[string]bool{workerSite: tc.networkPeered},
+					true, tc.poolType == "External", []string{"pool"}, "GENEVE", "WireGuard", sites, nil, assignments, nil)
+				uplink := []gatewayPeerInfo{{Name: "gateway/transit/pool", SiteName: gatewaySite, PoolName: "pool", PoolType: tc.poolType}}
+				resolveTunnelProtocolsOnPeers(nil, uplink, workerSite,
+					map[string]bool{gatewaySite: tc.peered}, map[string]bool{gatewaySite: tc.networkPeered},
+					false, false, nil, "GENEVE", "WireGuard", sites, nil, assignments, nil)
+
+				if downlink[0].TunnelProtocol != tc.want || uplink[0].TunnelProtocol != tc.want {
+					t.Fatalf("assignment transports differ: downlink=%s uplink=%s want=%s", downlink[0].TunnelProtocol, uplink[0].TunnelProtocol, tc.want)
+				}
+			})
+		}
+	}
+}
+
 // TestResolveTunnelProtocolsOnPeers_GatewayMeshSGPAScope verifies that gateway
 // assignment downlinks use their assignment scope without changing the
 // ordinary mesh link, including when both links use WireGuard.

@@ -2030,6 +2030,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 					downlink := peer
 					downlink.Name += "/assignment/" + poolName
 					downlink.TransitPoolName = poolName
+					downlink.TransitPoolType = normalizeGatewayPoolType(gatewayPoolMap[poolName].Spec.Type)
 					downlink.TransitWireguardPort = myGatewayPort
 					downlink.HealthCheckProfileName = assignmentPoolHealthCheckProfileNames[slice.SiteName+"|"+poolName]
 					peers = append(peers, downlink)

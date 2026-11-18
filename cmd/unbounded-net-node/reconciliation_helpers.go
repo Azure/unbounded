@@ -799,6 +799,7 @@ func meshPeersEqual(a, b []meshPeerInfo) bool {
 	for i := range a {
 		if a[i].Name != b[i].Name ||
 			a[i].TransitPoolName != b[i].TransitPoolName ||
+			a[i].TransitPoolType != b[i].TransitPoolType ||
 			a[i].TransitWireguardPort != b[i].TransitWireguardPort ||
 			a[i].SiteName != b[i].SiteName ||
 			a[i].HealthCheckProfileName != b[i].HealthCheckProfileName ||
