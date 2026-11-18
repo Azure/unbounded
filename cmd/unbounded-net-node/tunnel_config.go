@@ -878,18 +878,20 @@ func addWireGuardPeersToBPFMap(cfg *config, state *wireGuardState, wgMeshPeers [
 
 // reconcilePendingBPFEntries performs a single BPF map reconcile with all
 // accumulated entries from GENEVE, VXLAN, and WireGuard config phases.
-func reconcilePendingBPFEntries(state *wireGuardState) {
+func reconcilePendingBPFEntries(state *wireGuardState) error {
 	tm := state.tunnelMap
 	if tm == nil {
-		return
+		return nil
 	}
 
 	entries := takePendingBPFEntries(state)
 	if err := tm.Reconcile(entries); err != nil {
-		klog.Warningf("eBPF: BPF map reconciliation error: %v", err)
-	} else {
-		klog.V(2).Infof("eBPF: reconciled BPF map with %d total entries", len(entries))
+		return fmt.Errorf("reconcile primary BPF map: %w", err)
 	}
+
+	klog.V(2).Infof("eBPF: reconciled BPF map with %d total entries", len(entries))
+
+	return nil
 }
 
 func takePendingBPFEntries(state *wireGuardState) map[string]ebpfpkg.TunnelEndpoint {
