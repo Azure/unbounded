@@ -46,3 +46,6 @@ package-dir = {"" = "src"}
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "gpu: needs real torch, and torch with CUDA and a GPU for tensor_device cuda (see the gpu fixtures in ../racer/tests/conftest.py)",
+]

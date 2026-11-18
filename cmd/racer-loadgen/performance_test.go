@@ -594,6 +594,8 @@ func performanceProcess(t *testing.T, root string) (int, string) {
 		}
 	}
 
+	// SEGMENT_BYTES stays at 64 MiB, not the 1 GiB default, so the 1 GiB file-backed
+	// slab holds more segments than FREE_SEGMENT_RESERVE.
 	settings := map[string]string{
 		"CLUSTER_ID": "11111111-1111-4111-8111-111111111111", "CONTROL_ENDPOINT": endpoint,
 		"PEER_LISTEN": port(), "DIAGNOSTICS_LISTEN": diagnostics, "MAX_THREADS": "2", "ENABLE_RDMA": "false",

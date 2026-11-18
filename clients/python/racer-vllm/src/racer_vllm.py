@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """vLLM plugin that loads model weights from a Racer cache.
 
-Adds the load format "racer" (vLLM v0.25.x) and the racer-vllm-fetch
-command. See README.md for the options.
+Adds the load format "racer" (vLLM v0.30.0 and v0.33.0 or later) and the
+racer-vllm-fetch command. See README.md for the options.
 """
 
 from __future__ import annotations
@@ -14,8 +14,10 @@ import json
 import logging
 import math
 import os
+import re
 import string
 import struct
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -40,6 +42,8 @@ MAX_HEADER_BYTES = 100 * 1024 * 1024
 MAX_PARTS = 100_000
 TP_ONLY_PATTERN = "model-rank-{rank}-part-{part}.safetensors"
 PP_AND_TP_PATTERN = "model-pp-{pp_rank}-tp-{tp_rank}-part-{part}.safetensors"
+TENSOR_DEVICES = ("cuda", "cpu")
+SHARDED_STATE_SCRIPT = "examples/features/sharded_state/save_sharded_state_offline.py"
 
 # Small files vLLM and transformers read to build the model and tokenizer.
 CONFIG_FILES = (
@@ -84,6 +88,7 @@ DTYPES = {
 }
 
 _registered = False
+_tp_warned = False
 
 
 class ModelChangedError(RuntimeError):
@@ -188,13 +193,15 @@ def weight_files(client, uri: ModelURI, pins: dict | None = None) -> list:
     return files
 
 
-def fetch(uri, dest: str, client=None, pattern=None) -> list:
+def fetch(uri, dest: str, client=None, pattern=None, info=None) -> list:
     """Copy the small model files to dest and write racer-model.json.
 
     racer-model.json records the URI and the ETag of every fetched file and
     every weight file, so the loader reads the same model version. Without
     safetensors weights, it records the files of a sharded_state checkpoint
-    (pattern, else vLLM's default patterns) for every rank.
+    (pattern, else vLLM's default patterns) for every rank. info, a dict,
+    gets the weight layout ("regular", "sharded_state" or "none"), the
+    number of weight files and their total bytes.
     """
     u = parse_uri(uri) if isinstance(uri, str) else uri
     client = client or racer.Client(cache=u.cache)
@@ -223,11 +230,18 @@ def fetch(uri, dest: str, client=None, pattern=None) -> list:
                     names.append(v)
     try:
         weights = weight_files(client, u, etags)
+        layout = "regular"
     except racer.NotFound:
         weights = sharded_files(client, u, pattern)
+        layout = "sharded_state" if weights else "none"
+    total = 0
     for name in weights:
-        etags[name] = stat_pinned(client, u, name).etag
+        meta = stat_pinned(client, u, name)
+        etags[name] = meta.etag
+        total += meta.size
     _write(os.path.join(dest, MARKER), json.dumps({"uri": str(u), "etags": etags}, sort_keys=True).encode())
+    if info is not None:
+        info.update(layout=layout, files=len(weights), bytes=total)
     return fetched
 
 
@@ -395,8 +409,14 @@ def _limit(start: int, staging_bytes: int, page_bytes: int) -> int:
     return end - end % page_bytes if page_bytes else end
 
 
-def read_chunks(client, uri: ModelURI, files: list, staging_bytes: int) -> list:
-    """Read every file's header and plan its chunks. files holds (name, Metadata)."""
+def read_chunks(client, uri: ModelURI, files: list, staging_bytes: int, select=None, stats=None) -> list:
+    """Read every file's header and plan its chunks. files holds (name, Metadata).
+
+    With select, only tensors whose name it accepts are read. Each run of
+    accepted tensors is planned on its own, so no skipped byte is read, and
+    a file with no accepted tensor gets no chunks. stats, a dict, gets the
+    count and bytes of skipped tensors and the count of skipped files.
+    """
     chunks = []
     for name, meta in files:
         req = uri.request(name)
@@ -405,20 +425,69 @@ def read_chunks(client, uri: ModelURI, files: list, staging_bytes: int) -> list:
             tensors = parse_header(client.read(req, 8, n, if_match=meta.etag), meta.size)
         except (racer.VersionUnavailable, racer.NotFound):
             raise _changed(uri, name, meta.etag) from None
-        chunks += plan_chunks(name, meta.etag, tensors, staging_bytes, racer.PAGE_SIZE)
+        runs = [[]]
+        for t in tensors:
+            if select is None or select(t.name):
+                runs[-1].append(t)
+                continue
+            if runs[-1]:
+                runs.append([])
+            if stats is not None:
+                stats["skipped_tensors"] += 1
+                stats["skipped_bytes"] += t.end - t.start
+        if stats is not None and tensors and not runs[0]:
+            stats["skipped_files"] += 1
+        for run in runs:
+            chunks += plan_chunks(name, meta.etag, run, staging_bytes, racer.PAGE_SIZE)
     return chunks
 
 
+def tensor_filter(include: list, exclude: list, model, draft: bool):
+    """A function that says whether to read a checkpoint tensor, or None to read every tensor.
+
+    include and exclude are compiled regular expressions (re.search). The
+    model's is_unused_checkpoint_weight (vLLM 0.33 and later) returns True
+    for tensors the model does not load.
+    """
+    rules = []
+    if include:
+        rules.append(lambda name: any(p.search(name) for p in include))
+    if exclude:
+        rules.append(lambda name: not any(p.search(name) for p in exclude))
+    unused = getattr(model, "is_unused_checkpoint_weight", None)
+    if callable(unused):
+        rules.append(lambda name: not unused(name))
+    if draft and type(model).__name__.startswith("DSparkDeepseekV4"):
+        # Stopgap until upstream DSpark (DeepSeek-V4) drafters define
+        # is_unused_checkpoint_weight: they load only the mtp.* tensors of the
+        # target checkpoint, as _remap_dspark_name in
+        # vllm/models/deepseek_v4/*/dspark.py does.
+        rules.append(lambda name: name.startswith("mtp."))
+    if not rules:
+        return None
+    return lambda name: all(rule(name) for rule in rules)
+
+
 def iter_weights(
-    client, uri: ModelURI, chunks: list, staging_bytes: int, concurrency: int, clone=True, use_vmm=True, stats=None
+    client,
+    uri: ModelURI,
+    chunks: list,
+    staging_bytes: int,
+    concurrency: int,
+    clone=True,
+    use_vmm=True,
+    stats=None,
+    tensor_device="cuda",
 ):
-    """Yield (name, CUDA tensor) for every tensor in chunks.
+    """Yield (name, tensor) for every tensor in chunks.
 
     Up to concurrency chunks are read ahead, each into its own staging
     buffer. A buffer is reused only after the consumer has moved past its
     tensors and the GPU work queued on it has finished (a CUDA event). Every
     buffer is fenced before it is dropped, also on early close or error.
     stats, a dict, gets counts and bytes of reads per delivery mode.
+    With tensor_device "cpu", staging buffers and tensors are in host memory,
+    reads use host-read, and no CUDA event is needed.
     """
     import torch
     import racer.cuda as rcuda
@@ -426,23 +495,30 @@ def iter_weights(
 
     if concurrency < 1:
         raise ValueError("concurrency must be at least 1")
-    device = torch.cuda.current_device()
-    cuda_device = f"cuda:{device}"
+    cpu = tensor_device == "cpu"
+    device = None if cpu else torch.cuda.current_device()
+    where = "cpu" if cpu else f"cuda:{device}"
 
     def new_buffer(size):
         # Exportable cuMemCreate memory allows gpu-read; torch memory needs host-read.
         nonlocal use_vmm
-        if use_vmm:
+        if use_vmm and not cpu:
             try:
                 alloc = rcuda.GpuAllocation(size, device)
                 return {"target": alloc, "flat": rtensors.as_tensor(alloc), "event": None}
             except racer.RacerError as exc:
-                log.info("racer: exportable GPU memory unavailable (%s); using torch memory", exc)
+                log.warning(
+                    "racer: exportable GPU memory unavailable (%s: %s); using torch memory, so reads use host-read",
+                    type(exc).__name__,
+                    exc,
+                )
                 use_vmm = False
-        flat = torch.empty(size, dtype=torch.uint8, device=cuda_device)
+        flat = torch.empty(size, dtype=torch.uint8, device=where)
         return {"target": rtensors.TensorTarget(flat), "flat": flat, "event": None}
 
     def done(buf):
+        if cpu:
+            return  # host copies are done when they return
         # Record on the target device's stream; this thread's device may differ.
         with torch.cuda.device(device):
             buf["event"] = torch.cuda.Event()
@@ -495,7 +571,7 @@ def iter_weights(
             for t in chunk.tensors:
                 size = t.end - t.start
                 if size == 0:
-                    yield t.name, torch.empty(t.shape, dtype=getattr(torch, DTYPES[t.dtype][1]), device=cuda_device)
+                    yield t.name, torch.empty(t.shape, dtype=getattr(torch, DTYPES[t.dtype][1]), device=where)
                     continue
                 rel = t.start - chunk.start
                 raw = flat[rel : rel + size]
@@ -505,7 +581,7 @@ def iter_weights(
                 yield t.name, tensor(t, raw)
             for t, offset, length in chunk.parts:
                 if offset == 0:
-                    joined[t.name] = torch.empty(t.end - t.start, dtype=torch.uint8, device=cuda_device)
+                    joined[t.name] = torch.empty(t.end - t.start, dtype=torch.uint8, device=where)
                 rel = t.start + offset - chunk.start
                 joined[t.name][offset : offset + length].copy_(flat[rel : rel + length])
                 if offset + length == t.end - t.start:
@@ -601,9 +677,36 @@ def summary(stats: dict, seconds: float, uri) -> str:
         f"{m}={stats['reads'][m]} ({stats['bytes'][m] / (1 << 30):.2f} GiB)"
         for m in (racer.GPU, racer.HOST, racer.STREAM)
     )
-    return (
+    text = (
         f"racer: loaded {stats['files']} files, {total:.2f} GiB in {seconds:.2f}s ({rate:.2f} GiB/s) "
         f"from {uri}; reads by delivery mode: {modes}"
+    )
+    if stats.get("skipped_tensors"):
+        text += (
+            f"; skipped {stats['skipped_tensors']} tensors ({stats['skipped_bytes'] / (1 << 30):.2f} GiB) "
+            f"and {stats['skipped_files']} whole files by tensor selection"
+        )
+    return text
+
+
+def _size(n: int) -> str:
+    return f"{n / (1 << 40):.2f} TiB" if n >= 1 << 40 else f"{n / (1 << 30):.2f} GiB"
+
+
+def warn_tp(tp_size: int, nbytes: int) -> None:
+    """Warn once per process that every rank of a regular checkpoint reads all of it."""
+    global _tp_warned
+    if tp_size <= 1 or _tp_warned:
+        return
+    _tp_warned = True
+    log.warning(
+        "racer: regular checkpoint with tensor_parallel_size=%d: every rank reads all %s, so the node reads %s. "
+        "Repeat reads are cache hits but still cost client, dataplane and PCIe work. Save a sharded_state "
+        "checkpoint (vLLM %s) and load it with sharded_state=true, so each rank reads only its own shard",
+        tp_size,
+        _size(nbytes),
+        _size(nbytes * tp_size),
+        SHARDED_STATE_SCRIPT,
     )
 
 
@@ -692,6 +795,14 @@ def vllm_ranks() -> dict:
     }
 
 
+def _tp_size() -> int:
+    """This process's tensor parallel size, or 1 outside a vLLM worker."""
+    try:
+        return vllm_ranks()["tp_size"]
+    except (ImportError, AssertionError):
+        return 1
+
+
 def load_state(state_dict: dict, weights) -> None:
     """Copy (name, tensor) pairs into the parameters, as vLLM's ShardedStateLoader does.
 
@@ -745,12 +856,28 @@ def _int_option(extra: dict, key: str, default: int) -> int:
         raise ValueError(f"{key} must be an integer, not {value!r}") from None
 
 
+def _patterns(extra: dict, key: str) -> list:
+    """A list of regular expressions; a single string is one expression."""
+    value = extra.get(key) or []
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        raise ValueError(f"{key} must be a list of regular expressions, not {value!r}")
+    try:
+        return [re.compile(v) for v in value]
+    except re.error as exc:
+        raise ValueError(f"{key}: bad regular expression: {exc}") from None
+
+
 def settings(extra: dict) -> dict:
     """Loader options from model_loader_extra_config, with defaults."""
     retry = extra.get("mode_retry_seconds", racer.DEFAULT_MODE_RETRY_SECONDS)
     prefetch_ttl = _int_option(extra, "prefetch_ttl_seconds", DEFAULT_PREFETCH_TTL_SECONDS)
     if prefetch_ttl < 0:
         raise ValueError("prefetch_ttl_seconds must be at least 0")
+    device = extra.get("tensor_device", TENSOR_DEVICES[0])
+    if device not in TENSOR_DEVICES:
+        raise ValueError(f"tensor_device must be one of {', '.join(TENSOR_DEVICES)}, not {device!r}")
     return {
         "uri": extra.get("uri"),
         "staging_bytes": int(extra.get("staging_bytes", DEFAULT_STAGING_BYTES)),
@@ -763,6 +890,9 @@ def settings(extra: dict) -> dict:
         "pattern": extra.get("pattern"),
         "prefetch": _bool_option(extra, "prefetch", DEFAULT_PREFETCH),
         "prefetch_ttl_seconds": prefetch_ttl,
+        "tensor_device": device,
+        "tensor_include": _patterns(extra, "tensor_include"),
+        "tensor_exclude": _patterns(extra, "tensor_exclude"),
     }
 
 
@@ -780,17 +910,50 @@ def register() -> None:
         def __init__(self, load_config):
             super().__init__(load_config)
             self.opts = settings(dict(getattr(load_config, "model_loader_extra_config", None) or {}))
+            self.draft = self.inherited = False
+            self.target = None
+
+        def load_model(self, vllm_config, model_config, *args, **kwargs):
+            # A speculative decoding drafter gets the target's load config
+            # unless draft_load_config is set. Tell the loads apart as vLLM
+            # 0.33's IpcModelLoader does; the base load_model calls load_weights.
+            spec = getattr(vllm_config, "speculative_config", None)
+            self.draft = spec is not None and model_config is getattr(spec, "draft_model_config", None)
+            self.inherited = self.draft and getattr(spec, "draft_load_config", None) is None
+            self.target = getattr(vllm_config, "model_config", None)
+            return super().load_model(vllm_config, model_config, *args, **kwargs)
+
+        def _target_uri(self):
+            """The target model's URI, or None when it is unknown."""
+            if self.target is None:
+                return None
+            try:
+                return resolve_uri(str(self.target.model), self.opts if self.inherited else {})
+            except (ValueError, OSError):
+                return None
 
         def _open(self, model_config):
             """Return (uri, client, file names, pins)."""
             o = self.opts
-            uri = resolve_uri(str(model_config.model), o)
-            pins = resolve_pins(str(model_config.model), uri)
+            path = str(model_config.model)
+            if o["sharded_state"] and self.inherited:
+                raise ValueError(
+                    "racer loader: the draft model inherited the target's load config with sharded_state, so it "
+                    "would read the target's rank files; set draft_load_config in --speculative-config, for example "
+                    '{"load_format": "racer", "model_loader_extra_config": {"sharded_state": false}}, '
+                    "or point it at a sharded_state checkpoint of the draft model"
+                )
+            extra = o
+            if self.inherited and self.target is not None and path != str(self.target.model):
+                extra = {**o, "uri": None}  # the inherited uri names the target's checkpoint
+            uri = resolve_uri(path, extra)
+            pins = resolve_pins(path, uri)
             client = racer.Client(
                 cache=uri.cache,
                 socket_path=o["socket"],
                 staging_bytes=o["staging_bytes"],
                 mode_retry_seconds=o["mode_retry_seconds"],
+                pin_staging=o["tensor_device"] == "cuda",
             )
             try:
                 if o["sharded_state"]:
@@ -817,22 +980,48 @@ def register() -> None:
             o = self.opts
             started = time.monotonic()
             uri, client, files, pins = self._open(model_config)
+            select = None
+            if not o["sharded_state"]:
+                select = tensor_filter(o["tensor_include"], o["tensor_exclude"], model, self.draft)
             stats = {"files": len(files), "reads": dict.fromkeys((racer.GPU, racer.HOST, racer.STREAM), 0)}
             stats["bytes"] = dict(stats["reads"])
+            stats.update(skipped_tensors=0, skipped_bytes=0, skipped_files=0)
             with client:
                 # Stat every file before any data read, so the model is read at one version.
                 pinned = [(name, stat_pinned(client, uri, name, pins.get(name))) for name in files]
-                if o["prefetch"]:
-                    try:
-                        queued = prefetch_weights(client, uri, pinned, o["prefetch_ttl_seconds"])
-                        log.debug("racer: prefetch %s queued %d files (%s)", queued.id, len(pinned), queued.state)
-                    except (racer.RacerError, OSError) as exc:
-                        # A socket timeout or reset is not a RacerError; prefetch
-                        # is best effort, so load without it either way.
-                        log.debug("racer: prefetch unavailable (%s); loading without it", exc)
-                chunks = read_chunks(client, uri, pinned, o["staging_bytes"])
+                if self.draft and select is None and uri == self._target_uri():
+                    log.warning(
+                        "racer: the draft model reads all %s of %s again after the target model; set "
+                        "tensor_include or tensor_exclude in model_loader_extra_config to read only the draft's "
+                        "tensors, or set draft_load_config in --speculative-config",
+                        _size(sum(meta.size for _, meta in pinned)),
+                        uri,
+                    )
+                if o["prefetch"] and select is None:
+                    _prefetch(client, uri, pinned, o["prefetch_ttl_seconds"])
+                chunks = read_chunks(client, uri, pinned, o["staging_bytes"], select, stats)
+                if select is not None:
+                    if not chunks and stats["skipped_tensors"]:
+                        raise ValueError(f"racer loader: the tensor selection skips every tensor in {uri}")
+                    if o["prefetch"]:
+                        # Tickets cover whole files, so leave out the files with nothing to read.
+                        used = {c.file for c in chunks}
+                        _prefetch(client, uri, [p for p in pinned if p[0] in used], o["prefetch_ttl_seconds"])
+                stats["files"] -= stats["skipped_files"]
+                if not o["sharded_state"]:
+                    warn_tp(_tp_size(), sum(c.end - c.start for c in chunks))
+                # load_state copies each tensor before it asks for the next one, so it needs no clone.
+                clone = o["clone"] and not o["sharded_state"]
                 weights = iter_weights(
-                    client, uri, chunks, o["staging_bytes"], o["concurrency"], o["clone"], o["use_vmm"], stats
+                    client,
+                    uri,
+                    chunks,
+                    o["staging_bytes"],
+                    o["concurrency"],
+                    clone,
+                    o["use_vmm"],
+                    stats,
+                    o["tensor_device"],
                 )
                 try:
                     if o["sharded_state"]:
@@ -853,6 +1042,19 @@ def register() -> None:
     _registered = True
 
 
+def _prefetch(client, uri: ModelURI, pinned: list, ttl_seconds: int) -> None:
+    """Submit a prefetch ticket for pinned, best effort."""
+    if not pinned:
+        return
+    try:
+        queued = prefetch_weights(client, uri, pinned, ttl_seconds)
+        log.debug("racer: prefetch %s queued %d files (%s)", queued.id, len(pinned), queued.state)
+    except (racer.RacerError, OSError) as exc:
+        # A socket timeout or reset is not a RacerError; prefetch
+        # is best effort, so load without it either way.
+        log.debug("racer: prefetch unavailable (%s); loading without it", exc)
+
+
 def _filter_subtensors(state_dict: dict) -> dict:
     """vLLM's filter for tensors that share memory."""
     from vllm.model_executor.model_loader.sharded_state_loader import ShardedStateLoader
@@ -869,8 +1071,10 @@ def main(argv=None) -> int:
     p.add_argument("dest", help="local directory")
     p.add_argument("--pattern", help="sharded_state file name pattern, as the loader's pattern option")
     a = p.parse_args(argv)
-    for name in fetch(a.uri, a.dest, pattern=a.pattern):
+    info = {}
+    for name in fetch(a.uri, a.dest, pattern=a.pattern, info=info):
         print(name)
+    print(f"weights: {info['layout']} layout, {info['files']} files, {_size(info['bytes'])}", file=sys.stderr)
     return 0
 
 

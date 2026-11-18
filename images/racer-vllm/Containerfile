@@ -3,8 +3,9 @@
 
 # vLLM's OpenAI server with racer-client and racer-vllm installed, so
 # `vllm serve <dir> --load-format racer` and `racer-vllm-fetch` work as is.
-# racer-vllm targets vLLM v0.25.x; keep this tag in that series.
-ARG VLLM_IMAGE=docker.io/vllm/vllm-openai:v0.25.1
+# racer-vllm supports vLLM v0.30.0 and v0.33.0 or later; keep this tag at
+# v0.33.0 or later.
+ARG VLLM_IMAGE=docker.io/vllm/vllm-openai:v0.33.0
 
 # Build stage
 # Both packages are pure Python, so the wheels do not depend on the base image.

@@ -116,8 +116,9 @@ GPUDirect Storage (cuFile) on local NVMe has two paths:
 - **PCI P2PDMA (recommended).** Needs Linux 6.2 or later, the open kernel
   module, and cuFile 1.13 (CUDA 12.8) or later in the workload container. The
   image meets the host side and needs no `nvidia-fs`. cuFile uses P2PDMA only
-  when asked: set `"use_pci_p2pdma": true` under `properties` in `cufile.json`,
-  or for Racer set `RACER_GPU_PCI_P2PDMA=true` in `racer-settings`.
+  when asked: set `"use_pci_p2pdma": true` under `properties` in `cufile.json`.
+  Racer asks by default when the node has no `nvidia-fs*` device
+  (`RACER_GPU_PCI_P2PDMA=auto` in `racer-settings`).
 - **`nvidia-fs`.** Not installed. It needs `nvidia-fs-dkms` from the CUDA
   repository, which is unsigned like the GPU modules, and the NVMe patches from
   MLNX_OFED or DOCA for local NVMe.

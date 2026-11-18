@@ -658,19 +658,25 @@ racer-fuzz: ## Run each Racer libFuzzer target for FUZZ_SECONDS (default 30)
 RACER_GPU_NATIVE ?= $(CURDIR)/bin/racer-gpu-native
 # 1 skips when no GPU is found; require fails instead (dedicated GPU runners).
 RACER_GPU_TESTS ?= require
+# The same for the Python tensor tests when torch with CUDA is missing.
+RACER_GPU_TORCH ?= $(RACER_GPU_TESTS)
+RACER_PY_GPU_VENV ?= $(CURDIR)/tmp/racer-python-gpu-venv
+# cu128 wheels need driver 570 or later and exist for x86_64 and aarch64.
+RACER_TORCH_INDEX ?= https://download.pytorch.org/whl/cu128
 
 .PHONY: racer-gpu-test
 racer-gpu-test: ## Build the CUDA shim with kernels (needs nvcc) and run GPU hardware tests (needs a GPU)
 	RACER_GPU_REQUIRE_PTX=1 timeout --signal=TERM --kill-after=10s 600s sh images/racer/build-native-cuda.sh cmd/racer/gpu/native "$(RACER_GPU_NATIVE)/libracer_gpu_cuda.so.1"
 	LD_LIBRARY_PATH="$(RACER_GPU_NATIVE)$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}" timeout --signal=TERM --kill-after=10s 300s cargo test --locked --manifest-path cmd/racer/Cargo.toml -p racer-gpu --no-default-features --features native --lib ffi::tests::required_native_shim_loads_abi_and_symbols -- --exact --ignored
 	LD_LIBRARY_PATH="$(RACER_GPU_NATIVE)$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}" RACER_GPU_TESTS=$(RACER_GPU_TESTS) timeout --signal=TERM --kill-after=10s 900s cargo test --locked --manifest-path cmd/racer/Cargo.toml -p racer-gpu --no-default-features --features native --test hardware -- --nocapture --test-threads=1
-	@if [ -n "$$RACER_GPU_E2E_SOCKET" ]; then \
-		test -x "$(RACER_PY_VENV)/bin/pytest" || { timeout --signal=TERM --kill-after=10s 120s python3 -m venv "$(RACER_PY_VENV)" && \
-			timeout --signal=TERM --kill-after=10s 300s "$(RACER_PY_VENV)/bin/pip" install -q pytest; }; \
-		cd clients/python/racer && PYTHONPATH=src timeout --signal=TERM --kill-after=10s 300s "$(RACER_PY_VENV)/bin/pytest" -q -p no:cacheprovider -m gpu -rs; \
-	elif [ "$$RACER_GPU_E2E" = require ]; then \
-		echo "RACER_GPU_E2E=require but RACER_GPU_E2E_SOCKET is unset" >&2; exit 1; \
-	else echo "RACER_GPU_E2E_SOCKET unset: skipping the Python gpu-read test against a live dataplane"; fi
+	LD_LIBRARY_PATH="$(RACER_GPU_NATIVE)$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}" RACER_GPU_TESTS=$(RACER_GPU_TESTS) timeout --signal=TERM --kill-after=10s 1800s cargo test --locked --manifest-path cmd/racer/Cargo.toml -p racer --features cuda --lib gpu::hardware:: -- --nocapture --test-threads=1
+	@test -x "$(RACER_PY_GPU_VENV)/bin/pytest" || { timeout --signal=TERM --kill-after=10s 120s python3 -m venv "$(RACER_PY_GPU_VENV)" && \
+		timeout --signal=TERM --kill-after=10s 1200s "$(RACER_PY_GPU_VENV)/bin/pip" install -q torch --index-url "$(RACER_TORCH_INDEX)" && \
+		timeout --signal=TERM --kill-after=10s 300s "$(RACER_PY_GPU_VENV)/bin/pip" install -q pytest numpy; }
+	cd clients/python/racer && RACER_GPU_TESTS=$(RACER_GPU_TESTS) RACER_GPU_TORCH=$(RACER_GPU_TORCH) PYTHONPATH=src \
+		timeout --signal=TERM --kill-after=10s 600s "$(RACER_PY_GPU_VENV)/bin/pytest" -q -p no:cacheprovider -m gpu -rs
+	cd clients/python/racer-vllm && RACER_GPU_TESTS=$(RACER_GPU_TESTS) RACER_GPU_TORCH=$(RACER_GPU_TORCH) PYTHONPATH=src:../racer/src \
+		timeout --signal=TERM --kill-after=10s 600s "$(RACER_PY_GPU_VENV)/bin/pytest" -q -p no:cacheprovider -m gpu -rs
 
 RACER_PY_VENV ?= $(CURDIR)/tmp/racer-python-venv
 

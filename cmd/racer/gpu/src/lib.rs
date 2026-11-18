@@ -104,19 +104,81 @@ pub enum Error {
 }
 
 impl std::fmt::Display for Error {
-    /// Describe the error.
+    /// Describe the error, naming cuFile statuses.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Driver(code) => write!(f, "GPU driver call failed with status {code}"),
-            Self::Unsupported(code) => {
-                write!(f, "cuFile does not support the file (status {code})")
-            }
+            Self::Driver(code) => match cufile_status_name(*code) {
+                Some(name) => write!(f, "cuFile call failed with status {code} ({name})"),
+                None => write!(f, "GPU driver call failed with status {code}"),
+            },
+            Self::Unsupported(code) => match cufile_status_name(*code) {
+                Some(name) => write!(f, "cuFile does not support the file (status {code} {name})"),
+                None => write!(f, "cuFile does not support the file (status {code})"),
+            },
             other => write!(f, "{other:?}"),
         }
     }
 }
 
 impl std::error::Error for Error {}
+
+/// The name of a cuFile status (`CUfileOpError` in `cufile.h`), or `None`
+/// for any other code, such as a `CUresult`. cuFile statuses are
+/// `CUFILEOP_BASE_ERR` (5000) plus a small number; CUDA and NVML codes are
+/// all below that.
+pub fn cufile_status_name(code: i32) -> Option<&'static str> {
+    Some(match code {
+        5001 => "CU_FILE_DRIVER_NOT_INITIALIZED",
+        5002 => "CU_FILE_DRIVER_INVALID_PROPS",
+        5003 => "CU_FILE_DRIVER_UNSUPPORTED_LIMIT",
+        5004 => "CU_FILE_DRIVER_VERSION_MISMATCH",
+        5005 => "CU_FILE_DRIVER_VERSION_READ_ERROR",
+        5006 => "CU_FILE_DRIVER_CLOSING",
+        5007 => "CU_FILE_PLATFORM_NOT_SUPPORTED",
+        5008 => "CU_FILE_IO_NOT_SUPPORTED",
+        5009 => "CU_FILE_DEVICE_NOT_SUPPORTED",
+        5010 => "CU_FILE_NVFS_DRIVER_ERROR",
+        5011 => "CU_FILE_CUDA_DRIVER_ERROR",
+        5012 => "CU_FILE_CUDA_POINTER_INVALID",
+        5013 => "CU_FILE_CUDA_MEMORY_TYPE_INVALID",
+        5014 => "CU_FILE_CUDA_POINTER_RANGE_ERROR",
+        5015 => "CU_FILE_CUDA_CONTEXT_MISMATCH",
+        5016 => "CU_FILE_INVALID_MAPPING_SIZE",
+        5017 => "CU_FILE_INVALID_MAPPING_RANGE",
+        5018 => "CU_FILE_INVALID_FILE_TYPE",
+        5019 => "CU_FILE_INVALID_FILE_OPEN_FLAG",
+        5020 => "CU_FILE_DIO_NOT_SET",
+        5022 => "CU_FILE_INVALID_VALUE",
+        5023 => "CU_FILE_MEMORY_ALREADY_REGISTERED",
+        5024 => "CU_FILE_MEMORY_NOT_REGISTERED",
+        5025 => "CU_FILE_PERMISSION_DENIED",
+        5026 => "CU_FILE_DRIVER_ALREADY_OPEN",
+        5027 => "CU_FILE_HANDLE_NOT_REGISTERED",
+        5028 => "CU_FILE_HANDLE_ALREADY_REGISTERED",
+        5029 => "CU_FILE_DEVICE_NOT_FOUND",
+        5030 => "CU_FILE_INTERNAL_ERROR",
+        5031 => "CU_FILE_GETNEWFD_FAILED",
+        5033 => "CU_FILE_NVFS_SETUP_ERROR",
+        5034 => "CU_FILE_IO_DISABLED",
+        5035 => "CU_FILE_BATCH_SUBMIT_FAILED",
+        5036 => "CU_FILE_GPU_MEMORY_PINNING_FAILED",
+        5037 => "CU_FILE_BATCH_FULL",
+        5038 => "CU_FILE_ASYNC_NOT_SUPPORTED",
+        5039 => "CU_FILE_INTERNAL_BATCH_SETUP_ERROR",
+        5040 => "CU_FILE_INTERNAL_BATCH_SUBMIT_ERROR",
+        5041 => "CU_FILE_INTERNAL_BATCH_GETSTATUS_ERROR",
+        5042 => "CU_FILE_INTERNAL_BATCH_CANCEL_ERROR",
+        5043 => "CU_FILE_NOMEM_ERROR",
+        5044 => "CU_FILE_IO_ERROR",
+        5045 => "CU_FILE_INTERNAL_BUF_REGISTER_ERROR",
+        5046 => "CU_FILE_HASH_OPR_ERROR",
+        5047 => "CU_FILE_INVALID_CONTEXT_ERROR",
+        5048 => "CU_FILE_NVFS_INTERNAL_DRIVER_ERROR",
+        5049 => "CU_FILE_BATCH_NOCOMPAT_ERROR",
+        5050 => "CU_FILE_IO_MAX_ERROR",
+        _ => return None,
+    })
+}
 
 /// A GPU's compute mode (`CUcomputemode`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -276,6 +338,15 @@ impl Gpu {
             raw,
             ordinal,
         })))
+    }
+
+    /// Open the cuFile driver if it is not open yet, as [`Gpu::open_file`]
+    /// and [`StagingBuffer::register_cufile`] do first. A failed open is
+    /// final: this and every later open, on any thread, fail the same way,
+    /// with the cuFile status in [`Error::Driver`].
+    pub fn open_cufile(&self) -> Result<()> {
+        let shared = &self.shared;
+        shared.check(unsafe { (shared.api.file_open)(shared.file_flags.load(Ordering::Relaxed)) })
     }
 
     /// Open the cuFile driver if needed and register an `O_DIRECT` file.
@@ -1865,5 +1936,35 @@ mod tests {
         device.compute_mode = ComputeMode::Default;
         device.flags = flag::VMM;
         assert!(!device.usable());
+    }
+
+    #[test]
+    /// cuFile statuses are named in errors; other driver codes are not.
+    fn cufile_statuses_are_named() {
+        assert_eq!(
+            Error::Driver(5001).to_string(),
+            "cuFile call failed with status 5001 (CU_FILE_DRIVER_NOT_INITIALIZED)"
+        );
+        assert_eq!(
+            Error::Unsupported(5008).to_string(),
+            "cuFile does not support the file (status 5008 CU_FILE_IO_NOT_SUPPORTED)"
+        );
+        assert_eq!(
+            Error::Driver(999).to_string(),
+            "GPU driver call failed with status 999"
+        );
+        assert_eq!(
+            Error::Unsupported(-1).to_string(),
+            "cuFile does not support the file (status -1)"
+        );
+        assert_eq!(Error::Unavailable.to_string(), "Unavailable");
+        assert_eq!(
+            cufile_status_name(5007),
+            Some("CU_FILE_PLATFORM_NOT_SUPPORTED")
+        );
+        assert_eq!(cufile_status_name(5050), Some("CU_FILE_IO_MAX_ERROR"));
+        for code in [0, 1, 5000, 5021, 5032, 5051, -5001] {
+            assert_eq!(cufile_status_name(code), None, "{code}");
+        }
     }
 }
