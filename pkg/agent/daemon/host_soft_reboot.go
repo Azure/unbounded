@@ -150,6 +150,9 @@ func (h *HostSoftRebootHandler) Reconcile(ctx context.Context, op MachineOperati
 
 	if blocker != "" {
 		message := fmt.Sprintf("waiting for out-of-band host operation %s", blocker)
+		h.log.Info("not starting a HostSoftReboot: an out-of-band host operation on this machine is unfinished",
+			"operation", op.Name, "blockedBy", blocker)
+
 		return ctrl.Result{RequeueAfter: hostSoftRebootWaitInterval}, h.markWaiting(ctx, op.Name, message)
 	}
 
@@ -172,6 +175,10 @@ func (h *HostSoftRebootHandler) Reconcile(ctx context.Context, op MachineOperati
 
 	if err := h.host.RebootHost(ctx, h.log); err != nil {
 		if ctx.Err() != nil {
+			// Shutdown may be the reboot itself; the next daemon judges the boot ID.
+			h.log.Warn("daemon stopping while rebooting host; the next daemon reports HostSoftReboot",
+				"operation", op.Name, "error", err)
+
 			return ctrl.Result{}, nil
 		}
 
@@ -218,11 +225,21 @@ func (h *HostSoftRebootHandler) matches(ctx context.Context, op *v1alpha3.Machin
 	return h.target.MatchSelector(ctx, h.reader, op.Spec.OperationKind, selector)
 }
 
+func selectorOperation(op *v1alpha3.MachineOperation) bool {
+	return op.Spec.MachineRef == "" && op.Spec.MachineSelector != nil
+}
+
 func (h *HostSoftRebootHandler) pendingMatch(ctx context.Context, op *v1alpha3.MachineOperation) (bool, error) {
-	// Never overwrite boot evidence after a start, including an uncertain write.
-	if op.Spec.OperationKind != v1alpha3.OperationHostSoftReboot || !operationPending(op.Status.Phase) {
+	if op.Spec.OperationKind != v1alpha3.OperationHostSoftReboot {
 		return false, nil
 	}
+
+	// A peer may have started a selector request; this target must still be unstarted.
+	if !operationPending(op.Status.Phase) && (!selectorOperation(op) || op.Status.Phase != v1alpha3.OperationPhaseInProgress) {
+		return false, nil
+	}
+
+	// Never overwrite boot evidence after a start, including an uncertain write.
 
 	if target := operationTargetStatus(&op.Status, h.reference); target != nil && !operationPending(target.Phase) {
 		return false, nil
@@ -307,6 +324,8 @@ func (h *HostSoftRebootHandler) failBootRead(ctx context.Context, name string, c
 			return err
 		}
 
+		// A boot read failure retains the existing aggregate ExecutionFailed result,
+		// even when a selector peer has already started.
 		SetMachineOperationResult(&op, MachineOperationResult[int64]{
 			Phase:   v1alpha3.OperationPhaseFailed,
 			Reason:  "ExecutionFailed",
@@ -324,7 +343,13 @@ func (h *HostSoftRebootHandler) finish(ctx context.Context, name, bootID string,
 			return client.IgnoreNotFound(err)
 		}
 
-		if op.Spec.OperationKind != v1alpha3.OperationHostSoftReboot || op.Status.IsTerminal() {
+		if op.Spec.OperationKind != v1alpha3.OperationHostSoftReboot {
+			return nil
+		}
+
+		// A selector's peer can finish the aggregate before this issued target reports.
+		// A terminal single-reference operation remains immutable.
+		if op.Status.IsTerminal() && !selectorOperation(&op) {
 			return nil
 		}
 
@@ -339,7 +364,10 @@ func (h *HostSoftRebootHandler) finish(ctx context.Context, name, bootID string,
 		}
 
 		now := metav1.Now()
-		SetMachineOperationResult(&op, result, now)
+		if !op.Status.IsTerminal() {
+			SetMachineOperationResult(&op, result, now)
+		}
+
 		target.Phase = result.Phase
 		target.Message = result.Message
 		target.CompletedAt = &now
@@ -421,6 +449,10 @@ func (h *HostSoftRebootHandler) markWaiting(ctx context.Context, name, message s
 			return err
 		}
 
+		if !operationPending(op.Status.Phase) {
+			return nil
+		}
+
 		if op.Status.Phase == v1alpha3.OperationPhasePending && op.Status.Message == message {
 			return nil
 		}
@@ -448,7 +480,7 @@ func (h *HostSoftRebootHandler) PublishStartup(ctx context.Context) error {
 
 	for i := range ops.Items {
 		op := &ops.Items[i]
-		if op.Spec.OperationKind != v1alpha3.OperationHostSoftReboot || op.Status.IsTerminal() {
+		if op.Spec.OperationKind != v1alpha3.OperationHostSoftReboot || (op.Status.IsTerminal() && !selectorOperation(op)) {
 			continue
 		}
 

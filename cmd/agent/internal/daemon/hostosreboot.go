@@ -72,7 +72,17 @@ func newHostSoftRebootHandler(
 	host daemon.HostRebooter,
 	requested *atomic.Bool,
 ) (*daemon.HostSoftRebootHandler, error) {
-	return daemon.NewHostSoftRebootHandler(c, reader, log, hostSoftRebootTarget{machineName: machineName, nodeName: nodeName}, host, requested)
+	return daemon.NewHostSoftRebootHandler(
+		c,
+		reader,
+		log,
+		hostSoftRebootTarget{
+			machineName: machineName,
+			nodeName:    nodeName,
+		},
+		host,
+		requested,
+	)
 }
 
 func (t *machineOperationTarget) reconcileHostSoftReboot(ctx context.Context, _ daemon.MachineOperationStore[int64], op daemon.MachineOperation) (ctrl.Result, error) {
@@ -97,7 +107,15 @@ func (t *machineOperationTarget) reconcileHostSoftReboot(ctx context.Context, _ 
 		return ctrl.Result{}, err
 	}
 
-	handler, err := newHostSoftRebootHandler(t.Client, t.reader(), t.log, t.machineName, t.nodeName, t.nodeOperator, &t.rebootRequested)
+	handler, err := newHostSoftRebootHandler(
+		t.Client,
+		t.reader(),
+		t.log,
+		t.machineName,
+		t.nodeName,
+		t.nodeOperator,
+		&t.rebootRequested,
+	)
 	if err != nil {
 		return ctrl.Result{}, err
 	}

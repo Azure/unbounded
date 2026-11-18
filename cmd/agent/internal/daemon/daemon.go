@@ -192,7 +192,15 @@ func run(ctx context.Context, log *slog.Logger, opts runOptions) error {
 		log.Warn("failed to publish and clear AgentUpgrade daemon signals", "error", err)
 	}
 
-	rebootHandler, err := newHostSoftRebootHandler(kubeClient, kubeClient, log, active.Config.MachineName, active.Config.NodeName, runOpts.NodeOperator, &atomic.Bool{})
+	rebootHandler, err := newHostSoftRebootHandler(
+		kubeClient,
+		kubeClient,
+		log,
+		active.Config.MachineName,
+		active.Config.NodeName,
+		runOpts.NodeOperator,
+		&atomic.Bool{},
+	)
 	if err != nil {
 		return fmt.Errorf("create HostSoftReboot handler: %w", err)
 	}

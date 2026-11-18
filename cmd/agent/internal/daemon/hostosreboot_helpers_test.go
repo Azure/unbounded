@@ -77,21 +77,38 @@ func unfinishedOutOfBandHostOperation(ctx context.Context, reader client.Reader,
 
 	soft := &v1alpha3.MachineOperation{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-soft-probe"},
-		Spec:       v1alpha3.MachineOperationSpec{MachineRef: machine.Name, OperationKind: v1alpha3.OperationHostSoftReboot},
+		Spec: v1alpha3.MachineOperationSpec{
+			MachineRef:    machine.Name,
+			OperationKind: v1alpha3.OperationHostSoftReboot,
+		},
 	}
 	if err := c.Create(ctx, soft); err != nil {
 		return "", err
 	}
 	defer func() { _ = c.Delete(ctx, soft) }()
 
-	handler, err := newHostSoftRebootHandler(c, reader, discardLogger(), machine.Name, "test-node", testHostRebooter{bootID: staticBootID("test-boot")}, &atomic.Bool{})
+	host := &fakeNodeOperator{bootID: "test-boot"}
+
+	handler, err := newHostSoftRebootHandler(c, reader, discardLogger(), machine.Name, "test-node", host, &atomic.Bool{})
 	if err != nil {
 		return "", err
 	}
 
 	result, err := handler.Reconcile(ctx, daemon.MachineOperation{Name: soft.Name})
-	if err != nil || result.RequeueAfter == 0 {
+	if err != nil {
 		return "", err
+	}
+
+	if result.RequeueAfter == 0 {
+		if host.rebootCalls != 1 {
+			return "", fmt.Errorf("unblocked probe issued %d reboot commands, want 1", host.rebootCalls)
+		}
+
+		return "", nil
+	}
+
+	if host.rebootCalls != 0 {
+		return "", fmt.Errorf("blocked probe issued %d reboot commands, want 0", host.rebootCalls)
 	}
 
 	if err := reader.Get(ctx, client.ObjectKeyFromObject(soft), soft); err != nil {

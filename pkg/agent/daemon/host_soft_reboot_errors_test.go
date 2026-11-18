@@ -93,7 +93,12 @@ func TestHostSoftRebootPublicFailedPublicationDoesNotReplay(t *testing.T) {
 		},
 	}).Build()
 	flag := &atomic.Bool{}
-	host := &fakeHostRebooter{bootID: "boot-1", reboot: func(context.Context) error { return errors.New("command failed") }}
+	host := &fakeHostRebooter{
+		bootID: "boot-1",
+		reboot: func(context.Context) error {
+			return errors.New("command failed")
+		},
+	}
 	h := publicHandler(t, c, c, host, flag)
 
 	_, err := h.Reconcile(t.Context(), MachineOperation{Name: "soft"})
@@ -113,8 +118,16 @@ func TestHostSoftRebootPublicStartupRejectsStaleEvidence(t *testing.T) {
 		phase  v1alpha3.OperationPhase
 		bootID string
 	}{
-		{name: "finished target", phase: v1alpha3.OperationPhaseComplete, bootID: "boot-1"},
-		{name: "changed boot ID", phase: v1alpha3.OperationPhaseInProgress, bootID: "different"},
+		{
+			name:   "finished target",
+			phase:  v1alpha3.OperationPhaseComplete,
+			bootID: "boot-1",
+		},
+		{
+			name:   "changed boot ID",
+			phase:  v1alpha3.OperationPhaseInProgress,
+			bootID: "different",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			stale := publicSoftOp()

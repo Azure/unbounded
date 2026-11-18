@@ -70,7 +70,10 @@ func TestHostSoftRebootPublicNodeOutOfBandPriority(t *testing.T) {
 			ref:  "machine-1",
 			status: v1alpha3.MachineOperationStatus{
 				Targets: []v1alpha3.MachineOperationTargetStatus{
-					{MachineRef: "other", Phase: v1alpha3.OperationPhaseInProgress},
+					{
+						MachineRef: "other",
+						Phase:      v1alpha3.OperationPhaseInProgress,
+					},
 				},
 			},
 		},

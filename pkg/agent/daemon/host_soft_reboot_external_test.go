@@ -64,9 +64,14 @@ func TestHostSoftRebootExternalNodeTarget(t *testing.T) {
 		ref      string
 		selector *metav1.LabelSelector
 		node     *corev1.Node
+		peer     bool
 		want     bool
 	}{
-		{name: "explicit without node", ref: "aks-machine-1", want: true},
+		{
+			name: "explicit without node",
+			ref:  "aks-machine-1",
+			want: true,
+		},
 		{
 			name: "selector",
 			selector: &metav1.LabelSelector{
@@ -81,7 +86,28 @@ func TestHostSoftRebootExternalNodeTarget(t *testing.T) {
 			},
 			want: true,
 		},
-		{name: "empty selector without node", selector: &metav1.LabelSelector{}},
+		{
+			name: "selector with started peer",
+			selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"rack": "a",
+				},
+			},
+			node: &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "node-1",
+					Labels: map[string]string{
+						"rack": "a",
+					},
+				},
+			},
+			peer: true,
+			want: true,
+		},
+		{
+			name:     "empty selector without node",
+			selector: &metav1.LabelSelector{},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			scheme := runtime.NewScheme()
@@ -95,6 +121,17 @@ func TestHostSoftRebootExternalNodeTarget(t *testing.T) {
 					MachineSelector: tc.selector,
 					OperationKind:   v1alpha3.OperationHostSoftReboot,
 				},
+			}
+
+			if tc.peer {
+				op.Status.Phase = v1alpha3.OperationPhaseInProgress
+				op.Status.Targets = []v1alpha3.MachineOperationTargetStatus{
+					{
+						MachineRef: "other-machine",
+						Phase:      v1alpha3.OperationPhaseInProgress,
+						BootID:     "peer-boot",
+					},
+				}
 			}
 
 			objects := []client.Object{op}
@@ -120,11 +157,22 @@ func TestHostSoftRebootExternalNodeTarget(t *testing.T) {
 				require.NoError(t, c.Get(t.Context(), client.ObjectKey{Name: "soft"}, &latest))
 				assert.True(t, flag.Load())
 				assert.Equal(t, v1alpha3.OperationPhaseInProgress, latest.Status.Phase)
-				require.Len(t, latest.Status.Targets, 1)
-				assert.Equal(t, "aks-machine-1", latest.Status.Targets[0].MachineRef)
-				assert.Equal(t, "boot-1", latest.Status.Targets[0].BootID)
+
+				targetIndex := 0
+				if tc.peer {
+					targetIndex = 1
+				}
+
+				require.Len(t, latest.Status.Targets, targetIndex+1)
+
+				if tc.peer {
+					assert.Equal(t, op.Status.Targets[0], latest.Status.Targets[0])
+				}
+
+				assert.Equal(t, "aks-machine-1", latest.Status.Targets[targetIndex].MachineRef)
+				assert.Equal(t, "boot-1", latest.Status.Targets[targetIndex].BootID)
 				assert.Zero(t, latest.Status.ObservedMachineGeneration)
-				assert.Zero(t, latest.Status.Targets[0].ObservedGeneration)
+				assert.Zero(t, latest.Status.Targets[targetIndex].ObservedGeneration)
 			}
 			h, err := daemon.NewHostSoftRebootHandler(c, c, slog.New(slog.NewTextHandler(io.Discard, nil)), nodeTarget{}, host, flag)
 			require.NoError(t, err)

@@ -116,13 +116,63 @@ func TestHostSoftRebootHandlerValidatesDependencies(t *testing.T) {
 		host   HostRebooter
 		flag   *atomic.Bool
 	}{
-		{name: "client", reader: c, log: log, target: nodeRebootTarget{}, host: host, flag: flag},
-		{name: "reader", c: c, log: log, target: nodeRebootTarget{}, host: host, flag: flag},
-		{name: "logger", c: c, reader: c, target: nodeRebootTarget{}, host: host, flag: flag},
-		{name: "target", c: c, reader: c, log: log, host: host, flag: flag},
-		{name: "host", c: c, reader: c, log: log, target: nodeRebootTarget{}, flag: flag},
-		{name: "typed nil host", c: c, reader: c, log: log, target: nodeRebootTarget{}, host: (*fakeHostRebooter)(nil), flag: flag},
-		{name: "flag", c: c, reader: c, log: log, target: nodeRebootTarget{}, host: host},
+		{
+			name:   "client",
+			reader: c,
+			log:    log,
+			target: nodeRebootTarget{},
+			host:   host,
+			flag:   flag,
+		},
+		{
+			name:   "reader",
+			c:      c,
+			log:    log,
+			target: nodeRebootTarget{},
+			host:   host,
+			flag:   flag,
+		},
+		{
+			name:   "logger",
+			c:      c,
+			reader: c,
+			target: nodeRebootTarget{},
+			host:   host,
+			flag:   flag,
+		},
+		{
+			name:   "target",
+			c:      c,
+			reader: c,
+			log:    log,
+			host:   host,
+			flag:   flag,
+		},
+		{
+			name:   "host",
+			c:      c,
+			reader: c,
+			log:    log,
+			target: nodeRebootTarget{},
+			flag:   flag,
+		},
+		{
+			name:   "typed nil host",
+			c:      c,
+			reader: c,
+			log:    log,
+			target: nodeRebootTarget{},
+			host:   (*fakeHostRebooter)(nil),
+			flag:   flag,
+		},
+		{
+			name:   "flag",
+			c:      c,
+			reader: c,
+			log:    log,
+			target: nodeRebootTarget{},
+			host:   host,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := NewHostSoftRebootHandler(tc.c, tc.reader, tc.log, tc.target, tc.host, tc.flag)
@@ -139,8 +189,15 @@ func TestHostSoftRebootPublicNodeIdentity(t *testing.T) {
 		node     *corev1.Node
 		want     bool
 	}{
-		{name: "explicit without node", ref: "machine-1", want: true},
-		{name: "foreign ref", ref: "node-1"},
+		{
+			name: "explicit without node",
+			ref:  "machine-1",
+			want: true,
+		},
+		{
+			name: "foreign ref",
+			ref:  "node-1",
+		},
 		{
 			name: "selector matches node",
 			selector: &metav1.LabelSelector{
@@ -164,7 +221,10 @@ func TestHostSoftRebootPublicNodeIdentity(t *testing.T) {
 			name: "invalid selector",
 			selector: &metav1.LabelSelector{
 				MatchExpressions: []metav1.LabelSelectorRequirement{
-					{Key: "rack", Operator: "invalid"},
+					{
+						Key:      "rack",
+						Operator: "invalid",
+					},
 				},
 			},
 		},
@@ -210,10 +270,22 @@ func TestHostSoftRebootPublicStartCAS(t *testing.T) {
 		targetPhase v1alpha3.OperationPhase
 		ref         string
 	}{
-		{name: "started aggregate", phase: v1alpha3.OperationPhaseInProgress},
-		{name: "complete aggregate", phase: v1alpha3.OperationPhaseComplete},
-		{name: "started target", targetPhase: v1alpha3.OperationPhaseInProgress},
-		{name: "foreign identity", ref: "other"},
+		{
+			name:  "started aggregate",
+			phase: v1alpha3.OperationPhaseInProgress,
+		},
+		{
+			name:  "complete aggregate",
+			phase: v1alpha3.OperationPhaseComplete,
+		},
+		{
+			name:        "started target",
+			targetPhase: v1alpha3.OperationPhaseInProgress,
+		},
+		{
+			name: "foreign identity",
+			ref:  "other",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			op := publicSoftOp()
@@ -221,7 +293,11 @@ func TestHostSoftRebootPublicStartCAS(t *testing.T) {
 			op.Status.Phase = tc.phase
 			if tc.targetPhase != "" {
 				op.Status.Targets = []v1alpha3.MachineOperationTargetStatus{
-					{MachineRef: "machine-1", Phase: tc.targetPhase, BootID: "original"},
+					{
+						MachineRef: "machine-1",
+						Phase:      tc.targetPhase,
+						BootID:     "original",
+					},
 				}
 			}
 
@@ -300,8 +376,16 @@ func TestHostSoftRebootPublicCommandOutcomes(t *testing.T) {
 		wantPhase v1alpha3.OperationPhase
 		wantFlag  bool
 	}{
-		{name: "failure", wantPhase: v1alpha3.OperationPhaseFailed},
-		{name: "shutdown", cancel: true, wantPhase: v1alpha3.OperationPhaseInProgress, wantFlag: true},
+		{
+			name:      "failure",
+			wantPhase: v1alpha3.OperationPhaseFailed,
+		},
+		{
+			name:      "shutdown",
+			cancel:    true,
+			wantPhase: v1alpha3.OperationPhaseInProgress,
+			wantFlag:  true,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := fakeMachineOperationClient(publicSoftOp())
@@ -310,13 +394,16 @@ func TestHostSoftRebootPublicCommandOutcomes(t *testing.T) {
 			defer cancel()
 
 			flag := &atomic.Bool{}
-			host := &fakeHostRebooter{bootID: "boot-1", reboot: func(context.Context) error {
-				if tc.cancel {
-					cancel()
-				}
+			host := &fakeHostRebooter{
+				bootID: "boot-1",
+				reboot: func(context.Context) error {
+					if tc.cancel {
+						cancel()
+					}
 
-				return errors.New("command failed")
-			}}
+					return errors.New("command failed")
+				},
+			}
 			h := publicHandler(t, c, c, host, flag)
 			_, err := h.Reconcile(ctx, MachineOperation{Name: "soft"})
 			require.NoError(t, err)
@@ -334,8 +421,16 @@ func TestHostSoftRebootPublicInitialBootReadFailure(t *testing.T) {
 		name string
 		host *fakeHostRebooter
 	}{
-		{name: "error", host: &fakeHostRebooter{bootErr: errors.New("missing boot ID")}},
-		{name: "empty", host: &fakeHostRebooter{}},
+		{
+			name: "error",
+			host: &fakeHostRebooter{
+				bootErr: errors.New("missing boot ID"),
+			},
+		},
+		{
+			name: "empty",
+			host: &fakeHostRebooter{},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := fakeMachineOperationClient(publicSoftOp())
@@ -358,8 +453,18 @@ func TestHostSoftRebootPublicStartupJudgment(t *testing.T) {
 		phase         v1alpha3.OperationPhase
 		reason        string
 	}{
-		{name: "new boot", current: "boot-2", phase: v1alpha3.OperationPhaseComplete, reason: "Succeeded"},
-		{name: "same boot", current: "boot-1", phase: v1alpha3.OperationPhaseFailed, reason: "RebootNotObserved"},
+		{
+			name:    "new boot",
+			current: "boot-2",
+			phase:   v1alpha3.OperationPhaseComplete,
+			reason:  "Succeeded",
+		},
+		{
+			name:    "same boot",
+			current: "boot-1",
+			phase:   v1alpha3.OperationPhaseFailed,
+			reason:  "RebootNotObserved",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			op := publicSoftOp()
