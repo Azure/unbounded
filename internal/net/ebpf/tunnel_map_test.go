@@ -167,7 +167,11 @@ func TestEndpointDistanceSelectionAndFailover(t *testing.T) {
 			t.Fatalf("lost standby nexthops: %+v", value)
 		}
 
-		for _, next := range value.Nexthops {
+		for i, next := range value.Nexthops[:value.Count] {
+			if next.Ifindex != endpoint.Nexthops[i].IfIndex {
+				t.Fatalf("distance selection reordered HRW slots: %+v", value)
+			}
+
 			if (next.Healthy != 0) != want[next.Ifindex] {
 				t.Fatalf("unexpected eligibility: %+v, want %v", value, want)
 			}
@@ -187,6 +191,51 @@ func TestEndpointDistanceSelectionAndFailover(t *testing.T) {
 
 	if endpoint.Nexthops[0].IfIndex != 1 || !endpoint.Nexthops[0].Healthy {
 		t.Fatal("serialization mutated the standby state")
+	}
+}
+
+func TestEndpointHealthPreservesHRWSlots(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name  string
+		count int
+	}{
+		{"three gateways", 3},
+		{"over capacity", MaxNexthops + 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			endpoint := TunnelEndpoint{}
+			for i := range tc.count {
+				endpoint.Nexthops = append(endpoint.Nexthops, TunnelNexthop{IfIndex: uint32(i + 1), Healthy: true})
+			}
+
+			before := endpointToC(endpoint)
+			for failed := range int(before.Count) {
+				endpoint.Nexthops[failed].Healthy = false
+
+				after := endpointToC(endpoint)
+				for i := range int(before.Count) {
+					next := after.Nexthops[i]
+					if i != failed && (next.Ifindex != before.Nexthops[i].Ifindex || next.Healthy != 1) {
+						t.Fatalf("failure of slot %d moved a healthy gateway at slot %d: %+v", failed, i, after)
+					}
+
+					if i == failed && tc.count <= MaxNexthops && next.Healthy != 0 {
+						t.Fatalf("failed gateway remained eligible: %+v", after)
+					}
+
+					if i == failed && tc.count > MaxNexthops && (next.Ifindex != uint32(tc.count) || next.Healthy != 1) {
+						t.Fatalf("unused capacity candidate did not replace the failed slot: %+v", after)
+					}
+				}
+
+				endpoint.Nexthops[failed].Healthy = true
+				if got := endpointToC(endpoint); got != before {
+					t.Fatalf("recovery failed to restore the original HRW slots: %+v", got)
+				}
+			}
+		})
 	}
 }
 

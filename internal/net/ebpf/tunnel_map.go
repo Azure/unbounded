@@ -14,7 +14,6 @@
 package ebpf
 
 import (
-	"cmp"
 	"errors"
 	"fmt"
 	"net"
@@ -623,28 +622,38 @@ func endpointToC(ep TunnelEndpoint) tunnelEndpointC {
 
 	// ECMP across unequal path lengths can loop between gateways. Keep
 	// standby paths in Go so health changes can select the next best cost.
-	nexthops := slices.Clone(ep.Nexthops)
-	slices.SortStableFunc(nexthops, func(a, b TunnelNexthop) int {
-		if a.Healthy != b.Healthy {
-			if a.Healthy {
-				return -1
+	bestDistance := 0
+
+	for _, nh := range ep.Nexthops {
+		distance := max(1, nh.RouteDistance)
+		if nh.Healthy && (bestDistance == 0 || distance < bestDistance) {
+			bestDistance = distance
+		}
+	}
+
+	// HRW hashes slot indices. Only replace ineligible slots when over capacity.
+	nexthops := ep.Nexthops
+	if len(nexthops) > MaxNexthops {
+		nexthops = slices.Clone(ep.Nexthops[:MaxNexthops])
+		for _, candidate := range ep.Nexthops[MaxNexthops:] {
+			if !candidate.Healthy || max(1, candidate.RouteDistance) != bestDistance {
+				continue
 			}
 
-			return 1
+			slot := slices.IndexFunc(nexthops, func(nh TunnelNexthop) bool {
+				return !nh.Healthy || max(1, nh.RouteDistance) != bestDistance
+			})
+			if slot == -1 {
+				break
+			}
+
+			nexthops[slot] = candidate
 		}
-
-		return cmp.Compare(max(1, a.RouteDistance), max(1, b.RouteDistance))
-	})
-
-	bestDistance := 0
+	}
 
 	for i, nh := range nexthops {
 		if i >= MaxNexthops {
 			break
-		}
-
-		if nh.Healthy && bestDistance == 0 {
-			bestDistance = max(1, nh.RouteDistance)
 		}
 
 		c.Nexthops[i].Vni = nh.VNI
