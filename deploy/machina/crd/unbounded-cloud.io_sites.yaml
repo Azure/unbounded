@@ -37,6 +37,10 @@ spec:
       name: Token Refresher
       priority: 1
       type: boolean
+    - jsonPath: .spec.components.centerPivot.enabled
+      name: Center Pivot
+      priority: 1
+      type: boolean
     - jsonPath: .status.overrides.phase
       name: Overrides
       priority: 1
@@ -81,6 +85,98 @@ spec:
                 description: Components declares optional Unbounded components managed
                   for this site.
                 properties:
+                  centerPivot:
+                    description: |-
+                      CenterPivot updates the Site's Azure Container Linux nodes from
+                      Nebraska. It is disabled unless enabled is true. See
+                      designs/centerpivot.md.
+                    properties:
+                      appID:
+                        description: AppID is the Nebraska application the nodes run.
+                        minLength: 1
+                        type: string
+                      caConfigMap:
+                        description: |-
+                          CAConfigMap names a ConfigMap in the namespace Unbounded's components
+                          run in (unbounded-system by default) whose ca.crt key holds the
+                          certificates that sign Nebraska's. The image's certificates are used
+                          when it is empty.
+                        type: string
+                      checkInterval:
+                        description: |-
+                          CheckInterval is how often each node is checked for an update. Defaults
+                          to 1h.
+                        type: string
+                      defaultTrack:
+                        description: |-
+                          DefaultTrack is the track for nodes without the
+                          centerpivot.unbounded-cloud.io/track label.
+                        type: string
+                      deleteEmptyDirData:
+                        description: |-
+                          DeleteEmptyDirData lets the drain move pods with emptyDir volumes,
+                          losing their data, like kubectl drain --delete-emptydir-data.
+                        type: boolean
+                      drainDeadline:
+                        description: |-
+                          DrainDeadline is how long moving a node's pods may take. Defaults to
+                          30m.
+                        type: string
+                      enabled:
+                        description: Enabled controls whether the component is reconciled.
+                        type: boolean
+                      maxUnavailable:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        description: |-
+                          MaxUnavailable is how many of the Site's managed nodes may be updating
+                          or unavailable at once: a number, or a percentage of the managed nodes.
+                          Defaults to 1.
+                        x-kubernetes-int-or-string: true
+                      movePodsWithNoController:
+                        description: |-
+                          MovePodsWithNoController lets the drain delete pods that no controller
+                          recreates, like kubectl drain --force.
+                        type: boolean
+                      nebraskaURL:
+                        description: |-
+                          NebraskaURL is Nebraska's update endpoint, such as
+                          https://nebraska.example.com/v1/update.
+                        pattern: ^https://
+                        type: string
+                      recoveryDeadline:
+                        description: |-
+                          RecoveryDeadline is how long the workloads moved off a node have to
+                          recover after it comes back. Defaults to 30m.
+                        type: string
+                      restartDeadline:
+                        description: |-
+                          RestartDeadline is how long a node has to come back running the new
+                          version. Defaults to 30m.
+                        type: string
+                      settleTime:
+                        description: |-
+                          SettleTime is how long to wait after the moved workloads recover
+                          before the next node starts. Defaults to 5m.
+                        type: string
+                      statusDeadline:
+                        description: |-
+                          StatusDeadline is how long to wait for the node's agent to answer a
+                          request before writing it again. Defaults to 5m.
+                        type: string
+                      updateTimeout:
+                        description: |-
+                          UpdateTimeout must match the update timeout of the nodes' Nebraska
+                          groups. An update that couldn't restart well within it is ended
+                          instead. Defaults to 2h.
+                        type: string
+                    type: object
+                    x-kubernetes-validations:
+                    - message: nebraskaURL and appID are required when centerPivot
+                        is enabled
+                      rule: '!has(self.enabled) || !self.enabled || (has(self.nebraskaURL)
+                        && has(self.appID))'
                   gantry:
                     default:
                       enabled: true

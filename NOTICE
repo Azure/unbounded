@@ -917,6 +917,13 @@ notices:
     license:
       - name: Apache License, Version 2.0
         link: https://github.com/kubernetes/kube-aggregator/blob/v0.37.2/LICENSE
+  - dependency: k8s.io/kubectl
+    ecosystem: go
+    copyright:
+      - See LICENSE file
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/kubernetes/kubectl/blob/v0.37.2/LICENSE
   - dependency: k8s.io/utils
     ecosystem: go
     copyright:

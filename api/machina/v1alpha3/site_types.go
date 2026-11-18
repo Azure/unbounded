@@ -6,6 +6,7 @@ package v1alpha3
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
 
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 )
@@ -27,6 +28,7 @@ func init() {
 // +kubebuilder:printcolumn:name="Metalman",type=boolean,JSONPath=".spec.components.metalman.enabled",priority=1
 // +kubebuilder:printcolumn:name="Gantry",type=boolean,JSONPath=".spec.components.gantry.enabled",priority=1
 // +kubebuilder:printcolumn:name="Token Refresher",type=boolean,JSONPath=".spec.components.tokenRefresher.enabled",priority=1
+// +kubebuilder:printcolumn:name="Center Pivot",type=boolean,JSONPath=".spec.components.centerPivot.enabled",priority=1
 // +kubebuilder:printcolumn:name="Overrides",type=string,JSONPath=".status.overrides.phase",priority=1
 // +kubebuilder:printcolumn:name="Nodes",type=integer,JSONPath=".status.nodeCount"
 // +kubebuilder:printcolumn:name="Slices",type=integer,JSONPath=".status.sliceCount"
@@ -149,6 +151,12 @@ type SiteComponents struct {
 	// +optional
 	// +kubebuilder:default={enabled: true}
 	TokenRefresher *TokenRefresherComponentSpec `json:"tokenRefresher,omitempty"`
+
+	// CenterPivot updates the Site's Azure Container Linux nodes from
+	// Nebraska. It is disabled unless enabled is true. See
+	// designs/centerpivot.md.
+	// +optional
+	CenterPivot *CenterPivotComponentSpec `json:"centerPivot,omitempty"`
 }
 
 // SiteComponentSpec contains common component configuration. Components install
@@ -220,6 +228,90 @@ type GantryArtifactStreamingSpec struct {
 // TokenRefresherComponentSpec configures bootstrap token refresh for a Site.
 type TokenRefresherComponentSpec struct {
 	SiteComponentSpec `json:",inline"`
+}
+
+// CenterPivotComponentSpec configures centerpivot, which updates a Site's
+// Azure Container Linux nodes from Nebraska, the update server ACL uses. It
+// updates the nodes labeled centerpivot.unbounded-cloud.io/managed=true.
+// +kubebuilder:validation:XValidation:rule="!has(self.enabled) || !self.enabled || (has(self.nebraskaURL) && has(self.appID))",message="nebraskaURL and appID are required when centerPivot is enabled"
+type CenterPivotComponentSpec struct {
+	SiteComponentSpec `json:",inline"`
+
+	// NebraskaURL is Nebraska's update endpoint, such as
+	// https://nebraska.example.com/v1/update.
+	// +kubebuilder:validation:Pattern=`^https://`
+	// +optional
+	NebraskaURL string `json:"nebraskaURL,omitempty"`
+
+	// AppID is the Nebraska application the nodes run.
+	// +kubebuilder:validation:MinLength=1
+	// +optional
+	AppID string `json:"appID,omitempty"`
+
+	// CAConfigMap names a ConfigMap in the namespace Unbounded's components
+	// run in (unbounded-system by default) whose ca.crt key holds the
+	// certificates that sign Nebraska's. The image's certificates are used
+	// when it is empty.
+	// +optional
+	CAConfigMap string `json:"caConfigMap,omitempty"`
+
+	// DefaultTrack is the track for nodes without the
+	// centerpivot.unbounded-cloud.io/track label.
+	// +optional
+	DefaultTrack string `json:"defaultTrack,omitempty"`
+
+	// MaxUnavailable is how many of the Site's managed nodes may be updating
+	// or unavailable at once: a number, or a percentage of the managed nodes.
+	// Defaults to 1.
+	// +kubebuilder:validation:XIntOrString
+	// +optional
+	MaxUnavailable *intstr.IntOrString `json:"maxUnavailable,omitempty"`
+
+	// CheckInterval is how often each node is checked for an update. Defaults
+	// to 1h.
+	// +optional
+	CheckInterval *metav1.Duration `json:"checkInterval,omitempty"`
+
+	// UpdateTimeout must match the update timeout of the nodes' Nebraska
+	// groups. An update that couldn't restart well within it is ended
+	// instead. Defaults to 2h.
+	// +optional
+	UpdateTimeout *metav1.Duration `json:"updateTimeout,omitempty"`
+
+	// StatusDeadline is how long to wait for the node's agent to answer a
+	// request before writing it again. Defaults to 5m.
+	// +optional
+	StatusDeadline *metav1.Duration `json:"statusDeadline,omitempty"`
+
+	// DrainDeadline is how long moving a node's pods may take. Defaults to
+	// 30m.
+	// +optional
+	DrainDeadline *metav1.Duration `json:"drainDeadline,omitempty"`
+
+	// RestartDeadline is how long a node has to come back running the new
+	// version. Defaults to 30m.
+	// +optional
+	RestartDeadline *metav1.Duration `json:"restartDeadline,omitempty"`
+
+	// RecoveryDeadline is how long the workloads moved off a node have to
+	// recover after it comes back. Defaults to 30m.
+	// +optional
+	RecoveryDeadline *metav1.Duration `json:"recoveryDeadline,omitempty"`
+
+	// SettleTime is how long to wait after the moved workloads recover
+	// before the next node starts. Defaults to 5m.
+	// +optional
+	SettleTime *metav1.Duration `json:"settleTime,omitempty"`
+
+	// DeleteEmptyDirData lets the drain move pods with emptyDir volumes,
+	// losing their data, like kubectl drain --delete-emptydir-data.
+	// +optional
+	DeleteEmptyDirData bool `json:"deleteEmptyDirData,omitempty"`
+
+	// MovePodsWithNoController lets the drain delete pods that no controller
+	// recreates, like kubectl drain --force.
+	// +optional
+	MovePodsWithNoController bool `json:"movePodsWithNoController,omitempty"`
 }
 
 // SiteStatus defines the observed state of Site.
