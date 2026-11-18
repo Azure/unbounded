@@ -100,8 +100,11 @@ updates through `trident-acl-agent` with a test Nebraska:
 3. If the node falls back to the old copy during the restart, the agent still
    reports the commit as a success, and tells Nebraska the update finished
    ([microsoft/trident#956](https://github.com/microsoft/trident/issues/956)).
-4. ACL's `VERSION_ID`, such as `3.0.20261104`, can be the same for two builds,
-   so it can't be the version Nebraska compares.
+4. ACL's `VERSION_ID` is a date-based semver version: `3.0.20261104`, then
+   `3.0.20261106` in the next build tested. ACL sets no `IMAGE_VERSION`, and its
+   `BUILD_ID`, such as `1244962`, isn't semver. The harness's own builds copy
+   their base's os-release, so they can't show whether two released builds
+   share a `VERSION_ID`.
 5. On Unbounded ACL nodes, kubelet and pods run inside an nspawn machine, so
    pods can't read the host's `/etc/machine-id` or `/etc/os-release`.
 
@@ -219,13 +222,14 @@ They are in one annotation on the Node, `centerpivot.unbounded-cloud.io/agent-in
 3. It is written when the node starts, and again when the values change.
 
 Until Trident provides these (section 5), the DaemonSet writes the same
-annotation. Unbounded's host agent mounts the host's `/etc/machine-id` and
-`/etc/os-release` read-only into the nspawn machine at their own paths, under
-`/run/unbounded/host/`, not over the machine's own files. The DaemonSet's pod reads them,
-computes the ID the way the agent does, and reads the version with the agent's
-settings (`TRIDENT_ACL_AGENT_CURRENT_VERSION_PATH` and `_KEY`). After a
-restart, the pod may write the new version after the agent reports the commit,
-so the service waits for it rather than reading it once.
+annotation. Unbounded's host agent binds the host's `/etc/machine-id`
+read-only into an ACL node's nspawn machine at `/run/unbounded/host/machine-id`,
+not over the machine's own, and systemd-nspawn already binds the host's
+os-release at `/run/host/os-release`. The DaemonSet's pod reads both, computes
+the ID the way the agent does, and reads the version from the same os-release
+key as the agent, `VERSION_ID`. After a restart, the pod may write the new
+version after the agent reports the commit, so the service waits for it rather
+than reading it once.
 
 ### 4.4 An update, step by step
 
@@ -451,10 +455,10 @@ updates under way (`centerpivot_updating_nodes`), held nodes
 | Trident | A final status when Nebraska refuses an update during `stage`. Today the agent exits, and systemd restarts it (`"Nebraska query failed"` in `annotations/orchestrator.rs`). | No | The service stages only after a grant, so this is rare. |
 | Trident | Confirm that the recovery the service uses to end a grant (section 4.7) is intended and will stay, and document it. | No | |
 | Trident | Fix microsoft/trident#956 and #957. | No | The version check after the restart, and the status deadline |
-| Unbounded host agent | A `trident-acl-agent` drop-in: the prefix `centerpivot.unbounded-cloud.io`, kubelet's credentials, `kubelet-cert` to find the Node's name, and the version key. | Yes | |
-| Unbounded host agent | Mount the host's `/etc/machine-id` and `/etc/os-release` into the nspawn machine under `/run/unbounded/host/`. | Until Trident provides the identity | |
+| Unbounded host agent | A `trident-acl-agent` drop-in on the nodes the service updates: the prefix `centerpivot.unbounded-cloud.io`, kubelet's credentials, `kubelet-cert` to find the Node's name, and the version key (appendix). | Yes | Done |
+| Unbounded host agent | Bind the host's `/etc/machine-id` into the nspawn machine at `/run/unbounded/host/machine-id`. | Until Trident provides the identity | Done |
 | Unbounded host agent | Turn on kubelet's graceful node shutdown. | No | Pods left on the node stop at once. |
-| ACL images | An os-release key with a version that differs for every build, is valid semver, and doesn't vary only in build metadata (section 2.2). | Yes | |
+| ACL images | Confirm that `VERSION_ID` differs for every released build, only increases, and stays valid semver, with the changing part outside build metadata (sections 2.2 and 2.3). | Yes | The builds tested differ. |
 | Nebraska | Package labels, or the agent's `TRIDENT_ACL_AGENT_COSI_SHA384_SOURCE=hash` option. Release 4.0.3 has no labels. | Yes, one of the two | |
 | Nebraska | One database behind the URL, so the service's grant and the agent's check reach the same Nebraska. | Yes | |
 | Nebraska | Each group's update timeout matches the service's setting. | Yes | |
@@ -482,17 +486,13 @@ readable by anyone who can read Node annotations or the Site.
 ## 7. Open questions
 
 1. **Trident:** a `stage` without `targetVersion`, or `agent-info`?
-2. **ACL's version:** which os-release key carries the per-build version?
-3. **The host's os-release:** does `systemd-nspawn` on ACL already provide it
-   at `/run/host/os-release`?
-4. **Graceful node shutdown:** does it work with kubelet in an nspawn machine,
+2. **ACL's version:** does `VERSION_ID` differ for every released build?
+3. **Graceful node shutdown:** does it work with kubelet in an nspawn machine,
    and in a container?
-5. **`container` isolation on ACL:** when it's validated, which parts of this
+4. **`container` isolation on ACL:** when it's validated, which parts of this
    design change?
-6. **Claiming a node for maintenance:** what form should Unbounded's shared
+5. **Claiming a node for maintenance:** what form should Unbounded's shared
    claim take?
-7. **The `managed` label:** set by Unbounded when the node joins, or by
-   administrators?
 
 ## 8. Other approaches we considered
 
@@ -543,9 +543,9 @@ From the Site's `spec.components.centerPivot`. The component is off unless
 | `deleteEmptyDirData` | off | `kubectl drain --delete-emptydir-data` |
 | `movePodsWithNoController` | off | `kubectl drain --force` |
 
-The DaemonSet reads the version from the os-release key in its
-`--version-key` argument, `VERSION_ID` by default, which a workload override
-can change to match the agent's setting.
+The DaemonSet and the host agent's drop-in both read the version from
+os-release's `VERSION_ID`. The DaemonSet's `--version-key` argument can be
+changed with a workload override, but only together with the agent's.
 
 ### Labels, taints, and annotations
 
@@ -609,6 +609,31 @@ An example `state`, with the request the agent is carrying out:
    change only its own Node. It accepts only an `https` Nebraska URL, and checks
    each image against a checksum from Nebraska.
 
+### Host agent
+
+On Azure Container Linux hosts, Unbounded's host agent:
+
+1. Binds the host's `/etc/machine-id` read-only into the nspawn machine at
+   `/run/unbounded/host/machine-id`. Existing machines get it at their next
+   start.
+2. On a node whose MachineConfiguration's `nodeLabels` set
+   `centerpivot.unbounded-cloud.io/managed: "true"`, configures
+   `trident-acl-agent` each time the node starts:
+   1. `/etc/unbounded/trident-acl-agent/kubeconfig` names the API server, its
+      CA, and kubelet's client certificate in the active slot,
+      `/var/lib/machines/<slot>/var/lib/kubelet/pki/kubelet-client-current.pem`.
+   2. `/etc/systemd/system/trident-acl-agent.service.d/50-unbounded-centerpivot.conf`
+      sets annotation mode, the prefix, that kubeconfig, `kubelet-cert` to find
+      the Node's name, and `VERSION_ID`.
+   3. It enables the agent, and restarts it when either file changed, as when
+      the node moves to another slot.
+3. Undoes step 2 when the label goes or the node is reset, and turns the agent
+   off only if it turned it on.
+
+Step 2 needs kubelet to join with a bootstrap token, which leaves it a client
+certificate. With a direct kubeconfig or an exec credential, the host agent
+logs that it can't configure `trident-acl-agent`.
+
 ### Code layout
 
 | Part | Where |
@@ -618,3 +643,4 @@ An example `state`, with the request the agent is carrying out:
 | Operator component | `internal/operator/components/centerpivot`, and a `Site.Spec.Components` field |
 | Manifests and admission policies | `deploy/centerpivot/` |
 | Image | `images/centerpivot/` |
+| Host agent | `pkg/agent/phases/nodestart/tridentaclagent.go`, and the bind in `pkg/agent/goalstates/resolve.go` |
