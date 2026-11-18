@@ -34,7 +34,6 @@ type machineOperationTarget struct {
 	allocationLaunch     allocationLaunchOptions
 	log                  *slog.Logger
 	machineName          string
-	nodeName             string
 	nodeOperator         nodeOperator
 	agentUpgradeLockPath string
 	// requestRestart stops the controller so the daemon restarts from the

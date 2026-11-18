@@ -26,6 +26,7 @@ import (
 	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/config"
+	daemon "github.com/Azure/unbounded/pkg/agent/daemon"
 	"github.com/Azure/unbounded/pkg/agent/daemoncred"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
@@ -192,20 +193,19 @@ func run(ctx context.Context, log *slog.Logger, opts runOptions) error {
 		log.Warn("failed to publish and clear AgentUpgrade daemon signals", "error", err)
 	}
 
-	rebootHandler, err := newHostSoftRebootHandler(
+	rebootHandler, err := daemon.NewHostSoftRebootHandler(
 		kubeClient,
 		kubeClient,
 		log,
-		active.Config.MachineName,
-		active.Config.NodeName,
+		hostSoftRebootTarget{machineName: active.Config.MachineName},
 		runOpts.NodeOperator,
 		&atomic.Bool{},
 	)
-	if err != nil {
-		return fmt.Errorf("create HostSoftReboot handler: %w", err)
+	if err == nil {
+		err = rebootHandler.PublishStartup(ctx)
 	}
 
-	if err := rebootHandler.PublishStartup(ctx); err != nil {
+	if err != nil {
 		log.Warn("failed to report HostSoftReboot operations", "error", err)
 	}
 

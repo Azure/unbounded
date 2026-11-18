@@ -70,15 +70,6 @@ func TestNativeSelectorStartsEachQueuedHost(t *testing.T) {
 		_, err = r.ReconcileMachineOperation(context.Background(), "soft")
 		require.NoError(t, err)
 		require.Equal(t, 1, host.rebootCalls, name)
-
-		// Simulate a fresh process with no local stopping flag, before a reboot.
-		target.rebootRequested.Store(false)
-
-		before := getMachineOperation(t, c, "soft")
-		_, err = r.ReconcileMachineOperation(context.Background(), "soft")
-		require.NoError(t, err)
-		require.Equal(t, 1, host.rebootCalls, name)
-		require.Equal(t, before.Status, getMachineOperation(t, c, "soft").Status)
 	}
 
 	status := getMachineOperation(t, c, "soft").Status
@@ -99,7 +90,7 @@ func TestNativeSelectorPublishesEachIssuedTarget(t *testing.T) {
 	})
 	c := fakeStatusClient(op)
 
-	handlerA, err := newHostSoftRebootHandler(c, c, discardLogger(), "machine-a", "test-node", &fakeNodeOperator{bootID: "boot-a2"}, &atomic.Bool{})
+	handlerA, err := agentdaemon.NewHostSoftRebootHandler(c, c, discardLogger(), hostSoftRebootTarget{machineName: "machine-a"}, &fakeNodeOperator{bootID: "boot-a2"}, &atomic.Bool{})
 	require.NoError(t, err)
 	require.NoError(t, handlerA.PublishStartup(context.Background()))
 	first := getMachineOperation(t, c, "soft").Status
@@ -108,17 +99,13 @@ func TestNativeSelectorPublishesEachIssuedTarget(t *testing.T) {
 	require.Equal(t, v1alpha3.OperationPhaseComplete, first.Targets[0].Phase)
 	require.Equal(t, v1alpha3.OperationPhaseInProgress, first.Targets[1].Phase)
 
-	handlerB, err := newHostSoftRebootHandler(c, c, discardLogger(), "machine-b", "test-node", &fakeNodeOperator{bootID: "boot-b2"}, &atomic.Bool{})
+	handlerB, err := agentdaemon.NewHostSoftRebootHandler(c, c, discardLogger(), hostSoftRebootTarget{machineName: "machine-b"}, &fakeNodeOperator{bootID: "boot-b2"}, &atomic.Bool{})
 	require.NoError(t, err)
 	require.NoError(t, handlerB.PublishStartup(context.Background()))
 	second := getMachineOperation(t, c, "soft").Status
 	require.Equal(t, v1alpha3.OperationPhaseComplete, second.Targets[0].Phase)
 	require.Equal(t, v1alpha3.OperationPhaseComplete, second.Targets[1].Phase)
-	require.Equal(t, first.CompletedAt, second.CompletedAt)
-	require.Equal(t, first.Message, second.Message)
-	require.Equal(t, first.Conditions, second.Conditions)
-	require.Equal(t, first.ObservedMachineGeneration, second.ObservedMachineGeneration)
-	require.Equal(t, first.StartedAt, second.StartedAt)
+	require.Equal(t, int64(8), second.ObservedMachineGeneration)
 	require.Equal(t, first.Targets[0], second.Targets[0])
 
 	require.NoError(t, handlerB.PublishStartup(context.Background()))

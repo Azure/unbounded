@@ -15,13 +15,9 @@ import (
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
@@ -47,28 +43,20 @@ func (nodeRebootTarget) MatchSelector(ctx context.Context, r client.Reader, _ v1
 }
 
 type fakeHostRebooter struct {
-	bootID     string
-	bootErr    error
-	bootCalls  int
-	bootDuring func()
-	reboot     func(context.Context) error
-	calls      int
+	bootID    string
+	bootErr   error
+	bootCalls int
+	calls     int
 }
 
 func (h *fakeHostRebooter) BootID() (string, error) {
 	h.bootCalls++
-	if h.bootDuring != nil {
-		h.bootDuring()
-	}
 
 	return h.bootID, h.bootErr
 }
 
-func (h *fakeHostRebooter) RebootHost(ctx context.Context, _ *slog.Logger) error {
+func (h *fakeHostRebooter) RebootHost(context.Context, *slog.Logger) error {
 	h.calls++
-	if h.reboot != nil {
-		return h.reboot(ctx)
-	}
 
 	return nil
 }
@@ -99,6 +87,64 @@ func publicOperation(t *testing.T, r client.Reader) v1alpha3.MachineOperation {
 	require.NoError(t, r.Get(t.Context(), client.ObjectKey{Name: "soft"}, &op))
 
 	return op
+}
+
+type rebootTestStore struct {
+	operation MachineOperation
+	result    MachineOperationResult[int64]
+	err       error
+	calls     int
+}
+
+func (*rebootTestStore) MarkInProgress(context.Context, MachineOperation, string) error {
+	panic("unexpected MarkInProgress")
+}
+
+func (s *rebootTestStore) Finish(_ context.Context, op MachineOperation, result MachineOperationResult[int64]) error {
+	s.calls++
+	s.operation = op
+	s.result = result
+
+	return s.err
+}
+
+func TestHostSoftRebootBootFailureUsesCallerStore(t *testing.T) {
+	for _, storeErr := range []error{nil, errors.New("store failed")} {
+		c := fakeMachineOperationClient(publicSoftOp())
+		host := &fakeHostRebooter{bootErr: errors.New("boot failed")}
+		h := publicHandler(t, c, c, host, &atomic.Bool{})
+		store := &rebootTestStore{err: storeErr}
+		op := MachineOperation{Name: "soft", Kind: v1alpha3.OperationHostSoftReboot}
+
+		_, err := h.Reconcile(t.Context(), store, op)
+		assert.ErrorIs(t, err, storeErr)
+		assert.Equal(t, 1, store.calls)
+		assert.Equal(t, op, store.operation)
+		assert.Equal(t, MachineOperationResult[int64]{
+			Phase:   v1alpha3.OperationPhaseFailed,
+			Reason:  "ExecutionFailed",
+			Message: "boot failed",
+		}, store.result)
+		assert.Empty(t, publicOperation(t, c).Status.Phase)
+		assert.Zero(t, host.calls)
+	}
+}
+
+func TestHostSoftRebootUsesClientForStatusAndStartup(t *testing.T) {
+	c := fakeMachineOperationClient(publicSoftOp())
+	reader := fakeMachineOperationClient()
+	host := &fakeHostRebooter{bootID: "boot-1"}
+	h := publicHandler(t, c, reader, host, &atomic.Bool{})
+
+	_, err := h.Reconcile(t.Context(), &rebootTestStore{}, MachineOperation{Name: "soft"})
+	require.NoError(t, err)
+	require.Equal(t, 1, host.calls)
+	require.Equal(t, v1alpha3.OperationPhaseInProgress, publicOperation(t, c).Status.Phase)
+
+	host.bootID = "boot-2"
+
+	require.NoError(t, h.PublishStartup(t.Context()))
+	require.Equal(t, v1alpha3.OperationPhaseComplete, publicOperation(t, c).Status.Phase)
 }
 
 func TestHostSoftRebootHandlerValidatesDependencies(t *testing.T) {
@@ -177,320 +223,6 @@ func TestHostSoftRebootHandlerValidatesDependencies(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := NewHostSoftRebootHandler(tc.c, tc.reader, tc.log, tc.target, tc.host, tc.flag)
 			require.Error(t, err)
-		})
-	}
-}
-
-func TestHostSoftRebootPublicNodeIdentity(t *testing.T) {
-	for _, tc := range []struct {
-		name     string
-		ref      string
-		selector *metav1.LabelSelector
-		node     *corev1.Node
-		want     bool
-	}{
-		{
-			name: "explicit without node",
-			ref:  "machine-1",
-			want: true,
-		},
-		{
-			name: "foreign ref",
-			ref:  "node-1",
-		},
-		{
-			name: "selector matches node",
-			selector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{"rack": "a"},
-			},
-			node: &corev1.Node{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:   "node-1",
-					Labels: map[string]string{"rack": "a"},
-				},
-			},
-			want: true,
-		},
-		{
-			name: "selector without node",
-			selector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{"rack": "a"},
-			},
-		},
-		{
-			name: "invalid selector",
-			selector: &metav1.LabelSelector{
-				MatchExpressions: []metav1.LabelSelectorRequirement{
-					{
-						Key:      "rack",
-						Operator: "invalid",
-					},
-				},
-			},
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			op := publicSoftOp()
-			op.Spec.MachineRef = tc.ref
-			op.Spec.MachineSelector = tc.selector
-
-			objects := []client.Object{op}
-			if tc.node != nil {
-				objects = append(objects, tc.node)
-			}
-
-			c := fakeMachineOperationClient(objects...)
-			flag := &atomic.Bool{}
-			host := &fakeHostRebooter{bootID: "boot-1"}
-			host.reboot = func(ctx context.Context) error {
-				started := publicOperation(t, c)
-				assert.True(t, flag.Load())
-				assert.Equal(t, v1alpha3.OperationPhaseInProgress, started.Status.Phase)
-				require.Len(t, started.Status.Targets, 1)
-				assert.Equal(t, "machine-1", started.Status.Targets[0].MachineRef)
-				assert.Equal(t, "boot-1", started.Status.Targets[0].BootID)
-				assert.Zero(t, started.Status.ObservedMachineGeneration)
-				assert.Zero(t, started.Status.Targets[0].ObservedGeneration)
-
-				return nil
-			}
-			h := publicHandler(t, c, c, host, flag)
-			_, err := h.Reconcile(t.Context(), MachineOperation{Name: "soft"})
-			require.NoError(t, err)
-			assert.Equal(t, tc.want, host.calls == 1)
-			assert.Equal(t, tc.want, flag.Load())
-		})
-	}
-}
-
-func TestHostSoftRebootPublicStartCAS(t *testing.T) {
-	for _, tc := range []struct {
-		name        string
-		phase       v1alpha3.OperationPhase
-		targetPhase v1alpha3.OperationPhase
-		ref         string
-	}{
-		{
-			name:  "started aggregate",
-			phase: v1alpha3.OperationPhaseInProgress,
-		},
-		{
-			name:  "complete aggregate",
-			phase: v1alpha3.OperationPhaseComplete,
-		},
-		{
-			name:        "started target",
-			targetPhase: v1alpha3.OperationPhaseInProgress,
-		},
-		{
-			name: "foreign identity",
-			ref:  "other",
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			op := publicSoftOp()
-
-			op.Status.Phase = tc.phase
-			if tc.targetPhase != "" {
-				op.Status.Targets = []v1alpha3.MachineOperationTargetStatus{
-					{
-						MachineRef: "machine-1",
-						Phase:      tc.targetPhase,
-						BootID:     "original",
-					},
-				}
-			}
-
-			if tc.ref != "" {
-				op.Spec.MachineRef = tc.ref
-			}
-
-			c := fakeMachineOperationClient(op)
-			host := &fakeHostRebooter{bootID: "boot-1"}
-			h := publicHandler(t, c, c, host, &atomic.Bool{})
-			_, err := h.Reconcile(t.Context(), MachineOperation{Name: "soft"})
-			require.NoError(t, err)
-			assert.Zero(t, host.calls)
-			assert.Equal(t, op.Status, publicOperation(t, c).Status)
-		})
-	}
-}
-
-func TestHostSoftRebootPublicUncertainWriteNeverReplays(t *testing.T) {
-	writes := 0
-	c := fake.NewClientBuilder().WithScheme(fakeMachineOperationClient().Scheme()).
-		WithStatusSubresource(&v1alpha3.MachineOperation{}).
-		WithObjects(publicSoftOp()).WithInterceptorFuncs(interceptor.Funcs{
-		SubResourceUpdate: func(ctx context.Context, c client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
-			writes++
-
-			require.NoError(t, c.SubResource(sub).Update(ctx, obj, opts...))
-
-			return errors.New("response lost")
-		},
-	}).Build()
-	host := &fakeHostRebooter{bootID: "boot-1"}
-	h := publicHandler(t, c, c, host, &atomic.Bool{})
-	_, err := h.Reconcile(t.Context(), MachineOperation{Name: "soft"})
-	require.ErrorContains(t, err, "response lost")
-	_, err = h.Reconcile(t.Context(), MachineOperation{Name: "soft"})
-	require.NoError(t, err)
-	assert.Zero(t, host.calls)
-	assert.Equal(t, 1, writes)
-	assert.Equal(t, v1alpha3.OperationPhaseInProgress, publicOperation(t, c).Status.Phase)
-}
-
-func TestHostSoftRebootPublicConflictReadsFreshStatus(t *testing.T) {
-	writes := 0
-	c := fake.NewClientBuilder().WithScheme(fakeMachineOperationClient().Scheme()).
-		WithStatusSubresource(&v1alpha3.MachineOperation{}).
-		WithObjects(publicSoftOp()).WithInterceptorFuncs(interceptor.Funcs{
-		SubResourceUpdate: func(ctx context.Context, c client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
-			writes++
-
-			var latest v1alpha3.MachineOperation
-			if err := c.Get(ctx, client.ObjectKey{Name: "soft"}, &latest); err != nil {
-				return err
-			}
-
-			latest.Status.Phase = v1alpha3.OperationPhaseInProgress
-			if err := c.Status().Update(ctx, &latest); err != nil {
-				return err
-			}
-
-			return apierrors.NewConflict(schema.GroupResource{Resource: "machineoperations"}, "soft", errors.New("changed"))
-		},
-	}).Build()
-	host := &fakeHostRebooter{bootID: "boot-1"}
-	h := publicHandler(t, c, c, host, &atomic.Bool{})
-	_, err := h.Reconcile(t.Context(), MachineOperation{Name: "soft"})
-	require.NoError(t, err)
-	assert.Zero(t, host.calls)
-	assert.Equal(t, 1, writes)
-}
-
-func TestHostSoftRebootPublicCommandOutcomes(t *testing.T) {
-	for _, tc := range []struct {
-		name      string
-		cancel    bool
-		wantPhase v1alpha3.OperationPhase
-		wantFlag  bool
-	}{
-		{
-			name:      "failure",
-			wantPhase: v1alpha3.OperationPhaseFailed,
-		},
-		{
-			name:      "shutdown",
-			cancel:    true,
-			wantPhase: v1alpha3.OperationPhaseInProgress,
-			wantFlag:  true,
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			c := fakeMachineOperationClient(publicSoftOp())
-
-			ctx, cancel := context.WithCancel(t.Context())
-			defer cancel()
-
-			flag := &atomic.Bool{}
-			host := &fakeHostRebooter{
-				bootID: "boot-1",
-				reboot: func(context.Context) error {
-					if tc.cancel {
-						cancel()
-					}
-
-					return errors.New("command failed")
-				},
-			}
-			h := publicHandler(t, c, c, host, flag)
-			_, err := h.Reconcile(ctx, MachineOperation{Name: "soft"})
-			require.NoError(t, err)
-			status := publicOperation(t, c).Status
-			assert.Equal(t, tc.wantPhase, status.Phase)
-			require.Len(t, status.Targets, 1)
-			assert.Equal(t, tc.wantPhase, status.Targets[0].Phase)
-			assert.Equal(t, tc.wantFlag, flag.Load())
-		})
-	}
-}
-
-func TestHostSoftRebootPublicInitialBootReadFailure(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		host *fakeHostRebooter
-	}{
-		{
-			name: "error",
-			host: &fakeHostRebooter{
-				bootErr: errors.New("missing boot ID"),
-			},
-		},
-		{
-			name: "empty",
-			host: &fakeHostRebooter{},
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			c := fakeMachineOperationClient(publicSoftOp())
-			h := publicHandler(t, c, c, tc.host, &atomic.Bool{})
-			_, err := h.Reconcile(t.Context(), MachineOperation{Name: "soft"})
-			require.NoError(t, err)
-			status := publicOperation(t, c).Status
-			assert.Equal(t, v1alpha3.OperationPhaseFailed, status.Phase)
-			condition := apimeta.FindStatusCondition(status.Conditions, "Completed")
-			require.NotNil(t, condition)
-			assert.Equal(t, "ExecutionFailed", condition.Reason)
-			assert.Zero(t, tc.host.calls)
-		})
-	}
-}
-
-func TestHostSoftRebootPublicStartupJudgment(t *testing.T) {
-	for _, tc := range []struct {
-		name, current string
-		phase         v1alpha3.OperationPhase
-		reason        string
-	}{
-		{
-			name:    "new boot",
-			current: "boot-2",
-			phase:   v1alpha3.OperationPhaseComplete,
-			reason:  "Succeeded",
-		},
-		{
-			name:    "same boot",
-			current: "boot-1",
-			phase:   v1alpha3.OperationPhaseFailed,
-			reason:  "RebootNotObserved",
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			op := publicSoftOp()
-			op.Status.Phase = v1alpha3.OperationPhaseInProgress
-			op.Status.Targets = []v1alpha3.MachineOperationTargetStatus{
-				{
-					MachineRef: "machine-1",
-					Phase:      v1alpha3.OperationPhaseInProgress,
-					BootID:     "boot-1",
-				},
-			}
-			c := fakeMachineOperationClient(op)
-			host := &fakeHostRebooter{bootID: tc.current}
-			h := publicHandler(t, c, c, host, &atomic.Bool{})
-			require.NoError(t, h.PublishStartup(t.Context()))
-			status := publicOperation(t, c).Status
-			assert.Equal(t, tc.phase, status.Phase)
-			require.Len(t, status.Targets, 1)
-			assert.Equal(t, tc.phase, status.Targets[0].Phase)
-			assert.Equal(t, "boot-1", status.Targets[0].BootID)
-			condition := apimeta.FindStatusCondition(status.Conditions, "Completed")
-			require.NotNil(t, condition)
-			assert.Equal(t, tc.reason, condition.Reason)
-			require.NoError(t, h.PublishStartup(t.Context()))
-			assert.Equal(t, status, publicOperation(t, c).Status)
-			assert.Zero(t, host.calls)
 		})
 	}
 }

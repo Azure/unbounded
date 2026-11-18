@@ -23,19 +23,6 @@ import (
 	agentdaemon "github.com/Azure/unbounded/pkg/agent/daemon"
 )
 
-type staleHostReadClient struct {
-	client.Client
-	reader client.Reader
-}
-
-func (c staleHostReadClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-	return c.reader.Get(ctx, key, obj, opts...)
-}
-
-func (c staleHostReadClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
-	return c.reader.List(ctx, list, opts...)
-}
-
 func outOfBandOperation(name, machineRef string, kind v1alpha3.OperationKind) *v1alpha3.MachineOperation {
 	return &v1alpha3.MachineOperation{
 		ObjectMeta: metav1.ObjectMeta{Name: name},
@@ -221,19 +208,19 @@ func TestReconcileHostSoftReboot_UsesAPIReader(t *testing.T) {
 	apiReader := fakeStatusClient(machine, hostSoftRebootOperation("op-soft"), outOfBandOperation("op-oob", "test-machine", v1alpha3.OperationHostHardReboot))
 	target := &machineOperationTarget{Client: c, apiReader: apiReader, log: discardLogger()}
 	host := &fakeNodeOperator{bootID: "boot-1"}
-	handler, err := newHostSoftRebootHandler(c, target.reader(), target.log, machine.Name, "test-node", host, &atomic.Bool{})
+	handler, err := agentdaemon.NewHostSoftRebootHandler(c, target.reader(), target.log, hostSoftRebootTarget{machineName: machine.Name, generation: machine.Generation, labels: machine.Labels}, host, &atomic.Bool{})
 	require.NoError(t, err)
 
-	result, err := handler.Reconcile(context.Background(), agentdaemon.MachineOperation{Name: "op-soft"})
+	result, err := handler.Reconcile(context.Background(), nil, agentdaemon.MachineOperation{Name: "op-soft"})
 	require.NoError(t, err)
 	assert.Equal(t, 10*time.Second, result.RequeueAfter)
 	assert.Equal(t, "waiting for out-of-band host operation op-oob", getMachineOperation(t, c, "op-soft").Status.Message)
 	assert.Zero(t, host.rebootCalls)
 
 	target.apiReader = nil
-	handler, err = newHostSoftRebootHandler(c, target.reader(), target.log, machine.Name, "test-node", host, &atomic.Bool{})
+	handler, err = agentdaemon.NewHostSoftRebootHandler(c, target.reader(), target.log, hostSoftRebootTarget{machineName: machine.Name, generation: machine.Generation, labels: machine.Labels}, host, &atomic.Bool{})
 	require.NoError(t, err)
-	result, err = handler.Reconcile(context.Background(), agentdaemon.MachineOperation{Name: "op-soft"})
+	result, err = handler.Reconcile(context.Background(), nil, agentdaemon.MachineOperation{Name: "op-soft"})
 	require.NoError(t, err)
 	assert.Zero(t, result.RequeueAfter)
 	assert.Equal(t, 1, host.rebootCalls)
@@ -249,9 +236,8 @@ func TestReconcileHostSoftReboot_ReadsMachineFromAPIReader(t *testing.T) {
 	outOfBand.Spec.MachineSelector = &metav1.LabelSelector{MatchLabels: map[string]string{"rack": "a"}}
 
 	op := &fakeNodeOperator{bootID: "boot-1"}
-	cache := fakeStatusClient(cached, hostSoftRebootOperation("op-soft"))
-	apiReader := fakeStatusClient(fresh, outOfBand, hostSoftRebootOperation("op-soft"))
-	c := staleHostReadClient{Client: apiReader, reader: cache}
+	c := fakeStatusClient(cached, hostSoftRebootOperation("op-soft"))
+	apiReader := fakeStatusClient(fresh, outOfBand)
 	reconciler := newTestMachinaMachineOperationReconcilerWithLockPath(
 		t, c, op, filepath.Join(t.TempDir(), "agent-upgrade.lock"), apiReader,
 	)
@@ -261,7 +247,7 @@ func TestReconcileHostSoftReboot_ReadsMachineFromAPIReader(t *testing.T) {
 	assert.Zero(t, op.rebootCalls, "the host must not reboot while an out-of-band operation is pending")
 	assert.Equal(t, 10*time.Second, result.RequeueAfter)
 
-	waiting := getMachineOperation(t, apiReader, "op-soft")
+	waiting := getMachineOperation(t, c, "op-soft")
 	assert.Equal(t, v1alpha3.OperationPhasePending, waiting.Status.Phase)
 	assert.Equal(t, "waiting for out-of-band host operation op-oob", waiting.Status.Message)
 }

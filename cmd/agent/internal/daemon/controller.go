@@ -138,7 +138,6 @@ func runController(
 		allocationLaunch:     defaultAllocationLaunchOptions(),
 		log:                  log,
 		machineName:          machineName,
-		nodeName:             nodeName,
 		nodeOperator:         nodeOperator,
 		agentUpgradeLockPath: goalstates.DaemonAgentUpgradeLockPath,
 		requestRestart:       func() { stopManager(ErrRestartRequested) },

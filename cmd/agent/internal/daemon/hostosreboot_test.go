@@ -17,6 +17,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	agentdaemon "github.com/Azure/unbounded/pkg/agent/daemon"
 )
 
 func hostSoftRebootOperation(name string) *v1alpha3.MachineOperation {
@@ -74,7 +75,7 @@ func TestReconcileHostOSReboot_CompletesAfterReboot(t *testing.T) {
 	assert.Equal(t, "boot-1", updated.Status.Targets[0].BootID)
 
 	// The daemon that starts after the reboot observes a new boot ID.
-	handler, err := newHostSoftRebootHandler(c, c, discardLogger(), "test-machine", "test-node", &fakeNodeOperator{bootID: "boot-2"}, &atomic.Bool{})
+	handler, err := agentdaemon.NewHostSoftRebootHandler(c, c, discardLogger(), hostSoftRebootTarget{machineName: "test-machine"}, &fakeNodeOperator{bootID: "boot-2"}, &atomic.Bool{})
 	require.NoError(t, err)
 	require.NoError(t, handler.PublishStartup(context.Background()))
 
@@ -126,7 +127,7 @@ func TestReconcileHostOSReboot_RebootCommandFails(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 2, op.rebootCalls)
 
-	handler, err := newHostSoftRebootHandler(c, c, discardLogger(), "test-machine", "test-node", &fakeNodeOperator{bootID: "boot-2"}, &atomic.Bool{})
+	handler, err := agentdaemon.NewHostSoftRebootHandler(c, c, discardLogger(), hostSoftRebootTarget{machineName: "test-machine"}, &fakeNodeOperator{bootID: "boot-2"}, &atomic.Bool{})
 	require.NoError(t, err)
 	require.NoError(t, handler.PublishStartup(context.Background()))
 	updated = getMachineOperation(t, c, "op-1")
@@ -190,7 +191,7 @@ func TestReconcileHostOSReboot_DaemonStoppingLeavesInProgress(t *testing.T) {
 	assert.Equal(t, v1alpha3.OperationPhaseInProgress, updated.Status.Phase, "the next daemon decides from the boot ID")
 
 	// The reboot happened after all.
-	handler, err := newHostSoftRebootHandler(c, c, discardLogger(), "test-machine", "test-node", &fakeNodeOperator{bootID: "boot-2"}, &atomic.Bool{})
+	handler, err := agentdaemon.NewHostSoftRebootHandler(c, c, discardLogger(), hostSoftRebootTarget{machineName: "test-machine"}, &fakeNodeOperator{bootID: "boot-2"}, &atomic.Bool{})
 	require.NoError(t, err)
 	require.NoError(t, handler.PublishStartup(context.Background()))
 

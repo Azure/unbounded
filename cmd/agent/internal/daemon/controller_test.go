@@ -196,7 +196,6 @@ func newTestMachinaMachineOperationReconcilerWithLockPath(
 		Client:               c,
 		log:                  discardLogger(),
 		machineName:          "test-machine",
-		nodeName:             "test-node",
 		nodeOperator:         op,
 		agentUpgradeLockPath: lockPath,
 		apiReader:            firstReader(apiReader),

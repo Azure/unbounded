@@ -5,92 +5,56 @@ package daemon
 
 import (
 	"context"
+	"errors"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
+	daemon "github.com/Azure/unbounded/pkg/agent/daemon"
 )
 
-func TestHostSoftRebootTargetSelectorSources(t *testing.T) {
-	machine := &v1alpha3.Machine{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:       "machine-1",
-			Generation: 7,
-			Labels:     map[string]string{"source": "machine"},
-		},
-	}
-	node := &corev1.Node{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:   "node-1",
-			Labels: map[string]string{"source": "node"},
-		},
-	}
-	target := hostSoftRebootTarget{machineName: "machine-1", nodeName: "node-1"}
+type nativeBootFailureStore struct {
+	operation daemon.MachineOperation
+	result    daemon.MachineOperationResult[int64]
+}
 
-	for _, tc := range []struct {
-		name    string
-		kind    v1alpha3.OperationKind
-		objects []client.Object
-		label   string
-		want    bool
-	}{
-		{
-			name:    "soft uses node",
-			kind:    v1alpha3.OperationHostSoftReboot,
-			objects: []client.Object{machine, node},
-			label:   "node",
-			want:    true,
-		},
-		{
-			name:    "soft does not use machine when node exists",
-			kind:    v1alpha3.OperationHostSoftReboot,
-			objects: []client.Object{machine, node},
-			label:   "machine",
-		},
-		{
-			name:    "soft falls back to machine",
-			kind:    v1alpha3.OperationHostSoftReboot,
-			objects: []client.Object{machine},
-			label:   "machine",
-			want:    true,
-		},
-		{
-			name:    "out of band uses machine",
-			kind:    v1alpha3.OperationHostPowerOff,
-			objects: []client.Object{machine, node},
-			label:   "machine",
-			want:    true,
-		},
-		{
-			name:    "out of band does not use node",
-			kind:    v1alpha3.OperationHostPowerOff,
-			objects: []client.Object{machine, node},
-			label:   "node",
-		},
-		{
-			name:    "missing machine",
-			kind:    v1alpha3.OperationHostPowerOff,
-			objects: []client.Object{node},
-			label:   "node",
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			c := fakeStatusClient(tc.objects...)
-			matches, err := target.MatchSelector(context.Background(), c, tc.kind, labels.SelectorFromSet(labels.Set{"source": tc.label}))
-			require.NoError(t, err)
-			assert.Equal(t, tc.want, matches)
-		})
-	}
+func (*nativeBootFailureStore) MarkInProgress(context.Context, daemon.MachineOperation, string) error {
+	panic("unexpected MarkInProgress")
+}
 
-	generation, err := target.ObservedGeneration(context.Background(), fakeStatusClient(machine))
+func (s *nativeBootFailureStore) Finish(_ context.Context, op daemon.MachineOperation, result daemon.MachineOperationResult[int64]) error {
+	s.operation = op
+	s.result = result
+
+	return nil
+}
+
+func TestNativeHostSoftRebootForwardsCallerStore(t *testing.T) {
+	machine := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "test-machine"}}
+	c := fakeStatusClient(machine, hostSoftRebootOperation("op-1"))
+	host := &fakeNodeOperator{bootIDErr: errors.New("boot failed")}
+	target := &machineOperationTarget{
+		installation: installstate.NewStore(filepath.Join(t.TempDir(), "state"), filepath.Join(t.TempDir(), "install.lock")),
+		Client:       c,
+		log:          discardLogger(),
+		machineName:  "test-machine",
+		nodeOperator: host,
+	}
+	store := &nativeBootFailureStore{}
+	op := daemon.MachineOperation{Name: "op-1", Kind: v1alpha3.OperationHostSoftReboot}
+
+	_, err := target.reconcileHostSoftReboot(t.Context(), store, op)
 	require.NoError(t, err)
-	assert.Equal(t, int64(7), generation)
+	require.Equal(t, op, store.operation)
+	require.Equal(t, v1alpha3.OperationPhaseFailed, store.result.Phase)
+	require.Equal(t, "ExecutionFailed", store.result.Reason)
+	require.Equal(t, "boot failed", store.result.Message)
+	require.Empty(t, getMachineOperation(t, c, "op-1").Status.Phase)
 }
 
 func TestHostSoftRebootRequiresNativeMachineBeforeBootRead(t *testing.T) {

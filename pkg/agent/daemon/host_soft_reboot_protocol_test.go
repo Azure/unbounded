@@ -366,7 +366,7 @@ func TestHostSoftRebootWaitingRechecksSingleReference(t *testing.T) {
 			host := &fakeHostRebooter{bootID: "boot-1"}
 			h := publicHandler(t, c, c, host, &atomic.Bool{})
 
-			result, err := h.Reconcile(t.Context(), MachineOperation{Name: "soft"})
+			result, err := h.Reconcile(t.Context(), nil, MachineOperation{Name: "soft"})
 			require.NoError(t, err)
 			assert.Equal(t, hostSoftRebootWaitInterval, result.RequeueAfter)
 			assert.Zero(t, host.calls)
