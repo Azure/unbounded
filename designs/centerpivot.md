@@ -83,34 +83,7 @@ points at a version, and has rollout settings (Nebraska's
 So anyone who sends a check on a node's behalf must send exactly what the
 node's agent sends, and must act on a grant right away.
 
-### 2.3 What testing showed
-
-The ACL update harness in AKSFlexNode
-([Azure/AKSFlexNode#462](https://github.com/Azure/AKSFlexNode/pull/462)) drives
-updates through `trident-acl-agent` with a test Nebraska:
-
-1. The agent's instance ID is the first 16 bytes of the SHA-384 hash of the
-   host's `/etc/machine-id`, written as a UUID (`crates/osutils/src/machine_id.rs`
-   in Trident). It stays the same across the A/B switch: the agent's checks
-   before and after the restart came from the same ID, since both copies share
-   the root partition.
-2. The agent writes no status for a request it can't parse, including one with
-   a field the protocol doesn't define
-   ([microsoft/trident#957](https://github.com/microsoft/trident/issues/957)).
-3. If the node falls back to the old copy during the restart, the agent still
-   reports the commit as a success, and tells Nebraska the update finished
-   ([microsoft/trident#956](https://github.com/microsoft/trident/issues/956)).
-4. ACL's `VERSION_ID` is a date-based semver version: `3.0.20261104`, then
-   `3.0.20261106` in the next build tested. ACL sets no `IMAGE_VERSION`, and its
-   `BUILD_ID`, such as `1244962`, isn't semver. The harness's own builds copy
-   their base's os-release, so they can't show whether two released builds
-   share a `VERSION_ID`.
-5. On Unbounded ACL nodes, kubelet and pods run inside an nspawn machine, so
-   pods can't read the host's `/etc/machine-id` or `/etc/os-release`.
-
-## 3. Goals and non-goals
-
-Goals:
+## 3. Goals
 
 1. Update ACL nodes automatically when Nebraska has a newer version for them.
 2. Limit how many nodes in a Site update at once, and move workloads off a node
@@ -119,9 +92,6 @@ Goals:
 4. End every grant the service starts: finished, or reported failed, before
    Nebraska's timeout. Never create extra Nebraska instances.
 5. Notice failed updates, and stop the cluster's updates until a person looks.
-
-Not in the first version: maintenance windows beyond Nebraska's office hours,
-rolling back automatically, and choosing versions.
 
 ## 4. Design
 
@@ -155,7 +125,7 @@ flowchart TB
    leader election, on nodes it doesn't update, and reads its settings from
    the Site.
 2. **`trident-acl-agent`** ships with ACL and runs on each host. Unbounded's
-   host agent configures it (section 5).
+   host agent configures it (appendix, "Host agent").
 3. **`centerpivot-node-info`** is a temporary DaemonSet (section 4.3).
 
 This design covers ACL nodes that run kubelet in an nspawn machine, Unbounded's
@@ -209,19 +179,22 @@ They are in one annotation on the Node, `centerpivot.unbounded-cloud.io/agent-in
 {
   "schemaVersion": "1.0",
   "machineId": "ebb9a2bb-9365-d34e-133f-8da0664e7366",
-  "currentVersion": "20261105.1.0"
+  "currentVersion": "3.0.20261106"
 }
 ```
 
-1. `machineId` is the ID the agent sends Nebraska. The service can't use the
-   Node's `status.nodeInfo.machineID`: kubelet reads that inside the nspawn
-   machine, which has its own `/etc/machine-id`.
+1. `machineId` is the ID the agent sends Nebraska: the first 16 bytes of the
+   SHA-384 hash of the host's `/etc/machine-id`, written as a UUID
+   (`crates/osutils/src/machine_id.rs` in Trident). It stays the same across
+   the A/B switch, since both copies share the root partition. The service
+   can't use the Node's `status.nodeInfo.machineID`: kubelet reads that inside
+   the nspawn machine, which has its own `/etc/machine-id`.
 2. `currentVersion` is the version the agent sends Nebraska, read from the
    running OS, and is left out if the agent couldn't read one. The service
    checks nothing for a node without it.
 3. It is written when the node starts, and again when the values change.
 
-Until Trident provides these (section 5), the DaemonSet writes the same
+Until Trident provides these (section 5.1), the DaemonSet writes the same
 annotation. Unbounded's host agent binds the host's `/etc/machine-id`
 read-only into an ACL node's nspawn machine at `/run/unbounded/host/machine-id`,
 not over the machine's own, and systemd-nspawn already binds the host's
@@ -448,23 +421,113 @@ updates under way (`centerpivot_updating_nodes`), held nodes
 
 ## 5. Work needed from other teams
 
-| Team | Ask | Blocks v1? | Until then |
-|---|---|---|---|
-| Trident | **Preferred:** a `stage` without `targetVersion` that stages whatever Nebraska grants, with a final status for "no update". Only the agent would then talk to Nebraska; the service would stop sending checks, and `agent-info` would need only the version, for the check after a restart. | No | The service checks as the node, using `agent-info`. |
-| Trident | Otherwise: `agent-info` written by the agent (section 4.3). | No | The temporary DaemonSet |
-| Trident | A final status when Nebraska refuses an update during `stage`. Today the agent exits, and systemd restarts it (`"Nebraska query failed"` in `annotations/orchestrator.rs`). | No | The service stages only after a grant, so this is rare. |
-| Trident | Confirm that the recovery the service uses to end a grant (section 4.7) is intended and will stay, and document it. | No | |
-| Trident | Fix microsoft/trident#956 and #957. | No | The version check after the restart, and the status deadline |
-| Unbounded host agent | A `trident-acl-agent` drop-in on the nodes the service updates: the prefix `centerpivot.unbounded-cloud.io`, kubelet's credentials, `kubelet-cert` to find the Node's name, and the version key (appendix). | Yes | Done |
-| Unbounded host agent | Bind the host's `/etc/machine-id` into the nspawn machine at `/run/unbounded/host/machine-id`. | Until Trident provides the identity | Done |
-| Unbounded host agent | Turn on kubelet's graceful node shutdown. | No | Pods left on the node stop at once. |
-| ACL images | Confirm that `VERSION_ID` differs for every released build, only increases, and stays valid semver, with the changing part outside build metadata (sections 2.2 and 2.3). | Yes | The builds tested differ. |
-| Nebraska | Package labels, or the agent's `TRIDENT_ACL_AGENT_COSI_SHA384_SOURCE=hash` option. Release 4.0.3 has no labels. | Yes, one of the two | |
-| Nebraska | One database behind the URL, so the service's grant and the agent's check reach the same Nebraska. | Yes | |
-| Nebraska | Each group's update timeout matches the service's setting. | Yes | |
+Each item says what's needed, why, what the service does until then, and
+whether the first version needs it.
 
-If Nebraska's Omaha secret is used, it is part of the URL path, so it is
-readable by anyone who can read Node annotations or the Site.
+### 5.1 Trident
+
+1. **A `stage` that takes whatever Nebraska grants (preferred).**
+   - The ask: a `stage` request without `targetVersion`, which stages the
+     version Nebraska grants, with a final status for "no update".
+   - Why: today the agent compares `targetVersion` with the running version
+     before it asks Nebraska, so the service has to learn the version first,
+     by sending its own update check as the node. With this, only the agent
+     would talk to Nebraska, and `agent-info` would need only the version, for
+     the check after the restart.
+   - Until then: the service checks as the node, using `agent-info`
+     (section 4.3).
+   - The first version needs it: no.
+2. **Otherwise, `agent-info` written by the agent.**
+   - The ask: the agent writes the `agent-info` annotation (section 4.3) on its
+     Node when it starts, and again when the values change.
+   - Why: the temporary `centerpivot-node-info` DaemonSet, and the host
+     agent's bind of the machine ID, would no longer be needed.
+   - Until then: the DaemonSet writes it.
+   - The first version needs it: no.
+3. **A final status when Nebraska refuses an update during `stage`.**
+   - The ask: when the agent's own update check during a `stage` is refused,
+     for example by a rollout limit, end the request with a final status.
+   - Why: today the agent exits (`"Nebraska query failed"` in
+     `annotations/orchestrator.rs`), and systemd restarts it, so the request
+     never gets a final status. The service writes it again at each status
+     deadline, and holds the node after three writes.
+   - Until then: the service stages only right after its own check was
+     granted, so a refusal in between is rare.
+   - The first version needs it: no.
+4. **Keep, and document, the recovery that ends a grant.**
+   - The ask: confirm that a `stage` request for another version is meant to
+     end an update left in progress (the agent's `UpdateInProgress` recovery,
+     section 4.7), and document it in the annotation contract.
+   - Why: it's how the service ends grants it can't finish in time. If it
+     changed, those grants would stay open until Nebraska times them out, and
+     in safe mode enough timeouts turn updates off for the whole group.
+   - Until then: the service relies on the agent's current behavior.
+   - The first version needs it: no.
+5. **Fix [microsoft/trident#956](https://github.com/microsoft/trident/issues/956).**
+   - The problem: if the node falls back to the old copy during the restart,
+     the agent still reports the commit as a success, and tells Nebraska the
+     update finished.
+   - Until then: the service accepts a commit only once `agent-info` shows the
+     new version, and holds the node otherwise (section 4.9).
+   - The first version needs it: no.
+6. **Fix [microsoft/trident#957](https://github.com/microsoft/trident/issues/957).**
+   - The problem: the agent writes no status for a request it can't parse,
+     such as one with a field the contract doesn't define.
+   - Until then: the service checks each request the way the agent does
+     before writing it, and the status deadline catches anything else.
+   - The first version needs it: no.
+
+### 5.2 ACL images
+
+1. **Confirm that `VERSION_ID` differs for every released build, and only
+   increases.**
+   - Why: the agent reports it to Nebraska as the node's version, and the
+     service compares it with the granted version after the restart. If two
+     released builds shared one, an update between them would look like a
+     failed update, and the node would be held.
+   - What we know: it's a date-based semver version, `3.0.20261104` and then
+     `3.0.20261106` in the builds tested. It isn't the build's own date, so two
+     builds might share one. ACL sets no `IMAGE_VERSION`, and its `BUILD_ID`,
+     such as `1244962`, isn't semver, so there's no other key to use.
+   - The first version needs it: yes.
+
+### 5.3 Nebraska
+
+1. **Checksums the agent can use.**
+   - The ask: package labels with each image's checksum, which release 4.0.3
+     doesn't have. Otherwise, packages published for the agent's
+     `TRIDENT_ACL_AGENT_COSI_SHA384_SOURCE=hash` option, which the host
+     agent's drop-in would then set.
+   - Why: the agent checks each image against a checksum from Nebraska, and by
+     default reads it from the package's labels.
+   - The first version needs it: yes, one of the two.
+2. **One database behind the update URL.**
+   - Why: the service's check takes the grant, and the agent's own check
+     during `stage` has to find it. If the URL spread checks across Nebraska
+     instances with separate databases, the agent's check could miss the
+     grant, and the node would count twice against the group's limits.
+   - The first version needs it: yes.
+3. **Each group's update timeout matches the Site's `updateTimeout`.**
+   - Why: the service ends every grant at least 10 minutes before that
+     timeout (section 4.8). If a group's timeout were shorter, Nebraska would
+     count updates as timed out, and in safe mode enough timeouts turn updates
+     off for the group, in every cluster.
+   - The first version needs it: yes.
+4. **The Omaha secret.**
+   - The ask: if Nebraska requires its Omaha secret, it's part of the update
+     URL, so anyone who can read Sites or Node annotations can read it.
+     Confirm that's acceptable, or offer another way to authenticate.
+   - The first version needs it: only if the secret is used.
+
+### 5.4 Unbounded host agent
+
+1. **Turn on kubelet's graceful node shutdown on ACL nodes.**
+   - Why: after the drain, only DaemonSet and static pods are left on the node
+     (section 4.6). With graceful shutdown, they stop cleanly when the node
+     restarts. Without it, they stop at once.
+   - Open: whether it works with kubelet in an nspawn machine (section 7), to
+     check in the AKSFlexNode harness.
+   - The first version needs it: no.
 
 ## 6. Testing
 
@@ -634,13 +697,7 @@ Step 2 needs kubelet to join with a bootstrap token, which leaves it a client
 certificate. With a direct kubeconfig or an exec credential, the host agent
 logs that it can't configure `trident-acl-agent`.
 
-### Code layout
+### Code
 
-| Part | Where |
-|---|---|
-| Binary, with `controller` and `node-info` subcommands | `cmd/centerpivot` |
-| Shared code | `internal/centerpivot/...` |
-| Operator component | `internal/operator/components/centerpivot`, and a `Site.Spec.Components` field |
-| Manifests and admission policies | `deploy/centerpivot/` |
-| Image | `images/centerpivot/` |
-| Host agent | `pkg/agent/phases/nodestart/tridentaclagent.go`, and the bind in `pkg/agent/goalstates/resolve.go` |
+The code's layout, and how to build and test it, are in
+[`cmd/centerpivot/AGENTS.md`](../cmd/centerpivot/AGENTS.md).
