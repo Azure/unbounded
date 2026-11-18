@@ -22,7 +22,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	"github.com/Azure/unbounded/internal/machineops"
 )
 
 // The drift logic treats modes as opaque strings: a newer CRD, or an agent
@@ -418,14 +417,42 @@ func TestSyncIsolationConditions_MessageIsBounded(t *testing.T) {
 	m.Status.Isolation = unboundedv1alpha3.IsolationNSpawn
 	m.Status.IsolationChange = &unboundedv1alpha3.IsolationChangeStatus{
 		TargetMode: isolationContainer, Phase: unboundedv1alpha3.IsolationChangeFailed,
-		Message: strings.Repeat("\u00e9", machineops.MaxConditionMessageBytes),
+		Message: strings.Repeat("\u00e9", maxConditionMessageBytes),
 	}
 
 	require.True(t, syncIso(m))
 
 	msg := cond(m, unboundedv1alpha3.MachineConditionIsolationDrift).Message
-	require.LessOrEqual(t, len(msg), machineops.MaxConditionMessageBytes)
+	require.LessOrEqual(t, len(msg), maxConditionMessageBytes)
 	require.True(t, utf8.ValidString(msg))
+}
+
+func TestTruncateUTF8Bytes(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name     string
+		value    string
+		maxBytes int
+		want     string
+	}{
+		{name: "shorter than the limit", value: "abc", maxBytes: 5, want: "abc"},
+		{name: "exactly the limit", value: "abcde", maxBytes: 5, want: "abcde"},
+		{name: "ascii over the limit", value: "abcdef", maxBytes: 5, want: "abcde"},
+		{name: "cut inside a two-byte sequence", value: "aé", maxBytes: 2, want: "a"},
+		{name: "cut after a two-byte sequence", value: "aéb", maxBytes: 3, want: "aé"},
+		{name: "cut inside a four-byte sequence", value: "a😀", maxBytes: 4, want: "a"},
+		{name: "zero limit", value: "abc", maxBytes: 0, want: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := truncateUTF8Bytes(tc.value, tc.maxBytes)
+			require.Equal(t, tc.want, got)
+			require.LessOrEqual(t, len(got), tc.maxBytes)
+			require.True(t, utf8.ValidString(got))
+		})
+	}
 }
 
 // An InProgress change must be looked at again when it turns stale, even when

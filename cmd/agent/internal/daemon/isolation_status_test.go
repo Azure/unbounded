@@ -169,6 +169,30 @@ func TestPatchIsolationStatus_TruncatesTheMessage(t *testing.T) {
 	assert.NotContains(t, string(sent), "\"isolation\":", "an empty Applied is not written")
 }
 
+func TestTruncateUTF8Bytes(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		value    string
+		maxBytes int
+		want     string
+	}{
+		{name: "shorter than the limit", value: "abc", maxBytes: 5, want: "abc"},
+		{name: "exactly the limit", value: "abcde", maxBytes: 5, want: "abcde"},
+		{name: "ascii over the limit", value: "abcdef", maxBytes: 5, want: "abcde"},
+		{name: "cut inside a two-byte sequence", value: "aé", maxBytes: 2, want: "a"},
+		{name: "cut after a two-byte sequence", value: "aéb", maxBytes: 3, want: "aé"},
+		{name: "cut inside a four-byte sequence", value: "a😀", maxBytes: 4, want: "a"},
+		{name: "zero limit", value: "abc", maxBytes: 0, want: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := truncateUTF8Bytes(tc.value, tc.maxBytes)
+			assert.Equal(t, tc.want, got)
+			assert.LessOrEqual(t, len(got), tc.maxBytes)
+			assert.True(t, utf8.ValidString(got))
+		})
+	}
+}
+
 // A refused change leaves a reason. A later attempt writes none, and the
 // stored reason must not survive it, or machina reports a failed reprovision
 // as a refusal that is still waiting for the opt-in.
