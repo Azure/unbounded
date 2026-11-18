@@ -269,6 +269,8 @@ jobs:
   #   - orca                          : deployed separately by deploy-orca
   #   - racer-object                  : sidecars injected by the racer component
   #   - racer-vllm                    : vLLM with the Racer loader; not deployed
+  #   - centerpivot                   : ACL update service; off unless a Site
+  #                                     enables it
   #
   # machine-ops-controller is omitted on purpose: the operator synthesizes
   # metalman per Site instead, so machine-ops is never rolled out here.
@@ -286,6 +288,8 @@ jobs:
             file: images/machina/Containerfile
           - name: token-refresher
             file: images/token-refresher/Containerfile
+          - name: centerpivot
+            file: images/centerpivot/Containerfile
           - name: netboot
             file: images/netboot/Containerfile
           - name: metalman

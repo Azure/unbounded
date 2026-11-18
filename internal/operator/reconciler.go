@@ -29,6 +29,7 @@ import (
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/operator/component"
+	"github.com/Azure/unbounded/internal/operator/components/centerpivot"
 	"github.com/Azure/unbounded/internal/operator/components/gantry"
 	"github.com/Azure/unbounded/internal/operator/components/machina"
 	"github.com/Azure/unbounded/internal/operator/components/metalman"
@@ -99,6 +100,7 @@ func DefaultRegistry() *component.Registry {
 			gantry.New(),
 			tokenrefresher.New(),
 			racer.New(),
+			centerpivot.New(),
 			metalman.NewBootstrap(),
 		},
 		Site: []component.SiteComponent{

@@ -1,0 +1,79 @@
+# Two replicas, one active through leader election. Neither runs on a node
+# centerpivot updates, so its own drains never move it.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: centerpivot
+  namespace: {{ default "unbounded-system" .Namespace }}
+  labels:
+    app.kubernetes.io/name: centerpivot
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: centerpivot
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: centerpivot
+    spec:
+      serviceAccountName: centerpivot
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: centerpivot.unbounded-cloud.io/managed
+                    operator: NotIn
+                    values: ["true"]
+      containers:
+        - name: centerpivot
+          image: {{ default "ghcr.io/azure/centerpivot:dev" .Image }}
+          imagePullPolicy: Always
+          args:
+            - controller
+            - --config=/etc/centerpivot/config.yaml
+          env:
+            # The namespace of the Sites' CA ConfigMaps and the leader lease.
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          ports:
+            - name: metrics
+              containerPort: 8080
+              protocol: TCP
+            - name: health
+              containerPort: 8081
+              protocol: TCP
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65534
+            capabilities:
+              drop: ["ALL"]
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+          volumeMounts:
+            - name: config
+              mountPath: /etc/centerpivot/config.yaml
+              subPath: config.yaml
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: centerpivot

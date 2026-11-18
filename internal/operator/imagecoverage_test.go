@@ -65,6 +65,7 @@ var componentImages = map[string][]string{
 	"metalman":        {"metalman"},
 	"token-refresher": {"token-refresher"},
 	"racer":           {"racer", "racer-object"},
+	"centerpivot":     {"centerpivot"},
 }
 
 // imagelessComponents are registered components that apply no workloads, only

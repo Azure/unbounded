@@ -26,7 +26,7 @@ name: unbounded release
 #     -> netboot-image     (PXE boot artifact images)
 #         -> metalman-image (stamped with the matching default netboot image)
 #     -> component-images  (matrix: machina, machine-ops-controller, unbounded-operator,
-#                           token-refresher, orca, gantry, racer,
+#                           token-refresher, centerpivot, orca, gantry, racer,
 #                           racer-object, racer-vllm,
 #                           host-ubuntu2404, host-ubuntu2404-nvidia,
 #                           host-azurelinux3, host-azurelinux3-nvidia,
@@ -721,6 +721,10 @@ jobs:
             trivy: true
           - name: token-refresher
             file: images/token-refresher/Containerfile
+            platforms: linux/amd64,linux/arm64
+            trivy: true
+          - name: centerpivot
+            file: images/centerpivot/Containerfile
             platforms: linux/amd64,linux/arm64
             trivy: true
           - name: machine-ops-controller
