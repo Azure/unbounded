@@ -302,8 +302,8 @@ must still hold the window plus one page; see
 | `min_rank_gibps`, `max_rank_gibps` | The slowest and fastest rank's throughput: its data over its load time. |
 | `reads` | Range reads by all ranks. |
 | `gpu_gib`, `host_gib`, `stream_gib` | Data by delivery mode: the delivery mix. |
-| `peak_gpu_mib` | Highest `memory.used` that `nvidia-smi` reported for any one GPU of the pod, sampled every 500 ms. It includes memory other processes hold, such as the dataplane's GPU staging. |
-| `peak_host_mib` | Highest memory use of the pod's container (cgroup `memory.current`), sampled every 500 ms. It includes page cache, but not the dataplane pod's memory. |
+| `peak_gpu_mib` | Highest `memory.used` that `nvidia-smi` reported for any one GPU of the pod, sampled every 500 ms until the last load line. It includes memory other processes hold, such as the dataplane's GPU staging. |
+| `peak_host_mib` | Highest memory use of the pod's container (cgroup `memory.current`), sampled every 500 ms until the last load line. It includes page cache, but not the dataplane pod's memory. |
 | `dp_host_reads` | Successful `host-read` requests (`racer_host_read_request_nanoseconds_count`). |
 | `dp_host_read_ms`, `dp_host_first_page_ms` | Mean `host-read` time to the final frame and to the first page, in milliseconds. |
 | `dp_gpu_reads` | `gpu-read` requests imported on a GPU (`racer_gpu_read_requests_total{outcome="gpu"}`). |

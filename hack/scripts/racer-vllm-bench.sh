@@ -224,10 +224,19 @@ start_samplers() { # dir
     fi
 }
 
+stop_samplers() {
+    local p
+    for p in "${SAMPLERS[@]}"; do
+        kill "$p" 2>/dev/null || true
+        wait "$p" 2>/dev/null || true
+    done
+    SAMPLERS=()
+}
+
 # stop_run asks vLLM to exit, kills whatever is left of its session, and stops
 # the samplers. It is also the EXIT trap.
 stop_run() {
-    local p i
+    local i
     if [[ -n $VLLM_PID ]]; then
         kill -TERM "$VLLM_PID" 2>/dev/null || true
         for ((i = 0; i < 60; i++)); do
@@ -238,11 +247,7 @@ stop_run() {
         wait "$VLLM_PID" 2>/dev/null || true
         VLLM_PID=
     fi
-    for p in "${SAMPLERS[@]}"; do
-        kill "$p" 2>/dev/null || true
-        wait "$p" 2>/dev/null || true
-    done
-    SAMPLERS=()
+    stop_samplers
 }
 
 run_one() { # phase concurrency staging_bytes use_vmm
@@ -287,6 +292,8 @@ run_one() { # phase concurrency staging_bytes use_vmm
         sleep 0.5
     done
     t1=$(date +%s.%N)
+    # Peaks cover the load only, not the KV cache and graph capture after it.
+    stop_samplers
 
     if [[ -n $metrics_ok ]] && ! scrape "$dir/metrics-after.txt"; then
         log "warning: dp_* columns are empty for this run"
