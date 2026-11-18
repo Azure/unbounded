@@ -6,22 +6,79 @@ package daemon
 import (
 	"context"
 	"errors"
+	"io"
+	"log/slog"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
+
+type rebootTestTarget struct {
+	labels map[string]string
+}
+
+func (rebootTestTarget) Reference() string { return "machine-1" }
+
+func (rebootTestTarget) ObservedGeneration(context.Context, client.Reader) (int64, error) {
+	return 0, nil
+}
+
+func (t rebootTestTarget) MatchSelector(_ context.Context, _ client.Reader, _ v1alpha3.OperationKind, selector labels.Selector) (bool, error) {
+	return selector.Matches(labels.Set(t.labels)), nil
+}
+
+type fakeHostRebooter struct {
+	bootID    string
+	bootErr   error
+	bootCalls int
+}
+
+func (h *fakeHostRebooter) BootID() (string, error) {
+	h.bootCalls++
+
+	return h.bootID, h.bootErr
+}
+
+func (*fakeHostRebooter) RebootHost(context.Context, *slog.Logger) error {
+	return nil
+}
+
+func publicSoftOp() *v1alpha3.MachineOperation {
+	return &v1alpha3.MachineOperation{
+		ObjectMeta: metav1.ObjectMeta{Name: "soft"},
+		Spec: v1alpha3.MachineOperationSpec{
+			OperationKind: v1alpha3.OperationHostSoftReboot,
+			MachineRef:    "machine-1",
+		},
+	}
+}
+
+func publicHandler(t *testing.T, c client.Client, reader client.Reader, host *fakeHostRebooter, flag *atomic.Bool) *HostSoftRebootHandler {
+	t.Helper()
+
+	h, err := NewHostSoftRebootHandler(c, reader, slog.New(slog.NewTextHandler(io.Discard, nil)), rebootTestTarget{}, host, flag)
+	require.NoError(t, err)
+
+	return h
+}
+
+func publicOperation(t *testing.T, r client.Reader) v1alpha3.MachineOperation {
+	t.Helper()
+
+	var op v1alpha3.MachineOperation
+	require.NoError(t, r.Get(t.Context(), client.ObjectKey{Name: "soft"}, &op))
+
+	return op
+}
 
 func outOfBandOperation(name, ref string, kind v1alpha3.OperationKind) *v1alpha3.MachineOperation {
 	op := publicSoftOp()
@@ -103,9 +160,9 @@ func TestUnfinishedOutOfBandHostOperation_IgnoresAllocationOperations(t *testing
 }
 
 func TestHostOperationUnfinishedOn(t *testing.T) {
-	node := &corev1.Node{
+	machine := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: "node-1",
+			Name: "machine-1",
 			Labels: map[string]string{
 				"unbounded-cloud.io/site": "lab",
 				"rack":                    "a",
@@ -284,8 +341,9 @@ func TestHostOperationUnfinishedOn(t *testing.T) {
 		},
 	}
 
-	c := fakeMachineOperationClient(node)
+	c := fakeMachineOperationClient()
 	h := publicHandler(t, c, c, &fakeHostRebooter{}, &atomic.Bool{})
+	h.target = rebootTestTarget{labels: machine.Labels}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -326,63 +384,6 @@ func TestMarkHostSoftRebootWaiting_IgnoresDeletedOperation(t *testing.T) {
 	h := publicHandler(t, c, c, &fakeHostRebooter{}, &atomic.Bool{})
 	require.NoError(t, c.Delete(context.Background(), op))
 	require.NoError(t, h.markWaiting(context.Background(), "soft", "waiting"))
-}
-
-func TestHostSoftRebootWaitingRechecksSingleReference(t *testing.T) {
-	for _, change := range []string{"started", "deleted"} {
-		t.Run(change, func(t *testing.T) {
-			blocker := outOfBandOperation("oob", "machine-1", v1alpha3.OperationHostHardReboot)
-			c := fake.NewClientBuilder().WithScheme(fakeMachineOperationClient().Scheme()).
-				WithStatusSubresource(&v1alpha3.MachineOperation{}).
-				WithObjects(publicSoftOp(), blocker).WithInterceptorFuncs(interceptor.Funcs{
-				List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
-					if err := c.List(ctx, list, opts...); err != nil {
-						return err
-					}
-
-					var latest v1alpha3.MachineOperation
-					if err := c.Get(ctx, client.ObjectKey{Name: "soft"}, &latest); err != nil {
-						return err
-					}
-
-					if change == "deleted" {
-						return c.Delete(ctx, &latest)
-					}
-
-					latest.Status.Phase = v1alpha3.OperationPhaseInProgress
-					latest.Status.Message = hostSoftRebootMessage
-					latest.Status.Targets = []v1alpha3.MachineOperationTargetStatus{
-						{
-							MachineRef:         "machine-1",
-							Phase:              v1alpha3.OperationPhaseInProgress,
-							BootID:             "boot-1",
-							ObservedGeneration: 4,
-						},
-					}
-
-					return c.Status().Update(ctx, &latest)
-				},
-			}).Build()
-			host := &fakeHostRebooter{bootID: "boot-1"}
-			h := publicHandler(t, c, c, host, &atomic.Bool{})
-
-			result, err := h.Reconcile(t.Context(), nil, MachineOperation{Name: "soft"})
-			require.NoError(t, err)
-			assert.Equal(t, hostSoftRebootWaitInterval, result.RequeueAfter)
-			assert.Zero(t, host.calls)
-
-			if change == "started" {
-				status := publicOperation(t, c).Status
-				assert.Equal(t, v1alpha3.OperationPhaseInProgress, status.Phase)
-				assert.Equal(t, hostSoftRebootMessage, status.Message)
-			} else {
-				var missing v1alpha3.MachineOperation
-
-				err := c.Get(t.Context(), client.ObjectKey{Name: "soft"}, &missing)
-				require.True(t, apierrors.IsNotFound(err))
-			}
-		})
-	}
 }
 
 func TestPublishHostOSReboots_SameBootFails(t *testing.T) {

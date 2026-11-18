@@ -30,22 +30,6 @@ func hostSoftRebootOperation(name string) *v1alpha3.MachineOperation {
 	}
 }
 
-// issuedHostSoftRebootOperation returns an operation an earlier daemon on
-// machineName issued a reboot for while the host had bootID.
-func issuedHostSoftRebootOperation(name, machineName, bootID string) *v1alpha3.MachineOperation {
-	op := hostSoftRebootOperation(name)
-	op.Spec.MachineRef = machineName
-	op.Status.Phase = v1alpha3.OperationPhaseInProgress
-	op.Status.Targets = []v1alpha3.MachineOperationTargetStatus{{
-		MachineRef:         machineName,
-		Phase:              v1alpha3.OperationPhaseInProgress,
-		ObservedGeneration: 4,
-		BootID:             bootID,
-	}}
-
-	return op
-}
-
 func getMachineOperation(t *testing.T, c client.Client, name string) v1alpha3.MachineOperation {
 	t.Helper()
 
