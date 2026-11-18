@@ -1,0 +1,14 @@
+{{- if and (eq (default "false" .ExecutionAuthorityEnabled) "true") (eq (default "true" .HardAbort) "false") }}
+[
+  {
+    "op": "test",
+    "path": "/data/hardAbort",
+    "value": "true"
+  },
+  {
+    "op": "replace",
+    "path": "/data/hardAbort",
+    "value": "false"
+  }
+]
+{{- end }}

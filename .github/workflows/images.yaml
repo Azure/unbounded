@@ -66,8 +66,8 @@ jobs:
 
           if [[ -n "$INPUT_PLATFORMS" ]]; then
             platforms="$INPUT_PLATFORMS"
-          elif [[ "$name" == host-azurelinux3-mshv ]]; then
-            # The Microsoft Hypervisor packages are x86_64 only.
+          elif [[ "$name" == host-azurelinux3-mshv || "$name" == project-signal-certification-runner ]]; then
+            # The Microsoft Hypervisor packages and the locked CUDA runner are x86_64 only.
             platforms="linux/amd64"
           elif [[ "$name" == host-ubuntu2404-nvidia ]]; then
             # The NVIDIA HGX image targets x86_64 servers only.
@@ -76,11 +76,13 @@ jobs:
             platforms="linux/amd64,linux/arm64"
           fi
 
-          echo "name=${name}" >> "$GITHUB_OUTPUT"
-          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
-          echo "file=${file}" >> "$GITHUB_OUTPUT"
-          echo "platforms=${platforms}" >> "$GITHUB_OUTPUT"
-          echo "should_build=true" >> "$GITHUB_OUTPUT"
+          {
+            echo "name=${name}"
+            echo "tag=${tag}"
+            echo "file=${file}"
+            echo "platforms=${platforms}"
+            echo "should_build=true"
+          } >> "$GITHUB_OUTPUT"
 
           echo "Image: ${name}:${tag}"
           echo "Containerfile: ${file}"
@@ -130,3 +132,4 @@ jobs:
       tags: ${{ needs.resolve.outputs.tag }}
       build-args: |
         VERSION=${{ needs.resolve.outputs.tag }}
+        GIT_COMMIT=${{ github.sha }}
