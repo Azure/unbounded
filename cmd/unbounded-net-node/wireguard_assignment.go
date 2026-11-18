@@ -279,13 +279,20 @@ func reconcileAssignmentReturnRules(desired []netlink.Rule) error {
 	}
 
 	missing := make(map[string]netlink.Rule, len(desired))
+	needsIPv6 := false
+
 	for _, rule := range desired {
 		missing[key(rule)] = rule
+		needsIPv6 = needsIPv6 || rule.Family == netlink.FAMILY_V6
 	}
 
 	for _, family := range []int{netlink.FAMILY_V4, netlink.FAMILY_V6} {
 		rules, err := assignmentRuleList(family)
 		if err != nil {
+			if family == netlink.FAMILY_V6 && !needsIPv6 && errors.Is(err, unix.EAFNOSUPPORT) {
+				continue
+			}
+
 			return fmt.Errorf("list assignment return rules: %w", err)
 		}
 

@@ -528,6 +528,53 @@ func TestAssignmentReturnRuleFailures(t *testing.T) {
 	}
 }
 
+func TestAssignmentReturnRulesWithoutIPv6(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		desiredFamily int
+		failedFamily  int
+		failure       error
+		wantError     bool
+	}{
+		{"cleanup", 0, netlink.FAMILY_V6, unix.EAFNOSUPPORT, false},
+		{"IPv4 rules", netlink.FAMILY_V4, netlink.FAMILY_V6, unix.EAFNOSUPPORT, false},
+		{"required IPv6", netlink.FAMILY_V6, netlink.FAMILY_V6, unix.EAFNOSUPPORT, true},
+		{"IPv6 permission error", netlink.FAMILY_V4, netlink.FAMILY_V6, unix.EPERM, true},
+		{"IPv4 error", netlink.FAMILY_V4, netlink.FAMILY_V4, unix.EAFNOSUPPORT, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			list, add, del := assignmentRuleList, assignmentRuleAdd, assignmentRuleDel
+
+			t.Cleanup(func() { assignmentRuleList, assignmentRuleAdd, assignmentRuleDel = list, add, del })
+
+			assignmentRuleList = func(family int) ([]netlink.Rule, error) {
+				if family == tc.failedFamily {
+					return nil, tc.failure
+				}
+
+				return nil, nil
+			}
+			added := 0
+			assignmentRuleAdd = func(_ *netlink.Rule) error { added++; return nil }
+			assignmentRuleDel = func(_ *netlink.Rule) error { t.Fatal("deleted an unowned rule"); return nil }
+
+			var desired []netlink.Rule
+			if tc.desiredFamily != 0 {
+				desired = []netlink.Rule{{Family: tc.desiredFamily, Table: assignmentReturnTableBase + 1, IifName: "vxlan0"}}
+			}
+
+			err := reconcileAssignmentReturnRules(desired)
+			if tc.wantError {
+				if !errors.Is(err, tc.failure) || added != 0 {
+					t.Fatalf("rule failure was hidden or published partial rules: %v, added=%d", err, added)
+				}
+			} else if err != nil || added != len(desired) {
+				t.Fatalf("unused IPv6 family blocked reconciliation: %v, added=%d", err, added)
+			}
+		})
+	}
+}
+
 func TestAssignmentReturnKernelRouteOwnership(t *testing.T) {
 	originalList, originalDel := assignmentRouteList, assignmentRouteDel
 
