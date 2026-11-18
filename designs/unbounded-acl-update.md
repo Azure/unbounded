@@ -29,13 +29,12 @@ This document proposes that piece:
    publishes them itself.
 
 The service never takes more than a set number of nodes in the cluster out of
-service at once, one by default, so workloads always have somewhere to run.
-Nebraska decides which version nodes get, and how fast the whole fleet moves.
-When an update fails, the service stops updating the cluster and waits for a
-person.
-
-Limiting updates and moving workloads raise two questions that still need
-answers before we build this. Section 17 describes them.
+service at once, one by default, so workloads always have somewhere to run. It
+moves workloads with the same rules as `kubectl drain`, checks that a node can
+be drained before starting its update, and pauses an update whose drain is
+blocked rather than forcing pods off the node. Nebraska decides which version
+nodes get, and how fast the whole fleet moves. When an update fails, the
+service stops updating the cluster and waits for a person.
 
 ## 2. Background
 
@@ -184,7 +183,8 @@ Nebraska. These findings shape this design:
 
 1. Update ACL nodes automatically when Nebraska has a newer version for them.
 2. Never take more than a set number of the cluster's nodes out of service at
-   once, and move workloads off a node before it restarts.
+   once, and move workloads off a node before it restarts, without breaking a
+   PodDisruptionBudget.
 3. Let Nebraska decide which version nodes get, and how fast the whole fleet
    moves.
 4. Never create extra Nebraska instances, or grants that a node won't use.
@@ -200,7 +200,7 @@ Nebraska. These findings shape this design:
 3. Rolling back automatically.
 4. Choosing versions. Nebraska decides which version each group gets.
 5. Replacing, or depending on, the HostUpgrade design
-   ([host-upgrade.md](host-upgrade.md)). See section 18.
+   ([host-upgrade.md](host-upgrade.md)). See section 17.
 
 ## 5. Overview
 
@@ -243,7 +243,7 @@ There are three parts:
 | Control | Who | Why |
 |---|---|---|
 | How many of the cluster's nodes are out of service at once | the service: a limit, one node by default (section 7) | Workloads always have somewhere to run, however Nebraska is set up. |
-| Moving workloads off a node before it restarts | the service: cordon, then drain (section 9) | Pods move first, within their PodDisruptionBudgets. |
+| Moving workloads off a node before it restarts | the service: cordon, then drain with `kubectl drain`'s rules (section 9.1) | Pods move first, within their PodDisruptionBudgets. |
 | Stopping after a failure | the service (section 10) | One failed node stops updates in this cluster until a person looks. |
 | Which version, in which order of groups, at what pace across the fleet, and pausing | Nebraska | Releases are managed in one place, across every cluster. |
 
@@ -329,24 +329,30 @@ the service limits it in the cluster, whatever Nebraska allows.
 1. The service has a fixed number of places: the "nodes out of service at
    once" setting, one by default.
 2. A node holds a place from just before its update check until its update is
-   done, or has failed.
+   done, which includes waiting for its workloads to recover (section 9). A
+   node whose drain is blocked gives its place back while it waits
+   (section 9.1).
 3. Nodes that are already out of service for other reasons use up places too:
    managed nodes that are not Ready, or that someone else cordoned. So the
    service never takes a node down while the cluster is already short.
 4. While any managed node is held after a failure (section 10), the service
    gives out no places. Updates in the cluster stop until a person looks.
-5. Free places go to nodes with the canary label first, then to the node that
-   was checked longest ago.
+5. While as many nodes are drain-blocked as the "blocked nodes at once"
+   setting, the service gives out no places either. Several blocked drains
+   point to a wider problem than one workload.
+6. Free places go first to drain-blocked nodes that can now be drained, since
+   their updates are already under way. Then they go to nodes with the canary
+   label, then to the node that was checked longest ago.
 
 ```mermaid
 flowchart TB
-    Start(["check interval"]) --> Count["count free places:<br/>limit, minus nodes updating,<br/>minus nodes not Ready or cordoned"]
-    Count --> Held{"any node held?"}
-    Held -->|yes| Wait(["give out no places"])
-    Held -->|no| Free{"a free place?"}
+    Start(["a place frees, or the check interval"]) --> Count["count free places:<br/>limit, minus nodes updating,<br/>minus nodes not Ready or cordoned"]
+    Count --> Stop{"any node held, or too<br/>many drain-blocked?"}
+    Stop -->|yes| Wait(["give out no places"])
+    Stop -->|no| Free{"a free place?"}
     Free -->|no| Wait2(["wait for a place"])
-    Free -->|yes| Pick["give it to the next node:<br/>canary nodes first"]
-    Pick --> Check["update check as that node (section 8)"]
+    Free -->|yes| Pick["give it to the next node:<br/>drain-blocked nodes that can now be drained,<br/>then canary nodes, then the rest"]
+    Pick --> Check["drain check, then update check (section 8)"]
 ```
 
 ### 7.2 Why a node takes a place before its update check
@@ -375,9 +381,10 @@ there's no update, a pass through the cluster is just a series of quick checks.
 3. If Nebraska refuses an update because a limit is reached or updates are
    off, nothing was granted. The node gives its place back and is checked again
    at the next interval.
-4. The group's update timeout must be longer than an update can take: staging,
-   the drain deadline, and the restart deadline together. Otherwise Nebraska
-   counts updates that are still running as timed out.
+4. The group's update timeout must be longer than the release deadline plus
+   the restart deadline (section 12): 1.5 hours with the defaults, so we
+   suggest 2 hours. A grant then always ends, with the update finished or
+   released (section 9.1), before Nebraska would count it as timed out.
 
 ## 8. Checking for updates
 
@@ -387,16 +394,23 @@ there's no update, a pass through the cluster is just a series of quick checks.
 2. It skips the node if any of these is true:
    - The node is paused.
    - The node is held after a failed update.
+   - The node is drain-blocked; it is retried as section 9.1 describes.
    - Its `agent-info` is missing, or has no `currentVersion`.
-3. It sends Nebraska one update check as the node: the node's instance ID and
+3. Before asking Nebraska, it checks that the node could be drained now: the
+   drain rules of section 9.1, and a dry-run eviction of each pod the drain
+   would move. A dry-run eviction asks Kubernetes whether the eviction would be
+   allowed, without evicting. If any pod couldn't be moved, the node gives its
+   place back, and the service records an Event naming the pods and why. No
+   update has started, so nothing in Nebraska is left open.
+4. It sends Nebraska one update check as the node: the node's instance ID and
    version, its architecture, and the server, app ID, and track the request
    will name. It never sends progress events or "ping" messages; those belong
    to the agent.
-4. If Nebraska answers "no update", the node gives its place back. Nebraska now
+5. If Nebraska answers "no update", the node gives its place back. Nebraska now
    lists the node with its current version.
-5. If Nebraska answers with version V, it has granted V to the node. The
+6. If Nebraska answers with version V, it has granted V to the node. The
    service writes the `stage` request right away (section 9).
-6. If Nebraska answers with an error, such as "updates disabled" or "limit
+7. If Nebraska answers with an error, such as "updates disabled" or "limit
    reached", nothing was granted. The node gives its place back.
 
 ```mermaid
@@ -405,15 +419,19 @@ sequenceDiagram
     participant API as Kubernetes API
     participant Nebraska
 
-    Service->>Service: give a free place to the next node that is due
-    Service->>API: read the Node: labels, agent-info, state
-    Service->>Nebraska: update check as the node (instance ID, version, track)
-    alt no update, or an error
-        Nebraska-->>Service: no update
-        Service->>Service: give the place back
-    else update to version V
-        Nebraska-->>Service: version V (granted to this node)
-        Service->>API: write stage request for V
+    Service->>Service: 1. give a free place to the next node that is due
+    Service->>API: 3. drain check: drain rules, dry-run evictions
+    alt a pod couldn't be moved
+        Service->>API: record an Event, give the place back
+    else the node could be drained
+        Service->>Nebraska: 4. update check as the node (instance ID, version, track)
+        alt no update, or an error
+            Nebraska-->>Service: no update
+            Service->>Service: 5. give the place back
+        else update to version V
+            Nebraska-->>Service: version V (granted to this node)
+            Service->>API: 6. write stage request for V
+        end
     end
 ```
 
@@ -426,11 +444,8 @@ sequenceDiagram
    agent downloads V, writes it into the unused copy, and reports `stage`
    `Success`.
 3. The service cordons the node, and records that it did.
-4. The service drains the node. It evicts every pod except DaemonSet pods and
-   static pods (pods kubelet runs from files on the node). Kubernetes refuses an
-   eviction that would break a PodDisruptionBudget, so the service tries those
-   again until the drain deadline. Which pods to evict is one of the open
-   questions (section 17.2).
+4. The service drains the node (section 9.1). If the drain can't finish by the
+   drain deadline, the update pauses as section 9.1 describes.
 5. The service writes a `finalize` request with the same `nodeUpdateId`, a new
    `operationId`, and the same version.
 6. The agent prepares the new copy, reports `finalize` `Success`, and restarts
@@ -442,8 +457,11 @@ sequenceDiagram
    `Success` for this `nodeUpdateId`, `agent-info` says the node runs V, and
    the Node is Ready. If they aren't all true by the restart deadline, it holds
    the node (section 10).
-9. The service uncordons the node, if it cordoned it, and gives its place back.
-   The update is done.
+9. The service uncordons the node, if it cordoned it.
+10. It waits for the workloads it moved to recover: every Deployment and
+    StatefulSet whose pods it evicted has all its pods available again, and the
+    settle time has passed. Then it gives the place back, and the next node can
+    start. The update is done.
 
 Whenever a node leaves an update early, because a step failed or the node was
 held, the service also uncordons it, if it cordoned it, and gives its place
@@ -471,7 +489,8 @@ sequenceDiagram
     Agent->>API: 7. agent-info (V), commit Success
     Agent->>Nebraska: update complete
     Service->>API: 8. check commit, version, and Ready
-    Service->>API: 9. uncordon, give the place back
+    Service->>API: 9. uncordon
+    Service->>API: 10. wait for moved workloads, then give the place back
 ```
 
 The service tracks each node in one of these states:
@@ -480,21 +499,120 @@ The service tracks each node in one of these states:
 stateDiagram-v2
     [*] --> Idle
     Idle --> Checking: a place is free
-    Checking --> Idle: no update, or Nebraska refused
+    Checking --> Idle: can't drain now, no update, or Nebraska refused
     Checking --> Staging: Nebraska grants V
     Staging --> Draining: stage Success
     Staging --> Idle: AlreadyAtTarget, or stage failed
     Draining --> Finalizing: all pods moved
-    Draining --> Held: drain deadline passed
+    Draining --> DrainBlocked: drain deadline passed
+    DrainBlocked --> Draining: the node can now be drained, and a place is free
+    DrainBlocked --> Idle: release deadline passed, grant released
     Finalizing --> Restarting: finalize Success
     Finalizing --> Staging: NotStaged
     Finalizing --> Idle: finalize failed
-    Restarting --> Idle: commit Success, runs V, Ready
+    Restarting --> Recovering: commit Success, runs V, Ready
+    Recovering --> Idle: moved workloads recovered, settle time passed
     Restarting --> Held: boot failed, wrong version, or no answer by the deadline
     Staging --> Held: no status after 3 tries
     Finalizing --> Held: no status after 3 tries
     Held --> Idle: a person clears the hold
 ```
+
+### 9.1 Moving workloads
+
+Without a drain, Kubernetes moves pods off a node only after it has been
+unreachable for 5 minutes, by default. A restart is often shorter, so the pods
+would wait for the node and come back on it, out of service the whole time. So
+the service moves them first.
+
+The service drains with `k8s.io/kubectl/pkg/drain`, the code behind
+`kubectl drain`, and uses kubectl's rules for which pods move:
+
+| Pods | What the drain does |
+|---|---|
+| Static pods, which kubelet runs from files on the node | Skips them. |
+| DaemonSet pods | Skips them, as `kubectl drain --ignore-daemonsets` does. They run on every node, so they stop and start again with the node. This is the one rule that differs from kubectl's default, which refuses to drain until told to ignore them. |
+| Pods that keep data in `emptyDir` volumes, scratch space on the node | Refuses to drain the node, unless the "delete `emptyDir` data" setting is on (`kubectl drain --delete-emptydir-data`). The data is lost when the pod moves. |
+| Pods with no controller, which nothing would create again | Refuses to drain the node, unless the "move pods with no controller" setting is on (`kubectl drain --force`). |
+| Every other pod | Evicts it through Kubernetes' eviction API, so PodDisruptionBudgets apply, and gives it its own grace period to stop. An eviction a budget refuses is tried again until the drain deadline. |
+
+The same rules, with a dry-run eviction of each pod, are the drain check that
+runs before each update check (section 8). So most nodes that can't be drained
+are skipped before any update starts.
+
+#### When a drain is blocked anyway
+
+Things can change between the drain check and the drain. For example, another
+pod of the same application may stop being ready, so its budget refuses the
+eviction. When the drain isn't done by the drain deadline:
+
+1. The service uncordons the node, marks it drain-blocked in its `state`, and
+   records an Event naming the pod and its budget. The update stays staged.
+2. The node gives its place back. A blocked drain is a problem with one
+   workload, not with the update, so other nodes continue.
+3. Every 5 minutes, the service runs the drain check on the node again.
+4. When the check passes and a place is free, the node gets that place ahead
+   of nodes that haven't started an update (section 7.1). The service cordons
+   and drains the node again, then finalizes the same update. The update
+   continues at step 5 of section 9.
+5. If the release deadline passes first, counted from Nebraska's grant, the
+   service releases the grant. It writes a new `stage` request for the same
+   version. Nebraska answers the agent's update check with "update in progress",
+   so the agent tells Nebraska the update failed, which closes the grant, and
+   reports `OperationFailed` (`trident-acl-agent`'s recovery for an update left
+   in progress, in `annotations/orchestrator.rs`). The node keeps running its
+   current version, goes back to Idle, and is checked again at later intervals.
+   The staged copy is overwritten by its next update.
+
+Releasing the grant before the group's update timeout means Nebraska never
+records a timeout, which in safe mode could turn updates off for the group
+(section 7.3).
+
+```mermaid
+sequenceDiagram
+    participant Service as unbounded-acl-update
+    participant API as Kubernetes API
+    participant Agent as trident-acl-agent
+    participant Nebraska
+
+    Note over Service: the drain deadline passes
+    Service->>API: 1. uncordon, mark drain-blocked, record an Event
+    Service->>Service: 2. give the place back
+    loop 3. every 5 minutes
+        Service->>API: drain check
+    end
+    alt 4. the check passes, and a place is free
+        Service->>API: cordon, drain, then finalize the same update
+    else 5. the release deadline passes first
+        Service->>API: new stage request (V)
+        Agent->>Nebraska: update check
+        Nebraska-->>Agent: update in progress
+        Agent->>Nebraska: update failed (closes the grant)
+        Agent->>API: stage OperationFailed
+    end
+```
+
+#### Pods left on the node
+
+After the drain, only DaemonSet pods and static pods are left on the node. They
+stop when the node restarts. Kubelet's graceful node shutdown gives them time to
+stop cleanly. Unbounded turns it on once we've confirmed it works with kubelet
+inside the nspawn machine (sections 15 and 17).
+
+### 9.2 What this means for applications
+
+1. An application with two or more replicas and a PodDisruptionBudget stays
+   available through updates. An application with one replica is out of
+   service while its pod starts again on another node, once per update of its
+   node.
+2. Pods that keep data in `emptyDir` volumes, or that have no controller, stop
+   their node from updating until an administrator turns on the matching
+   setting (section 12). The service records an Event on the node that names
+   them.
+3. A PodDisruptionBudget that never allows an eviction, such as
+   `maxUnavailable: 0`, stops the nodes running its pods from updating. The
+   Event names the budget.
+4. DaemonSet pods stay on the node, and restart with it.
 
 ## 10. When something goes wrong
 
@@ -504,7 +622,11 @@ stateDiagram-v2
 | `stage` or `finalize` reports `OperationFailed` or `AgentInternalError` | Leaves the update. The next check decides again. |
 | A request gets `InvalidRequest` | Records an Event and leaves the update. This points to a bug in the request. |
 | `finalize` reports `NotStaged` | Starts again with `stage`. |
-| The drain isn't done by the drain deadline | Holds the node. Nebraska's grant stays open; see section 17.1. |
+| The drain check fails before the update check | Skips the node until the next interval, with an Event. No update starts. |
+| The drain isn't done by the drain deadline | Marks the node drain-blocked and pauses its update (section 9.1). Other nodes continue. |
+| A drain-blocked node can't be drained before the release deadline | Releases Nebraska's grant, and goes back to Idle (section 9.1). |
+| As many nodes are drain-blocked as the "blocked nodes at once" setting | Starts no new updates until fewer are blocked. |
+| The workloads it moved don't recover within 30 minutes | Keeps the place, so no other node starts, and records an Event. The place frees once they recover. |
 | The commit reports `TargetBootFailed` | Holds the node. |
 | The commit reports `Success`, but `agent-info` still shows another version at the restart deadline | Holds the node. This is the case in microsoft/trident#956. |
 | No status appears for a request within 5 minutes | Writes the same request again. The agent treats a repeated request as one. After 3 tries, holds the node. |
@@ -528,11 +650,16 @@ restart, Nebraska may already list the update as complete (microsoft/trident#956
 Nebraska would then offer the same version again, and the node would repeat the
 same failed update.
 
+A drain-blocked node isn't held. Its problem is a workload that can't move yet,
+not the update, so the rest of the cluster keeps updating (section 9.1).
+
 ## 11. Leader election and restarts
 
 1. The service runs two replicas. A Lease keeps one active.
 2. All state is on the Node objects. A new leader continues where the old one
-   stopped, including counting places.
+   stopped, including counting places, a drain under way, and drain-blocked
+   nodes. Continuing a drain is safe: evicting a pod that's already gone does
+   nothing.
 3. The service writes every annotation change together with the Node's
    `resourceVersion`. If two leaders overlap for a moment, only one write
    succeeds, so a node never gets two different requests.
@@ -553,8 +680,13 @@ The service reads its settings from a ConfigMap:
 | Check interval | 1 hour | How often each node is checked. |
 | Status deadline | 5 minutes | How long to wait for a status before writing a request again. |
 | Step deadline | 1 hour | How long `stage` or `finalize` may stay `InProgress` before the service holds the node. |
-| Drain deadline | 30 minutes | How long the drain may take. It must be shorter than the Nebraska group's update timeout. |
+| Drain deadline | 30 minutes | How long one drain may take before the node's update pauses (section 9.1). |
+| Release deadline | 1 hour | How long after Nebraska's grant a node may take to reach `finalize`. After that, the service releases the grant (section 9.1). |
+| Blocked nodes at once | 2 | How many nodes may be drain-blocked before the service starts no new updates. |
 | Restart deadline | 30 minutes | How long to wait for a node to come back after `finalize`. |
+| Settle time | 5 minutes | How long to wait, after the workloads a drain moved have recovered, before the next node starts. |
+| Delete `emptyDir` data | off | Whether the drain may move pods that keep data in `emptyDir` volumes, losing the data (`kubectl drain --delete-emptydir-data`). |
+| Move pods with no controller | off | Whether the drain may evict pods that nothing would create again (`kubectl drain --force`). |
 
 The annotation prefix is fixed: `acl-update.unbounded-cloud.io`.
 `trident-acl-agent` on each node must use the same prefix (section 15).
@@ -571,25 +703,30 @@ The annotation prefix is fixed: `acl-update.unbounded-cloud.io`.
 | `acl-update.unbounded-cloud.io/update-status` | annotation | the agent | The result of a request (Trident's contract). |
 | `acl-update.unbounded-cloud.io/update-commit-status` | annotation | the agent | The result after the restart (Trident's contract). |
 | `acl-update.unbounded-cloud.io/agent-info` | annotation | the agent, or the temporary DaemonSet | The node's instance ID and version (section 6). |
-| `acl-update.unbounded-cloud.io/state` | annotation | the service | The node's update, whether the service cordoned it, and why it's held, if it is. |
+| `acl-update.unbounded-cloud.io/state` | annotation | the service | The node's update, when Nebraska granted it, whether the service cordoned the node, and why it's drain-blocked or held, if it is. |
 
-An example `state`:
+An example `state`, for a node whose drain is blocked:
 
 ```json
 {
-  "phase": "Held",
+  "phase": "DrainBlocked",
   "nodeUpdateId": "550e8400-e29b-41d4-a716-446655440000",
   "targetVersion": "20261106.1.0",
+  "grantedAt": "2026-11-18T10:02:00Z",
   "cordoned": false,
-  "reason": "commit reported Success, but the node runs 20261105.1.0",
+  "reason": "evicting default/db-0 would break PodDisruptionBudget default/db",
   "since": "2026-11-18T10:42:00Z"
 }
 ```
 
 ## 14. Permissions and safety
 
-1. The service's account can get, list, watch, and patch Nodes, list Pods,
-   evict Pods, create Events, and use a Lease for leader election.
+1. The service's account can:
+   - get, list, watch, and patch Nodes;
+   - list Pods, and evict them, including dry-run evictions;
+   - get DaemonSets, ReplicaSets, Deployments, and StatefulSets, to apply the
+     drain rules and to see when moved workloads have recovered;
+   - create Events, and use a Lease for leader election.
 2. Patching Nodes is a broad permission, so two admission policies narrow what
    can be written:
    1. The service's account may change only the `update-request` and `state`
@@ -599,8 +736,10 @@ An example `state`:
    2. The DaemonSet's account may change only `agent-info`, and only on its own
       Node. The policy checks the node name and UID in the pod's token, as
       `unbounded-net-node`'s policy does (`deploy/net/controller/09-vap.yaml.tmpl`).
-3. Evictions go through Kubernetes' eviction API, so PodDisruptionBudgets
-   always apply. The service never deletes pods directly.
+3. Every pod the drain moves goes through Kubernetes' eviction API, so
+   PodDisruptionBudgets always apply. That includes pods with no controller
+   when the setting allows them, as with `kubectl drain --force`. The service
+   never deletes pods directly.
 4. The agent writes its statuses and `agent-info` with the node's own
    credentials, which can only change the node's own Node object.
 5. The agent only accepts an `https` Nebraska URL, and only `https` or `oci`
@@ -618,8 +757,11 @@ An example `state`:
    (`crates/trident-acl-agent/src/annotations/orchestrator.rs`, the
    `"Nebraska query failed"` error). The service makes this rare, since it only
    asks for `stage` after a grant, but it shouldn't happen at all.
-3. Possibly, a `cancel` operation that discards a staged update and tells
-   Nebraska the update failed. It depends on how we answer section 17.1.
+3. Confirm that the recovery the service uses to release a grant is intended,
+   and will stay: a new `stage` request while an update is in progress makes
+   the agent tell Nebraska the update failed (section 9.1). It is in the code,
+   with a comment saying why, but not in the contract's documentation. No code
+   change is needed.
 4. Fix microsoft/trident#956: a fallback to the old copy is reported as a
    successful commit.
 5. Fix microsoft/trident#957: a request the agent can't parse gets no status.
@@ -633,6 +775,8 @@ An example `state`:
 2. Make the host's `/etc/machine-id` and `/etc/os-release` readable inside the
    nspawn machine, for the temporary DaemonSet.
 3. Set the `managed` label when the node joins, if we choose to.
+4. Turn on kubelet's graceful node shutdown, once we've confirmed it works with
+   kubelet inside the nspawn machine (section 9.1).
 
 **ACL images:**
 
@@ -646,16 +790,21 @@ An example `state`:
    image's checksum from a label by default.
 2. Keep every server behind the URL on one database, so the service's grant
    and the agent's update check are seen by the same Nebraska.
-3. Set each group's update timeout longer than an update can take (section 7.3).
+3. Set each group's update timeout longer than the release deadline plus the
+   restart deadline (section 7.3).
 
 ## 16. Testing
 
 1. Unit tests:
    - the state machine, with a fake Kubernetes client and a fake Nebraska;
-   - counting places: nodes that are updating, not Ready, or cordoned by
-     someone else, and no places while a node is held;
-   - the drain: evictions a PodDisruptionBudget refuses, and the drain
-     deadline;
+   - counting places: nodes that are updating, recovering, not Ready, or
+     cordoned by someone else, and no places while a node is held or too many
+     are drain-blocked;
+   - the drain check and the drain: static, DaemonSet, `emptyDir`, and
+     no-controller pods with each setting, evictions a PodDisruptionBudget
+     refuses, and the drain deadline;
+   - a blocked drain: retrying, finalizing the same update, and releasing the
+     grant at the release deadline;
    - the request format, against the JSON schemas in Trident's
      `annotations/protocol.rs`;
    - the instance ID: `/etc/machine-id` `34a267d412544d6a9e97b5ba6762f6e7`
@@ -663,83 +812,24 @@ An example `state`:
    - the admission policies' rules, as
      `internal/operator/components/net/vap_test.go` tests unbounded-net's.
 2. The AKSFlexNode harness: its test Nebraska and annotation scenarios, with
-   the service running against the harness's cluster.
+   the service running against the harness's cluster. The harness's nodes run
+   kubelet inside an nspawn machine, so it also checks:
+   - a staged update survives a pause, a restart of the agent, and an
+     unrelated restart of the node, and then finalizes;
+   - graceful node shutdown with kubelet inside the nspawn machine.
 3. Unbounded's ACL end-to-end tests (`agent-e2e-kind`, host `acl`), with
    several ACL nodes and a workload with a PodDisruptionBudget, to show that
    only one node is out of service at a time and the workload keeps running.
-4. A real Nebraska, to confirm that the agent's update check after the
-   service's gets the same grant, and that no extra instances appear. Trident's
-   own tests run a real Nebraska the same way (`tools/storm/aclagent`).
+4. A real Nebraska, to confirm:
+   - the agent's update check after the service's gets the same grant, and no
+     extra instances appear;
+   - releasing a grant with a new `stage` request makes Nebraska record the
+     update as failed, not timed out, and a later update succeeds.
 
-## 17. Questions to answer before building this
+   Trident's own tests run a real Nebraska the same way
+   (`tools/storm/aclagent`).
 
-Limiting updates and moving workloads first raise two questions we don't have
-answers to yet. Both need an answer before implementation starts.
-
-### 17.1 A drain that never finishes
-
-What happens:
-
-1. A node takes a place, Nebraska grants it version V, and it stages V.
-2. The service starts the drain, but a PodDisruptionBudget keeps refusing an
-   eviction. For example, an application with one replica and a budget of
-   "keep 1 running".
-3. The service can't restart the node without moving that pod, and Trident's
-   contract has no way to cancel a staged update.
-4. Nebraska's grant stays open until the group's update timeout, then counts
-   as timed out. In safe mode, enough timeouts turn updates off for the whole
-   group, in every cluster that uses it.
-
-Possible answers, none chosen yet:
-
-1. **A drain deadline.** Keep it shorter than the group's update timeout. At
-   the deadline, uncordon the node and hold it (the current text of this
-   design). This is simple, but the grant still ends as a timeout in Nebraska.
-2. **A `cancel` operation in `trident-acl-agent`.** It discards the staged
-   update and tells Nebraska the update failed, which closes the grant cleanly.
-   This needs the Trident team.
-3. **Check that the node can be drained before its update check.** Ask
-   Kubernetes whether each pod on the node could be evicted now (a dry-run
-   eviction), and skip the node if one couldn't. This makes blocked drains
-   rare, but not impossible, since things can change before the drain starts.
-4. **Drain before the update check.** No grant is open while the drain waits.
-   But it moves workloads off every node it checks, even when there's no
-   update, so it disrupts the cluster every interval.
-
-### 17.2 Workloads a drain doesn't protect
-
-What happens:
-
-1. A drain moves pods one at a time and respects their budgets. But an
-   application with one replica is still down while its pod starts again on
-   another node.
-2. Some pods can't be moved:
-   - Pods with no controller. Nothing creates them again elsewhere.
-   - DaemonSet pods. They run on every node, so they stop with the node.
-   - Pods that keep data in `emptyDir` volumes, scratch space on the node. The
-     data is lost when they move.
-3. Pods still on the node when it restarts stop without warning, unless
-   kubelet's graceful node shutdown works inside the nspawn machine. That
-   hasn't been checked yet.
-4. Without a drain, Kubernetes moves pods off a node only after it has been
-   unreachable for 5 minutes, by default. A restart is often shorter, so the
-   pods would wait for the node and come back on it. That's why the drain is
-   in the first version.
-
-Possible answers, none chosen yet:
-
-1. **Follow `kubectl drain`'s rules.** Skip DaemonSet pods. Refuse to drain a
-   node with pods that have no controller, or that keep `emptyDir` data, unless
-   a setting allows it. Such a node then behaves like a blocked drain
-   (section 17.1).
-2. **Evict every pod except DaemonSet pods and static pods** (the current text
-   of this design), and accept losing unmanaged pods and `emptyDir` data.
-3. **Turn on graceful node shutdown** inside the nspawn machine, once it's
-   confirmed to work, so the pods that stay on the node stop cleanly.
-4. **Ask applications to set PodDisruptionBudgets,** and document that an
-   application with one replica sees a short outage on each update.
-
-## 18. Other open questions
+## 17. Open questions
 
 1. **HostUpgrade.** [host-upgrade.md](host-upgrade.md) proposes driving Trident
    from Unbounded's host agent instead. Both can't drive the same node. Should
@@ -752,31 +842,46 @@ Possible answers, none chosen yet:
 3. **ACL's version.** Which os-release key will carry the per-build version?
 4. **The host's os-release.** Does `systemd-nspawn` on ACL already show it at
    `/run/host/os-release`?
-5. **The `managed` label.** Should Unbounded set it when the node joins, or
+5. **Graceful node shutdown.** Does it work with kubelet inside the nspawn
+   machine?
+6. **The `managed` label.** Should Unbounded set it when the node joins, or
    should administrators?
-6. **Later versions.** Separate limits per node pool or zone, and maintenance
+7. **Later versions.** Separate limits per node pool or zone, and maintenance
    windows: in this service, or in a shared rollout controller?
 
-## 19. Other approaches we considered
+## 18. Other approaches we considered
 
 1. **Letting Nebraska alone limit updates.** Its limits are shared by every
    cluster that uses a track, can be set loosely, and know nothing about
    workloads. A cluster could lose all its nodes at once.
 2. **Taking a place after the grant.** Granted nodes would wait for places with
    their grants open, and those grants would time out.
-3. **A DaemonSet that checks for its own node.** It could read the host's files
+3. **Draining before the update check.** No grant would be open while a drain
+   waits. But it would move workloads off every node it checks, even when
+   there's no update.
+4. **A `cancel` operation in `trident-acl-agent`.** Not needed: the agent's
+   existing recovery releases a grant (section 9.1).
+5. **Forcing pods off after a deadline, ignoring their budgets.** It breaks the
+   promise a PodDisruptionBudget makes to its application.
+6. **Annotations from other tools to protect pods.** It would tie the service
+   to those tools. PodDisruptionBudgets are Kubernetes' own way for an
+   application to say how many of its pods may be moved.
+7. **Running the `kubectl` binary for drains.** It behaves the same, but the
+   service would parse text output and ship a second binary. The Go package
+   gives the same rules with structured results.
+8. **A DaemonSet that checks for its own node.** It could read the host's files
    directly. But a pod restarts with its node, so it can't notice a node that
    doesn't come back. Each pod would need its own narrow permissions, and
    decisions about the whole cluster, such as places and draining, would have
    nowhere to live.
-4. **An instance ID made up by the service.** Nebraska would count every node
+9. **An instance ID made up by the service.** Nebraska would count every node
    twice. The made-up instance's grants would never finish, and in safe mode
    their timeouts can turn updates off for the group.
-5. **Reading the group's version from Nebraska's admin API.** Only the agent's
-   update check would then ask for the update. But the admin API needs a login,
-   and when Nebraska refuses an update, the agent currently exits instead of
-   reporting it (section 15).
-6. **A fixed target version in the cluster's settings.** This is simple, and is
-   how Trident's example works (a track named `pin-<version>`). But someone has
-   to change the setting for every release.
-7. **Using `VERSION_ID` as the version.** Several builds can share it.
+10. **Reading the group's version from Nebraska's admin API.** Only the agent's
+    update check would then ask for the update. But the admin API needs a
+    login, and when Nebraska refuses an update, the agent currently exits
+    instead of reporting it (section 15).
+11. **A fixed target version in the cluster's settings.** This is simple, and
+    is how Trident's example works (a track named `pin-<version>`). But someone
+    has to change the setting for every release.
+12. **Using `VERSION_ID` as the version.** Several builds can share it.
