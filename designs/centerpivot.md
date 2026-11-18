@@ -149,7 +149,8 @@ flowchart TB
 1. **`centerpivot`** is an operator component, enabled per Site
    through `Site.Spec.Components`, like token-refresher. It runs as a
    Deployment in `unbounded-system` with two replicas, one active through
-   leader election, and reads its settings from the Site.
+   leader election, on nodes it doesn't update, and reads its settings from
+   the Site.
 2. **`trident-acl-agent`** ships with ACL and runs on each host. Unbounded's
    host agent configures it (section 5).
 3. **`centerpivot-node-info`** is a temporary DaemonSet (section 4.3).
@@ -352,7 +353,8 @@ For applications, this means:
    elsewhere, once per update of its node.
 2. Pods with `emptyDir` data or no controller keep their node from updating
    until an administrator turns on the matching setting, and so does a budget
-   that never allows an eviction. The Site's condition and an Event name them.
+   that never allows an eviction. An Event on the Node, and the reason in the
+   Machine's `state`, name them.
 
 ### 4.7 Ending a grant
 
@@ -412,9 +414,11 @@ offer the same version again.
 The agent reports a failed boot to Nebraska, so Nebraska's own safe mode and
 statistics see it across clusters. The service never sends events to Nebraska.
 
-To make a stop visible, the component's condition on the Site says why new
-updates aren't starting, and the service exports metrics: nodes per version,
-updates under way, held nodes, and the reason updates are blocked.
+To make a stop visible, the component's `CenterPivotReady` condition on each
+Site turns false with reason `UpdatesHeld`, naming a held node and why, and the
+service exports metrics: nodes per version (`centerpivot_nodes`), updates under
+way (`centerpivot_updating_nodes`), held nodes (`centerpivot_held_nodes`), and
+the reason updates are blocked (`centerpivot_updates_blocked`).
 
 ### 4.10 Restarts, rebuilds, and other maintenance
 
@@ -519,22 +523,28 @@ readable by anyone who can read Node annotations or the Site.
 
 ### Settings
 
-From the component's spec on the Site:
+From the Site's `spec.components.centerPivot`. The component is off unless
+`enabled` is `true`, and then needs `nebraskaURL` and `appID`.
 
-| Setting | Default | Meaning |
+| Field | Default | Meaning |
 |---|---|---|
-| Nebraska URL, app ID, CA certificates | none, none, the image's | Where to check, and whom to trust. |
-| Default track | none | The track for nodes without a track label. |
-| `maxUnavailable` | 1 | Update slots per Site: a number or a percentage. |
-| Check interval | 1 hour | How often each node is checked. |
-| Nebraska update timeout | 2 hours | Must match each group's update timeout (section 4.8). |
-| Status deadline | 5 minutes | How long to wait for a status before writing a request again. |
-| Drain deadline | 30 minutes | How long one drain may take. |
-| Restart deadline | 30 minutes | How long a node has to come back after `finalize`. |
-| Recovery deadline | 30 minutes | How long moved workloads have to recover. |
-| Settle time | 5 minutes | How long to wait after they recover. |
-| Delete `emptyDir` data | off | `kubectl drain --delete-emptydir-data` |
-| Move pods with no controller | off | `kubectl drain --force` |
+| `nebraskaURL`, `appID` | none | Where to check. The URL must be `https`. |
+| `caConfigMap` | the image's certificates | A ConfigMap in Unbounded's namespace whose `ca.crt` signs Nebraska's certificate. |
+| `defaultTrack` | none | The track for nodes without a track label. |
+| `maxUnavailable` | 1 | Update slots per Site: a number, or a percentage of its managed nodes that gives at least 1. `0` stops updates. |
+| `checkInterval` | 1 hour | How often each node is checked. |
+| `updateTimeout` | 2 hours | Must match each group's update timeout (section 4.8). |
+| `statusDeadline` | 5 minutes | How long to wait for a status before writing a request again. |
+| `drainDeadline` | 30 minutes | How long one drain may take. |
+| `restartDeadline` | 30 minutes | How long a node has to come back after `finalize`. |
+| `recoveryDeadline` | 30 minutes | How long moved workloads have to recover. |
+| `settleTime` | 5 minutes | How long to wait after they recover. |
+| `deleteEmptyDirData` | off | `kubectl drain --delete-emptydir-data` |
+| `movePodsWithNoController` | off | `kubectl drain --force` |
+
+The DaemonSet reads the version from the os-release key in its
+`--version-key` argument, `VERSION_ID` by default, which a workload override
+can change to match the agent's setting.
 
 ### Labels, taints, and annotations
 
@@ -550,24 +560,42 @@ From the component's spec on the Site:
 | `centerpivot.unbounded-cloud.io/agent-info` | Node annotation | the agent, or the temporary DaemonSet | Section 4.3 |
 | `centerpivot.unbounded-cloud.io/state` | Machine annotation | the service | The node's state (section 4.5) |
 
-An example `state`:
+An example `state`, with the request the agent is carrying out:
 
 ```json
 {
   "phase": "Restarting",
-  "nodeUpdateId": "550e8400-e29b-41d4-a716-446655440000",
+  "since": "2026-11-18T10:31:00Z",
+  "lastCheck": "2026-11-18T10:02:00Z",
+  "nodeUid": "6f1c0a52-8d3e-4b7a-9c61-2f4e8a9b1d07",
   "targetVersion": "20261106.1.0",
+  "attempts": 1,
   "grantedAt": "2026-11-18T10:02:00Z",
-  "attempts": 1
+  "request": {
+    "schemaVersion": "1.0",
+    "nodeUpdateId": "550e8400-e29b-41d4-a716-446655440000",
+    "operationId": "c9d6f0a2-3b41-4e8d-9f27-1a5b6c7d8e90",
+    "operation": "finalize",
+    "targetVersion": "20261106.1.0",
+    "server": "https://nebraska.example.com/v1/update",
+    "appId": "11111111-2222-3333-4444-555555555555",
+    "track": "stable"
+  },
+  "requestedAt": "2026-11-18T10:29:00Z",
+  "writes": 1,
+  "workloads": [
+    {"kind": "Deployment", "namespace": "shop", "name": "web", "available": 3}
+  ]
 }
 ```
 
 ### Permissions
 
 1. The service's account can get, list, watch, and patch Nodes and Machines;
-   list and watch MachineOperations; list Pods and evict them, including dry-run
-   evictions; get DaemonSets, ReplicaSets, Deployments, and StatefulSets; create
-   Events; and use a Lease.
+   list and watch Sites and MachineOperations; list Pods and evict them,
+   including dry-run evictions; get DaemonSets, ReplicaSets, Deployments, and
+   StatefulSets; create Events; get ConfigMaps and use a Lease in its own
+   namespace. The DaemonSet's account can get and patch Nodes.
 2. Admission policies narrow what can be written:
    1. The service's account may change only its taint and `update-request` on
       Nodes, and `state` on Machines. A request must name the configured
