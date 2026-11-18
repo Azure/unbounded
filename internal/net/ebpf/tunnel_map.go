@@ -443,15 +443,23 @@ func (tm *TunnelMap) SetPeerHealth(peerName string, healthy bool) int {
 			klog.Warningf("eBPF SetPeerHealth %s: %v", cidrStr, err)
 
 			cached, exists := tm.lastResolved[cidrStr]
-			if healthy || !exists {
+			if !exists {
 				continue
 			}
 
 			resolved.Nexthops = slices.Clone(cached.Nexthops)
+			changed := false
+
 			for i := range resolved.Nexthops {
-				if resolved.Nexthops[i].PeerName == peerName {
-					resolved.Nexthops[i].Healthy = false
+				nh := &resolved.Nexthops[i]
+				if nh.PeerName == peerName && (!healthy || nh.Protocol != TunnelProtoNone) {
+					nh.Healthy = healthy
+					changed = true
 				}
+			}
+
+			if !changed {
+				continue
 			}
 		}
 

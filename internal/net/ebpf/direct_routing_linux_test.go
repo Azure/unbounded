@@ -293,12 +293,38 @@ func TestNoneProtocolNativeNeighborResolution(t *testing.T) {
 					t.Fatal(err)
 				}
 
-				var endpoint tunnelEndpointC
-				if err := tunnelMap.endpoints.Lookup(key, &endpoint); err != nil || endpoint.Count != 2 ||
-					endpoint.Nexthops[0].Protocol != TunnelProtoWireGuard || endpoint.Nexthops[0].Healthy != 1 ||
-					endpoint.Nexthops[1].Protocol != TunnelProtoNone || endpoint.Nexthops[1].Healthy != 0 {
-					t.Fatalf("underlay loss retained a withdrawn native path or lost its healthy fallback: %v, %+v", err, endpoint)
+				assertHealth := func(wantFallback uint32) {
+					t.Helper()
+
+					var endpoint tunnelEndpointC
+					if err := tunnelMap.endpoints.Lookup(key, &endpoint); err != nil || endpoint.Count != 2 {
+						t.Fatalf("read native and fallback paths: %v, %+v", err, endpoint)
+					}
+
+					native, fallback := endpoint.Nexthops[0], endpoint.Nexthops[1]
+					if native.Protocol == TunnelProtoWireGuard {
+						native, fallback = fallback, native
+					}
+
+					if native.Protocol != TunnelProtoNone || native.Healthy != 0 ||
+						fallback.Protocol != TunnelProtoWireGuard || fallback.Healthy != wantFallback {
+						t.Fatalf("incorrect health after native interface loss: %+v", endpoint)
+					}
 				}
+
+				assertHealth(1)
+
+				if tunnelMap.SetPeerHealth("fallback", false) != 1 {
+					t.Fatal("underlay loss blocked fallback health withdrawal")
+				}
+
+				assertHealth(0)
+
+				if tunnelMap.SetPeerHealth("fallback", true) != 1 {
+					t.Fatal("unresolved native path blocked recovered WireGuard fallback")
+				}
+
+				assertHealth(1)
 			}
 
 			if err := tunnelMap.DeleteEndpoint(prefix); err != nil {
