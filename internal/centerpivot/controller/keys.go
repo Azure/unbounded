@@ -19,7 +19,9 @@ const Prefix = "centerpivot.unbounded-cloud.io"
 const (
 	// ManagedLabel marks a node centerpivot updates, when "true".
 	ManagedLabel = Prefix + "/managed"
-	// TrackLabel is the node's Nebraska track, instead of the Site's default.
+	// AppLabel names the Site app the node runs, when the Site has several.
+	AppLabel = Prefix + "/app"
+	// TrackLabel is the node's Nebraska track, instead of its app's default.
 	TrackLabel = Prefix + "/track"
 	// CanaryLabel puts a node first among those due, when "true".
 	CanaryLabel = Prefix + "/canary"

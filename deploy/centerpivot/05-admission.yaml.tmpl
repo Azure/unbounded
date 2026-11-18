@@ -3,9 +3,9 @@
 # later Kubernetes versions are protected too.
 ---
 # centerpivot may change only its updating taint and the update request on
-# Nodes, and a request may name only the Nebraska URL and app ID of a Site that
-# enables it. The operator sets allowedSources from the Sites: one pair of JSON
-# fragments, "server":<url> and "appId":<id>, per Site. The request's JSON is
+# Nodes, and a request may name only the Nebraska URL and one of the app IDs of
+# a Site that enables it. The operator sets allowedSources from the Sites: one
+# pair of JSON fragments, "server":<url> and "appId":<id>, per app. The request's JSON is
 # written without spaces, and the agent rejects duplicate fields, so a
 # fragment can only match the field it names.
 apiVersion: admissionregistration.k8s.io/v1
@@ -55,7 +55,7 @@ spec:
         variables.allowedSources.exists(s,
           object.metadata.annotations['centerpivot.unbounded-cloud.io/update-request'].contains(s[0]) &&
           object.metadata.annotations['centerpivot.unbounded-cloud.io/update-request'].contains(s[1]))
-      message: "centerpivot may only name the Nebraska URL and app ID of a Site that enables it"
+      message: "centerpivot may only name the Nebraska URL and an app ID of a Site that enables it"
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding

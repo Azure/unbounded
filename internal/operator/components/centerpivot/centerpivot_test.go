@@ -33,7 +33,7 @@ func site(name string, enabled bool) unboundedv1alpha3.Site {
 			CenterPivot: &unboundedv1alpha3.CenterPivotComponentSpec{
 				SiteComponentSpec: unboundedv1alpha3.SiteComponentSpec{Enabled: ptr.To(enabled)},
 				NebraskaURL:       server,
-				AppID:             appID,
+				Apps:              []unboundedv1alpha3.CenterPivotApp{{Name: "acl", AppID: appID}},
 			},
 		}},
 	}

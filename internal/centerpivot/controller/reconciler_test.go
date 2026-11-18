@@ -66,10 +66,7 @@ func (h *harness) reconcile() State {
 func (h *harness) node() *corev1.Node {
 	h.t.Helper()
 
-	var node corev1.Node
-	require.NoError(h.t, h.client.Get(h.t.Context(), client.ObjectKey{Name: "acl-1"}, &node))
-
-	return &node
+	return nodeOf(h.t, h.client, "acl-1")
 }
 
 func (h *harness) request() contract.Request {
@@ -451,4 +448,47 @@ func TestANodeNeverGivenASlotKeepsNoState(t *testing.T) {
 	_, err := r.Reconcile(t.Context(), reconcile.Request{NamespacedName: types.NamespacedName{Name: "acl-1"}})
 	require.NoError(t, err)
 	assert.NotContains(t, machineOf(t, c, "acl-1").Annotations, StateAnnotation)
+}
+
+func TestTheNodesAppLabelChoosesItsApp(t *testing.T) {
+	t.Parallel()
+
+	site := testSite("edge", nil)
+	site.Spec.Components.CenterPivot.Apps = append(site.Spec.Components.CenterPivot.Apps,
+		unboundedv1alpha3.CenterPivotApp{Name: "acl-nvidia", AppID: nvidiaApp, DefaultTrack: "gpu-stable"})
+
+	gpu := testNode(t, "gpu-1", "edge", running)
+	gpu.Labels[AppLabel] = "acl-nvidia"
+
+	c := testClient(t, site,
+		gpu, testMachine(t, "gpu-1", &State{Phase: PhaseChecking}),
+		testNode(t, "unlabeled", "edge", running), testMachine(t, "unlabeled", &State{Phase: PhaseChecking}))
+	nebraska := &fakeNebraska{result: omaha.Result{Kind: omaha.Granted, Version: newer}}
+	r := &Reconciler{Client: c, Reader: c, Nebraska: nebraska, Drainer: &fakeDrainer{}, Clock: clocktesting.NewFakePassiveClock(start)}
+
+	for _, name := range []string{"gpu-1", "unlabeled"} {
+		_, err := r.Reconcile(t.Context(), reconcile.Request{NamespacedName: types.NamespacedName{Name: name}})
+		require.NoError(t, err)
+	}
+
+	require.Len(t, nebraska.checks, 1, "only the labeled node is checked")
+	assert.Equal(t, nvidiaApp, nebraska.checks[0].AppID)
+	assert.Equal(t, "gpu-stable", nebraska.checks[0].Track, "the app's default track")
+
+	var request contract.Request
+	require.NoError(t, json.Unmarshal([]byte(nodeOf(t, c, "gpu-1").Annotations[Keys.Request]), &request))
+	assert.Equal(t, nvidiaApp, request.AppID)
+
+	state := stateOf(t, c, "unlabeled")
+	assert.Equal(t, PhaseIdle, state.Phase)
+	assert.Contains(t, state.Reason, "the Site has 2 apps")
+}
+
+func nodeOf(t *testing.T, c client.Client, name string) *corev1.Node {
+	t.Helper()
+
+	var node corev1.Node
+	require.NoError(t, c.Get(t.Context(), client.ObjectKey{Name: name}, &node))
+
+	return &node
 }

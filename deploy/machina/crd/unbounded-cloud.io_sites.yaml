@@ -91,10 +91,44 @@ spec:
                       Nebraska. It is disabled unless enabled is true. See
                       designs/centerpivot.md.
                     properties:
-                      appID:
-                        description: AppID is the Nebraska application the nodes run.
-                        minLength: 1
-                        type: string
+                      apps:
+                        description: |-
+                          Apps are the Nebraska applications the Site's nodes run, one for each
+                          image flavor, such as ACL with NVIDIA drivers and ACL with AMD
+                          drivers. A node runs the app its centerpivot.unbounded-cloud.io/app
+                          label names, or the only app, when there is one. Required when
+                          enabled.
+                        items:
+                          description: CenterPivotApp is a Nebraska application a
+                            Site's nodes may run.
+                          properties:
+                            appID:
+                              description: AppID is the app's Nebraska application
+                                ID.
+                              minLength: 1
+                              type: string
+                            defaultTrack:
+                              description: |-
+                                DefaultTrack is the Nebraska track for the app's nodes without the
+                                centerpivot.unbounded-cloud.io/track label. A node with neither isn't
+                                updated.
+                              type: string
+                            name:
+                              description: |-
+                                Name is what a node's centerpivot.unbounded-cloud.io/app label calls
+                                the app.
+                              maxLength: 63
+                              pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                              type: string
+                          required:
+                          - appID
+                          - name
+                          type: object
+                        maxItems: 32
+                        type: array
+                        x-kubernetes-list-map-keys:
+                        - name
+                        x-kubernetes-list-type: map
                       caConfigMap:
                         description: |-
                           CAConfigMap names a ConfigMap in the namespace Unbounded's components
@@ -106,11 +140,6 @@ spec:
                         description: |-
                           CheckInterval is how often each node is checked for an update. Defaults
                           to 1h.
-                        type: string
-                      defaultTrack:
-                        description: |-
-                          DefaultTrack is the track for nodes without the
-                          centerpivot.unbounded-cloud.io/track label.
                         type: string
                       deleteEmptyDirData:
                         description: |-
@@ -142,7 +171,7 @@ spec:
                       nebraskaURL:
                         description: |-
                           NebraskaURL is Nebraska's update endpoint, such as
-                          https://nebraska.example.com/v1/update.
+                          https://nebraska.example.com/v1/update. Required when enabled.
                         pattern: ^https://
                         type: string
                       recoveryDeadline:
@@ -173,10 +202,10 @@ spec:
                         type: string
                     type: object
                     x-kubernetes-validations:
-                    - message: nebraskaURL and appID are required when centerPivot
+                    - message: nebraskaURL and apps are required when centerPivot
                         is enabled
                       rule: '!has(self.enabled) || !self.enabled || (has(self.nebraskaURL)
-                        && has(self.appID))'
+                        && has(self.apps) && size(self.apps) > 0)'
                   gantry:
                     default:
                       enabled: true

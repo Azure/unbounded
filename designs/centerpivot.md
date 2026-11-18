@@ -235,8 +235,8 @@ so the service waits for it rather than reading it once.
    If not, it gives the slot back and records why. No grant was taken.
 3. **Update check.** It sends Nebraska one check as the node: the instance ID
    and version from `agent-info`, the node's architecture (`arm64` sent as
-   `aarch64`, as the agent does), and the server, app ID, and track the request
-   will name. It never sends progress events or pings. Nebraska records the
+   `aarch64`, as the agent does), and the server, the node's app ID, and the
+   track the request will name. It never sends progress events or pings. Nebraska records the
    service's IP address for the node until the agent's next check. With no
    update, or a refusal, it gives the slot back. With "update in progress", it
    ends that update (section 4.7) and gives the slot back.
@@ -416,9 +416,10 @@ statistics see it across clusters. The service never sends events to Nebraska.
 
 To make a stop visible, the component's `CenterPivotReady` condition on each
 Site turns false with reason `UpdatesHeld`, naming a held node and why, and the
-service exports metrics: nodes per version (`centerpivot_nodes`), updates under
-way (`centerpivot_updating_nodes`), held nodes (`centerpivot_held_nodes`), and
-the reason updates are blocked (`centerpivot_updates_blocked`).
+service exports metrics: nodes per app and version (`centerpivot_nodes`),
+updates under way (`centerpivot_updating_nodes`), held nodes
+(`centerpivot_held_nodes`), and the reason updates are blocked
+(`centerpivot_updates_blocked`).
 
 ### 4.10 Restarts, rebuilds, and other maintenance
 
@@ -524,13 +525,13 @@ readable by anyone who can read Node annotations or the Site.
 ### Settings
 
 From the Site's `spec.components.centerPivot`. The component is off unless
-`enabled` is `true`, and then needs `nebraskaURL` and `appID`.
+`enabled` is `true`, and then needs `nebraskaURL` and at least one app.
 
 | Field | Default | Meaning |
 |---|---|---|
-| `nebraskaURL`, `appID` | none | Where to check. The URL must be `https`. |
+| `nebraskaURL` | none | Where to check. It must be `https`. |
+| `apps` | none | The Nebraska applications the Site's nodes run, one for each image flavor, such as ACL with NVIDIA drivers and ACL with AMD drivers. Each has a `name`, an `appID`, and an optional `defaultTrack` for its nodes without a track label. A node runs the app its `app` label names, or the only app when there is one. A node whose app can't be told isn't updated. |
 | `caConfigMap` | the image's certificates | A ConfigMap in Unbounded's namespace whose `ca.crt` signs Nebraska's certificate. |
-| `defaultTrack` | none | The track for nodes without a track label. |
 | `maxUnavailable` | 1 | Update slots per Site: a number, or a percentage of its managed nodes that gives at least 1. `0` stops updates. |
 | `checkInterval` | 1 hour | How often each node is checked. |
 | `updateTimeout` | 2 hours | Must match each group's update timeout (section 4.8). |
@@ -551,7 +552,8 @@ can change to match the agent's setting.
 | Key | On | Written by | Meaning |
 |---|---|---|---|
 | `centerpivot.unbounded-cloud.io/managed` | Node label | MachineConfiguration `nodeLabels` | The service updates this node. |
-| `centerpivot.unbounded-cloud.io/track` | Node label | MachineConfiguration `nodeLabels` | The node's track, instead of the default. |
+| `centerpivot.unbounded-cloud.io/app` | Node label | MachineConfiguration `nodeLabels` | The Site app the node runs, when the Site has several. |
+| `centerpivot.unbounded-cloud.io/track` | Node label | MachineConfiguration `nodeLabels` | The node's track, instead of its app's default. |
 | `centerpivot.unbounded-cloud.io/canary` | Node label | MachineConfiguration `nodeLabels` | The node goes first among due nodes. |
 | `centerpivot.unbounded-cloud.io/paused` | Node label | an administrator | Start no new updates on this node. |
 | `centerpivot.unbounded-cloud.io/updating` | Node taint (`NoSchedule`) | the service | The node is being drained or updated. |
@@ -598,8 +600,8 @@ An example `state`, with the request the agent is carrying out:
    namespace. The DaemonSet's account can get and patch Nodes.
 2. Admission policies narrow what can be written:
    1. The service's account may change only its taint and `update-request` on
-      Nodes, and `state` on Machines. A request must name the configured
-      Nebraska URL and app ID.
+      Nodes, and `state` on Machines. A request must name the Nebraska URL and
+      one of the app IDs of a Site that enables the service.
    2. The DaemonSet's account may change only `agent-info`, on its own Node,
       checked with the node name and UID in the pod's token, as
       `unbounded-net-node`'s policy does (`deploy/net/controller/09-vap.yaml.tmpl`).

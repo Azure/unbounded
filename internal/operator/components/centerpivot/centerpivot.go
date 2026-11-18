@@ -54,11 +54,11 @@ func (Component) Name() string          { return name }
 func (Component) ConditionType() string { return "CenterPivotReady" }
 
 // EnabledFor reports whether the Site enables centerpivot, with the Nebraska
-// URL and app ID it needs. It is off unless enabled is true.
+// URL and apps it needs. It is off unless enabled is true.
 func EnabledFor(site *unboundedv1alpha3.Site) bool {
 	spec := site.Spec.Components.CenterPivot
 
-	return spec != nil && unboundedv1alpha3.ComponentEnabled(&spec.SiteComponentSpec) && spec.NebraskaURL != "" && spec.AppID != ""
+	return spec != nil && unboundedv1alpha3.ComponentEnabled(&spec.SiteComponentSpec) && spec.NebraskaURL != "" && len(spec.Apps) > 0
 }
 
 // Plan applies the singleton while any Site enables it, and removes every
@@ -67,8 +67,13 @@ func (c Component) Plan(ctx context.Context, env *component.Env, sites []unbound
 	var sources [][2]string
 
 	for i := range sites {
-		if EnabledFor(&sites[i]) {
-			source, err := allowedSource(sites[i].Spec.Components.CenterPivot)
+		if !EnabledFor(&sites[i]) {
+			continue
+		}
+
+		spec := sites[i].Spec.Components.CenterPivot
+		for _, app := range spec.Apps {
+			source, err := allowedSource(spec.NebraskaURL, app.AppID)
 			if err != nil {
 				return nil, component.Result{}, err
 			}
@@ -163,14 +168,15 @@ func (c Component) installPlan(env *component.Env, sources [][2]string) (*compon
 }
 
 // allowedSource returns the JSON fragments that name a Site's Nebraska URL
-// and app ID in an update request, written as the service writes them.
-func allowedSource(spec *unboundedv1alpha3.CenterPivotComponentSpec) ([2]string, error) {
-	server, err := json.Marshal(spec.NebraskaURL)
+// and one of its app IDs in an update request, written as the service writes
+// them.
+func allowedSource(nebraskaURL, id string) ([2]string, error) {
+	server, err := json.Marshal(nebraskaURL)
 	if err != nil {
 		return [2]string{}, fmt.Errorf("encode Nebraska URL: %w", err)
 	}
 
-	appID, err := json.Marshal(spec.AppID)
+	appID, err := json.Marshal(id)
 	if err != nil {
 		return [2]string{}, fmt.Errorf("encode app ID: %w", err)
 	}

@@ -4,6 +4,7 @@
 package controller
 
 import (
+	"fmt"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -24,12 +25,18 @@ const (
 	DefaultSettleTime       = 5 * time.Minute
 )
 
+// App is a Nebraska application a Site's nodes may run.
+type App struct {
+	Name         string
+	AppID        string
+	DefaultTrack string
+}
+
 // Settings are one Site's centerPivot settings, with defaults filled in.
 type Settings struct {
-	Server       string
-	AppID        string
-	CAConfigMap  string
-	DefaultTrack string
+	Server      string
+	Apps        []App
+	CAConfigMap string
 
 	MaxUnavailable   intstr.IntOrString
 	CheckInterval    time.Duration
@@ -47,15 +54,13 @@ type Settings struct {
 // doesn't enable centerpivot, or doesn't name a Nebraska URL and app ID.
 func SettingsFor(site *unboundedv1alpha3.Site) (Settings, bool) {
 	spec := site.Spec.Components.CenterPivot
-	if spec == nil || !unboundedv1alpha3.ComponentEnabled(&spec.SiteComponentSpec) || spec.NebraskaURL == "" || spec.AppID == "" {
+	if spec == nil || !unboundedv1alpha3.ComponentEnabled(&spec.SiteComponentSpec) || spec.NebraskaURL == "" || len(spec.Apps) == 0 {
 		return Settings{}, false
 	}
 
 	settings := Settings{
 		Server:           spec.NebraskaURL,
-		AppID:            spec.AppID,
 		CAConfigMap:      spec.CAConfigMap,
-		DefaultTrack:     spec.DefaultTrack,
 		MaxUnavailable:   intstr.FromInt32(1),
 		CheckInterval:    duration(spec.CheckInterval, DefaultCheckInterval),
 		UpdateTimeout:    duration(spec.UpdateTimeout, DefaultUpdateTimeout),
@@ -73,7 +78,32 @@ func SettingsFor(site *unboundedv1alpha3.Site) (Settings, bool) {
 		settings.MaxUnavailable = *spec.MaxUnavailable
 	}
 
+	for _, app := range spec.Apps {
+		settings.Apps = append(settings.Apps, App{Name: app.Name, AppID: app.AppID, DefaultTrack: app.DefaultTrack})
+	}
+
 	return settings, true
+}
+
+// AppFor returns the app a node with these labels runs: the one its app label
+// names, or the Site's only app.
+func (s Settings) AppFor(labels map[string]string) (App, error) {
+	name, labeled := labels[AppLabel]
+	if !labeled {
+		if len(s.Apps) == 1 {
+			return s.Apps[0], nil
+		}
+
+		return App{}, fmt.Errorf("the node has no %s label, and the Site has %d apps", AppLabel, len(s.Apps))
+	}
+
+	for _, app := range s.Apps {
+		if app.Name == name {
+			return app, nil
+		}
+	}
+
+	return App{}, fmt.Errorf("the Site has no app %q, which the node's %s label names", name, AppLabel)
 }
 
 // Slots returns how many of managed nodes may be unavailable at once. A

@@ -28,6 +28,9 @@ import (
 const (
 	running = "202606.15.0"
 	newer   = "202606.29.0"
+
+	aclApp    = "11111111-2222-3333-4444-555555555555"
+	nvidiaApp = "22222222-2222-3333-4444-555555555555"
 )
 
 var start = time.Date(2026, 11, 18, 10, 0, 0, 0, time.UTC)
@@ -61,8 +64,7 @@ func testSite(name string, maxUnavailable *intstr.IntOrString) *unboundedv1alpha
 			CenterPivot: &unboundedv1alpha3.CenterPivotComponentSpec{
 				SiteComponentSpec: unboundedv1alpha3.SiteComponentSpec{Enabled: ptr.To(true)},
 				NebraskaURL:       "https://nebraska.example.com/v1/update",
-				AppID:             "11111111-2222-3333-4444-555555555555",
-				DefaultTrack:      "stable",
+				Apps:              []unboundedv1alpha3.CenterPivotApp{{Name: "acl", AppID: aclApp, DefaultTrack: "stable"}},
 				MaxUnavailable:    maxUnavailable,
 			},
 		}},

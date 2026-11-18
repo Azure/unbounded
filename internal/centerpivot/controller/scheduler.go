@@ -117,7 +117,8 @@ func (s *Scheduler) Schedule(ctx context.Context) error {
 		slots.managed++
 
 		if info, err := agentInfoOf(node); err == nil {
-			nodesGauge.WithLabelValues(siteName, info.CurrentVersion).Inc()
+			app, _ := slots.settings.AppFor(node.Labels) //nolint:errcheck // A node without an app is counted under none.
+			nodesGauge.WithLabelValues(siteName, app.Name, info.CurrentVersion).Inc()
 		}
 
 		if state.Phase.Updating() {

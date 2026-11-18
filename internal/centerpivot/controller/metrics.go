@@ -12,8 +12,8 @@ import (
 var (
 	nodesGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "centerpivot_nodes",
-		Help: "Managed nodes, by Site and the version their agent reports.",
-	}, []string{"site", "version"})
+		Help: "Managed nodes, by Site, app, and the version their agent reports.",
+	}, []string{"site", "app", "version"})
 	updatingGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "centerpivot_updating_nodes",
 		Help: "Nodes with an update under way, by Site and phase.",

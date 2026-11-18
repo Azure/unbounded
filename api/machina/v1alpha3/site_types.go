@@ -233,20 +233,26 @@ type TokenRefresherComponentSpec struct {
 // CenterPivotComponentSpec configures centerpivot, which updates a Site's
 // Azure Container Linux nodes from Nebraska, the update server ACL uses. It
 // updates the nodes labeled centerpivot.unbounded-cloud.io/managed=true.
-// +kubebuilder:validation:XValidation:rule="!has(self.enabled) || !self.enabled || (has(self.nebraskaURL) && has(self.appID))",message="nebraskaURL and appID are required when centerPivot is enabled"
+// +kubebuilder:validation:XValidation:rule="!has(self.enabled) || !self.enabled || (has(self.nebraskaURL) && has(self.apps) && size(self.apps) > 0)",message="nebraskaURL and apps are required when centerPivot is enabled"
 type CenterPivotComponentSpec struct {
 	SiteComponentSpec `json:",inline"`
 
 	// NebraskaURL is Nebraska's update endpoint, such as
-	// https://nebraska.example.com/v1/update.
+	// https://nebraska.example.com/v1/update. Required when enabled.
 	// +kubebuilder:validation:Pattern=`^https://`
 	// +optional
 	NebraskaURL string `json:"nebraskaURL,omitempty"`
 
-	// AppID is the Nebraska application the nodes run.
-	// +kubebuilder:validation:MinLength=1
+	// Apps are the Nebraska applications the Site's nodes run, one for each
+	// image flavor, such as ACL with NVIDIA drivers and ACL with AMD
+	// drivers. A node runs the app its centerpivot.unbounded-cloud.io/app
+	// label names, or the only app, when there is one. Required when
+	// enabled.
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:MaxItems=32
 	// +optional
-	AppID string `json:"appID,omitempty"`
+	Apps []CenterPivotApp `json:"apps,omitempty"`
 
 	// CAConfigMap names a ConfigMap in the namespace Unbounded's components
 	// run in (unbounded-system by default) whose ca.crt key holds the
@@ -254,11 +260,6 @@ type CenterPivotComponentSpec struct {
 	// when it is empty.
 	// +optional
 	CAConfigMap string `json:"caConfigMap,omitempty"`
-
-	// DefaultTrack is the track for nodes without the
-	// centerpivot.unbounded-cloud.io/track label.
-	// +optional
-	DefaultTrack string `json:"defaultTrack,omitempty"`
 
 	// MaxUnavailable is how many of the Site's managed nodes may be updating
 	// or unavailable at once: a number, or a percentage of the managed nodes.
@@ -312,6 +313,27 @@ type CenterPivotComponentSpec struct {
 	// recreates, like kubectl drain --force.
 	// +optional
 	MovePodsWithNoController bool `json:"movePodsWithNoController,omitempty"`
+}
+
+// CenterPivotApp is a Nebraska application a Site's nodes may run.
+type CenterPivotApp struct {
+	// Name is what a node's centerpivot.unbounded-cloud.io/app label calls
+	// the app.
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Required
+	Name string `json:"name"`
+
+	// AppID is the app's Nebraska application ID.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:Required
+	AppID string `json:"appID"`
+
+	// DefaultTrack is the Nebraska track for the app's nodes without the
+	// centerpivot.unbounded-cloud.io/track label. A node with neither isn't
+	// updated.
+	// +optional
+	DefaultTrack string `json:"defaultTrack,omitempty"`
 }
 
 // SiteStatus defines the observed state of Site.

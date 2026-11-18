@@ -250,7 +250,7 @@ func (r *Reconciler) checking(ctx context.Context, p *pass) (State, time.Duratio
 
 		return r.grant(p, s, check, result.Version), 0, nil
 	case omaha.InProgress:
-		if err := r.endGrant(ctx, p, check.Track); err != nil {
+		if err := r.endGrant(ctx, p, sourceOf(check)); err != nil {
 			return s, 0, err
 		}
 
@@ -279,7 +279,7 @@ func (r *Reconciler) grant(p *pass, s State, check omaha.Check, version string) 
 	r.event(p, corev1.EventTypeNormal, "UpdateGranted", fmt.Sprintf("Nebraska granted %s; staging it", version))
 
 	return s.request(PhaseStaging, p.now,
-		contract.NewRequest(contract.OperationStage, "", version, source(p.settings, check.Track)))
+		contract.NewRequest(contract.OperationStage, "", version, sourceOf(check)))
 }
 
 // staging waits for the agent to stage the version, then starts the drain.
@@ -339,7 +339,7 @@ func (r *Reconciler) draining(ctx context.Context, p *pass) (State, time.Duratio
 	}
 
 	if p.now.Sub(s.Since) > p.settings.DrainDeadline {
-		if err := r.endGrant(ctx, p, s.Request.Track); err != nil {
+		if err := r.endGrant(ctx, p, requestSource(s.Request)); err != nil {
 			return s, 0, err
 		}
 
@@ -350,7 +350,7 @@ func (r *Reconciler) draining(ctx context.Context, p *pass) (State, time.Duratio
 	}
 
 	if !p.settings.TimeLeftToRestart(s.GrantedAt, p.now) {
-		if err := r.endGrant(ctx, p, s.Request.Track); err != nil {
+		if err := r.endGrant(ctx, p, requestSource(s.Request)); err != nil {
 			return s, 0, err
 		}
 
@@ -508,7 +508,7 @@ func (r *Reconciler) rebuilt(ctx context.Context, p *pass) (State, time.Duration
 		return p.state, pollInterval, nil
 	}
 
-	if err := r.endGrant(ctx, p, p.state.Request.Track); err != nil {
+	if err := r.endGrant(ctx, p, requestSource(p.state.Request)); err != nil {
 		return p.state, 0, err
 	}
 
@@ -533,10 +533,11 @@ func waitForStatus(p *pass, keepTaint bool) State {
 	return s
 }
 
-// endGrant ends the node's open grant in Nebraska: a stage request for a
-// version other than the one it runs makes the agent tell Nebraska the
-// update in progress failed (designs/centerpivot.md, section 4.7).
-func (r *Reconciler) endGrant(ctx context.Context, p *pass, track string) error {
+// endGrant ends the node's open grant from source in Nebraska: a stage
+// request for a version other than the one it runs makes the agent tell
+// Nebraska the update in progress failed (designs/centerpivot.md, section
+// 4.7).
+func (r *Reconciler) endGrant(ctx context.Context, p *pass, source contract.Source) error {
 	if p.node == nil {
 		return nil
 	}
@@ -556,7 +557,7 @@ func (r *Reconciler) endGrant(ctx context.Context, p *pass, track string) error 
 		version = running.IncPatch().String()
 	}
 
-	request := contract.NewRequest(contract.OperationStage, "", version, source(p.settings, track))
+	request := contract.NewRequest(contract.OperationStage, "", version, source)
 	if err := r.writeRequest(ctx, p.node, request); err != nil {
 		return err
 	}
@@ -566,20 +567,25 @@ func (r *Reconciler) endGrant(ctx context.Context, p *pass, track string) error 
 	return nil
 }
 
-// checkFor returns the update check to send as the node.
+// checkFor returns the update check to send as the node, for its app.
 func (r *Reconciler) checkFor(p *pass) (omaha.Check, error) {
 	info, err := agentInfoOf(p.node)
 	if err != nil {
 		return omaha.Check{}, err
 	}
 
+	app, err := p.settings.AppFor(p.node.Labels)
+	if err != nil {
+		return omaha.Check{}, err
+	}
+
 	track := p.node.Labels[TrackLabel]
 	if track == "" {
-		track = p.settings.DefaultTrack
+		track = app.DefaultTrack
 	}
 
 	if track == "" {
-		return omaha.Check{}, errors.New("the node has no track, and the Site no default track")
+		return omaha.Check{}, fmt.Errorf("the node has no track, and app %s no default track", app.Name)
 	}
 
 	arch, err := omaha.Arch(p.node.Labels[corev1.LabelArchStable])
@@ -589,7 +595,7 @@ func (r *Reconciler) checkFor(p *pass) (omaha.Check, error) {
 
 	return omaha.Check{
 		Server:    p.settings.Server,
-		AppID:     p.settings.AppID,
+		AppID:     app.AppID,
 		Track:     track,
 		MachineID: info.MachineID,
 		Version:   info.CurrentVersion,
@@ -721,8 +727,9 @@ func agentInfoOf(node *corev1.Node) (identity.AgentInfo, error) {
 	return info, nil
 }
 
-func source(settings Settings, track string) contract.Source {
-	return contract.Source{Server: settings.Server, AppID: settings.AppID, Track: track}
+// sourceOf returns the source a request for the check's grant names.
+func sourceOf(check omaha.Check) contract.Source {
+	return contract.Source{Server: check.Server, AppID: check.AppID, Track: check.Track}
 }
 
 func requestSource(request *contract.Request) contract.Source {

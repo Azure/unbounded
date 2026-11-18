@@ -944,7 +944,9 @@ func TestOverrideKindsMatchWhatComponentsPlan(t *testing.T) {
 				CenterPivot: &unboundedv1alpha3.CenterPivotComponentSpec{
 					SiteComponentSpec: enabled(),
 					NebraskaURL:       "https://nebraska.example.com/v1/update",
-					AppID:             "11111111-2222-3333-4444-555555555555",
+					Apps: []unboundedv1alpha3.CenterPivotApp{
+						{Name: "acl", AppID: "11111111-2222-3333-4444-555555555555"},
+					},
 				},
 			},
 		},

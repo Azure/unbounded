@@ -20,6 +20,7 @@ import (
 const (
 	serviceUser  = "system:serviceaccount:unbounded-system:centerpivot"
 	nodeInfoUser = "system:serviceaccount:unbounded-system:centerpivot-node-info"
+	nvidiaAppID  = "22222222-2222-3333-4444-555555555555"
 )
 
 func plannedPolicy(t *testing.T, name string) *unstructured.Unstructured {
@@ -27,9 +28,13 @@ func plannedPolicy(t *testing.T, name string) *unstructured.Unstructured {
 
 	other := site("core", true)
 	other.Spec.Components.CenterPivot.NebraskaURL = "https://other.example.com/v1/update"
-	other.Spec.Components.CenterPivot.AppID = "99999999-2222-3333-4444-555555555555"
+	other.Spec.Components.CenterPivot.Apps = []unboundedv1alpha3.CenterPivotApp{{Name: "acl", AppID: "99999999-2222-3333-4444-555555555555"}}
 
-	plan, _, err := (Component{}).Plan(t.Context(), testEnv(t), []unboundedv1alpha3.Site{site("edge", true), other})
+	edge := site("edge", true)
+	edge.Spec.Components.CenterPivot.Apps = append(edge.Spec.Components.CenterPivot.Apps,
+		unboundedv1alpha3.CenterPivotApp{Name: "acl-nvidia", AppID: nvidiaAppID})
+
+	plan, _, err := (Component{}).Plan(t.Context(), testEnv(t), []unboundedv1alpha3.Site{edge, other})
 	require.NoError(t, err)
 
 	for _, op := range plan.Operations {
@@ -157,6 +162,7 @@ func TestNodePolicy(t *testing.T) {
 		{name: "its taint with another effect", before: node(info), after: node(info, updating("NoExecute"))},
 		{name: "another taint", before: node(info, gpu), after: node(info)},
 		{name: "a request to an enabled Site's Nebraska", before: node(info), after: node(withRequest(request(t, server, appID))), wantAdmitted: true},
+		{name: "a request for the Site's other app", before: node(info), after: node(withRequest(request(t, server, nvidiaAppID))), wantAdmitted: true},
 		{
 			name:   "a request to the other enabled Site's Nebraska",
 			before: node(info), after: node(withRequest(request(t, "https://other.example.com/v1/update", "99999999-2222-3333-4444-555555555555"))),
