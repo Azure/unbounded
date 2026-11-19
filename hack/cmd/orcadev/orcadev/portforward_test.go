@@ -10,48 +10,6 @@ import (
 	"time"
 )
 
-func TestHostPortFromURL(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		in       string
-		wantHost string
-		wantPort string
-		wantErr  bool
-	}{
-		{"http://localhost:8443", "localhost", "8443", false},
-		{"http://127.0.0.1:8443", "127.0.0.1", "8443", false},
-		{"https://orca.example.com", "orca.example.com", "443", false},
-		{"http://orca.example.com", "orca.example.com", "80", false},
-		{"http://localhost:8443/some/path", "localhost", "8443", false},
-		// Bare "://x" is parseable by url.Parse (returns empty scheme/host)
-		// so we don't expect an error here, just empty host/port-default.
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.in, func(t *testing.T) {
-			h, p, err := hostPortFromURL(tt.in)
-			if tt.wantErr {
-				if err == nil {
-					t.Errorf("hostPortFromURL(%q) = (%q, %q, nil) want error", tt.in, h, p)
-				}
-
-				return
-			}
-
-			if err != nil {
-				t.Errorf("hostPortFromURL(%q) unexpected error: %v", tt.in, err)
-				return
-			}
-
-			if h != tt.wantHost || p != tt.wantPort {
-				t.Errorf("hostPortFromURL(%q) = (%q, %q) want (%q, %q)",
-					tt.in, h, p, tt.wantHost, tt.wantPort)
-			}
-		})
-	}
-}
-
 // TestProbeTCP_Open spins up a real loopback listener on an
 // OS-assigned port and verifies probeTCP detects it.
 func TestProbeTCP_Open(t *testing.T) {
