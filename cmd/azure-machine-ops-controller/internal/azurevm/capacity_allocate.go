@@ -176,15 +176,16 @@ func parseAllocateHandle(token string) (allocateHandle, error) {
 //
 // It returns a PermanentError only before the VM create is sent, when it
 // cannot have created anything: for input it rejects, a conflicting resource,
-// or a read Azure refuses for the credential (see beforeCreate). A create that Azure definitively refuses
-// (see classifyCreateRejection) returns a handle that records the refusal,
-// and PollAllocate reports the failure after it confirmed that nothing
-// exists. Only a response that leaves the outcome open, such as throttling, a
-// server error or a conflict with an operation in progress, is returned as a
-// retryable error. The engine treats a
-// PermanentError from a replayed Begin as unknown ownership, so reporting the
-// refusal through Poll keeps an out-of-capacity or quota failure that follows
-// a retried Begin a clean, releasable failure.
+// a credential that cannot be built, or a read Azure refuses for the
+// credential (see authFailed and beforeCreate). A create that Azure
+// definitively refuses (see classifyCreateRejection) returns a handle that
+// records the refusal, and PollAllocate reports the failure after it confirmed
+// that nothing exists. Only a response that leaves the outcome open, such as
+// throttling, a server error or a conflict with an operation in progress, is
+// returned as a retryable error. The engine treats a PermanentError from a
+// replayed Begin as unknown ownership, so reporting the refusal through Poll
+// keeps an out-of-capacity or quota failure that follows a retried Begin a
+// clean, releasable failure.
 func (p *Provider) BeginAllocate(ctx context.Context, request machineops.OperationRequest) (machineops.BeginResult, error) {
 	target, err := allocationTarget(request)
 	if err != nil {
@@ -198,7 +199,9 @@ func (p *Provider) BeginAllocate(ctx context.Context, request machineops.Operati
 
 	client, err := p.capacityClient(target.subscriptionID, request.Auth)
 	if err != nil {
-		return machineops.BeginResult{}, fmt.Errorf("create Azure capacity client: %w", err)
+		// Nothing has been created yet, so retrying cannot succeed until an
+		// operator fixes the credential.
+		return machineops.BeginResult{}, authFailed(fmt.Errorf("create Azure capacity client: %w", err))
 	}
 
 	existing, err := client.GetVM(ctx, target.resourceGroup, target.name, false)

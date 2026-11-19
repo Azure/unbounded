@@ -353,3 +353,34 @@ func TestPowerStateReadsInstanceView(t *testing.T) {
 	require.Empty(t, powerState(&armcompute.VirtualMachine{}))
 	require.Nil(t, provisioningStatusTime(&armcompute.VirtualMachine{}))
 }
+
+// Before anything is sent, a credential that cannot be built ends a host
+// operation, as it ends an allocation. Once a handle exists it is retried,
+// so an operator can repair the credential and Poll resumes the operation.
+func TestHostOperationsAndTheCredentialThatCannotBeBuilt(t *testing.T) {
+	t.Parallel()
+
+	provider := &Provider{}
+
+	power := hostRequest(unboundedv1alpha3.OperationHostPowerOff)
+	power.Auth = authWithoutClientSecret()
+
+	_, err := provider.BeginPowerOperation(t.Context(), power)
+	requirePermanentReason(t, err, string(unboundedv1alpha3.FailureAuthFailed))
+	require.ErrorContains(t, err, "clientSecret")
+
+	_, err = provider.PollPowerOperation(t.Context(), power, machineops.ProviderOperation{OperationID: hostVMID()})
+	requireTransient(t, err)
+
+	replace := replaceRequest()
+	replace.Auth = authWithoutClientSecret()
+
+	_, err = provider.BeginReplace(t.Context(), replace)
+	requirePermanentReason(t, err, string(unboundedv1alpha3.FailureAuthFailed))
+	require.ErrorContains(t, err, "clientSecret")
+
+	operation := beginTestReplace(t, newFakeVMClient(replaceableVM()))
+
+	_, err = provider.PollReplace(t.Context(), replace, operation)
+	requireTransient(t, err)
+}

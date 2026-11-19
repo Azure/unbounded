@@ -1016,6 +1016,52 @@ func TestBeginAllocateFailsWhenAzureRefusesTheCredential(t *testing.T) {
 	}
 }
 
+// A Secret missing clientSecret cannot build a credential, so Begin ends the
+// allocation before anything exists instead of being retried without end.
+func TestBeginAllocateFailsWhenTheCredentialCannotBeBuilt(t *testing.T) {
+	client := newFakeCapacityClient()
+	offering := resolveTestOffering(t, newTestProvider(client))
+
+	provider := &Provider{}
+	request := testOperationRequest(t, unboundedv1alpha3.OperationHostAllocate, offering)
+	request.Auth = authWithoutClientSecret()
+
+	_, err := provider.BeginAllocate(t.Context(), request)
+	requirePermanent(t, err, unboundedv1alpha3.FailureAuthFailed)
+	require.ErrorContains(t, err, "create Azure capacity client")
+	require.ErrorContains(t, err, "clientSecret")
+	require.Zero(t, client.mutations())
+}
+
+// After a VM may exist, a credential that cannot be built stays retryable so
+// an operator can repair it and Poll resumes the operation.
+func TestPollAllocateRetriesWhenTheCredentialCannotBeBuilt(t *testing.T) {
+	client := newFakeCapacityClient()
+	offering := resolveTestOffering(t, newTestProvider(client))
+
+	provider := &Provider{}
+	request := pollRequestFor(t, testOperationRequest(t, unboundedv1alpha3.OperationHostAllocate, offering))
+	request.Auth = authWithoutClientSecret()
+
+	_, err := provider.PollAllocate(t.Context(), request, machineops.ProviderOperation{OperationID: testVMID()})
+	requireTransient(t, err)
+	require.ErrorContains(t, err, "create Azure capacity client")
+	require.ErrorContains(t, err, "clientSecret")
+	require.Zero(t, client.mutations())
+}
+
+// authWithoutClientSecret is an external plugin credential whose Secret is
+// missing the clientSecret key.
+func authWithoutClientSecret() *machineops.OperationAuth {
+	return &machineops.OperationAuth{
+		Mode: unboundedv1alpha3.MachineOperationCredentialAuthExternalPlugin,
+		SecretData: map[string]string{
+			"tenantID": "tenant",
+			"clientID": "client",
+		},
+	}
+}
+
 // Canceled is a terminal Azure provisioning state: the VM and what it
 // references are reported so release can remove them.
 func TestPollAllocateTreatsCanceledAsFailed(t *testing.T) {

@@ -124,7 +124,7 @@ func (p *Provider) BeginReplace(ctx context.Context, request machineops.Operatio
 
 	client, err := p.client(target.SubscriptionID, request.Auth)
 	if err != nil {
-		return machineops.BeginResult{}, fmt.Errorf("create Azure VM client: %w", err)
+		return machineops.BeginResult{}, authFailed(fmt.Errorf("create Azure VM client: %w", err))
 	}
 
 	vm, err := client.GetVM(ctx, target.ResourceGroup, target.VMName, false)
