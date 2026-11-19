@@ -190,7 +190,18 @@ func ReplaySafe() OperationOption {
 }
 
 // RequiresReplaceUserData declares that the lifecycle controller must build
-// host replacement bootstrap data before invoking the provider callback.
+// host replacement bootstrap data and set OperationRequest.ReplaceUserData
+// before it invokes the provider callback: Execute for an immediate
+// operation, and Begin and every Poll for a long-running one.
+//
+// A long-running operation gets the data in Poll because a host can only be
+// given it when the host is created, and a provider that deletes the old host
+// first creates the new one from Poll. The data carries a bootstrap token, so
+// a provider must not store it in the handle Begin returns. It is built again
+// for each call and is not guaranteed to be identical between calls. When it
+// cannot be built for a Poll, Poll is still called and the data is empty: a
+// Poll that only observes does not need it, and one that does returns an
+// error and is called again.
 func RequiresReplaceUserData() OperationOption {
 	return operationOptionFunc(func(operation *Operation) error {
 		operation.requiresReplaceUserData = true

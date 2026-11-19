@@ -23,10 +23,15 @@ type OperationRequest struct {
 	// ProviderRef snapshots Machine.spec.host.external.machineRef when present.
 	ProviderRef *unboundedv1alpha3.ProviderMachineSnapshot
 	// ProviderID is the current canonical or legacy provider-specific host ID.
-	ProviderID      string
-	HostImage       string
-	Operation       unboundedv1alpha3.OperationKind
-	Parameters      map[string]string
+	ProviderID string
+	HostImage  string
+	Operation  unboundedv1alpha3.OperationKind
+	Parameters map[string]string
+	// ReplaceUserData is the bootstrap data for the host that replaces this
+	// one. It is set only for a HostReplace operation registered with
+	// RequiresReplaceUserData, and it carries a bootstrap token. It is never
+	// empty in Execute or Begin; in Poll it is empty when it could not be
+	// built.
 	ReplaceUserData string
 	Auth            *OperationAuth
 	// Allocation is the allocation input for HostAllocate and HostRelease. It

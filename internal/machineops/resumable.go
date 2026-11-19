@@ -15,6 +15,7 @@ import (
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/helpers/statusmsg"
@@ -75,20 +76,38 @@ func (r *MachineOperationReconciler) reconcileResumableOperation(
 		return r.failOperationTarget(ctx, op, machine.Name, authFailure.Reason, authFailure.Message)
 	}
 
-	includeReplaceUserData := target.ProviderOperation == nil && providerMatch.operation.RequiresReplaceUserData()
-
 	host, err := resolveMachineHost(machine)
 	if err != nil {
 		return r.failOperationTarget(ctx, op, machine.Name, "InvalidHost", err.Error())
 	}
 
-	request, err := r.operationRequest(ctx, op, machine, target, host.providerID, auth, includeReplaceUserData)
+	// The replacement bootstrap data is built for Begin and for every Poll.
+	// It can only be handed to a host when the host is created, and a
+	// provider that has to delete the old host first creates the new one from
+	// Poll. It carries a bootstrap token, so it is built again each time
+	// instead of being stored in the persisted handle.
+	request, err := r.operationRequest(ctx, op, machine, target, host.providerID, auth, providerMatch.operation.RequiresReplaceUserData())
+
+	// bootstrapDataErr is why a Poll is called without the bootstrap data.
+	var bootstrapDataErr error
+
+	if err != nil && target.ProviderOperation != nil {
+		// The provider already accepted the operation and may have changed
+		// the host, so the operation must not end here, and most Polls only
+		// observe and do not need the data. Poll without it: a Poll that
+		// needs it returns an error and is called again.
+		log.FromContext(ctx).Error(err, "poll without replacement bootstrap data", "machineOperation", op.Name, "machine", machine.Name)
+
+		bootstrapDataErr = err
+		request, err = r.operationRequest(ctx, op, machine, target, host.providerID, auth, false)
+	}
+
 	if err != nil {
 		return r.failOperationTarget(ctx, op, machine.Name, "RequestBuildFailed", err.Error())
 	}
 
 	if target.ProviderOperation != nil {
-		return r.pollResumableOperation(ctx, op, machine, providerMatch, request, target)
+		return r.pollResumableOperation(ctx, op, machine, providerMatch, request, target, bootstrapDataErr)
 	}
 
 	begin, beginErr := providerMatch.operation.Begin(ctx, request)
@@ -183,6 +202,7 @@ func (r *MachineOperationReconciler) pollResumableOperation(
 	providerMatch providerMatch,
 	request OperationRequest,
 	target *unboundedv1alpha3.MachineOperationTargetStatus,
+	bootstrapDataErr error,
 ) (ctrl.Result, error) {
 	providerOperation := publicmachineops.ProviderOperation{
 		OperationID: target.ProviderOperation.OperationID,
@@ -192,6 +212,10 @@ func (r *MachineOperationReconciler) pollResumableOperation(
 	result, err := providerMatch.operation.Poll(ctx, request, providerOperation)
 	if err != nil {
 		message := fmt.Sprintf("poll provider operation %s: %v", providerOperation.OperationID, err)
+		if bootstrapDataErr != nil {
+			// Most likely the cause, and the provider cannot know it.
+			message = fmt.Sprintf("%s (the replacement bootstrap data could not be built: %v)", message, bootstrapDataErr)
+		}
 
 		var permanentErr *publicmachineops.PermanentError
 		if errors.As(err, &permanentErr) {
@@ -200,12 +224,7 @@ func (r *MachineOperationReconciler) pollResumableOperation(
 			return r.failOperationTarget(ctx, op, machine.Name, reason, message)
 		}
 
-		delay := r.providerPollInterval()
-		if r.providerOperationStalled(target) {
-			delay = r.providerStalledPollInterval()
-		}
-
-		return r.waitForResumableOperation(ctx, op.Name, machine.Name, "PollFailed", message, delay)
+		return r.waitForResumableOperation(ctx, op.Name, machine.Name, "PollFailed", message, r.resumableRetryDelay(target))
 	}
 
 	switch result.State {
@@ -469,6 +488,16 @@ func (r *MachineOperationReconciler) providerOperationStalled(target *unboundedv
 	}
 
 	return r.now().Sub(target.LastAttemptAt.Time) >= r.providerStallAfter()
+}
+
+// resumableRetryDelay is the wait before an accepted provider operation is
+// tried again after a failure that is not the provider's verdict.
+func (r *MachineOperationReconciler) resumableRetryDelay(target *unboundedv1alpha3.MachineOperationTargetStatus) time.Duration {
+	if r.providerOperationStalled(target) {
+		return r.providerStalledPollInterval()
+	}
+
+	return r.providerPollInterval()
 }
 
 func (r *MachineOperationReconciler) providerPollInterval() time.Duration {
