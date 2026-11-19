@@ -694,6 +694,12 @@ async fn reporter(shared: Rc<Shared>, outer: Arc<Outer>, signal: Signal) {
     let mut backoff_fills = 1;
     while !shared.stopping.get() {
         let generation = signal.generation();
+        // Set when an annotation we want to publish is still unwritten after
+        // its attempt. A new Node needs its report to be admitted, so a
+        // transient failure must retry after the backoff slept above, not
+        // after the new-encoding wait below, which no one would cut short
+        // when the desired annotation did not change.
+        let mut dirty = false;
         for (key, wanted, written, backoff) in [
             (
                 annotations::REPORT,
@@ -728,10 +734,15 @@ async fn reporter(shared: Rc<Shared>, outer: Arc<Outer>, signal: Signal) {
                     *backoff = 1;
                 }
                 Err(_) => {
+                    dirty = true;
                     rt::sleep(Duration::from_secs(*backoff)).await;
                     *backoff = (*backoff * 2).min(60);
                 }
             }
+        }
+        if dirty {
+            // The per-annotation backoff already ran; retry immediately.
+            continue;
         }
         let _ = rt::timeout(Duration::from_secs(60), signal.changed(generation)).await;
     }
@@ -851,6 +862,55 @@ mod tests {
             pinned_bytes: 10,
             refused_bytes: 0,
         }
+    }
+
+    /// A failed annotation write retries after its own backoff, without
+    /// waiting for a new encoding that will never arrive.
+    #[test]
+    fn reporter_retries_a_failed_annotation_without_a_new_encoding() {
+        let clock = racer_io::ctx::VirtualClock::new();
+        let os = racer_io::sim::SimOs::seeded(7);
+        let mut ex = Executor::simulated(os, &clock, 7, 64).unwrap();
+        ex.block_on(async {
+            let api = crate::kube::fake::FakeApi::new();
+            let config = crate::kube::fake::serve_at(
+                api.clone(),
+                std::path::Path::new("/kube"),
+                "10.0.0.1:443".parse().unwrap(),
+            );
+            let kube = Rc::new(Kube::new(config).unwrap());
+            let shared = crate::shared::tests::shared(kube);
+            let pod = paths::pod(&shared.config.namespace, &shared.config.pod_name);
+            api.put_object(
+                &pod,
+                json!({"metadata": {"name": "p1", "namespace": "racer-system"}}),
+            );
+            let outer = Outer::new();
+            outer.set_report(8, Vec::new()).unwrap();
+            let signal = Signal::default();
+            // The first report write is lost, and no new encoding arrives.
+            api.fail_next_write(500);
+            rt::spawn(reporter(shared.clone(), outer.clone(), signal.clone())).unwrap();
+            // Backoff is one second; the old code then waited up to sixty.
+            rt::sleep(Duration::from_secs(3)).await;
+            assert_eq!(
+                api.object(&pod).unwrap()["metadata"]["annotations"][annotations::REPORT],
+                json!(r#"{"shares":8,"rdma_nics":[]}"#)
+            );
+            let patches = || {
+                api.requests()
+                    .iter()
+                    .filter(|(method, _)| method == "PATCH")
+                    .count()
+            };
+            assert_eq!(patches(), 2);
+            // Clean: the reporter parks for a new encoding instead of retrying.
+            rt::sleep(Duration::from_secs(65)).await;
+            assert_eq!(patches(), 2);
+            shared.stopping.set(true);
+            signal.notify();
+            rt::sleep(Duration::from_millis(10)).await;
+        });
     }
 
     #[test]
