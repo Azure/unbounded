@@ -12,9 +12,12 @@ This section says what each top-level directory is for. Look in the directory to
   `api/machina/v1alpha3/`. Run `make generate` after changing them.
 - `bin/` - build output.
 - `bpf/` - eBPF C programs for network encapsulation (compiled with clang).
+- `clients/` - client libraries in other languages, such as the Python Racer client and vLLM plugin in
+  `clients/python/`.
 - `cmd/` - one directory per component. See "Components" below.
+- `demo/` - example environment setups, such as `demo/nebius-ssh/`.
 - `deploy/` - Kubernetes manifests, one directory per component or plugin, such as `deploy/machina/`. `make help`
-  lists the `-manifests` targets that render them. Rendered output is not committed.
+  lists the `-manifests` targets that render them.
 - `designs/` - design documents and internal planning.
 - `docs/` - the public web site only. Do not put design documents or internal notes here.
 - `e2e/` - end-to-end tests, one directory per suite. Build them with `-tags e2e`.
@@ -32,16 +35,15 @@ This section says what each top-level directory is for. Look in the directory to
 
 ### Components
 
-A component is one directory under `cmd/`, such as `cmd/machina` or `cmd/agent`. One component's code must not import
-another component's code.
-
-- The network binaries (`cmd/unbounded-net-*`, `cmd/unbounded-ipam`, `cmd/unping`, `cmd/unroute`) are one component.
-- `cmd/racer` and `cmd/racer-object` are Rust. The Go rules do not apply to them.
+A component is one directory under `cmd/`, such as `cmd/machina` or `cmd/racer`. It can hold Go, Rust or both. The
+network binaries (`cmd/unbounded-net-*`, `cmd/unbounded-ipam`, `cmd/unping`, `cmd/unroute`) count as one component.
 
 Some component code still lives in `internal/` and `pkg/`. For example, `internal/gantry` belongs to `cmd/gantry`.
 #1175 moves it into `cmd/`.
 
-## Building and Testing
+## Go
+
+### Building and testing
 
 - `make` builds all binaries (kubectl-unbounded, forge, machina, and all net binaries).
 - To build `machina` use `make machina` which runs formatters, lint, tests, and go build.
@@ -66,10 +68,29 @@ Some component code still lives in `internal/` and `pkg/`. For example, `interna
 - `make lint` runs the same checks locally and in CI and does NOT auto-fix. Always run `make fmt` before committing to satisfy the linter (gofumpt and wsl_v5 are enforced by `make lint`/CI); do not hand-format.
 - Locally `test` implies `lint`. In CI (`CI=1`), each runs independently.
 
+### Rules
+
+- Do not import another component's code. For example, `cmd/agent` must not import `cmd/machina`. The one exception
+  is code two components must agree on, which its owner exports (rule 3 in `internal/AGENTS.md`).
+- To share code between components, follow "Where new code goes" in `internal/AGENTS.md`.
+
+## Rust
+
+Rust code lives in:
+
+- `cmd/racer/` - the Racer dataplane, a Cargo workspace of several crates. Shared test fixtures are in
+  `cmd/racer/tests/support/`.
+- `cmd/racer-object/` - the racer-object sidecar.
+- `cmd/racer-loadgen/performance/` - a performance harness, run with its `run.sh`.
+
+To check your changes:
+
+- `cmd/racer/`: `make racer-fmt` formats, `make racer-lint` checks formatting and runs Clippy and the crate purity
+  checks, and `make racer-rust-test` runs the tests.
+- `cmd/racer-object/`: `make racer-object-test` checks formatting, runs Clippy and runs the tests.
+
 ## Coding Standards
 
-- One component must not import another component's code. For example, `cmd/agent` must not import `cmd/machina`.
-  To share code, see "Where new code goes" in `internal/AGENTS.md`.
 - Do not use em-dashes (`—`) in comments, strings, or any source/config files. Use a plain ASCII hyphen (`-`)
   or rephrase the sentence instead.
 - Write American English, not British. Use `behavior`, `initialize`, `labeled`, `catalog`, `defense`, `judgment`,

@@ -1,6 +1,6 @@
 # internal/
 
-Shared code that no single component owns. Only this Go module can import it.
+Shared code that no single component owns.
 
 ## What can go here
 
@@ -39,6 +39,4 @@ moves into `cmd/`. Until then:
 - You may change those packages.
 - Do not add packages, not even inside an existing tree such as `internal/gantry/`. Add the code to an existing
   package, or to a new package under `cmd/<component>/internal/`.
-- Go does not let code in `internal/` import a package under `cmd/<component>/internal/`. If it needs your new
-  package, its component has to move first.
 - For rule 3, "the component that writes it" means one of that component's existing packages in `internal/`.

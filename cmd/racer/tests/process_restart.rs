@@ -54,7 +54,7 @@ const P: u64 = PAGE_BYTES;
 const LENGTH: u64 = 2 * P + 113;
 const TIMEOUT: Duration = Duration::from_secs(30);
 
-#[path = "../../../internal/racer-test/control.rs"]
+#[path = "support/control.rs"]
 mod control;
 
 mod measurement {

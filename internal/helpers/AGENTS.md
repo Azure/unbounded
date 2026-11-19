@@ -1,7 +1,7 @@
 # internal/helpers/
 
 Small generic helpers that two or more components share. Each helper is its own package, such as
-`internal/helpers/statusmsg`. Do not put Go files directly in `internal/helpers/`; `make lint` fails if you do.
+`internal/helpers/statusmsg`.
 
 ## What belongs here
 
@@ -20,7 +20,7 @@ A helper must meet all of these:
 - **Small.** Functions and constants only. No types with methods, goroutines, global variables or `init`. One
   exception: a function that registers something with a third-party library, if calling it twice is safe and its
   comment says so, such as `dockermedia.RegisterParsers`.
-- **Imports nothing from this repository.** Only the standard library and third-party modules. `make lint` checks this.
+- **Imports nothing from this repository.** Only the standard library and third-party modules.
 - **Not an agreement between components.** If one component writes a value and another checks it, the writer owns that
   code (rule 3 in `internal/AGENTS.md`). Do not put it here.
 
@@ -39,8 +39,7 @@ If a helper stops meeting these rules, move it into the component that needs the
 - **Units in constant names:** `conditionMaxBytes`, not `conditionMax`. Use `time.Duration` for durations, never an
   integer number of seconds.
 - **Parameters:** at most three. Beyond that, take one `Options` struct. No functional options.
-- **Errors:** error variables are `Err<Condition>`, and error types are `<Condition>Error`. Messages are lowercase,
-  with no trailing punctuation.
+- **Error types:** `<Condition>Error`.
 
 ## Documentation and tests
 

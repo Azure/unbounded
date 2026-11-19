@@ -19,7 +19,7 @@ const NODE: &str = "22222222-2222-4222-8222-222222222222";
 const CACHE: &str = "44444444-4444-4444-8444-444444444444";
 const NAME: &str = "gantry";
 
-#[path = "../../../internal/racer-test/control.rs"]
+#[path = "../../racer/tests/support/control.rs"]
 mod control;
 
 fn read_head(stream: &mut impl Read) -> io::Result<String> {
