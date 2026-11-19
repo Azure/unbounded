@@ -6,43 +6,40 @@ and at the edge, without being limited by the location of your control plane.
 
 ## Repository Structure
 
-The tree is the source of truth for what exists. This section says what each top-level directory is for, so it does
-not list their contents.
+This section says what each top-level directory is for. Look in the directory to see what it contains.
 
-- `api/` - API types, one directory per group and version, such as `api/machina/v1alpha3/`: CRD types, and wire
-  schemas such as gRPC protobufs. Deepcopy code, CRDs and protobuf code are generated from each package's
-  `go:generate` directives by `make generate`.
-- `bin/` - where generated binary artifacts should be placed.
+- `api/` - API types: Kubernetes CRD types and gRPC protobuf schemas, one directory per group and version, such as
+  `api/machina/v1alpha3/`. Run `make generate` after changing them.
+- `bin/` - build output.
 - `bpf/` - eBPF C programs for network encapsulation (compiled with clang).
-- `cmd/` - one directory per component. A component is a directory under `cmd/`: the binary it builds and the code
-  only it uses. Net's binaries (`cmd/unbounded-net-*`, `cmd/unbounded-ipam`, `cmd/unping` and `cmd/unroute`) count as
-  one component, since #1175 groups them under `cmd/net/`. Directories with a `Cargo.toml` are Rust crates, and the Go
-  rules in the `AGENTS.md` files do not apply to them. Much component code still lives under `internal/` and `pkg/`
-  until #1175 moves it.
-- `deploy/` - manifests and manifest templates, one directory per component or plugin, such as `deploy/machina/`. Most
-  render with `make <name>-manifests` into `deploy/<name>/rendered/`, which is gitignored; `make help` lists the
-  targets.
-- `designs/` - design documents, proposals, and internal planning documentation for the project.
-- `docs/` - public web site documentation only. Do not place design documents, plans, or ad-hoc internal docs here.
-- `e2e/` - end-to-end suites, one directory per suite, such as `e2e/gantry/`. The suites build only with `-tags e2e`;
-  support packages such as `e2e/gantry/fixture` do not need the tag.
-- `frontend/` - React/TypeScript web UI for network topology visualization (built with Vite).
-- `hack/` - development tools and scripts. Code here is not a component.
-  - `cmd/` - development tools built as Go binaries, such as forge and `render-manifests`. `render-manifests` is a
-    generic Go template renderer driven by repeatable `--set key=value` flags; templates rely on sprig's `default` for
-    fallbacks.
-  - `scripts/` - operational and development shell scripts.
-  - `scratch/` - scratch space for quick Go experiments.
-- `images/` - OCI image definitions and related assets for building container images.
-- `internal/` - code shared by more than one component that no single component owns: project conventions
-  (`internal/<name>`) and small generic helpers (`internal/helpers/<name>`). Read `internal/AGENTS.md` before adding a
-  package here. Most packages here today are component code that #1175 moves into `cmd/<component>/`.
-- `pkg/` - public Go libraries that other repositories import, such as `pkg/racersdk`. Export only what those users
-  need.
-- `plugins/` - integrations that are their own Go modules because their upstream pins different library versions.
-  The Karpenter plugin (`plugins/karpenter/`) must not import the root module; it projects the API fields it uses and
-  checks them against the generated CRDs.
-- `tmp/` - project local temporary directory for intermediate stuff that will be cleaned up quickly.
+- `cmd/` - one directory per component. See "Components" below.
+- `deploy/` - Kubernetes manifests, one directory per component or plugin, such as `deploy/machina/`. `make help`
+  lists the `-manifests` targets that render them. Rendered output is not committed.
+- `designs/` - design documents and internal planning.
+- `docs/` - the public web site only. Do not put design documents or internal notes here.
+- `e2e/` - end-to-end tests, one directory per suite. Build them with `-tags e2e`.
+- `frontend/` - React/TypeScript web UI for network topology (built with Vite).
+- `hack/` - development tools and scripts. These are not components.
+  - `cmd/` - Go development tools, such as forge and `render-manifests`.
+  - `scripts/` - shell scripts.
+  - `scratch/` - space for quick Go experiments.
+- `images/` - container image definitions.
+- `internal/` - shared code that no single component owns. Read `internal/AGENTS.md` before adding anything here.
+- `pkg/` - Go libraries that other repositories import, such as `pkg/racersdk`. Export only what they need.
+- `plugins/` - integrations that are separate Go modules. `plugins/karpenter/` must not import the root module. It
+  keeps its own copy of the API fields it uses, and its tests check them against the generated CRDs.
+- `tmp/` - temporary files. Use it instead of `/tmp`.
+
+### Components
+
+A component is one directory under `cmd/`, such as `cmd/machina` or `cmd/agent`. One component's code must not import
+another component's code.
+
+- The network binaries (`cmd/unbounded-net-*`, `cmd/unbounded-ipam`, `cmd/unping`, `cmd/unroute`) are one component.
+- `cmd/racer` and `cmd/racer-object` are Rust. The Go rules do not apply to them.
+
+Some component code still lives in `internal/` and `pkg/`. For example, `internal/gantry` belongs to `cmd/gantry`.
+#1175 moves it into `cmd/`.
 
 ## Building and Testing
 
@@ -71,8 +68,8 @@ not list their contents.
 
 ## Coding Standards
 
-- Do not cross cmd/ package boundaries. For example, `cmd/agent` should not import from `cmd/machina`. If you need to
-  share code between these packages, follow "Where new code goes" in `internal/AGENTS.md`.
+- One component must not import another component's code. For example, `cmd/agent` must not import `cmd/machina`.
+  To share code, see "Where new code goes" in `internal/AGENTS.md`.
 - Do not use em-dashes (`—`) in comments, strings, or any source/config files. Use a plain ASCII hyphen (`-`)
   or rephrase the sentence instead.
 - Write American English, not British. Use `behavior`, `initialize`, `labeled`, `catalog`, `defense`, `judgment`,
@@ -116,15 +113,14 @@ not list their contents.
     - New dependencies with broad impact.
     - Destructive data or migration changes.
     - Removal of _test.go or Test* functions or subtests.
-    - Adding a project convention package, `internal/<name>` (see `internal/AGENTS.md`).
+    - Adding a package directly under `internal/`, such as `internal/systemns`.
     - Proceeding when a design doc or comment contradicts the code.
 - **Never**
     - Commit secrets, credentials, or tokens.
     - Edit generated files by hand when a generation workflow exists.
     - Use destructive git operations unless explicitly requested.
-    - Add any other package under `internal/`, including sub-packages inside existing component trees such as
-      `internal/gantry/<new>`. Helpers under `internal/helpers/<name>` are the only exception (see
-      `internal/helpers/AGENTS.md`).
+    - Add a package deeper inside `internal/`, such as `internal/gantry/<new>`. The only exception is a helper,
+      `internal/helpers/<name>`.
     - Go outside the project boundary, for example, DO NOT edit files in user's home directories, add or edit files 
       in /tmp or anywhere else on the host filesystem.
 
