@@ -6,18 +6,14 @@ package controller
 import (
 	"fmt"
 	"time"
-	"unicode/utf8"
 
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/helpers/statusmsg"
 	"github.com/Azure/unbounded/internal/provision"
 )
-
-// maxConditionMessageBytes is the longest metav1.Condition message the API
-// server accepts.
-const maxConditionMessageBytes = 32768
 
 // Reasons for the IsolationDrift condition.
 const (
@@ -93,7 +89,7 @@ func syncIsolationConditions(machine *unboundedv1alpha3.Machine, now time.Time, 
 		}
 	}
 
-	cond.Message = truncateUTF8Bytes(cond.Message, maxConditionMessageBytes)
+	cond.Message = statusmsg.Truncate(cond.Message, statusmsg.MaxBytes)
 
 	return setConditionIfChanged(machine, cond), recheck
 }
@@ -193,19 +189,4 @@ func setConditionIfChanged(machine *unboundedv1alpha3.Machine, cond metav1.Condi
 func checkIsolationEnabled(mode unboundedv1alpha3.IsolationMode, containerEnabled bool) error {
 	return provision.CheckIsolationEnabled(mode, containerEnabled, "machina",
 		"set experimentalContainerIsolation: true in the machina configuration")
-}
-
-// truncateUTF8Bytes returns value cut to at most maxBytes bytes without
-// splitting a UTF-8 sequence.
-func truncateUTF8Bytes(value string, maxBytes int) string {
-	if len(value) <= maxBytes {
-		return value
-	}
-
-	end := maxBytes
-	for end > 0 && !utf8.RuneStart(value[end]) {
-		end--
-	}
-
-	return value[:end]
 }

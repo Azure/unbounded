@@ -23,6 +23,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/helpers/statusmsg"
 	publicmachineops "github.com/Azure/unbounded/pkg/machineops"
 )
 
@@ -307,7 +308,7 @@ func TestLongRunningOperationSanitizesProviderDiagnostics(t *testing.T) {
 	require.NotNil(t, completed)
 	require.Empty(t, metav1validation.ValidateCondition(*completed, field.NewPath("status", "conditions")))
 
-	require.LessOrEqual(t, len(updated.Status.Targets[0].Message), MaxConditionMessageBytes)
+	require.LessOrEqual(t, len(updated.Status.Targets[0].Message), statusmsg.MaxBytes)
 	require.Equal(t, updated.Status.Targets[0].Message, strings.ToValidUTF8(updated.Status.Targets[0].Message, ""))
 }
 

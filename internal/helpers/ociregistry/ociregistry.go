@@ -1,8 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package ociutil provides shared helpers for OCI registry operations.
-package ociutil
+// Package ociregistry configures clients for OCI registries the way every
+// component that pulls images expects.
+package ociregistry
 
 import (
 	"net"

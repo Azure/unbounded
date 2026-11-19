@@ -10,49 +10,20 @@ import (
 	"io"
 	"log/slog"
 	"os/exec"
-	"sort"
+	"slices"
 	"strings"
 )
 
 func Kubectl(env []string, kubeconfig string) func(context.Context) *exec.Cmd {
 	return func(ctx context.Context) *exec.Cmd {
-		envMap := envSliceToMap(env)
-		envMap["KUBECONFIG"] = kubeconfig
-
 		c := exec.CommandContext(ctx, "kubectl")
-		c.Env = envMapToSlice(envMap)
+
+		c.Env = append(slices.DeleteFunc(slices.Clone(env), func(v string) bool {
+			return strings.HasPrefix(v, "KUBECONFIG=")
+		}), "KUBECONFIG="+kubeconfig)
 
 		return c
 	}
-}
-
-// envSliceToMap converts KEY=VALUE entries into a map. An entry without "="
-// maps to an empty value.
-func envSliceToMap(env []string) map[string]string {
-	m := map[string]string{}
-
-	for _, ev := range env {
-		if parts := strings.SplitN(ev, "=", 2); len(parts) == 2 {
-			m[parts[0]] = parts[1]
-		} else {
-			m[parts[0]] = ""
-		}
-	}
-
-	return m
-}
-
-// envMapToSlice converts a map into sorted KEY=VALUE entries.
-func envMapToSlice(env map[string]string) []string {
-	out := make([]string, 0, len(env))
-
-	for k, v := range env {
-		out = append(out, k+"="+v)
-	}
-
-	sort.Strings(out)
-
-	return out
 }
 
 func KubectlCmd(ctx context.Context, logger *slog.Logger, kubectl func(context.Context) *exec.Cmd, args ...string) error {

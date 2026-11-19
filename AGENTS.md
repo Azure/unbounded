@@ -40,7 +40,9 @@ unbounded-kube is organized into several directories:
 - `images/` - where OCI image definitions and related assets for building container images are located.
 - `e2e/` - end-to-end integration test suites.
   - `gantry/` - kind-based e2e tests for gantry (guarded by `//go:build e2e`).
-- `internal/` - where shared but internal to this project packages are located.
+- `internal/` - code shared by more than one component that no single component owns: project conventions
+  (`internal/<name>`) and small generic helpers (`internal/helpers/<name>`). Read `internal/AGENTS.md` before adding a
+  package here.
   - `gantry/` - gantry shared packages (21 sub-packages: config, mirror, transfer, discovery, coord, hrw, coldstart, members, metrics, etc.). Includes `internal/gantry/proto/coord/v1/` for the libp2p coordination RPC messages (pull intent, please-pull); kept under internal/ so the wire schema isn't an exported API surface.
   - `net/` - unbounded-net shared packages (APIs, controllers, networking, metrics, webhooks, etc.).
 - `plugins/` - integrations that are their own Go modules because their upstream pins different library versions.
@@ -121,6 +123,7 @@ unbounded-kube is organized into several directories:
     - New dependencies with broad impact.
     - Destructive data or migration changes.
     - Removal of _test.go or Test* functions or subtests.
+    - Adding a package directly under `internal/` (anywhere other than `internal/helpers/`).
     - Proceeding when a design doc or comment contradicts the code.
 - **Never**
     - Commit secrets, credentials, or tokens.

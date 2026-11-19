@@ -19,7 +19,7 @@ import (
 	"oras.land/oras-go/v2/registry/remote/credentials"
 	"oras.land/oras-go/v2/registry/remote/retry"
 
-	"github.com/Azure/unbounded/internal/ociutil"
+	"github.com/Azure/unbounded/internal/helpers/ociregistry"
 )
 
 const (
@@ -74,7 +74,7 @@ func ArchiveOCIImage(ctx context.Context, sourceRef, archivePath string) error {
 		return fmt.Errorf("OCI image source %q must use a tag: %w", sourceRef, err)
 	}
 
-	ociutil.ConfigurePlainHTTP(repo)
+	ociregistry.ConfigurePlainHTTP(repo)
 
 	credentialStore, err := credentials.NewStoreFromDocker(credentials.StoreOptions{})
 	if err != nil {
@@ -155,7 +155,7 @@ func retryOCIImageCopy(
 			return nil
 		}
 
-		if !ociutil.RetryableNetworkError(err) || attempt == ociImageCopyMaxAttempts {
+		if !isRetryableNetworkError(err) || attempt == ociImageCopyMaxAttempts {
 			return err
 		}
 

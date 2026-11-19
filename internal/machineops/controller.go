@@ -23,6 +23,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/helpers/statusmsg"
 	publicmachineops "github.com/Azure/unbounded/pkg/machineops"
 )
 
@@ -530,7 +531,7 @@ func (r *MachineOperationReconciler) reconcileTerminal(ctx context.Context, op *
 }
 
 func (r *MachineOperationReconciler) markInProgress(ctx context.Context, op *unboundedv1alpha3.MachineOperation, message string) error {
-	message = TruncateUTF8Bytes(message, MaxConditionMessageBytes)
+	message = statusmsg.Truncate(message, statusmsg.MaxBytes)
 
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var latest unboundedv1alpha3.MachineOperation
@@ -594,7 +595,7 @@ func (r *MachineOperationReconciler) finishOperation(
 	observedMachineGeneration int64,
 ) (ctrl.Result, error) {
 	reason = normalizeConditionReason(reason)
-	message = TruncateUTF8Bytes(message, MaxConditionMessageBytes)
+	message = statusmsg.Truncate(message, statusmsg.MaxBytes)
 
 	var updated unboundedv1alpha3.MachineOperation
 

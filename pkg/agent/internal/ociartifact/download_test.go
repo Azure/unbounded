@@ -9,13 +9,13 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/stretchr/testify/require"
 
-	"github.com/Azure/unbounded/internal/ociutil"
+	"github.com/Azure/unbounded/internal/helpers/dockermedia"
 )
 
 func TestIsIndexMediaType(t *testing.T) {
 	t.Parallel()
 
 	require.True(t, isIndexMediaType(ocispec.MediaTypeImageIndex))
-	require.True(t, isIndexMediaType(ociutil.DockerMediaTypeManifestList))
+	require.True(t, isIndexMediaType(dockermedia.ManifestListType))
 	require.False(t, isIndexMediaType(ocispec.MediaTypeImageManifest))
 }

@@ -6,8 +6,8 @@ package kube
 import (
 	"context"
 	"os/exec"
-
-	"github.com/Azure/unbounded/internal/helpers"
+	"slices"
+	"strings"
 )
 
 type KubectlFunc func(context.Context) *exec.Cmd
@@ -18,11 +18,11 @@ const (
 
 func Kubectl(env []string, kubeconfig string) KubectlFunc {
 	return func(ctx context.Context) *exec.Cmd {
-		envMap := helpers.EnvSliceToMap(env)
-		envMap["KUBECONFIG"] = kubeconfig
-
 		c := exec.CommandContext(ctx, kubectlBinary)
-		c.Env = helpers.EnvMapToSlice(envMap)
+
+		c.Env = append(slices.DeleteFunc(slices.Clone(env), func(v string) bool {
+			return strings.HasPrefix(v, "KUBECONFIG=")
+		}), "KUBECONFIG="+kubeconfig)
 
 		return c
 	}

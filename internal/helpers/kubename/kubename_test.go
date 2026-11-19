@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package kube
+package kubename
 
 import (
 	"testing"
@@ -9,7 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestSanitizeK8sName(t *testing.T) {
+func TestSanitize(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -62,7 +62,7 @@ func TestSanitizeK8sName(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			require.Equal(t, tt.expected, SanitizeK8sName(tt.input))
+			require.Equal(t, tt.expected, Sanitize(tt.input))
 		})
 	}
 }

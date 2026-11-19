@@ -6,7 +6,6 @@ package controller
 import (
 	"context"
 	"fmt"
-	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -16,6 +15,8 @@ import (
 	"oras.land/oras-go/v2/registry/remote"
 	"oras.land/oras-go/v2/registry/remote/auth"
 	"oras.land/oras-go/v2/registry/remote/retry"
+
+	"github.com/Azure/unbounded/internal/helpers/ociregistry"
 )
 
 const (
@@ -41,42 +42,13 @@ func newKubeProxyTagRepository(repository string) (*remote.Repository, error) {
 		return nil, fmt.Errorf("parse kube-proxy repository %q: %w", repository, err)
 	}
 
-	configurePlainHTTP(repo)
+	ociregistry.ConfigurePlainHTTP(repo)
 	repo.TagListPageSize = 1000
 	repo.TagListMaxPages = kubeProxyRegistryMaxPages
 	repo.MaxMetadataBytes = 32 << 20
 	repo.Client = newKubeProxyRegistryClient(retry.DefaultClient)
 
 	return repo, nil
-}
-
-// configurePlainHTTP sets PlainHTTP on the repository when the registry host
-// is a loopback address (localhost, 127.0.0.1, [::1]) or a private IP
-// (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16). These registries almost
-// never serve TLS and defaulting to HTTPS causes "http: server gave HTTP
-// response to HTTPS client" errors.
-func configurePlainHTTP(repo *remote.Repository) {
-	host := repo.Reference.Host()
-
-	// Strip the port if present so we can parse the bare IP/hostname.
-	hostname := host
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		hostname = h
-	}
-
-	if hostname == "localhost" {
-		repo.PlainHTTP = true
-		return
-	}
-
-	ip := net.ParseIP(hostname)
-	if ip == nil {
-		return
-	}
-
-	if ip.IsLoopback() || ip.IsPrivate() {
-		repo.PlainHTTP = true
-	}
 }
 
 // kubeProxyRegistryReference normalizes the implicit Docker Hub registry and

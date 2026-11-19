@@ -21,6 +21,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	"github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/helpers/kubename"
 	"github.com/Azure/unbounded/internal/kube"
 	"github.com/Azure/unbounded/internal/unbounded"
 )
@@ -343,7 +344,7 @@ func (h *machineRegisterHandler) setDefaults() {
 		// Strip port from host if present, so "10.0.0.5:2222" becomes "10.0.0.5-2222"
 		// after sanitization. We use the raw host string for sanitization so the colon
 		// gets replaced with a dash.
-		h.name = fmt.Sprintf("%s-%s", h.siteName, kube.SanitizeK8sName(h.host))
+		h.name = fmt.Sprintf("%s-%s", h.siteName, kubename.Sanitize(h.host))
 	} else {
 		h.name = fmt.Sprintf("%s-%s", h.siteName, h.name)
 	}

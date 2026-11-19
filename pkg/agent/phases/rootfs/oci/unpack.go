@@ -15,11 +15,11 @@ import (
 	"github.com/opencontainers/umoci/oci/casext"
 	"github.com/opencontainers/umoci/oci/layer"
 
-	"github.com/Azure/unbounded/internal/ociutil"
+	"github.com/Azure/unbounded/internal/helpers/dockermedia"
 )
 
 func init() {
-	ociutil.RegisterDockerParsers()
+	dockermedia.RegisterParsers()
 }
 
 // unpackOCILayout opens an OCI image layout at layoutDir and unpacks the image
@@ -66,7 +66,7 @@ func unpackOCILayout(ctx context.Context, log *slog.Logger, hostArch, layoutDir,
 	// Convert Docker media types to OCI equivalents so that umoci's strict
 	// media-type checks pass. Docker V2 images use different MIME types for
 	// the config and layer blobs but are structurally identical to OCI.
-	ociutil.ConvertDockerMediaTypes(&manifest)
+	dockermedia.ConvertToOCI(&manifest)
 
 	log.Info("unpacking OCI image layers",
 		slog.Int("layers", len(manifest.Layers)),

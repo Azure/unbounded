@@ -1,7 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package kube
+// Package kubename turns arbitrary strings, such as host names and addresses,
+// into valid Kubernetes object names.
+package kubename
 
 import (
 	"regexp"
@@ -12,11 +14,11 @@ import (
 // dash, or dot - i.e. characters not allowed in a Kubernetes object name.
 var nonK8sNameChars = regexp.MustCompile(`[^a-z0-9\-.]`)
 
-// SanitizeK8sName converts a raw string into a valid Kubernetes object name.
+// Sanitize converts a raw string into a valid Kubernetes object name.
 // Kubernetes names must be lowercase RFC-1123 subdomains: lowercase alphanumeric
 // characters, '-' or '.', must start and end with an alphanumeric character,
 // and be at most 253 characters.
-func SanitizeK8sName(raw string) string {
+func Sanitize(raw string) string {
 	s := strings.ToLower(raw)
 
 	// Replace any character that is not alphanumeric, '-', or '.' with '-'.
