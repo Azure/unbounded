@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package ociutil
+package dockermedia
 
 import (
 	"io"
@@ -12,23 +12,23 @@ import (
 	ispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
-func TestConvertDockerMediaTypes(t *testing.T) {
+func TestConvertToOCI(t *testing.T) {
 	m := ispec.Manifest{
 		Versioned: specs.Versioned{SchemaVersion: 2},
-		MediaType: DockerMediaTypeManifest,
+		MediaType: ManifestType,
 		Config: ispec.Descriptor{
-			MediaType: DockerMediaTypeConfig,
+			MediaType: ConfigType,
 			Digest:    "sha256:aaa",
 			Size:      100,
 		},
 		Layers: []ispec.Descriptor{
-			{MediaType: DockerMediaTypeLayerGzip, Digest: "sha256:bbb", Size: 200},
-			{MediaType: DockerMediaTypeLayer, Digest: "sha256:ccc", Size: 300},
-			{MediaType: DockerMediaTypeForeignLayer, Digest: "sha256:ddd", Size: 400},
+			{MediaType: LayerGzipType, Digest: "sha256:bbb", Size: 200},
+			{MediaType: LayerType, Digest: "sha256:ccc", Size: 300},
+			{MediaType: ForeignLayerType, Digest: "sha256:ddd", Size: 400},
 		},
 	}
 
-	ConvertDockerMediaTypes(&m)
+	ConvertToOCI(&m)
 
 	if m.MediaType != ispec.MediaTypeImageManifest {
 		t.Errorf("manifest MediaType = %q, want %q", m.MediaType, ispec.MediaTypeImageManifest)
@@ -51,7 +51,7 @@ func TestConvertDockerMediaTypes(t *testing.T) {
 	}
 }
 
-func TestConvertDockerMediaTypes_OCI_Noop(t *testing.T) {
+func TestConvertToOCI_OCI_Noop(t *testing.T) {
 	// An already-OCI manifest should not be modified.
 	m := ispec.Manifest{
 		Versioned: specs.Versioned{SchemaVersion: 2},
@@ -66,7 +66,7 @@ func TestConvertDockerMediaTypes_OCI_Noop(t *testing.T) {
 		},
 	}
 
-	ConvertDockerMediaTypes(&m)
+	ConvertToOCI(&m)
 
 	if m.MediaType != ispec.MediaTypeImageManifest {
 		t.Errorf("manifest MediaType = %q, want %q", m.MediaType, ispec.MediaTypeImageManifest)
@@ -81,14 +81,14 @@ func TestConvertDockerMediaTypes_OCI_Noop(t *testing.T) {
 	}
 }
 
-func TestRegisterDockerParsers_Idempotent(t *testing.T) {
+func TestRegisterParsers_Idempotent(t *testing.T) {
 	// Calling multiple times must not panic.
-	RegisterDockerParsers()
-	RegisterDockerParsers()
+	RegisterParsers()
+	RegisterParsers()
 }
 
-func TestRegisterDockerParsers_ParseManifest(t *testing.T) {
-	RegisterDockerParsers()
+func TestRegisterParsers_ParseManifest(t *testing.T) {
+	RegisterParsers()
 
 	rdr := strings.NewReader(`{"schemaVersion":2,"mediaType":"application/vnd.docker.distribution.manifest.v2+json"}`)
 
@@ -107,7 +107,7 @@ func TestRegisterDockerParsers_ParseManifest(t *testing.T) {
 	}
 }
 
-func TestRegisterDockerParsers_ParseManifest_NilReader(t *testing.T) {
+func TestRegisterParsers_ParseManifest_NilReader(t *testing.T) {
 	result, err := parseManifest(nil)
 	if err != nil {
 		t.Fatalf("parseManifest(nil): %v", err)
@@ -118,7 +118,7 @@ func TestRegisterDockerParsers_ParseManifest_NilReader(t *testing.T) {
 	}
 }
 
-func TestRegisterDockerParsers_ParseIndex(t *testing.T) {
+func TestRegisterParsers_ParseIndex(t *testing.T) {
 	rdr := strings.NewReader(`{"schemaVersion":2,"manifests":[]}`)
 
 	result, err := parseIndex(rdr)
@@ -131,7 +131,7 @@ func TestRegisterDockerParsers_ParseIndex(t *testing.T) {
 	}
 }
 
-func TestRegisterDockerParsers_ParseImage(t *testing.T) {
+func TestRegisterParsers_ParseImage(t *testing.T) {
 	rdr := strings.NewReader(`{"architecture":"amd64","os":"linux"}`)
 
 	result, err := parseImage(rdr)
@@ -189,21 +189,21 @@ func TestParsers_InvalidJSON(t *testing.T) {
 	}
 }
 
-func TestConvertDockerMediaTypes_MixedLayers(t *testing.T) {
+func TestConvertToOCI_MixedLayers(t *testing.T) {
 	// A manifest with a mix of Docker and OCI layer types should only
 	// convert the Docker ones, leaving OCI layers untouched.
 	m := ispec.Manifest{
-		MediaType: DockerMediaTypeManifest,
-		Config:    ispec.Descriptor{MediaType: DockerMediaTypeConfig},
+		MediaType: ManifestType,
+		Config:    ispec.Descriptor{MediaType: ConfigType},
 		Layers: []ispec.Descriptor{
-			{MediaType: DockerMediaTypeLayerGzip},
+			{MediaType: LayerGzipType},
 			{MediaType: ispec.MediaTypeImageLayerGzip}, // already OCI
 			{MediaType: ispec.MediaTypeImageLayerZstd}, // OCI zstd
-			{MediaType: DockerMediaTypeLayer},
+			{MediaType: LayerType},
 		},
 	}
 
-	ConvertDockerMediaTypes(&m)
+	ConvertToOCI(&m)
 
 	want := []string{
 		ispec.MediaTypeImageLayerGzip,

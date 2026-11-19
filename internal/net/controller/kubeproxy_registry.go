@@ -16,7 +16,7 @@ import (
 	"oras.land/oras-go/v2/registry/remote/auth"
 	"oras.land/oras-go/v2/registry/remote/retry"
 
-	"github.com/Azure/unbounded/internal/ociutil"
+	"github.com/Azure/unbounded/internal/helpers/ociregistry"
 )
 
 const (
@@ -42,7 +42,7 @@ func newKubeProxyTagRepository(repository string) (*remote.Repository, error) {
 		return nil, fmt.Errorf("parse kube-proxy repository %q: %w", repository, err)
 	}
 
-	ociutil.ConfigurePlainHTTP(repo)
+	ociregistry.ConfigurePlainHTTP(repo)
 	repo.TagListPageSize = 1000
 	repo.TagListMaxPages = kubeProxyRegistryMaxPages
 	repo.MaxMetadataBytes = 32 << 20

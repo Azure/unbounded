@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package ociutil
+package utilio
 
 import (
 	"context"
@@ -11,9 +11,9 @@ import (
 	"syscall"
 )
 
-// RetryableNetworkError reports whether err represents a transient network or
+// IsRetryableNetworkError reports whether err represents a transient network or
 // response-body read failure that is safe to retry.
-func RetryableNetworkError(err error) bool {
+func IsRetryableNetworkError(err error) bool {
 	if err == nil {
 		return false
 	}

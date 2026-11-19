@@ -30,7 +30,7 @@ import (
 	"oras.land/oras-go/v2/registry/remote/retry"
 
 	"github.com/Azure/unbounded/internal/agentartifacts"
-	"github.com/Azure/unbounded/internal/ociutil"
+	"github.com/Azure/unbounded/internal/helpers/ociregistry"
 	"github.com/Azure/unbounded/pkg/agent/artifactsource"
 	"github.com/Azure/unbounded/pkg/agent/bootstrapartifacts"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
@@ -248,7 +248,7 @@ func PushOCI(ctx context.Context, log *slog.Logger, rootDir, ref string) error {
 		return fmt.Errorf("parse OCI reference %q: %w", ref, err)
 	}
 
-	ociutil.ConfigurePlainHTTP(repo)
+	ociregistry.ConfigurePlainHTTP(repo)
 
 	credentialStore, err := credentials.NewStoreFromDocker(credentials.StoreOptions{})
 	if err != nil {

@@ -7,7 +7,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"os/exec"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerservice/armcontainerservice/v4"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v7"
@@ -24,7 +23,6 @@ type ClusterDetails struct {
 	KubernetesCluster     *armcontainerservice.ManagedCluster
 	VirtualNetwork        *armnetwork.VirtualNetwork
 	KubeCli               kubernetes.Interface
-	Kubectl               func(context.Context) *exec.Cmd
 	KubeconfigData        []byte
 	KubeCACertificateData []byte
 	GatewayPoolName       string
@@ -115,7 +113,6 @@ func (g *GetClusterDetails) Get(ctx context.Context) (*ClusterDetails, error) {
 		KubeconfigData:        kubeConfig,
 		KubeCACertificateData: kubeCA,
 		KubeCli:               kubeCli,
-		Kubectl:               kube.Kubectl(nil, kubeconfigPath),
 		NodesResourceGroup:    rg,
 		VirtualNetwork:        vnet,
 		KubernetesCluster:     mc,

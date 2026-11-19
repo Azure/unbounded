@@ -17,6 +17,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/helpers/statusmsg"
 	publicmachineops "github.com/Azure/unbounded/pkg/machineops"
 )
 
@@ -328,7 +329,7 @@ func (r *MachineOperationReconciler) updateOperationTarget(
 			}
 
 			mutate(&op.Status.Targets[i])
-			op.Status.Targets[i].Message = TruncateUTF8Bytes(op.Status.Targets[i].Message, MaxConditionMessageBytes)
+			op.Status.Targets[i].Message = statusmsg.TruncateCondition(op.Status.Targets[i].Message)
 			op.Status.Message = op.Status.Targets[i].Message
 
 			return

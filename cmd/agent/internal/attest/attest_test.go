@@ -21,8 +21,6 @@ import (
 	"github.com/google/go-tpm/tpm2/transport"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	"github.com/Azure/unbounded/internal/helpers"
 )
 
 // TestParseTPM2B tests the TPM2B wire-format parser.
@@ -158,7 +156,7 @@ func (n *nonClosingTPM) Close() error { return nil }
 func openSimulatorForE2E(t *testing.T) transport.TPMCloser {
 	t.Helper()
 
-	if !helpers.CgoEnabled {
+	if !cgoEnabled {
 		t.Skipf("skipping because the TPU simulator requires CGO, which is disabled")
 	}
 

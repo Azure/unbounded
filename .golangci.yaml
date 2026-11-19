@@ -38,6 +38,7 @@ linters:
     - unused
 
     # Project policy.
+    - depguard
     - goheader
     - misspell
     - wsl_v5
@@ -77,6 +78,19 @@ linters:
   # settings for linters that never ran are what this file was full of.
 
   settings:
+    depguard:
+      rules:
+        # internal/helpers packages are leaves: they import only the standard
+        # library and third-party modules, so depending on one never couples a
+        # component to another. See internal/helpers/AGENTS.md. The pattern is
+        # anchored to the repository root, so an internal/helpers directory
+        # inside a component's own tree is not covered.
+        helpers:
+          files:
+            - "${config-path}/internal/helpers/**"
+          deny:
+            - pkg: github.com/Azure/unbounded
+              desc: internal/helpers packages must not import code from this repository (see internal/helpers/AGENTS.md)
     errcheck:
       # Treat type assertion as erroneous operation, though assertions should be avoided in general.
       check-type-assertions: true

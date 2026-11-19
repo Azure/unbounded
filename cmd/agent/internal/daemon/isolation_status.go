@@ -13,7 +13,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	"github.com/Azure/unbounded/internal/machineops"
+	"github.com/Azure/unbounded/internal/helpers/statusmsg"
 	"github.com/Azure/unbounded/internal/provision"
 )
 
@@ -86,7 +86,7 @@ var isolationChangeOptionalFields = []string{"strategy", "reason", "message", "l
 // status.isolationChange, with its message truncated and every empty optional
 // field set to null.
 func isolationChangePatch(change v1alpha3.IsolationChangeStatus) (map[string]any, error) {
-	change.Message = machineops.TruncateUTF8Bytes(change.Message, v1alpha3.IsolationChangeMessageMaxLength)
+	change.Message = statusmsg.Truncate(change.Message, v1alpha3.IsolationChangeMessageMaxLength)
 
 	data, err := json.Marshal(change)
 	if err != nil {

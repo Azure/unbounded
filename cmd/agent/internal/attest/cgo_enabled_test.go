@@ -3,6 +3,6 @@
 
 //go:build cgo
 
-package helpers
+package attest
 
-const CgoEnabled = true
+const cgoEnabled = true

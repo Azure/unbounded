@@ -21,7 +21,6 @@ import (
 	"github.com/Azure/unbounded/hack/cmd/forge/forge/azsdk"
 	"github.com/Azure/unbounded/hack/cmd/forge/forge/cluster"
 	"github.com/Azure/unbounded/hack/cmd/forge/forge/infra"
-	"github.com/Azure/unbounded/internal/kube"
 )
 
 const (
@@ -44,7 +43,6 @@ type MachinePool struct {
 type Datacenter struct {
 	AzureCli          *azsdk.ClientSet
 	KubeCli           kubernetes.Interface
-	Kubectl           kube.KubectlFunc
 	Logger            *slog.Logger
 	Name              string
 	Location          string

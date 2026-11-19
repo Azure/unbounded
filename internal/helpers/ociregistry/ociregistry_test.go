@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package ociutil
+package ociregistry
 
 import (
 	"testing"
@@ -30,11 +30,14 @@ func TestConfigurePlainHTTP(t *testing.T) {
 		{name: "172.31.x.x", imageRef: "172.31.255.255:5555/repo", wantPlain: true},
 		{name: "192.168.x.x", imageRef: "192.168.0.1/repo", wantPlain: true},
 		{name: "192.168.x.x with port", imageRef: "192.168.200.1:5555/repo", wantPlain: true},
+		// Private IPv6 (unique local, fc00::/7).
+		{name: "IPv6 unique local", imageRef: "[fd00::1]:5000/repo", wantPlain: true},
 
-		// Public addresses — should NOT be plain HTTP.
+		// Public addresses must not use plain HTTP.
 		{name: "public registry", imageRef: "registry.example.com/repo", wantPlain: false},
 		{name: "docker.io", imageRef: "docker.io/library/ubuntu", wantPlain: false},
 		{name: "public IP", imageRef: "8.8.8.8:5000/repo", wantPlain: false},
+		{name: "public IPv6", imageRef: "[2001:db8::1]:5000/repo", wantPlain: false},
 		{name: "172.32.x.x (not private)", imageRef: "172.32.0.1:5555/repo", wantPlain: false},
 	}
 

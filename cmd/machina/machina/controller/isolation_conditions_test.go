@@ -14,15 +14,16 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	metav1validation "k8s.io/apimachinery/pkg/apis/meta/v1/validation"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	"github.com/Azure/unbounded/internal/machineops"
 )
 
 // The drift logic treats modes as opaque strings: a newer CRD, or an agent
@@ -418,14 +419,14 @@ func TestSyncIsolationConditions_MessageIsBounded(t *testing.T) {
 	m.Status.Isolation = unboundedv1alpha3.IsolationNSpawn
 	m.Status.IsolationChange = &unboundedv1alpha3.IsolationChangeStatus{
 		TargetMode: isolationContainer, Phase: unboundedv1alpha3.IsolationChangeFailed,
-		Message: strings.Repeat("\u00e9", machineops.MaxConditionMessageBytes),
+		Message: strings.Repeat("\u00e9", 1<<15),
 	}
 
 	require.True(t, syncIso(m))
 
-	msg := cond(m, unboundedv1alpha3.MachineConditionIsolationDrift).Message
-	require.LessOrEqual(t, len(msg), machineops.MaxConditionMessageBytes)
-	require.True(t, utf8.ValidString(msg))
+	c := cond(m, unboundedv1alpha3.MachineConditionIsolationDrift)
+	require.Empty(t, metav1validation.ValidateCondition(*c, field.NewPath("status", "conditions")))
+	require.True(t, utf8.ValidString(c.Message))
 }
 
 // An InProgress change must be looked at again when it turns stale, even when

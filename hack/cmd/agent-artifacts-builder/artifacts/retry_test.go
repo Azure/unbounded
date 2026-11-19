@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package ociutil
+package artifacts
 
 import (
 	"context"
@@ -13,7 +13,7 @@ import (
 	"testing"
 )
 
-func TestRetryableNetworkError(t *testing.T) {
+func TestIsRetryableNetworkError(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -35,8 +35,8 @@ func TestRetryableNetworkError(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			if got := RetryableNetworkError(tt.err); got != tt.want {
-				t.Fatalf("RetryableNetworkError(%v) = %t, want %t", tt.err, got, tt.want)
+			if got := isRetryableNetworkError(tt.err); got != tt.want {
+				t.Fatalf("isRetryableNetworkError(%v) = %t, want %t", tt.err, got, tt.want)
 			}
 		})
 	}

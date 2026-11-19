@@ -17,7 +17,8 @@ import (
 	"oras.land/oras-go/v2/registry/remote/auth"
 	"oras.land/oras-go/v2/registry/remote/retry"
 
-	"github.com/Azure/unbounded/internal/ociutil"
+	"github.com/Azure/unbounded/internal/helpers/dockermedia"
+	"github.com/Azure/unbounded/internal/helpers/ociregistry"
 )
 
 // Open opens one OCI artifact blob selected by title from a source of the form
@@ -153,7 +154,7 @@ func fetchManifestDescriptor(ctx context.Context, repo *remote.Repository, sourc
 }
 
 func isIndexMediaType(mediaType string) bool {
-	return mediaType == ocispec.MediaTypeImageIndex || mediaType == ociutil.DockerMediaTypeManifestList
+	return mediaType == ocispec.MediaTypeImageIndex || mediaType == dockermedia.ManifestListType
 }
 
 func fetchPlatformManifest(ctx context.Context, repo *remote.Repository, sourceRoot string, data []byte) (ocispec.Manifest, error) {
@@ -202,7 +203,7 @@ func openRepository(parsed *url.URL) (*remote.Repository, string, error) {
 		return nil, "", fmt.Errorf("parse OCI repository %q: %w", name, err)
 	}
 
-	ociutil.ConfigurePlainHTTP(repo)
+	ociregistry.ConfigurePlainHTTP(repo)
 	repo.Client = &auth.Client{Client: retry.DefaultClient, Cache: auth.DefaultCache}
 
 	return repo, reference, nil

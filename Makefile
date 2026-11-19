@@ -247,7 +247,7 @@ NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
 # Frontend build toggle (dev builds produce unminified output with sourcemaps).
 REACT_DEV ?= false
 
-.PHONY: all help fmt lint lint-actions test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc install-helm install-kind generate kubectl-unbounded forge relctl relctl-build agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests e2e-gantry e2e-racer gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build license-check notice notice-check gantry gantry-build gantry-manifests inventory-manifests
+.PHONY: all help fmt lint lint-actions lint-layout test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc install-helm install-kind generate kubectl-unbounded forge relctl relctl-build agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests e2e-gantry e2e-racer gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build license-check notice notice-check gantry gantry-build gantry-manifests inventory-manifests
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests gantry-chart-lint gantry-chart-package unbounded-operator-chart-lint unbounded-operator-chart-package release-bom release-manifests unbounded-operator-release-manifest
 .PHONY: karpenter karpenter-fmt karpenter-lint karpenter-test karpenter-test-ci karpenter-build karpenter-manifests image-karpenter-local
 .PHONY: image-machina-local image-token-refresher-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-unbounded-operator-push image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
@@ -271,8 +271,9 @@ help: ## Show this help
 	@echo ""
 	@echo "Development:"
 	@echo "  fmt                              Format Go source (gofumpt + wsl_v5)"
-	@echo "  lint                             Run golangci-lint and actionlint"
+	@echo "  lint                             Run golangci-lint, actionlint and the layout checks"
 	@echo "  lint-actions                     Run actionlint over .github/workflows"
+	@echo "  lint-layout                      Check repository layout rules golangci-lint cannot express"
 	@echo "  test                             Run all tests"
 	@echo "  karpenter                        Lint, test and build the Karpenter plugin (nested module)"
 	@echo "  karpenter-fmt|lint|test|build    Individual Karpenter plugin steps"
@@ -563,9 +564,10 @@ fmt: check-deps ## Format all Go source files (gofumpt + golangci-lint auto-fixe
 
 # lint runs the same checks locally and in CI and does NOT auto-fix. Run
 # `make fmt` to apply fixes. wsl_v5 is enforced via .golangci.yaml.
-lint: ## Run golangci-lint and actionlint (matches CI; run `make fmt` to auto-fix)
+lint: ## Run golangci-lint, actionlint and the layout checks (matches CI; run `make fmt` to auto-fix)
 	$(GOLINT) $(GO_PACKAGE_PATTERNS)
 	@$(MAKE) --no-print-directory lint-actions
+	@$(MAKE) --no-print-directory lint-layout
 
 # lint-actions is part of `lint` because a workflow file is only ever parsed
 # when it is dispatched. A duplicate `default:` key made release-prepare.yaml
@@ -582,6 +584,17 @@ lint-actions: ## Run actionlint over .github/workflows
 		{ echo "error: actionlint not found. Install it with:"; \
 		  echo "  go install github.com/rhysd/actionlint/cmd/actionlint@$(ACTIONLINT_VERSION)"; exit 1; }
 	actionlint -shellcheck= -pyflakes=
+
+# lint-layout checks layout rules golangci-lint cannot express. internal/helpers/
+# holds helper packages only: a Go file directly in it would turn the directory
+# back into a catch-all package. See internal/helpers/AGENTS.md.
+lint-layout: ## Check repository layout rules golangci-lint cannot express
+	@files=$$(find internal/helpers -maxdepth 1 -name '*.go'); \
+	if [ -n "$$files" ]; then \
+		echo "error: internal/helpers/ holds packages only (see internal/helpers/AGENTS.md); move these into a package under it:"; \
+		echo "$$files"; \
+		exit 1; \
+	fi
 
 ifdef CI
 # In CI each job is independent; skip chained prerequisites.
