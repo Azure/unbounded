@@ -368,7 +368,7 @@ fn collection(t: &Term_, kind: Kind) -> String {
     }
 }
 
-fn apply(inv: &mut Inventory, kind: Kind, event: &str, v: &Value) {
+fn apply(shared: &Shared, inv: &mut Inventory, kind: Kind, event: &str, v: &Value) {
     let key = str_at(v, &["metadata", "uid"]).to_owned();
     let deleted = event == "DELETED";
     match kind {
@@ -384,8 +384,21 @@ fn apply(inv: &mut Inventory, kind: Kind, event: &str, v: &Value) {
         Kind::Pods => {
             if deleted {
                 inv.pods.remove(&key);
+                shared.pod_reports.borrow_mut().remove(&key);
             } else {
-                inv.pods.insert(key, PodInfo::from_json(v));
+                let pod = PodInfo::from_json(v);
+                match pod.annotations.get(annotations::REPORT) {
+                    Some(report) => {
+                        shared
+                            .pod_reports
+                            .borrow_mut()
+                            .insert(key.clone(), report.clone());
+                    }
+                    None => {
+                        shared.pod_reports.borrow_mut().remove(&key);
+                    }
+                }
+                inv.pods.insert(key, pod);
             }
         }
         Kind::Caches => {
@@ -431,7 +444,7 @@ async fn watch(t: Rc<Term_>, kind: Kind) {
                 Kind::Caches => inv.caches.clear(),
             }
             for v in &items {
-                apply(&mut inv, kind, "ADDED", v);
+                apply(&t.shared, &mut inv, kind, "ADDED", v);
             }
             match kind {
                 Kind::Nodes => inv.nodes_synced = true,
@@ -463,7 +476,13 @@ async fn watch(t: Rc<Term_>, kind: Kind) {
                         backoff = 1;
                         rv = str_at(&e.object, &["metadata", "resourceVersion"]).to_owned();
                         if e.kind != "BOOKMARK" {
-                            apply(&mut t.inventory.borrow_mut(), kind, &e.kind, &e.object);
+                            apply(
+                                &t.shared,
+                                &mut t.inventory.borrow_mut(),
+                                kind,
+                                &e.kind,
+                                &e.object,
+                            );
                             t.changed.notify();
                         }
                     }

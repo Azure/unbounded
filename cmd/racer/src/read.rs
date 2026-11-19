@@ -510,6 +510,18 @@ impl Coordinator {
         self.fill.dependencies.candidates.node.clone()
     }
 
+    /// The local node's position in the current ranking of `page`.
+    pub(crate) fn rank_position(
+        &self,
+        membership: std::sync::Arc<crate::topology::Membership>,
+        page: &crate::model::PageId,
+    ) -> Option<usize> {
+        self.fill
+            .dependencies
+            .candidates
+            .rank_position(membership, page)
+    }
+
     /// The page's rank-0 owner within its cache's pool, the same ranking reads use.
     pub(crate) async fn rank_owner(
         &self,

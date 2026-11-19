@@ -61,6 +61,7 @@ var RequiredCRDNames = [...]string{
 	"sitepeerings.net.unbounded-cloud.io",
 	"gatewaypoolpeerings.net.unbounded-cloud.io",
 	"clustercaches.racer.unbounded-cloud.io",
+	"clustercachefills.racer.unbounded-cloud.io",
 }
 
 // bootstrapManifestSets returns the embedded manifest filesystems whose CRDs the

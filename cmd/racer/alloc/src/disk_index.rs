@@ -137,6 +137,9 @@ pub struct PageTicket {
     slot: PageSlot,
 
     cache: CacheKey,
+
+    /// Append into the pinned segment class; see [`DiskIndex::reserve_pinned`].
+    pinned: bool,
 }
 
 impl PageTicket {
@@ -751,17 +754,32 @@ impl DiskIndex {
         Ok(())
     }
 
-    fn reserve_unchecked(&mut self, slot: PageSlot, cache: CacheKey) -> PageTicket {
+    fn reserve_unchecked(&mut self, slot: PageSlot, cache: CacheKey, pinned: bool) -> PageTicket {
         self.update(slot, |this| this.entries[slot.0 as usize].flags |= INFLIGHT);
         self.caches[usize::from(cache.idx.0)].inflight += 1;
-        PageTicket { slot, cache }
+        PageTicket {
+            slot,
+            cache,
+            pinned,
+        }
     }
 
     /// Reserve the right to publish `slot` for `cache`. A stored slot may be
     /// re-published (replacing its record) without extra capacity.
     pub fn reserve(&mut self, slot: PageSlot, cache: CacheKey) -> Result<PageTicket> {
+        self.reserve_pinned(slot, cache, false)
+    }
+
+    /// Like [`Self::reserve`], recording that the record's append belongs to
+    /// the pinned segment class.
+    pub fn reserve_pinned(
+        &mut self,
+        slot: PageSlot,
+        cache: CacheKey,
+        pinned: bool,
+    ) -> Result<PageTicket> {
         self.check_reserve(slot, cache, 0)?;
-        Ok(self.reserve_unchecked(slot, cache))
+        Ok(self.reserve_unchecked(slot, cache, pinned))
     }
 
     /// Transactional queue replacement: validate that `slot` can be reserved
@@ -779,11 +797,15 @@ impl DiskIndex {
         }
         self.check_reserve(slot, cache, 1)?;
         let removed = self.unstore(victim);
-        Ok((self.reserve_unchecked(slot, cache), removed))
+        Ok((self.reserve_unchecked(slot, cache, false), removed))
     }
 
     fn release_ticket(&mut self, ticket: PageTicket) {
-        let PageTicket { slot, cache } = ticket;
+        let PageTicket {
+            slot,
+            cache,
+            pinned: _,
+        } = ticket;
         self.update(slot, |this| {
             this.entries[slot.0 as usize].flags &= !INFLIGHT
         });
@@ -809,7 +831,8 @@ impl DiskIndex {
         if segments.count() > self.segments.len() {
             return Err((ticket, Error::InvalidConfiguration));
         }
-        let (lease, extent) = match segments.append(length) {
+        let pinned = ticket.pinned;
+        let (lease, extent) = match segments.append_in(length, pinned) {
             Ok(appended) => appended,
             Err(error) => return Err((ticket, error)),
         };
@@ -1240,6 +1263,12 @@ impl DiskIndex {
             let index = self.hand % count;
             self.hand = (index + 1) % count;
             let id = SegmentId(index as u64);
+            // A pinned segment may have no live page holders (for example a
+            // sealed tail whose pages were released after a checkpoint) and
+            // must never be reclaimed. See `Segments::clear_pinned`.
+            if segments.pinned(id)? {
+                continue;
+            }
             let state = segments.state(id)?;
             let heat = self.segments[index].heat;
             self.segments[index].heat /= 2;
@@ -1398,6 +1427,53 @@ mod tests {
         drop(lease);
         let written = index.write_complete(writing);
         index.publish(written)
+    }
+
+    fn write_pinned(
+        index: &mut DiskIndex,
+        segments: &Segments,
+        slot: u32,
+        cache: CacheKey,
+        length: usize,
+    ) -> Result<Option<Removed>> {
+        let ticket = index.reserve_pinned(PageSlot(slot), cache, true)?;
+        let (lease, writing) =
+            index
+                .append(segments, ticket, length)
+                .map_err(|(ticket, error)| {
+                    index.cancel(ticket);
+                    error
+                })?;
+        drop(lease);
+        let written = index.write_complete(writing);
+        index.publish(written)
+    }
+
+    #[test]
+    fn reclaim_skips_pinned_segments_even_without_page_holders() {
+        let segments = segments(2);
+        let mut index = DiskIndex::new(4, 4, 2).unwrap();
+        let cache = index.add_cache(CacheIdx(0)).unwrap();
+        write_pinned(&mut index, &segments, 0, cache, SEGMENT as usize).unwrap();
+        write(&mut index, &segments, 1, cache, SEGMENT as usize).unwrap();
+        assert!(segments.pinned(SegmentId(0)).unwrap());
+        assert!(index.can_evict(SegmentId(0)), "no page holders remain");
+        let mut removed = Vec::new();
+        index
+            .reclaim(
+                &segments,
+                ReclaimBudget {
+                    free_reserve: 1,
+                    max_visits: 8,
+                    max_entries: 8,
+                },
+                |slot, _| removed.push(slot.0),
+            )
+            .unwrap();
+        assert_eq!(removed, [1]);
+        assert!(index.get(PageSlot(0)).is_some());
+        assert!(index.get(PageSlot(1)).is_none());
+        assert_eq!(segments.state(SegmentId(0)), Ok(SegmentState::Sealed));
     }
 
     fn walk(index: &mut DiskIndex, cursor: AgeCursor, limit: usize) -> Vec<u32> {

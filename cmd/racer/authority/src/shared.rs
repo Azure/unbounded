@@ -124,6 +124,16 @@ pub struct Shared {
     pub authz: RefCell<crate::rules::authz::AuthCache<crate::auth::Caller>>,
     /// API call budget for bearer authorization.
     pub auth_budget: RefCell<crate::rules::authz::ApiBudget>,
+    /// Process-wide ClusterCacheFills by UID.
+    pub fills: RefCell<BTreeMap<String, crate::fills::FillView>>,
+    /// ClusterCacheFills listed at least once, or the CRD is absent.
+    pub fills_synced: Cell<bool>,
+    /// Process-wide ClusterCaches by UID, for fill cache resolution.
+    pub fills_caches: RefCell<BTreeMap<String, crate::rules::catalog::CacheInfo>>,
+    /// ClusterCaches listed at least once, or the CRD is absent.
+    pub fills_caches_synced: Cell<bool>,
+    /// Racer Pod report annotations by Pod UID, kept by the primary.
+    pub pod_reports: RefCell<BTreeMap<String, String>>,
 }
 
 impl Shared {
@@ -242,6 +252,9 @@ pub(crate) mod tests {
             peer_port: 8082,
             page_size: racer_wire::object::PageSize::DEFAULT,
             rotation: Default::default(),
+            trust_bundle: "/etc/ssl/certs/ca-certificates.crt".into(),
+            azure_authority_host: "https://login.microsoftonline.com/".into(),
+            azure_federated_token_file: None,
         };
         Rc::new(Shared {
             identity: "p1/00".into(),
@@ -266,6 +279,11 @@ pub(crate) mod tests {
             rng: RefCell::new(Box::new(racer_core::rng::SplitMix64::new(1))),
             authz: Default::default(),
             auth_budget: Default::default(),
+            fills: RefCell::new(BTreeMap::new()),
+            fills_synced: Cell::new(false),
+            fills_caches: RefCell::new(BTreeMap::new()),
+            fills_caches_synced: Cell::new(false),
+            pod_reports: RefCell::new(BTreeMap::new()),
         })
     }
 }

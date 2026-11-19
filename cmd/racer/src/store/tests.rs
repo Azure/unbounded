@@ -5029,7 +5029,7 @@ mod checkpoint {
         let env = racer_io::Env::host();
         let original = image(&env, 3);
         let bytes = encode(&original).unwrap();
-        assert_eq!(CHECKPOINT_VERSION, 4);
+        assert_eq!(CHECKPOINT_VERSION, 5);
         assert_eq!(&bytes[32..68], original.cluster.0.as_bytes());
         let decoded = decode(&bytes).unwrap();
         assert_eq!(decoded.cluster, original.cluster);
@@ -5247,14 +5247,14 @@ mod checkpoint {
             }],
         };
         let bytes = checkpoint_format::encode(&image).unwrap();
-        assert_eq!(bytes.len(), 252);
-        let digest: String = bytes[220..]
+        assert_eq!(bytes.len(), 254);
+        let digest: String = bytes[222..]
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect();
         assert_eq!(
             digest,
-            "bbf59ea8dd0c1f31c0790d92da22835a5d1ab13391ea37c16c8a5dbc824376bf"
+            "909bcb3e77b5b46dee0eff0db007b058b5641cbb2c380536dbca7f30c1427e3c"
         );
     }
 
@@ -5263,20 +5263,20 @@ mod checkpoint {
         let env = racer_io::Env::host();
         let bytes = checkpoint_format::encode(&image(&env, 7)).unwrap();
         // image(7) layout: header 32 + cluster UUID 36 + shard count 4 + worker 2 + geometry 80
-        // + segment count 4 + two segments 50 + page count 4 + descriptor 92
+        // + segment count 4 + two segments 52 + page count 4 + descriptor 92
         // (36-byte cache, 32-byte key, 4-byte quoted ETag, length 8, three
         // string lengths 12) + page fields 56 (page number, key ID, segment,
         // generation, extent offset and length) + descriptor count 4 + the
-        // standalone "empty" descriptor 95 + hold count 4 = 463 body bytes,
+        // standalone "empty" descriptor 95 + hold count 4 = 465 body bytes,
         // then the digest.
-        assert_eq!(bytes.len(), 495);
-        let digest: String = bytes[463..]
+        assert_eq!(bytes.len(), 497);
+        let digest: String = bytes[465..]
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect();
         assert_eq!(
             digest,
-            "23b6ac07a293ccf5f5ea277ec59980d3fc5a82b66a68b0a2190100ec07e51caa"
+            "9b3c9202c65a91ef1b93ca0360e1fb8cf29e8ece277cd252ba31974eed9e7af6"
         );
         let decoded = checkpoint_format::decode(&bytes).unwrap();
         assert_eq!(decoded.shards[0].index.entries.len(), 1);
@@ -5413,7 +5413,7 @@ mod checkpoint {
         let mut corrupt = encoded.clone();
         corrupt[20] ^= 1;
         assert!(checkpoint_format::decode(&corrupt).is_err());
-        for (offset, value) in [(8, 5u32), (12, 1), (32, u32::MAX)] {
+        for (offset, value) in [(8, CHECKPOINT_VERSION + 1), (12, 1), (32, u32::MAX)] {
             let mut corrupt = encoded.clone();
             corrupt[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
             resign(&mut corrupt);
@@ -6375,6 +6375,45 @@ fn retention_sweep_drops_pages_whose_key_left_the_keyring() {
     }
     assert_eq!(removed, 3);
     assert!(memory.resident().is_empty());
+}
+
+#[test]
+fn sweep_unavailable_keeps_a_pinned_page_whose_key_left_the_keyring() {
+    use crate::control::for_caches;
+    use crate::store::holds::HoldPages;
+    use crate::store::pins::FillId;
+    use crate::test_support::security::keys;
+    use crate::test_support::security::rotation_bundle;
+    let env = racer_io::Env::host();
+    let keys = Rc::new(keys(&env));
+    let cache = CacheId(crate::test_support::security::CACHE.into());
+    let availability = for_caches(&env, keys.clone(), vec![cache]);
+    let f = Fixture::assemble(&env, Directory::new(), availability);
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().unwrap();
+    let index = f.store.writer.index();
+    let copy = f.copy(1, 3);
+    let version = copy.metadata.version.clone();
+    f.enqueue(copy).unwrap();
+    drive(&f.reactor, f.store.writer.progress(1, &scope(&env))).unwrap();
+    assert_eq!(index.snapshot().unwrap().entries.len(), 1);
+    let until = racer_io::Clock::host().wall_now() + std::time::Duration::from_secs(60);
+    let epoch = index
+        .reserve_pin_pages(FillId(1), &version, &HoldPages::prefix(1), until)
+        .unwrap();
+    // Retiring the page key starts a sweep pass that must skip the pinned page.
+    let mut next = rotation_bundle(2, (*keys.peer_trust_roots().unwrap()).clone());
+    next.cache_keys.clear();
+    keys.install(next).unwrap();
+    assert_eq!(index.sweep_unavailable(1), 0);
+    assert_eq!(index.snapshot().unwrap().entries.len(), 1);
+    index.release_pin_pages(FillId(1), &version, &HoldPages::prefix(1), epoch);
+    // A new key generation restarts the sweep pass at the oldest page.
+    let mut next = rotation_bundle(3, (*keys.peer_trust_roots().unwrap()).clone());
+    next.cache_keys.clear();
+    keys.install(next).unwrap();
+    assert_eq!(index.sweep_unavailable(1), 1);
+    assert!(index.snapshot().unwrap().entries.is_empty());
 }
 
 /// Pools aligned only to a 512-byte device unit pad bodies short of the 4 KiB

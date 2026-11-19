@@ -44,6 +44,7 @@ mod config;
 mod conn;
 mod control;
 pub mod entropy;
+pub mod fills;
 mod kube;
 mod lease;
 pub mod limits;
@@ -64,8 +65,12 @@ pub mod webhook;
 
 pub use config::{Config, Rotation, SeatPolicy};
 pub use control::{Authority, Bootstrap, Diagnostics, Handle, Role, start};
+pub use fills::{FillObject, FillView, Manifest};
 pub use racer_io::exec::Next;
 pub use shared::PrimaryView;
+
+/// Progress one node reports for one fill.
+pub use rules::rails::FillProgress;
 
 /// Threads started by [`start`]. The dataplane counts this against its budget.
 pub const CONTROL_THREADS: usize = 1;

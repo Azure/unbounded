@@ -230,6 +230,7 @@ func TestRequiredCRDNames(t *testing.T) {
 		"sitepeerings.net.unbounded-cloud.io",
 		"gatewaypoolpeerings.net.unbounded-cloud.io",
 		"clustercaches.racer.unbounded-cloud.io",
+		"clustercachefills.racer.unbounded-cloud.io",
 	}
 
 	if RequiredCRDNames != want {

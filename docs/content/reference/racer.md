@@ -242,6 +242,82 @@ reads the origin instead. Do these steps before you upgrade:
   can edit `credential` in place; only `containerURL` is immutable. Then delete
   the Secret if nothing else uses it.
 
+## ClusterCacheFill
+
+| Property | Contract |
+|----------|----------|
+| API | `racer.unbounded-cloud.io/v1alpha1`, kind `ClusterCacheFill` |
+| Resource / short name | `clustercachefills` / `ccfill` |
+| Scope | Cluster-scoped |
+| Fields | `spec.cacheName`, `spec.prefixes`, `spec.replicas`, `spec.maxFootprint`, `spec.resyncInterval`; `status` is written by the control plane |
+| Cache requirement | `spec.origin` must be set, and `spec.passthrough` must not be set |
+| Limits | 1 to 16 prefixes, 8192 listed objects per fill, 1 to 3 replicas |
+
+A fill pre-fetches the objects under a set of blob-name prefixes and keeps
+them on disk. Prefetch tickets are best effort and can be evicted at any time.
+A fill is a reservation: while it is `Ready`, its pages are not evicted to
+make room for other data, and pages lost to node replacement or a restart are
+fetched again.
+
+```yaml
+apiVersion: racer.unbounded-cloud.io/v1alpha1
+kind: ClusterCacheFill
+metadata:
+  name: llama-70b
+spec:
+  cacheName: models
+  prefixes: ["meta-llama/Llama-3-70B/"]
+  replicas: 2
+  maxFootprint: 322122547200   # 300 GiB, in bytes
+```
+
+Prefixes are blob names in the cache's container, not Racer keys. Racer keys
+are hashes, so the control plane lists the container to expand each prefix,
+using the cache's credential. Listing needs permission to list that container;
+a credential that can only read blobs fails with `Forbidden`. With a workload
+identity, set `spec.origin.azure.credential.workloadIdentity.tenantID`: the
+fill lister exchanges the projected token for that tenant directly and does
+not discover a tenant from a storage challenge.
+
+`spec.maxFootprint` bounds the pinned payload the fill may reserve
+cluster-wide, in bytes, counting each object's pages rounded up to the page
+size, times every replica. Actual disk use can be higher because a pinned
+segment keeps its unused tail until its last pin is released. A larger
+selection fails admission with `ExceedsMaxFootprint`; it is never truncated.
+`spec.replicas` is the number of distinct nodes that keep a copy and defaults
+to 2. `spec.resyncInterval` defaults to `1h` and bounds how long the listed
+object set may go stale.
+
+The fill reports its place in the node cache in status:
+
+- `manifest` lists the object count, logical bytes, and the digest of the
+  listed set.
+- `footprintBytes` is the planned reservation and stays at or below
+  `maxFootprint` while `Accepted` is true.
+- `residentBytes` is the page-rounded payload of the copies confirmed on disk.
+  It reaches `footprintBytes` when every replica is pinned and is lower while a
+  fill is still in progress.
+- `underReplicatedBytes` is the missing-copy shortfall; a `Ready` fill reports
+  zero.
+
+Conditions are `Accepted` (the cache is supported and the reservation fits),
+`Listed` (the current generation has a manifest), `Progressing` (the first
+fill is under way), `Ready` (every replica copy is confirmed), and `Degraded`
+(the fill is short of confirmed copies after being `Ready`, or a node refused
+pinned bytes).
+A `Degraded` fill still serves reads from the pages it has and falls back to
+peers and the origin for the rest.
+
+Deleting a fill releases its pins. Data leaves by normal eviction; it is not
+deleted outright. Changing `spec.cacheName` is not allowed: create a new fill
+instead. Changing prefixes, replicas, or `maxFootprint` bumps the spec
+generation and the fill re-adopts it and pins again under the new plan.
+
+A fill reserves pinned segments on each node. The per-worker pin budget is
+`RACER_PINNED_SEGMENT_PERCENT` of the worker's segments, 50 by default. When
+that budget is full, the fill reports `Degraded` with `CapacityLost` rather
+than evicting other data.
+
 ## Node requirements
 
 Run Racer on Linux nodes with working `io_uring` support and enough local disk.
@@ -393,6 +469,7 @@ each worker and are never divided.
 | `RACER_DISK_PAGE_ENTRIES` | `65536` | Node | 1..1,048,576 | Disk page-index budget in file mode; device mode can raise it. |
 | `RACER_CHECKPOINT_BYTES` | `67108864` (64 MiB) | Node | 1..536,870,912 bytes | Checkpoint working-set budget; device mode can raise it. |
 | `RACER_RETAINED_SEGMENT_PERCENT` | `50` | Per I/O worker | 1..100 % | Spill-hold cap of each I/O worker, as a percentage of its segments and page-index capacity. |
+| `RACER_PINNED_SEGMENT_PERCENT` | `50` | Per I/O worker | 0..100 % | Cache-fill pin cap of each I/O worker, as a percentage of its segments and page-index capacity; `0` disables pins. |
 | `RACER_RANGE_SPILL_PAGES` | `0` | Node | 0..1,024 | Pages past the read window that a read may fetch to local disk under a short hold; `0` disables spill. |
 
 #### Disk retention
