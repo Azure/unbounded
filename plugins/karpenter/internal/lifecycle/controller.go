@@ -5,12 +5,13 @@
 // upstream Karpenter controllers and the shared allocation controller leave
 // open between them: fencing a host as soon as its NodeClaim terminates,
 // replacing a NodeClaim whose allocation failed, and releasing an allocation
-// whose NodeClaim is gone.
+// whose NodeClaim is gone once its Node runs no workload.
 package lifecycle
 
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -28,6 +29,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	podutil "sigs.k8s.io/karpenter/pkg/utils/pod"
 
 	"github.com/Azure/unbounded/plugins/karpenter/internal/capacity"
 	"github.com/Azure/unbounded/plugins/karpenter/internal/nodeclass"
@@ -38,6 +40,13 @@ const (
 	// orphanRecheck is how often an orphan that cannot be released yet is
 	// looked at again when nothing about it changes.
 	orphanRecheck = 30 * time.Second
+
+	// cordonedAtAnnotation records on a Node when this controller cordoned
+	// it as an orphan's Node.
+	cordonedAtAnnotation = "karpenter.unbounded-cloud.io/orphan-cordoned-at"
+
+	// podNodeField selects the Pods bound to one Node.
+	podNodeField = "spec.nodeName"
 
 	reasonMachineDeleting = "MachineDeleting"
 
@@ -61,6 +70,8 @@ type Controller struct {
 	Reader   client.Reader
 	Recorder record.EventRecorder
 	Marker   UnavailableMarker
+	// Now is the clock; it defaults to time.Now.
+	Now func() time.Time
 }
 
 // Register adds the controller to the manager.
@@ -291,8 +302,9 @@ func failureLabel(allocation *capacity.Allocation) string {
 
 // reconcileOrphan handles an allocation whose NodeClaim is gone, so nobody
 // will call Delete for it. It fences the allocation first, then authorizes
-// release only when no Node exists for it: without a consumer nothing has
-// drained a Node, and this controller never evicts workloads.
+// release only when no Node exists for it or the Node runs no workload:
+// without a consumer nothing has drained the Node, and this controller never
+// evicts workloads.
 func (c *Controller) reconcileOrphan(
 	ctx context.Context,
 	object *unstructured.Unstructured,
@@ -303,8 +315,9 @@ func (c *Controller) reconcileOrphan(
 	}
 
 	if allocation.Spec.Lifecycle == capacity.Released {
-		// Release is authorized; the allocation controller finishes it.
-		return reconcile.Result{}, nil
+		// Release is authorized; the allocation controller finishes it. No
+		// NodeClaim is left to remove the Node of the host it deletes.
+		return reconcile.Result{}, c.removeNodes(ctx, allocation)
 	}
 
 	if !apimeta.IsStatusConditionTrue(allocation.Status.Conditions, capacity.ConditionFenced) {
@@ -313,63 +326,192 @@ func (c *Controller) reconcileOrphan(
 		return reconcile.Result{RequeueAfter: orphanRecheck}, nil
 	}
 
-	node, err := c.nodeFor(ctx, allocation)
+	nodes, err := c.nodesFor(ctx, allocation)
 	if err != nil {
 		return reconcile.Result{}, err
 	}
 
-	if node != "" {
+	if len(nodes) == 0 {
+		return reconcile.Result{}, c.releaseOrphan(ctx, object,
+			"NodeClaim %s is gone and no Node is registered for this allocation; release authorized",
+			allocation.Spec.ConsumerRef.Name)
+	}
+
+	// Nothing new may land on a Node that no NodeClaim accounts for. Pods are
+	// counted only once the cordon has settled, so one the scheduler placed
+	// just before it is seen.
+	settled, err := c.cordon(ctx, nodes)
+	if err != nil || !settled {
+		return reconcile.Result{RequeueAfter: orphanRecheck}, err
+	}
+
+	names := nodeNames(nodes)
+
+	workloads, err := c.workloads(ctx, nodes)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+
+	if len(workloads) > 0 {
 		orphans.WithLabelValues("held").Inc()
 		c.Recorder.Eventf(object, corev1.EventTypeWarning, eventOrphanHeld,
-			"NodeClaim %s is gone and Node %s is registered for this allocation; drain and delete the Node, or set spec.lifecycle to Released, to release the host",
-			allocation.Spec.ConsumerRef.Name, node)
+			"NodeClaim %s is gone and cordoned Node %s still runs %d workload Pod(s), such as %s; the host is released once they are gone, or drain and delete the Node, or set spec.lifecycle to Released",
+			allocation.Spec.ConsumerRef.Name, names, len(workloads), workloads[0])
 
 		return reconcile.Result{RequeueAfter: orphanRecheck}, nil
 	}
 
+	return reconcile.Result{}, c.releaseOrphan(ctx, object,
+		"NodeClaim %s is gone and Node %s runs no workload Pods; release authorized",
+		allocation.Spec.ConsumerRef.Name, names)
+}
+
+func (c *Controller) releaseOrphan(ctx context.Context, object *unstructured.Unstructured, message string, arguments ...any) error {
 	if err := provider.AuthorizeRelease(ctx, c.Client, object); err != nil {
-		return reconcile.Result{}, err
+		return err
 	}
 
 	orphans.WithLabelValues("released").Inc()
-	c.Recorder.Eventf(object, corev1.EventTypeNormal, eventOrphanReleased,
-		"NodeClaim %s is gone and no Node is registered for this allocation; release authorized",
-		allocation.Spec.ConsumerRef.Name)
+	c.Recorder.Eventf(object, corev1.EventTypeNormal, eventOrphanReleased, message, arguments...)
 
-	return reconcile.Result{}, nil
+	return nil
 }
 
-// nodeFor returns the name of a Node that exists for the allocation, or "".
+func nodeNames(nodes []*corev1.Node) string {
+	names := make([]string, 0, len(nodes))
+	for _, node := range nodes {
+		names = append(names, node.Name)
+	}
+
+	return strings.Join(names, ", ")
+}
+
+func (c *Controller) now() time.Time {
+	if c.Now != nil {
+		return c.Now()
+	}
+
+	return time.Now()
+}
+
+// cordon makes every Node unschedulable and records when. It reports whether
+// all of them have been cordoned for at least orphanRecheck. A Node somebody
+// else cordoned, or uncordoned again, starts its own wait here.
+func (c *Controller) cordon(ctx context.Context, nodes []*corev1.Node) (bool, error) {
+	now := c.now()
+	settled := true
+
+	for _, node := range nodes {
+		since, err := time.Parse(time.RFC3339, node.Annotations[cordonedAtAnnotation])
+		if err == nil && node.Spec.Unschedulable {
+			settled = settled && !now.Before(since.Add(orphanRecheck))
+
+			continue
+		}
+
+		settled = false
+		base := node.DeepCopy()
+		node.Spec.Unschedulable = true
+
+		if node.Annotations == nil {
+			node.Annotations = map[string]string{}
+		}
+
+		node.Annotations[cordonedAtAnnotation] = now.UTC().Format(time.RFC3339)
+
+		if err := c.Client.Patch(ctx, node, client.MergeFrom(base)); client.IgnoreNotFound(err) != nil {
+			return false, fmt.Errorf("cordon Node %s: %w", node.Name, err)
+		}
+	}
+
+	return settled, nil
+}
+
+// workloads returns the Pods on the Nodes that releasing their host would
+// interrupt, as namespace/name in a stable order. DaemonSet and static Pods
+// exist only because the Node does, and a finished Pod has nothing left to
+// interrupt. It reads the API server, because a Pod the cache has not seen
+// yet must still block release.
+func (c *Controller) workloads(ctx context.Context, nodes []*corev1.Node) ([]string, error) {
+	var workloads []string
+
+	for _, node := range nodes {
+		var pods corev1.PodList
+		if err := c.Reader.List(ctx, &pods, client.MatchingFields{podNodeField: node.Name}); err != nil {
+			return nil, fmt.Errorf("list Pods on Node %s: %w", node.Name, err)
+		}
+
+		for index := range pods.Items {
+			pod := &pods.Items[index]
+			if podutil.IsOwnedByDaemonSet(pod) || podutil.IsOwnedByNode(pod) || podutil.IsTerminal(pod) {
+				continue
+			}
+
+			workloads = append(workloads, pod.Namespace+"/"+pod.Name)
+		}
+	}
+
+	slices.Sort(workloads)
+
+	return workloads, nil
+}
+
+// removeNodes deletes every Node that exists for the allocation.
+func (c *Controller) removeNodes(ctx context.Context, allocation *capacity.Allocation) error {
+	nodes, err := c.nodesFor(ctx, allocation)
+	if err != nil {
+		return err
+	}
+
+	for _, node := range nodes {
+		err := c.Client.Delete(ctx, node, client.Preconditions{UID: &node.UID})
+		if client.IgnoreNotFound(err) != nil && !apierrors.IsConflict(err) {
+			return fmt.Errorf("delete Node %s: %w", node.Name, err)
+		}
+	}
+
+	return nil
+}
+
+// nodesFor returns every Node that exists for the allocation: the one its
+// nodeRef names and any registered with its provider ID. All of them run on
+// the allocation's host, so all of them decide whether it can be released.
 // It reads the API server, because a Node the cache has not seen yet must
 // still block release. The allocation's nodeRef is set once and never
 // cleared, so it is only a hint: the Node it names counts only while it
 // exists as the same object.
-func (c *Controller) nodeFor(ctx context.Context, allocation *capacity.Allocation) (string, error) {
+func (c *Controller) nodesFor(ctx context.Context, allocation *capacity.Allocation) ([]*corev1.Node, error) {
 	providerID := capacity.ProviderIDPrefix + string(allocation.UID)
 
-	if reference := allocation.Status.NodeRef; reference != nil && reference.Name != "" {
-		var node corev1.Node
+	var (
+		found    []*corev1.Node
+		recorded string
+	)
 
-		err := c.Reader.Get(ctx, client.ObjectKey{Name: reference.Name}, &node)
+	if reference := allocation.Status.NodeRef; reference != nil && reference.Name != "" {
+		node := new(corev1.Node)
+
+		err := c.Reader.Get(ctx, client.ObjectKey{Name: reference.Name}, node)
 		if client.IgnoreNotFound(err) != nil {
-			return "", fmt.Errorf("get Node %s: %w", reference.Name, err)
+			return nil, fmt.Errorf("get Node %s: %w", reference.Name, err)
 		}
 
 		if err == nil && (reference.UID == "" || node.UID == reference.UID || node.Spec.ProviderID == providerID) {
-			return node.Name, nil
+			found = append(found, node)
+			recorded = node.Name
 		}
 	}
 
 	var nodes corev1.NodeList
 	if err := c.Reader.List(ctx, &nodes); err != nil {
-		return "", fmt.Errorf("list Nodes: %w", err)
+		return nil, fmt.Errorf("list Nodes: %w", err)
 	}
 
 	for index := range nodes.Items {
-		if nodes.Items[index].Spec.ProviderID == providerID {
-			return nodes.Items[index].Name, nil
+		if node := &nodes.Items[index]; node.Spec.ProviderID == providerID && node.Name != recorded {
+			found = append(found, node)
 		}
 	}
 
-	return "", nil
+	return found, nil
 }

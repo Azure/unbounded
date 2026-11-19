@@ -26,15 +26,19 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 
 	"github.com/Azure/unbounded/plugins/karpenter/internal/capacity"
+	"github.com/Azure/unbounded/plugins/karpenter/internal/lifecycle"
 	"github.com/Azure/unbounded/plugins/karpenter/internal/manifests"
 	"github.com/Azure/unbounded/plugins/karpenter/internal/nodeclass"
 	"github.com/Azure/unbounded/plugins/karpenter/internal/provider"
@@ -117,6 +121,10 @@ func start(t *testing.T) *cluster {
 	scheme := runtime.NewScheme()
 	must(t, corev1.AddToScheme(scheme))
 	nodeclass.AddToScheme(scheme)
+
+	karpenter := schema.GroupVersion{Group: "karpenter.sh", Version: "v1"}
+	scheme.AddKnownTypes(karpenter, &v1.NodeClaim{}, &v1.NodeClaimList{})
+	metav1.AddToGroupVersion(scheme, karpenter)
 
 	admin, err := client.New(config, client.Options{Scheme: scheme})
 	must(t, err)
@@ -456,6 +464,116 @@ func TestPluginLifecycleAgainstTheAPIServer(t *testing.T) {
 
 	if err := instance.Delete(ctx, nodeClaim); !cloudprovider.IsNodeClaimNotFoundError(err) {
 		t.Fatalf("a released allocation must be reported not found, got %v", err)
+	}
+}
+
+type noMarks struct{}
+
+func (noMarks) MarkUnavailable(types.UID, string) {}
+
+// TestOrphanIsReleasedOnceItsNodeIsEmpty runs the orphan path under the
+// plugin's identity: it must be allowed to cordon the Node, list the Pods
+// bound to it, authorize release and remove the Node.
+func TestOrphanIsReleasedOnceItsNodeIsEmpty(t *testing.T) {
+	c := start(t)
+	ctx := t.Context()
+
+	c.readyClass()
+
+	nodeClaim := claim()
+	name := capacity.AllocationName(nodeClaim.UID)
+
+	// The NodeClaim is never stored, so the allocation is an orphan.
+	if _, err := c.provider().Create(ctx, nodeClaim); err == nil {
+		t.Fatal("an allocation without a snapshot must be pending")
+	}
+
+	accepted := c.accept(name)
+	providerID := capacity.ProviderIDPrefix + string(accepted.GetUID())
+
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "ub-node"}, Spec: corev1.NodeSpec{ProviderID: providerID}}
+	must(t, c.admin.Create(ctx, node))
+
+	pod := func(name string, owners ...metav1.OwnerReference) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: name, OwnerReferences: owners},
+			Spec: corev1.PodSpec{
+				NodeName:   node.Name,
+				Containers: []corev1.Container{{Name: "main", Image: "registry.example.com/main:v1"}},
+			},
+		}
+	}
+
+	workload := pod("workload")
+	must(t, c.admin.Create(ctx, workload))
+	must(t, c.admin.Create(ctx, pod("daemon", metav1.OwnerReference{
+		APIVersion: "apps/v1", Kind: "DaemonSet", Name: "daemon", UID: "00000000-0000-4000-8000-0000000da3a0",
+	})))
+
+	controller := &lifecycle.Controller{
+		Client: c.plugin, Reader: c.plugin, Recorder: record.NewFakeRecorder(10), Marker: noMarks{},
+	}
+	reconcileOrphan := func() {
+		t.Helper()
+
+		_, err := controller.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name}})
+		must(t, err)
+	}
+	lifecycleOf := func() string {
+		t.Helper()
+
+		stored := provider.AllocationObject()
+		must(t, c.admin.Get(ctx, client.ObjectKey{Name: name}, stored))
+
+		value, _, _ := unstructured.NestedString(stored.Object, "spec", "lifecycle")
+
+		return value
+	}
+
+	// First pass: the orphan is deleted, which fences it. The allocation
+	// controller then reports the fence.
+	reconcileOrphan()
+
+	stored := provider.AllocationObject()
+	must(t, c.admin.Get(ctx, client.ObjectKey{Name: name}, stored))
+
+	if stored.GetDeletionTimestamp() == nil {
+		t.Fatal("an orphan must be deleted first")
+	}
+
+	must(t, unstructured.SetNestedSlice(stored.Object, []any{map[string]any{
+		"type": capacity.ConditionFenced, "status": "True", "reason": "AllocationDeleting", "message": "fenced",
+		"lastTransitionTime": metav1.Now().UTC().Format(time.RFC3339),
+	}}, "status", "conditions"))
+	must(t, c.admin.Status().Update(ctx, stored))
+
+	reconcileOrphan()
+	must(t, c.admin.Get(ctx, client.ObjectKey{Name: node.Name}, node))
+
+	if !node.Spec.Unschedulable || lifecycleOf() != capacity.Active {
+		t.Fatal("the orphan's Node must be cordoned before anything is decided")
+	}
+
+	// The cordon has settled.
+	controller.Now = func() time.Time { return time.Now().Add(time.Minute) }
+
+	reconcileOrphan()
+
+	if lifecycleOf() != capacity.Active {
+		t.Fatal("a workload Pod on the Node must hold the orphan")
+	}
+
+	must(t, c.admin.Delete(ctx, workload, client.GracePeriodSeconds(0)))
+	reconcileOrphan()
+
+	if lifecycleOf() != capacity.Released {
+		t.Fatal("a Node that runs only a DaemonSet Pod must not hold the orphan")
+	}
+
+	reconcileOrphan()
+
+	if err := c.admin.Get(ctx, client.ObjectKey{Name: node.Name}, node); !apierrors.IsNotFound(err) {
+		t.Fatalf("the released host's Node must be removed, got %v", err)
 	}
 }
 

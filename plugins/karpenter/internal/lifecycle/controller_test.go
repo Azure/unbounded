@@ -5,6 +5,7 @@ package lifecycle
 
 import (
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -63,7 +64,12 @@ func newFixture(t *testing.T, objects ...client.Object) *fixture {
 	scheme.AddKnownTypes(schema.GroupVersion{Group: "karpenter.sh", Version: "v1"}, &v1.NodeClaim{}, &v1.NodeClaimList{})
 	metav1.AddToGroupVersion(scheme, schema.GroupVersion{Group: "karpenter.sh", Version: "v1"})
 
-	store := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
+	store := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).
+		WithIndex(&corev1.Pod{}, podNodeField, func(object client.Object) []string {
+			pod, _ := object.(*corev1.Pod)
+
+			return []string{pod.Spec.NodeName}
+		}).Build()
 	marker := &fakeMarker{}
 
 	return &fixture{
@@ -416,6 +422,59 @@ func TestFencedOrphanWithoutANodeIsReleased(t *testing.T) {
 	}
 }
 
+// cordoned is an orphan's Node after the controller's first pass.
+func cordoned(node *corev1.Node) *corev1.Node {
+	node.Spec.Unschedulable = true
+	node.Annotations = map[string]string{
+		cordonedAtAnnotation: time.Now().Add(-time.Hour).UTC().Format(time.RFC3339),
+	}
+
+	return node
+}
+
+func testPod(name, node string, changes ...func(*corev1.Pod)) *corev1.Pod {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "workloads", Name: name},
+		Spec:       corev1.PodSpec{NodeName: node},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+
+	for _, change := range changes {
+		change(pod)
+	}
+
+	return pod
+}
+
+func ownedBy(apiVersion, kind string) func(*corev1.Pod) {
+	return func(pod *corev1.Pod) {
+		pod.OwnerReferences = []metav1.OwnerReference{{APIVersion: apiVersion, Kind: kind, Name: "owner", UID: "owner-uid"}}
+	}
+}
+
+func (f *fixture) node(name string) *corev1.Node {
+	f.t.Helper()
+
+	node := new(corev1.Node)
+
+	err := f.store.Get(f.t.Context(), client.ObjectKey{Name: name}, node)
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+
+	if err != nil {
+		f.t.Fatal(err)
+	}
+
+	return node
+}
+
+func (f *fixture) events() int {
+	recorder, _ := f.controller.Recorder.(*record.FakeRecorder)
+
+	return len(recorder.Events)
+}
+
 func TestFencedOrphanWithANodeIsHeld(t *testing.T) {
 	fenced := condition(capacity.ConditionFenced, metav1.ConditionTrue, "AllocationDeleting")
 	recorded := func(allocation *capacity.Allocation) {
@@ -425,21 +484,43 @@ func TestFencedOrphanWithANodeIsHeld(t *testing.T) {
 	for name, objects := range map[string][]client.Object{
 		"Node recorded on the allocation": {
 			testAllocation(t, deleting, fenced, recorded),
-			&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "ub-node", UID: "node-uid"}},
+			cordoned(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "ub-node", UID: "node-uid"}}),
+			testPod("workload", "ub-node"),
 		},
 		"Node registered with the provider ID": {
 			testAllocation(t, deleting, fenced),
-			&corev1.Node{
+			cordoned(&corev1.Node{
 				ObjectMeta: metav1.ObjectMeta{Name: "ub-node"},
 				Spec:       corev1.NodeSpec{ProviderID: capacity.ProviderIDPrefix + string(allocationUID)},
-			},
+			}),
+			testPod("workload", "ub-node"),
 		},
 		"recorded Node is gone but another has the provider ID": {
 			testAllocation(t, deleting, fenced, recorded),
-			&corev1.Node{
+			cordoned(&corev1.Node{
 				ObjectMeta: metav1.ObjectMeta{Name: "renamed"},
 				Spec:       corev1.NodeSpec{ProviderID: capacity.ProviderIDPrefix + string(allocationUID)},
-			},
+			}),
+			testPod("workload", "renamed"),
+		},
+		"workload is owned by a ReplicaSet": {
+			testAllocation(t, deleting, fenced, recorded),
+			cordoned(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "ub-node", UID: "node-uid"}}),
+			testPod("workload", "ub-node", ownedBy("apps/v1", "ReplicaSet")),
+		},
+		"workload is terminating": {
+			testAllocation(t, deleting, fenced, recorded),
+			cordoned(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "ub-node", UID: "node-uid"}}),
+			testPod("workload", "ub-node", func(pod *corev1.Pod) {
+				pod.Finalizers = []string{"example.com/hold"}
+				pod.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+			}),
+		},
+		"workload is pending on the Node": {
+			testAllocation(t, deleting, fenced, recorded),
+			cordoned(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "ub-node", UID: "node-uid"}}),
+			testPod("daemon", "ub-node", ownedBy("apps/v1", "DaemonSet")),
+			testPod("workload", "ub-node", func(pod *corev1.Pod) { pod.Status.Phase = corev1.PodPending }),
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -448,18 +529,199 @@ func TestFencedOrphanWithANodeIsHeld(t *testing.T) {
 			result := f.reconcile()
 
 			if f.allocation().Spec.Lifecycle != capacity.Active {
-				t.Fatal("an orphan with a Node must not be released: nothing drained it")
+				t.Fatal("an orphan whose Node runs a workload must not be released: nothing drained it")
 			}
 
 			if result.RequeueAfter == 0 {
 				t.Fatal("a held orphan must be looked at again")
 			}
 
-			recorder, _ := f.controller.Recorder.(*record.FakeRecorder)
-			if len(recorder.Events) != 1 {
+			if f.events() != 1 {
 				t.Fatal("holding an orphan must be reported")
 			}
 		})
+	}
+}
+
+// A Pod bound just before the cordon must be seen, so the pass that cordons
+// the Node decides nothing, even when the Node looks empty.
+func TestFencedOrphanCordonsItsNodeBeforeCountingPods(t *testing.T) {
+	f := newFixture(
+		t,
+		testAllocation(t, deleting, condition(capacity.ConditionFenced, metav1.ConditionTrue, "AllocationDeleting")),
+		&corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: "ub-node"},
+			Spec:       corev1.NodeSpec{ProviderID: capacity.ProviderIDPrefix + string(allocationUID)},
+		},
+	)
+
+	result := f.reconcile()
+
+	if !f.node("ub-node").Spec.Unschedulable {
+		t.Fatal("an orphan's Node must be cordoned")
+	}
+
+	if f.allocation().Spec.Lifecycle != capacity.Active || result.RequeueAfter == 0 {
+		t.Fatal("the pass that cordons the Node must not release and must look again")
+	}
+
+	if f.events() != 0 {
+		t.Fatal("nothing is decided yet, so nothing is reported")
+	}
+
+	// Another event on the allocation must not cut the wait short.
+	if result := f.reconcile(); f.allocation().Spec.Lifecycle != capacity.Active || result.RequeueAfter == 0 {
+		t.Fatal("Pods must not be counted before the cordon has settled")
+	}
+
+	f.controller.Now = func() time.Time { return time.Now().Add(orphanRecheck) }
+	f.reconcile()
+
+	if f.allocation().Spec.Lifecycle != capacity.Released {
+		t.Fatal("an empty cordoned Node must not hold the orphan")
+	}
+}
+
+// A Node cordoned by someone else, or uncordoned again, has not been watched
+// by this controller, so it starts its own wait.
+func TestFencedOrphanDoesNotTrustAForeignCordon(t *testing.T) {
+	for name, node := range map[string]*corev1.Node{
+		"cordoned by someone else": {
+			ObjectMeta: metav1.ObjectMeta{Name: "ub-node"},
+			Spec:       corev1.NodeSpec{ProviderID: capacity.ProviderIDPrefix + string(allocationUID), Unschedulable: true},
+		},
+		"uncordoned after the controller cordoned it": func() *corev1.Node {
+			node := cordoned(&corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{Name: "ub-node"},
+				Spec:       corev1.NodeSpec{ProviderID: capacity.ProviderIDPrefix + string(allocationUID)},
+			})
+			node.Spec.Unschedulable = false
+
+			return node
+		}(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(
+				t,
+				testAllocation(t, deleting, condition(capacity.ConditionFenced, metav1.ConditionTrue, "AllocationDeleting")),
+				node,
+			)
+
+			result := f.reconcile()
+
+			if f.allocation().Spec.Lifecycle != capacity.Active || result.RequeueAfter == 0 {
+				t.Fatal("the orphan must wait for its own cordon to settle")
+			}
+
+			if stored := f.node("ub-node"); !stored.Spec.Unschedulable || stored.Annotations[cordonedAtAnnotation] == "" {
+				t.Fatal("the Node must be cordoned and the time recorded")
+			}
+		})
+	}
+}
+
+// Two Nodes can carry the allocation's provider ID, for example after a host
+// registered again under another name. Both run on the host.
+func TestFencedOrphanConsidersEveryNodeOfItsHost(t *testing.T) {
+	fenced := condition(capacity.ConditionFenced, metav1.ConditionTrue, "AllocationDeleting")
+	hostNode := func(name string) *corev1.Node {
+		return cordoned(&corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: name, UID: types.UID(name + "-uid")},
+			Spec:       corev1.NodeSpec{ProviderID: capacity.ProviderIDPrefix + string(allocationUID)},
+		})
+	}
+
+	f := newFixture(t, testAllocation(t, deleting, fenced), hostNode("a-empty"), hostNode("b-busy"), testPod("workload", "b-busy"))
+
+	f.reconcile()
+
+	if f.allocation().Spec.Lifecycle != capacity.Active {
+		t.Fatal("a workload on any Node of the host must hold the orphan")
+	}
+
+	workload := testPod("workload", "b-busy")
+	if err := f.store.Delete(t.Context(), workload); err != nil {
+		t.Fatal(err)
+	}
+
+	f.reconcile()
+
+	if f.allocation().Spec.Lifecycle != capacity.Released {
+		t.Fatal("the orphan must be released once every Node of the host is empty")
+	}
+
+	f.reconcile()
+
+	if f.node("a-empty") != nil || f.node("b-busy") != nil {
+		t.Fatal("every Node of the released host must be removed")
+	}
+}
+
+func TestFencedOrphanWithAnEmptyNodeIsReleasedAndItsNodeRemoved(t *testing.T) {
+	f := newFixture(
+		t,
+		testAllocation(t, deleting, condition(capacity.ConditionFenced, metav1.ConditionTrue, "AllocationDeleting")),
+		cordoned(&corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: "ub-node"},
+			Spec:       corev1.NodeSpec{ProviderID: capacity.ProviderIDPrefix + string(allocationUID)},
+		}),
+		&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "unrelated"}},
+		testPod("daemon", "ub-node", ownedBy("apps/v1", "DaemonSet")),
+		testPod("static", "ub-node", ownedBy("v1", "Node")),
+		testPod("succeeded", "ub-node", func(pod *corev1.Pod) { pod.Status.Phase = corev1.PodSucceeded }),
+		testPod("failed", "ub-node", func(pod *corev1.Pod) { pod.Status.Phase = corev1.PodFailed }),
+		testPod("elsewhere", "unrelated"),
+	)
+
+	f.reconcile()
+
+	if f.allocation().Spec.Lifecycle != capacity.Released {
+		t.Fatal("DaemonSet, static and finished Pods must not hold the orphan")
+	}
+
+	if f.events() != 1 {
+		t.Fatal("releasing an orphan must be reported")
+	}
+
+	if f.node("ub-node") == nil {
+		t.Fatal("the Node is removed only once release is authorized")
+	}
+
+	f.reconcile()
+
+	if f.node("ub-node") != nil {
+		t.Fatal("no NodeClaim is left to remove the released host's Node")
+	}
+
+	if f.node("unrelated") == nil {
+		t.Fatal("only the allocation's own Node may be removed")
+	}
+
+	// The Node is gone: nothing is left to do.
+	if result := f.reconcile(); result.RequeueAfter != 0 {
+		t.Fatal("nothing is left to do once the Node is removed")
+	}
+}
+
+// An operator who sets spec.lifecycle to Released on a held orphan has
+// accepted the interruption; the Node goes with the host.
+func TestReleasedOrphanLosesItsNodeWhateverItRuns(t *testing.T) {
+	f := newFixture(
+		t,
+		testAllocation(t, deleting, func(allocation *capacity.Allocation) {
+			allocation.Spec.Lifecycle = capacity.Released
+		}),
+		&corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: "ub-node"},
+			Spec:       corev1.NodeSpec{ProviderID: capacity.ProviderIDPrefix + string(allocationUID)},
+		},
+		testPod("workload", "ub-node"),
+	)
+
+	f.reconcile()
+
+	if f.node("ub-node") != nil {
+		t.Fatal("a released orphan's Node must be removed")
 	}
 }
 
