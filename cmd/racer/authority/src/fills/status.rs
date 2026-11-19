@@ -21,7 +21,6 @@ const TICK: Duration = Duration::from_secs(10);
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Progress {
     pub resident_bytes: u64,
-    pub under_replicated_bytes: u64,
     pub refused_bytes: u64,
     pub nodes: i32,
 }
@@ -50,9 +49,6 @@ pub fn aggregate(reports: &BTreeMap<String, String>, view: &FillView) -> Progres
             continue;
         }
         progress.resident_bytes = progress.resident_bytes.saturating_add(entry.pinned_bytes);
-        progress.under_replicated_bytes = progress
-            .under_replicated_bytes
-            .saturating_add(entry.owned_bytes.saturating_sub(entry.pinned_bytes));
         progress.refused_bytes = progress.refused_bytes.saturating_add(entry.refused_bytes);
         if entry.pinned_pages > 0 {
             progress.nodes = progress.nodes.saturating_add(1);
@@ -76,12 +72,13 @@ pub fn status(
         && view.listed_cache_uid == view.cache_uid;
     let listed_ok = manifest_current && view.error.is_none();
     let footprint = view.planned_footprint_bytes.unwrap_or(0);
+    let under_replicated_bytes = footprint.saturating_sub(progress.resident_bytes);
     let missing_members = view.replicas > view.available_nodes;
     let ready = view.accepted
         && manifest_current
         && !missing_members
         && progress.resident_bytes >= footprint
-        && progress.under_replicated_bytes == 0;
+        && under_replicated_bytes == 0;
     let was_ready = previous
         .map(|p| condition_status(p, "Ready") == Some("True"))
         .unwrap_or(false);
@@ -108,7 +105,7 @@ pub fn status(
                 view.replicas, view.available_nodes
             ),
         ))
-    } else if (was_ready || was_degraded) && (short || progress.under_replicated_bytes > 0) {
+    } else if (was_ready || was_degraded) && (short || under_replicated_bytes > 0) {
         if progress.nodes == 0 || previous_nodes > i64::from(progress.nodes) {
             Some(("MemberLost", "a node with pins left".to_owned()))
         } else {
@@ -199,7 +196,7 @@ pub fn status(
         "cacheUID": view.cache_uid,
         "footprintBytes": footprint,
         "residentBytes": progress.resident_bytes,
-        "underReplicatedBytes": progress.under_replicated_bytes,
+        "underReplicatedBytes": under_replicated_bytes,
         "nodes": progress.nodes,
         "conditions": [accepted, listed, progressing, ready_condition, degraded_condition],
     });
@@ -422,7 +419,6 @@ mod tests {
         reports.insert("p2".into(), report(other));
         let p = aggregate(&reports, &v);
         assert_eq!(p.resident_bytes, 100);
-        assert_eq!(p.under_replicated_bytes, 0);
         assert_eq!(p.nodes, 1);
         let s = status(&v, &reports, None);
         assert_eq!(s["observedGeneration"], 2);
@@ -431,7 +427,7 @@ mod tests {
         assert_eq!(s["manifest"]["logicalBytes"], 100);
         assert_eq!(s["footprintBytes"], 200);
         assert_eq!(s["residentBytes"], 100);
-        assert_eq!(s["underReplicatedBytes"], 0);
+        assert_eq!(s["underReplicatedBytes"], 100);
         assert_eq!(s["nodes"], 1);
         let c = statuses(&s);
         assert_eq!(c["Accepted"], ("True".into(), "Accepted".into()));
@@ -439,15 +435,19 @@ mod tests {
         assert_eq!(c["Progressing"], ("True".into(), "Filling".into()));
         assert_eq!(c["Ready"], ("False".into(), "Filling".into()));
         assert_eq!(c["Degraded"], ("False".into(), "Complete".into()));
-        // Missing copies make it Ready only when they are caught up.
+        // The shortfall is the full planned footprint minus confirmed pins.
         let mut short = progress_for(&v);
         short.pinned_pages = 5;
         short.pinned_bytes = 50;
         let mut reports = BTreeMap::new();
         reports.insert("p1".into(), report(short));
         let p = aggregate(&reports, &v);
-        assert_eq!(p.under_replicated_bytes, 50);
-        assert_eq!(status(&v, &reports, None)["underReplicatedBytes"], 50);
+        assert_eq!(p.resident_bytes, 50);
+        assert_eq!(status(&v, &reports, None)["underReplicatedBytes"], 150);
+        // A missing report leaves no resident copies and the whole plan short.
+        let missing = status(&v, &BTreeMap::new(), None);
+        assert_eq!(missing["residentBytes"], 0);
+        assert_eq!(missing["underReplicatedBytes"], 200);
     }
 
     #[test]
