@@ -418,6 +418,45 @@ Verify a private pull and Gantry peer distribution separately. Removing the
 selected upstream while retaining managed policy reports a configuration error;
 rerun attachment to restore it.
 
+Managed authentication is supported only on Linux Flex nodes whose kubelet runs
+on the host (the agent-managed node). Nodes that isolate the kubelet in a
+systemd-nspawn machine are not supported: the installer operates on the host
+filesystem and cannot reach a kubelet that runs in another PID namespace. On
+such a node the operator reports `GantryReady=False` with reason
+`RegistryAuthFailed` rather than restarting the kubelet indefinitely; inspect
+the `gantry-acr-auth` pod logs for the reason. Kubelet restarts are bounded by a
+per-configuration budget with exponential backoff, so a node that cannot
+activate the managed provider stops being restarted and is reported, not
+flapped.
+
+To turn managed authentication off and clean up the node configuration, use the
+explicit detach command:
+
+```bash
+kubectl unbounded gantry detach-acr
+```
+
+This reverts the node-auth policy to `external`, so the operator removes the
+managed provider files from every opted-in Flex node and restarts each kubelet
+once to drop the credential-provider flags, and removes the Gantry-owned
+Kubernetes authentication grants (`gantry-acr-pull` and the
+kubelet-token-audience bindings). It reports success only once the operator has
+converged the nodes. The Gantry-owned Azure pull identity, its identity binding,
+and the AcrPull role assignment are **retained** by default, because other
+workloads may still use that grant. To delete the owned identity and binding as
+well:
+
+```bash
+kubectl unbounded gantry detach-acr \
+  --remove-azure \
+  --cluster-resource-id "$AKS_ID"
+```
+
+`--remove-azure` deletes the `gantry-pull-<hash>` user-assigned identity and its
+AKS identity binding. The AcrPull role assignment at the ACR scope is not
+deleted automatically; remove it manually with `az role assignment delete` if it
+is no longer needed.
+
 #### Shared-Identity Authentication
 
 Shared identity is a compatibility mode for environments where kubelet or CRI

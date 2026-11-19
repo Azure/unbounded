@@ -52,6 +52,7 @@ type attachACRHandler struct {
 
 func gantryCommandGroup() *cobra.Command {
 	group := &cobra.Command{Use: "gantry", Short: "Configure Gantry image acceleration"}
+
 	h := &attachACRHandler{}
 	cmd := &cobra.Command{
 		Use: "attach-acr", Short: "Attach an existing ACR without changing authentication by default",
@@ -71,6 +72,7 @@ func gantryCommandGroup() *cobra.Command {
 	}
 
 	group.AddCommand(cmd)
+	group.AddCommand(gantryDetachCommand())
 
 	return group
 }

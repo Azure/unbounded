@@ -5,6 +5,8 @@ package registryauth
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -97,4 +99,56 @@ func TestNodeRejectsInvalidInlineConfiguration(t *testing.T) {
 	for _, config := range []string{"", "{", `{"mode":"unsupported"}`} {
 		require.Error(t, RunNode(t.Context(), NodeOptions{ConfigJSON: config}))
 	}
+}
+
+func TestProbeNodeLayoutRejectsIsolatedKubelet(t *testing.T) {
+	// A node root with no agent kubelet unit at all (the nspawn case, where the
+	// unit lives inside the machine rootfs, not the host) is an unsupported
+	// layout and must be a terminal failure, not an indefinite wait.
+	root := t.TempDir()
+	require.ErrorIs(t, probeNodeLayout(t.Context(), root), ErrUnsupportedKubeletLayout)
+}
+
+func TestProbeNodeLayoutToleratesMissingKubeletProcess(t *testing.T) {
+	// A node root that has the agent kubelet unit but no running kubelet process
+	// is a transient "wait for the kubelet", not an unsupported layout: the
+	// probe must succeed so the reconcile loop keeps waiting.
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, filepath.Dir(unitPath)), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(root, unitPath), []byte("[Service]\nExecStart=/usr/local/bin/kubelet $KUBELET_NODE_CONFIG_ARGS\n"), 0o644))
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "proc"), 0o755))
+
+	require.NoError(t, probeNodeLayout(t.Context(), root))
+}
+
+func TestProbeNodeLayoutAcceptsRunningKubelet(t *testing.T) {
+	// A fully matching node (unit + running kubelet in the root's /proc) is
+	// supported and must pass the probe.
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, filepath.Dir(unitPath)), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(root, unitPath), []byte("[Service]\nExecStart=/usr/local/bin/kubelet $KUBELET_NODE_CONFIG_ARGS\n"), 0o644))
+
+	proc := filepath.Join(root, "proc", "42")
+	require.NoError(t, os.MkdirAll(proc, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(proc, "comm"), []byte("kubelet\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(proc, "cmdline"), []byte("/usr/local/bin/kubelet\x00--config=/x\x00"), 0o644))
+
+	require.NoError(t, probeNodeLayout(t.Context(), root))
+}
+
+func TestProbeNodeLayoutReportsAmbiguousKubelet(t *testing.T) {
+	// Two kubelet processes in the root is ambiguous and must be reported as an
+	// error, not treated as a supported node.
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, filepath.Dir(unitPath)), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(root, unitPath), []byte("[Service]\nExecStart=/usr/local/bin/kubelet $KUBELET_NODE_CONFIG_ARGS\n"), 0o644))
+
+	for _, pid := range []string{"10", "20"} {
+		proc := filepath.Join(root, "proc", pid)
+		require.NoError(t, os.MkdirAll(proc, 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(proc, "comm"), []byte("kubelet\n"), 0o644))
+		require.NoError(t, os.WriteFile(filepath.Join(proc, "cmdline"), []byte("/usr/local/bin/kubelet\x00\x00"), 0o644))
+	}
+
+	require.Error(t, probeNodeLayout(t.Context(), root))
 }

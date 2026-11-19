@@ -170,6 +170,20 @@ func planRegistryAuth(ctx context.Context, env *component.Env) ([]component.Oper
 
 	result := component.NotReady("RegistryAuthInstalling", "installing the stock ACR credential provider on opted-in Flex nodes; inspect DaemonSet/"+registryAuthName+" and its pod logs")
 
+	// A rolled-out DaemonSet whose installers are all NotReady is a terminal
+	// failure, not an install in progress: every targeted node's installer has
+	// reported that it cannot configure the kubelet (unsupported layout, feature
+	// gate disabled, or restart budget exhausted). Surface it as a distinct
+	// condition reason so it stops reading as an infinite install.
+	if workloadMatches && existing.Spec.Template.Annotations[registryAuthHash] == digest &&
+		existing.Status.ObservedGeneration >= existing.Generation &&
+		existing.Status.DesiredNumberScheduled > 0 &&
+		existing.Status.UpdatedNumberScheduled == existing.Status.DesiredNumberScheduled &&
+		existing.Status.NumberAvailable == 0 {
+		result = component.NotReady("RegistryAuthFailed",
+			"stock ACR credential provider cannot be configured on targeted Flex nodes; every installer reports failure; inspect DaemonSet/"+registryAuthName+" pod logs for the reason (unsupported node layout, disabled feature gate, or exhausted restart budget)")
+	}
+
 	if workloadMatches && existing.Spec.Template.Annotations[registryAuthHash] == digest && registryAuthWorkloadReady(&existing) &&
 		len(existing.Spec.Template.Spec.Containers) > 0 && existing.Spec.Template.Spec.Containers[0].Image == env.Config.Image("unbounded-operator") {
 		message := "stock ACR credential provider configured; private pulls and Gantry acceleration remain unverified"

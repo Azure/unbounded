@@ -199,6 +199,37 @@ func TestNodeAuthReadinessDistinguishesUnverifiedPermissions(t *testing.T) {
 	}
 }
 
+func TestNodeAuthRolledOutButUnavailableReportsFailure(t *testing.T) {
+	// A DaemonSet that has rolled out to the current generation but whose
+	// installers are all NotReady (no pod available on a non-empty node set) is
+	// a terminal failure, not an install in progress: it must surface a distinct
+	// reason rather than reading as an infinite install.
+	source := authSource("")
+	env := testEnv(t, source)
+	operations, _, err := planRegistryAuth(t.Context(), env)
+	require.NoError(t, err)
+
+	var existing appsv1.DaemonSet
+
+	for _, op := range operations {
+		if op.Object.GetKind() == "DaemonSet" {
+			require.NoError(t, runtime.DefaultUnstructuredConverter.FromUnstructured(op.Object.Object, &existing))
+		}
+	}
+
+	existing.Generation = 2
+	existing.UID = "owned-installer"
+	// Rolled out to the current generation, all pods scheduled, but none ready.
+	existing.Status = appsv1.DaemonSetStatus{ObservedGeneration: 2, DesiredNumberScheduled: 2, UpdatedNumberScheduled: 2, NumberAvailable: 0}
+	require.NoError(t, env.Client.Create(t.Context(), &existing))
+
+	_, result, err := planRegistryAuth(t.Context(), env)
+	require.NoError(t, err)
+	require.False(t, result.Ready)
+	require.Equal(t, "RegistryAuthFailed", result.Reason)
+	require.Contains(t, result.Message, "cannot be configured")
+}
+
 func TestNodeAuthExternalModeKeepsReconcilerForOwnedFileCleanup(t *testing.T) {
 	source := authSource("mode: external")
 	existing := &appsv1.DaemonSet{ObjectMeta: ownedAuthMetadata()}

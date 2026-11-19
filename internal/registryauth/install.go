@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"sigs.k8s.io/yaml"
 )
@@ -29,10 +31,64 @@ const (
 	ownedCAPath        = installDir + "/proxy-ca.crt"
 	ownerPath          = installDir + "/.owner"
 	restartPath        = installDir + "/.restart-required"
+	backoffPath        = installDir + "/.restart-backoff"
 	dropInPath         = "/etc/systemd/system/kubelet.service.d/90-unbounded-registry-auth.conf"
 	unitPath           = "/etc/systemd/system/kubelet.service"
 	managedMarker      = "# Managed by unbounded-operator registry authentication.\n"
 )
+
+// restartBudget caps how many consecutive kubelet restarts one policy revision
+// may trigger before the installer stops restarting and reports a terminal
+// failure. It is deliberately small: a kubelet that cannot come up with the
+// managed provider flags is not healed by more restarts, and unbounded
+// restarts flap workloads. A budget reset requires a genuine configuration
+// change or an explicit detach.
+const restartBudget = 3
+
+// restartBackoffDelay grows per restart attempt so a flapping node does not
+// restart the kubelet on every reconcile tick. The first attempt is immediate;
+// subsequent attempts wait base << (attempt-1), capped.
+func restartBackoffDelay(attempt int) time.Duration {
+	if attempt <= 1 {
+		return 0
+	}
+
+	const base = 2 * time.Minute
+
+	const cap = 30 * time.Minute
+
+	delay := base << (attempt - 2)
+	if delay > cap {
+		return cap
+	}
+
+	return delay
+}
+
+// BackoffState persists the restart budget across installer pod restarts so a
+// recreated DaemonSet pod does not get a fresh budget. It lives on the node
+// filesystem, keyed by the policy revision (config hash), so a genuine policy
+// change resets the budget while a pod recreation does not.
+type BackoffState struct {
+	Revision  string    `json:"revision"`
+	Attempt   int       `json:"attempt"`
+	NextTime  time.Time `json:"nextTime"`
+	Exhausted bool      `json:"exhausted"`
+}
+
+// ErrRestartBudgetExhausted is returned when the per-revision restart budget is
+// spent and the kubelet still lacks the managed provider flags. The installer
+// stops restarting and reports this as a terminal failure; a genuine
+// configuration change or an explicit detach resets the budget.
+var ErrRestartBudgetExhausted = errors.New("kubelet restart budget exhausted for this configuration; stop retrying and inspect the node (managed ACR provider is installed but the kubelet has not activated it)")
+
+// ErrRestartBackoff is returned while the exponential backoff between restart
+// attempts is in progress. The caller should wait RetryAfter before retrying.
+type ErrRestartBackoff struct{ RetryAfter time.Duration }
+
+func (e ErrRestartBackoff) Error() string {
+	return fmt.Sprintf("kubelet restart backoff in progress; retry in %s", e.RetryAfter.Round(time.Second))
+}
 
 // Installer manages its own files and drop-in without editing the agent's unit.
 type Installer struct {
@@ -40,6 +96,113 @@ type Installer struct {
 	Executable  string
 	HostCommand func(context.Context, ...string) error
 	KubeletArgs func() ([]string, error)
+
+	// Revision identifies the policy revision this reconcile belongs to. It is
+	// the key of the persisted restart budget, so a policy change resets the
+	// budget while a pod recreation on the same policy does not.
+	Revision string
+
+	// now overrides the clock for the backoff; defaults to time.Now.
+	now func() time.Time
+}
+
+func (i *Installer) clock() time.Time {
+	if i.now != nil {
+		return i.now()
+	}
+
+	return time.Now()
+}
+
+// loadBackoff reads the persisted restart budget. A missing or corrupt file
+// yields a fresh state.
+func (i *Installer) loadBackoff() BackoffState {
+	data, err := os.ReadFile(i.path(backoffPath))
+	if err != nil {
+		return BackoffState{}
+	}
+
+	var state BackoffState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return BackoffState{}
+	}
+
+	return state
+}
+
+// recordBackoff persists the restart budget after a restart attempt.
+func (i *Installer) recordBackoff(state BackoffState) error {
+	data, err := json.Marshal(state)
+	if err != nil {
+		return err
+	}
+
+	_, err = i.write(backoffPath, data, 0o600)
+
+	return err
+}
+
+// clearBackoff drops the persisted budget once the kubelet is known to run with
+// the managed flags, so the next configuration change starts from a fresh
+// budget. It is a no-op if the file is already absent.
+func (i *Installer) clearBackoff() error {
+	err := os.Remove(i.path(backoffPath))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
+	return nil
+}
+
+// gateRestart enforces the per-revision restart budget and exponential backoff
+// before a kubelet restart is allowed. It returns ErrRestartBudgetExhausted
+// when the budget is spent, ErrRestartBackoff while a cooldown is in progress,
+// or nil to allow the restart. It is the single choke point shared by the
+// managed and external (teardown) paths, so neither can flap a node.
+func (i *Installer) gateRestart(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	state := i.loadBackoff()
+
+	if state.Revision != i.Revision {
+		state = BackoffState{Revision: i.Revision}
+	}
+
+	if state.Exhausted {
+		if err := i.recordBackoff(state); err != nil {
+			return err
+		}
+
+		return ErrRestartBudgetExhausted
+	}
+
+	now := i.clock()
+	if !state.NextTime.IsZero() && now.Before(state.NextTime) {
+		return ErrRestartBackoff{RetryAfter: state.NextTime.Sub(now)}
+	}
+
+	return nil
+}
+
+// recordRestartAttempt records that a restart was issued, advancing the budget
+// and scheduling the next backoff. It marks the state exhausted once the
+// budget is spent so subsequent reconciles stop restarting.
+func (i *Installer) recordRestartAttempt() error {
+	state := i.loadBackoff()
+	if state.Revision != i.Revision {
+		state = BackoffState{Revision: i.Revision}
+	}
+
+	state.Attempt++
+	state.NextTime = i.clock().Add(restartBackoffDelay(state.Attempt))
+
+	if state.Attempt >= restartBudget {
+		state.Exhausted = true
+	}
+
+	return i.recordBackoff(state)
 }
 
 func (i *Installer) Reconcile(ctx context.Context, cfg Config) error {
@@ -167,7 +330,11 @@ func (i *Installer) Reconcile(ctx context.Context, cfg Config) error {
 	}
 
 	if changed || binaryChanged || unitChanged || pendingErr == nil || !hasProviderArgs(args) {
-		if err := ctx.Err(); err != nil {
+		// A restart is disruptive, so a failed attempt is not retried on every
+		// 30 s tick: it is gated by a per-revision budget and an exponential
+		// backoff, both persisted on the node so a pod recreation neither resets
+		// the budget nor restarts immediately.
+		if err := i.gateRestart(ctx); err != nil {
 			return err
 		}
 
@@ -176,6 +343,10 @@ func (i *Installer) Reconcile(ctx context.Context, cfg Config) error {
 		}
 
 		if err := i.HostCommand(ctx, "restart", "kubelet.service"); err != nil {
+			return err
+		}
+
+		if err := i.recordRestartAttempt(); err != nil {
 			return err
 		}
 	}
@@ -194,6 +365,10 @@ func (i *Installer) Reconcile(ctx context.Context, cfg Config) error {
 	}
 
 	if err := os.Remove(i.path(restartPath)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
+	if err := i.clearBackoff(); err != nil {
 		return err
 	}
 
@@ -432,6 +607,14 @@ func (i *Installer) remove(ctx context.Context) error {
 	}
 
 	if data != nil || usesManagedProvider(args) || pendingErr == nil {
+		// The disable path restarts the kubelet to drop the managed flags, so it
+		// is bounded by the same per-revision budget and backoff as the
+		// managed path. A node that cannot be brought back without the flags is
+		// reported, not flapped.
+		if err := i.gateRestart(ctx); err != nil {
+			return err
+		}
+
 		if err := i.HostCommand(ctx, "daemon-reload"); err != nil {
 			return err
 		}

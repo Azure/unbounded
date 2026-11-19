@@ -5,6 +5,7 @@ package registryauth
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,6 +23,17 @@ import (
 )
 
 var ErrKubeletNotRunning = errors.New("no running kubelet found; waiting before configuring node authentication")
+
+// ErrUnsupportedKubeletLayout reports that the kubelet the installer operates on
+// is not the agent-managed host kubelet it is designed to configure. This is
+// the nspawn case: the node's kubelet runs inside a systemd-nspawn machine, in a
+// separate PID namespace and under a different systemd manager, so it is neither
+// visible in the host /proc nor restartable via `chroot <host> systemctl`.
+//
+// Unlike ErrKubeletNotRunning (a transient "the kubelet is down, keep waiting"),
+// this is a terminal condition: no retry on this node layout can succeed, so the
+// installer reports it as a failure instead of waiting forever.
+var ErrUnsupportedKubeletLayout = errors.New("kubelet is not the agent-managed host kubelet (nspawn or other isolated node); managed ACR authentication is not supported on this node layout; inspect the node or use external authentication")
 
 type NodeOptions struct {
 	Root         string
@@ -41,7 +53,11 @@ func RunNode(ctx context.Context, opts NodeOptions) error {
 		return err
 	}
 
-	installer := &Installer{Root: opts.Root, Executable: opts.ProviderPath}
+	// The revision keys the persisted restart budget to this policy, so a config
+	// change resets the budget while a pod recreation on the same policy does not.
+	revision := sha256.Sum256([]byte(opts.ConfigJSON))
+
+	installer := &Installer{Root: opts.Root, Executable: opts.ProviderPath, Revision: fmt.Sprintf("%x", revision[:])}
 	installer.HostCommand = func(ctx context.Context, args ...string) error {
 		commandCtx, cancel := context.WithTimeout(ctx, 40*time.Second)
 		defer cancel()
@@ -53,6 +69,10 @@ func RunNode(ctx context.Context, opts NodeOptions) error {
 		return nil
 	}
 	installer.KubeletArgs = func() ([]string, error) { return RunningKubeletArgs(opts.Root) }
+
+	if err := probeNodeLayout(ctx, opts.Root); err != nil {
+		return err
+	}
 
 	return runNode(ctx, opts.Listen, cfg.Mode, func(reconcileCtx context.Context) error {
 		if cfg.Mode == IdentityBindingMode {
@@ -200,4 +220,102 @@ func RunningKubeletArgs(root string) ([]string, error) {
 	}
 
 	return result, nil
+}
+
+// probeNodeLayout runs once at startup, before the reconcile loop, to turn the
+// two failure shapes that used to be indistinguishable "no running kubelet
+// found" into actionable ones:
+//
+//   - a missing agent kubelet unit means this node layout is not the one the
+//     installer supports (the nspawn case), so it returns
+//     ErrUnsupportedKubeletLayout, a terminal failure rather than an infinite
+//     wait;
+//   - a present unit with no running kubelet is logged with diagnostics (proc
+//     mount state, candidate PID namespace, unit shape) so a real "kubelet is
+//     down" can be distinguished from a wrong-root or namespace mismatch.
+//
+// It never mutates the node; it only reads and logs.
+func probeNodeLayout(ctx context.Context, root string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	unit := filepath.Join(root, unitPath)
+
+	data, err := os.ReadFile(unit)
+	if errors.Is(err, os.ErrNotExist) {
+		slog.Error("managed ACR authentication cannot operate this node: agent kubelet unit is absent",
+			"root", root, "unit", unit,
+			"hint", "kubelet is likely isolated (e.g. systemd-nspawn); use external authentication or run the node with a host kubelet")
+
+		return fmt.Errorf("probe node layout: %w", ErrUnsupportedKubeletLayout)
+	}
+
+	if err != nil {
+		return fmt.Errorf("probe node layout: read kubelet unit: %w", err)
+	}
+
+	args, err := RunningKubeletArgs(root)
+	if errors.Is(err, ErrKubeletNotRunning) {
+		slog.Warn("managed ACR authentication waiting for the kubelet to appear",
+			"root", root, "unit", unit,
+			"proc", probeProc(root),
+			"unitShape", unitShape(data),
+		)
+
+		return nil
+	}
+
+	if err != nil {
+		return fmt.Errorf("probe node layout: %w", err)
+	}
+
+	slog.Info("managed ACR authentication node layout OK", "root", root, "unit", unit, "kubeletArgs", len(args))
+
+	return nil
+}
+
+// probeProc reports whether the procfs the installer scans is populated, which
+// distinguishes "no kubelet running" from "wrong root / PID namespace".
+func probeProc(root string) string {
+	entries, err := os.ReadDir(filepath.Join(root, "proc"))
+	if err != nil {
+		return fmt.Sprintf("unreadable: %v", err)
+	}
+
+	kubelet, others := 0, 0
+
+	for _, entry := range entries {
+		comm, err := os.ReadFile(filepath.Join(root, "proc", entry.Name(), "comm"))
+		if err != nil {
+			others++
+
+			continue
+		}
+
+		if strings.TrimSpace(string(comm)) == "kubelet" {
+			kubelet++
+		} else {
+			others++
+		}
+	}
+
+	return fmt.Sprintf("procs=%d kubelet=%d", kubelet+others, kubelet)
+}
+
+// unitShape reports the ExecStart line of the kubelet unit (truncated) so a log
+// line shows whether it is the agent-managed unit the installer expects.
+func unitShape(unit []byte) string {
+	for _, line := range strings.Split(string(unit), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "ExecStart=") {
+			if len(line) > 120 {
+				return line[:120] + "..."
+			}
+
+			return line
+		}
+	}
+
+	return "no-ExecStart"
 }
