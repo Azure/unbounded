@@ -185,9 +185,15 @@ pub async fn watch(shared: Rc<Shared>) {
     let fills = shared.clone();
     let caches = shared.clone();
     let listing = shared.clone();
+    // Admission follows the publication, not the origin: a node drops its pins
+    // as soon as the membership version moves and cannot adopt a current plan
+    // until admission is recomputed. A listing batch can take arbitrarily
+    // long, so admission gets its own task instead of sharing origin I/O.
+    let admission = shared.clone();
     let _ = rt::spawn(async move { watch_fills(fills).await });
     let _ = rt::spawn(async move { watch_caches(caches).await });
     let _ = rt::spawn(async move { list_fills(listing).await });
+    let _ = rt::spawn(async move { admit_fills(admission).await });
 }
 
 /// Carry the process-local listing and admission state from an existing view
@@ -475,6 +481,18 @@ async fn list_fills(shared: Rc<Shared>) {
                 }
             }
         }
+        rt::sleep(TICK).await;
+    }
+}
+
+/// Refresh admission every [`TICK`] independently of origin listing.
+///
+/// Admission is driven by the cache catalog and the publication's membership
+/// version, so it must not queue behind a listing batch: the node controller
+/// releases pins when the membership version moves and cannot adopt a current
+/// plan until admission is refreshed.
+async fn admit_fills(shared: Rc<Shared>) {
+    while !shared.stopping.get() {
         recompute(&shared);
         rt::sleep(TICK).await;
     }
@@ -740,5 +758,49 @@ mod tests {
     fn prefix_over_the_character_limit_is_rejected() {
         let prefix = "雪".repeat(1025);
         assert!(FillView::from_json(&fill_json(&prefix)).is_none());
+    }
+
+    #[test]
+    fn admission_refreshes_on_its_own_task() {
+        crate::kube::fake::run(|_api, kube| async move {
+            let shared = crate::shared::tests::shared(kube);
+            let cache_uid = "22222222-2222-4222-8222-222222222222";
+            let cache = CacheInfo::from_json(&serde_json::json!({
+                "metadata": {"uid": cache_uid, "name": "models"},
+                "spec": {"origin": {"azure": {"containerURL":
+                    "https://acct.blob.core.windows.net/models"}}},
+            }));
+            shared
+                .fills_caches
+                .borrow_mut()
+                .insert(cache_uid.to_owned(), cache);
+            let view = FillView::from_json(&serde_json::json!({
+                "metadata": {
+                    "uid": "11111111-1111-4111-8111-111111111111",
+                    "name": "fill",
+                    "generation": 1,
+                },
+                "spec": {
+                    "cacheName": "models",
+                    "maxFootprint": 1_000_000_000,
+                    "prefixes": [""],
+                },
+            }))
+            .unwrap();
+            assert!(!view.accepted);
+            let uid = view.uid.clone();
+            shared.fills.borrow_mut().insert(uid.clone(), view);
+
+            // No listing runs here: admission alone must resolve the cache,
+            // as it does when the publication changes during a slow listing.
+            rt::spawn(admit_fills(shared.clone())).unwrap();
+            rt::sleep(Duration::from_millis(10)).await;
+
+            let fills = shared.fills.borrow();
+            let view = fills.get(&uid).unwrap();
+            assert!(view.accepted);
+            assert_eq!(view.cache_uid, cache_uid);
+            shared.stopping.set(true);
+        });
     }
 }
