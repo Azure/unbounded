@@ -67,6 +67,12 @@ impl Pin {
 /// not consume the spill-hold cap.
 pub(super) struct Pins {
     pub entries: HashMap<(FillId, ObjectVersion), Pin>,
+    /// Reverse index of member pages: version -> page -> fills whose entry
+    /// contains that page. Lookups visit only the fills listed here instead of
+    /// scanning every entry. Expired but unswept entries stay indexed until
+    /// [`Self::expire`], [`Self::drop_key`], or [`Self::clear`] removes them,
+    /// so readers must still check [`Pin::live`].
+    pub page_fills: HashMap<ObjectVersion, HashMap<PageNumber, Vec<FillId>>>,
     /// Key of each live disk index hold.
     pub owners: HashMap<HoldId, (FillId, ObjectVersion)>,
     /// Member pages across all entries.
@@ -84,12 +90,54 @@ impl Pins {
     pub fn new(_clock: &racer_io::Clock) -> Self {
         Self {
             entries: HashMap::default(),
+            page_fills: HashMap::default(),
             owners: HashMap::default(),
             members: 0,
             segments: None,
             segment_pages: HashMap::default(),
             percent: DEFAULT_PIN_PERCENT,
         }
+    }
+
+    /// Index `pages` as member pages of one reservation.
+    pub(super) fn note_members(&mut self, fill: FillId, version: &ObjectVersion, pages: &[PageId]) {
+        for page in pages {
+            let fills = self
+                .page_fills
+                .entry(version.clone())
+                .or_default()
+                .entry(page.number)
+                .or_default();
+            if !fills.contains(&fill) {
+                fills.push(fill);
+            }
+        }
+    }
+
+    /// Remove one fill from the reverse index of one page.
+    fn forget_member(&mut self, version: &ObjectVersion, number: PageNumber, fill: FillId) {
+        let Some(pages) = self.page_fills.get_mut(version) else {
+            return;
+        };
+        let Some(fills) = pages.get_mut(&number) else {
+            return;
+        };
+        fills.retain(|held| *held != fill);
+        if fills.is_empty() {
+            pages.remove(&number);
+        }
+        if pages.is_empty() {
+            self.page_fills.remove(version);
+        }
+    }
+
+    /// Fills whose entry contains `page`, live or not.
+    fn holders_of<'a>(&'a self, page: &PageId) -> impl Iterator<Item = FillId> + 'a {
+        self.page_fills
+            .get(&page.version)
+            .and_then(|pages| pages.get(&page.number))
+            .into_iter()
+            .flat_map(|fills| fills.iter().copied())
     }
 
     pub fn deadline(until: SystemTime, clock: &racer_io::Clock) -> Result<Instant> {
@@ -148,27 +196,36 @@ impl Pins {
 
     /// Whether a live pin covers `page`, stored or not.
     pub fn is_pinned(&self, page: &PageId, clock: &racer_io::Clock) -> bool {
-        self.entries.iter().any(|((_, version), pin)| {
-            version == &page.version && pin.live(clock) && pin.pages.contains(page.number)
+        self.holders_of(page).any(|fill| {
+            self.entries
+                .get(&(fill, page.version.clone()))
+                .is_some_and(|pin| pin.live(clock) && pin.pages.contains(page.number))
         })
     }
 
     /// Latest live pin deadline for `page`, or `None` when it is not pinned.
     pub fn expiry(&self, page: &PageId, clock: &racer_io::Clock) -> Option<SystemTime> {
-        self.entries
-            .iter()
-            .filter(|((_, version), pin)| {
-                version == &page.version && pin.live(clock) && pin.pages.contains(page.number)
-            })
-            .map(|(_, pin)| pin.until)
+        self.holders_of(page)
+            .filter_map(|fill| self.entries.get(&(fill, page.version.clone())))
+            .filter(|pin| pin.live(clock) && pin.pages.contains(page.number))
+            .map(|pin| pin.until)
             .max()
     }
 
     /// Count a newly stored pinned page for every live holder of it.
-    pub(super) fn note_stored(&mut self, page: &PageId, segment: SegmentId) {
+    pub(super) fn note_stored(
+        &mut self,
+        page: &PageId,
+        segment: SegmentId,
+        clock: &racer_io::Clock,
+    ) {
+        let fills: Vec<_> = self.holders_of(page).collect();
         let mut moved = Vec::new();
-        for ((_, version), pin) in &mut self.entries {
-            if version != &page.version {
+        for fill in fills {
+            let Some(pin) = self.entries.get_mut(&(fill, page.version.clone())) else {
+                continue;
+            };
+            if !pin.live(clock) {
                 continue;
             }
             let Some(holder) = pin.holders.get_mut(&page.number) else {
@@ -200,10 +257,12 @@ impl Pins {
             return;
         };
         let mut released: Vec<(HoldId, PageSlot)> = Vec::new();
+        let mut dropped = Vec::new();
         let mut segments = Vec::new();
         for number in numbers {
             if let Some(holder) = pin.holders.remove(number) {
                 released.push((holder.since.0, holder.slot));
+                dropped.push(*number);
                 if let Some(segment) = holder.counted {
                     segments.push(segment);
                 }
@@ -236,6 +295,9 @@ impl Pins {
         if empty {
             self.entries.remove(key);
         }
+        for number in dropped {
+            self.forget_member(&key.1, number, key.0);
+        }
         for segment in segments {
             self.segment_released(segment);
         }
@@ -247,6 +309,9 @@ impl Pins {
             return;
         };
         self.members -= pin.pages.len();
+        for number in pin.pages.iter() {
+            self.forget_member(&key.1, number, key.0);
+        }
         let segments: Vec<_> = pin
             .holders
             .values()

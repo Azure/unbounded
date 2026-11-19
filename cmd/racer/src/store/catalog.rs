@@ -558,6 +558,7 @@ impl Index {
         };
         let epoch = super::pins::PinEpoch(state.pages.last_hold_id());
         pins.members += joining.len();
+        pins.note_members(fill, version, &joining);
         let counted: Vec<_> = joining
             .iter()
             .map(|page| state.pages.location(page).map(|location| location.segment))
@@ -1343,7 +1344,9 @@ impl Index {
         }
         state.pages.charge(&page, payload);
         if pinned {
-            self.pins.borrow_mut().note_stored(&stored_page, segment);
+            self.pins
+                .borrow_mut()
+                .note_stored(&stored_page, segment, &self.clock);
         }
         Ok(())
     }
@@ -2573,6 +2576,112 @@ mod tests {
             .reserve_pin_pages(FillId(3), &missing, &page_set(&[0]), until)
             .unwrap();
         index.release_pin_pages(FillId(2), &b.version, &page_set(&[0]), b_epoch);
+    }
+
+    /// A page shared by several fills and versions stays pinned until the last
+    /// live reservation releases it, and the reverse index follows every
+    /// release.
+    #[test]
+    fn pin_index_tracks_shared_pages_across_fills_and_versions() {
+        use super::super::pins::FillId;
+        let env = racer_io::Env::host();
+        let segments = Rc::new(segments(1024, 8));
+        let index = Rc::new(index(&env, 16));
+        index.set_page_capacity(16).unwrap();
+        index.set_pin_capacity_percent(100).unwrap();
+        let _clock = SegmentClock::new(index.clone(), segments, 1);
+        let first = descriptor("shared", 17).version;
+        let second = descriptor("other", 17).version;
+        let at = |version: &ObjectVersion, number| PageId {
+            version: version.clone(),
+            number: crate::model::PageNumber(number),
+        };
+        let now = racer_io::Clock::host().wall_now();
+        let early = now + std::time::Duration::from_secs(30);
+        let late = now + std::time::Duration::from_secs(60);
+        let first_epoch = index
+            .reserve_pin_pages(FillId(1), &first, &page_set(&[0, 1]), early)
+            .unwrap();
+        let second_epoch = index
+            .reserve_pin_pages(FillId(2), &first, &page_set(&[0]), late)
+            .unwrap();
+        let other_epoch = index
+            .reserve_pin_pages(FillId(3), &second, &page_set(&[0]), early)
+            .unwrap();
+        assert!(index.is_pinned(&at(&first, 0)));
+        assert!(index.is_pinned(&at(&first, 1)));
+        assert!(index.is_pinned(&at(&second, 0)));
+        // The shared page reports the later of its two live deadlines.
+        assert_eq!(index.pin_expiry(&at(&first, 0)), Some(late));
+        assert_eq!(index.pin_expiry(&at(&first, 1)), Some(early));
+        assert_eq!(index.pin_expiry(&at(&second, 0)), Some(early));
+        // Releasing one holder leaves the shared page pinned by the other.
+        index.release_pin_pages(FillId(2), &first, &page_set(&[0]), second_epoch);
+        assert!(index.is_pinned(&at(&first, 0)));
+        assert_eq!(index.pin_expiry(&at(&first, 0)), Some(early));
+        index.release_pin_pages(FillId(1), &first, &page_set(&[0]), first_epoch);
+        assert!(!index.is_pinned(&at(&first, 0)));
+        assert!(index.is_pinned(&at(&first, 1)));
+        index.release_pin_pages(FillId(1), &first, &page_set(&[1]), first_epoch);
+        assert!(!index.is_pinned(&at(&first, 1)));
+        // A different version never inherits the first version's holders.
+        assert!(index.is_pinned(&at(&second, 0)));
+        index.release_pin_pages(FillId(3), &second, &page_set(&[0]), other_epoch);
+        assert!(!index.is_pinned(&at(&second, 0)));
+        let pins = index.pins.borrow();
+        assert!(pins.entries.is_empty());
+        assert!(pins.page_fills.is_empty(), "reverse index fully released");
+    }
+
+    /// An expired but unswept pin stops reporting as pinned, does not take a
+    /// new store into its segment accounting, and leaves the reverse index
+    /// when the maintenance sweep removes it.
+    #[test]
+    fn pin_index_filters_expired_entries_and_new_stores() {
+        use super::super::pins::FillId;
+        let clock = racer_io::SimClock::new(31);
+        let sim_env = clock.ctx(0);
+        let env = racer_io::Env::new(racer_io::Driver::Uring, sim_env.clone());
+        let sim_ctx = sim_env.clone();
+        let segments = Rc::new(segments(1024, 4));
+        let index = Rc::new(index(&env, 8));
+        index.set_page_capacity(8).unwrap();
+        index.set_pin_capacity_percent(100).unwrap();
+        let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
+        let (page, entry) = indexed(descriptor("expiring", 17), 0);
+        let version = page.version.clone();
+        drop(segments.append(1024).unwrap());
+        let now = sim_ctx.clock.wall_now();
+        let live = now + std::time::Duration::from_secs(60);
+        let dead = now + std::time::Duration::from_secs(10);
+        index
+            .reserve_pin_pages(FillId(1), &version, &page_set(&[0]), live)
+            .unwrap();
+        index
+            .reserve_pin_pages(FillId(2), &version, &page_set(&[0]), dead)
+            .unwrap();
+        clock.advance(std::time::Duration::from_secs(11));
+        assert!(index.is_pinned(&page));
+        assert_eq!(index.pin_expiry(&page), Some(live));
+        // Only the live fill charges the stored page to the new segment.
+        index.publish(page.clone(), entry).unwrap();
+        {
+            let pins = index.pins.borrow();
+            let live = &pins.entries[&(FillId(1), version.clone())];
+            let dead = &pins.entries[&(FillId(2), version.clone())];
+            assert_eq!(live.holders[&page.number].counted, Some(SegmentId(0)));
+            assert_eq!(dead.holders[&page.number].counted, None);
+            assert_eq!(pins.segment_pages.get(&SegmentId(0)), Some(&1));
+        }
+        clock.advance(std::time::Duration::from_secs(60));
+        // Both entries are expired but not swept yet.
+        assert!(!index.is_pinned(&page));
+        assert_eq!(index.pin_expiry(&page), None);
+        index.expire_pins(usize::MAX);
+        assert_eq!(segments.pinned_count(), 0);
+        let pins = index.pins.borrow();
+        assert!(pins.entries.is_empty());
+        assert!(pins.page_fills.is_empty(), "sweep drops reverse index rows");
     }
 
     #[test]
