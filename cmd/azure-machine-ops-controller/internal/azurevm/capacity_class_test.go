@@ -14,8 +14,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	"github.com/Azure/unbounded/internal/machineops"
-	publicmachineops "github.com/Azure/unbounded/pkg/machineops"
+	"github.com/Azure/unbounded/pkg/machineops"
 )
 
 func TestParseCapacityConfig(t *testing.T) {
@@ -216,8 +215,8 @@ func TestResolveClassWithoutZoneOrPrice(t *testing.T) {
 	client := newFakeCapacityClient()
 	provider := newTestProvider(client)
 
-	resolution, err := provider.ResolveClass(t.Context(), publicmachineops.ClassRequest{
-		ProviderConfig: publicmachineops.ProviderConfig{Data: data},
+	resolution, err := provider.ResolveClass(t.Context(), machineops.ClassRequest{
+		ProviderConfig: machineops.ProviderConfig{Data: data},
 	})
 	require.NoError(t, err)
 	require.Len(t, resolution.Offerings, 1)
@@ -231,7 +230,7 @@ func TestResolveClassWithoutZoneOrPrice(t *testing.T) {
 	require.Nil(t, offering.Price)
 
 	request := testOperationRequest(t, unboundedv1alpha3.OperationHostAllocate, offering)
-	request.Allocation.ProviderConfig = publicmachineops.ProviderConfig{Data: data}
+	request.Allocation.ProviderConfig = machineops.ProviderConfig{Data: data}
 
 	_, err = provider.BeginAllocate(t.Context(), request)
 	require.NoError(t, err)
@@ -312,8 +311,8 @@ func TestResolveClassReportsRestrictions(t *testing.T) {
 
 func TestResolveClassFailures(t *testing.T) {
 	resolve := func(client *fakeCapacityClient, data map[string]string) error {
-		_, err := newTestProvider(client).ResolveClass(t.Context(), publicmachineops.ClassRequest{
-			ProviderConfig: publicmachineops.ProviderConfig{Data: data},
+		_, err := newTestProvider(client).ResolveClass(t.Context(), machineops.ClassRequest{
+			ProviderConfig: machineops.ProviderConfig{Data: data},
 		})
 
 		return err

@@ -1,6 +1,16 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
+// Command azure-machine-ops-controller is the machine-ops controller for
+// Azure. It is also the reference for writing one for another provider: the
+// provider in internal/azurevm implements the callbacks of pkg/machineops,
+// and this file hands its registration to pkg/machineops/controller, which
+// owns the MachineOperation, MachineClass and MachineAllocation reconcilers.
+//
+// A controller for another provider copies this command and replaces
+// azureProviders. Apart from the provider itself, the only packages it cannot
+// import from outside this repository are internal/unbounded, for the default
+// namespace of the flags, and internal/version, for the version string.
 package main
 
 import (
@@ -11,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"syscall"
 
@@ -25,7 +36,7 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	"github.com/Azure/unbounded/internal/machineops/providers/azurevm"
+	"github.com/Azure/unbounded/cmd/azure-machine-ops-controller/internal/azurevm"
 	"github.com/Azure/unbounded/internal/unbounded"
 	"github.com/Azure/unbounded/internal/version"
 	"github.com/Azure/unbounded/pkg/machineops"
@@ -33,7 +44,7 @@ import (
 )
 
 const (
-	controllerName    = "machine-ops-controller"
+	controllerName    = "azure-machine-ops-controller"
 	scopeFallbackName = "scope"
 
 	errSiteProviderPair          = "--site and --provider must be set together"
@@ -56,7 +67,7 @@ func newCommand(runController func(context.Context, config) error) *cobra.Comman
 
 	cmd := &cobra.Command{
 		Use:   controllerName,
-		Short: "External MachineOperation controller",
+		Short: "Machine-ops controller for Azure",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx, cancel := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer cancel()
@@ -124,6 +135,11 @@ func run(ctx context.Context, cfg config) error {
 		return err
 	}
 
+	providers, err := configuredProviders(cfg.providerName)
+	if err != nil {
+		return err
+	}
+
 	restConfig := ctrl.GetConfigOrDie()
 	scheme := runtimeScheme()
 
@@ -140,11 +156,6 @@ func run(ctx context.Context, cfg config) error {
 		return fmt.Errorf("create manager: %w", err)
 	}
 
-	providers, err := configuredProviders(cfg.providerName)
-	if err != nil {
-		return err
-	}
-
 	if err := addControllers(mgr, cfg, providers, capacity); err != nil {
 		return err
 	}
@@ -157,7 +168,7 @@ func run(ctx context.Context, cfg config) error {
 		return fmt.Errorf("add readyz check: %w", err)
 	}
 
-	ctrl.Log.Info("starting machine-ops-controller",
+	ctrl.Log.Info("starting "+controllerName,
 		"site", cfg.siteName,
 		"provider", cfg.providerName,
 		"capacity", cfg.enableCapacity,
@@ -203,33 +214,39 @@ func addControllers(
 	return nil
 }
 
-func configuredProviders(providerName string) ([]*machineops.Provider, error) {
-	factories := map[string]func() (*machineops.Provider, error){
-		unboundedv1alpha3.ExternalProviderAzureVM: func() (*machineops.Provider, error) {
-			return (&azurevm.Provider{}).Registration()
-		},
-	}
-
-	if providerName != "" {
-		factory, ok := factories[providerName]
-		if !ok {
-			return nil, fmt.Errorf("unknown machine-ops provider %q", providerName)
-		}
-
-		provider, err := factory()
-		if err != nil {
-			return nil, fmt.Errorf("register machine-ops provider %q: %w", providerName, err)
-		}
-
-		return []*machineops.Provider{provider}, nil
-	}
-
-	azureProvider, err := factories[unboundedv1alpha3.ExternalProviderAzureVM]()
+// azureProviders returns every Azure provider this controller can serve.
+// Each compute mode is its own provider with its own name: a provider for
+// virtual machine scale sets would be registered here next to the one for
+// single virtual machines, and --provider would select between them.
+func azureProviders() ([]*machineops.Provider, error) {
+	azureVM, err := (&azurevm.Provider{}).Registration()
 	if err != nil {
 		return nil, fmt.Errorf("register Azure VM machine-ops provider: %w", err)
 	}
 
-	return []*machineops.Provider{azureProvider}, nil
+	return []*machineops.Provider{azureVM}, nil
+}
+
+// configuredProviders returns the providers to serve: every Azure provider,
+// or only the one named providerName.
+func configuredProviders(providerName string) ([]*machineops.Provider, error) {
+	providers, err := azureProviders()
+	if err != nil {
+		return nil, err
+	}
+
+	if providerName == "" {
+		return providers, nil
+	}
+
+	i := slices.IndexFunc(providers, func(provider *machineops.Provider) bool {
+		return provider.Name() == providerName
+	})
+	if i < 0 {
+		return nil, fmt.Errorf("unknown machine-ops provider %q", providerName)
+	}
+
+	return providers[i : i+1], nil
 }
 
 // capacityOptions returns the options for the capacity controllers, or nil

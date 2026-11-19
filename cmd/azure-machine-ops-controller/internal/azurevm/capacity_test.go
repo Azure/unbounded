@@ -12,8 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	"github.com/Azure/unbounded/internal/machineops"
-	publicmachineops "github.com/Azure/unbounded/pkg/machineops"
+	"github.com/Azure/unbounded/pkg/machineops"
 )
 
 func TestRegistrationDeclaresCapacityAndHostOperations(t *testing.T) {
@@ -29,13 +28,13 @@ func TestRegistrationDeclaresCapacityAndHostOperations(t *testing.T) {
 	} {
 		operation, ok := registration.Operation(kind)
 		require.True(t, ok, kind)
-		require.Equal(t, publicmachineops.OperationModeLongRunning, operation.Mode(), kind)
+		require.Equal(t, machineops.OperationModeLongRunning, operation.Mode(), kind)
 	}
 
 	for kind := range azureVMOperations {
 		operation, ok := registration.Operation(kind)
 		require.True(t, ok, kind)
-		require.Equal(t, publicmachineops.OperationModeImmediate, operation.Mode(), kind)
+		require.Equal(t, machineops.OperationModeImmediate, operation.Mode(), kind)
 	}
 }
 
@@ -63,7 +62,7 @@ func allocatedVM(t *testing.T, client *fakeCapacityClient, provider *Provider) m
 
 	result, err := provider.PollAllocate(t.Context(), allocate, begin.Operation)
 	require.NoError(t, err)
-	require.Equal(t, publicmachineops.ProviderOperationStateSucceeded, result.State)
+	require.Equal(t, machineops.ProviderOperationStateSucceeded, result.State)
 
 	release := testOperationRequest(t, unboundedv1alpha3.OperationHostRelease, offering)
 	release.Allocation.OwnedResources = result.Result.Allocation.OwnedResources
@@ -71,10 +70,10 @@ func allocatedVM(t *testing.T, client *fakeCapacityClient, provider *Provider) m
 	return release
 }
 
-func pollRelease(t *testing.T, provider *Provider, request machineops.OperationRequest) publicmachineops.PollResult {
+func pollRelease(t *testing.T, provider *Provider, request machineops.OperationRequest) machineops.PollResult {
 	t.Helper()
 
-	result, err := provider.PollRelease(t.Context(), request, publicmachineops.ProviderOperation{
+	result, err := provider.PollRelease(t.Context(), request, machineops.ProviderOperation{
 		OperationID: testVMID(),
 	})
 	require.NoError(t, err)

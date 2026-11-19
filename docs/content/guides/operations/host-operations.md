@@ -5,7 +5,7 @@ description: "Power management and host replacement operations."
 ---
 
 Host operations change the power state of the VM, PXE host, or bare-metal
-machine. They are handled by `machine-ops-controller` for cloud VMs and by
+machine. They are handled by `azure-machine-ops-controller` for cloud VMs and by
 `metalman` for PXE/bare-metal machines with BMC. The exception is
 `HostSoftReboot`, which the `unbounded-agent` daemon on the host executes.
 
@@ -28,7 +28,7 @@ An operation that no metalman instance can own is marked `Failed`. This covers
 a selector that names no site or more than one site, and a `machineRef` that
 names a Machine that does not exist.
 
-For cloud VMs, run `machine-ops-controller` scoped to the Machine's site and
+For cloud VMs, run `azure-machine-ops-controller` scoped to the Machine's site and
 provider, for example `--site=remote --provider=AzureVM`. A scoped controller
 only executes operations whose target Machine has the matching
 `unbounded-cloud.io/site` label and `spec.provider`; other controllers ignore
@@ -227,10 +227,10 @@ cloud-init times out before the node rejoins.
 **Azure VM** - reads the existing VM model, detaches NICs and data disks,
 deletes the VM resource, and recreates the same VM name with fresh cloud-init
 custom data that installs `unbounded-agent`. The old OS disk is not reused.
-Configure `machine-ops-controller --api-server-endpoint` with an API server
+Configure `azure-machine-ops-controller --api-server-endpoint` with an API server
 address reachable from replaced hosts; the generated agent bootstrap config uses
 that value. A Machine that declares the experimental `spec.isolation: container`
-is replaced only when `machine-ops-controller` runs with
+is replaced only when `azure-machine-ops-controller` runs with
 `--experimental-container-isolation`; see
 [Enabling the container mode]({{< relref "reference/agent/isolation#enabling-the-container-mode" >}}).
 

@@ -32,7 +32,7 @@ func newMachineReplaceCommand(rt *machineCommandRuntime) *cobra.Command {
 		Use:   "replace NAME",
 		Short: "Destructively replace a machine through MachineOperation",
 		Long: `Replace creates a MachineOperation CR requesting a host VM replacement.
-The machine-ops-controller processes the operation through the external
+A machine-ops controller processes the operation through the external
 provider by deleting and recreating the host VM with fresh bootstrap data.
 Host-local OS disk state is destroyed.`,
 		Args: cobra.ExactArgs(1),

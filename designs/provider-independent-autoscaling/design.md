@@ -138,9 +138,9 @@ DRA, reservations, and specialized repair policies remain separate extensions.
 | Retirement fences the Machine and revokes bootstrap before checking release authorization. | `internal/capacity/allocation_release.go:158-212`, `:247-309` | Deletion, fencing, and safe release are distinct. |
 | Allocation-backed Machines reject HostReplace, HostPowerOff, and HostPowerOn even if the provider registers them. | `internal/machineops/allocation.go:64-96` | Provider capability and permission to operate on a particular Machine are separate; broader support needs lifecycle review. |
 | A recorded allocate operation cannot be silently replaced. | `internal/capacity/allocation_controller.go:247-262`; `internal/machineops/allocation.go:250-268` | Losing the recorded journal requires recovery, not another launch. |
-| Providers record actual attached resources, including results from failed allocation. | `internal/machineops/providers/azurevm/capacity.go:659-795`; `internal/machineops/providers/awsec2/capacity.go:883-963` | Cleanup cannot be derived from a naming convention alone. |
+| Providers record actual attached resources, including results from failed allocation. | `cmd/azure-machine-ops-controller/internal/azurevm/capacity.go:659-795`; `internal/machineops/providers/awsec2/capacity.go:883-963` | Cleanup cannot be derived from a naming convention alone. |
 | Related-object indexes and selective class watches limit reconciliation fan-out. | `internal/capacity/indexes.go:16-101`; `internal/capacity/setup.go:187-249` | An offering refresh must not wake every healthy allocation. |
-| Provider/Site selection gives controllers separate leader leases; AWS is explicitly enabled. | `cmd/machine-ops-controller/main.go:180-230` | Providers can share code without sharing cloud credentials or a global leader. |
+| Provider/Site selection gives controllers separate leader leases; AWS is explicitly enabled. | `cmd/azure-machine-ops-controller/main.go:180-230` | Providers can share code without sharing cloud credentials or a global leader. |
 
 The earlier proposal used provider-specific CR references, illustrative
 `requests` and `offerings.items` fields, and a late-binding Machine model.
@@ -415,7 +415,7 @@ or every host lifecycle operation has been qualified.
 
 These are logical modules, not a requirement for a deployment per module.
 The POC hosts shared capacity reconciliation beside provider operations in
-`machine-ops-controller`. Each provider/Site scope has one elected writer.
+`azure-machine-ops-controller`. Each provider/Site scope has one elected writer.
 Adapters return normalized results; they do not race the shared controller to
 patch allocation status. The Karpenter plugin is packaged with a compatible
 self-hosted controller, not a remote plugin protocol or managed AKS NAP extension.
@@ -932,8 +932,8 @@ and observations. A provider-specific host CR is an optional backend model,
 not a replacement for that shared ownership boundary.
 
 The AzureVM POC already combines existing-host operations and capacity in one
-registration (`internal/machineops/providers/azurevm/provider.go:39-96`;
-`internal/machineops/providers/azurevm/capacity.go:88-98`). The AWSEC2 POC
+registration (`cmd/azure-machine-ops-controller/internal/azurevm/provider.go:39-96`;
+`cmd/azure-machine-ops-controller/internal/azurevm/capacity.go:88-98`). The AWSEC2 POC
 registers capacity only; it does not implement host power or replacement
 operations (`internal/machineops/providers/awsec2/provider.go:18-39`).
 The accepted dual-cloud proof qualifies the tested allocation/release paths,

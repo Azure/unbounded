@@ -69,13 +69,13 @@ func TestConfiguredProvidersRejectsOCIInstance(t *testing.T) {
 func TestLeaderElectionID(t *testing.T) {
 	t.Parallel()
 
-	require.Equal(t, "machine-ops-controller", leaderElectionID(config{}))
+	require.Equal(t, "azure-machine-ops-controller", leaderElectionID(config{}))
 
 	siteA := leaderElectionID(config{providerName: unboundedv1alpha3.ExternalProviderAzureVM, siteName: "site-a"})
 	siteB := leaderElectionID(config{providerName: unboundedv1alpha3.ExternalProviderAzureVM, siteName: "site-b"})
 	exampleSiteA := leaderElectionID(config{providerName: "ExampleCloud", siteName: "site-a"})
 
-	require.NotEqual(t, "machine-ops-controller", siteA)
+	require.NotEqual(t, "azure-machine-ops-controller", siteA)
 	require.NotEqual(t, siteA, siteB)
 	require.NotEqual(t, siteA, exampleSiteA)
 	require.Equal(t, siteA, leaderElectionID(config{providerName: unboundedv1alpha3.ExternalProviderAzureVM, siteName: "site-a"}))
@@ -88,7 +88,7 @@ func TestSafeNamePartFallsBackForSymbolOnlyScope(t *testing.T) {
 	part := safeNamePart("!!!")
 
 	require.Contains(t, part, "scope-")
-	require.LessOrEqual(t, len("machine-ops-controller-"+part), 63)
+	require.LessOrEqual(t, len("azure-machine-ops-controller-"+part), 63)
 }
 
 func TestAzureVMRegistrationDeclaresCapacity(t *testing.T) {

@@ -19,8 +19,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v6"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	"github.com/Azure/unbounded/internal/machineops"
-	publicmachineops "github.com/Azure/unbounded/pkg/machineops"
+	"github.com/Azure/unbounded/pkg/machineops"
 )
 
 const azureCustomDataMaxBytes = 65535
@@ -76,24 +75,24 @@ func (p *Provider) Name() string {
 // Registration returns this Azure adapter's registration: its host
 // operations and its capacity lifecycle (class resolution, allocation
 // planning, HostAllocate and HostRelease).
-func (p *Provider) Registration() (*publicmachineops.Provider, error) {
-	options := make([]publicmachineops.ProviderOption, 0, len(azureVMOperations)+3)
+func (p *Provider) Registration() (*machineops.Provider, error) {
+	options := make([]machineops.ProviderOption, 0, len(azureVMOperations)+3)
 
 	for kind := range azureVMOperations {
-		operationOptions := []publicmachineops.OperationOption(nil)
+		operationOptions := []machineops.OperationOption(nil)
 		if kind == unboundedv1alpha3.OperationHostReplace {
 			operationOptions = append(
 				operationOptions,
-				publicmachineops.RequiresReplaceUserData(),
+				machineops.RequiresReplaceUserData(),
 			)
 		}
 
-		options = append(options, publicmachineops.WithImmediateOperation(kind, p.Execute, operationOptions...))
+		options = append(options, machineops.WithImmediateOperation(kind, p.Execute, operationOptions...))
 	}
 
 	options = append(options, p.capacityRegistration()...)
 
-	return publicmachineops.NewProvider(p.Name(), options...)
+	return machineops.NewProvider(p.Name(), options...)
 }
 
 func (p *Provider) Execute(ctx context.Context, request machineops.OperationRequest) (machineops.OperationResult, error) {

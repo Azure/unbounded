@@ -22,8 +22,8 @@ func TestControllerCanResolveMachineConfigurationVersion(t *testing.T) {
 	}
 
 	document := strings.SplitN(string(data), "\n---", 2)[0]
-	document = strings.Replace(document, `{{- $controllerName := default "machine-ops-controller" .ControllerName }}`, "", 1)
-	document = strings.ReplaceAll(document, "{{ $controllerName }}", "machine-ops-controller")
+	document = strings.Replace(document, `{{- $controllerName := default "azure-machine-ops-controller" .ControllerName }}`, "", 1)
+	document = strings.ReplaceAll(document, "{{ $controllerName }}", "azure-machine-ops-controller")
 
 	var clusterRole rbacv1.ClusterRole
 	if err := yaml.Unmarshal([]byte(document), &clusterRole); err != nil {

@@ -12,30 +12,29 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v6"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	"github.com/Azure/unbounded/internal/machineops"
-	publicmachineops "github.com/Azure/unbounded/pkg/machineops"
+	"github.com/Azure/unbounded/pkg/machineops"
 )
 
 // BeginRelease starts deleting what the allocation recorded as owned. See
 // releaseStep.
-func (p *Provider) BeginRelease(ctx context.Context, request machineops.OperationRequest) (publicmachineops.BeginResult, error) {
+func (p *Provider) BeginRelease(ctx context.Context, request machineops.OperationRequest) (machineops.BeginResult, error) {
 	target, err := allocationTarget(request)
 	if err != nil {
-		return publicmachineops.BeginResult{}, invalidRequest(err)
+		return machineops.BeginResult{}, invalidRequest(err)
 	}
 
 	client, err := p.capacityClient(target.subscriptionID, request.Auth)
 	if err != nil {
-		return publicmachineops.BeginResult{}, fmt.Errorf("create Azure capacity client: %w", err)
+		return machineops.BeginResult{}, fmt.Errorf("create Azure capacity client: %w", err)
 	}
 
 	step, err := releaseStep(ctx, client, target, request.Allocation.OwnedResources)
 	if err != nil {
-		return publicmachineops.BeginResult{}, err
+		return machineops.BeginResult{}, err
 	}
 
 	if step.conflict != nil {
-		return publicmachineops.BeginResult{}, providerConflict(step.conflict)
+		return machineops.BeginResult{}, providerConflict(step.conflict)
 	}
 
 	return beginResult(target, step.message), nil
@@ -49,34 +48,34 @@ func (p *Provider) BeginRelease(ctx context.Context, request machineops.Operatio
 func (p *Provider) PollRelease(
 	ctx context.Context,
 	request machineops.OperationRequest,
-	_ publicmachineops.ProviderOperation,
-) (publicmachineops.PollResult, error) {
+	_ machineops.ProviderOperation,
+) (machineops.PollResult, error) {
 	target, err := allocationTarget(request)
 	if err != nil {
-		return publicmachineops.PollResult{}, invalidRequest(err)
+		return machineops.PollResult{}, invalidRequest(err)
 	}
 
 	client, err := p.capacityClient(target.subscriptionID, request.Auth)
 	if err != nil {
-		return publicmachineops.PollResult{}, fmt.Errorf("create Azure capacity client: %w", err)
+		return machineops.PollResult{}, fmt.Errorf("create Azure capacity client: %w", err)
 	}
 
 	step, err := releaseStep(ctx, client, target, request.Allocation.OwnedResources)
 	if err != nil {
-		return publicmachineops.PollResult{}, err
+		return machineops.PollResult{}, err
 	}
 
 	switch {
 	case step.conflict != nil:
 		return failedPoll(unboundedv1alpha3.FailureProviderConflict, step.conflict.Error()), nil
 	case step.done:
-		return publicmachineops.PollResult{
-			State:   publicmachineops.ProviderOperationStateSucceeded,
+		return machineops.PollResult{
+			State:   machineops.ProviderOperationStateSucceeded,
 			Message: step.message,
 		}, nil
 	default:
-		return publicmachineops.PollResult{
-			State:        publicmachineops.ProviderOperationStateInProgress,
+		return machineops.PollResult{
+			State:        machineops.ProviderOperationStateInProgress,
 			Message:      step.message,
 			RequeueAfter: pollInterval,
 		}, nil

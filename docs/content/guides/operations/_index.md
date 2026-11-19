@@ -25,18 +25,18 @@ remove the host-resident agent binary and its managed resources.
 
 | Operation | Boundary | Responsible Component | Description |
 |-----------|----------|-----------------------|-------------|
-| `HostPowerOff` | Host | `machine-ops-controller` / `metalman` | Power off the VM or physical host. |
-| `HostPowerOn` | Host | `machine-ops-controller` / `metalman` | Power on or start the VM or physical host. |
-| `HostHardReboot` | Host | `machine-ops-controller` / `metalman` | Reboot or power-cycle the host out of band. |
+| `HostPowerOff` | Host | `azure-machine-ops-controller` / `metalman` | Power off the VM or physical host. |
+| `HostPowerOn` | Host | `azure-machine-ops-controller` / `metalman` | Power on or start the VM or physical host. |
+| `HostHardReboot` | Host | `azure-machine-ops-controller` / `metalman` | Reboot or power-cycle the host out of band. |
 | `HostSoftReboot` | Host | `unbounded-agent` | Reboot the host OS from inside the host (`systemctl reboot`). |
-| `HostReplace` | Host | `machine-ops-controller` / `metalman` | Delete and recreate the VM or reimage the physical host. |
+| `HostReplace` | Host | `azure-machine-ops-controller` / `metalman` | Delete and recreate the VM or reimage the physical host. |
 | `NodeReboot` | Node | `unbounded-agent` | Restart the nspawn container without replacing the rootfs. |
 | `AgentUpgrade` | Agent | `unbounded-agent` | Replace the host agent binary using blue-green staging. |
 | `AgentReset` | Agent | `unbounded-agent` | Remove the agent and all managed resources from the host. |
 
 ## Component Ownership
 
-`machine-ops-controller` owns cloud-provider host operations. It maps
+`azure-machine-ops-controller` owns cloud-provider host operations. It maps
 `HostPowerOff`, `HostPowerOn`, `HostHardReboot`, and `HostReplace` to provider APIs
 based on `Machine.spec.host.azure` or `Machine.spec.host.external`. Deprecated
 top-level provider fields remain readable for existing Machines.

@@ -306,7 +306,7 @@ stops new starts: a node that is already running is not stopped.
 | Scope | Cluster |
 | Status subresource | Yes |
 
-`MachineOperation` is a job-like CR for discrete operations. The in-host agent handles Kubernetes node operations such as `NodeReboot` and agent operations such as `AgentReset`; `machine-ops-controller` handles out-of-band VM operations such as Azure VM power actions. PXE/BMC operations remain owned by metalman for now.
+`MachineOperation` is a job-like CR for discrete operations. The in-host agent handles Kubernetes node operations such as `NodeReboot` and agent operations such as `AgentReset`; `azure-machine-ops-controller` handles out-of-band VM operations such as Azure VM power actions. PXE/BMC operations remain owned by metalman for now.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
@@ -333,7 +333,7 @@ The Azure VM provider handles:
 | `HostPowerOn` | `VirtualMachinesClient.BeginStart` |
 | `HostReplace` | `VirtualMachinesClient.Get`, `BeginDelete`, then `BeginCreateOrUpdate` |
 
-`HostReplace` for `AzureVM` destructively replaces the VM: it reads the existing VM model, detaches NICs and data disks, deletes the VM resource, and recreates the same VM name with fresh cloud-init custom data that installs `unbounded-agent`. An explicit host image may be an Azure resource ID or a `publisher:offer:sku:version` reference; an omitted image preserves the existing image reference. The old OS disk is not reused. Operation completion means the replacement VM create operation completed; it does not mean the Kubernetes `Node` is Ready. The `Machine` controller continues tracking whether the Kubernetes `Node` disappears and rejoins. Configure `machine-ops-controller --api-server-endpoint` with an API server address reachable from replaced hosts; the generated agent bootstrap config uses that value.
+`HostReplace` for `AzureVM` destructively replaces the VM: it reads the existing VM model, detaches NICs and data disks, deletes the VM resource, and recreates the same VM name with fresh cloud-init custom data that installs `unbounded-agent`. An explicit host image may be an Azure resource ID or a `publisher:offer:sku:version` reference; an omitted image preserves the existing image reference. The old OS disk is not reused. Operation completion means the replacement VM create operation completed; it does not mean the Kubernetes `Node` is Ready. The `Machine` controller continues tracking whether the Kubernetes `Node` disappears and rejoins. Configure `azure-machine-ops-controller --api-server-endpoint` with an API server address reachable from replaced hosts; the generated agent bootstrap config uses that value.
 
 This replacement flow avoids Azure standalone VM `customData` immutability during native reimage. It intentionally destroys host-local state on the old OS disk. The initial implementation retains the existing blocking clone-delete-create flow; a controller crash after deletion can require manual recovery because the captured VM model is not yet durably checkpointed.
 

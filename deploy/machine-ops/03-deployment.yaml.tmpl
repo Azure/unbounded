@@ -1,4 +1,4 @@
-{{- $controllerName := default "machine-ops-controller" .ControllerName }}
+{{- $controllerName := default "azure-machine-ops-controller" .ControllerName }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -49,7 +49,7 @@ spec:
           effect: NoSchedule
       containers:
         - name: controller
-          image: {{ default "ghcr.io/azure/machine-ops-controller:latest" .ControllerImage }}
+          image: {{ default "ghcr.io/azure/azure-machine-ops-controller:latest" .ControllerImage }}
           imagePullPolicy: Always
           args:
             - --leader-elect=true
