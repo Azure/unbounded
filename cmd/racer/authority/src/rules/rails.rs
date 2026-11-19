@@ -70,7 +70,12 @@ pub const MAX_REPORT_FILLS: usize = crate::limits::MAX_REPORT_FILLS;
 struct ReportDto {
     shares: u32,
     rdma_nics: Value,
-    /// Per-fill progress. Optional so an older primary reads a new report.
+}
+
+/// Pod fills annotation.
+#[derive(Debug, Deserialize, Serialize)]
+struct FillsDto {
+    /// Per-fill progress.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     fills: Vec<Value>,
     /// Bytes this node may still pin on this node.
@@ -92,11 +97,16 @@ struct FillProgressDto {
     refused_bytes: u64,
 }
 
-/// Values a Pod reports for its own Node.
+/// Values a Pod reports for its own Node in the report annotation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Report {
     pub shares: NonZeroU32,
     pub rdma_nics: Vec<RailMapping>,
+}
+
+/// Per-fill progress a Pod reports in the fills annotation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Fills {
     pub fills: Vec<FillProgress>,
     pub pinnable_bytes: Option<u64>,
 }
@@ -118,7 +128,7 @@ pub struct FillProgress {
 }
 
 impl FillProgress {
-    /// Whether the entry fits the report bounds.
+    /// Whether the entry fits the fills annotation bounds.
     pub fn valid(&self) -> bool {
         racer_wire::control::valid_uuid(&self.fill)
             && valid_digest(&self.digest)
@@ -134,17 +144,45 @@ fn valid_digest(digest: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// Parse a report annotation.
+/// Parse a report annotation. Unknown fields are ignored, so a report written
+/// by an older node and one written by a newer node both parse.
 pub fn parse_report(s: &str) -> Result<Report, wire::Error> {
     if s.len() > crate::limits::MAX_REPORT_BYTES {
         return Err(wire::Error::Overloaded);
     }
     let d: ReportDto = serde_json::from_str(s).map_err(|_| wire::Error::InvalidRequest)?;
+    Ok(Report {
+        shares: NonZeroU32::new(d.shares).ok_or(wire::Error::InvalidRequest)?,
+        rdma_nics: parse_nics(&d.rdma_nics)?,
+    })
+}
+
+/// Encode a report annotation. The shape is exactly
+/// `{"shares":N,"rdma_nics":[...]}`, with no fill fields, so an older primary
+/// that rejects unknown fields keeps parsing it.
+pub fn encode_report(r: &Report) -> Result<String, wire::Error> {
+    let s = serde_json::to_string(&ReportDto {
+        shares: r.shares.get(),
+        rdma_nics: encode_nics(&r.rdma_nics)?,
+    })
+    .map_err(|_| wire::Error::InvalidRequest)?;
+    if s.len() > crate::limits::MAX_REPORT_BYTES {
+        return Err(wire::Error::Overloaded);
+    }
+    Ok(s)
+}
+
+/// Parse a fills annotation.
+pub fn parse_fills(s: &str) -> Result<Fills, wire::Error> {
+    if s.len() > crate::limits::MAX_FILLS_BYTES {
+        return Err(wire::Error::Overloaded);
+    }
+    let d: FillsDto = serde_json::from_str(s).map_err(|_| wire::Error::InvalidRequest)?;
     let mut fills = Vec::new();
     for value in d.fills.into_iter().take(MAX_REPORT_FILLS) {
         // A malformed entry must not drop the node or the other fills. Each
         // entry is decoded on its own, so an unknown future entry shape is
-        // ignored rather than failing the whole report.
+        // ignored rather than failing the whole annotation.
         let Ok(d) = serde_json::from_value::<FillProgressDto>(value) else {
             continue;
         };
@@ -164,23 +202,19 @@ pub fn parse_report(s: &str) -> Result<Report, wire::Error> {
             fills.push(progress);
         }
     }
-    Ok(Report {
-        shares: NonZeroU32::new(d.shares).ok_or(wire::Error::InvalidRequest)?,
-        rdma_nics: parse_nics(&d.rdma_nics)?,
+    Ok(Fills {
         fills,
         pinnable_bytes: d.pinnable_bytes,
     })
 }
 
-/// Encode a report annotation.
-pub fn encode_report(r: &Report) -> Result<String, wire::Error> {
-    if r.fills.len() > MAX_REPORT_FILLS || r.fills.iter().any(|f| !f.valid()) {
+/// Encode a fills annotation.
+pub fn encode_fills(f: &Fills) -> Result<String, wire::Error> {
+    if f.fills.len() > MAX_REPORT_FILLS || f.fills.iter().any(|f| !f.valid()) {
         return Err(wire::Error::InvalidRequest);
     }
-    let s = serde_json::to_string(&ReportDto {
-        shares: r.shares.get(),
-        rdma_nics: encode_nics(&r.rdma_nics)?,
-        fills: r
+    let s = serde_json::to_string(&FillsDto {
+        fills: f
             .fills
             .iter()
             .map(|f| {
@@ -198,10 +232,10 @@ pub fn encode_report(r: &Report) -> Result<String, wire::Error> {
                 .map_err(|_| wire::Error::InvalidRequest)
             })
             .collect::<Result<Vec<_>, _>>()?,
-        pinnable_bytes: r.pinnable_bytes,
+        pinnable_bytes: f.pinnable_bytes,
     })
     .map_err(|_| wire::Error::InvalidRequest)?;
-    if s.len() > crate::limits::MAX_REPORT_BYTES {
+    if s.len() > crate::limits::MAX_FILLS_BYTES {
         return Err(wire::Error::Overloaded);
     }
     Ok(s)
@@ -230,8 +264,6 @@ pub(crate) mod tests {
         let r = Report {
             shares: NonZeroU32::new(8).unwrap(),
             rdma_nics: parse_nics(&json!([{"device":"d","port":1,"rail":0}])).unwrap(),
-            fills: vec![],
-            pinnable_bytes: None,
         };
         let s = encode_report(&r).unwrap();
         assert_eq!(parse_report(&s).unwrap(), r);
@@ -243,6 +275,21 @@ pub(crate) mod tests {
             parse_report(&" ".repeat(crate::limits::MAX_REPORT_BYTES + 1)),
             Err(wire::Error::Overloaded)
         );
+    }
+
+    #[test]
+    fn old_shaped_report_parses_and_new_report_has_no_fill_fields() {
+        // Exactly what an older node writes, and what this node must keep
+        // writing so an older primary can still read membership attributes.
+        let old = r#"{"shares":4,"rdma_nics":[{"device":"d","port":1,"rail":0}]}"#;
+        let r = parse_report(old).unwrap();
+        assert_eq!(r.shares.get(), 4);
+        assert_eq!(r.rdma_nics.len(), 1);
+        assert_eq!(encode_report(&r).unwrap(), old);
+        assert!(!encode_report(&r).unwrap().contains("fills"));
+        assert!(!encode_report(&r).unwrap().contains("pinnable_bytes"));
+        // The fills annotation is independent of the report.
+        assert!(parse_fills(r#"{"fills":[],"pinnable_bytes":0}"#).is_ok());
     }
 
     /// Widest valid NIC: the longest discoverable device name of characters
@@ -261,8 +308,6 @@ pub(crate) mod tests {
         Report {
             shares: NonZeroU32::MAX,
             rdma_nics: (0..64).map(widest_nic).collect(),
-            fills: vec![],
-            pinnable_bytes: None,
         }
     }
 
@@ -286,8 +331,6 @@ pub(crate) mod tests {
                     numa_node: Some(1),
                 })
                 .collect(),
-            fills: vec![],
-            pinnable_bytes: None,
         };
         assert_eq!(
             parse_report(&encode_report(&typical).unwrap()).unwrap(),
@@ -310,34 +353,27 @@ pub(crate) mod tests {
             pinned_bytes: 4_900_000,
             refused_bytes: 0,
         };
-        let r = Report {
-            shares: NonZeroU32::new(8).unwrap(),
-            rdma_nics: vec![],
+        let fills = Fills {
             fills: vec![progress.clone()],
             pinnable_bytes: Some(1234),
         };
-        let s = encode_report(&r).unwrap();
-        assert_eq!(parse_report(&s).unwrap(), r);
+        let s = encode_fills(&fills).unwrap();
+        assert_eq!(parse_fills(&s).unwrap(), fills);
         assert!(s.contains(r#""pinnable_bytes":1234"#));
-        // Old reports stay byte-identical: no fills or pinnable fields.
+        // Empty fills stay a minimal object, and the old report is unchanged.
         let old = Report {
             shares: NonZeroU32::new(8).unwrap(),
             rdma_nics: vec![],
-            fills: vec![],
-            pinnable_bytes: None,
         };
         assert_eq!(
             encode_report(&old).unwrap(),
             r#"{"shares":8,"rdma_nics":[]}"#
         );
-        // An old primary can read a new report, and a new primary tolerates
-        // fields it does not know.
-        assert_eq!(parse_report(&s).unwrap().fills[0], progress);
-        assert!(parse_report(r#"{"shares":1,"rdma_nics":[],"future":true}"#).is_ok());
+        // A new primary tolerates fields it does not know.
+        assert_eq!(parse_fills(&s).unwrap().fills[0], progress);
+        assert!(parse_fills(r#"{"fills":[],"future":true}"#).is_ok());
         // Invalid entries are ignored individually, not fatal.
         let invalid = serde_json::json!({
-            "shares": 1,
-            "rdma_nics": [],
             "fills": [
                 {"fill":"not-a-uuid","generation":1,"digest":digest,"membership":1,
                  "owned_pages":1,"pinned_pages":1,"owned_bytes":1,"pinned_bytes":1,"refused_bytes":0},
@@ -351,29 +387,38 @@ pub(crate) mod tests {
                  "owned_pages":1,"pinned_pages":1,"owned_bytes":1,"pinned_bytes":1,"refused_bytes":0}
             ]
         });
-        let parsed = parse_report(&invalid.to_string()).unwrap();
+        let parsed = parse_fills(&invalid.to_string()).unwrap();
         assert_eq!(parsed.fills.len(), 1);
         assert_eq!(parsed.fills[0].fill, fill);
         // Encoding rejects invalid or over-count entries.
-        let mut too_many = old.clone();
+        let mut too_many = fills.clone();
         too_many.fills = (0..MAX_REPORT_FILLS + 1)
             .map(|_| progress.clone())
             .collect();
-        assert_eq!(encode_report(&too_many), Err(wire::Error::InvalidRequest));
-        let mut bad = old;
+        assert_eq!(encode_fills(&too_many), Err(wire::Error::InvalidRequest));
+        let mut bad = fills;
         bad.fills = vec![FillProgress {
             owned_pages: 1,
             pinned_pages: 2,
             ..progress
         }];
-        assert_eq!(encode_report(&bad), Err(wire::Error::InvalidRequest));
+        assert_eq!(encode_fills(&bad), Err(wire::Error::InvalidRequest));
+        // The size limit counts UTF-8 bytes, like the admission policy.
+        let max = crate::limits::MAX_FILLS_BYTES;
+        assert_eq!(
+            parse_fills(&" ".repeat(max + 1)),
+            Err(wire::Error::Overloaded)
+        );
     }
 
     #[test]
-    fn maximum_report_including_fills_fits() {
-        let mut r = max_report();
+    fn maximum_fills_fit_and_report_is_inventory_only() {
+        let mut f = Fills {
+            fills: vec![],
+            pinnable_bytes: None,
+        };
         let digest = "ab".repeat(32);
-        r.fills = (0..MAX_REPORT_FILLS)
+        f.fills = (0..MAX_REPORT_FILLS)
             .map(|i| FillProgress {
                 fill: format!("11111111-1111-4111-8111-{:012}", i),
                 generation: u64::MAX,
@@ -386,14 +431,16 @@ pub(crate) mod tests {
                 refused_bytes: u64::MAX,
             })
             .collect();
-        r.pinnable_bytes = Some(u64::MAX);
-        let s = encode_report(&r).unwrap();
-        assert!(s.len() <= crate::limits::MAX_REPORT_BYTES, "{}", s.len());
-        assert!(
-            s.len()
-                <= crate::limits::MAX_REPORT_INVENTORY_BYTES + crate::limits::MAX_REPORT_FILL_BYTES
-        );
-        assert_eq!(parse_report(&s).unwrap(), r);
+        f.pinnable_bytes = Some(u64::MAX);
+        let s = encode_fills(&f).unwrap();
+        // The derived bound is exact for the worst case and fits the limit.
+        assert_eq!(s.len(), crate::limits::MAX_FILLS_INVENTORY_BYTES);
+        assert!(s.len() <= crate::limits::MAX_FILLS_BYTES, "{}", s.len());
+        assert_eq!(parse_fills(&s).unwrap(), f);
+        // The report keeps its inventory-only shape and bound.
+        let report = encode_report(&max_report()).unwrap();
+        assert_eq!(report.len(), crate::limits::MAX_REPORT_INVENTORY_BYTES);
+        assert!(!report.contains("fills"));
     }
 
     #[test]

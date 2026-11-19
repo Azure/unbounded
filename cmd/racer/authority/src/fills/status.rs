@@ -1,6 +1,6 @@
 //! ClusterCacheFill status computation and the primary's status writer.
 //!
-//! The primary aggregates node progress from Pod report annotations whose
+//! The primary aggregates node progress from Pod fills annotations whose
 //! generation, digest, and membership match its own, then writes the status
 //! subresource with resourceVersion CAS.
 
@@ -35,10 +35,10 @@ pub fn aggregate(reports: &BTreeMap<String, String>, view: &FillView) -> Progres
     };
     let mut progress = Progress::default();
     for report in reports.values() {
-        let Ok(report) = crate::rules::rails::parse_report(report) else {
+        let Ok(fills) = crate::rules::rails::parse_fills(report) else {
             continue;
         };
-        let entry: Option<&FillProgress> = report.fills.iter().find(|f| f.fill == view.uid);
+        let entry: Option<&FillProgress> = fills.fills.iter().find(|f| f.fill == view.uid);
         let Some(entry) = entry else {
             continue;
         };
@@ -267,7 +267,7 @@ pub async fn reconcile(shared: &Shared) {
     if views.is_empty() {
         return;
     }
-    let reports = shared.pod_reports.borrow().clone();
+    let reports = shared.pod_fills.borrow().clone();
     for view in views {
         let current = match shared.api.get(&paths::cluster_cache_fill(&view.name)).await {
             Ok(v) => v,
@@ -383,13 +383,11 @@ mod tests {
     }
 
     fn report(fill: FillProgress) -> String {
-        let r = crate::rules::rails::Report {
-            shares: std::num::NonZeroU32::new(1).unwrap(),
-            rdma_nics: vec![],
+        let f = crate::rules::rails::Fills {
             fills: vec![fill],
             pinnable_bytes: None,
         };
-        crate::rules::rails::encode_report(&r).unwrap()
+        crate::rules::rails::encode_fills(&f).unwrap()
     }
 
     fn statuses(status: &Value) -> BTreeMap<String, (String, String)> {

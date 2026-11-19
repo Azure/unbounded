@@ -71,6 +71,12 @@ pub const ENDPOINTS: &str = "racer.unbounded-cloud.io/endpoints";
 /// Pod annotation: JSON `{"shares": N, "rdma_nics": [...]}` reported by the Pod itself.
 pub const REPORT: &str = "racer.unbounded-cloud.io/report";
 
+/// Pod annotation: JSON `{"fills": [...], "pinnable_bytes": N}` reported by the
+/// Pod itself. It is separate from [`REPORT`] so an older primary, which
+/// rejects fields it does not know, keeps reading the membership report
+/// unchanged while ignoring this annotation.
+pub const FILLS: &str = "racer.unbounded-cloud.io/fills";
+
 /// Node annotation set by an administrator. Overrides the Pod report.
 pub const SHARES: &str = "racer.unbounded-cloud.io/shares";
 

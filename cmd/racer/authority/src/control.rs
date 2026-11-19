@@ -8,7 +8,7 @@ use crate::{
     limits,
     pki::DynamicClientVerifier,
     rt::{self, Executor, Listener, Notifier, Signal},
-    rules::rails::{self, FillProgress, Report},
+    rules::rails::{self, FillProgress, Fills, Report},
     seat, server,
     shared::{Serving, Shared},
 };
@@ -65,43 +65,55 @@ struct Outer {
     diagnostics: Mutex<Diagnostics>,
 }
 
-/// Fields of the Pod report annotation, merged from independent producers.
+/// Fields of the Pod annotations, merged from independent producers.
 #[derive(Default)]
 struct ReportState {
     shares: Option<NonZeroU32>,
     rdma_nics: Vec<racer_wire::control::RailMapping>,
     fills: Vec<FillProgress>,
     pinnable_bytes: Option<u64>,
-    encoded: Option<String>,
+    report: Option<String>,
+    fills_encoded: Option<String>,
 }
 
 impl ReportState {
     fn refresh(&mut self) -> Result<(), Error> {
-        let Some(shares) = self.shares else {
-            self.encoded = None;
-            return Ok(());
+        let report = match self.shares {
+            Some(shares) => Some(
+                rails::encode_report(&Report {
+                    shares,
+                    rdma_nics: self.rdma_nics.clone(),
+                })
+                .map_err(|_| Error::InvalidConfiguration)?,
+            ),
+            None => None,
         };
-        // A node may reconcile more fills than one report can carry. Keep a
+        // A node may reconcile more fills than one annotation can carry. Keep a
         // deterministic prefix and leave the rest out of the annotation; their
         // pins stay in place, and `pinnable_bytes` already accounts for them.
-        let mut fills = self.fills.clone();
-        fills.sort_by(|a, b| {
-            (&a.fill, a.generation, a.membership, &a.digest).cmp(&(
-                &b.fill,
-                b.generation,
-                b.membership,
-                &b.digest,
-            ))
-        });
-        fills.truncate(rails::MAX_REPORT_FILLS);
-        let report = Report {
-            shares,
-            rdma_nics: self.rdma_nics.clone(),
-            fills,
-            pinnable_bytes: self.pinnable_bytes,
+        let fills_encoded = if self.fills.is_empty() && self.pinnable_bytes.is_none() {
+            None
+        } else {
+            let mut fills = self.fills.clone();
+            fills.sort_by(|a, b| {
+                (&a.fill, a.generation, a.membership, &a.digest).cmp(&(
+                    &b.fill,
+                    b.generation,
+                    b.membership,
+                    &b.digest,
+                ))
+            });
+            fills.truncate(rails::MAX_REPORT_FILLS);
+            Some(
+                rails::encode_fills(&Fills {
+                    fills,
+                    pinnable_bytes: self.pinnable_bytes,
+                })
+                .map_err(|_| Error::InvalidConfiguration)?,
+            )
         };
-        self.encoded =
-            Some(rails::encode_report(&report).map_err(|_| Error::InvalidConfiguration)?);
+        self.report = report;
+        self.fills_encoded = fills_encoded;
         Ok(())
     }
 }
@@ -291,7 +303,7 @@ impl Authority {
                 fills_synced: Default::default(),
                 fills_caches: RefCell::new(Default::default()),
                 fills_caches_synced: Default::default(),
-                pod_reports: RefCell::new(Default::default()),
+                pod_fills: RefCell::new(Default::default()),
             });
             let primary_changed = Rc::new(RefCell::new((String::new(), None)));
             rt::spawn(bootstrap(shared.clone(), outer.clone()))?;
@@ -482,11 +494,16 @@ impl Outer {
     ) -> Result<(), Error> {
         let mut report = self.report.lock().unwrap_or_else(|e| e.into_inner());
         let shares = NonZeroU32::new(shares).ok_or(Error::InvalidConfiguration)?;
-        let previous = report.encoded.clone();
+        let previous = report.report.clone();
+        let old = (report.shares, std::mem::take(&mut report.rdma_nics));
         report.shares = Some(shares);
         report.rdma_nics = rdma_nics;
-        report.refresh()?;
-        if report.encoded != previous {
+        if let Err(error) = report.refresh() {
+            report.shares = old.0;
+            report.rdma_nics = old.1;
+            return Err(error);
+        }
+        if report.report != previous {
             self.report_generation.fetch_add(1, Ordering::SeqCst);
         }
         Ok(())
@@ -498,7 +515,7 @@ impl Outer {
         pinnable_bytes: Option<u64>,
     ) -> Result<(), Error> {
         let mut report = self.report.lock().unwrap_or_else(|e| e.into_inner());
-        let previous = report.encoded.clone();
+        let previous = report.fills_encoded.clone();
         let old = (std::mem::take(&mut report.fills), report.pinnable_bytes);
         report.fills = fills;
         report.pinnable_bytes = pinnable_bytes;
@@ -507,7 +524,7 @@ impl Outer {
             report.pinnable_bytes = old.1;
             return Err(error);
         }
-        if report.encoded != previous {
+        if report.fills_encoded != previous {
             self.report_generation.fetch_add(1, Ordering::SeqCst);
         }
         Ok(())
@@ -517,7 +534,15 @@ impl Outer {
         self.report
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .encoded
+            .report
+            .clone()
+    }
+
+    fn fills_string(&self) -> Option<String> {
+        self.report
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .fills_encoded
             .clone()
     }
 
@@ -657,15 +682,37 @@ async fn bound_to_installation(shared: &Shared, uid: &str) -> Result<(), Error> 
     Ok(())
 }
 
-/// Patch this Pod's report annotation whenever a new report arrives.
+/// Patch this Pod's report and fills annotations whenever a new encoding
+/// arrives. Each annotation has its own written value and backoff, so a
+/// failure on one does not rewrite the other.
 async fn reporter(shared: Rc<Shared>, outer: Arc<Outer>, signal: Signal) {
-    let mut written: Option<String> = None;
-    let mut backoff = 1;
+    let mut written_report: Option<String> = None;
+    let mut written_fills: Option<String> = None;
+    let mut backoff_report = 1;
+    let mut backoff_fills = 1;
     while !shared.stopping.get() {
         let generation = signal.generation();
-        let wanted = outer.report_string();
-        if wanted.is_some() && wanted != written {
-            let patch = json!({"metadata": {"annotations": {annotations::REPORT: wanted}}});
+        for (key, wanted, written, backoff) in [
+            (
+                annotations::REPORT,
+                outer.report_string(),
+                &mut written_report,
+                &mut backoff_report,
+            ),
+            (
+                annotations::FILLS,
+                outer.fills_string(),
+                &mut written_fills,
+                &mut backoff_fills,
+            ),
+        ] {
+            let Some(wanted) = wanted else {
+                continue;
+            };
+            if written.as_ref() == Some(&wanted) {
+                continue;
+            }
+            let patch = json!({"metadata": {"annotations": {key: wanted}}});
             match shared
                 .api
                 .merge_patch(
@@ -675,13 +722,12 @@ async fn reporter(shared: Rc<Shared>, outer: Arc<Outer>, signal: Signal) {
                 .await
             {
                 Ok(_) => {
-                    written = wanted;
-                    backoff = 1;
+                    *written = Some(wanted);
+                    *backoff = 1;
                 }
                 Err(_) => {
-                    rt::sleep(Duration::from_secs(backoff)).await;
-                    backoff = (backoff * 2).min(60);
-                    continue;
+                    rt::sleep(Duration::from_secs(*backoff)).await;
+                    *backoff = (*backoff * 2).min(60);
                 }
             }
         }
@@ -806,7 +852,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_bounds_fills_to_the_report_limit() {
+    fn refresh_bounds_fills_to_the_fills_limit() {
         let mut state = ReportState {
             shares: NonZeroU32::new(8),
             fills: (0..17).rev().map(progress).collect(),
@@ -814,9 +860,13 @@ mod tests {
             ..Default::default()
         };
         state.refresh().unwrap();
-        let report = rails::parse_report(state.encoded.as_deref().unwrap()).unwrap();
-        assert_eq!(report.fills.len(), rails::MAX_REPORT_FILLS);
-        let uids: Vec<&str> = report.fills.iter().map(|f| f.fill.as_str()).collect();
+        assert_eq!(
+            state.report.as_deref().unwrap(),
+            r#"{"shares":8,"rdma_nics":[]}"#
+        );
+        let fills = rails::parse_fills(state.fills_encoded.as_deref().unwrap()).unwrap();
+        assert_eq!(fills.fills.len(), rails::MAX_REPORT_FILLS);
+        let uids: Vec<&str> = fills.fills.iter().map(|f| f.fill.as_str()).collect();
         let expected: Vec<String> = (0..rails::MAX_REPORT_FILLS)
             .map(progress)
             .map(|p| p.fill)
@@ -826,6 +876,6 @@ mod tests {
             expected.iter().map(String::as_str).collect::<Vec<_>>()
         );
         // The headroom was computed over every fill, including the omitted one.
-        assert_eq!(report.pinnable_bytes, Some(4096));
+        assert_eq!(fills.pinnable_bytes, Some(4096));
     }
 }

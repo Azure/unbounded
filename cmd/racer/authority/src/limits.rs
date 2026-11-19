@@ -195,23 +195,28 @@ const MAX_REPORT_FILL_ENTRY_BYTES: usize = r#"{"fill":"","generation":1844674407
     + 36
     + 64;
 
-/// Largest addition the fill progress and pinnable fields make to a report:
-/// `,"fills":[...]` and `,"pinnable_bytes":18446744073709551615`.
-pub const MAX_REPORT_FILL_BYTES: usize = r#","fills":[]"#.len()
+/// Largest fills annotation: `{"fills":[...]}` plus the optional
+/// `,"pinnable_bytes":18446744073709551615`.
+pub const MAX_FILLS_INVENTORY_BYTES: usize = r#"{"fills":[]}"#.len()
     + MAX_REPORT_FILLS * MAX_REPORT_FILL_ENTRY_BYTES
     + (MAX_REPORT_FILLS - 1)
     + r#","pinnable_bytes":18446744073709551615"#.len();
 
-/// Maximum Pod report annotation length. It is the inventory bound plus the
-/// fill progress bound, rounded up to 64 KiB, well below the 256 KiB
-/// Kubernetes limit on all annotations of an object.
-/// `deploy/racer/policies.yaml.tmpl` enforces the same value in UTF-8 bytes;
-/// `report_limit_matches_policy` checks they agree.
+/// Maximum Pod report annotation length. It is the inventory bound, rounded up
+/// to 64 KiB, well below the 256 KiB Kubernetes limit on all annotations of an
+/// object. `deploy/racer/policies.yaml.tmpl` enforces the same value in UTF-8
+/// bytes; `annotation_limits_match_policy` checks they agree.
 pub const MAX_REPORT_BYTES: usize = 64 * 1024;
 
+/// Maximum Pod fills annotation length, the same 64 KiB cap as
+/// [`MAX_REPORT_BYTES`]. Separate annotations keep the fill bound from
+/// shrinking the inventory bound the membership report needs.
+pub const MAX_FILLS_BYTES: usize = 64 * 1024;
+
 const _: () = assert!(MAX_REPORT_INVENTORY_BYTES <= MAX_REPORT_BYTES);
-const _: () = assert!(MAX_REPORT_INVENTORY_BYTES + MAX_REPORT_FILL_BYTES <= MAX_REPORT_BYTES);
+const _: () = assert!(MAX_FILLS_INVENTORY_BYTES <= MAX_FILLS_BYTES);
 const _: () = assert!(MAX_REPORT_BYTES <= 256 * 1024 / 4);
+const _: () = assert!(MAX_FILLS_BYTES <= 256 * 1024 / 4);
 
 /// Members per seat when seats are automatic.
 pub const MEMBERS_PER_SEAT: usize = 2048;
@@ -241,14 +246,16 @@ mod tests {
     }
 
     #[test]
-    fn report_limit_matches_policy() {
+    fn annotation_limits_match_policy() {
         let policy = include_str!("../../../../deploy/racer/policies.yaml.tmpl");
-        let check = format!(
-            "size(bytes(variables.annotations['racer.unbounded-cloud.io/report'])) <= {MAX_REPORT_BYTES}"
-        );
-        assert_eq!(policy.matches(&check).count(), 1, "{check}");
-        let message = format!("limited to {MAX_REPORT_BYTES} UTF-8 bytes");
-        assert_eq!(policy.matches(&message).count(), 1, "{message}");
+        for (key, limit) in [("report", MAX_REPORT_BYTES), ("fills", MAX_FILLS_BYTES)] {
+            let check = format!(
+                "size(bytes(variables.annotations['racer.unbounded-cloud.io/{key}'])) <= {limit}"
+            );
+            assert_eq!(policy.matches(&check).count(), 1, "{check}");
+            let message = format!("{key} annotation is limited to {limit} UTF-8 bytes");
+            assert_eq!(policy.matches(&message).count(), 1, "{message}");
+        }
     }
 
     #[test]

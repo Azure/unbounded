@@ -132,8 +132,8 @@ pub struct Shared {
     pub fills_caches: RefCell<BTreeMap<String, crate::rules::catalog::CacheInfo>>,
     /// ClusterCaches listed at least once, or the CRD is absent.
     pub fills_caches_synced: Cell<bool>,
-    /// Racer Pod report annotations by Pod UID, kept by the primary.
-    pub pod_reports: RefCell<BTreeMap<String, String>>,
+    /// Racer Pod fills annotations by Pod UID, kept by the primary.
+    pub pod_fills: RefCell<BTreeMap<String, String>>,
 }
 
 impl Shared {
@@ -283,7 +283,7 @@ pub(crate) mod tests {
             fills_synced: Cell::new(false),
             fills_caches: RefCell::new(BTreeMap::new()),
             fills_caches_synced: Cell::new(false),
-            pod_reports: RefCell::new(BTreeMap::new()),
+            pod_fills: RefCell::new(BTreeMap::new()),
         })
     }
 }

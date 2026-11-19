@@ -384,18 +384,18 @@ fn apply(shared: &Shared, inv: &mut Inventory, kind: Kind, event: &str, v: &Valu
         Kind::Pods => {
             if deleted {
                 inv.pods.remove(&key);
-                shared.pod_reports.borrow_mut().remove(&key);
+                shared.pod_fills.borrow_mut().remove(&key);
             } else {
                 let pod = PodInfo::from_json(v);
-                match pod.annotations.get(annotations::REPORT) {
-                    Some(report) => {
+                match pod.annotations.get(annotations::FILLS) {
+                    Some(fills) => {
                         shared
-                            .pod_reports
+                            .pod_fills
                             .borrow_mut()
-                            .insert(key.clone(), report.clone());
+                            .insert(key.clone(), fills.clone());
                     }
                     None => {
-                        shared.pod_reports.borrow_mut().remove(&key);
+                        shared.pod_fills.borrow_mut().remove(&key);
                     }
                 }
                 inv.pods.insert(key, pod);
@@ -1043,6 +1043,40 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn pods_store_the_fills_annotation_not_the_report() {
+        crate::kube::fake::run(|_api, kube| async move {
+            let shared = crate::shared::tests::shared(kube);
+            let mut inv = Inventory::default();
+            let fills = r#"{"fills":[],"pinnable_bytes":7}"#;
+            let pod = json!({
+                "metadata": {
+                    "uid": "u1",
+                    "name": "racer-1",
+                    "annotations": {
+                        annotations::REPORT: r#"{"shares":4,"rdma_nics":[]}"#,
+                        annotations::FILLS: fills,
+                    },
+                },
+            });
+            apply(&shared, &mut inv, Kind::Pods, "ADDED", &pod);
+            assert_eq!(
+                shared.pod_fills.borrow().get("u1").map(String::as_str),
+                Some(fills)
+            );
+            // A Pod without a fills annotation leaves no stale value behind.
+            let pod = json!({
+                "metadata": {
+                    "uid": "u1",
+                    "name": "racer-1",
+                    "annotations": {annotations::REPORT: r#"{"shares":4,"rdma_nics":[]}"#},
+                },
+            });
+            apply(&shared, &mut inv, Kind::Pods, "MODIFIED", &pod);
+            assert!(shared.pod_fills.borrow().is_empty());
+        });
+    }
 
     #[test]
     fn webhook_trust_added_before_endpoints_and_removed_after() {
