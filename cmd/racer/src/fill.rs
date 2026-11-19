@@ -246,6 +246,13 @@ impl FillController {
 
     /// Drop a fill and everything this worker pinned for it.
     fn forget(&mut self, fill: &str) {
+        // A forgotten fill can be replaced in place: a membership change, a
+        // manifest resync, or a renewal reset installs a new plan without
+        // changing the spec generation, so `finish` cannot tell a completion
+        // launched for the old plan from one for the new plan. Drop this
+        // fill's receivers so an obsolete completion never credits a page or
+        // advances the replacement plan's cursor.
+        forget_inflight(&mut self.inflight, fill);
         if let Some(state) = self.local.remove(fill) {
             let id = fill_id(fill);
             for (page, epoch) in state.pins {
@@ -571,6 +578,11 @@ impl Drop for FillController {
     }
 }
 
+/// Drop every in-flight fetch launched for `fill`.
+fn forget_inflight(inflight: &mut Vec<Inflight>, fill: &str) {
+    inflight.retain(|work| work.fill != fill);
+}
+
 /// Stable local identity for a fill UID.
 fn fill_id(uid: &str) -> FillId {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
@@ -604,6 +616,34 @@ fn fill_request(uid: &str, version: &ObjectVersion, page: u64) -> RequestId {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{CacheKey, StrongEtag};
+
+    #[test]
+    fn forgetting_a_fill_drops_its_inflight_fetches() {
+        fn pending() -> Pin<Box<dyn Future<Output = Result<PageResult>>>> {
+            Box::pin(std::future::pending())
+        }
+
+        let version = ObjectVersion {
+            object: ObjectId {
+                cache: CacheId("cache".to_owned()),
+                key: CacheKey([0; 32]),
+            },
+            etag: StrongEtag::test_value("v1"),
+        };
+        let work = |fill: &str, page: u64| Inflight {
+            fill: fill.to_owned(),
+            generation: 1,
+            page,
+            accounted: 1024,
+            version: version.clone(),
+            future: pending(),
+        };
+        let mut inflight = vec![work("a", 0), work("b", 0), work("a", 1)];
+        forget_inflight(&mut inflight, "a");
+        assert_eq!(inflight.len(), 1);
+        assert_eq!(inflight[0].fill, "b");
+    }
 
     #[test]
     fn fill_ids_are_stable_and_distinct() {
