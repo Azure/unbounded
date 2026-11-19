@@ -12,7 +12,7 @@
 use crate::control::Managed;
 use crate::error::{Error, Result};
 use crate::model::{
-    ObjectId, ObjectVersion, PageId, PageNumber, RequestId, VersionMetadata, WorkerId,
+    ContentType, ObjectId, ObjectVersion, PageId, PageNumber, RequestId, VersionMetadata, WorkerId,
 };
 use crate::read::Coordinator;
 use crate::runtime::RequestScope;
@@ -391,7 +391,6 @@ impl FillController {
                     state.page += 1;
                     continue;
                 }
-                let length = page_size.min(object_length - page_number * page_size);
                 if directory.page_owner(&page)? != self.worker {
                     state.page += 1;
                     continue;
@@ -431,11 +430,7 @@ impl FillController {
                     state.refused_bytes = state.refused_bytes.saturating_sub(page_size);
                 }
                 let request = fill_request(&uid, &version, page_number);
-                let version_metadata = VersionMetadata {
-                    content_type,
-                    version: version.clone(),
-                    length,
-                };
+                let version_metadata = page_metadata(content_type, version.clone(), object_length);
                 let directory = directory.clone();
                 let clock = self.clock.clone();
                 let work_version = version.clone();
@@ -583,6 +578,23 @@ fn forget_inflight(inflight: &mut Vec<Inflight>, fill: &str) {
     inflight.retain(|work| work.fill != fill);
 }
 
+/// Immutable descriptor handed to the prefetch path for one page of an object.
+///
+/// The dispatcher compares this against the metadata the store fetched for the
+/// whole object, so `length` is the object's full length. Fetching one page
+/// does not narrow it: the page number selects the byte range.
+fn page_metadata(
+    content_type: Option<ContentType>,
+    version: ObjectVersion,
+    object_length: u64,
+) -> VersionMetadata {
+    VersionMetadata {
+        content_type,
+        version,
+        length: object_length,
+    }
+}
+
 /// Stable local identity for a fill UID.
 fn fill_id(uid: &str) -> FillId {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
@@ -643,6 +655,34 @@ mod tests {
         forget_inflight(&mut inflight, "a");
         assert_eq!(inflight.len(), 1);
         assert_eq!(inflight[0].fill, "b");
+    }
+
+    #[test]
+    fn page_metadata_carries_the_whole_object_length() {
+        let version = ObjectVersion {
+            object: ObjectId {
+                cache: CacheId("cache".to_owned()),
+                key: CacheKey([1; 32]),
+            },
+            etag: StrongEtag::test_value("v1"),
+        };
+        let page_size = crate::model::PAGE_BYTES;
+        let object_length = 3 * page_size;
+        let stored = VersionMetadata {
+            content_type: None,
+            version: version.clone(),
+            length: object_length,
+        };
+        for page in 0..3 {
+            let metadata = page_metadata(None, version.clone(), object_length);
+            assert!(metadata.compatible(&stored), "page {page}");
+        }
+        let page_payload = VersionMetadata {
+            content_type: None,
+            version,
+            length: page_size,
+        };
+        assert!(!page_payload.compatible(&stored));
     }
 
     #[test]
