@@ -183,6 +183,7 @@ func TestNonePlanDeactivatesBeforeOwnershipCheck(t *testing.T) {
 	p, s, _, _ := newNonePlan(t, false)
 
 	var calls []string
+
 	p.beforeOwnership = func() error {
 		calls = append(calls, "before")
 		return nil
