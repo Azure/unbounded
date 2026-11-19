@@ -303,7 +303,9 @@ impl Authority {
                 fills_synced: Default::default(),
                 fills_caches: RefCell::new(Default::default()),
                 fills_caches_synced: Default::default(),
-                pod_fills: RefCell::new(Default::default()),
+                nodes: RefCell::new(Default::default()),
+                pods: RefCell::new(Default::default()),
+                ownership: RefCell::new(Default::default()),
             });
             let primary_changed = Rc::new(RefCell::new((String::new(), None)));
             rt::spawn(bootstrap(shared.clone(), outer.clone()))?;

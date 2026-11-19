@@ -7,6 +7,7 @@ use crate::{
     pki::{DynamicClientVerifier, SeatIssuer, ServingIdentity},
     rt::Signal,
     rules::{
+        members::{NodeInfo, Ownership, PodInfo},
         publication::Image,
         state::{Freshness, StateRecord},
     },
@@ -132,8 +133,12 @@ pub struct Shared {
     pub fills_caches: RefCell<BTreeMap<String, crate::rules::catalog::CacheInfo>>,
     /// ClusterCaches listed at least once, or the CRD is absent.
     pub fills_caches_synced: Cell<bool>,
-    /// Racer Pod fills annotations by Pod UID, kept by the primary.
-    pub pod_fills: RefCell<BTreeMap<String, String>>,
+    /// Live Nodes by UID, mirrored for fill status member selection.
+    pub nodes: RefCell<BTreeMap<String, NodeInfo>>,
+    /// Live Pods by UID, mirrored for fill status member selection.
+    pub pods: RefCell<BTreeMap<String, PodInfo>>,
+    /// Live DaemonSet ownership, mirrored for fill status member selection.
+    pub ownership: RefCell<Ownership>,
 }
 
 impl Shared {
@@ -283,7 +288,9 @@ pub(crate) mod tests {
             fills_synced: Cell::new(false),
             fills_caches: RefCell::new(BTreeMap::new()),
             fills_caches_synced: Cell::new(false),
-            pod_fills: RefCell::new(BTreeMap::new()),
+            nodes: RefCell::new(BTreeMap::new()),
+            pods: RefCell::new(BTreeMap::new()),
+            ownership: RefCell::new(Ownership::default()),
         })
     }
 }

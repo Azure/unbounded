@@ -377,27 +377,19 @@ fn apply(shared: &Shared, inv: &mut Inventory, kind: Kind, event: &str, v: &Valu
             let name = n.name.clone();
             if deleted {
                 inv.nodes.remove(&name);
+                shared.nodes.borrow_mut().remove(&n.uid);
             } else {
+                shared.nodes.borrow_mut().insert(n.uid.clone(), n.clone());
                 inv.nodes.insert(name, n);
             }
         }
         Kind::Pods => {
             if deleted {
                 inv.pods.remove(&key);
-                shared.pod_fills.borrow_mut().remove(&key);
+                shared.pods.borrow_mut().remove(&key);
             } else {
                 let pod = PodInfo::from_json(v);
-                match pod.annotations.get(annotations::FILLS) {
-                    Some(fills) => {
-                        shared
-                            .pod_fills
-                            .borrow_mut()
-                            .insert(key.clone(), fills.clone());
-                    }
-                    None => {
-                        shared.pod_fills.borrow_mut().remove(&key);
-                    }
-                }
+                shared.pods.borrow_mut().insert(key.clone(), pod.clone());
                 inv.pods.insert(key, pod);
             }
         }
@@ -439,8 +431,14 @@ async fn watch(t: Rc<Term_>, kind: Kind) {
         {
             let mut inv = t.inventory.borrow_mut();
             match kind {
-                Kind::Nodes => inv.nodes.clear(),
-                Kind::Pods => inv.pods.clear(),
+                Kind::Nodes => {
+                    inv.nodes.clear();
+                    t.shared.nodes.borrow_mut().clear();
+                }
+                Kind::Pods => {
+                    inv.pods.clear();
+                    t.shared.pods.borrow_mut().clear();
+                }
                 Kind::Caches => inv.caches.clear(),
             }
             for v in &items {
@@ -625,6 +623,7 @@ async fn reconcile(t: &Rc<Term_>) -> Result<(), StateError> {
         },
         service_account: shared.config.service_account.clone(),
     };
+    *shared.ownership.borrow_mut() = ownership.clone();
 
     let cluster = shared.cluster.borrow().clone();
     let policy = Policy::from(shared.config.rotation);
@@ -1045,7 +1044,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pods_store_the_fills_annotation_not_the_report() {
+    fn pods_are_mirrored_with_their_annotations() {
         crate::kube::fake::run(|_api, kube| async move {
             let shared = crate::shared::tests::shared(kube);
             let mut inv = Inventory::default();
@@ -1062,10 +1061,15 @@ mod tests {
             });
             apply(&shared, &mut inv, Kind::Pods, "ADDED", &pod);
             assert_eq!(
-                shared.pod_fills.borrow().get("u1").map(String::as_str),
+                shared
+                    .pods
+                    .borrow()
+                    .get("u1")
+                    .and_then(|p| p.annotations.get(annotations::FILLS))
+                    .map(String::as_str),
                 Some(fills)
             );
-            // A Pod without a fills annotation leaves no stale value behind.
+            // A modified Pod replaces the old annotations.
             let pod = json!({
                 "metadata": {
                     "uid": "u1",
@@ -1074,7 +1078,14 @@ mod tests {
                 },
             });
             apply(&shared, &mut inv, Kind::Pods, "MODIFIED", &pod);
-            assert!(shared.pod_fills.borrow().is_empty());
+            assert!(
+                shared.pods.borrow()["u1"]
+                    .annotations
+                    .get(annotations::FILLS)
+                    .is_none()
+            );
+            apply(&shared, &mut inv, Kind::Pods, "DELETED", &pod);
+            assert!(shared.pods.borrow().is_empty());
         });
     }
 

@@ -6,11 +6,17 @@
 
 use super::{FillView, snapshot};
 use crate::{
+    annotations,
     kube::{self, KubeError, paths},
     limits, rt,
-    rules::{election, rails::FillProgress},
+    rules::{
+        election,
+        members::{NodeInfo, Ownership, PodInfo, select_pod},
+        rails::FillProgress,
+    },
     shared::Shared,
 };
+use racer_wire::control::Member;
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, time::Duration};
 
@@ -55,6 +61,42 @@ pub fn aggregate(reports: &BTreeMap<String, String>, view: &FillView) -> Progres
         }
     }
     progress
+}
+
+/// Fills annotations of the selected managed Pod for each current member Node.
+/// Keyed by Node UID so a Node contributes at most once, and Pods the
+/// dataplane DaemonSet does not own are ignored.
+fn member_reports(
+    pods: &BTreeMap<String, PodInfo>,
+    nodes: &BTreeMap<String, NodeInfo>,
+    ownership: &Ownership,
+    members: &[Member],
+) -> BTreeMap<String, String> {
+    let mut by_node: BTreeMap<&str, Vec<PodInfo>> = BTreeMap::new();
+    for pod in pods.values() {
+        by_node
+            .entry(pod.node_name.as_str())
+            .or_default()
+            .push(pod.clone());
+    }
+    let mut reports = BTreeMap::new();
+    let empty = Vec::new();
+    for member in members {
+        let Some(node) = nodes.get(&member.node.0) else {
+            continue;
+        };
+        let Some((pod, _)) = select_pod(
+            by_node.get(node.name.as_str()).unwrap_or(&empty),
+            ownership,
+            &node.name,
+        ) else {
+            continue;
+        };
+        if let Some(fills) = pod.annotations.get(annotations::FILLS) {
+            reports.insert(member.node.0.clone(), fills.clone());
+        }
+    }
+    reports
 }
 
 /// Compute the `status` object for one fill. `previous` is the status read
@@ -267,7 +309,17 @@ pub async fn reconcile(shared: &Shared) {
     if views.is_empty() {
         return;
     }
-    let reports = shared.pod_fills.borrow().clone();
+    let reports = {
+        let serving = shared.serving.borrow();
+        let members: &[Member] = serving
+            .image
+            .as_ref()
+            .map_or(&[], |image| image.publication.members.as_slice());
+        let pods = shared.pods.borrow();
+        let nodes = shared.nodes.borrow();
+        let ownership = shared.ownership.borrow();
+        member_reports(&pods, &nodes, &ownership, members)
+    };
     for view in views {
         let current = match shared.api.get(&paths::cluster_cache_fill(&view.name)).await {
             Ok(v) => v,
@@ -320,7 +372,8 @@ pub async fn run(shared: std::rc::Rc<Shared>) {
 mod tests {
     use super::*;
     use crate::fills::manifest;
-    use std::sync::Arc;
+    use racer_wire::control::NodeId;
+    use std::{num::NonZeroU32, sync::Arc};
 
     fn view() -> FillView {
         FillView {
@@ -528,5 +581,119 @@ mod tests {
             first["conditions"][0]["lastTransitionTime"],
             later["conditions"][0]["lastTransitionTime"]
         );
+    }
+
+    const DS: &str = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    const NODE_UID: &str = "33333333-3333-4333-8333-333333333333";
+
+    fn ownership() -> Ownership {
+        Ownership {
+            namespace: "racer-system".into(),
+            daemonset: "racer".into(),
+            uid: DS.into(),
+            service_account: "racer".into(),
+        }
+    }
+
+    fn node_map() -> BTreeMap<String, NodeInfo> {
+        BTreeMap::from([(
+            NODE_UID.to_owned(),
+            NodeInfo {
+                name: "n1".into(),
+                uid: NODE_UID.into(),
+                ..Default::default()
+            },
+        )])
+    }
+
+    fn managed_pod(uid: &str, created: &str, fills: &str, owner: &str) -> PodInfo {
+        PodInfo {
+            namespace: "racer-system".into(),
+            name: format!("racer-{uid}"),
+            uid: uid.into(),
+            node_name: "n1".into(),
+            pod_ip: "10.0.0.1".into(),
+            phase: "Running".into(),
+            creation: created.into(),
+            service_account: "racer".into(),
+            owner: Some(crate::rules::members::Owner {
+                api_version: "apps/v1".into(),
+                kind: "DaemonSet".into(),
+                name: "racer".into(),
+                uid: owner.into(),
+            }),
+            annotations: BTreeMap::from([(annotations::FILLS.to_owned(), fills.to_owned())]),
+            ..Default::default()
+        }
+    }
+
+    fn pod_map(list: Vec<PodInfo>) -> BTreeMap<String, PodInfo> {
+        list.into_iter().map(|p| (p.uid.clone(), p)).collect()
+    }
+
+    fn member() -> Member {
+        Member {
+            node: NodeId(NODE_UID.into()),
+            shares: NonZeroU32::new(4).unwrap(),
+            peer_endpoint: "10.0.0.1:8082".into(),
+            rails: Vec::new(),
+            site: String::new(),
+        }
+    }
+
+    #[test]
+    fn unrelated_pods_do_not_contribute_member_reports() {
+        let v = with_manifest(view());
+        let real = report(progress_for(&v));
+        // The unrelated Pod is newer and carries a byte-for-byte matching
+        // annotation, but the DaemonSet does not own it.
+        let pods = pod_map(vec![
+            managed_pod("real", "2024-01-01T00:00:00Z", &real, DS),
+            managed_pod("spoof", "2025-01-01T00:00:00Z", &real, "other"),
+        ]);
+        let reports = member_reports(&pods, &node_map(), &ownership(), &[member()]);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[NODE_UID], real);
+        assert_eq!(aggregate(&reports, &v).nodes, 1);
+    }
+
+    #[test]
+    fn two_managed_pods_on_one_node_contribute_once() {
+        let v = with_manifest(view());
+        let mut old = progress_for(&v);
+        old.pinned_bytes = 100;
+        let mut new = old.clone();
+        new.owned_bytes = 250;
+        new.pinned_bytes = 250;
+        let old_report = report(old);
+        let new_report = report(new);
+        let pods = pod_map(vec![
+            managed_pod("old", "2024-01-01T00:00:00Z", &old_report, DS),
+            managed_pod("new", "2024-01-02T00:00:00Z", &new_report, DS),
+        ]);
+        let reports = member_reports(&pods, &node_map(), &ownership(), &[member()]);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[NODE_UID], new_report);
+        let progress = aggregate(&reports, &v);
+        assert_eq!(progress.nodes, 1);
+        assert_eq!(progress.resident_bytes, 250);
+    }
+
+    #[test]
+    fn selected_managed_pod_contributes_normally() {
+        let v = with_manifest(view());
+        let full = progress_for(&v);
+        let reported = report(full.clone());
+        let pods = pod_map(vec![managed_pod(
+            "selected",
+            "2024-01-01T00:00:00Z",
+            &reported,
+            DS,
+        )]);
+        let reports = member_reports(&pods, &node_map(), &ownership(), &[member()]);
+        assert_eq!(reports[NODE_UID], reported);
+        let progress = aggregate(&reports, &v);
+        assert_eq!(progress.nodes, 1);
+        assert_eq!(progress.resident_bytes, full.pinned_bytes);
     }
 }
