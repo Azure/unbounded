@@ -447,12 +447,7 @@ async fn list_fills(shared: Rc<Shared>) {
                             .map_or(0, |d| d.as_secs()),
                     ) {
                         Ok(manifest) => {
-                            view.manifest = Some(Arc::new(manifest));
-                            view.listed_generation = Some(generation);
-                            view.listed_cache_uid = cache_uid;
-                            view.error = None;
-                            view.failures = 0;
-                            view.next_list = Some(now + Duration::from_secs(view.resync_secs));
+                            install_manifest(&shared, view, manifest, generation, cache_uid, now)
                         }
                         Err(ManifestError::TooManyObjects) => {
                             // Keep the previous manifest, as on a list failure.
@@ -482,38 +477,51 @@ async fn list_fills(shared: Rc<Shared>) {
     }
 }
 
-/// Recompute admission and the footprint plan for every fill from the current
-/// cache catalog and publication.
-pub fn recompute(shared: &Shared) {
-    let (page_size, membership, pool_sizes) = {
-        let serving = shared.serving.borrow();
-        match serving.image.as_ref() {
-            Some(image) => {
-                let publication = &image.publication;
-                let mut pools = BTreeMap::new();
-                for pool in &publication.pools {
-                    let members = pool
-                        .members
-                        .as_ref()
-                        .map_or(publication.members.len(), Vec::len);
-                    for cache in &pool.caches {
-                        pools.insert(cache.clone(), members);
+/// Admission inputs that do not change per fill.
+struct Admission {
+    page_size: u64,
+    membership: Option<u64>,
+    pool_sizes: BTreeMap<racer_wire::control::CacheId, usize>,
+}
+
+impl Admission {
+    /// Read the page size and publication admission is computed against.
+    fn read(shared: &Shared) -> Self {
+        let (page_size, membership, pool_sizes) = {
+            let serving = shared.serving.borrow();
+            match serving.image.as_ref() {
+                Some(image) => {
+                    let publication = &image.publication;
+                    let mut pools = BTreeMap::new();
+                    for pool in &publication.pools {
+                        let members = pool
+                            .members
+                            .as_ref()
+                            .map_or(publication.members.len(), Vec::len);
+                        for cache in &pool.caches {
+                            pools.insert(cache.clone(), members);
+                        }
                     }
+                    (
+                        publication.page_size.get(),
+                        Some(publication.membership_version.0),
+                        pools,
+                    )
                 }
-                (
-                    publication.page_size.get(),
-                    Some(publication.membership_version.0),
-                    pools,
-                )
+                None => (shared.config.page_size.get(), None, BTreeMap::new()),
             }
-            None => (shared.config.page_size.get(), None, BTreeMap::new()),
+        };
+        Self {
+            page_size,
+            membership,
+            pool_sizes,
         }
-    };
-    let caches = shared.fills_caches.borrow();
-    let mut fills = shared.fills.borrow_mut();
-    for view in fills.values_mut() {
-        view.membership = membership;
-        let origin = catalog::fill_cache_named(&view.cache_name, &caches);
+    }
+
+    /// Resolve the fill's cache and recompute admission and its footprint.
+    fn admit(&self, view: &mut FillView, caches: &BTreeMap<String, CacheInfo>) {
+        view.membership = self.membership;
+        let origin = catalog::fill_cache_named(&view.cache_name, caches);
         match &origin {
             FillCache::Usable { uid, .. } => {
                 view.cache_uid.clone_from(uid);
@@ -528,7 +536,8 @@ pub fn recompute(shared: &Shared) {
                 }
                 view.accepted = true;
                 view.message.clear();
-                view.available_nodes = pool_sizes
+                view.available_nodes = self
+                    .pool_sizes
                     .get(&racer_wire::control::CacheId(view.cache_uid.clone()))
                     .map_or(view.replicas, |members| {
                         u8::try_from(*members).unwrap_or(u8::MAX)
@@ -539,21 +548,21 @@ pub fn recompute(shared: &Shared) {
                 view.accepted = false;
                 view.message = "CacheNotFound".into();
                 view.planned_footprint_bytes = None;
-                continue;
+                return;
             }
             FillCache::UnsupportedCache => {
                 view.cache_uid.clear();
                 view.accepted = false;
                 view.message = "UnsupportedCache".into();
                 view.planned_footprint_bytes = None;
-                continue;
+                return;
             }
             FillCache::UnsupportedOrigin => {
                 view.cache_uid.clear();
                 view.accepted = false;
                 view.message = "UnsupportedOrigin".into();
                 view.planned_footprint_bytes = None;
-                continue;
+                return;
             }
         }
         if view.error.as_deref() == Some("TooManyObjects") {
@@ -564,7 +573,7 @@ pub fn recompute(shared: &Shared) {
             // Plan every requested replica so admission checks the requested
             // footprint. Missing pool members are reported as shortfall, not
             // folded into a smaller target.
-            let planned = manifest::planned_footprint(manifest, page_size, view.replicas);
+            let planned = manifest::planned_footprint(manifest, self.page_size, view.replicas);
             view.planned_footprint_bytes = Some(planned);
             if planned > view.max_footprint {
                 view.accepted = false;
@@ -573,5 +582,131 @@ pub fn recompute(shared: &Shared) {
         } else {
             view.planned_footprint_bytes = None;
         }
+    }
+}
+
+/// Recompute admission and the footprint plan for every fill from the current
+/// cache catalog and publication.
+pub fn recompute(shared: &Shared) {
+    let admission = Admission::read(shared);
+    let caches = shared.fills_caches.borrow();
+    let mut fills = shared.fills.borrow_mut();
+    for view in fills.values_mut() {
+        admission.admit(view, &caches);
+    }
+}
+
+/// Recompute one fill from the current cache catalog and publication.
+fn recompute_view(shared: &Shared, view: &mut FillView) {
+    let admission = Admission::read(shared);
+    let caches = shared.fills_caches.borrow();
+    admission.admit(view, &caches);
+}
+
+/// Replace a view's manifest from a successful listing and recompute the
+/// admission fields the new manifest implies before any other await can
+/// expose the view.
+fn install_manifest(
+    shared: &Shared,
+    view: &mut FillView,
+    manifest: Manifest,
+    generation: u64,
+    cache_uid: String,
+    now: Instant,
+) {
+    view.manifest = Some(Arc::new(manifest));
+    view.listed_generation = Some(generation);
+    view.listed_cache_uid = cache_uid;
+    view.error = None;
+    view.failures = 0;
+    view.next_list = Some(now + Duration::from_secs(view.resync_secs));
+    recompute_view(shared, view);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rules::catalog::CacheInfo;
+
+    #[test]
+    fn replacing_a_manifest_recomputes_admission_before_it_is_visible() {
+        crate::kube::fake::run(|_api, kube| async move {
+            let shared = crate::shared::tests::shared(kube);
+            let cache_uid = "22222222-2222-4222-8222-222222222222";
+            let cache = CacheInfo::from_json(&serde_json::json!({
+                "metadata": {"uid": cache_uid, "name": "models"},
+                "spec": {"origin": {"azure": {"containerURL":
+                    "https://acct.blob.core.windows.net/models"}}},
+            }));
+            shared
+                .fills_caches
+                .borrow_mut()
+                .insert(cache_uid.to_owned(), cache);
+            let mut view = FillView::from_json(&serde_json::json!({
+                "metadata": {
+                    "uid": "11111111-1111-4111-8111-111111111111",
+                    "name": "fill",
+                    "generation": 2,
+                },
+                "spec": {
+                    "cacheName": "models",
+                    "replicas": 2,
+                    "maxFootprint": 1_000_000_000,
+                    "prefixes": [""],
+                },
+            }))
+            .unwrap();
+            let page = shared.config.page_size.get();
+            let old = manifest::build(
+                "models",
+                &[manifest::ListedObject {
+                    name: "old".into(),
+                    etag: "\"e\"".into(),
+                    length: page,
+                    content_type: None,
+                }],
+                &["".into()],
+                1,
+            )
+            .unwrap();
+            view.manifest = Some(Arc::new(old));
+            view.listed_generation = Some(view.generation);
+            view.listed_cache_uid = cache_uid.into();
+            // Deliberately stale, as left by the previous manifest.
+            view.planned_footprint_bytes = Some(1);
+
+            let new = manifest::build(
+                "models",
+                &[manifest::ListedObject {
+                    name: "new".into(),
+                    etag: "\"e2\"".into(),
+                    length: page + 1,
+                    content_type: None,
+                }],
+                &["".into()],
+                2,
+            )
+            .unwrap();
+            let expected = manifest::planned_footprint(&new, page, view.replicas);
+            assert_ne!(Some(expected), view.planned_footprint_bytes);
+
+            let generation = view.generation;
+            install_manifest(
+                &shared,
+                &mut view,
+                new,
+                generation,
+                cache_uid.into(),
+                rt::now(),
+            );
+
+            // The new manifest and the footprint it implies become visible
+            // together; no snapshot sees the old plan with the new manifest.
+            assert_eq!(view.planned_footprint_bytes, Some(expected));
+            assert_eq!(view.listed_generation, Some(generation));
+            assert_eq!(view.listed_cache_uid, cache_uid);
+            assert!(view.error.is_none());
+            assert!(view.accepted);
+        });
     }
 }
