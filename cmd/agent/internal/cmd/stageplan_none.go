@@ -39,8 +39,9 @@ type nonePlan struct {
 	hostSeams
 
 	// ownership checks for processes remaining after service deactivation.
-	ownership  func() error
-	deactivate func(context.Context) error
+	ownership       func() error
+	beforeOwnership func() error
+	deactivate      func(context.Context) error
 }
 
 var _ stagePlan = (*nonePlan)(nil)
@@ -51,6 +52,15 @@ func (p *nonePlan) EnsureHostClean(ctx context.Context, s *agentStages) error {
 }
 
 func (p *nonePlan) deactivateAndCheck(ctx context.Context, s *agentStages) error {
+	before := p.beforeOwnership
+	if before == nil {
+		before = none.NewDefault(s.log).PreflightBeforeDeactivation
+	}
+
+	if err := before(); err != nil {
+		return fmt.Errorf("isolation mode none has conflicting processes before service deactivation: %w", err)
+	}
+
 	deactivate := p.deactivate
 	if deactivate == nil {
 		deactivate = phases.Serial(s.log, host.DisableKubelet(s.log), host.DisableContainerd(s.log)).Do

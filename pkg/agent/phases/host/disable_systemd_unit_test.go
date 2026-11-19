@@ -106,6 +106,11 @@ func TestDisableSystemdUnitsPreservesLocalUnit(t *testing.T) {
 		return nil
 	}
 	require.ErrorContains(t, task.Do(t.Context()), "disabling kubelet.service")
+
+	task.runCmdAt = func(_ context.Context, _ *slog.Logger, _ slog.Level, _ func(context.Context) *exec.Cmd, args ...string) error {
+		return errors.New("failed " + args[0])
+	}
+	require.ErrorContains(t, task.Do(t.Context()), "stopping kubelet.service")
 }
 
 func TestDisableServiceTasks(t *testing.T) {

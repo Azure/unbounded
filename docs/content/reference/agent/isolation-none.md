@@ -24,9 +24,9 @@ its daemon run on the host, as in every mode. See
   `/etc/systemd/system` cannot be masked without replacing it, bootstrap stops
   and disables it instead; another unit or an administrator can still start a
   disabled service. Existing packages and binaries can remain installed.
-  Bootstrap refuses to continue if unmanaged kubelet or containerd processes
-  remain after deactivation. Preflight reports processes outside the service
-  cgroups that bootstrap can stop.
+  Bootstrap refuses to deactivate services if unmanaged kubelet or containerd
+  processes are outside the service cgroups, and checks for remaining unmanaged
+  processes again after deactivation. Preflight reports the same initial conflicts.
 - `/usr` is never modified, so a read-only `/usr` is expected to work. This has
   not yet been validated on a read-only `/usr` host.
 - Units start after `network-online.target`.

@@ -138,7 +138,7 @@ func (b *Backend) Requirements() isolation.Requirements {
 // Preflight checks for conflicts that bootstrap cannot deactivate and required
 // host capabilities without changing the host.
 func (b *Backend) Preflight() error {
-	return errors.Join(b.PreflightStatic(), ownershipError(b.hostFS().DetectUnmanagedBeforeDeactivation(b.Layout.base())))
+	return errors.Join(b.PreflightStatic(), b.PreflightBeforeDeactivation())
 }
 
 // PreflightStatic checks what the host must provide whatever it runs now: the
@@ -175,6 +175,12 @@ func (b *Backend) PreflightStatic() error {
 	}
 
 	return errors.Join(errs...)
+}
+
+// PreflightBeforeDeactivation checks for conflicts outside the services that
+// bootstrap can stop.
+func (b *Backend) PreflightBeforeDeactivation() error {
+	return ownershipError(b.hostFS().DetectUnmanagedBeforeDeactivation(b.Layout.base()))
 }
 
 // PreflightOwnership checks for remaining foreign processes after deactivation.

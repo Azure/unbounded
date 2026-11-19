@@ -183,6 +183,10 @@ func TestNonePlanDeactivatesBeforeOwnershipCheck(t *testing.T) {
 	p, s, _, _ := newNonePlan(t, false)
 
 	var calls []string
+	p.beforeOwnership = func() error {
+		calls = append(calls, "before")
+		return nil
+	}
 	p.deactivate = func(context.Context) error {
 		calls = append(calls, "deactivate")
 		return nil
@@ -193,7 +197,7 @@ func TestNonePlanDeactivatesBeforeOwnershipCheck(t *testing.T) {
 	}
 
 	err := p.deactivateAndCheck(t.Context(), s)
-	require.Equal(t, []string{"deactivate", "ownership"}, calls)
+	require.Equal(t, []string{"before", "deactivate", "ownership"}, calls)
 	require.ErrorContains(t, err, "kubelet is already running")
 
 	p.ownership = func() error { return nil }
@@ -202,6 +206,10 @@ func TestNonePlanDeactivatesBeforeOwnershipCheck(t *testing.T) {
 	p.deactivate = func(context.Context) error { return errors.New("mask failed") }
 	p.ownership = func() error { t.Fatal("ownership check after deactivation failure"); return nil }
 	require.ErrorContains(t, p.deactivateAndCheck(t.Context(), s), "mask failed")
+
+	p.beforeOwnership = func() error { return errors.New("foreign process") }
+	p.deactivate = func(context.Context) error { t.Fatal("deactivation after conflict"); return nil }
+	require.ErrorContains(t, p.deactivateAndCheck(t.Context(), s), "foreign process")
 }
 
 // prepareHostCalls returns the host.* constructors called inside the

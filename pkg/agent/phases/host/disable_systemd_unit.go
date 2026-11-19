@@ -65,8 +65,9 @@ func (d *disableSystemdUnits) ensureDisabled(ctx context.Context) error {
 	for _, unit := range d.units {
 		// Stop the unit if running. The service may not be installed, so log stop
 		// errors at Debug - a missing unit is expected and not a problem.
-		if err := d.runCmdAt(ctx, d.log, slog.LevelDebug, systemctl, "stop", unit); err != nil {
-			d.log.DebugContext(ctx, "stopping unit (may already be stopped or not installed)", "unit", unit, "err", err)
+		stopErr := d.runCmdAt(ctx, d.log, slog.LevelDebug, systemctl, "stop", unit)
+		if stopErr != nil {
+			d.log.DebugContext(ctx, "stopping unit (may already be stopped or not installed)", "unit", unit, "err", stopErr)
 		}
 
 		// Mask the unit to prevent future activation. systemctl writes
@@ -82,6 +83,10 @@ func (d *disableSystemdUnits) ensureDisabled(ctx context.Context) error {
 			// Disable it instead, preserving the administrator's unit file.
 			info, statErr := os.Lstat(filepath.Join(dir, unit))
 			if (unit == kubeletServiceUnit || unit == containerdServiceUnit) && statErr == nil && info.Mode().IsRegular() {
+				if stopErr != nil {
+					return fmt.Errorf("stopping %s before disabling: %w", unit, stopErr)
+				}
+
 				if disableErr := d.runCmdAt(ctx, d.log, slog.LevelInfo, systemctl, "disable", unit); disableErr != nil {
 					return fmt.Errorf("disabling %s after mask failed: %w", unit, disableErr)
 				}

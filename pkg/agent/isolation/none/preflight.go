@@ -113,9 +113,17 @@ func inServiceCgroup(cgroup, unit string) bool {
 			continue
 		}
 
-		for _, part := range strings.Split(fields[2], "/") {
+		parts := strings.Split(fields[2], "/")
+		if len(parts) < 2 || parts[0] != "" {
+			continue
+		}
+
+		for _, part := range parts[1:] {
 			if part == unit {
 				return true
+			}
+			if !strings.HasSuffix(part, ".slice") {
+				break
 			}
 		}
 	}

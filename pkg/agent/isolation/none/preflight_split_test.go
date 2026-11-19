@@ -68,6 +68,9 @@ func TestPreflightOnlyExemptsMatchingServiceCgroups(t *testing.T) {
 	}{
 		{"service", "0::/system.slice/kubelet.service\n", true},
 		{"service child", "0::/system.slice/kubelet.service/child\n", true},
+		{"custom slice", "0::/system.slice/custom.slice/kubelet.service\n", true},
+		{"nested container", "0::/machine.slice/systemd-nspawn@other.service/system.slice/kubelet.service\n", false},
+		{"container scope", "0::/system.slice/container.scope/kubelet.service\n", false},
 		{"other service", "0::/system.slice/containerd.service\n", false},
 		{"similar name", "0::/system.slice/not-kubelet.service\n", false},
 		{"malformed", "kubelet.service\n", false},
