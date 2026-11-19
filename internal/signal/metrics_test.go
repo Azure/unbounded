@@ -4,7 +4,9 @@
 package signal
 
 import (
+	"fmt"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
@@ -122,9 +124,421 @@ func TestCertificationMetricsCollectorOmitsMissingMeasurements(t *testing.T) {
 	}
 }
 
+func TestCertificationMetricsCollectorPublishesRetainedRunCompletion(t *testing.T) {
+	t.Parallel()
+
+	finishedAt := metav1.NewTime(time.Date(2026, time.November, 17, 18, 25, 37, 0, time.UTC))
+	run := certificationStatusRun(
+		"retained-run",
+		"2026-11-17T18:00:00Z",
+		signalv1.RunPhaseSucceeded,
+		[]signalv1.CheckPhase{signalv1.CheckPhaseSucceeded, signalv1.CheckPhaseSucceeded},
+	)
+	run.Status.Evidence.Identity = &signalv1.QualificationEvidenceIdentity{
+		Stages: []signalv1.StageEvidenceSummary{{FinishedAt: finishedAt}},
+	}
+
+	families := gatherCertificationMetrics(t, run)
+
+	completions := families["project_signal_fleet_certification_run_finished_timestamp_seconds"]
+	if completions == nil || len(completions.Metric) != 1 {
+		t.Fatalf("run completion metrics = %#v, want one", completions)
+	}
+
+	metric := completions.Metric[0]
+	if metric.Gauge == nil || metric.Gauge.GetValue() != float64(finishedAt.Unix()) {
+		t.Fatalf("finished timestamp = %#v, want %d", metric.Gauge, finishedAt.Unix())
+	}
+
+	assertMetricLabels(t, metric, map[string]string{
+		"namespace": "project-signal",
+		"run":       "retained-run",
+		"run_uid":   "retained-run-uid",
+		"profile":   "profile-v1",
+		"suite":     "suite-v1",
+		"phase":     "Succeeded",
+	})
+}
+
+func TestCertificationMetricsCollectorPublishesRunParticipants(t *testing.T) {
+	t.Parallel()
+
+	run := certificationStatusRun(
+		"retained-run",
+		"2026-11-17T18:00:00Z",
+		signalv1.RunPhaseSucceeded,
+		[]signalv1.CheckPhase{signalv1.CheckPhaseSucceeded, signalv1.CheckPhaseSucceeded},
+	)
+	run.Spec.Campaign = &signalv1.CampaignRunIdentity{
+		Name:     "initial-validation",
+		UID:      "campaign-uid",
+		Sequence: 2,
+	}
+	run.Spec.Participants = append(run.Spec.Participants, signalv1.Participant{
+		NodeName: "participant-1",
+		NodeUID:  "node-uid-1",
+	})
+
+	families := gatherCertificationMetrics(t, run)
+
+	participants := families["project_signal_fleet_certification_run_participant_info"]
+	if participants == nil || len(participants.Metric) != 2 {
+		t.Fatalf("run participant metrics = %#v, want two", participants)
+	}
+
+	assertMetricLabels(t, participants.Metric[0], map[string]string{
+		"namespace": "project-signal",
+		"run":       "retained-run",
+		"run_uid":   "retained-run-uid",
+		"node":      "participant-0",
+		"node_uid":  "node-uid",
+		"profile":   "profile-v1",
+		"suite":     "suite-v1",
+		"campaign":  "initial-validation",
+	})
+	assertMetricLabels(t, participants.Metric[1], map[string]string{
+		"namespace": "project-signal",
+		"run":       "retained-run",
+		"run_uid":   "retained-run-uid",
+		"node":      "participant-1",
+		"node_uid":  "node-uid-1",
+		"profile":   "profile-v1",
+		"suite":     "suite-v1",
+		"campaign":  "initial-validation",
+	})
+}
+
+func TestCertificationMetricsCollectorPublishesCampaignHistory(t *testing.T) {
+	t.Parallel()
+
+	deadline := metav1.NewTime(time.Date(2026, time.November, 18, 22, 0, 0, 0, time.UTC))
+	campaign := &signalv1.CertificationCampaign{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "initial-validation",
+			Namespace: "project-signal",
+		},
+		Spec: signalv1.CertificationCampaignSpec{
+			Profile:  signalv1.PinnedProfile{Name: "complete-profile"},
+			Suite:    signalv1.PinnedSuite{Name: "complete-suite"},
+			NodeName: "participant-0",
+			NodeUID:  types.UID("node-uid"),
+			Deadline: deadline,
+		},
+		Status: signalv1.CertificationCampaignStatus{
+			Phase:            signalv1.CampaignPhaseRunning,
+			StartedRuns:      4,
+			SucceededRuns:    2,
+			FailedRuns:       1,
+			InconclusiveRuns: 1,
+		},
+	}
+
+	families := gatherCertificationMetricsObjects(t, campaign)
+
+	info := families["project_signal_certification_campaign_info"]
+	if info == nil || len(info.Metric) != 1 || info.Metric[0].Gauge.GetValue() != 1 {
+		t.Fatalf("campaign info = %#v", info)
+	}
+
+	assertMetricLabels(t, info.Metric[0], map[string]string{
+		"namespace": "project-signal",
+		"campaign":  "initial-validation",
+		"node":      "participant-0",
+		"node_uid":  "node-uid",
+		"profile":   "complete-profile",
+		"suite":     "complete-suite",
+		"phase":     "Running",
+	})
+
+	runs := families["project_signal_certification_campaign_runs"]
+	if runs == nil || len(runs.Metric) != 5 {
+		t.Fatalf("campaign run metrics = %#v, want 5", runs)
+	}
+
+	deadlineMetric := families["project_signal_certification_campaign_deadline_timestamp_seconds"]
+	if deadlineMetric == nil ||
+		len(deadlineMetric.Metric) != 1 ||
+		deadlineMetric.Metric[0].Gauge.GetValue() != float64(deadline.Unix()) {
+		t.Fatalf("campaign deadline = %#v", deadlineMetric)
+	}
+}
+
+func TestCertificationMetricsCollectorPublishesLatestNodeStatusAndStage(t *testing.T) {
+	t.Parallel()
+
+	oldRun := certificationStatusRun(
+		"old-run",
+		"2026-01-01T00:00:00Z",
+		signalv1.RunPhaseFailed,
+		[]signalv1.CheckPhase{signalv1.CheckPhaseSucceeded, signalv1.CheckPhaseFailed},
+	)
+	oldRun.Spec.Participants[0].NodeUID = "old-node-uid"
+	newRun := certificationStatusRun(
+		"new-run",
+		"2026-01-02T00:00:00Z",
+		signalv1.RunPhaseRunning,
+		[]signalv1.CheckPhase{signalv1.CheckPhaseSucceeded, signalv1.CheckPhaseRunning},
+	)
+
+	families := gatherCertificationMetrics(t, oldRun, newRun)
+
+	status := families["project_signal_node_certification_status"]
+	if status == nil || len(status.Metric) != 1 {
+		t.Fatalf("node status metrics = %#v, want one latest metric", status)
+	}
+
+	assertMetricLabels(t, status.Metric[0], map[string]string{
+		"namespace":   "project-signal",
+		"node":        "participant-0",
+		"node_uid":    "node-uid",
+		"profile":     "profile-v1",
+		"suite":       "suite-v1",
+		"status":      "certifying",
+		"phase":       "Running",
+		"stage":       "r02-second",
+		"stage_index": "2",
+		"stage_total": "2",
+	})
+}
+
+func TestCertificationMetricsCollectorPublishesTerminalNodeStatus(t *testing.T) {
+	t.Parallel()
+
+	succeeded := certificationStatusRun(
+		"succeeded-run",
+		"2026-01-01T00:00:00Z",
+		signalv1.RunPhaseSucceeded,
+		[]signalv1.CheckPhase{signalv1.CheckPhaseSucceeded, signalv1.CheckPhaseSucceeded},
+	)
+	succeeded.Spec.Participants[0].NodeName = "passed-node"
+	succeeded.Spec.Participants[0].NodeUID = "passed-node-uid"
+
+	failed := certificationStatusRun(
+		"failed-run",
+		"2026-01-01T00:00:00Z",
+		signalv1.RunPhaseInconclusive,
+		[]signalv1.CheckPhase{signalv1.CheckPhaseSucceeded, signalv1.CheckPhaseInconclusive},
+	)
+	failed.Spec.Participants[0].NodeName = "failed-node"
+	failed.Spec.Participants[0].NodeUID = "failed-node-uid"
+
+	families := gatherCertificationMetrics(t, succeeded, failed)
+
+	status := families["project_signal_node_certification_status"]
+	if status == nil || len(status.Metric) != 2 {
+		t.Fatalf("node status metrics = %#v, want two metrics", status)
+	}
+
+	labelsByNode := make(map[string]map[string]string, len(status.Metric))
+	for _, metric := range status.Metric {
+		labels := metricLabels(metric)
+		labelsByNode[labels["node"]] = labels
+	}
+
+	if labelsByNode["passed-node"]["status"] != "passed" ||
+		labelsByNode["passed-node"]["stage"] != "complete" {
+		t.Fatalf("passed labels = %#v", labelsByNode["passed-node"])
+	}
+
+	if labelsByNode["failed-node"]["status"] != "failed" ||
+		labelsByNode["failed-node"]["stage"] != "r02-second" {
+		t.Fatalf("failed labels = %#v", labelsByNode["failed-node"])
+	}
+}
+
+func TestCertificationMetricsCollectorPublishesCanceledResolvedStage(t *testing.T) {
+	t.Parallel()
+
+	run := certificationStatusRun(
+		"canceled-run",
+		"2026-01-01T00:00:00Z",
+		signalv1.RunPhaseCancelled,
+		[]signalv1.CheckPhase{signalv1.CheckPhaseSucceeded, signalv1.CheckPhaseInconclusive},
+	)
+
+	families := gatherCertificationMetrics(t, run)
+
+	status := families["project_signal_node_certification_status"]
+	if status == nil || len(status.Metric) != 1 {
+		t.Fatalf("node status metrics = %#v, want one metric", status)
+	}
+
+	assertMetricLabels(t, status.Metric[0], map[string]string{
+		"status":      "failed",
+		"phase":       "Canceled",
+		"stage":       "r02-second",
+		"stage_index": "2",
+		"stage_total": "2",
+	})
+}
+
+func TestCurrentParticipantStageReportsCanceledBeforeStart(t *testing.T) {
+	t.Parallel()
+
+	run := certificationStatusRun(
+		"canceled-before-start",
+		"2026-01-01T00:00:00Z",
+		signalv1.RunPhaseCancelled,
+		nil,
+	)
+
+	stage, index, total := currentParticipantStage(run, 0)
+	if stage != "canceled" || index != 0 || total != 2 {
+		t.Fatalf("stage = %q %d/%d, want canceled 0/2", stage, index, total)
+	}
+}
+
+func TestCertificationMetricsCollectorUsesParticipantSpecificStage(t *testing.T) {
+	t.Parallel()
+
+	run := certificationStatusRun(
+		"role-run",
+		"2026-01-01T00:00:00Z",
+		signalv1.RunPhaseRunning,
+		[]signalv1.CheckPhase{signalv1.CheckPhaseRunning, signalv1.CheckPhasePending},
+	)
+	run.Spec.Participants = append(run.Spec.Participants, signalv1.Participant{
+		NodeName: "participant-1",
+		NodeUID:  "node-uid-1",
+	})
+	run.Spec.ResolvedPlan.Phases[0].Stages[0].ParticipantRoles = []signalv1.ResolvedStageParticipantRoleBinding{{
+		Role:               "primary",
+		ParticipantIndexes: []int32{0},
+	}}
+	run.Spec.ResolvedPlan.Phases[0].Stages[1].ParticipantRoles = []signalv1.ResolvedStageParticipantRoleBinding{{
+		Role:               "secondary",
+		ParticipantIndexes: []int32{1},
+	}}
+
+	families := gatherCertificationMetrics(t, run)
+
+	status := families["project_signal_node_certification_status"]
+	if status == nil || len(status.Metric) != 2 {
+		t.Fatalf("node status metrics = %#v, want two metrics", status)
+	}
+
+	labelsByNode := make(map[string]map[string]string, len(status.Metric))
+	for _, metric := range status.Metric {
+		labels := metricLabels(metric)
+		labelsByNode[labels["node"]] = labels
+	}
+
+	if labelsByNode["participant-0"]["stage"] != "r01-first" ||
+		labelsByNode["participant-1"]["stage"] != "r02-second" {
+		t.Fatalf("participant stages = %#v", labelsByNode)
+	}
+}
+
+func TestCertificationMetricsCollectorPublishes5000NodeFleet(t *testing.T) {
+	t.Parallel()
+
+	const fleetSize = 5000
+
+	runs := make([]*signalv1.CertificationRun, fleetSize)
+	for index := range fleetSize {
+		run := certificationStatusRun(
+			fmt.Sprintf("fleet-run-%04d", index),
+			"2026-01-01T00:00:00Z",
+			signalv1.RunPhaseRunning,
+			[]signalv1.CheckPhase{signalv1.CheckPhaseSucceeded, signalv1.CheckPhaseRunning},
+		)
+		run.Spec.Participants[0].NodeName = fmt.Sprintf("participant-%04d", index)
+		run.Spec.Participants[0].NodeUID = types.UID(fmt.Sprintf("node-uid-%04d", index))
+		runs[index] = run
+	}
+
+	families := gatherCertificationMetrics(t, runs...)
+
+	status := families["project_signal_node_certification_status"]
+	if status == nil || len(status.Metric) != fleetSize {
+		t.Fatalf("node status metric count = %d, want %d", len(status.GetMetric()), fleetSize)
+	}
+}
+
+func TestCurrentLegacyCheckReportsTerminalFailureBeforePendingCheck(t *testing.T) {
+	t.Parallel()
+
+	run := &signalv1.CertificationRun{
+		Spec: signalv1.CertificationRunSpec{
+			Checks: make([]signalv1.CertificationCheckSnapshot, 3),
+		},
+		Status: signalv1.CertificationRunStatus{
+			Phase: signalv1.RunPhaseFailed,
+			Checks: []signalv1.CheckStatus{
+				{Phase: signalv1.CheckPhaseSucceeded},
+				{Phase: signalv1.CheckPhaseFailed},
+				{Phase: signalv1.CheckPhasePending},
+			},
+		},
+	}
+
+	stage, index, total := currentLegacyCheck(run)
+	if stage != "check-002" || index != 2 || total != 3 {
+		t.Fatalf("legacy stage = %q %d/%d, want check-002 2/3", stage, index, total)
+	}
+}
+
+func certificationStatusRun(
+	name string,
+	createdAt string,
+	phase signalv1.RunPhase,
+	checks []signalv1.CheckPhase,
+) *signalv1.CertificationRun {
+	created, err := time.Parse(time.RFC3339, createdAt)
+	if err != nil {
+		panic(err)
+	}
+
+	run := &signalv1.CertificationRun{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              name,
+			Namespace:         "project-signal",
+			UID:               types.UID(name + "-uid"),
+			CreationTimestamp: metav1.NewTime(created),
+		},
+		Spec: signalv1.CertificationRunSpec{
+			Profile: signalv1.PinnedProfile{Name: "profile-v1"},
+			Suite:   signalv1.PinnedSuite{Name: "suite-v1"},
+			Participants: []signalv1.Participant{{
+				NodeName: "participant-0",
+				NodeUID:  "node-uid",
+			}},
+			ResolvedPlan: &signalv1.ResolvedCertificationPlan{
+				Phases: []signalv1.ResolvedPhasePlan{{
+					Name: "certification",
+					Stages: []signalv1.ResolvedStagePlan{
+						{Name: "r01-first"},
+						{Name: "r02-second"},
+					},
+				}},
+			},
+		},
+		Status: signalv1.CertificationRunStatus{Phase: phase},
+	}
+	for _, checkPhase := range checks {
+		run.Status.Checks = append(run.Status.Checks, signalv1.CheckStatus{Phase: checkPhase})
+	}
+
+	return run
+}
+
 func gatherCertificationMetrics(
 	t *testing.T,
-	run *signalv1.CertificationRun,
+	runs ...*signalv1.CertificationRun,
+) map[string]*dto.MetricFamily {
+	t.Helper()
+
+	objects := make([]runtime.Object, len(runs))
+	for index := range runs {
+		objects[index] = runs[index]
+	}
+
+	return gatherCertificationMetricsObjects(t, objects...)
+}
+
+func gatherCertificationMetricsObjects(
+	t *testing.T,
+	objects ...runtime.Object,
 ) map[string]*dto.MetricFamily {
 	t.Helper()
 
@@ -133,7 +547,7 @@ func gatherCertificationMetrics(
 		t.Fatal(err)
 	}
 
-	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(run).Build()
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(objects...).Build()
 	registry := prometheus.NewPedanticRegistry()
 	registry.MustRegister(NewCertificationMetricsCollector(reader))
 
@@ -157,14 +571,20 @@ func assertMetricLabels(
 ) {
 	t.Helper()
 
-	actual := make(map[string]string, len(metric.Label))
-	for _, label := range metric.Label {
-		actual[label.GetName()] = label.GetValue()
-	}
+	actual := metricLabels(metric)
 
 	for name, value := range expected {
 		if actual[name] != value {
 			t.Fatalf("label %s = %q, want %q; labels = %#v", name, actual[name], value, actual)
 		}
 	}
+}
+
+func metricLabels(metric *dto.Metric) map[string]string {
+	actual := make(map[string]string, len(metric.Label))
+	for _, label := range metric.Label {
+		actual[label.GetName()] = label.GetValue()
+	}
+
+	return actual
 }

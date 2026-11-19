@@ -9,8 +9,9 @@ workloads. Certification Policies separately evaluate terminal evidence into
 per-Node qualification ledgers. A successful Run alone is not production
 eligibility.
 
-Project Signal does not integrate with Kueue. Queue admission, recurring
-campaign orchestration, and fleet dashboards are intentionally deferred.
+Project Signal does not integrate with Kueue. Queue admission and repeatable
+fleet scheduling outside bounded initial-validation campaigns are intentionally
+deferred.
 
 ## Components
 
@@ -25,6 +26,11 @@ campaign orchestration, and fleet dashboards are intentionally deferred.
 - `CertificationProfile` is cluster-scoped admission policy: it defines
   participant selection and references one Suite.
 - `CertificationRun` is a namespaced, immutable execution snapshot.
+- `CertificationCampaignPolicy` is a cluster-scoped node selector, Profile
+  reference, trigger, and bounded campaign duration.
+- `CertificationCampaign` is the namespaced, controller-owned execution state
+  for one exact Node UID. It serializes full immutable Runs until its admission
+  deadline.
 - `CertificationPolicy` is cluster-scoped qualification policy: it defines
   which terminal Runs count, how many are required, how qualification expires,
   and how non-passing evidence affects prior credit.
@@ -52,6 +58,34 @@ Argo Workflows is required. The Kubeflow MPI Operator is required when a
 Suite's bound WorkflowTemplates create `MPIJob` resources, including the
 private R03 and R05 certification stages; the public native stage model does
 not otherwise require it.
+
+### Grafana fleet dashboard
+
+Import both dashboards into a Grafana instance that can query the controller
+metrics endpoint:
+
+- `grafana/project-signal-fleet-overview.json` answers how the selected cluster
+  is doing now, summarizes recent certification activity, and identifies nodes
+  that need investigation.
+- `grafana/project-signal-node-certification.json` answers how one selected
+  node is doing now, how its active R01-R21 Run is progressing, and how its
+  repeated Runs performed during the 24-hour soak campaign.
+
+Missing stage evidence is shown as not reached rather than zero. Exact Run
+phases remain distinct, so failed, inconclusive, canceled, pending, and active
+work are not collapsed into one dashboard state. Retained history is bounded
+by the configured Run retention policy. The node dashboard keeps active Run,
+soak campaign, and retained Run selectors separate because each represents a
+different level of certification evidence. Selecting a Node filters both active
+and retained Runs through
+`project_signal_fleet_certification_run_participant_info`; leave Retained Run
+on `All` to compare every retained Run for that node.
+
+The instant fleet query is capped at 5,000 points and the table is paginated,
+so one dashboard supports clusters with up to 5,000 participants. The metric
+also exposes the current stage name, one-based stage index, and total stage
+count. Grafana or the Prometheus ingestion layer should attach a stable
+`cluster` label when a data source aggregates multiple clusters.
 
 ## First deployment
 
@@ -436,7 +470,9 @@ are retained only in the durable evidence document.
 
 A Suite and Profile describe one execution. They do not describe a recurring
 production qualification gate. Each request creates one independent immutable
-Run.
+Run. A `CertificationCampaignPolicy` can enroll matching Ready Nodes into
+bounded `CertificationCampaign` executions that repeatedly request the same
+Profile while preserving every Run independently.
 
 A `CertificationPolicy` evaluates terminal Run evidence into one
 `NodeCertification` ledger per exact Node UID. Policy requirements select a
@@ -508,6 +544,78 @@ If that execution is interrupted, a replacement starts a new duration from
 zero. Multiple shorter Runs do not prove one uninterrupted duration unless a
 Policy explicitly defines a repeated-Run requirement, and even then they remain
 separate credited executions rather than a continuous observation.
+
+## Initial validation campaigns
+
+An initial validation campaign repeatedly executes one Profile for a bounded
+window. It never overlaps Runs for the same participant and never rewrites or
+collapses evidence. The controller:
+
+1. creates one `CertificationCampaign` for each matching Ready Node and exact
+   Node UID;
+2. pins the current Profile and Suite identities and requests one full
+   immutable Run;
+3. waits for durable evidence, workload cleanup, and participant release;
+4. records the terminal outcome and requests the next Run; and
+5. stops admitting new Runs at the campaign deadline while allowing an active
+   Run to finish and release.
+
+Failed, inconclusive, and canceled Runs are automatically released after their
+evidence is durable so the campaign can continue. Set `spec.stop: true` on the
+Campaign to stop new admissions early; an active Run still finishes normally.
+Deleting or changing the Policy does not mutate an already-created Campaign.
+Changing or replacing the pinned Profile or Suite blocks new campaign Runs
+rather than mixing different plans in one campaign history.
+
+Create an opt-in 24-hour node-join policy after the referenced Profile exists:
+
+```yaml
+apiVersion: signal.unbounded-cloud.io/v1alpha1
+kind: CertificationCampaignPolicy
+metadata:
+  name: initial-validation
+spec:
+  profile:
+    name: complete-certification
+  nodeSelector:
+    matchLabels:
+      signal.unbounded-cloud.io/initial-validation: "true"
+  trigger: OnNodeReady
+  duration: 24h
+  # Optional. The default is false, so failed Runs are retained and the
+  # campaign continues until its deadline.
+  stopOnFailure: false
+```
+
+The selector is evaluated whenever a Node or Policy changes. Therefore, a
+matching Node that is already Ready is enrolled when the Policy is introduced;
+a newly joined matching Node is enrolled on its first observed Ready state.
+The deterministic Campaign identity prevents controller restarts from creating
+another campaign for the same Policy UID and Node UID.
+
+Set `stopOnFailure: true` when a campaign should stop admitting new Runs after
+the first failed Run finishes and releases. Inconclusive or canceled Runs still
+continue; operators can use `spec.stop: true` on the Campaign to stop after any
+other outcome. Existing Campaigns pin this choice, so changing the Policy only
+affects newly enrolled Nodes.
+
+Inspect campaign progress and retained Runs:
+
+```bash
+kubectl get certificationcampaigns -n project-signal
+kubectl get certificationruns -n project-signal \
+  -l signal.unbounded-cloud.io/campaign=<campaign-name>
+```
+
+The controller exports:
+
+- `project_signal_certification_campaign_info`;
+- `project_signal_certification_campaign_runs`; and
+- `project_signal_certification_campaign_deadline_timestamp_seconds`.
+
+Qualification remains separate. Use `CertificationPolicy.requiredPassCount`
+and optional `minRunSeparation` when multiple successful campaign Runs must
+contribute to qualification.
 
 ## Bounded vLLM acceptance canary
 
@@ -791,7 +899,9 @@ After each stage completes, the controller validates the immutable stage result
 and publishes its bounded typed measurement projection in Run status while the
 parent Workflow continues. It exports numeric completed measurements as
 `project_signal_fleet_certification_measurement`; compatibility projections such
-as the completed R07 minimum derive from the same state. Script metrics may
+as the completed R07 minimum derive from the same state. The fleet Grafana
+dashboard uses this projection for run-selectable R19/R20 AIPerf output token
+throughput and time-to-first-token panels. Script metrics may
 declare a bounded telemetry contract with a live
 gauge mode, allowed dimensions, series and sample limits, and an optional final
 evidence aggregation. Workloads append generic JSON measurement records; the

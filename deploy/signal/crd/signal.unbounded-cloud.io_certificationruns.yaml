@@ -54,6 +54,26 @@ spec:
             type: object
           spec:
             properties:
+              campaign:
+                description: Campaign identifies the optional bounded campaign that
+                  requested this Run.
+                properties:
+                  name:
+                    type: string
+                  sequence:
+                    format: int32
+                    type: integer
+                  uid:
+                    description: |-
+                      UID is a type that holds unique ID values, including UUIDs.  Because we
+                      don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                      intent and helps make sure that UIDs and names do not get conflated.
+                    type: string
+                required:
+                - name
+                - sequence
+                - uid
+                type: object
               cancel:
                 type: boolean
               checks:
@@ -1955,6 +1975,9 @@ spec:
               rule: self.profile == oldSelf.profile
             - message: suite is immutable
               rule: self.suite == oldSelf.suite
+            - message: campaign is immutable
+              rule: has(self.campaign) == has(oldSelf.campaign) && (!has(self.campaign)
+                || self.campaign == oldSelf.campaign)
             - message: participants are immutable
               rule: self.participants == oldSelf.participants
             - message: scriptBundle is immutable
