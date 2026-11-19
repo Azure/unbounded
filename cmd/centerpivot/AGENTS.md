@@ -64,6 +64,20 @@ make image-centerpivot-local
 `make test`, `make lint`, and `make generate` cover centerpivot with the rest of
 the repository.
 
+The end-to-end test runs centerpivot on real ACL nodes, with a real Nebraska,
+`trident-acl-agent`, and Trident. It needs KVM, root Podman, and ACL images; its
+[README](../../hack/acl-abupdate/README.md#centerpivots-end-to-end-test) says
+how to set them up:
+
+```bash
+hack/acl-abupdate/centerpivot_e2e.py test
+```
+
+Run it after changing anything a node takes part in: the host agent's part,
+the request and status contract, node-info, the drain, or the manifests and
+admission policies. Its scenarios cover each update path on real nodes; cases
+that need many nodes or apps belong in the controller's unit tests.
+
 ## Rules
 
 1. The reconciler never blocks. Each pass takes one step for one node and asks

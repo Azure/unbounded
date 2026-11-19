@@ -599,7 +599,7 @@ whether the first version needs it.
      (section 4.6). With graceful shutdown, they stop cleanly when the node
      restarts. Without it, they stop at once.
    - Open: whether it works with kubelet in an nspawn machine (section 7), to
-     check in the AKSFlexNode harness.
+     check on the end-to-end test's nodes (section 6).
    - The first version needs it: no.
 
 ## 6. Testing
@@ -611,14 +611,27 @@ whether the first version needs it.
    report against the agent's (`core/nebraska/wire.rs`); the instance ID
    (`34a267d412544d6a9e97b5ba6762f6e7` gives
    `ebb9a2bb-9365-d34e-133f-8da0664e7366`); and the admission policies' rules.
-2. **The AKSFlexNode harness**, which runs kubelet in an nspawn machine: the
-   service against its cluster, and graceful node shutdown.
-3. **Unbounded's ACL end-to-end tests**, with several nodes and a workload with
-   a PodDisruptionBudget: no more than `maxUnavailable` nodes update at once,
-   and the workload stays available.
-4. **A real Nebraska**, as Trident's tests use (`tools/storm/aclagent`): the
-   agent's check after the service's gets the same grant, no extra instances
-   appear, and ending a grant records a failure, not a timeout.
+2. **The end-to-end test,**
+   [`hack/acl-abupdate/centerpivot_e2e.py`](../hack/acl-abupdate/README.md),
+   with nothing faked. Two ACL VMs join a kind cluster through Unbounded's host
+   agent, and the service updates them from a real Nebraska, built from
+   source, through `trident-acl-agent` and Trident. Each scenario starts from a
+   snapshot of the joined VMs, with a Nebraska app of its own:
+   1. **Rolling:** both nodes update, with a workload whose
+      PodDisruptionBudget keeps one pod available. No more than
+      `maxUnavailable` nodes update at once, and the workload stays available.
+   2. **Silent agent:** a node whose agent doesn't answer is held on its own,
+      and the other node updates.
+   3. **Blocked drain:** a drain that misses its deadline fails the attempt,
+      and the next attempt updates the node.
+   4. **Boot failure:** a node whose first boot of the new version fails is
+      held, which stops its app.
+
+   Each also checks Nebraska: the service's check and the agent's are one
+   instance per node, and a grant the service ends shows as a failure, not a
+   timeout.
+3. **Cases that need many nodes, apps, or channel moves**, such as rollout
+   limits, floors, and several apps, are unit tests, with the fakes of item 1.
 
 ## 7. Open questions
 
