@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -25,6 +26,7 @@ import (
 	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/config"
+	daemon "github.com/Azure/unbounded/pkg/agent/daemon"
 	"github.com/Azure/unbounded/pkg/agent/daemoncred"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
@@ -191,7 +193,19 @@ func run(ctx context.Context, log *slog.Logger, opts runOptions) error {
 		log.Warn("failed to publish and clear AgentUpgrade daemon signals", "error", err)
 	}
 
-	if err := publishHostSoftReboots(ctx, log, kubeClient, active.Config.MachineName, runOpts.NodeOperator.BootID); err != nil {
+	rebootHandler, err := daemon.NewHostSoftRebootHandler(
+		kubeClient,
+		kubeClient,
+		log,
+		hostSoftRebootTarget{machineName: active.Config.MachineName},
+		runOpts.NodeOperator,
+		&atomic.Bool{},
+	)
+	if err == nil {
+		err = rebootHandler.PublishStartup(ctx)
+	}
+
+	if err != nil {
 		log.Warn("failed to report HostSoftReboot operations", "error", err)
 	}
 
