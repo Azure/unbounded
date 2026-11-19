@@ -14,7 +14,7 @@ import (
 // isRetryableNetworkError reports whether err represents a transient network or
 // response-body read failure that is safe to retry. It copies the agent's
 // utilio.IsRetryableNetworkError, which this tool cannot import from outside the
-// agent's tree.
+// agent's tree. Delete it when #1175 moves this tool into the agent's tree.
 func isRetryableNetworkError(err error) bool {
 	if err == nil {
 		return false

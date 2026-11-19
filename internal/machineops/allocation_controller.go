@@ -449,7 +449,7 @@ func (r *MachineAllocationReconciler) fail(
 	}
 
 	s.status.FailureReason = reason
-	s.status.FailureMessage = statusmsg.Truncate(message, statusmsg.MaxBytes)
+	s.status.FailureMessage = statusmsg.TruncateCondition(message)
 	r.setCondition(s, unboundedv1alpha3.MachineAllocationConditionAllocated, metav1.ConditionFalse, string(reason), message)
 }
 

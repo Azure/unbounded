@@ -89,7 +89,7 @@ func syncIsolationConditions(machine *unboundedv1alpha3.Machine, now time.Time, 
 		}
 	}
 
-	cond.Message = statusmsg.Truncate(cond.Message, statusmsg.MaxBytes)
+	cond.Message = statusmsg.TruncateCondition(cond.Message)
 
 	return setConditionIfChanged(machine, cond), recheck
 }

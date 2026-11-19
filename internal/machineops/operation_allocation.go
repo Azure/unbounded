@@ -739,7 +739,7 @@ func (r *MachineOperationReconciler) finishAllocationOperation(
 		targetMessage = fmt.Sprintf("%s: %s", reason, message)
 	}
 
-	targetMessage = statusmsg.Truncate(targetMessage, statusmsg.MaxBytes)
+	targetMessage = statusmsg.TruncateCondition(targetMessage)
 
 	if err := r.updateOperationStatus(ctx, a.op.Name, func(latest *unboundedv1alpha3.MachineOperation) {
 		target, ok := operationTarget(latest, a.machine.Name)
@@ -830,7 +830,7 @@ func (r *MachineOperationReconciler) holdAllocationOperation(
 	message string,
 ) (ctrl.Result, error) {
 	reason = normalizeConditionReason(reason)
-	message = statusmsg.Truncate(fmt.Sprintf("%s: %s", reason, message), statusmsg.MaxBytes)
+	message = statusmsg.TruncateCondition(fmt.Sprintf("%s: %s", reason, message))
 
 	if err := r.updateOperationStatus(ctx, a.op.Name, func(latest *unboundedv1alpha3.MachineOperation) {
 		if latest.Status.IsTerminal() {

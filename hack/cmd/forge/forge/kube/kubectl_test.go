@@ -18,5 +18,4 @@ func TestKubectlSetsKubeconfig(t *testing.T) {
 	require.Equal(t, []string{"PATH=/bin", "KUBECONFIG=/new"}, kubectl(t.Context()).Env)
 	require.Equal(t, []string{"KUBECONFIG=/old", "PATH=/bin"}, env, "the caller's environment is not modified")
 	require.Equal(t, []string{"PATH=/bin", "KUBECONFIG=/new"}, kubectl(t.Context()).Env, "a second command gets the same environment")
-	require.Equal(t, []string{"KUBECONFIG=/new"}, Kubectl(nil, "/new")(t.Context()).Env)
 }

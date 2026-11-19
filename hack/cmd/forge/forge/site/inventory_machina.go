@@ -12,8 +12,8 @@ import (
 	"sigs.k8s.io/yaml"
 
 	machinav1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/hack/cmd/forge/forge/kube"
 	"github.com/Azure/unbounded/hack/cmd/forge/forge/site/azuredev"
-	"github.com/Azure/unbounded/internal/helpers/kubename"
 	"github.com/Azure/unbounded/internal/unbounded"
 )
 
@@ -21,7 +21,7 @@ import (
 // and NAT port. For example, site "dc1" with IP "20.48.100.5" port 50001
 // becomes "dc1-20.48.100.5-50001".
 func machinaNameFromInventory(site string, m azuredev.Machine) string {
-	return kubename.Sanitize(fmt.Sprintf("%s-%s-%d", site, m.IPAddress, m.Port))
+	return kube.SanitizeK8sName(fmt.Sprintf("%s-%s-%d", site, m.IPAddress, m.Port))
 }
 
 // parseSecretKeyRef parses a secret reference string in the format

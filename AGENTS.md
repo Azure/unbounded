@@ -42,7 +42,7 @@ unbounded-kube is organized into several directories:
   - `gantry/` - kind-based e2e tests for gantry (guarded by `//go:build e2e`).
 - `internal/` - code shared by more than one component that no single component owns: project conventions
   (`internal/<name>`) and small generic helpers (`internal/helpers/<name>`). Read `internal/AGENTS.md` before adding a
-  package here.
+  package here. Most packages here today are component code that #1175 moves into `cmd/<component>/`, for example:
   - `gantry/` - gantry shared packages (21 sub-packages: config, mirror, transfer, discovery, coord, hrw, coldstart, members, metrics, etc.). Includes `internal/gantry/proto/coord/v1/` for the libp2p coordination RPC messages (pull intent, please-pull); kept under internal/ so the wire schema isn't an exported API surface.
   - `net/` - unbounded-net shared packages (APIs, controllers, networking, metrics, webhooks, etc.).
 - `plugins/` - integrations that are their own Go modules because their upstream pins different library versions.
@@ -79,7 +79,7 @@ unbounded-kube is organized into several directories:
 ## Coding Standards
 
 - Do not cross cmd/ package boundaries. For example, `cmd/agent` should not import from `cmd/machina`. If you need to
-  share code between these packages, put it in `internal/`.
+  share code between these packages, follow "Where new code goes" in `internal/AGENTS.md`.
 - Do not use em-dashes (`—`) in comments, strings, or any source/config files. Use a plain ASCII hyphen (`-`)
   or rephrase the sentence instead.
 - Write American English, not British. Use `behavior`, `initialize`, `labeled`, `catalog`, `defense`, `judgment`,
@@ -123,12 +123,15 @@ unbounded-kube is organized into several directories:
     - New dependencies with broad impact.
     - Destructive data or migration changes.
     - Removal of _test.go or Test* functions or subtests.
-    - Adding a package directly under `internal/` (anywhere other than `internal/helpers/`).
+    - Adding a project convention package, `internal/<name>` (see `internal/AGENTS.md`).
     - Proceeding when a design doc or comment contradicts the code.
 - **Never**
     - Commit secrets, credentials, or tokens.
     - Edit generated files by hand when a generation workflow exists.
     - Use destructive git operations unless explicitly requested.
+    - Add any other package under `internal/`, including sub-packages inside existing component trees such as
+      `internal/gantry/<new>`. Helpers under `internal/helpers/<name>` are the only exception (see
+      `internal/helpers/AGENTS.md`).
     - Go outside the project boundary, for example, DO NOT edit files in user's home directories, add or edit files 
       in /tmp or anywhere else on the host filesystem.
 

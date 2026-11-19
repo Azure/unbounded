@@ -9,7 +9,6 @@ import (
 	"log/slog"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -44,7 +43,6 @@ type MachinePool struct {
 type Datacenter struct {
 	AzureCli          *azsdk.ClientSet
 	KubeCli           kubernetes.Interface
-	Kubectl           func(context.Context) *exec.Cmd
 	Logger            *slog.Logger
 	Name              string
 	Location          string

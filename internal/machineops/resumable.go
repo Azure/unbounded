@@ -329,7 +329,7 @@ func (r *MachineOperationReconciler) updateOperationTarget(
 			}
 
 			mutate(&op.Status.Targets[i])
-			op.Status.Targets[i].Message = statusmsg.Truncate(op.Status.Targets[i].Message, statusmsg.MaxBytes)
+			op.Status.Targets[i].Message = statusmsg.TruncateCondition(op.Status.Targets[i].Message)
 			op.Status.Message = op.Status.Targets[i].Message
 
 			return

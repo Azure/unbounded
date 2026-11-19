@@ -8,12 +8,24 @@ package statusmsg
 
 import "unicode/utf8"
 
-// MaxBytes is the longest metav1.Condition message the API server accepts.
-const MaxBytes = 32768
+// conditionMaxBytes is the longest metav1.Condition message the API server
+// accepts. It mirrors maxMessageLen in
+// k8s.io/apimachinery/pkg/apis/meta/v1/validation, which is not exported.
+const conditionMaxBytes = 32 * 1024
+
+// TruncateCondition returns msg cut to the longest metav1.Condition message the
+// API server accepts, without splitting a UTF-8 sequence.
+func TruncateCondition(msg string) string {
+	return Truncate(msg, conditionMaxBytes)
+}
 
 // Truncate returns msg cut to at most maxBytes bytes without splitting a UTF-8
-// sequence.
+// sequence. It panics if maxBytes is negative.
 func Truncate(msg string, maxBytes int) string {
+	if maxBytes < 0 {
+		panic("statusmsg: negative Truncate maxBytes")
+	}
+
 	if len(msg) <= maxBytes {
 		return msg
 	}

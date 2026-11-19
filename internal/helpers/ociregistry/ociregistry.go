@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package ociregistry configures clients for OCI registries the way every
-// component that pulls images expects.
+// component that pulls or pushes images expects.
 package ociregistry
 
 import (
@@ -13,9 +13,9 @@ import (
 
 // ConfigurePlainHTTP sets PlainHTTP on the repository when the registry host
 // is a loopback address (localhost, 127.0.0.1, [::1]) or a private IP
-// (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16). These registries almost
-// never serve TLS and defaulting to HTTPS causes "http: server gave HTTP
-// response to HTTPS client" errors.
+// (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, fc00::/7). These registries
+// almost never serve TLS and defaulting to HTTPS causes "http: server gave
+// HTTP response to HTTPS client" errors.
 func ConfigurePlainHTTP(repo *remote.Repository) {
 	host := repo.Reference.Host()
 

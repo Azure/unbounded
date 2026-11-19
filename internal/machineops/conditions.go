@@ -18,7 +18,7 @@ const (
 
 func normalizeCondition(condition metav1.Condition) metav1.Condition {
 	condition.Reason = normalizeConditionReason(condition.Reason)
-	condition.Message = statusmsg.Truncate(condition.Message, statusmsg.MaxBytes)
+	condition.Message = statusmsg.TruncateCondition(condition.Message)
 
 	return condition
 }
