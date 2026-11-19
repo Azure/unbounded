@@ -104,7 +104,10 @@ impl FillView {
             Some(Value::Array(a)) if a.len() <= 16 => {
                 for p in a {
                     let p = p.as_str()?;
-                    if p.len() > 1024 {
+                    // The CRD bounds a prefix by characters, so count the same
+                    // way. A byte limit would reject multibyte prefixes the API
+                    // accepted.
+                    if p.chars().count() > 1024 {
                         return None;
                     }
                     prefixes.push(p.to_owned());
@@ -708,5 +711,34 @@ mod tests {
             assert!(view.error.is_none());
             assert!(view.accepted);
         });
+    }
+
+    fn fill_json(prefix: &str) -> serde_json::Value {
+        serde_json::json!({
+            "metadata": {
+                "uid": "11111111-1111-4111-8111-111111111111",
+                "name": "fill",
+            },
+            "spec": {
+                "cacheName": "models",
+                "prefixes": [prefix],
+                "maxFootprint": 1_000_000_000,
+            },
+        })
+    }
+
+    #[test]
+    fn multibyte_prefix_within_the_character_limit_is_accepted() {
+        // 400 characters, 1200 UTF-8 bytes: the CRD accepts it, so the parser
+        // must not drop the fill.
+        let prefix = "雪".repeat(400);
+        let view = FillView::from_json(&fill_json(&prefix)).expect("within the API limit");
+        assert_eq!(view.prefixes, vec![prefix]);
+    }
+
+    #[test]
+    fn prefix_over_the_character_limit_is_rejected() {
+        let prefix = "雪".repeat(1025);
+        assert!(FillView::from_json(&fill_json(&prefix)).is_none());
     }
 }
