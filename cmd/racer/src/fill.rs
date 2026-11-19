@@ -352,10 +352,7 @@ impl FillController {
                 continue;
             }
             let id = fill_id(&uid);
-            loop {
-                let Some(object) = state.manifest.objects.get(state.object) else {
-                    break;
-                };
+            while let Some(object) = state.manifest.objects.get(state.object).cloned() {
                 let pages = object.length.div_ceil(page_size);
                 if state.page >= pages {
                     state.object += 1;
@@ -364,10 +361,10 @@ impl FillController {
                 }
                 let page_number = state.page;
                 let key = object.key;
-                let etag = object.etag.clone();
+                let etag = object.etag;
                 let object_length = object.length;
-                let content_type = object.content_type.clone();
-                let metadata_bytes = object.metadata.clone();
+                let content_type = object.content_type;
+                let metadata_bytes = object.metadata;
                 let version = ObjectVersion {
                     object: ObjectId {
                         cache: state.cache.clone(),

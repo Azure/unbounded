@@ -231,7 +231,7 @@ pub enum FillCache {
     Usable {
         uid: String,
         name: String,
-        origin: wire::OriginDefinition,
+        origin: Box<wire::OriginDefinition>,
     },
     /// No cache has `spec.cacheName`.
     CacheNotFound,
@@ -262,7 +262,7 @@ pub fn fill_cache_named(name: &str, caches: &BTreeMap<String, CacheInfo>) -> Fil
         Ok(Some(origin)) => FillCache::Usable {
             uid: cache.uid.clone(),
             name: cache.name.clone(),
-            origin,
+            origin: Box::new(origin),
         },
         _ => FillCache::UnsupportedOrigin,
     }

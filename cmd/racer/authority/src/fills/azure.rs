@@ -346,6 +346,7 @@ fn token_response(body: &[u8]) -> Result<(String, Duration), ListError> {
     Ok((token, Duration::from_secs(seconds)))
 }
 
+#[allow(clippy::too_many_arguments)] // Forward endpoint, request, and bounds without a parameter shim.
 async fn exchange(
     trust: &Option<Arc<rustls::ClientConfig>>,
     https: bool,

@@ -94,7 +94,7 @@ pub fn build(
             return Err(ManifestError::TooManyObjects);
         }
     }
-    objects.sort_by(|a, b| a.key.cmp(&b.key));
+    objects.sort_by_key(|a| a.key);
     let logical_bytes = objects.iter().map(|o| o.length).sum();
     Ok(Manifest {
         digest: digest(&objects),
