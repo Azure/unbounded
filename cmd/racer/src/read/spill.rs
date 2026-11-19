@@ -10,6 +10,9 @@ pub struct Config {
     /// Percent of segment capacity that holds may pin
     /// (`RACER_RETAINED_SEGMENT_PERCENT`).
     pub retained_percent: usize,
+    /// Percent of segment capacity that cache-fill pins may hold
+    /// (`RACER_PINNED_SEGMENT_PERCENT`). Zero disables pins.
+    pub pinned_percent: usize,
     /// Pages a read may fetch ahead of its in-memory window and park on local
     /// disk under its own short hold. Zero disables read spill.
     pub range_spill_pages: usize,
@@ -19,6 +22,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             retained_percent: 50,
+            pinned_percent: 50,
             range_spill_pages: 0,
         }
     }
@@ -27,6 +31,7 @@ impl Default for Config {
 impl Config {
     pub fn validate(self) -> Result<()> {
         if !(1..=100).contains(&self.retained_percent)
+            || self.pinned_percent > 100
             || self.range_spill_pages > MAX_RANGE_SPILL_PAGES
         {
             return Err(Error::InvalidConfiguration);

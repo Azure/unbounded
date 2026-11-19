@@ -90,6 +90,15 @@ pub struct Config {
 
     /// Cluster-wide page size published to every node.
     pub page_size: racer_wire::object::PageSize,
+
+    /// CA bundle for Azure origins and the Entra authority.
+    pub trust_bundle: PathBuf,
+
+    /// Entra authority base URL ending in `/`.
+    pub azure_authority_host: String,
+
+    /// Workload identity federated token file.
+    pub azure_federated_token_file: Option<PathBuf>,
 }
 
 impl Config {

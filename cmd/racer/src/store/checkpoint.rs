@@ -581,6 +581,9 @@ impl Recovery {
             // The coordinator must fence admission for the complete operation.
             self.index.restore(image.index)?;
             self.segments.restore(image.segments)?;
+            // Pins are re-established by the fill controller after restart.
+            // A restored pinned flag with no pin owning it would stay protected.
+            self.segments.clear_pinned_flags();
             self.index.restore_holds(&image.holds)?;
             Ok(())
         })
@@ -721,8 +724,8 @@ pub(crate) fn read_candidates_with_budget(
 // descriptors. Counts and string lengths are u32. A descriptor is cache UTF-8
 // string, key[32], quoted ETag string, length:u64, and a counted ASCII MIME
 // string where zero length means absent. A segment is id:u64, generation:u64,
-// state:u8, used_bytes:u64, and counted record-offset hold deadlines
-// (offset:u64, seconds:u64, nanos:u32). A page entry is its descriptor,
+// state:u8, used_bytes:u64, pinned:u8, and counted record-offset hold
+// deadlines (offset:u64, seconds:u64, nanos:u32). A page entry is its descriptor,
 // page:u64, key_id[16], segment:u64, generation:u64, offset:u64,
 // disk_length:u64. Encoder ordering is canonical by worker, segment, and full
 // version/page identity. No freshness or payload bytes are serialized.
@@ -731,7 +734,7 @@ pub(crate) fn read_candidates_with_budget(
 // restarts at 1, so they can repeat across clusters. Recovery skips a cut
 // from another cluster. Checkpoints with any other version or cluster are
 // discarded as disposable cache hints.
-pub const CHECKPOINT_VERSION: u32 = 4;
+pub const CHECKPOINT_VERSION: u32 = 5;
 const CLUSTER_BYTES: usize = 36;
 pub const FILE_LAYOUT_DIGEST: [u8; 32] = *b"racer-file-layout-v1\0\0\0\0\0\0\0\0\0\0\0\0";
 /// Largest encoded checkpoint file. Recovery additionally bounds decoded memory
@@ -748,7 +751,7 @@ const MAX_STRING_BYTES: usize = 8192;
 // Shared with decode_with_budget/recovery_memory input.count calls for shards,
 // segments, page entries, standalone descriptors, and held pages.
 const SHARD_BYTES: usize = 98; // worker + geometry + digest + four u32 counts.
-const SEGMENT_BYTES: usize = 25; // id + generation + state + used.
+const SEGMENT_BYTES: usize = 26; // id + generation + state + used + pinned.
 /// Entry index + remaining hold nanoseconds.
 pub(super) const HELD_RECORD_BYTES: usize = 12;
 const DESCRIPTOR_BYTES: usize = 52; // key + length + three u32 string lengths.
@@ -1010,6 +1013,7 @@ pub async fn encode_incremental(image: &CheckpointImage) -> Result<Vec<u8>> {
                 SegmentState::Evicting => 3,
             }])?;
             out.u64(segment.used_bytes)?;
+            out.bytes(&[u8::from(segment.pinned)])?;
         }
         out.count(shard.index.entries.len())?;
         let mut entries: Vec<_> = shard.index.entries.iter().collect();
@@ -1135,6 +1139,11 @@ pub fn decode_with_budget(bytes: &[u8], budget: usize) -> Result<CheckpointImage
                     _ => return Err(Error::CorruptRecord),
                 },
                 used_bytes: input.u64()?,
+                pinned: match input.take(1)?[0] {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(Error::CorruptRecord),
+                },
             });
         }
         let count = input.count(MAX_ITEMS, PAGE_ENTRY_BYTES)?;
@@ -1609,6 +1618,56 @@ mod budget_tests {
         }
     }
 
+    /// A cut may record both open tails; the pinned flag round-trips through
+    /// encoding and recovery clears it because pins are not persisted.
+    #[test]
+    fn pinned_flag_round_trips_and_recovery_clears_it() {
+        let alignment = Alignment::new(512, 512, 512).unwrap();
+        let geometry = CheckpointGeometry::new(2 * 4096, 4096, 2, alignment).unwrap();
+        let store = Segments::from_geometry(geometry.allocation_geometry().unwrap()).unwrap();
+        drop(store.append(2048).unwrap());
+        drop(store.append_in(2048, true).unwrap());
+        let image = CheckpointImage {
+            version: CHECKPOINT_VERSION,
+            page_size: racer_wire::object::PageSize::DEFAULT,
+            cluster: crate::store::checkpoint::test_cluster(),
+            sequence: 1,
+            shards: vec![ShardImage {
+                worker: WorkerId(0),
+                geometry,
+                index: IndexSnapshot {
+                    entries: vec![],
+                    metadata: vec![],
+                },
+                segments: store.snapshot(),
+                holds: vec![],
+            }],
+        };
+        let encoded = encode(&image).unwrap();
+        let mut decoded = decode(&encoded).unwrap();
+        assert!(
+            decoded.shards[0]
+                .segments
+                .iter()
+                .any(|segment| segment.pinned)
+        );
+        let env = racer_io::Env::host();
+        let index = Rc::new(Index::new(
+            WorkerId(0),
+            1,
+            crate::test_support::availability(&env),
+            racer_io::Clock::host(),
+        ));
+        let live =
+            Rc::new(Segments::from_geometry(geometry.allocation_geometry().unwrap()).unwrap());
+        let recovery = Recovery::new(PathBuf::new(), index, live.clone());
+        recovery.configure_geometry(geometry).unwrap();
+        futures::executor::block_on(recovery.install_shard(Some(decoded.shards.remove(0))))
+            .unwrap();
+        assert_eq!(live.pinned_count(), 0);
+        assert!(live.snapshot().iter().all(|segment| !segment.pinned));
+    }
+
     #[test]
     fn planned_budget_writes_and_recovers_a_full_cut() {
         let strings = descriptor_string_bytes(&metadata());
@@ -1667,8 +1726,11 @@ mod budget_tests {
     #[test]
     fn segment_charge_handles_empty_full_and_overflow() {
         assert_eq!(snapshot_base_bytes(0), Ok(SHARD_BYTES));
-        assert_eq!(snapshot_base_bytes(1), Ok(SHARD_BYTES + 25));
-        assert_eq!(snapshot_base_bytes(64), Ok(SHARD_BYTES + 25 * 64));
+        assert_eq!(snapshot_base_bytes(1), Ok(SHARD_BYTES + SEGMENT_BYTES));
+        assert_eq!(
+            snapshot_base_bytes(64),
+            Ok(SHARD_BYTES + SEGMENT_BYTES * 64)
+        );
         assert_eq!(snapshot_base_bytes(usize::MAX), Err(Error::Overloaded));
     }
 

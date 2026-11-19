@@ -3,11 +3,12 @@
 use crate::{
     Config, DiscoveredEndpoints, Error, annotations,
     entropy::{Entropy, OsEntropy},
+    fills::{self, FillView},
     kube::{Kube, KubeConfig, paths, str_at},
     limits,
     pki::DynamicClientVerifier,
     rt::{self, Executor, Listener, Notifier, Signal},
-    rules::rails::{self, Report},
+    rules::rails::{self, FillProgress, Report},
     seat, server,
     shared::{Serving, Shared},
 };
@@ -56,10 +57,40 @@ pub struct Diagnostics {
 struct Outer {
     bootstrap: Mutex<Option<Result<Bootstrap, Error>>>,
     bootstrapped: Condvar,
-    report: Mutex<Option<String>>,
+    report: Mutex<ReportState>,
     report_generation: AtomicU64,
+    /// Latest fill snapshot, for [`Handle::fills`].
+    fills: Mutex<Vec<FillView>>,
     stop: AtomicBool,
     diagnostics: Mutex<Diagnostics>,
+}
+
+/// Fields of the Pod report annotation, merged from independent producers.
+#[derive(Default)]
+struct ReportState {
+    shares: Option<NonZeroU32>,
+    rdma_nics: Vec<racer_wire::control::RailMapping>,
+    fills: Vec<FillProgress>,
+    pinnable_bytes: Option<u64>,
+    encoded: Option<String>,
+}
+
+impl ReportState {
+    fn refresh(&mut self) -> Result<(), Error> {
+        let Some(shares) = self.shares else {
+            self.encoded = None;
+            return Ok(());
+        };
+        let report = Report {
+            shares,
+            rdma_nics: self.rdma_nics.clone(),
+            fills: self.fills.clone(),
+            pinnable_bytes: self.pinnable_bytes,
+        };
+        self.encoded =
+            Some(rails::encode_report(&report).map_err(|_| Error::InvalidConfiguration)?);
+        Ok(())
+    }
 }
 
 /// Owner of the control thread. Dropping it stops and joins the thread.
@@ -243,6 +274,11 @@ impl Authority {
                 rng: RefCell::new(rng),
                 authz: Default::default(),
                 auth_budget: Default::default(),
+                fills: RefCell::new(Default::default()),
+                fills_synced: Default::default(),
+                fills_caches: RefCell::new(Default::default()),
+                fills_caches_synced: Default::default(),
+                pod_reports: RefCell::new(Default::default()),
             });
             let primary_changed = Rc::new(RefCell::new((String::new(), None)));
             rt::spawn(bootstrap(shared.clone(), outer.clone()))?;
@@ -260,6 +296,10 @@ impl Authority {
                 outer.clone(),
                 report_signal.clone(),
             ))?;
+            // Fill state is process-wide: every process lists its fills.
+            rt::spawn(fills::watch(shared.clone()))?;
+            rt::spawn(fills::status::run(shared.clone()))?;
+            rt::spawn(publish_fills(shared.clone(), outer.clone()))?;
             Ok(shared)
         })?;
         Ok(Self {
@@ -342,6 +382,27 @@ impl Authority {
         Ok(())
     }
 
+    /// Report per-fill progress, merged into the next Pod report.
+    pub fn report_fill_progress(
+        &mut self,
+        fills: Vec<FillProgress>,
+        pinnable_bytes: Option<u64>,
+    ) -> Result<(), Error> {
+        self.ctl.outer.set_fill_progress(fills, pinnable_bytes)?;
+        self.executor.notifier().notify();
+        Ok(())
+    }
+
+    /// Snapshot of the process-wide fills.
+    pub fn fills(&self) -> Vec<FillView> {
+        self.ctl
+            .outer
+            .fills
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     /// Point-in-time state, as of this call.
     pub fn diagnostics(&self) -> Diagnostics {
         self.executor
@@ -393,8 +454,9 @@ impl Outer {
         Arc::new(Self {
             bootstrap: Mutex::new(None),
             bootstrapped: Condvar::new(),
-            report: Mutex::new(None),
+            report: Mutex::new(ReportState::default()),
             report_generation: AtomicU64::new(0),
+            fills: Mutex::new(Vec::new()),
             stop: AtomicBool::new(false),
             diagnostics: Mutex::new(Diagnostics::default()),
         })
@@ -405,14 +467,49 @@ impl Outer {
         shares: u32,
         rdma_nics: Vec<racer_wire::control::RailMapping>,
     ) -> Result<(), Error> {
-        let report = Report {
-            shares: NonZeroU32::new(shares).ok_or(Error::InvalidConfiguration)?,
-            rdma_nics,
-        };
-        let encoded = rails::encode_report(&report).map_err(|_| Error::InvalidConfiguration)?;
-        *self.report.lock().unwrap_or_else(|e| e.into_inner()) = Some(encoded);
-        self.report_generation.fetch_add(1, Ordering::SeqCst);
+        let mut report = self.report.lock().unwrap_or_else(|e| e.into_inner());
+        let shares = NonZeroU32::new(shares).ok_or(Error::InvalidConfiguration)?;
+        let previous = report.encoded.clone();
+        report.shares = Some(shares);
+        report.rdma_nics = rdma_nics;
+        report.refresh()?;
+        if report.encoded != previous {
+            self.report_generation.fetch_add(1, Ordering::SeqCst);
+        }
         Ok(())
+    }
+
+    fn set_fill_progress(
+        &self,
+        fills: Vec<FillProgress>,
+        pinnable_bytes: Option<u64>,
+    ) -> Result<(), Error> {
+        let mut report = self.report.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = report.encoded.clone();
+        let old = (std::mem::take(&mut report.fills), report.pinnable_bytes);
+        report.fills = fills;
+        report.pinnable_bytes = pinnable_bytes;
+        if let Err(error) = report.refresh() {
+            report.fills = old.0;
+            report.pinnable_bytes = old.1;
+            return Err(error);
+        }
+        if report.encoded != previous {
+            self.report_generation.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
+    fn report_string(&self) -> Option<String> {
+        self.report
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .encoded
+            .clone()
+    }
+
+    fn publish_fills(&self, fills: Vec<FillView>) {
+        *self.fills.lock().unwrap_or_else(|e| e.into_inner()) = fills;
     }
 
     fn diagnostics(&self) -> Diagnostics {
@@ -420,6 +517,14 @@ impl Outer {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+}
+
+/// Mirror the process-wide fill snapshot for [`Handle::fills`].
+async fn publish_fills(shared: Rc<Shared>, outer: Arc<Outer>) {
+    while !shared.stopping.get() {
+        outer.publish_fills(crate::fills::snapshot(&shared));
+        rt::sleep(Duration::from_secs(2)).await;
     }
 }
 
@@ -545,11 +650,7 @@ async fn reporter(shared: Rc<Shared>, outer: Arc<Outer>, signal: Signal) {
     let mut backoff = 1;
     while !shared.stopping.get() {
         let generation = signal.generation();
-        let wanted = outer
-            .report
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let wanted = outer.report_string();
         if wanted.is_some() && wanted != written {
             let patch = json!({"metadata": {"annotations": {annotations::REPORT: wanted}}});
             match shared
@@ -619,6 +720,26 @@ impl Handle {
         self.outer.set_report(shares, rdma_nics)?;
         self.notifier.notify();
         Ok(())
+    }
+
+    /// Report per-fill progress, merged into the next Pod report.
+    pub fn report_fill_progress(
+        &self,
+        fills: Vec<FillProgress>,
+        pinnable_bytes: Option<u64>,
+    ) -> Result<(), Error> {
+        self.outer.set_fill_progress(fills, pinnable_bytes)?;
+        self.notifier.notify();
+        Ok(())
+    }
+
+    /// Snapshot of the process-wide fills.
+    pub fn fills(&self) -> Vec<FillView> {
+        self.outer
+            .fills
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     pub fn diagnostics(&self) -> Diagnostics {

@@ -90,6 +90,14 @@ pub struct ControlEndpoint {
 /// Called from the control reactor; implementations must only enqueue work.
 pub type Report = Arc<dyn Fn(u32, Vec<wire::RailMapping>) + Send + Sync>;
 
+/// Report per-fill progress to the embedded cluster control.
+///
+/// Called from the control reactor; implementations must only enqueue work.
+pub type FillReport = Arc<dyn Fn(Vec<racer_authority::FillProgress>, Option<u64>) + Send + Sync>;
+
+/// Read the process-wide ClusterCacheFill view from cluster control.
+pub type Fills = Arc<dyn Fn() -> Vec<racer_authority::FillView> + Send + Sync>;
+
 /// Managed-mode bindings from the embedded authority service.
 #[derive(Clone)]
 pub struct Managed {
@@ -98,6 +106,12 @@ pub struct Managed {
 
     /// Background Pod report of shares and discovered rails.
     pub report: Report,
+
+    /// Background Pod report of fill progress and residual pinnable bytes.
+    pub fill_report: FillReport,
+
+    /// Process-wide ClusterCacheFills, for the node fill controller.
+    pub fills: Fills,
 
     /// Device selector from control bootstrap; preferred over the enrollment copy.
     pub block_devices: Option<String>,

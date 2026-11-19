@@ -632,6 +632,17 @@ pub mod paths {
 
     pub const CACHES: &str = "/apis/racer.unbounded-cloud.io/v1alpha1/clustercaches";
 
+    pub const CLUSTER_CACHE_FILLS: &str =
+        "/apis/racer.unbounded-cloud.io/v1alpha1/clustercachefills";
+
+    pub fn cluster_cache_fill(name: &str) -> String {
+        format!("{CLUSTER_CACHE_FILLS}/{name}")
+    }
+
+    pub fn cluster_cache_fill_status(name: &str) -> String {
+        format!("{CLUSTER_CACHE_FILLS}/{name}/status")
+    }
+
     pub fn daemonset(ns: &str, name: &str) -> String {
         format!("/apis/apps/v1/namespaces/{ns}/daemonsets/{name}")
     }

@@ -45,6 +45,7 @@ pub mod catalog;
 pub mod checkpoint;
 pub mod holds;
 mod pages;
+pub mod pins;
 
 pub struct Store {
     pub reader: Rc<StoreReader>,

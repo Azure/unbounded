@@ -31,6 +31,19 @@ pub trait ClusterControl: Send + Sync + 'static {
 
     /// Enqueue a Pod report of shares and rails; must not block the caller.
     fn report(&self, shares: u32, rails: Vec<racer_wire::control::RailMapping>);
+
+    /// Enqueue a Pod report of fill progress; must not block the caller.
+    fn report_fill_progress(
+        &self,
+        _fills: Vec<racer_authority::FillProgress>,
+        _pinnable_bytes: Option<u64>,
+    ) {
+    }
+
+    /// Process-wide ClusterCacheFills, for the node fill controller.
+    fn fills(&self) -> Vec<racer_authority::FillView> {
+        Vec::new()
+    }
 }
 
 /// Cluster state returned once cluster control has initialized or joined it.
@@ -126,9 +139,15 @@ fn start_with(
         }
     };
     let reporter = control.clone();
+    let fill_reporter = control.clone();
+    let fills = control.clone();
     let managed = Managed {
         endpoints: control.endpoints(),
         report: std::sync::Arc::new(move |shares, rails| reporter.report(shares, rails)),
+        fill_report: std::sync::Arc::new(move |progress, pinnable| {
+            fill_reporter.report_fill_progress(progress, pinnable)
+        }),
+        fills: std::sync::Arc::new(move || fills.fills()),
         block_devices: bootstrapped.block_devices,
     };
     adopt(config, bootstrapped.cluster, managed)
@@ -280,6 +299,8 @@ mod tests {
         Managed {
             endpoints: Default::default(),
             report: std::sync::Arc::new(|_, _| {}),
+            fill_report: std::sync::Arc::new(|_, _| {}),
+            fills: std::sync::Arc::new(Vec::new),
             block_devices: Some("nvme*".into()),
         }
     }

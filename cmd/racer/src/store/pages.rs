@@ -346,12 +346,13 @@ impl Pages {
         Ok((slot, cache))
     }
 
-    /// Reserve a publication of `page`. `Overloaded` when the slot arena or
-    /// cache table is full, `Busy` when `page` is already being written.
-    pub fn reserve(&mut self, page: &PageId) -> Result<Reservation> {
+    /// Reserve a publication of `page`, appending into the pinned segment
+    /// class when `pinned` is set. `Overloaded` when the slot arena or cache
+    /// table is full, `Busy` when `page` is already being written.
+    pub fn reserve(&mut self, page: &PageId, pinned: bool) -> Result<Reservation> {
         let (slot, cache) = self.intern(page)?;
         let inner = self.inner.as_mut().expect("initialized page table");
-        match PendingWrite::reserve(&inner.disk, slot, cache) {
+        match PendingWrite::reserve(&inner.disk, slot, cache, pinned) {
             Ok(write) => Ok(Reservation {
                 write,
                 disk: inner.disk.clone(),

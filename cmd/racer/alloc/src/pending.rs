@@ -30,13 +30,15 @@ pub struct PendingWrite {
 }
 
 impl PendingWrite {
-    /// Reserve `slot` for `cache`.
+    /// Reserve `slot` for `cache`, appending into the pinned segment class
+    /// when `pinned` is set.
     pub fn reserve(
         index: &Rc<RefCell<DiskIndex>>,
         slot: PageSlot,
         cache: CacheKey,
+        pinned: bool,
     ) -> Result<Self> {
-        let ticket = index.borrow_mut().reserve(slot, cache)?;
+        let ticket = index.borrow_mut().reserve_pinned(slot, cache, pinned)?;
         Ok(Self::from_ticket(index.clone(), ticket))
     }
 
@@ -123,7 +125,7 @@ mod tests {
     #[test]
     fn publish_follows_reserve_append_write() {
         let (index, segments, cache) = fixture();
-        let mut pending = PendingWrite::reserve(&index, PageSlot(0), cache).unwrap();
+        let mut pending = PendingWrite::reserve(&index, PageSlot(0), cache, false).unwrap();
         let (lease, location) = pending.append(&segments, 512).unwrap();
         assert!(!index.borrow().can_reclaim(location.segment()));
         drop(lease);
@@ -136,16 +138,16 @@ mod tests {
     #[test]
     fn dropped_reservation_and_write_release_counts() {
         let (index, segments, cache) = fixture();
-        drop(PendingWrite::reserve(&index, PageSlot(0), cache).unwrap());
+        drop(PendingWrite::reserve(&index, PageSlot(0), cache, false).unwrap());
         assert!(!index.borrow().references(PageSlot(0)));
-        let mut pending = PendingWrite::reserve(&index, PageSlot(0), cache).unwrap();
+        let mut pending = PendingWrite::reserve(&index, PageSlot(0), cache, false).unwrap();
         let (lease, location) = pending.append(&segments, 512).unwrap();
         drop(pending);
         drop(lease);
         assert!(!index.borrow().references(PageSlot(0)));
         assert!(index.borrow().can_reclaim(location.segment()));
         // Capacity 1 is free again.
-        PendingWrite::reserve(&index, PageSlot(1), cache).unwrap();
+        PendingWrite::reserve(&index, PageSlot(1), cache, false).unwrap();
         index.borrow().check_invariants();
     }
 
@@ -155,7 +157,7 @@ mod tests {
         let persist = {
             let index = index.clone();
             async move {
-                let mut pending = PendingWrite::reserve(&index, PageSlot(0), cache)?;
+                let mut pending = PendingWrite::reserve(&index, PageSlot(0), cache, false)?;
                 let (_lease, _location) = pending.append(&segments, 512)?;
                 std::future::pending::<()>().await; // the disk write never completes
                 pending.publish()

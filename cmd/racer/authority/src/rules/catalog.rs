@@ -142,7 +142,7 @@ fn origin_definition(
 /// Parse a Go `time.Duration` string such as "30s", "1m30s", or "1.5h", as
 /// written by metav1.Duration, to nanosecond precision. Negative durations are
 /// rejected; "-0" is zero.
-fn go_duration(s: &str) -> Option<std::time::Duration> {
+pub(crate) fn go_duration(s: &str) -> Option<std::time::Duration> {
     let (negative, mut rest) = match s.as_bytes().first()? {
         b'-' => (true, &s[1..]),
         b'+' => (false, &s[1..]),
@@ -222,6 +222,50 @@ fn to_millis(d: std::time::Duration, up: bool) -> Option<std::time::Duration> {
         millis = millis.checked_add(1)?;
     }
     Some(std::time::Duration::from_millis(millis))
+}
+
+/// Whether a ClusterCache can serve a ClusterCacheFill.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FillCache {
+    /// Cached (not passthrough) with a usable Azure origin.
+    Usable {
+        uid: String,
+        name: String,
+        origin: wire::OriginDefinition,
+    },
+    /// No cache has `spec.cacheName`.
+    CacheNotFound,
+    /// The cache is passthrough or has an invalid `spec.passthrough`.
+    UnsupportedCache,
+    /// The cache has no origin, or its `spec.origin` is invalid or unsupported.
+    UnsupportedOrigin,
+}
+
+/// Resolve a ClusterCacheFill's `spec.cacheName` against the ClusterCache
+/// catalog. Usable fills need a Cached (not passthrough) cache with an origin
+/// definition, because a fill lists that origin directly.
+pub fn fill_cache(fill: &Value, caches: &BTreeMap<String, CacheInfo>) -> FillCache {
+    let name = kube::str_at(fill, &["spec", "cacheName"]);
+    fill_cache_named(name, caches)
+}
+
+/// [`fill_cache`] with the cache name already read.
+pub fn fill_cache_named(name: &str, caches: &BTreeMap<String, CacheInfo>) -> FillCache {
+    let Some(cache) = caches.values().find(|c| c.name == name) else {
+        return FillCache::CacheNotFound;
+    };
+    match mode(cache.passthrough.as_ref()) {
+        Ok(wire::CacheMode::Cached) => {}
+        _ => return FillCache::UnsupportedCache,
+    }
+    match origin_definition(cache.origin.as_ref()) {
+        Ok(Some(origin)) => FillCache::Usable {
+            uid: cache.uid.clone(),
+            name: cache.name.clone(),
+            origin,
+        },
+        _ => FillCache::UnsupportedOrigin,
+    }
 }
 
 /// Build the catalog sorted by UID. A cache with an invalid node selector is
@@ -457,6 +501,57 @@ mod tests {
         assert!(build(&[c(u, "a"), c(u, "b")]).is_err());
         assert!(build(&[c(u, "a"), c("22222222-2222-4222-8222-222222222222", "a")]).is_err());
         assert!(build(&[c(u, "A/B")]).is_err());
+    }
+
+    #[test]
+    fn fill_cache_requires_cached_cache_with_origin() {
+        let u = "11111111-1111-4111-8111-111111111111";
+        let url = "https://acct.blob.core.windows.net/models";
+        let with = |spec: Value| {
+            let info = CacheInfo::from_json(
+                &serde_json::json!({"metadata":{"uid":u,"name":"models"},"spec":spec}),
+            );
+            let mut map = BTreeMap::new();
+            map.insert(u.to_owned(), info);
+            map
+        };
+        let usable = with(serde_json::json!({"origin":{"azure":{"containerURL":url}}}));
+        let fill = serde_json::json!({"spec":{"cacheName":"models"}});
+        match fill_cache(&fill, &usable) {
+            FillCache::Usable { uid, name, origin } => {
+                assert_eq!((uid.as_str(), name.as_str()), (u, "models"));
+                assert_eq!(
+                    origin.azure.container_url,
+                    wire::AzureContainerUrl::parse(url).unwrap()
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            fill_cache(&serde_json::json!({"spec":{"cacheName":"other"}}), &usable),
+            FillCache::CacheNotFound
+        );
+        assert_eq!(
+            fill_cache(&fill, &BTreeMap::new()),
+            FillCache::CacheNotFound
+        );
+        for (spec, want) in [
+            (
+                serde_json::json!({"origin":{"azure":{"containerURL":url}},"passthrough":{"route":"Peers"}}),
+                FillCache::UnsupportedCache,
+            ),
+            (
+                serde_json::json!({"passthrough":{"route":"Local"}}),
+                FillCache::UnsupportedCache,
+            ),
+            (serde_json::json!({}), FillCache::UnsupportedOrigin),
+            (
+                serde_json::json!({"origin":{"azure":{}}}),
+                FillCache::UnsupportedOrigin,
+            ),
+        ] {
+            assert_eq!(fill_cache(&fill, &with(spec.clone())), want, "{spec}");
+        }
     }
 
     #[test]

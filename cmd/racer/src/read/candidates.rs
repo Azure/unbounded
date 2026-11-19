@@ -957,6 +957,20 @@ impl CandidatePolicy {
             })
     }
 
+    /// The local node's position in the page's current ranking, if it ranks.
+    /// Positions at or above the fill's replica count are not pinned.
+    pub(crate) fn rank_position(
+        &self,
+        membership: std::sync::Arc<crate::topology::Membership>,
+        page: &crate::model::PageId,
+    ) -> Option<usize> {
+        self.placement
+            .rank(membership, &page.version.object, page.number)
+            .ordered
+            .iter()
+            .position(|node| node == &self.node)
+    }
+
     /// Call once per worker service turn, also when no reads are arriving.
     /// Walks indexed residents (including recovered idle pages) in order. Pages
     /// whose current ranking is already cached complete without scoring, up to
