@@ -37,9 +37,14 @@ const (
 	// configDir holds the kubeconfig written for trident-acl-agent, and the
 	// marker that the host agent enabled it.
 	configDir = "/etc/unbounded/trident-acl-agent"
-	// kubeletClientCertPath is kubelet's client certificate and key after TLS
-	// bootstrap, inside the node's root. Its subject is system:node:<Node name>.
-	kubeletClientCertPath = "/var/lib/kubelet/pki/kubelet-client-current.pem"
+	// kubeletPKIDir holds kubelet's client certificate and key after TLS
+	// bootstrap, inside the node's root. The certificate's subject is
+	// system:node:<Node name>.
+	kubeletPKIDir = "/var/lib/kubelet/pki"
+	// kubeletClientCertPath is a symlink kubelet's certificate store writes
+	// with an absolute target in kubeletPKIDir, and moves when it rotates the
+	// certificate.
+	kubeletClientCertPath = kubeletPKIDir + "/kubelet-client-current.pem"
 )
 
 // HostMounts returns the host paths centerpivot needs bound into this host's
@@ -173,14 +178,12 @@ func (h tridentACLAgentHost) configure(ctx context.Context, gs *goalstates.NodeS
 		}
 	}
 
-	cert := gs.Root().Path(kubeletClientCertPath)
-
 	kubeconfig, err := clientcmd.Write(clientcmdapi.Config{
 		Clusters: map[string]*clientcmdapi.Cluster{
 			"cluster": {Server: gs.Kubelet.APIServer, CertificateAuthorityData: gs.Kubelet.CACertData},
 		},
 		AuthInfos: map[string]*clientcmdapi.AuthInfo{
-			"kubelet": {ClientCertificate: cert, ClientKey: cert},
+			"kubelet": {ClientCertificate: kubeletClientCertPath, ClientKey: kubeletClientCertPath},
 		},
 		Contexts:       map[string]*clientcmdapi.Context{"default": {Cluster: "cluster", AuthInfo: "kubelet"}},
 		CurrentContext: "default",
@@ -197,7 +200,7 @@ func (h tridentACLAgentHost) configure(ctx context.Context, gs *goalstates.NodeS
 		"Environment=TRIDENT_ACL_AGENT_KUBERNETES_ANNOTATION_PREFIX=" + names.Prefix,
 		"Environment=TRIDENT_ACL_AGENT_KUBERNETES_KUBECONFIG=" + h.kubeconfig(),
 		"Environment=TRIDENT_ACL_AGENT_KUBERNETES_NODE_NAME_SOURCE=kubelet-cert",
-		"Environment=TRIDENT_ACL_AGENT_KUBERNETES_KUBELET_CERT_PATH=" + cert,
+		"Environment=TRIDENT_ACL_AGENT_KUBERNETES_KUBELET_CERT_PATH=" + kubeletClientCertPath,
 		"Environment=TRIDENT_ACL_AGENT_CURRENT_VERSION_KEY=" + names.VersionKey,
 		// Without a version, the agent would report 0.0.0, which Nebraska
 		// always offers an update to.
@@ -205,6 +208,10 @@ func (h tridentACLAgentHost) configure(ctx context.Context, gs *goalstates.NodeS
 		// centerpivot's deadlines build on these.
 		"Environment=TRIDENT_ACL_AGENT_ORCHESTRATION_STAGE_TIMEOUT=" + minutes(names.AgentStageTimeout),
 		"Environment=TRIDENT_ACL_AGENT_ORCHESTRATION_FINALIZE_TIMEOUT=" + minutes(names.AgentFinalizeTimeout),
+		// kubelet's certificate is a symlink to an absolute path in the
+		// machine, so the agent sees the machine's directory where kubelet
+		// does, and follows the link as kubelet rotates the certificate.
+		"BindReadOnlyPaths=" + gs.Root().Path(kubeletPKIDir) + ":" + kubeletPKIDir,
 		"",
 	}, "\n")
 
@@ -228,7 +235,7 @@ func (h tridentACLAgentHost) configure(ctx context.Context, gs *goalstates.NodeS
 		}
 	}
 
-	h.log.Info("Configured trident-acl-agent for centerpivot", "kubeletCert", cert)
+	h.log.Info("Configured trident-acl-agent for centerpivot", "kubeletPKI", gs.Root().Path(kubeletPKIDir))
 
 	return nil
 }

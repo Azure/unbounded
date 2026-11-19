@@ -93,7 +93,7 @@ func TestConfigureTridentACLAgent(t *testing.T) {
 
 	require.NoError(t, configure(managedNode("kube1")))
 
-	cert := "/var/lib/machines/kube1/var/lib/kubelet/pki/kubelet-client-current.pem"
+	cert := "/var/lib/kubelet/pki/kubelet-client-current.pem"
 
 	dropIn, err := os.ReadFile(host.dropIn)
 	require.NoError(t, err)
@@ -108,6 +108,8 @@ func TestConfigureTridentACLAgent(t *testing.T) {
 		"Environment=TRIDENT_ACL_AGENT_CURRENT_VERSION_FALLBACK=error",
 		"Environment=TRIDENT_ACL_AGENT_ORCHESTRATION_STAGE_TIMEOUT=20m",
 		"Environment=TRIDENT_ACL_AGENT_ORCHESTRATION_FINALIZE_TIMEOUT=10m",
+		// kubelet's certificate is an absolute symlink inside the machine.
+		"BindReadOnlyPaths=/var/lib/machines/kube1/var/lib/kubelet/pki:/var/lib/kubelet/pki",
 	} {
 		assert.Contains(t, string(dropIn), line+"\n")
 	}
@@ -118,7 +120,7 @@ func TestConfigureTridentACLAgent(t *testing.T) {
 	cluster, user := kubeconfig.Clusters[kubeconfig.Contexts[kubeconfig.CurrentContext].Cluster], kubeconfig.AuthInfos[kubeconfig.Contexts[kubeconfig.CurrentContext].AuthInfo]
 	assert.Equal(t, "https://api.example.com:6443", cluster.Server)
 	assert.Equal(t, []byte("-----BEGIN CERTIFICATE-----\n"), cluster.CertificateAuthorityData)
-	assert.Equal(t, cert, user.ClientCertificate, "kubelet's own credentials, read from the machine's root on the host")
+	assert.Equal(t, cert, user.ClientCertificate, "kubelet's own credentials, from the machine's directory the drop-in binds")
 	assert.Equal(t, cert, user.ClientKey)
 
 	info, err := os.Stat(host.kubeconfig())
@@ -150,7 +152,7 @@ func TestConfigureTridentACLAgent(t *testing.T) {
 
 	dropIn, err = os.ReadFile(host.dropIn)
 	require.NoError(t, err)
-	assert.Contains(t, string(dropIn), "/var/lib/machines/kube2/var/lib/kubelet/pki/kubelet-client-current.pem")
+	assert.Contains(t, string(dropIn), "BindReadOnlyPaths=/var/lib/machines/kube2/var/lib/kubelet/pki:/var/lib/kubelet/pki\n")
 }
 
 func TestConfigureTridentACLAgentLeavesOtherNodesAlone(t *testing.T) {

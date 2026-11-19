@@ -776,8 +776,12 @@ On Azure Container Linux hosts, Unbounded's host agent:
    `centerpivot.unbounded-cloud.io/managed: "true"`, configures
    `trident-acl-agent` each time the node starts:
    1. `/etc/unbounded/trident-acl-agent/kubeconfig` names the API server, its
-      CA, and kubelet's client certificate in the active slot,
-      `/var/lib/machines/<slot>/var/lib/kubelet/pki/kubelet-client-current.pem`.
+      CA, and kubelet's client certificate,
+      `/var/lib/kubelet/pki/kubelet-client-current.pem`. That's a symlink
+      kubelet writes with an absolute target inside the machine, and moves
+      when it rotates the certificate, so the drop-in binds the active slot's
+      `/var/lib/machines/<slot>/var/lib/kubelet/pki` read-only at
+      `/var/lib/kubelet/pki` for the agent alone, where the link resolves.
    2. `/etc/systemd/system/trident-acl-agent.service.d/50-unbounded-centerpivot.conf`
       sets annotation mode, the prefix, that kubeconfig, `kubelet-cert` to find
       the Node's name, and `VERSION_ID`. It also sets the stage and finalize
