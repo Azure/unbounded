@@ -800,7 +800,10 @@ On Azure Container Linux hosts, Unbounded's host agent:
       the Node's name, and `VERSION_ID`. It also sets the stage and finalize
       timeouts the service's deadlines build on (section 4.8), and makes the
       agent fail rather than report `0.0.0` when it can't read the version,
-      since Nebraska always offers that an update.
+      since Nebraska always offers that an update. It turns on the agent's
+      Nebraska affinity cookie, so where a load balancer in front of Nebraska
+      offers one, the agent's later requests for an update reach the server
+      its own check reached.
    3. It enables the agent, and restarts it when either file changed, as when
       the node moves to another slot.
 3. Undoes step 2 when the label goes or the node is reset, and turns the agent

@@ -108,6 +108,7 @@ func TestConfigureTridentACLAgent(t *testing.T) {
 		"Environment=TRIDENT_ACL_AGENT_CURRENT_VERSION_FALLBACK=error",
 		"Environment=TRIDENT_ACL_AGENT_ORCHESTRATION_STAGE_TIMEOUT=20m",
 		"Environment=TRIDENT_ACL_AGENT_ORCHESTRATION_FINALIZE_TIMEOUT=10m",
+		"Environment=TRIDENT_ACL_AGENT_ORCHESTRATION_COOKIE_ENABLED=true",
 		// kubelet's certificate is an absolute symlink inside the machine.
 		"BindReadOnlyPaths=/var/lib/machines/kube1/var/lib/kubelet/pki:/var/lib/kubelet/pki",
 	} {

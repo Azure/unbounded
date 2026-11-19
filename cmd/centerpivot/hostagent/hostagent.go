@@ -208,6 +208,11 @@ func (h tridentACLAgentHost) configure(ctx context.Context, gs *goalstates.NodeS
 		// centerpivot's deadlines build on these.
 		"Environment=TRIDENT_ACL_AGENT_ORCHESTRATION_STAGE_TIMEOUT=" + minutes(names.AgentStageTimeout),
 		"Environment=TRIDENT_ACL_AGENT_ORCHESTRATION_FINALIZE_TIMEOUT=" + minutes(names.AgentFinalizeTimeout),
+		// Where a load balancer in front of Nebraska offers an affinity
+		// cookie, the agent's progress, finalize, and completion requests go
+		// to the server its own update check reached. Where none does, the
+		// agent sends no cookie, as with it off.
+		"Environment=TRIDENT_ACL_AGENT_ORCHESTRATION_COOKIE_ENABLED=true",
 		// kubelet's certificate is a symlink to an absolute path in the
 		// machine, so the agent sees the machine's directory where kubelet
 		// does, and follows the link as kubelet rotates the certificate.
