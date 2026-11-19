@@ -65,9 +65,10 @@ provider other than `AzureVM` through `spec.host.external`.
 5. Take the manifests from `deploy/machine-ops`:
    - `01` to `03` and `08` belong to one controller. Copy them and set
      `ControllerName` and `ControllerImage`.
-   - `04` to `07` are the capacity roles and admission policies. They are
-     cluster-wide objects with fixed names that every machine-ops controller
-     shares, so install them once and do not copy them.
+   - `04` to `07` are the capacity roles and admission policies, and `09` is
+     the admission policy for MachineOperation status. They are cluster-wide
+     objects with fixed names that every machine-ops controller shares, so
+     install them once and do not copy them.
    - `01` and `03` contain Azure and AKS specifics to replace: the workload
      identity annotation and label, the node affinity and the API server
      annotation.
@@ -90,3 +91,9 @@ provider other than `AzureVM` through `spec.host.external`.
   stops an identity that may create Machines from binding one to an
   allocation, and `07` limits the controller's Secret writes in `kube-system`
   to its own bootstrap tokens.
+- Every controller needs the admission policy in `09`, with or without
+  capacity. The engine trusts `providerOperation` and `input` in a
+  MachineOperation's status targets, and the agent on every node may update
+  that status. `09` lets only an identity allowed `update` on
+  `machineoperations/finalizers` change those two fields. The role in `02`
+  grants that, so keep the grant in a copy and never give it to the agents.

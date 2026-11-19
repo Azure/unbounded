@@ -25,6 +25,9 @@ const (
 	allocationRefPolicyName   = "unbounded-machine-allocationref"
 	allocationRefPolicyDenial = "only an identity granted the allocate verb on machines may set spec.allocationRef"
 	bootstrapTokenDenial      = "an identity granted the allocate verb on machines may create and delete only bootstrap token Secrets labeled unbounded-cloud.io/allocation-uid in kube-system"
+	providerStatePolicyFile   = "09-machineoperation-provider-state-policy.yaml.tmpl"
+	providerStatePolicyName   = "unbounded-machineoperation-provider-state"
+	providerStateDenial       = "only an identity allowed to update machineoperations/finalizers may change providerOperation or input of a status target"
 )
 
 func TestMachineAllocationRBACGrantsExactly(t *testing.T) {

@@ -132,7 +132,7 @@ func TestEnvtestMachineAllocationBootstrapTokenPolicy(t *testing.T) {
 }
 
 // startPolicyEnvironment starts an API server with the Machine CRDs, applies
-// the allocation roles and both admission policies, and returns an admin
+// the allocation roles and every admission policy, and returns an admin
 // client.
 func startPolicyEnvironment(t *testing.T) (*envtest.Environment, client.Client) {
 	t.Helper()
@@ -155,7 +155,7 @@ func startPolicyEnvironment(t *testing.T) (*envtest.Environment, client.Client) 
 	admin, err := client.New(cfg, client.Options{Scheme: policyScheme(t)})
 	require.NoError(t, err)
 
-	for _, file := range []string{allocationRBACFile, allocationRefPolicyFile, bootstrapTokenPolicyFile} {
+	for _, file := range []string{allocationRBACFile, allocationRefPolicyFile, bootstrapTokenPolicyFile, providerStatePolicyFile} {
 		for _, document := range manifestDocuments(t, file) {
 			object := &unstructured.Unstructured{}
 			require.NoError(t, yaml.Unmarshal([]byte(document), &object.Object))
