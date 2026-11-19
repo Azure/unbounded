@@ -73,7 +73,9 @@ pub(super) struct Pins {
     pub members: usize,
     pub segments: Option<Rc<Segments>>,
     /// Stored pinned pages per segment, one per holder entry. A segment loses
-    /// its pinned flag when this reaches zero.
+    /// its pinned flag when this reaches zero. A zero count whose clear was
+    /// refused by a frozen table stays here until a maintenance sweep retries,
+    /// so the segment keeps counting against the pin budget meanwhile.
     pub segment_pages: HashMap<SegmentId, usize>,
     pub percent: usize,
 }
@@ -113,9 +115,34 @@ impl Pins {
         if *count != 0 {
             return;
         }
+        self.clear_released(segment);
+    }
+
+    /// Clear a segment whose last holder went away. A checkpoint freeze makes
+    /// [`Segments::clear_pinned`] return `Busy`; keep the zero count then, so
+    /// the segment still counts as pinned and [`Self::expire`] retries after
+    /// the thaw instead of leaving the table protected forever.
+    fn clear_released(&mut self, segment: SegmentId) {
+        let Some(segments) = self.segments.clone() else {
+            self.segment_pages.remove(&segment);
+            return;
+        };
+        if matches!(segments.clear_pinned(segment), Err(page_alloc::Error::Busy)) {
+            return;
+        }
         self.segment_pages.remove(&segment);
-        if let Some(segments) = &self.segments {
-            let _ = segments.clear_pinned(segment);
+    }
+
+    /// Retry segment clears a checkpoint freeze deferred.
+    fn retry_released(&mut self) {
+        let pending: Vec<_> = self
+            .segment_pages
+            .iter()
+            .filter(|(_, count)| **count == 0)
+            .map(|(segment, _)| *segment)
+            .collect();
+        for segment in pending {
+            self.clear_released(segment);
         }
     }
 
@@ -260,7 +287,9 @@ impl Pins {
         }
     }
 
-    /// Release up to `budget` entries due at `now`, reporting each.
+    /// Release up to `budget` entries due at `now`, reporting each. Also
+    /// retries segment clears a checkpoint freeze deferred; those do not use
+    /// the expiry budget.
     pub(super) fn expire(
         &mut self,
         pages: &mut Pages,
@@ -268,6 +297,7 @@ impl Pins {
         budget: usize,
         mut expired: impl FnMut((FillId, ObjectVersion)),
     ) -> usize {
+        self.retry_released();
         let due: Vec<_> = self
             .entries
             .iter()

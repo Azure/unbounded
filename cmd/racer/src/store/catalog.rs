@@ -680,8 +680,18 @@ impl Index {
     /// Release up to `budget` expired pins. Runs on the same maintenance path
     /// as [`Self::expire_holds`].
     pub fn expire_pins(&self, budget: usize) {
-        if self.pins.borrow().entries.is_empty() {
-            return;
+        {
+            let pins = self.pins.borrow();
+            // A zero count is a segment clear a frozen table deferred. A
+            // frozen table cannot clear it, so skip the mutation until thaw.
+            let retry = !pins.segment_pages.is_empty()
+                && pins
+                    .segments
+                    .as_ref()
+                    .is_none_or(|segments| !segments.reuse_frozen());
+            if pins.entries.is_empty() && !retry {
+                return;
+            }
         }
         let mut state = self.state_mut();
         let mut pins = self.pins.borrow_mut();
@@ -2444,6 +2454,49 @@ mod tests {
         assert_eq!(segments.pinned_count(), 1);
         assert!(!index.can_evict(segment));
         index.release_pin_pages(FillId(1), &page.version, &page_set(&[0]), epoch);
+        assert!(!segments.pinned(segment).unwrap());
+        assert_eq!(segments.pinned_count(), 0);
+        assert!(index.can_evict(segment));
+    }
+
+    /// A checkpoint freeze refuses the clear of the last pin's segment. The
+    /// release must stay pending and keep charging the segment until the
+    /// maintenance sweep retries after the thaw.
+    #[test]
+    fn last_pin_release_stays_charged_until_the_freeze_ends() {
+        use super::super::pins::FillId;
+        let env = racer_io::Env::host();
+        let segments = Rc::new(segments(1024, 4));
+        let index = Rc::new(index(&env, 8));
+        index.set_page_capacity(4).unwrap();
+        index.set_pin_capacity_percent(100).unwrap();
+        let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
+        let (page, entry) = indexed(descriptor("frozen", 17), 0);
+        let segment = entry.location.segment;
+        drop(segments.append(1024).unwrap());
+        index.publish(page.clone(), entry).unwrap();
+        let until = racer_io::Clock::host().wall_now() + std::time::Duration::from_secs(60);
+        let epoch = index
+            .reserve_pin_pages(FillId(1), &page.version, &page_set(&[0]), until)
+            .unwrap();
+        assert!(segments.pinned(segment).unwrap());
+        // Releasing during the freeze cannot clear the flag.
+        let freeze = segments.freeze().unwrap();
+        index.release_pin_pages(FillId(1), &page.version, &page_set(&[0]), epoch);
+        assert!(!index.is_pinned(&page));
+        assert!(segments.pinned(segment).unwrap());
+        assert_eq!(
+            segments.pinned_count(),
+            1,
+            "still charged against the budget"
+        );
+        // A maintenance turn during the freeze must not lose the release.
+        index.expire_pins(usize::MAX);
+        assert!(segments.pinned(segment).unwrap());
+        assert_eq!(segments.pinned_count(), 1);
+        drop(freeze);
+        // With no pin entries left, the sweep still retries the pending clear.
+        index.expire_pins(usize::MAX);
         assert!(!segments.pinned(segment).unwrap());
         assert_eq!(segments.pinned_count(), 0);
         assert!(index.can_evict(segment));
