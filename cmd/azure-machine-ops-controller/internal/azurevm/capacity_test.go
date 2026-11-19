@@ -25,17 +25,25 @@ func TestRegistrationDeclaresCapacityAndHostOperations(t *testing.T) {
 	for _, kind := range []unboundedv1alpha3.OperationKind{
 		unboundedv1alpha3.OperationHostAllocate,
 		unboundedv1alpha3.OperationHostRelease,
+		unboundedv1alpha3.OperationHostHardReboot,
+		unboundedv1alpha3.OperationHostPowerOff,
+		unboundedv1alpha3.OperationHostPowerOn,
+		unboundedv1alpha3.OperationHostReplace,
 	} {
-		operation, ok := registration.Operation(kind)
-		require.True(t, ok, kind)
+		operation, registered := registration.Operation(kind)
+		require.True(t, registered, kind)
 		require.Equal(t, machineops.OperationModeLongRunning, operation.Mode(), kind)
 	}
 
-	for kind := range azureVMOperations {
-		operation, ok := registration.Operation(kind)
-		require.True(t, ok, kind)
-		require.Equal(t, machineops.OperationModeImmediate, operation.Mode(), kind)
-	}
+	// Without this declaration the engine gives HostReplace no cloud-init for
+	// the replacement VM.
+	replace, ok := registration.Operation(unboundedv1alpha3.OperationHostReplace)
+	require.True(t, ok)
+	require.True(t, replace.RequiresReplaceUserData())
+
+	// Azure VMs have no provider machine object of their own.
+	_, ok = registration.ProviderMachineKind()
+	require.False(t, ok)
 }
 
 func TestVMNameUsesFullAllocationUID(t *testing.T) {
