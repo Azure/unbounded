@@ -5,7 +5,7 @@ description: "Power management and host replacement operations."
 ---
 
 Host operations change the power state of the VM, PXE host, or bare-metal
-machine. They are handled by `azure-machine-ops-controller` for cloud VMs and by
+machine. They are handled by `azure-machine-ops-controller` for Azure VMs and by
 `metalman` for PXE/bare-metal machines with BMC. The exception is
 `HostSoftReboot`, which the `unbounded-agent` daemon on the host executes.
 
@@ -28,7 +28,7 @@ An operation that no metalman instance can own is marked `Failed`. This covers
 a selector that names no site or more than one site, and a `machineRef` that
 names a Machine that does not exist.
 
-For cloud VMs, run `azure-machine-ops-controller` scoped to the Machine's site and
+For Azure VMs, run `azure-machine-ops-controller` scoped to the Machine's site and
 provider, for example `--site=remote --provider=AzureVM`. A scoped controller
 only executes operations whose target Machine has the matching
 `unbounded-cloud.io/site` label and `spec.provider`; other controllers ignore
@@ -48,7 +48,7 @@ Machines joined via SSH do not have a cloud provider or BMC backing them.
 for SSH-joined machines because there is no out-of-band API to power-cycle,
 power on, or recreate the machine. Use `HostSoftReboot` to reboot them.
 
-| Operation | Cloud VM | Bare metal (BMC) | SSH-joined |
+| Operation | Azure VM | Bare metal (BMC) | SSH-joined |
 |-----------|----------|-------------------|------------|
 | `HostHardReboot` | Yes | Yes | Not supported |
 | `HostSoftReboot` | Yes (agent) | Yes (agent) | Yes (agent) |

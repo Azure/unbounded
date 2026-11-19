@@ -15,6 +15,7 @@ unbounded-kube is organized into several directories:
 - `bpf/` - eBPF C programs for network encapsulation (compiled with clang).
 - `cmd/` - where the sources for each binary artifact are located. Each subdirectory corresponds to a binary artifact.
   - `agent` - sources for the unbounded-agent.
+  - `azure-machine-ops-controller` - machine-ops controller for Azure and the reference for provider controllers; its provider is in its `internal/azurevm`.
   - `gantry` - sources for the gantry peer-to-peer OCI distribution agent.
   - `inventory` - sources for the inventory controller.
   - `kubectl-unbounded` - sources for the `kubectl unbounded` plugin (includes `net` subcommand).
@@ -27,6 +28,7 @@ unbounded-kube is organized into several directories:
   - `unroute` - eBPF route inspection utility.
 - `deploy/` - component manifests for deploying on a Kubernetes cluster.
   - `machina/` - machina controller manifest templates (*.yaml.tmpl) plus generated CRDs under `crd/`; rendered output lives under `machina/rendered/` (gitignored, produced by `make machina-manifests`).
+  - `machine-ops/` - machine-ops controller manifests plus the MachineClass and MachineAllocation RBAC and admission policies; rendered by `make machine-ops-manifests`.
   - `gantry/` - gantry DaemonSet, ConfigMap, and ServiceAccount manifests.
   - `karpenter/` - rendered Karpenter plugin manifests under `karpenter/rendered/` (gitignored, produced by `make karpenter-manifests`); the template lives in the plugin module.
   - `net/` - unbounded-net controller and node manifest templates (*.yaml.tmpl); rendered output lives under `net/rendered/` (gitignored, produced by `make net-manifests`).

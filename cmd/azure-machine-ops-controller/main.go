@@ -47,7 +47,6 @@ const (
 	controllerName    = "azure-machine-ops-controller"
 	scopeFallbackName = "scope"
 
-	errSiteProviderPair          = "--site and --provider must be set together"
 	errCapacityLeaderElection    = "--enable-capacity requires --leader-elect: the capacity controllers must run under a leader-election lease"
 	errConsumerKindsCapacity     = "--allocation-consumer-kind requires --enable-capacity"
 	errCapacityAPIServerEndpoint = "--enable-capacity requires --api-server-endpoint: allocated hosts bootstrap against it"
@@ -84,8 +83,8 @@ func newCommand(runController func(context.Context, config) error) *cobra.Comman
 	cmd.Flags().StringVar(&cfg.credentialSecretNamespace, "credential-secret-namespace", unbounded.SystemNamespace(), "Namespace containing MachineOperationCredential referenced Secrets")
 	cmd.Flags().IntVar(&cfg.maxConcurrentReconciles, "max-concurrent-reconciles", 10, "Maximum concurrent MachineOperation reconciles")
 	cmd.Flags().StringVar(&cfg.apiServerEndpoint, "api-server-endpoint", "", "Kubernetes API server endpoint used in host replacement bootstrap config")
-	cmd.Flags().StringVar(&cfg.siteName, "site", "", "Site name this controller should operate on")
-	cmd.Flags().StringVar(&cfg.providerName, "provider", "", "Provider name this controller should operate on")
+	cmd.Flags().StringVar(&cfg.siteName, "site", "", "Limit this controller to Machines of one Site. Deployments must not have overlapping scopes")
+	cmd.Flags().StringVar(&cfg.providerName, "provider", "", "Limit this controller to one of its providers. Deployments must not have overlapping scopes")
 	cmd.Flags().BoolVar(&cfg.experimentalContainerIsolation, "experimental-container-isolation", false,
 		"Enable the experimental container isolation mode for HostReplace: opt the replacement agent configuration in "+
 			"(Experimental.ContainerIsolation); without it a HostReplace of a Machine that declares spec.isolation container fails")
@@ -125,10 +124,6 @@ type config struct {
 
 func run(ctx context.Context, cfg config) error {
 	ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
-
-	if (cfg.siteName == "") != (cfg.providerName == "") {
-		return errors.New(errSiteProviderPair)
-	}
 
 	capacity, err := capacityOptions(cfg)
 	if err != nil {
@@ -330,8 +325,9 @@ func leaderElectionID(cfg config) string {
 		return controllerName
 	}
 
-	// Scoped controllers must not contend for the same lease. Each
-	// provider/site deployment needs its own active leader.
+	// Deployments with different scopes must not contend for the same lease:
+	// each needs its own active leader. The scope may name a provider, a
+	// Site, or both.
 	return controllerName + "-" + safeNamePart(cfg.providerName+"-"+cfg.siteName)
 }
 

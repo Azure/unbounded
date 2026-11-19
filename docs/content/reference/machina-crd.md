@@ -306,7 +306,7 @@ stops new starts: a node that is already running is not stopped.
 | Scope | Cluster |
 | Status subresource | Yes |
 
-`MachineOperation` is a job-like CR for discrete operations. The in-host agent handles Kubernetes node operations such as `NodeReboot` and agent operations such as `AgentReset`; `azure-machine-ops-controller` handles out-of-band VM operations such as Azure VM power actions. PXE/BMC operations remain owned by metalman for now.
+`MachineOperation` is a job-like CR for discrete operations. The in-host agent handles Kubernetes node operations such as `NodeReboot` and agent operations such as `AgentReset`; `azure-machine-ops-controller` handles out-of-band Azure VM operations such as power actions. PXE/BMC operations remain owned by metalman for now.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
