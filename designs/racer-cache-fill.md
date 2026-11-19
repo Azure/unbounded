@@ -212,12 +212,13 @@ Conditions:
 | `Listed` | The current generation has a manifest | `ListFailed`, `Forbidden` |
 | `Progressing` | The first fill has not completed | `Filling` |
 | `Ready` | Every page has its replica copies confirmed by the counted reports | `Complete` |
-| `Degraded` | The fill was Ready (or already Degraded) and is now short of copies | `MemberLost`, `Refilling`, `CapacityLost` |
+| `Degraded` | The fill was Ready (or already Degraded) and is now short of copies, or `spec.replicas` exceeds the cache pool's node count | `MemberLost`, `Refilling`, `CapacityLost` |
 
 `footprintBytes` is the planned reservation. `residentBytes` is the summed
-page-rounded payload of confirmed pins. `underReplicatedBytes` is the summed
-shortfall between the copies each node should pin and the copies it confirmed.
-A `Ready` fill has zero `underReplicatedBytes`.
+page-rounded payload of confirmed pins. `underReplicatedBytes` is the planned
+footprint minus confirmed resident bytes, so it counts missing nodes, node
+capacity refusals, and pages a worker has not visited yet. A `Ready` fill has
+zero `underReplicatedBytes`.
 
 `Degraded` does not mean reads fail. Reads fall back to peers and then the
 origin as usual; it means the reservation no longer holds at the requested

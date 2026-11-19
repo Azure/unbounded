@@ -303,8 +303,8 @@ The fill reports its place in the node cache in status:
 Conditions are `Accepted` (the cache is supported and the reservation fits),
 `Listed` (the current generation has a manifest), `Progressing` (the first
 fill is under way), `Ready` (every replica copy is confirmed), and `Degraded`
-(the fill is short of confirmed copies after being `Ready`, or a node refused
-pinned bytes).
+(the fill is short of confirmed copies after being `Ready`, a node refused
+pinned bytes, or `replicas` exceeds the cache pool's node count).
 A `Degraded` fill still serves reads from the pages it has and falls back to
 peers and the origin for the rest.
 
