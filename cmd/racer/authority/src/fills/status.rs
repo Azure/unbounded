@@ -299,7 +299,9 @@ fn condition(
 /// Primary-only: write status for changed fills. At most one PUT per pass, so
 /// the primary Lease renewal stays on schedule. `cursor` is the first fill to
 /// try next; it advances after every write attempt, so a fill whose status
-/// stays dirty cannot starve the rest.
+/// stays dirty cannot starve the rest. A fill whose live object has a
+/// different UID or generation than the snapshot is skipped: the snapshot
+/// describes an older object, so its status must not be written.
 pub async fn reconcile(shared: &Shared, cursor: &mut usize) {
     if shared.primary_term(rt::now()).is_none()
         || !shared.fills_synced.get()
@@ -335,6 +337,20 @@ pub async fn reconcile(shared: &Shared, cursor: &mut usize) {
                 return;
             }
         };
+        // The snapshot can outlive the object it was taken from: the fill may
+        // have been updated (new generation) or recreated (new UID) before
+        // this GET. The resourceVersion below belongs to the object just
+        // read, so a PUT would publish the stale snapshot's manifest,
+        // admission, and Ready=True onto the newer object. Only write the
+        // fill the snapshot actually describes; otherwise skip it.
+        if kube::str_at(&current, &["metadata", "uid"]) != view.uid.as_str()
+            || current
+                .pointer("/metadata/generation")
+                .and_then(Value::as_u64)
+                != Some(view.generation)
+        {
+            continue;
+        }
         let resource_version = kube::str_at(&current, &["metadata", "resourceVersion"]).to_owned();
         if resource_version.is_empty() {
             continue;
@@ -724,13 +740,20 @@ mod tests {
             shared.fills_synced.set(true);
             shared.fills_caches_synced.set(true);
             for name in ["fill-a", "fill-b"] {
-                api.put_object(
-                    &paths::cluster_cache_fill(name),
-                    json!({"metadata": {"name": name}, "spec": {"cacheName": "models"}}),
-                );
                 let mut v = view();
                 v.name = name.into();
                 v.uid = format!("{name}-uid");
+                api.put_object(
+                    &paths::cluster_cache_fill(name),
+                    json!({
+                        "metadata": {
+                            "name": name,
+                            "uid": v.uid,
+                            "generation": v.generation,
+                        },
+                        "spec": {"cacheName": "models"},
+                    }),
+                );
                 shared.fills.borrow_mut().insert(v.uid.clone(), v);
             }
 
@@ -757,6 +780,96 @@ mod tests {
                 .collect();
             assert_eq!(second.len(), 1);
             assert!(second[0].ends_with("/fill-b/status"), "{second:?}");
+            assert_eq!(cursor, 0);
+        });
+    }
+
+    #[test]
+    fn stale_snapshot_is_not_written_onto_a_newer_fill() {
+        crate::kube::fake::run(|api, kube| async move {
+            let shared = crate::shared::tests::shared(kube);
+            shared.is_primary.set(true);
+            *shared.term.borrow_mut() = Some((
+                crate::rules::state::Term {
+                    lease_uid: "lease".into(),
+                    transitions: 1,
+                    holder: "p1/00".into(),
+                },
+                crate::rules::state::Freshness::confirmed(rt::now(), Duration::from_secs(3600)),
+            ));
+            shared.fills_synced.set(true);
+            shared.fills_caches_synced.set(true);
+
+            let mut v = view();
+            v.name = "fill".into();
+            v.uid = "old-uid".into();
+            let path = paths::cluster_cache_fill("fill");
+            shared.fills.borrow_mut().insert(v.uid.clone(), v.clone());
+
+            // The live object was recreated under the same name: new UID.
+            api.put_object(
+                &path,
+                json!({
+                    "metadata": {
+                        "name": "fill",
+                        "uid": "new-uid",
+                        "generation": v.generation,
+                    },
+                    "spec": {"cacheName": "models"},
+                }),
+            );
+            let mut cursor = 0;
+            let start = api.requests().len();
+            reconcile(&shared, &mut cursor).await;
+            assert!(
+                api.requests()[start..].iter().all(|(m, _)| m == "GET"),
+                "a stale UID must not be written"
+            );
+            assert_eq!(cursor, 0);
+
+            // Same UID but a newer generation is stale too.
+            api.put_object(
+                &path,
+                json!({
+                    "metadata": {
+                        "name": "fill",
+                        "uid": v.uid,
+                        "generation": v.generation + 1,
+                    },
+                    "spec": {"cacheName": "models"},
+                }),
+            );
+            let start = api.requests().len();
+            reconcile(&shared, &mut cursor).await;
+            assert!(
+                api.requests()[start..].iter().all(|(m, _)| m == "GET"),
+                "a newer generation must not be written"
+            );
+            assert_eq!(cursor, 0);
+
+            // The matching object is written, so the guard does not block the
+            // normal path. The fake has no status subresource, so the PUT
+            // itself fails with 404 after being sent.
+            api.put_object(
+                &path,
+                json!({
+                    "metadata": {
+                        "name": "fill",
+                        "uid": v.uid,
+                        "generation": v.generation,
+                    },
+                    "spec": {"cacheName": "models"},
+                }),
+            );
+            let start = api.requests().len();
+            reconcile(&shared, &mut cursor).await;
+            let writes: Vec<_> = api.requests()[start..]
+                .iter()
+                .filter(|(method, _)| method == "PUT")
+                .map(|(_, path)| path.clone())
+                .collect();
+            assert_eq!(writes.len(), 1, "{writes:?}");
+            assert!(writes[0].ends_with("/fill/status"), "{writes:?}");
             assert_eq!(cursor, 0);
         });
     }
