@@ -469,33 +469,62 @@ impl Index {
         if members.is_empty() {
             return Ok(super::pins::PinEpoch(state.pages.last_hold_id()));
         }
-        // Pinned segments have their own cap, and pins must leave the shared
-        // free reserve intact. A segment holds many pages, so this admits a
-        // reservation as soon as one pinned segment of headroom remains.
-        let pinned_segments = segments.pinned_count();
-        if pins.percent == 0
-            || pinned_segments > segments.count() * pins.percent / 100
-            || segments.count().saturating_sub(pinned_segments) <= free_reserve
-        {
-            return Err(Error::Overloaded);
-        }
         let mut page = PageId {
             version: version.clone(),
             number: crate::model::PageNumber(0),
         };
         let mut joining = Vec::new();
         let mut joining_unused = 0;
+        // Resident pages that would newly count their segment against the pin
+        // budget, and whether any joining page still needs an append.
+        let mut resident_segments = HashSet::default();
+        let mut needs_new_segment = false;
         for number in members.iter() {
             page.number = number;
-            if let Some(location) = state.pages.location(&page) {
+            let location = state.pages.location(&page);
+            if let Some(location) = &location {
                 segments
                     .validate(location.segment, location.generation, &location.extent)
                     .map_err(|_| Error::Overloaded)?;
             }
             if old.is_none_or(|pin| !pin.holders.contains_key(&number)) {
                 joining_unused += usize::from(!state.pages.occupied(&page));
+                match location {
+                    Some(location) if !segments.pinned(location.segment).unwrap_or(false) => {
+                        resident_segments.insert(location.segment);
+                    }
+                    None => needs_new_segment = true,
+                    Some(_) => {}
+                }
                 joining.push(page.clone());
             }
+        }
+        // Pin membership may use its own share of the page index, and a new
+        // reservation must leave a pinned segment of allocation headroom.
+        let page_limit = self.page_capacity.get() * pins.percent / 100;
+        if pins.percent == 0
+            || pins
+                .members
+                .checked_add(joining.len())
+                .ok_or(Error::Overloaded)?
+                > page_limit
+        {
+            return Err(Error::Overloaded);
+        }
+        let free_reserve = free_reserve.max(1);
+        let segment_limit = (segments.count() * pins.percent / 100)
+            .min(segments.count().saturating_sub(free_reserve));
+        let mut projected = segments
+            .pinned_count()
+            .saturating_add(resident_segments.len());
+        if needs_new_segment {
+            // A joining page that is not resident may claim a new pinned
+            // segment. Reserve that headroom rather than admitting equality
+            // with the cap and overshooting on the later append.
+            projected = projected.saturating_add(1);
+        }
+        if !joining.is_empty() && projected > segment_limit {
+            return Err(Error::Overloaded);
         }
         // Hard page-slot and index-entry capacity, shared with spill holds.
         if state.pages.len() + self.reserved.get() + state.pages.holds_unused() + joining_unused
@@ -570,6 +599,9 @@ impl Index {
         }
         for segment in counted.into_iter().flatten() {
             *pins.segment_pages.entry(segment).or_insert(0) += 1;
+            // A resident page pins its existing segment immediately, so the
+            // budget sees the same segments a stored pinned page would charge.
+            let _ = segments.pin_segment(segment);
         }
         Ok(epoch)
     }
@@ -2386,6 +2418,108 @@ mod tests {
             .reclaim_now()
             .unwrap();
         assert!(index.lookup(&page).unwrap().is_none());
+    }
+
+    /// Pinning a resident page charges its ordinary segment against the pin
+    /// budget immediately and releases it with the last holder.
+    #[test]
+    fn resident_pin_charges_its_segment() {
+        use super::super::pins::FillId;
+        let env = racer_io::Env::host();
+        let segments = Rc::new(segments(1024, 4));
+        let index = Rc::new(index(&env, 8));
+        index.set_page_capacity(4).unwrap();
+        index.set_pin_capacity_percent(100).unwrap();
+        let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
+        let (page, entry) = indexed(descriptor("warm", 17), 0);
+        let segment = entry.location.segment;
+        drop(segments.append(1024).unwrap());
+        index.publish(page.clone(), entry).unwrap();
+        assert!(!segments.pinned(segment).unwrap());
+        let until = racer_io::Clock::host().wall_now() + std::time::Duration::from_secs(60);
+        let epoch = index
+            .reserve_pin_pages(FillId(1), &page.version, &page_set(&[0]), until)
+            .unwrap();
+        assert!(segments.pinned(segment).unwrap());
+        assert_eq!(segments.pinned_count(), 1);
+        assert!(!index.can_evict(segment));
+        index.release_pin_pages(FillId(1), &page.version, &page_set(&[0]), epoch);
+        assert!(!segments.pinned(segment).unwrap());
+        assert_eq!(segments.pinned_count(), 0);
+        assert!(index.can_evict(segment));
+    }
+
+    /// Pin membership cannot exceed its percentage of the page index, even
+    /// when every page is only reserved and not yet stored.
+    #[test]
+    fn pin_membership_respects_the_page_index_percentage() {
+        use super::super::pins::FillId;
+        let env = racer_io::Env::host();
+        let segments = Rc::new(segments(1024, 8));
+        let index = Rc::new(index(&env, 8));
+        index.set_page_capacity(4).unwrap();
+        index.set_pin_capacity_percent(50).unwrap();
+        let _clock = SegmentClock::new(index.clone(), segments, 1);
+        let version = descriptor("pin", 17).version;
+        let until = racer_io::Clock::host().wall_now() + std::time::Duration::from_secs(60);
+        // Half of four page slots admits two members.
+        let first = index
+            .reserve_pin_pages(FillId(1), &version, &page_set(&[0]), until)
+            .unwrap();
+        let second = index
+            .reserve_pin_pages(FillId(1), &version, &page_set(&[1]), until)
+            .unwrap();
+        assert_eq!(
+            index.reserve_pin_pages(FillId(1), &version, &page_set(&[2]), until),
+            Err(Error::Overloaded)
+        );
+        index.release_pin_pages(FillId(1), &version, &page_set(&[0]), first);
+        index.release_pin_pages(FillId(1), &version, &page_set(&[1]), second);
+        // Room returns when the budget is released.
+        index
+            .reserve_pin_pages(FillId(1), &version, &page_set(&[2]), until)
+            .unwrap();
+    }
+
+    /// At the pinned segment cap, a reservation that needs another segment is
+    /// rejected, while a renewal that adds none still succeeds.
+    #[test]
+    fn pin_admission_reserves_segment_headroom() {
+        use super::super::pins::FillId;
+        let env = racer_io::Env::host();
+        let segments = Rc::new(segments(1024, 4));
+        let index = Rc::new(index(&env, 8));
+        index.set_page_capacity(8).unwrap();
+        index.set_pin_capacity_percent(50).unwrap();
+        let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
+        let until = racer_io::Clock::host().wall_now() + std::time::Duration::from_secs(60);
+        let (a, a_entry) = indexed(descriptor("a", 17), 0);
+        let (b, b_entry) = indexed(descriptor("b", 17), 1);
+        drop(segments.append(1024).unwrap());
+        drop(segments.append(1024).unwrap());
+        index.publish(a.clone(), a_entry).unwrap();
+        index.publish(b.clone(), b_entry).unwrap();
+        // Two of four segments is the configured cap.
+        let a_epoch = index
+            .reserve_pin_pages(FillId(1), &a.version, &page_set(&[0]), until)
+            .unwrap();
+        let b_epoch = index
+            .reserve_pin_pages(FillId(2), &b.version, &page_set(&[0]), until)
+            .unwrap();
+        assert_eq!(segments.pinned_count(), 2);
+        let missing = descriptor("missing", 17).version;
+        assert_eq!(
+            index.reserve_pin_pages(FillId(3), &missing, &page_set(&[0]), until),
+            Err(Error::Overloaded)
+        );
+        // Renewals need no new segment and still fit at the cap.
+        index.renew_pin(FillId(1), &a.version, until).unwrap();
+        index.release_pin_pages(FillId(1), &a.version, &page_set(&[0]), a_epoch);
+        assert_eq!(segments.pinned_count(), 1);
+        index
+            .reserve_pin_pages(FillId(3), &missing, &page_set(&[0]), until)
+            .unwrap();
+        index.release_pin_pages(FillId(2), &b.version, &page_set(&[0]), b_epoch);
     }
 
     #[test]
