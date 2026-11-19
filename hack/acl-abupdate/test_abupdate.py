@@ -17,9 +17,9 @@ import sys
 import tarfile
 import tempfile
 import unittest
+import unittest.mock
 import urllib.parse
 from pathlib import Path
-from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import abupdate  # noqa: E402
@@ -268,7 +268,7 @@ class SeedTest(unittest.TestCase):
     def test_seed_digest(self) -> None:
         digest = abupdate.seed_digest()
         self.assertEqual(abupdate.seed_digest(), digest)
-        with mock.patch.object(abupdate, "DEFAULT_HOSTNAME", "changed"):
+        with unittest.mock.patch.object(abupdate, "DEFAULT_HOSTNAME", "changed"):
             self.assertNotEqual(abupdate.seed_digest(), digest)
 
 
@@ -356,7 +356,7 @@ class BookkeepingTest(unittest.TestCase):
         # Another harness's seed, sharing the cache, gets its own install rather than replacing this one.
         here = abupdate.install_dir("20261105.1")
         self.assertTrue(here.name.startswith("20261105.1-"))
-        with mock.patch.object(abupdate, "DEFAULT_HOSTNAME", "changed"):
+        with unittest.mock.patch.object(abupdate, "DEFAULT_HOSTNAME", "changed"):
             self.assertNotEqual(abupdate.install_dir("20261105.1"), here)
         with tempfile.TemporaryDirectory() as directory:
             installed = Path(directory)
@@ -516,8 +516,8 @@ class BuildTest(unittest.TestCase):
         (builds / "hello.work").mkdir()
         (self.directory / "victim.work").mkdir()
         parser = abupdate.build_parser()
-        with mock.patch.object(abupdate.cosibuild, "reclaim"), \
-                mock.patch.object(abupdate, "STATE_FILE", self.directory / "no-state.json"):
+        with unittest.mock.patch.object(abupdate.cosibuild, "reclaim"), \
+                unittest.mock.patch.object(abupdate, "STATE_FILE", self.directory / "no-state.json"):
             abupdate.image_delete(parser.parse_args(["image", "delete", "hello"]))
             self.assertEqual(list(builds.iterdir()), [])
             with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):

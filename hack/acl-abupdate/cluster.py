@@ -49,7 +49,8 @@ _PRIVATE_KEY = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]
 
 class Runner(Protocol):
     def __call__(self, cmd: list[str], *, input: str | None = None, timeout: float | None = None,
-                 stream: bool = False) -> subprocess.CompletedProcess[str]: ...
+                 stream: bool = False) -> subprocess.CompletedProcess[str]:
+        """Run a host command, with its output as text, or shown as it runs, and none kept, if stream."""
 
 
 # ---------------------------------------------------------------------------------------------

@@ -1233,7 +1233,6 @@ def cmd_run(args: argparse.Namespace) -> None:
 
 
 def cmd_test(args: argparse.Namespace) -> None:
-    code = 1
     try:
         cmd_up(args)
         code = run_scenarios(list(SCENARIOS))

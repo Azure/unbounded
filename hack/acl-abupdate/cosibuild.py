@@ -281,6 +281,8 @@ def decompressed(tar: tarfile.TarFile, member: tarfile.TarInfo) -> Iterator[byte
         try:
             shutil.copyfileobj(source, process.stdin, CHUNK)
         except BrokenPipeError:
+            # zstd stopped reading because it failed; its exit status and stderr, checked
+            # once its output ends, say why.
             pass
         finally:
             process.stdin.close()
