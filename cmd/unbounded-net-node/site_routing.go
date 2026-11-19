@@ -193,11 +193,34 @@ func excludeLocalSupernets(supernets map[string]bool, meshPeers []meshPeerInfo, 
 }
 
 func gatewayBPFPrefixes(peer gatewayPeerInfo, localCIDRs []netip.Prefix) []string {
-	cidrs := append([]string(nil), peer.PodCIDRs...)
-	cidrs = append(cidrs, peer.RoutedCidrs...)
-	cidrs = append(cidrs, ipsToHostCIDRs(peer.InternalIPs)...)
+	prefixes := append([]string(nil), peer.RoutedCidrs...)
+	// Pin an advertised gateway host to that gateway instead of another ECMP
+	// member, but never invent reachability from gateway identity alone.
+	for _, value := range peer.InternalIPs {
+		ip, err := netip.ParseAddr(value)
+		if err != nil {
+			continue
+		}
 
-	return excludeLocalCIDRs(cidrs, localCIDRs)
+		ip = ip.Unmap()
+
+		for _, cidr := range peer.RoutedCidrs {
+			prefix, err := parseRoutingPrefix(cidr)
+			if err == nil && prefix.Contains(ip) {
+				prefixes = append(prefixes, netip.PrefixFrom(ip, ip.BitLen()).String())
+				break
+			}
+		}
+	}
+
+	// Health endpoints are host-only control paths, not pod transit ownership.
+	prefixes = append(prefixes, gatewayHealthPrefixes(peer)...)
+
+	return excludeLocalCIDRs(prefixes, localCIDRs)
+}
+
+func gatewayHealthPrefixes(peer gatewayPeerInfo) []string {
+	return ipsToHostCIDRs(getHealthIPsFromPodCIDRs(peer.PodCIDRs))
 }
 
 func subtractLocalPrefix(prefix, local netip.Prefix) []netip.Prefix {

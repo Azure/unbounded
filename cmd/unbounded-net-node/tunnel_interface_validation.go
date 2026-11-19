@@ -20,7 +20,7 @@ const maxLinuxIfNameLen = 15
 //   - Names are pairwise distinct (the eBPF dataplane creates one device
 //     per protocol; reusing the same name across protocols would have the
 //     second creation collide with the first).
-//   - No name collides with the agent's eBPF dummy device unbounded0DeviceName.
+//   - No name collides with the agent's reserved eBPF dummy devices.
 //
 // Returning a non-nil error here aborts startup; the caller is expected to
 // surface the message via os.Exit / log.Fatal.
@@ -40,8 +40,8 @@ func validateTunnelInterfaceNames(geneve, vxlan, ipip string) error {
 			return fmt.Errorf("--%s %q is too long: kernel limit is %d bytes", flag, name, maxLinuxIfNameLen)
 		}
 
-		if name == unbounded0DeviceName {
-			return fmt.Errorf("--%s %q collides with the agent's reserved device name %q", flag, name, unbounded0DeviceName)
+		if name == unbounded0DeviceName || name == assignmentReturnDeviceName {
+			return fmt.Errorf("--%s %q collides with the agent's reserved device name %q", flag, name, name)
 		}
 	}
 

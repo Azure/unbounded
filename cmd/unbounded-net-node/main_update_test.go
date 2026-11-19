@@ -250,7 +250,7 @@ func TestUpdateWireGuardFromSlices_SitePodCIDRPoolChanges(t *testing.T) {
 }
 
 // TestUpdateWireGuardFromSlices_GatewayMeshPeersUseOnlyDirectConnectedSites tests UpdateWireGuardFromSlices_GatewayMeshPeersUseOnlyDirectConnectedSites.
-func TestUpdateWireGuardFromSlices_GatewayMeshPeersUseOnlyDirectConnectedSites(t *testing.T) {
+func TestUpdateWireGuardFromSlices_GatewayMeshPeersIncludeSiteMeshAndAssignmentDownlinks(t *testing.T) {
 	mySiteName := "site2"
 	myPubKey := "pub-self"
 
@@ -353,12 +353,12 @@ func TestUpdateWireGuardFromSlices_GatewayMeshPeersUseOnlyDirectConnectedSites(t
 		peerNames[peer.Name] = true
 	}
 
-	if !peerNames["worker-direct"] {
+	if !peerNames["worker-direct/assignment/site2extgw1"] {
 		t.Fatalf("expected direct connected site worker to be included, got peers %#v", gotPeers)
 	}
 
-	if peerNames["worker-transitive"] {
-		t.Fatalf("did not expect transitive-only site worker to be included, got peers %#v", gotPeers)
+	if !peerNames["worker-transitive"] || peerNames["worker-transitive/assignment/site2extgw1"] {
+		t.Fatalf("mesh-peered worker must retain its direct mesh without an unassigned transit downlink, got peers %#v", gotPeers)
 	}
 }
 
@@ -458,11 +458,11 @@ func TestUpdateWireGuardFromSlices_ExternalGatewayIncludesAssignedNonDirectSites
 		peerNames[peer.Name] = true
 	}
 
-	if !peerNames["worker-direct"] {
+	if !peerNames["worker-direct/assignment/site2extgw1"] {
 		t.Fatalf("expected direct connected site worker to be included, got peers %#v", gotPeers)
 	}
 
-	if !peerNames["worker-remote-assigned"] {
+	if !peerNames["worker-remote-assigned/assignment/site2extgw1"] {
 		t.Fatalf("expected assigned non-direct site worker to be included for external pool, got peers %#v", gotPeers)
 	}
 }
@@ -937,7 +937,7 @@ func TestUpdateWireGuardFromSlices_UnmanagedSiteGatewayWithoutPodCIDRIsTunnelRea
 		peers[peer.Name] = peer
 	}
 
-	unmanagedGW, ok := peers["gw-unmanaged"]
+	unmanagedGW, ok := peers["gw-unmanaged/transit/pool-cluster"]
 	if !ok {
 		t.Fatalf("expected gateway peer gw-unmanaged, got %#v", gotGatewayPeers)
 	}
@@ -951,11 +951,11 @@ func TestUpdateWireGuardFromSlices_UnmanagedSiteGatewayWithoutPodCIDRIsTunnelRea
 	}
 
 	prefixes := gatewayBPFPrefixes(unmanagedGW, nil)
-	if !slices.Contains(prefixes, "10.224.0.0/16") || !slices.Contains(prefixes, "10.1.0.20/32") {
-		t.Fatalf("expected routed CIDR and gateway host CIDR in BPF prefixes, got %v", prefixes)
+	if !slices.Contains(prefixes, "10.224.0.0/16") || slices.Contains(prefixes, "10.1.0.20/32") {
+		t.Fatalf("only advertised transit prefixes should be added, got %v", prefixes)
 	}
 
-	managedGW, ok := peers["gw-managed-pending"]
+	managedGW, ok := peers["gw-managed-pending/transit/pool-cluster"]
 	if !ok {
 		t.Fatalf("expected gateway peer gw-managed-pending, got %#v", gotGatewayPeers)
 	}

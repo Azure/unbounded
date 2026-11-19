@@ -103,6 +103,53 @@ func TestCriticalStatusIgnoresOnlyMeasurements(t *testing.T) {
 	}
 }
 
+func TestCriticalStatusPreservesRelationshipMeasurements(t *testing.T) {
+	t.Parallel()
+
+	for _, protocol := range []string{"VXLAN", "GENEVE"} {
+		t.Run(protocol, func(t *testing.T) {
+			prev, curr := measuredNodeStatus(), measuredNodeStatus()
+			base := prev.Peers[0]
+			prev.Peers, curr.Peers = nil, nil
+
+			for i, id := range []string{"worker", "worker/assignment/pool", ""} {
+				old := base
+
+				old.Name, old.PeerID = "worker", id
+				if id == "" {
+					old.Name = "legacy-worker"
+				}
+
+				old.Tunnel.Protocol, old.Tunnel.Interface, old.Tunnel.PublicKey = protocol, "shared0", ""
+				old.Tunnel.RxBytes = int64(10 * (i + 1))
+				old.HealthCheck = &HealthCheckPeerStatus{Enabled: true, Status: "up", RTT: fmt.Sprintf("%dms", i+1), Uptime: fmt.Sprintf("%dm", i+1)}
+				prev.Peers = append(prev.Peers, old)
+				next := old
+				next.Tunnel.RxBytes += 100
+				next.HealthCheck = &HealthCheckPeerStatus{Enabled: true, Status: "down", RTT: "99ms", Uptime: "99m"}
+				curr.Peers = append(curr.Peers, next)
+			}
+
+			slices.Reverse(curr.Peers)
+			before := nodeStatusToProto(curr)
+
+			published := criticalStatus(prev, curr)
+			for i, peer := range published.Peers {
+				old := prev.Peers[len(prev.Peers)-1-i]
+				if peer.Tunnel.RxBytes != old.Tunnel.RxBytes ||
+					peer.HealthCheck.RTT != old.HealthCheck.RTT || peer.HealthCheck.Uptime != old.HealthCheck.Uptime ||
+					peer.HealthCheck.Status != "down" {
+					t.Fatalf("relationship %q inherited other measurements: %+v", peer.PeerID, peer)
+				}
+			}
+
+			if !proto.Equal(before, nodeStatusToProto(curr)) {
+				t.Fatal("critical update mutated the current snapshot")
+			}
+		})
+	}
+}
+
 func TestTypedStatusDeltaCompactCompatibility(t *testing.T) {
 	prev, curr := measuredNodeStatus(), measuredNodeStatus()
 	curr.Peers[0].Tunnel.RxBytes = 0

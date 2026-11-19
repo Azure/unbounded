@@ -18,6 +18,59 @@ import (
 	"github.com/Azure/unbounded/internal/net/routeplan"
 )
 
+func meshWireGuardAllowedIPs(peer meshPeerInfo) []string {
+	allowedIPs := make([]string, 0, len(peer.PodCIDRs)+len(peer.InternalIPs))
+	for _, cidr := range peer.PodCIDRs {
+		if normalized := routeplan.NormalizeCIDR(cidr); normalized != "" {
+			allowedIPs = append(allowedIPs, normalized)
+		}
+	}
+
+	// AllowedIPs authorizes sources without installing underlay routes.
+	// Node services reply to pods using their node IPs.
+	allowedIPs = append(allowedIPs, ipsToHostCIDRs(peer.InternalIPs)...)
+
+	return dedupeStrings(allowedIPs)
+}
+
+func (state *wireGuardState) gatewayWireGuardManager(iface string) *unboundednetnetlink.WireGuardManager {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	return state.gatewayWireguardManagers[iface]
+}
+
+func (state *wireGuardState) storeGatewayWireGuardManager(iface string, manager *unboundednetnetlink.WireGuardManager) {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	if state.gatewayWireguardManagers == nil {
+		state.gatewayWireguardManagers = make(map[string]*unboundednetnetlink.WireGuardManager)
+	}
+
+	state.gatewayWireguardManagers[iface] = manager
+}
+
+func (state *wireGuardState) clearGatewayPeerMetadataLocked(iface string) {
+	delete(state.gatewayNames, iface)
+	delete(state.gatewaySiteNames, iface)
+	delete(state.gatewayHealthEndpoints, iface)
+	delete(state.gatewayRoutes, iface)
+	delete(state.gatewayRouteDistances, iface)
+	delete(state.gatewaySiteCIDRs, iface)
+	delete(state.gatewayPodCIDRs, iface)
+	delete(state.gatewayPeerHealthCheckEnabled, iface)
+}
+
+func (state *wireGuardState) removeGatewayInterfaceState(iface string) {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	delete(state.gatewayLinkManagers, iface)
+	delete(state.gatewayWireguardManagers, iface)
+	state.clearGatewayPeerMetadataLocked(iface)
+}
+
 // configureWireGuard sets up WireGuard interfaces and configures peers
 // - wg<port>: Main mesh interface for all mesh peers (intra-site, remote, same-pool gateways)
 // - wg<gwPort>: Separate interfaces for each gateway peer (for ECMP routing)
@@ -81,6 +134,14 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 	}
 
 	// === Configure main mesh interface ===
+	returnPrefixes := assignmentReturnPrefixes(state.pendingAssignmentBPFEntries, peers)
+
+	returnRoutes, err := prepareAssignmentReturnRoutes(cfg, state, returnPrefixes, tunnelMTU)
+	if err != nil {
+		return err
+	}
+
+	additionalRoutes = append(additionalRoutes, returnRoutes...)
 
 	// If there are no WireGuard peers, remove the mesh interface and flush
 	// routes. The informer sync guard in reconcileUpdate ensures we only
@@ -167,22 +228,20 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 	// Endpoint selection is driven by SiteName:
 	//   - Peered site (including same site): endpoint = InternalIPs[0]
 	//   - Non-peered site: endpoint = "" (peer initiates connection to gateways)
-	// Port selection: when this node is a gateway, non-gateway mesh peers have a
-	// dedicated gateway interface (wg<gwPort>) listening on this gateway's assigned
-	// port, so the endpoint port must be myGatewayPort for those peers. Other
-	// gateway peers use the standard mesh port since they communicate via wg51820.
 	wgPeerByPublicKey := make(map[string]unboundednetnetlink.WireGuardPeer, len(peers))
+	assignmentWGPeers := make(map[int][]unboundednetnetlink.WireGuardPeer)
 
 	for _, peer := range peers {
 		if peer.WireGuardPublicKey == "" {
 			continue
 		}
 
-		// Choose endpoint port: gateway nodes use their assigned port for
-		// non-gateway peers; standard mesh port for other gateways.
 		peerEndpointPort := port
-		if isGatewayNode && myGatewayPort != 0 && !gatewayNodePubKeys[peer.WireGuardPublicKey] {
-			peerEndpointPort = int(myGatewayPort)
+		if peer.TransitPoolName != "" {
+			peerEndpointPort = int(peer.TransitWireguardPort)
+			if peerEndpointPort == 0 {
+				return fmt.Errorf("assignment peer %s has no transit WireGuard port", peer.Name)
+			}
 		}
 
 		var endpoint string
@@ -195,30 +254,14 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 		}
 		// Non-peered sites: no endpoint, WireGuard learns it from incoming packets
 
-		normalizedPeerPodCIDRs := make([]string, 0, len(peer.PodCIDRs))
-		for _, podCIDR := range peer.PodCIDRs {
-			normalizedCIDR := routeplan.NormalizeCIDR(podCIDR)
-			if normalizedCIDR == "" {
-				continue
-			}
-
-			normalizedPeerPodCIDRs = append(normalizedPeerPodCIDRs, normalizedCIDR)
-		}
-
-		// AllowedIPs policy on mesh interface:
-		// - Always include peer podCIDRs.
-		// - Include peer internal IP host routes only for non-peered sites.
-		//   Same-site and directly peered-site nodes are directly reachable, so
-		//   internal host /32-/128 prefixes are intentionally excluded.
-		allowedIPs := append([]string{}, normalizedPeerPodCIDRs...)
-		if !peeredSites[peer.SiteName] {
-			allowedIPs = append(allowedIPs, ipsToHostCIDRs(peer.InternalIPs)...)
-		}
-
 		desiredPeer := unboundednetnetlink.WireGuardPeer{
 			PublicKey:  peer.WireGuardPublicKey,
 			Endpoint:   endpoint,
-			AllowedIPs: dedupeStrings(allowedIPs),
+			AllowedIPs: meshWireGuardAllowedIPs(peer),
+		}
+		if peer.TransitPoolName != "" {
+			assignmentWGPeers[peerEndpointPort] = append(assignmentWGPeers[peerEndpointPort], desiredPeer)
+			continue
 		}
 
 		if existingPeer, exists := wgPeerByPublicKey[peer.WireGuardPublicKey]; exists {
@@ -299,6 +342,7 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 	// === Configure separate gateway interfaces for gateway peers ===
 
 	// Initialize gateway interface maps if needed
+	state.mu.Lock()
 	if state.gatewayLinkManagers == nil {
 		state.gatewayLinkManagers = make(map[string]*unboundednetnetlink.LinkManager)
 	}
@@ -326,6 +370,7 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 	if state.gatewayPodCIDRs == nil {
 		state.gatewayPodCIDRs = make(map[string][]string)
 	}
+	state.mu.Unlock()
 
 	// Initialize gateway policy manager if unavailable.
 	if state.gatewayPolicyManager == nil {
@@ -369,11 +414,14 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 		}
 
 		// Get or create link manager for this gateway interface
+		state.mu.Lock()
+
 		gwLinkManager, exists := state.gatewayLinkManagers[gwIfaceName]
 		if !exists {
 			gwLinkManager = unboundednetnetlink.NewLinkManager(gwIfaceName)
 			state.gatewayLinkManagers[gwIfaceName] = gwLinkManager
 		}
+		state.mu.Unlock()
 
 		// Ensure gateway interface exists
 		if err := gwLinkManager.EnsureWireGuardInterface(); err != nil {
@@ -393,8 +441,8 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 		}
 
 		// Get or create WireGuard manager for this gateway interface
-		gwWgManager, exists := state.gatewayWireguardManagers[gwIfaceName]
-		if !exists {
+		gwWgManager := state.gatewayWireGuardManager(gwIfaceName)
+		if gwWgManager == nil {
 			var err error
 
 			gwWgManager, err = unboundednetnetlink.NewWireGuardManager(gwIfaceName)
@@ -403,7 +451,7 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 				continue
 			}
 
-			state.gatewayWireguardManagers[gwIfaceName] = gwWgManager
+			state.storeGatewayWireGuardManager(gwIfaceName, gwWgManager)
 		}
 
 		// Build endpoint using three-way site-based rule:
@@ -414,9 +462,8 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 		// Port selection:
 		//   Gateway-to-gateway: crossover -- endpoint port is our own gateway port
 		//     (the remote gateway's interface for us listens on our GatewayWireguardPort).
-		//   Non-gateway to gateway: use the standard mesh port. The non-gateway node's
-		//     gateway interface (wg<gwPort>) sends to the gateway's mesh interface,
-		//     which has the non-gateway node as a peer.
+		//   Worker to gateway: use the assigned transit port on both ends,
+		//     independently of the ordinary mesh interface.
 		var (
 			endpoint     string
 			endpointPort int32
@@ -426,8 +473,7 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 			// Gateway-to-gateway: crossover -- endpoint port is our own gateway port
 			endpointPort = myGatewayPort
 		} else {
-			// Non-gateway to gateway: connect to the gateway's mesh interface (default port)
-			endpointPort = int32(port)
+			endpointPort = gwPeer.GatewayWireguardPort
 		}
 
 		if gwPeer.SiteName == mySiteName {
@@ -453,20 +499,17 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 			klog.V(3).Infof("Gateway %s is in different site (%s), internal pool, no endpoint (WireGuard learns)", gwPeer.Name, gwPeer.SiteName)
 		}
 
-		// Build allowed IPs from routed CIDRs plus the gateway node's own podCIDRs.
-		// Including podCIDRs ensures packets destined to the gateway node's pod ranges
-		// are accepted on this peer even when routed supernets are narrowed,
-		// except for destinations explicitly excluded by the local Site.
-		allowedIPs := pruneCoveredAllowedCIDRs(excludeLocalCIDRs(
-			append(append([]string{}, gwPeer.RoutedCidrs...), gwPeer.PodCIDRs...), state.siteRouting.localCIDRs))
+		// Source authorization must not restore loop-prone transit destinations.
+		allowedIPs := pruneCoveredAllowedCIDRs(append(gatewayBPFPrefixes(gwPeer, state.siteRouting.localCIDRs), gwPeer.SourceCIDRs...))
 
-		// Configure this gateway interface with a single peer
-		// No PersistentKeepalive needed - we rely on health checks for connectivity monitoring
+		// ECMP can send routed health probes over a different gateway. Keep each
+		// direct WireGuard link active so NAT-only gateways establish endpoints.
 		gwPeersCfg := []unboundednetnetlink.WireGuardPeer{
 			{
-				PublicKey:  gwPeer.WireGuardPublicKey,
-				Endpoint:   endpoint,
-				AllowedIPs: allowedIPs,
+				PublicKey:           gwPeer.WireGuardPublicKey,
+				Endpoint:            endpoint,
+				AllowedIPs:          allowedIPs,
+				PersistentKeepalive: 25,
 			},
 		}
 
@@ -505,6 +548,7 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 			}
 		}
 
+		state.mu.Lock()
 		prevName, hadPrevName := state.gatewayNames[gwIfaceName]
 		prevSiteName := state.gatewaySiteNames[gwIfaceName]
 		prevRoutedCIDRs := state.gatewaySiteCIDRs[gwIfaceName]
@@ -532,10 +576,11 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 		state.gatewaySiteNames[gwIfaceName] = gwPeer.SiteName
 
 		// Store routes for tracking
-		state.gatewayRoutes[gwIfaceName] = gwPeer.PodCIDRs // Gateway-specific routes
+		state.gatewayRoutes[gwIfaceName] = nil
 		state.gatewayRouteDistances[gwIfaceName] = copyStringIntMap(gwPeer.RouteDistances)
 		state.gatewaySiteCIDRs[gwIfaceName] = gwPeer.RoutedCidrs // Shared routed CIDRs
 		state.gatewayPodCIDRs[gwIfaceName] = gwPeer.PodCIDRs     // Specific gateway podCIDRs
+		state.mu.Unlock()
 
 		if gatewayIfaceChanged {
 			klog.V(4).Infof("Configured gateway interface %s with peer %s (%s)",
@@ -543,9 +588,20 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 		}
 	}
 
+	for assignmentPort, assignmentPeers := range assignmentWGPeers {
+		assignmentIface := wireGuardInterfaceName(cfg, assignmentPort)
+		desiredGatewayIfaces[assignmentIface] = true
+
+		desiredGatewayPolicyTables[assignmentIface] = assignmentPort
+		if err := configureAssignmentWireGuard(cfg, state, assignmentIface, assignmentPort, privKey, assignmentPeers, wgAddresses, tunnelMTU); err != nil {
+			return err
+		}
+	}
+
 	// Store gateway CIDRs for health monitoring.
 	// Collect stale interfaces and clean up state under lock, then
 	// perform netlink cleanup outside the lock.
+	state.mu.Lock()
 	state.gatewayCIDRs = gatewayCIDRs
 	staleGatewayIfaces := make(map[string]*unboundednetnetlink.LinkManager)
 
@@ -554,6 +610,7 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 			staleGatewayIfaces[ifaceName] = linkManager
 		}
 	}
+	state.mu.Unlock()
 
 	// Remove old gateway interfaces that are no longer needed
 	for ifaceName, linkManager := range staleGatewayIfaces {
@@ -569,13 +626,7 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 			return fmt.Errorf("delete gateway interface %s: %w", ifaceName, err)
 		}
 
-		delete(state.gatewayLinkManagers, ifaceName)
-		delete(state.gatewayWireguardManagers, ifaceName)
-		delete(state.gatewayHealthEndpoints, ifaceName)
-		delete(state.gatewayRoutes, ifaceName)
-		delete(state.gatewayRouteDistances, ifaceName)
-		delete(state.gatewaySiteCIDRs, ifaceName)
-		delete(state.gatewayPodCIDRs, ifaceName)
+		state.removeGatewayInterfaceState(ifaceName)
 
 		if state.forwardManager != nil {
 			state.forwardManager.RemoveInterface(ifaceName)
@@ -655,6 +706,8 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 
 	// Update Prometheus collector with current set of WireGuard managers
 	if state.wgCollector != nil {
+		state.mu.Lock()
+
 		managers := make([]*unboundednetnetlink.WireGuardManager, 0, 1+len(state.gatewayWireguardManagers))
 		if state.wireguardManager != nil {
 			managers = append(managers, state.wireguardManager)
@@ -663,6 +716,7 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 		for _, gwm := range state.gatewayWireguardManagers {
 			managers = append(managers, gwm)
 		}
+		state.mu.Unlock()
 
 		state.wgCollector.SetManagers(managers)
 	}

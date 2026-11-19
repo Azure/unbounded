@@ -905,6 +905,7 @@ type PeerStatus struct {
 	Tunnel            *PeerTunnelStatus      `protobuf:"bytes,7,opt,name=tunnel,proto3" json:"tunnel,omitempty"`
 	RouteDestinations []string               `protobuf:"bytes,8,rep,name=route_destinations,json=routeDestinations,proto3" json:"route_destinations,omitempty"`
 	HealthCheck       *HealthCheckPeerStatus `protobuf:"bytes,9,opt,name=health_check,json=healthCheck,proto3" json:"health_check,omitempty"`
+	PeerId            string                 `protobuf:"bytes,10,opt,name=peer_id,json=peerId,proto3" json:"peer_id,omitempty"`
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
@@ -1000,6 +1001,13 @@ func (x *PeerStatus) GetHealthCheck() *HealthCheckPeerStatus {
 		return x.HealthCheck
 	}
 	return nil
+}
+
+func (x *PeerStatus) GetPeerId() string {
+	if x != nil {
+		return x.PeerId
+	}
+	return ""
 }
 
 // PeerTunnelStatus contains per-link tunnel transport metrics.
@@ -2194,7 +2202,7 @@ const file_status_proto_rawDesc = "" +
 	"\vlisten_port\x18\x03 \x01(\x05R\n" +
 	"listenPort\x12\x1d\n" +
 	"\n" +
-	"peer_count\x18\x04 \x01(\x05R\tpeerCount\"\x9e\x04\n" +
+	"peer_count\x18\x04 \x01(\x05R\tpeerCount\"\xb7\x04\n" +
 	"\n" +
 	"PeerStatus\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1b\n" +
@@ -2205,7 +2213,9 @@ const file_status_proto_rawDesc = "" +
 	"\x0froute_distances\x18\x06 \x03(\v26.unboundednet.status.v1.PeerStatus.RouteDistancesEntryR\x0erouteDistances\x12@\n" +
 	"\x06tunnel\x18\a \x01(\v2(.unboundednet.status.v1.PeerTunnelStatusR\x06tunnel\x12-\n" +
 	"\x12route_destinations\x18\b \x03(\tR\x11routeDestinations\x12P\n" +
-	"\fhealth_check\x18\t \x01(\v2-.unboundednet.status.v1.HealthCheckPeerStatusR\vhealthCheck\x1aA\n" +
+	"\fhealth_check\x18\t \x01(\v2-.unboundednet.status.v1.HealthCheckPeerStatusR\vhealthCheck\x12\x17\n" +
+	"\apeer_id\x18\n" +
+	" \x01(\tR\x06peerId\x1aA\n" +
 	"\x13RouteDistancesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\x05R\x05value:\x028\x01\"\x93\x02\n" +

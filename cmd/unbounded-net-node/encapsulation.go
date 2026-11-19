@@ -101,10 +101,8 @@ func tunnelProtoPtr(m map[string]string, key string) *unboundednetv1alpha1.Tunne
 //   - Same-pool gateways:         GatewayPool
 //   - Pool-to-pool gateways:      Explicit GatewayPoolPeering, otherwise existing pool/Site fallback
 //
-// Gateway nodes with same-site mesh peers use the SiteGatewayPoolAssignment
-// scope instead of the Site scope, because the non-gateway peer on the other
-// end resolves the link as a "site to gateway pool" connection. Both ends must
-// agree on the tunnel protocol.
+// Assignment downlinks are separate from ordinary mesh links and resolve
+// against the same assignment as the worker's gateway uplink.
 //
 // localPoolIsExternal indicates whether the local node belongs to an External
 // gateway pool. When true and the peer is cross-site, WireGuard is selected
@@ -131,23 +129,18 @@ func resolveTunnelProtocolsOnPeers(
 
 		var scope *unboundednetv1alpha1.TunnelProtocol
 
-		if peer.SiteName == mySiteName || peeredSites[peer.SiteName] {
+		if peer.TransitPoolName != "" {
+			usesExternal = normalizeGatewayPoolType(peer.TransitPoolType) == "External" &&
+				peer.SiteName != mySiteName && !networkPeeredSites[peer.SiteName]
+
+			scope = tunnelProtoPtr(assignmentPoolTunnelProtos, peer.SiteName+"|"+peer.TransitPoolName)
+			if (scope == nil || *scope == unboundednetv1alpha1.TunnelProtocolAuto) && peer.SiteName == mySiteName {
+				scope = tunnelProtoPtr(siteTunnelProtos, mySiteName)
+			}
+		} else if peer.SiteName == mySiteName || peeredSites[peer.SiteName] {
 			if peer.SiteName != mySiteName {
 				// Peered nodes in different sites -> SitePeering
 				scope = tunnelProtoPtr(peeringSiteTunnelProtos, peer.SiteName)
-			} else if isGatewayNode && len(localGatewayPools) > 0 {
-				// Gateway node with same-site mesh peers: use the SGPA
-				// scope so both ends agree. The non-gateway peer resolves
-				// this link as "site to gateway pool" via the SGPA, so the
-				// gateway end must use the same scope.
-				scope = tunnelProtoPtr(assignmentPoolTunnelProtos, mySiteName+"|"+localGatewayPools[0])
-				// Fall back to Site if SGPA is nil/Auto.
-				if scope == nil || *scope == unboundednetv1alpha1.TunnelProtocolAuto {
-					siteScope := tunnelProtoPtr(siteTunnelProtos, mySiteName)
-					if siteScope != nil && *siteScope != unboundednetv1alpha1.TunnelProtocolAuto {
-						scope = siteScope
-					}
-				}
 			} else {
 				// Same-site peers -> Site
 				scope = tunnelProtoPtr(siteTunnelProtos, mySiteName)

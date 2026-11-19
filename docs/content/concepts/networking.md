@@ -62,6 +62,14 @@ all Site `nodeCidrs` and labels it with `unbounded-cloud.io/site=<name>`.
 
 A **GatewayPool** defines a set of nodes that act as routers between sites.
 Gateway nodes forward traffic from one site's pods to another using tunnels.
+They remain ordinary members of their SiteNodeSlices. Their own pods use the
+same Site and SitePeering mesh connectivity as other nodes; selecting one or
+all nodes as gateways does not remove that connectivity.
+
+GatewayPoolNode advertisements establish transit routes, not an additional
+route to a gateway's own PodCIDRs. A genuine advertised Site prefix can still
+cover those pods for Sites that reach them through transit. Direct mesh
+PodCIDRs take precedence over equal or more-specific transit advertisements.
 
 Key properties:
 
@@ -74,6 +82,20 @@ Key properties:
 Traffic flow: Pod on Site A &rarr; local node routes to a gateway &rarr;
 gateway tunnels to a gateway in Site B &rarr; gateway routes to the destination
 pod's node.
+
+WireGuard mesh links use the standard mesh port. Assignment links use the
+gateway's allocated transit port on both ends, independently of mesh links.
+Upgrade all participating node agents together when moving from the previous
+assignment-port behavior; mixed versions do not interoperate for these links.
+Health profiles are scoped to each relationship. These probes measure node
+liveness over the selected route, not every possible transit tunnel.
+
+On gateways, forwarded replies to assigned workers use a separate
+`unbounded-rtn` dataplane and the assignment's tunnel protocol. Host- and
+pod-originated traffic still uses ordinary mesh links. This separation keeps
+remote source addresses intact without broadening mesh WireGuard AllowedIPs.
+Transit ECMP uses only the shortest healthy advertised paths; longer healthy
+paths remain available for failover.
 
 ### Peering
 

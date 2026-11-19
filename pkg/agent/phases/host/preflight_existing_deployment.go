@@ -23,15 +23,6 @@ import (
 // resumed installation intentionally skips.
 const CheckExistingDeploymentName = "existing-deployment"
 
-// CheckExistingDeployment verifies the host does not already contain nspawn
-// node deployment artifacts.
-//
-// Deprecated: use CheckExistingDeploymentFor. This wrapper is kept for one
-// release and checks for the nspawn mode.
-func CheckExistingDeployment(log *slog.Logger) preflight.Checker {
-	return CheckExistingDeploymentFor(log, isolation.ModeNSpawn)
-}
-
 // CheckExistingDeploymentFor verifies the host does not already contain node
 // deployment artifacts. Bootstrap must start from a clean host; otherwise
 // partial state from a prior run can be reused accidentally. Modes other than

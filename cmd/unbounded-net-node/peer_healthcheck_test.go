@@ -30,7 +30,7 @@ func TestRegisterHealthProfilesAllTunnelModes(t *testing.T) {
 			{name: "mesh default", site: "site", want: "site"},
 			{name: "mesh peering", site: "site", peering: "peering", want: "peering"},
 			{name: "mesh assignment", site: "site", peering: "peering", assignmentSite: "assignment", want: "assignment"},
-			{name: "mesh gateway role", gatewayNode: true, site: "site", peering: "peering", assignmentSite: "assignment", want: "assignment"},
+			{name: "mesh gateway role", gatewayNode: true, site: "site", peering: "peering", assignmentSite: "assignment", want: "peering"},
 			{name: "mesh explicit pool", override: "pool", assignmentSite: "assignment", want: "pool"},
 			{name: "mesh explicit pool peering", override: "pool-peering", assignmentSite: "assignment", want: "pool-peering"},
 			{name: "mesh disabled assignment", site: "site", assignmentSite: disabledHealthCheckProfile},
@@ -73,6 +73,9 @@ func TestRegisterHealthProfilesAllTunnelModes(t *testing.T) {
 					gateways = []gatewayPeerInfo{{Name: "peer", SiteName: "remote", PoolName: "pool", PodCIDRs: []string{"10.244.1.0/24"}, HealthCheckProfileName: tc.override, TunnelProtocol: protocol}}
 				} else {
 					mesh = []meshPeerInfo{{Name: "peer", SiteName: "remote", WireGuardPublicKey: "pub", PodCIDRs: []string{"10.244.1.0/24"}, HealthCheckProfileName: tc.override, TunnelProtocol: protocol}}
+					if tc.name == "mesh assignment" || tc.name == "mesh disabled assignment" {
+						mesh[0].TransitPoolName = "pool"
+					}
 				}
 
 				desired, err := registerPeersWithHealthCheck(mesh, gateways, "local", tc.gatewayNode,
@@ -84,7 +87,7 @@ func TestRegisterHealthProfilesAllTunnelModes(t *testing.T) {
 				}
 
 				if tc.want == "" {
-					if desired["peer"] || len(manager.GetAllPeerStatuses()) != 0 || state.meshPeerHealthCheckEnabled["pub"] || state.gatewayPeerHealthCheckEnabled["iface"] {
+					if desired["peer"] || len(manager.GetAllPeerStatuses()) != 0 || state.meshPeerHealthCheckEnabled["peer"] || state.gatewayPeerHealthCheckEnabled["iface"] {
 						t.Fatal("disabled profile fell through to enabled lower-precedence profile")
 					}
 

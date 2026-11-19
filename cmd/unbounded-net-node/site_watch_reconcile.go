@@ -31,6 +31,7 @@ import (
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
+	ebpfpkg "github.com/Azure/unbounded/internal/net/ebpf"
 	"github.com/Azure/unbounded/internal/net/healthcheck"
 	unboundednetnetlink "github.com/Azure/unbounded/internal/net/netlink"
 )
@@ -106,6 +107,14 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 			if n := tm.SetPeerHealth(peerHostname, healthy); n > 0 {
 				klog.V(2).Infof("eBPF: set %d BPF entries for peer %s healthy=%v", n, peerHostname, healthy)
 			}
+		}
+
+		state.mu.Lock()
+		assignmentMap := state.assignmentTunnelMap
+		state.mu.Unlock()
+
+		if assignmentMap != nil {
+			assignmentMap.SetPeerHealth(peerHostname, newState == healthcheck.StateUp)
 		}
 	})
 	if err != nil {
@@ -1779,7 +1788,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 
 	// Collect gateway peers from gateway pools for dedicated gateway interfaces.
 	// Non-gateway nodes: connect to pools from peerings involving their site
-	// Gateway nodes: connect only to peered pools (other pools in the same Peering)
+	// Gateway nodes: connect to peered pools and authorized same-pool transit peers.
 	var gatewayPeers []gatewayPeerInfo
 
 	var (
@@ -1790,8 +1799,11 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 	{
 		var poolsToIterate map[string]*unboundednetv1alpha1.GatewayPool
 		if isGatewayNode {
-			// Gateway nodes only connect to peered pools (not their own pool)
-			poolsToIterate = make(map[string]*unboundednetv1alpha1.GatewayPool, len(peeredPoolSet))
+			poolsToIterate = make(map[string]*unboundednetv1alpha1.GatewayPool, len(peeredPoolSet)+len(gatewayPoolsForNode))
+			for poolName, pool := range gatewayPoolsForNode {
+				poolsToIterate[poolName] = pool
+			}
+
 			for poolName := range peeredPoolSet {
 				if pool := gatewayPoolMap[poolName]; pool != nil {
 					poolsToIterate[poolName] = pool
@@ -1848,11 +1860,26 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 
 				// Never install NodeCidr routes from network-peered sites via gateways.
 				excludedNodeCIDRSites := networkPeeredSites
-				routedCidrs, routeDistances, learnedRoutes := routedCIDRsForGatewayPeer(peerGatewayNode, fallbackRoutedCIDRs, mySiteName, localGatewayPools, excludedNodeCIDRSites, now, staleAfter)
+
+				var excludedTransitSites map[string]bool
+				if _, localPool := localGatewayPoolSet[pool.Name]; localPool {
+					excludedTransitSites = assignedSiteSet
+				}
+
+				routedCidrs, routeDistances, learnedRoutes, sourceCIDRs := routedCIDRsForGatewayPeer(peerGatewayNode, fallbackRoutedCIDRs, mySiteName, localGatewayPools, excludedNodeCIDRSites, excludedTransitSites, now, staleAfter)
+				// Assigned gateway pods use the gateway mesh instead of a worker downlink.
+				if assignedSiteSet[gwNode.SiteName] {
+					routedCidrs = dedupeStrings(slices.Concat(routedCidrs, gwNode.PodCIDRs))
+				}
+
 				filteredRoutes := excludeLocalGatewayRoutes(gatewayPeerInfo{
 					RoutedCidrs: routedCidrs, RouteDistances: routeDistances, LearnedRoutes: learnedRoutes,
 				}, siteRouting.localCIDRs)
+
 				routedCidrs, routeDistances, learnedRoutes = filteredRoutes.RoutedCidrs, filteredRoutes.RouteDistances, filteredRoutes.LearnedRoutes
+				if _, localPool := localGatewayPoolSet[pool.Name]; localPool && len(routedCidrs) == 0 {
+					continue
+				}
 
 				if len(learnedRoutes) > 0 && peeringEdgeMTUs == nil {
 					assignmentEdgeMTUs = assignmentEdgeTunnelMTUs(assignments)
@@ -1877,7 +1904,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 				}
 
 				gatewayPeers = append(gatewayPeers, gatewayPeerInfo{
-					Name:                   gwNode.Name,
+					Name:                   gwNode.Name + "/transit/" + pool.Name,
 					SiteName:               gwNode.SiteName,
 					PoolName:               pool.Name,
 					PeeringTunnelProtocol:  peeringTunnelProtocol,
@@ -1889,6 +1916,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 					ExternalIPs:            gwNode.ExternalIPs,
 					HealthEndpoints:        gwNode.HealthEndpoints,
 					RoutedCidrs:            routedCidrs,
+					SourceCIDRs:            sourceCIDRs,
 					RouteDistances:         routeDistances,
 					LearnedRoutes:          learnedRoutes,
 					PodCIDRs:               gwNode.PodCIDRs,
@@ -1951,33 +1979,19 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 	var peers []meshPeerInfo
 
 	for _, slice := range allSlices {
-		// Non-gateway: only peered sites (including own site)
-		if !isGatewayNode {
-			if !peeredSites[slice.SiteName] {
-				continue
-			}
-		} else {
-			// Gateway: include only sites explicitly assigned to this gateway pool,
-			// and only when the site is local or directly connected.
-			if !shouldIncludeSliceForGatewayNode(slice.SiteName, mySiteName, connectedSiteSet, assignedSiteSet, hasExternalGatewayPool) {
-				klog.V(3).Infof("Ignoring %d node(s) from site %s for gateway mesh peering: site is not assigned or not eligible for this gateway pool", len(slice.Nodes), slice.SiteName)
-				continue
-			}
-		}
-		// An unmanaged CNI owns same-site routes unless explicitly overridden.
-		// Keep directly peered remote sites so unmanaged sites can still route to managed remote pods.
-		if !manageCniPlugin && !cfg.ManageSameSitePodRoutes && !isGatewayNode && slice.SiteName == mySiteName {
+		directMesh := peeredSites[slice.SiteName]
+
+		assignmentDownlink := isGatewayNode &&
+			shouldIncludeSliceForGatewayNode(slice.SiteName, mySiteName, connectedSiteSet, assignedSiteSet, hasExternalGatewayPool)
+		if !directMesh && !assignmentDownlink {
 			continue
 		}
+
+		skipLocalPods := !manageCniPlugin && !cfg.ManageSameSitePodRoutes && slice.SiteName == mySiteName
 
 		for _, node := range slice.Nodes {
 			// Skip self
 			if node.WireGuardPublicKey == myPubKey {
-				continue
-			}
-			// Skip gateway nodes on mesh interface -- they get dedicated gateway interfaces
-			if gatewayNodePubKeys[node.WireGuardPublicKey] {
-				klog.V(3).Infof("Skipping peer %s on mesh interface: gateway node (has dedicated gateway interface)", node.Name)
 				continue
 			}
 			// Skip nodes without WireGuard keys or internal IPs
@@ -1991,47 +2005,37 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 				continue
 			}
 
-			peers = append(peers, meshPeerInfo{
+			peer := meshPeerInfo{
 				Name:               node.Name,
 				SiteName:           slice.SiteName,
 				WireGuardPublicKey: node.WireGuardPublicKey,
 				InternalIPs:        node.InternalIPs,
 				PodCIDRs:           node.PodCIDRs,
-				SkipPodCIDRRoutes:  !manageCniPlugin && !cfg.ManageSameSitePodRoutes && isGatewayNode && slice.SiteName == mySiteName,
-			})
-		}
-	}
+				SkipPodCIDRRoutes:  skipLocalPods,
+			}
+			if directMesh && (!skipLocalPods || isGatewayNode) {
+				peers = append(peers, peer)
+			}
 
-	// For gateway nodes: also add same-pool gateway nodes as mesh peers.
-	// This enables gateway-to-gateway communication for pods on gateway nodes.
-	if isGatewayNode {
-		addedGwKeys := make(map[string]bool)
+			// Assigned workers need a reciprocal transit link even when their
+			// ordinary mesh link uses a different protocol or WireGuard port.
+			if assignmentDownlink && !gatewayNodePubKeys[node.WireGuardPublicKey] {
+				for _, poolName := range localGatewayPools {
+					assigned := slices.ContainsFunc(assignments, func(assignment unboundednetv1alpha1.SiteGatewayPoolAssignment) bool {
+						return slices.Contains(assignment.Spec.GatewayPools, poolName) && slices.Contains(assignment.Spec.Sites, slice.SiteName)
+					})
+					if !assigned {
+						continue
+					}
 
-		for poolName, pool := range gatewayPoolsForNode {
-			for _, gwNode := range pool.Status.Nodes {
-				if gwNode.WireGuardPublicKey == myPubKey || gwNode.WireGuardPublicKey == "" {
-					continue
+					downlink := peer
+					downlink.Name += "/assignment/" + poolName
+					downlink.TransitPoolName = poolName
+					downlink.TransitPoolType = normalizeGatewayPoolType(gatewayPoolMap[poolName].Spec.Type)
+					downlink.TransitWireguardPort = myGatewayPort
+					downlink.HealthCheckProfileName = assignmentPoolHealthCheckProfileNames[slice.SiteName+"|"+poolName]
+					peers = append(peers, downlink)
 				}
-
-				if addedGwKeys[gwNode.WireGuardPublicKey] {
-					continue
-				}
-
-				if len(gwNode.PodCIDRs) == 0 {
-					klog.V(3).Infof("Skipping same-pool gateway peer %s: no podCIDRs", gwNode.Name)
-					continue
-				}
-
-				addedGwKeys[gwNode.WireGuardPublicKey] = true
-				peers = append(peers, meshPeerInfo{
-					Name:                   gwNode.Name,
-					SiteName:               gwNode.SiteName,
-					HealthCheckProfileName: poolHealthCheckProfileNames[poolName],
-					WireGuardPublicKey:     gwNode.WireGuardPublicKey,
-					InternalIPs:            gwNode.InternalIPs,
-					PodCIDRs:               gwNode.PodCIDRs,
-				})
-				klog.V(4).Infof("Gateway node (same pool %s): added gateway peer %s on mesh interface, podCIDRs %v", poolName, gwNode.Name, gwNode.PodCIDRs)
 			}
 		}
 	}
@@ -2191,8 +2195,25 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 
 	if !wgChanged {
 		klog.V(3).Info("State unchanged, skipping tunnel update")
+
+		tunnelMap, assignmentMap := state.tunnelMap, state.assignmentTunnelMap
 		state.mu.Unlock()
 		syncMasqueradeRules(state, nonMasqCIDRs)
+
+		// Heartbeat reconciliations also follow changed native underlay routes.
+		var refreshErrors []error
+
+		for _, tunnelMap := range []*ebpfpkg.TunnelMap{tunnelMap, assignmentMap} {
+			if tunnelMap != nil {
+				if err := tunnelMap.RefreshNativeNexthops(); err != nil {
+					refreshErrors = append(refreshErrors, err)
+				}
+			}
+		}
+
+		if err := errors.Join(refreshErrors...); err != nil {
+			return err
+		}
 
 		return publishGatewayStatus(fabricMTU, peers, gatewayPeers)
 	}
@@ -2279,6 +2300,8 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 	if geneveEnabled {
 		state.mu.Lock()
 		state.pendingBPFEntries = nil
+		state.pendingDirectBPFEntries = nil
+		state.pendingAssignmentBPFEntries = nil
 		state.mu.Unlock()
 
 		var (
@@ -2358,9 +2381,20 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 	}
 
 	addWireGuardPeersToBPFMap(cfg, state, wgMeshPeers, wgGatewayPeers)
-	reconcilePendingBPFEntries(state)
+
+	if err := reconcileAssignmentReturnDataplane(cfg, state); err != nil {
+		return err
+	}
+
+	if err := reconcilePendingBPFEntries(state); err != nil {
+		return err
+	}
+
 	cleanupUnusedTunnelDevices(cfg, peers, gatewayPeers, wgGatewayPeers, state.forwardManager, state.notrackManager)
-	reapplyRPFilterOnActiveTunnels(cfg, peers, gatewayPeers, wgGatewayPeers, state.forwardManager, state.isGatewayNode, state.notrackManager)
+
+	if err := reapplyRPFilterOnActiveTunnels(cfg, peers, gatewayPeers, wgGatewayPeers, state.forwardManager, state.isGatewayNode, state.notrackManager, state.netlinkCache); err != nil {
+		return err
+	}
 
 	// Reconcile notrack rules for conntrack bypass on gateway nodes.
 	if state.notrackManager != nil {

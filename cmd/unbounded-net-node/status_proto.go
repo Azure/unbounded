@@ -150,6 +150,7 @@ func peerStatusToProto(p *statusv1alpha1.PeerStatus) *statusproto.PeerStatus {
 	}
 
 	pb := &statusproto.PeerStatus{
+		PeerId:            p.PeerID,
 		Name:              p.Name,
 		PeerType:          p.PeerType,
 		SiteName:          p.SiteName,

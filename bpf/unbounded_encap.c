@@ -43,6 +43,16 @@
 #define BPF_F_NO_PREALLOC    (1U << 0)
 #define BPF_MAP_TYPE_LPM_TRIE 11
 #define BPF_MAP_TYPE_RINGBUF  27
+#define AF_INET               2
+#define AF_INET6              10
+
+struct bpf_redir_neigh {
+	__u32 nh_family;
+	union {
+		__be32 ipv4_nh;
+		__u32 ipv6_nh[4];
+	};
+};
 
 // Maximum number of nexthops per CIDR prefix.
 #define MAX_NEXTHOPS 4
@@ -207,7 +217,7 @@ static __always_inline int is_v4_mapped(const __u8 *addr16)
 
 // needs_tunnel_key reports whether the given protocol expects the BPF
 // program to populate bpf_tunnel_key. GENEVE/VXLAN/IPIP do; WireGuard and
-// None (plain redirect) do not.
+// None (native neighbor resolution) do not.
 static __always_inline int needs_tunnel_key(__u32 protocol)
 {
 	return protocol == PROTO_GENEVE ||
@@ -442,7 +452,21 @@ int unbounded_encap(struct __sk_buff *skb)
 		ev.set_key_ret = (__s32)set_tunnel_key_from_endpoint(skb, &nh);
 	}
 
-	long redir = bpf_redirect(nh.ifindex, 0);
+	long redir;
+	if (nh.protocol == PROTO_NONE) {
+		// Physical underlays need real neighbor MACs, not synthetic tunnel MACs.
+		struct bpf_redir_neigh neighbor = {};
+		if (is_v4_mapped(nh.remote_endpoint)) {
+			neighbor.nh_family = AF_INET;
+			__builtin_memcpy(&neighbor.ipv4_nh, nh.remote_endpoint + 12, 4);
+		} else {
+			neighbor.nh_family = AF_INET6;
+			__builtin_memcpy(neighbor.ipv6_nh, nh.remote_endpoint, 16);
+		}
+		redir = bpf_redirect_neigh(nh.ifindex, &neighbor, sizeof(neighbor), 0);
+	} else {
+		redir = bpf_redirect(nh.ifindex, 0);
+	}
 	ev.redirect_ret = (__s32)redir;
 	ev.verdict = (__s32)redir;
 	emit_trace(&ev);
