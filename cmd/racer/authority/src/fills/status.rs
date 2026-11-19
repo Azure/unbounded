@@ -297,8 +297,10 @@ fn condition(
 }
 
 /// Primary-only: write status for changed fills. At most one PUT per pass, so
-/// the primary Lease renewal stays on schedule.
-pub async fn reconcile(shared: &Shared) {
+/// the primary Lease renewal stays on schedule. `cursor` is the first fill to
+/// try next; it advances after every write attempt, so a fill whose status
+/// stays dirty cannot starve the rest.
+pub async fn reconcile(shared: &Shared, cursor: &mut usize) {
     if shared.primary_term(rt::now()).is_none()
         || !shared.fills_synced.get()
         || !shared.fills_caches_synced.get()
@@ -320,18 +322,25 @@ pub async fn reconcile(shared: &Shared) {
         let ownership = shared.ownership.borrow();
         member_reports(&pods, &nodes, &ownership, members)
     };
-    for view in views {
+    let len = views.len();
+    let start = *cursor % len;
+    for offset in 0..len {
+        let index = (start + offset) % len;
+        let view = &views[index];
         let current = match shared.api.get(&paths::cluster_cache_fill(&view.name)).await {
             Ok(v) => v,
             Err(KubeError::NotFound) => continue,
-            Err(_) => return,
+            Err(_) => {
+                *cursor = (index + 1) % len;
+                return;
+            }
         };
         let resource_version = kube::str_at(&current, &["metadata", "resourceVersion"]).to_owned();
         if resource_version.is_empty() {
             continue;
         }
         let previous = current.get("status").filter(|s| s.is_object());
-        let next = status(&view, &reports, previous);
+        let next = status(view, &reports, previous);
         if previous == Some(&next) {
             continue;
         }
@@ -351,6 +360,7 @@ pub async fn reconcile(shared: &Shared) {
                 .put(&paths::cluster_cache_fill_status(&view.name), &body),
         )
         .await;
+        *cursor = (index + 1) % len;
         match result {
             Ok(Ok(_)) => return,
             // Conflict: re-read next turn. NotFound: deleted.
@@ -362,8 +372,9 @@ pub async fn reconcile(shared: &Shared) {
 
 /// Loop while this process lives; only the primary actually writes.
 pub async fn run(shared: std::rc::Rc<Shared>) {
+    let mut cursor = 0;
     while !shared.stopping.get() {
-        reconcile(&shared).await;
+        reconcile(&shared, &mut cursor).await;
         rt::sleep(TICK).await;
     }
 }
@@ -695,5 +706,58 @@ mod tests {
         let progress = aggregate(&reports, &v);
         assert_eq!(progress.nodes, 1);
         assert_eq!(progress.resident_bytes, full.pinned_bytes);
+    }
+
+    #[test]
+    fn round_robin_cursor_advances_after_a_failed_status_write() {
+        crate::kube::fake::run(|api, kube| async move {
+            let shared = crate::shared::tests::shared(kube);
+            shared.is_primary.set(true);
+            *shared.term.borrow_mut() = Some((
+                crate::rules::state::Term {
+                    lease_uid: "lease".into(),
+                    transitions: 1,
+                    holder: "p1/00".into(),
+                },
+                crate::rules::state::Freshness::confirmed(rt::now(), Duration::from_secs(3600)),
+            ));
+            shared.fills_synced.set(true);
+            shared.fills_caches_synced.set(true);
+            for name in ["fill-a", "fill-b"] {
+                api.put_object(
+                    &paths::cluster_cache_fill(name),
+                    json!({"metadata": {"name": name}, "spec": {"cacheName": "models"}}),
+                );
+                let mut v = view();
+                v.name = name.into();
+                v.uid = format!("{name}-uid");
+                shared.fills.borrow_mut().insert(v.uid.clone(), v);
+            }
+
+            // The fake has no status subresource, so both writes fail. The
+            // first fill stays dirty, but the cursor still moves past it.
+            let mut cursor = 0;
+            let start = api.requests().len();
+            reconcile(&shared, &mut cursor).await;
+            let first: Vec<_> = api.requests()[start..]
+                .iter()
+                .filter(|(method, _)| method == "PUT")
+                .map(|(_, path)| path.clone())
+                .collect();
+            assert_eq!(first.len(), 1);
+            assert!(first[0].ends_with("/fill-a/status"), "{first:?}");
+            assert_eq!(cursor, 1);
+
+            let start = api.requests().len();
+            reconcile(&shared, &mut cursor).await;
+            let second: Vec<_> = api.requests()[start..]
+                .iter()
+                .filter(|(method, _)| method == "PUT")
+                .map(|(_, path)| path.clone())
+                .collect();
+            assert_eq!(second.len(), 1);
+            assert!(second[0].ends_with("/fill-b/status"), "{second:?}");
+            assert_eq!(cursor, 0);
+        });
     }
 }
