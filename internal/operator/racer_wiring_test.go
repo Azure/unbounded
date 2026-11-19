@@ -89,6 +89,7 @@ func TestRacerBootstrapUsesClusterScopedClusterCache(t *testing.T) {
 	}
 
 	version := versions[0].(map[string]any)
+
 	status, _ := version["subresources"].(map[string]any)
 	if _, ok := status["status"]; !ok {
 		t.Fatalf("ClusterCacheFill CRD has no status subresource: %v", version["subresources"])

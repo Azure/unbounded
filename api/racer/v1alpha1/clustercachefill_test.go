@@ -95,6 +95,7 @@ func TestClusterCacheFillEffectiveDefaults(t *testing.T) {
 
 	for _, replicas := range []int32{-1, 0, 1, 2, 3, 4} {
 		spec.Replicas = replicas
+
 		expected := replicas
 		if replicas < 1 || replicas > MaxFillReplicas {
 			expected = DefaultFillReplicas

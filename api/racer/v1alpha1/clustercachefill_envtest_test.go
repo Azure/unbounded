@@ -140,6 +140,7 @@ func TestEnvtestClusterCacheFillValidation(t *testing.T) {
 
 func mustNestedInt(t *testing.T, obj map[string]any, fields ...string) int64 {
 	t.Helper()
+
 	value, found, err := unstructured.NestedInt64(obj, fields...)
 	require.NoError(t, err)
 	require.True(t, found, "%v", fields)
@@ -149,6 +150,7 @@ func mustNestedInt(t *testing.T, obj map[string]any, fields ...string) int64 {
 
 func mustNestedString(t *testing.T, obj map[string]any, fields ...string) string {
 	t.Helper()
+
 	value, found, err := unstructured.NestedString(obj, fields...)
 	require.NoError(t, err)
 	require.True(t, found, "%v", fields)
