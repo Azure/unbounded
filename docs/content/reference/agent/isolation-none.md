@@ -17,15 +17,16 @@ its daemon run on the host, as in every mode. See
 ## Requirements
 
 - Writable `/etc`, `/opt`, and `/var`. `/usr` is not modified.
-- `systemctl` on the host.
-- **No kubelet or containerd that the agent does not own.** Bootstrap refuses
-  the host, before it changes anything, if it finds, for the standard names, a
-  `kubelet.service` or `containerd.service` unit file in the systemd unit
-  directories, a `kubelet` or `containerd` executable on the standard binary
-  paths, or a running `kubelet` or `containerd` process. The `preflight`
-  subcommand reports the same findings. A unit masked to `/dev/null` (which an
-  `nspawn` installation leaves behind) is not a finding. Remove them, or use
-  `nspawn`.
+- `systemctl` and `systemd-detect-virt` on the host. Run the agent on the host,
+  not in a container that may depend on the host container runtime.
+- Bootstrap stops and masks the host `kubelet.service` and
+  `containerd.service` before starting the node. If a local unit file in
+  `/etc/systemd/system` cannot be masked without replacing it, bootstrap stops
+  and disables it instead; another unit or an administrator can still start a
+  disabled service. Existing packages and binaries can remain installed.
+  Bootstrap refuses to continue if unmanaged kubelet or containerd processes
+  remain after deactivation. Preflight reports processes outside the service
+  cgroups that bootstrap can stop.
 - `/usr` is never modified, so a read-only `/usr` is expected to work. This has
   not yet been validated on a read-only `/usr` host.
 - Units start after `network-online.target`.
@@ -64,8 +65,8 @@ last-known-good binary, refuse a binary that does not answer
 the Kubernetes version plus a short digest of the other artifact versions, so an
 unchanged configuration reuses its directory.
 
-The agent never writes or edits the distro's `kubelet.service` or
-`containerd.service`.
+The agent does not overwrite local `kubelet.service` or `containerd.service`
+files. Masks and disablement change their systemd activation state.
 
 The same-path contract holds, as in every mode; see
 [Isolation Modes]({{< relref "reference/agent/isolation" >}}).
@@ -74,7 +75,7 @@ The same-path contract holds, as in every mode; see
 
 | Operation | Behavior |
 |---|---|
-| Bootstrap | The ownership check above, host preparation (the same nftables, sysctl, swap and docker phases as `nspawn`, plus loading `overlay` and `br_netfilter`; the apt and needrestart guards against systemd-machined restarts, which first-boot provisioning writes for every mode, are removed), install the version directory and units, reload systemd, point `current` at the version, write the configuration at the shared host paths, start the units, wait for kubelet to bootstrap. |
+| Bootstrap | Deactivate the host services and check for remaining unmanaged processes, prepare the host (the same nftables, sysctl, swap and docker phases as `nspawn`, plus loading `overlay` and `br_netfilter`; the apt and needrestart guards against systemd-machined restarts, which first-boot provisioning writes for every mode, are removed), install the version directory and units, reload systemd, point `current` at the version, write the configuration at the shared host paths, start the units, wait for kubelet to bootstrap. |
 | Start | Enable and start LocalDNS (and wait for it), then containerd (and import preloaded images), then kubelet. |
 | Stop | Stop kubelet, then containerd, then LocalDNS. Every unit is attempted even if one fails. |
 | Soft reboot (`NodeReboot`) | Restart LocalDNS, containerd, then kubelet, wait for LocalDNS and for kubelet to be active. The host does not reboot. |
@@ -88,8 +89,8 @@ The same-path contract holds, as in every mode; see
 ## Limits
 
 - **No filesystem isolation.** The node stack shares the host filesystem and
-  process table. Host packages and the node stack can conflict, which is why
-  preflight refuses an existing kubelet or containerd.
+  process table. Host packages and the node stack can conflict, so unmanaged
+  kubelet and containerd processes must not remain running.
 - **No per-machine bpffs.** The host `/sys/fs/bpf` is used directly. eBPF CNIs
   such as Cilium that expect a machine-scoped bpffs see the host's. This is a
   documented difference from `nspawn`.
@@ -130,7 +131,7 @@ The same-path contract holds, as in every mode; see
 
 | Symptom | Check |
 |---|---|
-| Bootstrap or preflight reports an unmanaged kubelet or containerd | Remove the listed unit, binary, or process, or choose another mode. The message lists each finding. |
+| Bootstrap or preflight reports an unmanaged kubelet or containerd | Stop the listed process using its actual supervisor, then retry. Package files do not need to be removed. |
 | An agent upgrade is refused with "cannot operate isolation mode" | The candidate agent predates `none`. Use an agent version that supports it. |
 | Preflight reports a path is not writable | `/etc`, `/opt/unbounded/node`, and `/var` must be writable. Check for a read-only mount. |
 | Node not Ready after an upgrade | `sudo unbounded-agent logs --unit kubelet --lines 200`. The agent flips `current` back automatically; `readlink /opt/unbounded/node/current` shows which version is active. |

@@ -189,6 +189,46 @@ func TestListenerOwnershipRequiresRootAndExecutableForEverySocket(t *testing.T) 
 	}
 }
 
+func TestListenerOwnedByService(t *testing.T) {
+	for _, mode := range []string{"service", "wrong-service", "wrong-process", "missing-cgroup", "unknown-owner", "shared-with-foreign"} {
+		t.Run(mode, func(t *testing.T) {
+			proc := createProcFixture(t, procTCPHeader+"0: 00000000:280A 00000000:0000 0A 0 0 0 0 0 45678\n", procTCPHeader)
+			if mode != "unknown-owner" {
+				dir := filepath.Join(proc, "123")
+				require.NoError(t, os.MkdirAll(filepath.Join(dir, "fd"), 0o755))
+				require.NoError(t, os.Symlink("socket:[45678]", filepath.Join(dir, "fd", "4")))
+				name, group := "kubelet", "0::/system.slice/kubelet.service\n"
+				if mode == "wrong-service" {
+					group = "0::/system.slice/other.service\n"
+				}
+				if mode == "wrong-process" {
+					name = "other"
+				}
+				require.NoError(t, os.WriteFile(filepath.Join(dir, "comm"), []byte(name), 0o644))
+				if mode != "missing-cgroup" {
+					require.NoError(t, os.WriteFile(filepath.Join(dir, "cgroup"), []byte(group), 0o644))
+				}
+			}
+			if mode == "shared-with-foreign" {
+				require.NoError(t, os.MkdirAll(filepath.Join(proc, "456", "fd"), 0o755))
+				require.NoError(t, os.Symlink("socket:[45678]", filepath.Join(proc, "456", "fd", "4")))
+			}
+			require.Equal(t, mode == "service", listenerOwnedByService(proc, kubeletBindAddress, "kubelet.service", "kubelet"))
+		})
+	}
+}
+
+func TestBindAddressCheckerWarnsForServiceToBeStopped(t *testing.T) {
+	checker := testBindAddressChecker(func(string) (string, bool, error) {
+		return `"kubelet" (PID 123)`, true, nil
+	})
+	checker.deactivated = func() bool { return true }
+	results := checker.Check(t.Context())
+	require.Len(t, results, 1)
+	require.Equal(t, preflight.SeverityWarning, results[0].Severity)
+	require.Contains(t, results[0].Message, "bootstrap will stop")
+}
+
 // TestCheckBindAddressRejectsAnyListener exercises the exported constructor
 // rather than the checker type the other tests here build directly.
 //

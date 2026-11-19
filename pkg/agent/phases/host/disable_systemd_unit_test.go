@@ -7,7 +7,9 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -71,6 +73,39 @@ func TestDisableSystemdUnitsReturnsMaskError(t *testing.T) {
 	err := task.ensureDisabled(context.Background())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), containerdServiceUnit)
+}
+
+func TestDisableSystemdUnitsPreservesLocalUnit(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, kubeletServiceUnit)
+	require.NoError(t, os.WriteFile(path, []byte("unit"), 0o644))
+
+	var commands []string
+	task := &disableSystemdUnits{
+		name: "disable-test", units: []string{kubeletServiceUnit}, unitDir: dir,
+		log: slog.New(slog.DiscardHandler),
+		runCmdAt: func(_ context.Context, _ *slog.Logger, _ slog.Level, _ func(context.Context) *exec.Cmd, args ...string) error {
+			commands = append(commands, args[0])
+			if args[0] == "mask" {
+				return errors.New("file exists")
+			}
+			return nil
+		},
+	}
+
+	require.NoError(t, task.Do(t.Context()))
+	require.Equal(t, []string{"stop", "mask", "disable"}, commands)
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, "unit", string(data))
+
+	task.runCmdAt = func(_ context.Context, _ *slog.Logger, _ slog.Level, _ func(context.Context) *exec.Cmd, args ...string) error {
+		if args[0] != "stop" {
+			return errors.New("failed")
+		}
+		return nil
+	}
+	require.ErrorContains(t, task.Do(t.Context()), "disabling kubelet.service")
 }
 
 func TestDisableServiceTasks(t *testing.T) {

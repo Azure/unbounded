@@ -135,11 +135,10 @@ func (b *Backend) Requirements() isolation.Requirements {
 	}
 }
 
-// Preflight refuses to proceed when the host already has a kubelet or
-// containerd the agent does not own, or a required path is read only. It
-// mutates nothing. It is PreflightStatic followed by PreflightOwnership.
+// Preflight checks for conflicts that bootstrap cannot deactivate and required
+// host capabilities without changing the host.
 func (b *Backend) Preflight() error {
-	return errors.Join(b.PreflightStatic(), b.PreflightOwnership())
+	return errors.Join(b.PreflightStatic(), ownershipError(b.hostFS().DetectUnmanagedBeforeDeactivation(b.Layout.base())))
 }
 
 // PreflightStatic checks what the host must provide whatever it runs now: the
@@ -178,11 +177,12 @@ func (b *Backend) PreflightStatic() error {
 	return errors.Join(errs...)
 }
 
-// PreflightOwnership refuses a host that already has a kubelet or containerd
-// the agent does not own (unit, binary or running process). It fails on a host
-// that is a running node, so a migration runs it only after the reset.
+// PreflightOwnership checks for remaining foreign processes after deactivation.
 func (b *Backend) PreflightOwnership() error {
-	findings := b.hostFS().DetectUnmanaged(b.Layout.base())
+	return ownershipError(b.hostFS().DetectUnmanaged(b.Layout.base()))
+}
+
+func ownershipError(findings []string) error {
 	if len(findings) == 0 {
 		return nil
 	}
@@ -192,7 +192,7 @@ func (b *Backend) PreflightOwnership() error {
 		errs = append(errs, errors.New(f))
 	}
 
-	errs = append(errs, errors.New("use isolation mode nspawn, or remove the existing kubelet and containerd"))
+	errs = append(errs, errors.New("stop the unmanaged processes before starting the node"))
 
 	return errors.Join(errs...)
 }

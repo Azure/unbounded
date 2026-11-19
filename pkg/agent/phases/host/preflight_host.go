@@ -82,8 +82,8 @@ func (c simpleHostChecker) Check(ctx context.Context) []preflight.Result { retur
 //
 // The mode comes from cfg. For nspawn the list is the one this package has
 // always returned. For none the nspawn runtime check is replaced by the none
-// backend's own preflight, which refuses a host that already runs a kubelet or
-// containerd the agent does not own, or whose /etc, /opt or /var is read only,
+// backend's own preflight, which checks for processes outside the host services
+// and writable paths,
 // and the systemd-container package is not required. The kubelet and
 // containerd "active" checks stay: they report the same conflict early with the
 // check names operators already know.

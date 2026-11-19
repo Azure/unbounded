@@ -159,19 +159,17 @@ func TestPreflightReportsUnknownMode(t *testing.T) {
 	assert.Contains(t, results[0].Message, "bogus")
 }
 
-func TestCheckNoneBackendRefusesUnmanagedKubeletWithSuggestedMode(t *testing.T) {
+func TestCheckNoneBackendAcceptsInstalledKubeletUnit(t *testing.T) {
 	t.Parallel()
 
 	units := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(units, "kubelet.service"), nil, 0o644))
 
-	b := &none.Backend{Host: &none.HostFS{UnitDirs: []string{units}, BinDirs: nil, Proc: filepath.Join(t.TempDir(), "proc")}, Layout: none.Layout{Base: filepath.Join(t.TempDir(), "node")}}
+	b := &none.Backend{Host: &none.HostFS{UnitDirs: []string{units}, BinDirs: nil, Proc: filepath.Join(t.TempDir(), "proc")}, Layout: none.Layout{Base: filepath.Join(t.TempDir(), "node")}, CheckPaths: []string{t.TempDir()}}
 	results := checkNoneBackend(slog.New(slog.DiscardHandler), b).Check(context.Background())
 
 	require.Len(t, results, 1)
-	assert.Equal(t, preflight.SeverityError, results[0].Severity)
-	assert.Contains(t, results[0].Message, "kubelet unit")
-	assert.Contains(t, results[0].Message, "use isolation mode nspawn", "invariant 5: fail fast with a suggested mode")
+	assert.Equal(t, preflight.SeverityOK, results[0].Severity)
 }
 
 func TestCheckNoneBackendRefusesUnmanagedContainerdProcess(t *testing.T) {

@@ -179,32 +179,29 @@ func TestNonePlanEnsureNodeStartedFailureNamesTheTaskAndRecordsNothing(t *testin
 		errors.New("start-none-node: wait-for-kubelet-bootstrap: kubelet did not bootstrap")))
 }
 
-// The ownership check is part of EnsureHostClean, not only of the optional
-// preflight subcommand: the plan neither stops nor disables a distro kubelet or
-// containerd, so a host that has one must be refused before anything changes.
-func TestNonePlanEnsureHostCleanRunsTheOwnershipCheck(t *testing.T) {
+func TestNonePlanDeactivatesBeforeOwnershipCheck(t *testing.T) {
 	p, s, _, _ := newNonePlan(t, false)
-	s.cfg = &provision.UnboundedAgentConfig{AgentConfig: config.AgentConfig{Isolation: "none"}}
 
-	called := false
+	var calls []string
+	p.deactivate = func(context.Context) error {
+		calls = append(calls, "deactivate")
+		return nil
+	}
 	p.ownership = func() error {
-		called = true
-
-		return errors.New("kubelet unit /lib/systemd/system/kubelet.service exists and is not managed by the agent")
+		calls = append(calls, "ownership")
+		return errors.New("kubelet is already running")
 	}
 
-	err := s.EnsureHostClean(t.Context())
-	if err != nil && strings.Contains(err.Error(), "existing node deployment detected") {
-		t.Skip("the test host has node artifacts; the ownership check is not reached")
-	}
-
-	require.True(t, called)
-	require.ErrorContains(t, err, "needs a host without a kubelet or containerd of its own")
-	require.ErrorContains(t, err, "kubelet.service")
+	err := p.deactivateAndCheck(t.Context(), s)
+	require.Equal(t, []string{"deactivate", "ownership"}, calls)
+	require.ErrorContains(t, err, "kubelet is already running")
 
 	p.ownership = func() error { return nil }
+	require.NoError(t, p.deactivateAndCheck(t.Context(), s))
 
-	require.NoError(t, s.EnsureHostClean(t.Context()))
+	p.deactivate = func(context.Context) error { return errors.New("mask failed") }
+	p.ownership = func() error { t.Fatal("ownership check after deactivation failure"); return nil }
+	require.ErrorContains(t, p.deactivateAndCheck(t.Context(), s), "mask failed")
 }
 
 // prepareHostCalls returns the host.* constructors called inside the
@@ -271,8 +268,8 @@ func TestOnlyTheNSpawnPlanHardensAPT(t *testing.T) {
 	calls := prepareHostCalls(t, "stageplan_none.go", "nonePlan")
 	require.NotContains(t, calls, "HardenAPT", "the none plan has no machined to harden against")
 	require.Contains(t, calls, "RemoveAPTHardening")
-	require.NotContains(t, calls, "DisableContainerd", "EnsureHostClean refused a host with one")
-	require.NotContains(t, calls, "DisableKubelet", "EnsureHostClean refused a host with one")
+	require.NotContains(t, calls, "DisableContainerd", "deactivation is performed before the remaining host steps")
+	require.NotContains(t, calls, "DisableKubelet", "deactivation is performed before the remaining host steps")
 
 	// The container plan has no machine either. It still disables the distro
 	// containerd and kubelet, which would own the sockets the container shares

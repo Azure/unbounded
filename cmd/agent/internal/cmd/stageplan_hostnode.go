@@ -17,6 +17,7 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/hostnode"
 	"github.com/Azure/unbounded/pkg/agent/isolation"
 	"github.com/Azure/unbounded/pkg/agent/phases"
+	"github.com/Azure/unbounded/pkg/agent/phases/host"
 	"github.com/Azure/unbounded/pkg/agent/phases/rootfs"
 )
 
@@ -139,6 +140,10 @@ func (m hostMode) resolveInputs(ctx context.Context, s *agentStages, newNode fun
 // prepareHostSteps is the host preparation every plan runs: the host root, the
 // bootstrap binary, then steps in order, then the sync that makes it durable.
 func prepareHostSteps(ctx context.Context, s *agentStages, steps ...phases.Task) error {
+	if err := host.CheckServiceDeactivationSafe(ctx); err != nil {
+		return err
+	}
+
 	if err := hostroot.Prepare(ctx, s.log, "bin", "libexec"); err != nil {
 		return err
 	}

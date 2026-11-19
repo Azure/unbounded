@@ -13,11 +13,8 @@ import (
 
 const checkNoneBackendName = "none-backend"
 
-// CheckNoneBackend runs the none backend's own preflight: it fails when the
-// host already has a kubelet or containerd the agent does not own (unit,
-// binary or running process), or when /etc, /opt or /var is not writable. The
-// failure names the mode to use instead, rather than switching silently. It
-// mutates nothing.
+// CheckNoneBackend checks for processes bootstrap cannot stop and required
+// writable paths without changing the host.
 func CheckNoneBackend(log *slog.Logger) preflight.Checker {
 	return checkNoneBackend(log, &none.Backend{Log: log})
 }
@@ -30,6 +27,6 @@ func checkNoneBackend(log *slog.Logger, b *none.Backend) preflight.Checker {
 			return preflight.ResultsError(checkNoneBackendName, "isolation mode none", "%s", err.Error())
 		}
 
-		return preflight.ResultsOK(checkNoneBackendName, "isolation mode none", "no unmanaged kubelet or containerd, and /etc, /opt and /var are writable")
+		return preflight.ResultsOK(checkNoneBackendName, "isolation mode none", "no unmanaged kubelet or containerd outside the host services, and /etc, /opt and /var are writable")
 	}}
 }

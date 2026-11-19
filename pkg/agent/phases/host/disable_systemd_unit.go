@@ -7,7 +7,9 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"os/exec"
+	"path/filepath"
 
 	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/phases"
@@ -25,6 +27,7 @@ type disableSystemdUnits struct {
 	units    []string
 	log      *slog.Logger
 	runCmdAt func(context.Context, *slog.Logger, slog.Level, func(context.Context) *exec.Cmd, ...string) error
+	unitDir  string
 }
 
 // DisableDocker returns a task that stops and masks Docker on the host.
@@ -70,6 +73,23 @@ func (d *disableSystemdUnits) ensureDisabled(ctx context.Context) error {
 		// informational messages (e.g. "Created symlink ...") to stderr on
 		// success, so use Info level to avoid misleading Error logs.
 		if err := d.runCmdAt(ctx, d.log, slog.LevelInfo, systemctl, "mask", unit); err != nil {
+			dir := d.unitDir
+			if dir == "" {
+				dir = "/etc/systemd/system"
+			}
+
+			// A locally installed unit file cannot be masked without replacing it.
+			// Disable it instead, preserving the administrator's unit file.
+			info, statErr := os.Lstat(filepath.Join(dir, unit))
+			if (unit == kubeletServiceUnit || unit == containerdServiceUnit) && statErr == nil && info.Mode().IsRegular() {
+				if disableErr := d.runCmdAt(ctx, d.log, slog.LevelInfo, systemctl, "disable", unit); disableErr != nil {
+					return fmt.Errorf("disabling %s after mask failed: %w", unit, disableErr)
+				}
+
+				d.log.WarnContext(ctx, "unit file cannot be masked without replacing it; disabled instead", "unit", unit)
+				continue
+			}
+
 			return fmt.Errorf("masking %s: %w", unit, err)
 		}
 	}

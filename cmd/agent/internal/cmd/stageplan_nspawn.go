@@ -56,6 +56,10 @@ func nspawnHostSteps(s *agentStages) phases.Task {
 }
 
 func (nspawnPlan) PrepareHost(ctx context.Context, s *agentStages) error {
+	if err := host.CheckServiceDeactivationSafe(ctx); err != nil {
+		return err
+	}
+
 	if err := hostroot.Prepare(ctx, s.log, "bin", "libexec"); err != nil {
 		return err
 	}

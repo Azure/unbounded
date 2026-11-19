@@ -20,6 +20,10 @@ func runningNode(t *testing.T) (*Backend, HostFS) {
 	h, root := fakeHost(t)
 	require.NoError(t, os.WriteFile(filepath.Join(h.UnitDirs[0], "kubelet.service"), nil, 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(h.UnitDirs[0], "containerd.service"), nil, 0o644))
+	proc := filepath.Join(h.Proc, "123")
+	require.NoError(t, os.MkdirAll(proc, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(proc, "comm"), []byte("kubelet\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(proc, "cgroup"), []byte("0::/system.slice/kubelet.service\n"), 0o644))
 
 	cgroup := filepath.Join(root, "cgroup")
 	require.NoError(t, os.MkdirAll(cgroup, 0o755))
@@ -40,8 +44,8 @@ func TestPreflightStaticAcceptsAHostThatRunsANode(t *testing.T) {
 	b, _ := runningNode(t)
 
 	require.NoError(t, b.PreflightStatic(), "the node being migrated must not fail the static half")
-	require.ErrorContains(t, b.PreflightOwnership(), "not managed by the agent")
-	require.ErrorContains(t, b.Preflight(), "not managed by the agent", "the combined preflight keeps refusing a foreign stack")
+	require.ErrorContains(t, b.PreflightOwnership(), "kubelet is already running")
+	require.NoError(t, b.Preflight(), "bootstrap can stop the systemd service")
 }
 
 func TestPreflightOwnershipAcceptsACleanHost(t *testing.T) {
@@ -51,6 +55,40 @@ func TestPreflightOwnershipAcceptsACleanHost(t *testing.T) {
 	require.NoError(t, b.PreflightOwnership())
 	require.NoError(t, b.PreflightStatic())
 	require.NoError(t, b.Preflight())
+}
+
+func TestPreflightOnlyExemptsMatchingServiceCgroups(t *testing.T) {
+	b, h := runningNode(t)
+	proc := filepath.Join(h.Proc, "123")
+
+	for _, tc := range []struct {
+		name    string
+		cgroup  string
+		allowed bool
+	}{
+		{"service", "0::/system.slice/kubelet.service\n", true},
+		{"service child", "0::/system.slice/kubelet.service/child\n", true},
+		{"other service", "0::/system.slice/containerd.service\n", false},
+		{"similar name", "0::/system.slice/not-kubelet.service\n", false},
+		{"malformed", "kubelet.service\n", false},
+		{"missing", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(proc, "cgroup")
+			if tc.cgroup == "" {
+				require.NoError(t, os.Remove(path))
+			} else {
+				require.NoError(t, os.WriteFile(path, []byte(tc.cgroup), 0o644))
+			}
+
+			if tc.allowed {
+				require.NoError(t, b.Preflight())
+			} else {
+				require.ErrorContains(t, b.Preflight(), "kubelet is already running")
+			}
+			require.ErrorContains(t, b.PreflightOwnership(), "kubelet is already running")
+		})
+	}
 }
 
 func TestPreflightStaticFailures(t *testing.T) {

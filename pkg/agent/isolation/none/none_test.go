@@ -159,8 +159,8 @@ func TestDetectUnmanagedFindsUnitsBinariesAndProcesses(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(other, "comm"), []byte("sshd\n"), 0o644))
 
 	got := strings.Join(h.DetectUnmanaged("/opt/unbounded/node"), "\n")
-	require.Contains(t, got, "kubelet unit")
-	require.Contains(t, got, "containerd binary")
+	require.NotContains(t, got, "kubelet unit")
+	require.NotContains(t, got, "containerd binary")
 	require.Contains(t, got, "kubelet is already running as pid 4242")
 	require.NotContains(t, got, "sshd")
 }
@@ -177,9 +177,7 @@ func TestDetectUnmanagedIgnoresAgentOwnedProcess(t *testing.T) {
 	require.Empty(t, h.DetectUnmanaged(base))
 }
 
-// A unit masked to /dev/null cannot start; the nspawn mode leaves the distro's
-// containerd and kubelet masked, and a mask is not a foreign stack. A dangling
-// link or a link anywhere else still is.
+// Installed unit files and symlinks do not themselves represent running processes.
 func TestDetectUnmanagedTreatsAMaskedUnitAsAbsent(t *testing.T) {
 	h, _ := fakeHost(t)
 	require.NoError(t, os.Symlink(os.DevNull, filepath.Join(h.UnitDirs[0], "kubelet.service")))
@@ -196,8 +194,7 @@ func TestDetectUnmanagedTreatsAMaskedUnitAsAbsent(t *testing.T) {
 	require.NoError(t, os.Symlink(filepath.Join(t.TempDir(), "missing"), filepath.Join(h.UnitDirs[0], "kubelet.service")))
 
 	got := strings.Join(h.DetectUnmanaged("/opt/unbounded/node"), "\n")
-	require.Contains(t, got, "containerd unit")
-	require.Contains(t, got, "kubelet unit")
+	require.Empty(t, got)
 }
 
 // Flip is durable: the link change is synced to the base directory, and a
@@ -228,12 +225,14 @@ func TestDetectUnmanagedAgentUnitsAreNotForeign(t *testing.T) {
 
 func TestPreflightRefusesUnmanagedStack(t *testing.T) {
 	h, _ := fakeHost(t)
-	require.NoError(t, os.WriteFile(filepath.Join(h.UnitDirs[0], "containerd.service"), nil, 0o644))
+	proc := filepath.Join(h.Proc, "42")
+	require.NoError(t, os.MkdirAll(proc, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(proc, "comm"), []byte("containerd\n"), 0o644))
 
 	b := &Backend{Layout: Layout{Base: filepath.Join(t.TempDir(), "node")}, Host: &h}
 	err := b.Preflight()
-	require.ErrorContains(t, err, "not managed by the agent")
-	require.ErrorContains(t, err, "use isolation mode nspawn")
+	require.ErrorContains(t, err, "containerd is already running as pid 42")
+	require.ErrorContains(t, err, "stop the unmanaged processes")
 }
 
 func TestCheckWritable(t *testing.T) {

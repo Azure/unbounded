@@ -15,9 +15,9 @@ import (
 // HostFS locates the host paths preflight inspects. Tests point the fields at
 // a temporary tree; production uses DefaultHostFS.
 type HostFS struct {
-	// UnitDirs are directories searched for systemd unit files.
+	// UnitDirs is retained for compatibility; installed unit files are not conflicts.
 	UnitDirs []string
-	// BinDirs are directories searched for executables.
+	// BinDirs is retained for compatibility; installed binaries are not conflicts.
 	BinDirs []string
 	// Proc is the procfs mount.
 	Proc string
@@ -33,54 +33,25 @@ var DefaultHostFS = HostFS{
 	Cgroup:   "/sys/fs/cgroup",
 }
 
-// foreign names the components that must not already be on the host.
+// foreign names the components that must not be running outside agent ownership.
 var foreign = []struct{ unit, binary string }{
 	{"kubelet.service", "kubelet"},
 	{"containerd.service", "containerd"},
 }
 
-// DetectUnmanaged returns one finding per kubelet or containerd the agent does
-// not own: a unit file, an executable on the standard paths, or a running
-// process. The agent refuses to start with any finding, since two kubelets or
-// two containerds on one host fight over the same sockets and directories.
-//
-// Binaries below the agent's own base are not findings, and a process whose
-// executable lives below ownedBase is the agent's own.
+// DetectUnmanaged reports running processes outside the agent's own base.
+// Installed unit files and binaries are harmless after the units are masked.
 func (h HostFS) DetectUnmanaged(ownedBase string) []string {
-	var findings []string
-
-	for _, f := range foreign {
-		for _, dir := range h.UnitDirs {
-			path := filepath.Join(dir, f.unit)
-			if _, err := os.Lstat(path); err == nil && !masked(path) {
-				findings = append(findings, fmt.Sprintf("%s unit %s exists and is not managed by the agent", f.binary, path))
-			}
-		}
-
-		for _, dir := range h.BinDirs {
-			path := filepath.Join(dir, f.binary)
-			if _, err := os.Lstat(path); err == nil {
-				findings = append(findings, fmt.Sprintf("%s binary %s exists and is not managed by the agent", f.binary, path))
-			}
-		}
-	}
-
-	findings = append(findings, h.runningProcesses(ownedBase)...)
-
-	return findings
+	return h.runningProcesses(ownedBase, false)
 }
 
-// masked reports whether the unit file at path is a mask: a link to /dev/null.
-// A masked unit cannot start, so it is no kubelet or containerd of its own. The
-// nspawn mode masks the distro's containerd and kubelet, which is what a host
-// that once ran nspawn keeps.
-func masked(path string) bool {
-	target, err := filepath.EvalSymlinks(path)
-
-	return err == nil && target == os.DevNull
+// DetectUnmanagedBeforeDeactivation allows processes in the service cgroup
+// that bootstrap will stop, but reports processes outside those units.
+func (h HostFS) DetectUnmanagedBeforeDeactivation(ownedBase string) []string {
+	return h.runningProcesses(ownedBase, true)
 }
 
-func (h HostFS) runningProcesses(ownedBase string) []string {
+func (h HostFS) runningProcesses(ownedBase string, allowService bool) []string {
 	entries, err := os.ReadDir(h.Proc)
 	if err != nil {
 		return nil
@@ -109,11 +80,47 @@ func (h HostFS) runningProcesses(ownedBase string) []string {
 				continue
 			}
 
+			if allowService {
+				if ServiceOwnsProcess(h.Proc, e.Name(), f.unit, f.binary) {
+					continue
+				}
+			}
+
 			findings = append(findings, fmt.Sprintf("%s is already running as pid %s", f.binary, e.Name()))
 		}
 	}
 
 	return findings
+}
+
+// ServiceOwnsProcess verifies the process name and exact systemd service
+// cgroup; unreadable process metadata is not evidence of ownership.
+func ServiceOwnsProcess(proc, pid, unit, binary string) bool {
+	dir := filepath.Join(proc, pid)
+	comm, err := os.ReadFile(filepath.Join(dir, "comm"))
+	if err != nil || strings.TrimSpace(string(comm)) != binary {
+		return false
+	}
+
+	cgroup, err := os.ReadFile(filepath.Join(dir, "cgroup"))
+	return err == nil && inServiceCgroup(string(cgroup), unit)
+}
+
+func inServiceCgroup(cgroup, unit string) bool {
+	for _, line := range strings.Split(cgroup, "\n") {
+		fields := strings.SplitN(line, ":", 3)
+		if len(fields) != 3 {
+			continue
+		}
+
+		for _, part := range strings.Split(fields[2], "/") {
+			if part == unit {
+				return true
+			}
+		}
+	}
+
+	return false
 }
 
 // CheckWritable fails when any of paths cannot be written. A path that does not

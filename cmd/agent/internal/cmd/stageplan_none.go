@@ -8,6 +8,7 @@ import (
 	"fmt"
 
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/hostnode"
 	"github.com/Azure/unbounded/pkg/agent/isolation"
 	"github.com/Azure/unbounded/pkg/agent/isolation/none"
 	"github.com/Azure/unbounded/pkg/agent/noneops"
@@ -37,21 +38,25 @@ type nonePlan struct {
 
 	hostSeams
 
-	// ownership refuses a host that already has a kubelet or containerd of its
-	// own. Nil is the none backend's check of the real host.
-	ownership func() error
+	// ownership checks for processes remaining after service deactivation.
+	ownership  func() error
+	deactivate func(context.Context) error
 }
 
 var _ stagePlan = (*nonePlan)(nil)
 
-// EnsureHostClean refuses a host with a previous node deployment, then a host
-// with a kubelet or containerd the agent does not own: a unit (other than a
-// masked one), a binary on the standard paths, or a running process. The
-// ownership check is mandatory here, not only in the optional preflight
-// subcommand, because the rest of the plan relies on it: it neither stops nor
-// disables a distro containerd or kubelet.
+// EnsureHostClean refuses a host with a previous node deployment.
 func (p *nonePlan) EnsureHostClean(ctx context.Context, s *agentStages) error {
-	if err := host.EnsureNoExistingDeploymentFor(ctx, s.log, isolation.ModeNone); err != nil {
+	return host.EnsureNoExistingDeploymentFor(ctx, s.log, isolation.ModeNone)
+}
+
+func (p *nonePlan) deactivateAndCheck(ctx context.Context, s *agentStages) error {
+	deactivate := p.deactivate
+	if deactivate == nil {
+		deactivate = phases.Serial(s.log, host.DisableKubelet(s.log), host.DisableContainerd(s.log)).Do
+	}
+
+	if err := deactivate(ctx); err != nil {
 		return err
 	}
 
@@ -61,7 +66,7 @@ func (p *nonePlan) EnsureHostClean(ctx context.Context, s *agentStages) error {
 	}
 
 	if err := ownership(); err != nil {
-		return fmt.Errorf("isolation mode none needs a host without a kubelet or containerd of its own: %w", err)
+		return fmt.Errorf("isolation mode none has conflicting processes after service deactivation: %w", err)
 	}
 
 	return nil
@@ -77,13 +82,11 @@ func (p *nonePlan) ResolveInputs(ctx context.Context, s *agentStages) error {
 
 // PrepareHost is the nspawn plan's sequence without the steps that exist only
 // for the machine: no systemd-container, no apt hardening against machined
-// restarts (the guards first boot writes for every mode are removed), and no
-// DisableContainerd/DisableKubelet, since those stop and disable the distro
-// units and EnsureHostClean has already refused a host that has any. The
-// kernel modules the machine would have loaded at boot are loaded on the host
-// first, because the sysctls below need br_netfilter.
+// restarts (the guards first boot writes for every mode are removed). Kernel
+// modules are loaded on the host because the sysctls need br_netfilter.
 func (p *nonePlan) PrepareHost(ctx context.Context, s *agentStages) error {
 	return prepareHostSteps(ctx, s,
+		hostnode.Func("deactivate-unmanaged-node", func(ctx context.Context) error { return p.deactivateAndCheck(ctx, s) }),
 		host.InstallPackagesFor(s.log, isolation.ModeNone),
 		noneops.LoadKernelModules(s.log, nil),
 		phases.Parallel(s.log,

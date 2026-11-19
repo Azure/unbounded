@@ -170,7 +170,7 @@ set is organized around the same bootstrap phases as `unbounded-agent start`.
 | `existing-deployment` | Error | The host has no leftover node deployment from a previous run. In `nspawn` mode it looks for registered `kube1` and `kube2` machines and their files. In `none` mode it also looks for the host-native node directory and units, and in `container` mode for the container node directory and units. A resumed installation skips this check. |
 | `nspawn-runtime` | Warning | `nspawn` mode only. Required nspawn runtime tools are available: `systemctl`, `machinectl`, and `systemd-nspawn`. It also checks that `/run/systemd/system` is available. Missing tools are warnings because bootstrap may install them. |
 | `container-backend` | Error | `container` mode only (experimental). cgroup v2 is available, the SELinux `spc_t` label is accepted when SELinux is enforcing, and `/etc`, `/opt`, and `/var` are writable. A missing `runc` is not an error because bootstrap installs it. |
-| `none-backend` | Error | `none` mode only. No kubelet or containerd that the agent does not own is present (unit file other than one masked to `/dev/null`, executable, or running process), and `/etc`, `/opt/unbounded/node`, and `/var` are writable. The failure names the mode to use instead. Bootstrap runs the ownership half of this check itself, so a host with such a kubelet or containerd is refused even without `preflight`. |
+| `none-backend` | Error | `none` mode only. No unmanaged kubelet or containerd process is running outside the host service that bootstrap will stop, and `/etc`, `/opt/unbounded/node`, and `/var` are writable. Bootstrap checks again for remaining unmanaged processes after stopping the host services. Unit files and binaries may remain installed. |
 | `docker-active` | Warning | Docker is active. Bootstrap will disable Docker when needed. |
 | `containerd-active` | Warning | The host containerd service is active. Bootstrap will disable it before starting the node. |
 | `kubelet-active` | Warning | The host kubelet service is active. Bootstrap will disable it before starting the node. |
@@ -202,8 +202,8 @@ verify that `nvidia-smi -L` lists GPUs before retrying bootstrap.
 | Check | Severity when failing | What it validates |
 |---|---|---|
 | `api-server-reachable` | Error | Cluster CA data and bootstrap credentials are valid enough to use, the configured API server endpoint is well formed, and the host can reach the API server `/readyz` endpoint. API server responses with status 500 or higher are fatal. |
-| `kubelet-bind-address` | Error | No TCP listener occupies kubelet's `0.0.0.0:10250` port in the shared host network namespace. |
-| `containerd-metrics-bind-address` | Error | No TCP listener occupies containerd's configured metrics port, currently `0.0.0.0:10257`, in the shared host network namespace. |
+| `kubelet-bind-address` | Error or warning | Checks kubelet's `0.0.0.0:10250` port in the shared host network namespace. A listener owned by the host kubelet service that bootstrap will stop is a warning; other foreign listeners are errors. |
+| `containerd-metrics-bind-address` | Error or warning | Checks containerd's configured metrics port, currently `0.0.0.0:10257`, in the shared host network namespace. A listener owned by the host containerd service that bootstrap will stop is a warning; other foreign listeners are errors. |
 
 ### Rootfs and Artifact Checks
 

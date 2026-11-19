@@ -36,17 +36,20 @@ type apiServerReachableChecker struct {
 func Preflight(log *slog.Logger, cfg config.AgentConfig, goalState *goalstates.MachineGoalState) []preflight.Checker {
 	root, kubeletExe, containerdExe := ownerIdentity(cfg, goalState)
 
+	kubeletCheck := checkOwnedBindAddress(log, checkKubeletBindAddressName, kubeletBindAddress, "kubelet bind address", root, kubeletExe).(bindAddressChecker)
+	kubeletCheck.deactivated = func() bool {
+		return listenerOwnedByService("/proc", kubeletBindAddress, "kubelet.service", "kubelet")
+	}
+	containerdAddress := goalState.NodeStart.Containerd.MetricsAddress
+	containerdCheck := checkOwnedBindAddress(log, checkContainerdMetricsBindAddressName, containerdAddress, "containerd metrics bind address", root, containerdExe).(bindAddressChecker)
+	containerdCheck.deactivated = func() bool {
+		return listenerOwnedByService("/proc", containerdAddress, "containerd.service", "containerd")
+	}
+
 	return []preflight.Checker{
 		// TODO: Consider moving the kubelet bind address to the kubelet goal state.
-		checkOwnedBindAddress(log, checkKubeletBindAddressName, kubeletBindAddress, "kubelet bind address", root, kubeletExe),
-		checkOwnedBindAddress(
-			log,
-			checkContainerdMetricsBindAddressName,
-			goalState.NodeStart.Containerd.MetricsAddress,
-			"containerd metrics bind address",
-			root,
-			containerdExe,
-		),
+		kubeletCheck,
+		containerdCheck,
 		CheckAPIServerReachable(log, cfg),
 	}
 }
