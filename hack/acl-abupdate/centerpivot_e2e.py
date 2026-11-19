@@ -92,6 +92,9 @@ REQUEST_ANNOTATION = f"{PREFIX}/update-request"
 TRIDENT_AGENT = "trident-acl-agent.service"
 HOST_AGENT_DROP_IN = f"/etc/systemd/system/{TRIDENT_AGENT}.d/50-unbounded-centerpivot.conf"
 UPDATING_PHASES = frozenset({"Checking", "Staging", "Draining", "Finalizing", "Restarting", "Recovering"})
+# An update's phases, each with the one that follows it.
+UPDATE_PATH = (("Checking", "Staging"), ("Staging", "Draining"), ("Draining", "Finalizing"),
+               ("Finalizing", "Restarting"), ("Restarting", "Recovering"), ("Recovering", "Idle"))
 
 # The Site's centerPivot timings: short enough for a test, and within its CRD's budget.
 SETTINGS: dict[str, Any] = {
@@ -344,6 +347,22 @@ def sample_of(names: list[str], nodes: dict[str, Any], machines: dict[str, Any],
     return {"time": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
             "nodes": {name: node_view(by_node.get(name), by_machine.get(name)) for name in names},
             "available": available}
+
+
+def phase_counts(text: str, site: str) -> dict[tuple[str, str], float]:
+    """centerpivot_phase_seconds' counts for the Site, by phase and the phase that followed, from
+    Prometheus's text format."""
+    counts: dict[tuple[str, str], float] = {}
+    prefix = "centerpivot_phase_seconds_count{"
+    for line in text.splitlines():
+        if not line.startswith(prefix):
+            continue
+        labels_text, _, value = line[len(prefix):].rpartition("} ")
+        labels = dict(re.findall(r'(\w+)="([^"]*)"', labels_text))
+        if labels.get("site") == site:
+            key = (labels.get("phase", ""), labels.get("next", ""))
+            counts[key] = counts.get(key, 0) + float(value)
+    return counts
 
 
 def updated(view: dict[str, Any], target: str) -> bool:
@@ -614,6 +633,18 @@ class E2E:
         self.kubectl("-n", NAMESPACE, "rollout", "status", "deployment/centerpivot", "--timeout=300s")
         self.kubectl("-n", NAMESPACE, "rollout", "status", "daemonset/centerpivot-node-info", "--timeout=300s")
         log("centerpivot is installed")
+
+    def phase_counts(self) -> dict[tuple[str, str], float]:
+        """centerpivot_phase_seconds' counts for Site e2e, from each centerpivot pod's metrics: only
+        the leader's grow."""
+        total: dict[tuple[str, str], float] = {}
+        pods = self.kubectl_json("-n", NAMESPACE, "get", "pods", "-l", "app.kubernetes.io/name=centerpivot")
+        for pod in pods["items"]:
+            text = self.kubectl("get", "--raw", f"/api/v1/namespaces/{NAMESPACE}/pods/{pod['metadata']['name']}:8080"
+                                "/proxy/metrics").stdout
+            for key, count in phase_counts(text, SITE).items():
+                total[key] = total.get(key, 0) + count
+        return total
 
     def site(self, center_pivot_spec: dict[str, Any]) -> None:
         self.apply(site_manifest(self.spec, center_pivot_spec))
@@ -1022,10 +1053,16 @@ def scenario(name: str, description: str) -> Callable[[Scenario], Scenario]:
 @scenario("rolling", "Both nodes update, one at a time, and a workload with a PodDisruptionBudget stays available")
 def rolling(ctx: Context) -> None:
     ctx.deploy_workload()
+    # The metric counts since centerpivot started, so the scenario's are what it adds.
+    counted = ctx.e2e.phase_counts()
     ctx.enable()
     with Monitor(ctx.e2e) as ctx.monitor:
         ctx.wait("both nodes to update", lambda s: ctx.updated(ctx.a)(s) and ctx.updated(ctx.b)(s),
                  2 * UPDATE_SECONDS)
+    added = {step: count - counted.get(step, 0) for step, count in ctx.e2e.phase_counts().items()}
+    ctx.expect(all(added.get(step) == 2 for step in UPDATE_PATH),
+               "centerpivot_phase_seconds counted each phase of both updates",
+               str({f"{a}->{b}": added.get((a, b), 0) for a, b in UPDATE_PATH}))
     samples = ctx.monitor.all()
     ctx.expect(most_updating(samples) == 1, "no more than maxUnavailable, 1, node updated at once",
                f"{most_updating(samples)} did")

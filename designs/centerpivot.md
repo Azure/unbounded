@@ -463,7 +463,10 @@ To make a stop visible:
    (`centerpivot_nodes`), updates under way (`centerpivot_updating_nodes`),
    held nodes (`centerpivot_held_nodes`), and why a Site's due nodes can't
    start (`centerpivot_updates_blocked`, by Site: `held`; `unavailable`, when
-   nodes that aren't updating use every slot; or `invalid_settings`).
+   nodes that aren't updating use every slot; or `invalid_settings`). It also
+   exports how long each phase of an update took (`centerpivot_phase_seconds`),
+   by the phase that followed, so a drain that missed its deadline stands
+   apart from one that finished.
 
 ### 4.10 Restarts, rebuilds, and other maintenance
 

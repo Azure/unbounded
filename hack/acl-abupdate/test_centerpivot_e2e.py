@@ -169,6 +169,20 @@ class SampleTest(unittest.TestCase):
         self.assertEqual(e2e.phases_seen(samples, "acl-e2e-1"), ["Idle", "Staging", "Idle"])
         self.assertEqual(e2e.most_updating([]), 0)
 
+    def test_phase_counts(self) -> None:
+        text = "\n".join([
+            "# HELP centerpivot_phase_seconds How long nodes spent in each phase of an update.",
+            "# TYPE centerpivot_phase_seconds histogram",
+            'centerpivot_phase_seconds_bucket{app="acl",next="Draining",phase="Staging",site="e2e",le="5"} 0',
+            'centerpivot_phase_seconds_sum{app="acl",next="Draining",phase="Staging",site="e2e"} 61.5',
+            'centerpivot_phase_seconds_count{app="acl",next="Draining",phase="Staging",site="e2e"} 2',
+            'centerpivot_phase_seconds_count{app="",next="Draining",phase="Staging",site="e2e"} 1',
+            'centerpivot_phase_seconds_count{app="acl",next="Idle",phase="Draining",site="e2e"} 1',
+            'centerpivot_phase_seconds_count{app="acl",next="Draining",phase="Staging",site="other"} 5',
+        ])
+        self.assertEqual(e2e.phase_counts(text, "e2e"), {("Staging", "Draining"): 3, ("Draining", "Idle"): 1})
+        self.assertEqual(e2e.phase_counts("", "e2e"), {})
+
     def test_operations_seen(self) -> None:
         def sample(request: str) -> dict:
             return {"nodes": {"acl-e2e-1": {"request": request}}}

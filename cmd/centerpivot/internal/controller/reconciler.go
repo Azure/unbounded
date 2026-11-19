@@ -121,7 +121,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		node = nil
 	}
 
-	settings, ok, err := r.settingsFor(ctx, siteOf(node, machine))
+	site := siteOf(node, machine)
+
+	settings, ok, err := r.settingsFor(ctx, site)
 	if err != nil || !ok {
 		return reconcile.Result{}, err
 	}
@@ -158,6 +160,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	if changed {
 		if err := writeState(ctx, r.Client, machine, next); err != nil {
 			return reconcile.Result{}, err
+		}
+
+		// After the write, so a pass that's tried again doesn't count twice.
+		if spent, left := phaseTime(before, next, p.now); left {
+			phaseSeconds.WithLabelValues(site, appName(p), string(before.Phase), string(next.Phase)).Observe(spent.Seconds())
 		}
 	}
 
@@ -755,6 +762,21 @@ func sourceOf(check omaha.Check) contract.Source {
 
 func requestSource(request *contract.Request) contract.Source {
 	return contract.Source{Server: request.Server, AppID: request.AppID, Track: request.Track}
+}
+
+// appName returns the name of the app the node runs, or "" while its Node
+// doesn't exist or names no app of the Site.
+func appName(p *pass) string {
+	if p.node == nil {
+		return ""
+	}
+
+	app, err := p.settings.AppFor(p.node.Labels)
+	if err != nil {
+		return ""
+	}
+
+	return app.Name
 }
 
 // siteOf returns the node's Site, from the Node, or from the Machine while
