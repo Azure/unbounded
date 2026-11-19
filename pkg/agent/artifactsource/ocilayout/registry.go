@@ -12,7 +12,8 @@ import (
 	"oras.land/oras-go/v2/registry/remote/auth"
 	"oras.land/oras-go/v2/registry/remote/retry"
 
-	"github.com/Azure/unbounded/internal/ociutil"
+	"github.com/Azure/unbounded/internal/helpers/ociregistry"
+	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 )
 
 const (
@@ -26,7 +27,7 @@ func newRemoteRepository(ref string) (*remote.Repository, error) {
 		return nil, err
 	}
 
-	ociutil.ConfigurePlainHTTP(repo)
+	ociregistry.ConfigurePlainHTTP(repo)
 	configureOCIPullRetry(repo)
 
 	return repo, nil
@@ -57,7 +58,7 @@ func newOCIPullRetryPolicy() retry.Policy {
 }
 
 func retryOCIPullFailure(resp *http.Response, err error) (bool, error) {
-	if ociutil.RetryableNetworkError(err) {
+	if utilio.IsRetryableNetworkError(err) {
 		return true, nil
 	}
 
@@ -103,7 +104,7 @@ func retryOCIPullOperation(
 			return nil
 		}
 
-		if !ociutil.RetryableNetworkError(err) || attempt == ociPullMaxAttempts {
+		if !utilio.IsRetryableNetworkError(err) || attempt == ociPullMaxAttempts {
 			return err
 		}
 

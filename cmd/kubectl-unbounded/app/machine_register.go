@@ -102,9 +102,6 @@ type machineRegisterHandler struct {
 	// kubeResourcesCli is the controller-runtime client used for server-side apply of manifests.
 	kubeResourcesCli client.Client
 
-	// kubectl is function that creates a kubectl command pointed to the correct KUBECONFIG for the cluster.
-	kubectl kube.KubectlFunc
-
 	logger *slog.Logger
 }
 
@@ -134,7 +131,6 @@ func (h *machineRegisterHandler) executeAfterValidation(ctx context.Context) err
 
 		h.kubeCli = kubeCli
 		h.kubeConfig = kubeConfig
-		h.kubectl = kube.Kubectl(nil, h.kubeconfigPath)
 
 		kubeResourcesCli, err := client.New(kubeConfig, client.Options{})
 		if err != nil {
@@ -343,7 +339,7 @@ func (h *machineRegisterHandler) setDefaults() {
 		// Strip port from host if present, so "10.0.0.5:2222" becomes "10.0.0.5-2222"
 		// after sanitization. We use the raw host string for sanitization so the colon
 		// gets replaced with a dash.
-		h.name = fmt.Sprintf("%s-%s", h.siteName, kube.SanitizeK8sName(h.host))
+		h.name = fmt.Sprintf("%s-%s", h.siteName, sanitizeK8sName(h.host))
 	} else {
 		h.name = fmt.Sprintf("%s-%s", h.siteName, h.name)
 	}

@@ -10,17 +10,17 @@ import (
 	"io"
 	"log/slog"
 	"os/exec"
-
-	"github.com/Azure/unbounded/internal/helpers"
+	"slices"
+	"strings"
 )
 
 func Kubectl(env []string, kubeconfig string) func(context.Context) *exec.Cmd {
 	return func(ctx context.Context) *exec.Cmd {
-		envMap := helpers.EnvSliceToMap(env)
-		envMap["KUBECONFIG"] = kubeconfig
-
 		c := exec.CommandContext(ctx, "kubectl")
-		c.Env = helpers.EnvMapToSlice(envMap)
+
+		c.Env = append(slices.DeleteFunc(slices.Clone(env), func(v string) bool {
+			return strings.HasPrefix(v, "KUBECONFIG=")
+		}), "KUBECONFIG="+kubeconfig)
 
 		return c
 	}

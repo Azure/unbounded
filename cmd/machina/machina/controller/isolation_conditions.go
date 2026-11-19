@@ -11,7 +11,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	"github.com/Azure/unbounded/internal/machineops"
+	"github.com/Azure/unbounded/internal/helpers/statusmsg"
 	"github.com/Azure/unbounded/internal/provision"
 )
 
@@ -89,7 +89,7 @@ func syncIsolationConditions(machine *unboundedv1alpha3.Machine, now time.Time, 
 		}
 	}
 
-	cond.Message = machineops.TruncateUTF8Bytes(cond.Message, machineops.MaxConditionMessageBytes)
+	cond.Message = statusmsg.TruncateCondition(cond.Message)
 
 	return setConditionIfChanged(machine, cond), recheck
 }

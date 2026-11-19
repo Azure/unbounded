@@ -12,8 +12,8 @@ import (
 	"sigs.k8s.io/yaml"
 
 	machinav1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/hack/cmd/forge/forge/kube"
 	"github.com/Azure/unbounded/hack/cmd/forge/forge/site/azuredev"
-	"github.com/Azure/unbounded/internal/kube"
 	"github.com/Azure/unbounded/internal/unbounded"
 )
 

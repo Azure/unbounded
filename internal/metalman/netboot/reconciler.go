@@ -30,11 +30,12 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	"github.com/Azure/unbounded/internal/ociutil"
+	"github.com/Azure/unbounded/internal/helpers/dockermedia"
+	"github.com/Azure/unbounded/internal/helpers/ociregistry"
 )
 
 func init() {
-	ociutil.RegisterDockerParsers()
+	dockermedia.RegisterParsers()
 }
 
 // imageResyncInterval is how often the reconciler re-resolves remote tags
@@ -207,7 +208,7 @@ func newRepository(imageRef string) (*remote.Repository, error) {
 	}
 
 	// Use plain HTTP for loopback and private-network registries.
-	ociutil.ConfigurePlainHTTP(repo)
+	ociregistry.ConfigurePlainHTTP(repo)
 
 	return repo, nil
 }
@@ -520,7 +521,7 @@ func unpackOCILayout(ctx context.Context, layoutDir, tag, destDir, architecture 
 	// Convert Docker media types to OCI equivalents so that umoci's strict
 	// media-type checks pass. Docker V2 images use different MIME types for
 	// the config and layer blobs but are structurally identical to OCI.
-	ociutil.ConvertDockerMediaTypes(&manifest)
+	dockermedia.ConvertToOCI(&manifest)
 
 	unpackOpts := &layer.UnpackOptions{
 		OnDiskFormat: layer.DirRootfs{

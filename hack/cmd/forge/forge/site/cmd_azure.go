@@ -73,7 +73,6 @@ func addSiteCmd(siteCmdContext *siteCommandContext, site *azuredev.Datacenter) *
 
 			site.ClusterDetails = clusterDetails
 			site.KubeCli = clusterDetails.KubeCli
-			site.Kubectl = clusterDetails.Kubectl
 
 			if err := site.ApplyDatacenterSite(cmd.Context()); err != nil {
 				return fmt.Errorf("apply datacenter site: %w", err)
@@ -152,7 +151,6 @@ func addPoolCmd(siteCmdContext *siteCommandContext, site *azuredev.Datacenter) *
 
 			site.ClusterDetails = clusterDetails
 			site.KubeCli = clusterDetails.KubeCli
-			site.Kubectl = clusterDetails.Kubectl
 
 			mp.SSHKeyPair.Logger = site.Logger
 

@@ -25,6 +25,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/helpers/statusmsg"
 	"github.com/Azure/unbounded/internal/provision"
 	publicmachineops "github.com/Azure/unbounded/pkg/machineops"
 )
@@ -738,7 +739,7 @@ func (r *MachineOperationReconciler) finishAllocationOperation(
 		targetMessage = fmt.Sprintf("%s: %s", reason, message)
 	}
 
-	targetMessage = TruncateUTF8Bytes(targetMessage, MaxConditionMessageBytes)
+	targetMessage = statusmsg.TruncateCondition(targetMessage)
 
 	if err := r.updateOperationStatus(ctx, a.op.Name, func(latest *unboundedv1alpha3.MachineOperation) {
 		target, ok := operationTarget(latest, a.machine.Name)
@@ -829,7 +830,7 @@ func (r *MachineOperationReconciler) holdAllocationOperation(
 	message string,
 ) (ctrl.Result, error) {
 	reason = normalizeConditionReason(reason)
-	message = TruncateUTF8Bytes(fmt.Sprintf("%s: %s", reason, message), MaxConditionMessageBytes)
+	message = statusmsg.TruncateCondition(fmt.Sprintf("%s: %s", reason, message))
 
 	if err := r.updateOperationStatus(ctx, a.op.Name, func(latest *unboundedv1alpha3.MachineOperation) {
 		if latest.Status.IsTerminal() {

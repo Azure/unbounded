@@ -21,7 +21,6 @@ import (
 
 	"oras.land/oras-go/v2/registry/remote/retry"
 
-	"github.com/Azure/unbounded/internal/ociutil"
 	"github.com/Azure/unbounded/pkg/agent/internal/ociartifact"
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 )
@@ -65,7 +64,7 @@ func newHTTPDownloadRetryPolicy() retry.Policy {
 }
 
 func retryHTTPDownloadFailure(resp *http.Response, err error) (bool, error) {
-	if ociutil.RetryableNetworkError(err) {
+	if utilio.IsRetryableNetworkError(err) {
 		return true, nil
 	}
 
@@ -366,7 +365,7 @@ func retryableHTTPDownloadError(ctx context.Context, err error) bool {
 		return false
 	}
 
-	if ociutil.RetryableNetworkError(err) {
+	if utilio.IsRetryableNetworkError(err) {
 		return true
 	}
 
