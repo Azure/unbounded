@@ -71,20 +71,30 @@ func TestUnmanagedSupernetsHonorSkippedPeerPodCIDRs(t *testing.T) {
 		{PodCIDRs: []string{"10.245.1.0/24"}},
 	}
 	gateways := []gatewayPeerInfo{
-		{PodCIDRs: []string{"10.244.2.0/24"}, SkipPodCIDRRoutes: true},
-		{PodCIDRs: []string{"10.246.1.0/24"}},
+		{PodCIDRs: []string{"10.244.2.0/24", "fd44:2::/64"}, SkipPodCIDRRoutes: true},
+		{PodCIDRs: []string{"10.246.1.0/24", "fd46:1::/64"}},
 	}
 
 	supernets := collectSupernets(state, peers, gateways, gateways, nil, false)
-	for _, cidr := range []string{"10.244.0.0/16", "10.244.1.0/24", "10.244.2.0/24"} {
+	for _, cidr := range []string{"10.244.0.0/16", "10.244.1.0/24", "10.244.2.0/24", "10.244.2.1/32", "fd44:2::/64", "fd44:2::1/128"} {
 		if supernets[cidr] {
 			t.Fatalf("unmanaged local route %s was added: %v", cidr, supernets)
 		}
+
+		for _, prefix := range []string{"10.246.1.1/32", "fd46:1::1/128"} {
+			if !supernets[prefix] {
+				t.Fatalf("remote gateway health route %s was lost: %v", prefix, supernets)
+			}
+		}
 	}
 
-	for _, cidr := range []string{"10.245.1.0/24", "10.246.1.0/24"} {
+	for _, cidr := range []string{"10.245.1.0/24"} {
 		if !supernets[cidr] {
 			t.Fatalf("non-skipped peer route %s was lost: %v", cidr, supernets)
+		}
+
+		if supernets["10.246.1.0/24"] {
+			t.Fatalf("gateway identity injected its own PodCIDR without a slice or transit advertisement: %v", supernets)
 		}
 	}
 }

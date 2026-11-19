@@ -40,9 +40,9 @@ type setupNVIDIA struct {
 //  5. Selects CDI runtime mode so environment-variable requests from the
 //     device plugin resolve against the generated CDI spec.
 //
-// This task must run after StartNSpawnMachine (the machine must be booted and
-// the /run/host-nvidia/ bind mounts must be active) and before StartKubelet
-// (so pods can use GPUs immediately).
+// This task must run after StartNode's start-nspawn-machine task (the machine
+// must be booted and the /run/host-nvidia/ bind mounts must be active) and
+// before StartKubelet (so pods can use GPUs immediately).
 //
 // The task is a no-op when the NVIDIA runtime is not enabled or no library
 // mappings were discovered on the host.

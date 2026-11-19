@@ -27,7 +27,12 @@ func hashPeerIdentities(peers []WireGuardPeerStatus) peerIdentityDigest {
 	var size [8]byte
 
 	for _, peer := range peers {
-		for _, value := range [4]string{peer.Name, peer.Tunnel.Protocol, peer.Tunnel.Interface, peer.Tunnel.PublicKey} {
+		peerID := peer.PeerID
+		if peerID == "" {
+			peerID = peer.Name
+		}
+
+		for _, value := range [4]string{peerID, peer.Tunnel.Protocol, peer.Tunnel.Interface, peer.Tunnel.PublicKey} {
 			binary.BigEndian.PutUint64(size[:], uint64(len(value)))
 			_, _ = digest.Write(size[:])
 			_, _ = digest.Write([]byte(value))

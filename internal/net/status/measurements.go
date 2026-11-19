@@ -23,7 +23,12 @@ func PeerIdentityDigest(peers []statusv1alpha1.PeerStatus) ([]byte, error) {
 	var size [8]byte
 
 	for _, peer := range peers {
-		identity := [4]string{peer.Name, peer.Tunnel.Protocol, peer.Tunnel.Interface, peer.Tunnel.PublicKey}
+		peerID := peer.PeerID
+		if peerID == "" {
+			peerID = peer.Name
+		}
+
+		identity := [4]string{peerID, peer.Tunnel.Protocol, peer.Tunnel.Interface, peer.Tunnel.PublicKey}
 		if peer.Name == "" {
 			return nil, fmt.Errorf("peer identity has no name")
 		}
@@ -46,7 +51,7 @@ func PeerIdentityDigest(peers []statusv1alpha1.PeerStatus) ([]byte, error) {
 // PeerMetadataEqual excludes only measurements, not health state or topology.
 func PeerMetadataEqual(a, b statusv1alpha1.PeerStatus) bool {
 	ah, bh := a.HealthCheck, b.HealthCheck
-	if a.Name != b.Name || a.PeerType != b.PeerType || a.SiteName != b.SiteName ||
+	if a.PeerID != b.PeerID || a.Name != b.Name || a.PeerType != b.PeerType || a.SiteName != b.SiteName ||
 		a.SkipPodCIDRRoutes != b.SkipPodCIDRRoutes ||
 		!slices.Equal(a.PodCIDRGateways, b.PodCIDRGateways) ||
 		!slices.Equal(a.RouteDestinations, b.RouteDestinations) ||

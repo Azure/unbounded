@@ -957,7 +957,7 @@ function NodeDetailModal({
       const hcState = getPeerHealthCheckState(peer);
 
       return {
-        id: `${destination}-${peer.tunnel?.endpoint || index}`,
+        id: `${peer.peerId || destination}-${peerInterface}-${peer.tunnel?.endpoint || index}`,
         destination,
         destinationNodeAvailable: Boolean(peer.name && knownNodeNames.has(peer.name)),
         peerTypeLabel,

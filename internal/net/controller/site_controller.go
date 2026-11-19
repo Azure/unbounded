@@ -1115,16 +1115,10 @@ func (sc *SiteController) updateSiteSlicesForWork(ctx context.Context, work slic
 	// from every Site participate in deciding which Site owns a Node.
 	allSites := cachedSites
 
-	// Track which nodes belong to each site
-	// Gateway nodes are excluded - they are accessed via GatewayPool.Status.Nodes instead
+	// Site membership includes gateways; pool membership only adds transit routing.
 	siteNodesInfo := make(map[string][]unboundednetv1alpha1.NodeInfo)
 
 	for _, node := range nodes {
-		// Skip gateway nodes - they should not be in SiteNodeSlices
-		if sc.isNodeGateway(node) {
-			continue
-		}
-
 		siteName := sc.findSiteForNode(node, allSites)
 		if _, dirty := work.sites[siteName]; siteName != "" && (work.all || dirty) {
 			nodeInfo := sc.buildNodeInfo(node)
@@ -1132,9 +1126,7 @@ func (sc *SiteController) updateSiteSlicesForWork(ctx context.Context, work slic
 		}
 	}
 
-	// Count ALL nodes per site (including gateway nodes) for finalizer decisions.
-	// Gateway nodes are excluded from SiteNodeSlices but still count as assigned
-	// to a site for deletion-protection purposes.
+	// Count all assigned nodes for deletion protection, including unready nodes.
 	allSiteNodeCounts := make(map[string]int)
 
 	for _, node := range nodes {

@@ -34,6 +34,13 @@ func TestPeerIdentityDigest(t *testing.T) {
 		t.Fatal("different links to the same named peer must remain distinguishable")
 	}
 
+	another = peer
+
+	another.PeerID = "a/assignment/pool"
+	if _, err := PeerIdentityDigest([]statusv1alpha1.PeerStatus{peer, another}); err != nil {
+		t.Fatal("scoped relationships sharing a node and tunnel must remain distinguishable")
+	}
+
 	if _, err := PeerIdentityDigest([]statusv1alpha1.PeerStatus{peer, peer}); err == nil {
 		t.Fatal("duplicate identity accepted")
 	}
@@ -53,6 +60,7 @@ func TestPeerMetadataEqualAllFields(t *testing.T) {
 	base := statusv1alpha1.PeerStatus{Name: "peer"}
 
 	for field, change := range map[string]func(*statusv1alpha1.PeerStatus){
+		"relationship":    func(p *statusv1alpha1.PeerStatus) { p.PeerID = "peer/assignment/pool" },
 		"name":            func(p *statusv1alpha1.PeerStatus) { p.Name = "other" },
 		"type":            func(p *statusv1alpha1.PeerStatus) { p.PeerType = "site" },
 		"site":            func(p *statusv1alpha1.PeerStatus) { p.SiteName = "site-a" },

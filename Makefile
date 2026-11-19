@@ -1239,6 +1239,12 @@ MACHINA_MANIFEST_RENDERED_DIR  := deploy/machina/rendered
 MACHINE_OPS_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
 MACHINE_OPS_API_SERVER_ENDPOINT ?=
 MACHINE_OPS_EXPERIMENTAL_CONTAINER_ISOLATION ?= false
+# MACHINE_OPS_ENABLE_CAPACITY=true runs the MachineClass and MachineAllocation
+# controllers and binds their roles. The other three are optional.
+MACHINE_OPS_ENABLE_CAPACITY ?= false
+MACHINE_OPS_PROVIDER_CONFIG_NAMESPACE ?=
+MACHINE_OPS_ALLOCATION_CONSUMER_KINDS ?=
+MACHINE_OPS_WORKLOAD_IDENTITY_CLIENT_ID ?=
 MACHINE_OPS_MANIFEST_TEMPLATES_DIR := deploy/machine-ops
 MACHINE_OPS_MANIFEST_RENDERED_DIR  := deploy/machine-ops/rendered
 
@@ -1310,7 +1316,11 @@ machine-ops-manifests: ## Render machine-ops-controller manifests into deploy/ma
 		--set Provider=$(MACHINE_OPS_PROVIDER) \
 		--set Site=$(MACHINE_OPS_SITE) \
 		--set APIServerEndpoint=$(MACHINE_OPS_API_SERVER_ENDPOINT) \
-		--set ExperimentalContainerIsolation=$(MACHINE_OPS_EXPERIMENTAL_CONTAINER_ISOLATION)
+		--set ExperimentalContainerIsolation=$(MACHINE_OPS_EXPERIMENTAL_CONTAINER_ISOLATION) \
+		--set EnableCapacity=$(MACHINE_OPS_ENABLE_CAPACITY) \
+		--set ProviderConfigNamespace=$(MACHINE_OPS_PROVIDER_CONFIG_NAMESPACE) \
+		--set AllocationConsumerKinds=$(MACHINE_OPS_ALLOCATION_CONSUMER_KINDS) \
+		--set WorkloadIdentityClientID=$(MACHINE_OPS_WORKLOAD_IDENTITY_CLIENT_ID)
 	@echo "Rendered machine-ops manifests into $(MACHINE_OPS_MANIFEST_RENDERED_DIR) (image: $(MACHINE_OPS_CONTROLLER_IMAGE))"
 
 machina-run: machina ## Replace the in-cluster machina with a locally built binary

@@ -44,6 +44,14 @@ func TestPeerIdentityHashMatchesProtocol(t *testing.T) {
 				if hashPeerIdentities(peers) == got {
 					t.Fatal("identity boundaries are ambiguous")
 				}
+
+				peers[0].PeerID = "peer/assignment/pool"
+				scopedDigest, err := netstatus.PeerIdentityDigest(peers)
+
+				scopedHash := hashPeerIdentities(peers)
+				if err != nil || !bytes.Equal(scopedHash[:], scopedDigest) {
+					t.Fatal("scoped identity encoding differs from the wire protocol")
+				}
 			}
 		})
 	}

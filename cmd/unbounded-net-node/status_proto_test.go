@@ -52,6 +52,7 @@ func TestNodeStatusToProto(t *testing.T) {
 		},
 		Peers: []statusv1alpha1.PeerStatus{
 			{
+				PeerID:            "peer-1/assignment/pool",
 				Name:              "peer-1",
 				PeerType:          "mesh",
 				SiteName:          "site-a",
@@ -158,6 +159,10 @@ func TestNodeStatusToProto(t *testing.T) {
 	full := roundTrip.Status
 	if full == nil {
 		t.Fatal("expected non-nil status in round-tripped message")
+	}
+
+	if len(full.Peers) != 1 || full.Peers[0].PeerId != "peer-1/assignment/pool" || full.Peers[0].Name != "peer-1" {
+		t.Fatalf("relationship identity or node name lost on the wire: %+v", full.Peers)
 	}
 
 	if full.TimestampUnixNs != now.UnixNano() {

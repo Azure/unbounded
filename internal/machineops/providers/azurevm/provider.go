@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -56,20 +57,27 @@ var azureVMOperations = map[unboundedv1alpha3.OperationKind]azureVMOperation{
 	},
 }
 
-// Provider executes operations against Azure virtual machines.
+// Provider executes operations against Azure virtual machines and allocates
+// capacity for MachineClasses backed by Azure VMs.
 type Provider struct {
 	NewClient         azureVMClientFactory
 	NewClientWithAuth azureVMClientFactoryWithAuth
+	NewCapacityClient capacityClientFactory
+	Now               func() time.Time
+
+	credentials credentialCache
+	skus        skuCache
 }
 
 func (p *Provider) Name() string {
 	return unboundedv1alpha3.ExternalProviderAzureVM
 }
 
-// Registration returns this Azure adapter's MachineOperation lifecycle
-// registration.
+// Registration returns this Azure adapter's registration: its host
+// operations and its capacity lifecycle (class resolution, allocation
+// planning, HostAllocate and HostRelease).
 func (p *Provider) Registration() (*publicmachineops.Provider, error) {
-	options := make([]publicmachineops.ProviderOption, 0, len(azureVMOperations))
+	options := make([]publicmachineops.ProviderOption, 0, len(azureVMOperations)+3)
 
 	for kind := range azureVMOperations {
 		operationOptions := []publicmachineops.OperationOption(nil)
@@ -82,6 +90,8 @@ func (p *Provider) Registration() (*publicmachineops.Provider, error) {
 
 		options = append(options, publicmachineops.WithImmediateOperation(kind, p.Execute, operationOptions...))
 	}
+
+	options = append(options, p.capacityRegistration()...)
 
 	return publicmachineops.NewProvider(p.Name(), options...)
 }
@@ -562,15 +572,34 @@ func parseAzureImageReference(hostImage string) (*armcompute.ImageReference, err
 
 func validateAzureCustomData(userData string) error {
 	if len([]byte(userData)) > azureCustomDataMaxBytes {
-		return fmt.Errorf("replacement cloud-init is %d bytes, exceeding Azure customData limit of %d bytes", len([]byte(userData)), azureCustomDataMaxBytes)
+		return fmt.Errorf("cloud-init is %d bytes, exceeding Azure customData limit of %d bytes", len([]byte(userData)), azureCustomDataMaxBytes)
 	}
 
 	return nil
 }
 
+// Azure error codes that say the addressed resource, or the resource group
+// that would hold it, does not exist.
+var azureNotFoundCodes = []string{
+	"ResourceNotFound",
+	"ResourceGroupNotFound",
+	"NotFound",
+}
+
+// isAzureNotFound reports that Azure said the addressed resource is absent.
+// The status alone is not enough: a 404 with another error code, such as
+// SubscriptionNotFound, or with no Azure error code at all, such as one
+// answered by an intermediary, says nothing about the resource and is an
+// error.
 func isAzureNotFound(err error) bool {
-	var responseErr *azcore.ResponseError
-	return err != nil && errors.As(err, &responseErr) && responseErr.StatusCode == http.StatusNotFound
+	responseErr, ok := errors.AsType[*azcore.ResponseError](err)
+	if !ok || responseErr.StatusCode != http.StatusNotFound {
+		return false
+	}
+
+	return slices.ContainsFunc(azureNotFoundCodes, func(code string) bool {
+		return strings.EqualFold(responseErr.ErrorCode, code)
+	})
 }
 
 func toValue(value *string, fallback string) string {

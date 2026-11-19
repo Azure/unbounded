@@ -20,11 +20,6 @@ import (
 
 const remoteHTTPProbeTimeout = 10 * time.Second
 
-var remoteHTTPClient = &http.Client{
-	Timeout:       10 * time.Minute, // FIXME: proper configuration
-	CheckRedirect: CheckRedirectNoHTTPSDowngrade,
-}
-
 var remoteHTTPProbeClient = &http.Client{
 	Transport:     newRemoteHTTPProbeTransport(),
 	Timeout:       remoteHTTPProbeTimeout,
@@ -104,29 +99,6 @@ func newRemoteHTTPProbeTransport() http.RoundTripper {
 	return transport.Clone()
 }
 
-func downloadFromRemote(ctx context.Context, source string) (io.ReadCloser, error) {
-	if err := validateHTTPDownloadSource(source); err != nil {
-		return nil, err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, source, http.NoBody)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create HTTP request: %w", RedactHTTPError(err))
-	}
-
-	resp, err := remoteHTTPClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to perform HTTP request: %w", RedactHTTPError(err))
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		_ = resp.Body.Close() //nolint:errcheck // body close
-		return nil, fmt.Errorf("download %q failed with status code %d", RedactURLQuery(source), resp.StatusCode)
-	}
-
-	return resp.Body, nil
-}
-
 func validateHTTPDownloadSource(source string) error {
 	parsed, err := url.Parse(source)
 	if err != nil {
@@ -194,24 +166,6 @@ type TarFile struct {
 }
 
 type TarFileSeq = iter.Seq2[*TarFile, error]
-
-// DecompressTarGzFromRemote returns an iterator that yields the files contained in a .tar.gz file located at the given HTTP(S) URL.
-func DecompressTarGzFromRemote(ctx context.Context, url string) TarFileSeq {
-	return func(yield func(*TarFile, error) bool) {
-		body, err := downloadFromRemote(ctx, url)
-		if err != nil {
-			yield(nil, err)
-			return
-		}
-		defer body.Close() //nolint:errcheck // body close
-
-		for tarFile, err := range DecompressTarGz(body) {
-			if !yield(tarFile, err) {
-				return
-			}
-		}
-	}
-}
 
 // DecompressTarGz returns an iterator that yields the files contained in a gzip-compressed tar stream.
 func DecompressTarGz(body io.Reader) TarFileSeq {

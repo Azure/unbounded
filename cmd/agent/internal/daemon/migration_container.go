@@ -8,7 +8,7 @@ import (
 	"io"
 	"log/slog"
 
-	"github.com/Azure/unbounded/cmd/agent/internal/containerops"
+	"github.com/Azure/unbounded/pkg/agent/containerops"
 	"github.com/Azure/unbounded/pkg/agent/isolation"
 )
 

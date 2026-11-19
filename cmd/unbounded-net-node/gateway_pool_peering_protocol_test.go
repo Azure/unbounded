@@ -7,18 +7,21 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
+	ebpfpkg "github.com/Azure/unbounded/internal/net/ebpf"
 	"github.com/Azure/unbounded/internal/net/healthcheck"
 	unboundednetnetlink "github.com/Azure/unbounded/internal/net/netlink"
 )
@@ -141,6 +144,8 @@ func TestPinnedGatewayPoolAcknowledgmentWaitsForTaint(t *testing.T) {
 }
 
 type poolPeeringProtocolFixture struct {
+	dynamicClient  dynamic.Interface
+	sites          cache.SharedIndexInformer
 	peerings       cache.SharedIndexInformer
 	pools          cache.SharedIndexInformer
 	nodes          cache.SharedIndexInformer
@@ -149,6 +154,7 @@ type poolPeeringProtocolFixture struct {
 	update         func() error
 	configureCalls int
 	configureErr   error
+	configureState func(*wireGuardState)
 	gateways       []gatewayPeerInfo
 	mesh           []meshPeerInfo
 }
@@ -182,6 +188,7 @@ func newPoolPeeringProtocolFixture(t *testing.T, gateway bool) *poolPeeringProto
 	remote.PodCIDRs = []string{"10.244.3.0/24"}
 
 	f := &poolPeeringProtocolFixture{
+		sites:    siteInformer,
 		peerings: newInformerWithObjects(),
 		pools:    newInformerWithObjects(),
 		state: &wireGuardState{
@@ -233,16 +240,20 @@ func newPoolPeeringProtocolFixture(t *testing.T, gateway bool) *poolPeeringProto
 	f.nodes = gatewayNodes
 	cfg := &config{NodeName: "self", WireGuardPort: 51820, WireGuardInterfacePrefix: "gpp-test-wg", MTU: 576, PreferredPrivateEncap: "WireGuard"}
 	f.update = func() error {
-		return updateWireGuardFromSlices(context.Background(), nil, siteInformer, empty, f.pools,
+		return updateWireGuardFromSlices(context.Background(), f.dynamicClient, siteInformer, empty, f.pools,
 			gatewayNodes, empty, assignmentInformer, f.peerings, cfg, siteName, "priv", "pub-self", true, f.state)
 	}
 
 	original := configureWireGuardFunc
-	configureWireGuardFunc = func(_ context.Context, _ *config, _ string, mesh []meshPeerInfo, gateways []gatewayPeerInfo, _ string, _, _, _ map[string]bool, _, _, _, _, _ map[string]string, _, _, _, _, _ map[string]int, _ []unboundednetnetlink.DesiredRoute, _ map[string]bool, _ *wireGuardState, _ map[string]healthcheck.HealthCheckSettings) error {
+	configureWireGuardFunc = func(_ context.Context, _ *config, _ string, mesh []meshPeerInfo, gateways []gatewayPeerInfo, _ string, _, _, _ map[string]bool, _, _, _, _, _ map[string]string, _, _, _, _, _ map[string]int, _ []unboundednetnetlink.DesiredRoute, _ map[string]bool, state *wireGuardState, _ map[string]healthcheck.HealthCheckSettings) error {
 		f.configureCalls++
 
 		f.gateways = append([]gatewayPeerInfo(nil), gateways...)
+
 		f.mesh = append([]meshPeerInfo(nil), mesh...)
+		if f.configureState != nil {
+			f.configureState(state)
+		}
 
 		return f.configureErr
 	}
@@ -542,6 +553,70 @@ func TestGatewayPolicyFailureRetriesAfterAssignmentReactivation(t *testing.T) {
 	if f.configureCalls != 3 {
 		t.Fatal("successful repair did not restore no-op reconciliation")
 	}
+}
+
+func TestPrimaryBPFReconcileFailurePreventsPublication(t *testing.T) {
+	f := newPoolPeeringProtocolFixture(t, true)
+	client := fakeGatewayDynamic(toUnstructured(t, &unboundednetv1alpha1.GatewayPoolNode{
+		ObjectMeta: metav1.ObjectMeta{Name: "self"},
+	}))
+	f.dynamicClient = client
+	verify := verifyActiveTunnelMTUsFunc
+
+	t.Cleanup(func() { verifyActiveTunnelMTUsFunc = verify })
+
+	verifyActiveTunnelMTUsFunc = func(_ *config, _ int, _ []meshPeerInfo, _ []gatewayPeerInfo) error { return nil }
+
+	f.putPeering(t, "peering", "local-z", nil, true)
+
+	if err := f.update(); err != nil {
+		t.Fatal(err)
+	}
+
+	published := len(client.Actions())
+	if published == 0 {
+		t.Fatal("baseline did not exercise gateway publication")
+	}
+
+	f.putPeering(t, "peering", "local-z", new(unboundednetv1alpha1.TunnelProtocolWireGuard), true)
+
+	f.configureState = func(state *wireGuardState) {
+		state.tunnelMap = &ebpfpkg.TunnelMap{}
+		state.pendingBPFEntries = map[string]ebpfpkg.TunnelEndpoint{
+			"192.0.2.0/24": {Nexthops: []ebpfpkg.TunnelNexthop{{
+				Protocol: ebpfpkg.TunnelProtoNone, RemoteIP: net.ParseIP("192.0.2.254"), IfIndex: ^uint32(0),
+			}}},
+		}
+	}
+	for range 2 {
+		f.state.tunnelMap = nil
+
+		err := f.update()
+		if err == nil || !strings.Contains(err.Error(), "reconcile primary BPF map") {
+			t.Fatalf("primary map failure was hidden: %v", err)
+		}
+
+		if !f.state.dataplaneDirty || f.state.reconcileCount != 1 || f.state.gatewayPeers[0].PeeringTunnelProtocol != "" {
+			t.Fatal("failed primary map update committed desired state")
+		}
+
+		if len(client.Actions()) != published {
+			t.Fatal("failed primary map update reached gateway publication")
+		}
+	}
+
+	f.state.tunnelMap = nil
+
+	f.configureState = nil
+	if err := f.update(); err != nil {
+		t.Fatal(err)
+	}
+
+	if f.configureCalls != 4 || f.state.reconcileCount != 2 || f.state.dataplaneDirty || len(client.Actions()) != published+1 {
+		t.Fatalf("unchanged desired state did not recover: calls=%d count=%d dirty=%v actions=%d", f.configureCalls, f.state.reconcileCount, f.state.dataplaneDirty, len(client.Actions()))
+	}
+
+	f.checkGateway(t, "WireGuard", "WireGuard")
 }
 
 func TestGatewayPoolPeeringProtocolFailureRetries(t *testing.T) {

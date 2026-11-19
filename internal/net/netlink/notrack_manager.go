@@ -36,9 +36,10 @@ const (
 // Jump rules in raw/PREROUTING are per-interface, matching the ForwardManager
 // pattern.
 type NotrackManager struct {
-	ipt4 *iptables.IPTables
-	ipt6 *iptables.IPTables
-	mu   sync.Mutex
+	ipt4       forwardIPTables
+	ipt6       forwardIPTables
+	mu         sync.Mutex
+	interfaces map[string]bool
 
 	// ctSupported tracks whether the CT target is available.
 	ctSupported4 bool
@@ -68,9 +69,12 @@ func NewNotrackManager() (*NotrackManager, error) {
 
 	m := &NotrackManager{
 		ipt4:         ipt4,
-		ipt6:         ipt6,
+		interfaces:   make(map[string]bool),
 		ctSupported4: detectCTSupport(ipt4, "IPv4"),
 		ctSupported6: ipt6 != nil && detectCTSupport(ipt6, "IPv6"),
+	}
+	if ipt6 != nil {
+		m.ipt6 = ipt6
 	}
 
 	if !m.ctSupported4 {
@@ -120,43 +124,103 @@ func (m *NotrackManager) EnsureInterface(ifName string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	m.ensureInterfaceForFamily(m.ipt4, "IPv4", m.ctSupported4, ifName)
+	if m.interfaces == nil {
+		m.interfaces = make(map[string]bool)
+	}
+
+	m.interfaces[ifName] = true
+	if err := m.ensureInterfaceForFamily(m.ipt4, "IPv4", m.ctSupported4, ifName); err != nil {
+		klog.Warningf("NotrackManager: failed to ensure IPv4 PREROUTING jump for %s: %v", ifName, err)
+	}
 
 	if m.ipt6 != nil {
-		m.ensureInterfaceForFamily(m.ipt6, "IPv6", m.ctSupported6, ifName)
+		if err := m.ensureInterfaceForFamily(m.ipt6, "IPv6", m.ctSupported6, ifName); err != nil {
+			klog.Warningf("NotrackManager: failed to ensure IPv6 PREROUTING jump for %s: %v", ifName, err)
+		}
 	}
 }
 
-func (m *NotrackManager) ensureInterfaceForFamily(ipt *iptables.IPTables, family string, ctSupported bool, ifName string) {
+func (m *NotrackManager) ensureInterfaceForFamily(ipt forwardIPTables, family string, ctSupported bool, ifName string) error {
 	if !ctSupported {
-		return
+		return nil
 	}
 
 	// Ensure chain exists (self-healing).
 	if err := m.ensureChain(ipt, family); err != nil {
-		klog.Warningf("NotrackManager: failed to ensure %s chain for %s: %v", family, ifName, err)
-
-		return
+		return err
 	}
 
 	jRule := notrackJumpRule(ifName)
 
 	exists, err := ipt.Exists("raw", "PREROUTING", jRule...)
 	if err != nil {
-		klog.Warningf("NotrackManager: failed to check %s PREROUTING jump for %s: %v", family, ifName, err)
-	} else if !exists {
+		return err
+	}
+
+	if !exists {
 		if err := ipt.Insert("raw", "PREROUTING", 1, jRule...); err != nil {
-			klog.Warningf("NotrackManager: failed to insert %s PREROUTING jump for %s: %v", family, ifName, err)
-		} else {
-			klog.V(2).Infof("NotrackManager: added %s PREROUTING jump for %s", family, ifName)
+			return err
+		}
+
+		klog.V(2).Infof("NotrackManager: added %s PREROUTING jump for %s", family, ifName)
+	}
+
+	return nil
+}
+
+// ReconcileNativeInterface replaces stale physical ingress jumps while
+// preserving explicitly registered tunnel interfaces, including after restart.
+func (m *NotrackManager) ReconcileNativeInterface(ifName string, enabled bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	delete(m.interfaces, ifName)
+
+	for _, family := range []struct {
+		ipt       forwardIPTables
+		name      string
+		supported bool
+	}{{m.ipt4, "IPv4", m.ctSupported4}, {m.ipt6, "IPv6", m.ctSupported6}} {
+		if family.ipt == nil || !family.supported {
+			continue
+		}
+
+		rules, err := family.ipt.List("raw", "PREROUTING")
+		if err != nil {
+			return fmt.Errorf("list %s native notrack ingress: %w", family.name, err)
+		}
+
+		for _, rule := range rules {
+			if !strings.Contains(rule, notrackChain) || !strings.Contains(rule, notrackComment) {
+				continue
+			}
+
+			existing := parseInterfaceFromRule(rule, "-i")
+			if existing == "" || m.interfaces[existing] || (enabled && existing == ifName) {
+				continue
+			}
+
+			if err := family.ipt.DeleteIfExists("raw", "PREROUTING", notrackJumpRule(existing)...); err != nil {
+				return fmt.Errorf("remove stale %s native notrack ingress on %s: %w", family.name, existing, err)
+			}
+		}
+
+		if enabled {
+			if err := m.ensureInterfaceForFamily(family.ipt, family.name, true, ifName); err != nil {
+				return fmt.Errorf("ensure %s native notrack ingress on %s: %w", family.name, ifName, err)
+			}
 		}
 	}
+
+	return nil
 }
 
 // RemoveInterface removes the raw/PREROUTING jump rule for the given interface.
 func (m *NotrackManager) RemoveInterface(ifName string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	delete(m.interfaces, ifName)
 
 	m.removeInterfaceForFamily(m.ipt4, "IPv4", ifName)
 
@@ -165,7 +229,7 @@ func (m *NotrackManager) RemoveInterface(ifName string) {
 	}
 }
 
-func (m *NotrackManager) removeInterfaceForFamily(ipt *iptables.IPTables, family, ifName string) {
+func (m *NotrackManager) removeInterfaceForFamily(ipt forwardIPTables, family, ifName string) {
 	jRule := notrackJumpRule(ifName)
 	if err := ipt.DeleteIfExists("raw", "PREROUTING", jRule...); err != nil {
 		klog.V(4).Infof("NotrackManager: failed to remove %s PREROUTING jump for %s: %v", family, ifName, err)
@@ -225,7 +289,7 @@ func (m *NotrackManager) ReconcileCIDRs(podCIDRs, returnCIDRs, supernets []strin
 	return nil
 }
 
-func (m *NotrackManager) reconcileFamily(ipt *iptables.IPTables, family string, ctSupported bool, podCIDRs, returnCIDRs, supernets []string) error {
+func (m *NotrackManager) reconcileFamily(ipt forwardIPTables, family string, ctSupported bool, podCIDRs, returnCIDRs, supernets []string) error {
 	if !ctSupported {
 		return nil
 	}
@@ -290,7 +354,7 @@ func (m *NotrackManager) reconcileFamily(ipt *iptables.IPTables, family string, 
 }
 
 // ensureChain creates the UNBOUNDED-NOTRACK chain if it does not exist.
-func (m *NotrackManager) ensureChain(ipt *iptables.IPTables, family string) error {
+func (m *NotrackManager) ensureChain(ipt forwardIPTables, family string) error {
 	exists, err := ipt.ChainExists("raw", notrackChain)
 	if err != nil {
 		return fmt.Errorf("failed to check if %s chain exists: %w", family, err)
@@ -322,11 +386,12 @@ func (m *NotrackManager) Cleanup() {
 	m.currentPodCIDRs = ""
 	m.currentReturnCIDRs = ""
 	m.currentSupernets = ""
+	clear(m.interfaces)
 
 	klog.V(2).Info("NotrackManager: cleaned up notrack chain and rules")
 }
 
-func (m *NotrackManager) cleanupFamily(ipt *iptables.IPTables, family string) {
+func (m *NotrackManager) cleanupFamily(ipt forwardIPTables, family string) {
 	// Remove all PREROUTING jump rules referencing our chain.
 	rules, err := ipt.List("raw", "PREROUTING")
 	if err != nil {

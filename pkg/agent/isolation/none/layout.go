@@ -6,7 +6,7 @@
 // directories under an agent-owned base, selected by a "current" symlink, so an
 // upgrade is a symlink flip that can be flipped back.
 //
-// The agent's node stack operations (cmd/agent/internal/noneops) build the
+// The agent's node stack operations (pkg/agent/noneops) build the
 // Backend with its install and readiness hooks.
 package none
 

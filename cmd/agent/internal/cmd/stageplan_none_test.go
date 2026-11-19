@@ -19,14 +19,14 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/Azure/unbounded/cmd/agent/internal/hostnode"
-	"github.com/Azure/unbounded/cmd/agent/internal/hostnode/hostnodetest"
-	"github.com/Azure/unbounded/cmd/agent/internal/noneops"
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/config"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/hostnode"
+	"github.com/Azure/unbounded/pkg/agent/hostnode/hostnodetest"
 	"github.com/Azure/unbounded/pkg/agent/isolation"
 	"github.com/Azure/unbounded/pkg/agent/isolation/none"
+	"github.com/Azure/unbounded/pkg/agent/noneops"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
 
