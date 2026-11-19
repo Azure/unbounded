@@ -17,10 +17,11 @@ use rustls::pki_types::ServerName;
 use serde_json::Value;
 use std::{
     cell::RefCell,
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     net::{SocketAddr, ToSocketAddrs},
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex},
+    task::{Poll, Waker},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -113,6 +114,7 @@ impl Client {
     ) -> Result<Vec<ListedObject>, ListError> {
         let bearer = self.token(credential, key).await?;
         let mut objects = Vec::new();
+        let mut seen = BTreeSet::new();
         for prefix in prefixes {
             let mut marker = String::new();
             loop {
@@ -126,8 +128,7 @@ impl Client {
                     });
                 }
                 let page = parse_list(&body).map_err(|_| ListError::Failed)?;
-                objects.extend(page.blobs);
-                if objects.len() > MAX_FILL_OBJECTS {
+                if extend_unique(&mut objects, &mut seen, page.blobs) {
                     return Ok(objects);
                 }
                 marker = page.next_marker;
@@ -359,10 +360,10 @@ async fn exchange(
     body: &[u8],
     limit: usize,
 ) -> Result<(u16, Vec<u8>), ListError> {
-    let address = resolve(host, port)?;
     let request =
         zeroize::Zeroizing::new(conn::request(method, host_header, target, headers, body));
     rt::timeout(LIST_TIMEOUT, async {
+        let address = resolve(host, port).await?;
         let tcp = Tcp::connect(address).await.map_err(|_| ListError::Failed)?;
         if https {
             let config = trust.clone().ok_or(ListError::Failed)?;
@@ -393,12 +394,60 @@ async fn exchange(
     .map_err(|_| ListError::Failed)?
 }
 
-fn resolve(host: &str, port: u16) -> Result<SocketAddr, ListError> {
-    (host, port)
-        .to_socket_addrs()
-        .map_err(|_| ListError::Failed)?
-        .next()
-        .ok_or(ListError::Failed)
+/// Add one page's blobs, skipping names already listed under another prefix.
+/// Returns true once the unique count exceeds the manifest limit.
+fn extend_unique(
+    objects: &mut Vec<ListedObject>,
+    seen: &mut BTreeSet<String>,
+    blobs: Vec<ListedObject>,
+) -> bool {
+    for blob in blobs {
+        if seen.insert(blob.name.clone()) {
+            objects.push(blob);
+        }
+    }
+    objects.len() > MAX_FILL_OBJECTS
+}
+
+/// Resolve off the control thread so a slow lookup cannot stall the primary
+/// lease or other authority work.
+async fn resolve(host: &str, port: u16) -> Result<SocketAddr, ListError> {
+    let host = host.to_owned();
+    let result = Arc::new(Mutex::new(None));
+    let waker = Arc::new(Mutex::new(None::<Waker>));
+    {
+        let result = Arc::clone(&result);
+        let waker = Arc::clone(&waker);
+        std::thread::Builder::new()
+            .name("racer-fill-resolve".into())
+            .spawn(move || {
+                let address = (host.as_str(), port)
+                    .to_socket_addrs()
+                    .ok()
+                    .and_then(|mut addresses| addresses.next());
+                *lock(&result) = Some(address);
+                if let Some(waker) = lock(&waker).take() {
+                    waker.wake();
+                }
+            })
+            .map_err(|_| ListError::Failed)?;
+    }
+    std::future::poll_fn(move |cx| {
+        if let Some(address) = *lock(&result) {
+            return Poll::Ready(address.ok_or(ListError::Failed));
+        }
+        *lock(&waker) = Some(cx.waker().clone());
+        // Re-check after publishing the waker so a completion cannot be lost.
+        if let Some(address) = *lock(&result) {
+            return Poll::Ready(address.ok_or(ListError::Failed));
+        }
+        Poll::Pending
+    })
+    .await
+}
+
+fn lock<T>(value: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    value.lock().unwrap_or_else(|poison| poison.into_inner())
 }
 
 /// Plain HTTP for IMDS, which is link-local and never TLS.
@@ -715,6 +764,35 @@ mod tests {
   </Blobs>
   <NextMarker>next+/=</NextMarker>
 </EnumerationResults>"#;
+
+    #[test]
+    fn extend_unique_skips_duplicates_and_caps_unique_names() {
+        let blob = |name: &str| ListedObject {
+            name: name.to_owned(),
+            etag: "\"e\"".into(),
+            length: 1,
+            content_type: None,
+        };
+        let mut objects = Vec::new();
+        let mut seen = BTreeSet::new();
+        assert!(!extend_unique(
+            &mut objects,
+            &mut seen,
+            vec![blob("a/one"), blob("a/one"), blob("a/two")]
+        ));
+        assert_eq!(
+            objects.iter().map(|o| o.name.as_str()).collect::<Vec<_>>(),
+            vec!["a/one", "a/two"]
+        );
+
+        let mut objects = Vec::new();
+        let mut seen = BTreeSet::new();
+        let many = (0..=MAX_FILL_OBJECTS)
+            .map(|i| blob(&format!("a/{i}")))
+            .collect();
+        assert!(extend_unique(&mut objects, &mut seen, many));
+        assert_eq!(objects.len(), MAX_FILL_OBJECTS + 1);
+    }
 
     #[test]
     fn parses_names_entities_and_next_marker() {
