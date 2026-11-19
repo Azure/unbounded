@@ -1,0 +1,70 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+ARG GO_IMAGE=docker.io/library/golang:1.27.4-trixie@sha256:f18c3d73a184fb0582828510722e723b63a93f7188d11dd223d9be6f6880e65d
+ARG AIPERF_IMAGE=nvcr.io/nvidia/ai-dynamo/aiperf@sha256:514349de4fc72f62f15580dbe044219c5c4b113bd1c0c20082d1fc741a336721
+ARG UV_IMAGE=ghcr.io/astral-sh/uv@sha256:9a23023be68b2ed09750ae636228e903a54a05ea56ed03a934d00fe9fbeded4b
+ARG VLLM_IMAGE=docker.io/vllm/vllm-openai@sha256:e4f88a835143cd22aee2397a26ec6bb80b3a4a6fe0c882bcbc63822904766089
+
+FROM ${GO_IMAGE} AS builder
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd/project-signal-model-cache ./cmd/project-signal-model-cache
+RUN CGO_ENABLED=0 go build -trimpath -o /out/project-signal-model-cache ./cmd/project-signal-model-cache
+
+FROM ${AIPERF_IMAGE} AS aiperf-licenses
+
+FROM ${UV_IMAGE} AS uv
+
+FROM ${VLLM_IMAGE}
+
+USER root
+COPY --from=uv /uv /usr/local/bin/uv
+ADD --checksum=sha256:6b637b5600b1e241f16e66c210f037677759226fb1f79a43db145f19730ed9d6 \
+    https://github.com/ai-dynamo/aiperf/archive/refs/tags/v0.13.0.tar.gz /tmp/aiperf.tar.gz
+RUN uv venv --python /usr/bin/python3 /opt/aiperf/venv \
+    && mkdir /tmp/aiperf \
+    && tar -xzf /tmp/aiperf.tar.gz --strip-components=1 -C /tmp/aiperf \
+    && cd /tmp/aiperf \
+    && VIRTUAL_ENV=/opt/aiperf/venv uv sync \
+        --active \
+        --locked \
+        --no-default-groups \
+        --no-editable \
+    && rm -rf /root/.cache/uv /tmp/aiperf /tmp/aiperf.tar.gz /usr/local/bin/uv
+COPY --from=aiperf-licenses /legal /unbounded/licenses/aiperf
+COPY --from=aiperf-licenses /licenses /unbounded/licenses/aiperf-dependencies
+COPY --from=builder /out/project-signal-model-cache /usr/local/bin/project-signal-model-cache
+COPY images/project-signal-vllm-canary/aiperf_runner.py /usr/local/bin/aiperf_runner.py
+COPY images/project-signal-vllm-canary/aiperf_runner.py /usr/local/bin/project-signal-aiperf
+COPY images/project-signal-vllm-canary/harness.py /usr/local/bin/project-signal-vllm-canary
+COPY LICENSE NOTICE /unbounded/licenses/
+RUN if ! getent group 65532 >/dev/null; then \
+        printf '%s\n' 'project-signal:x:65532:' >> /etc/group; \
+    fi \
+    && if ! getent passwd 65532 >/dev/null; then \
+        printf '%s\n' 'project-signal:x:65532:65532:Project Signal:/tmp:/usr/sbin/nologin' >> /etc/passwd; \
+    fi \
+    && chmod 0755 /usr/local/bin/project-signal-aiperf \
+    && /opt/aiperf/venv/bin/aiperf --help >/dev/null \
+    && /usr/local/bin/project-signal-aiperf --help >/dev/null \
+    && python3 -m py_compile \
+        /usr/local/bin/aiperf_runner.py \
+        /usr/local/bin/project-signal-vllm-canary
+
+ENV HF_HUB_OFFLINE=1 \
+    HF_HUB_DISABLE_TELEMETRY=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    VLLM_NO_USAGE_STATS=1 \
+    DO_NOT_TRACK=1 \
+    NO_PROXY=127.0.0.1,localhost \
+    HOME=/tmp \
+    HF_HOME=/tmp/huggingface \
+    XDG_CACHE_HOME=/tmp/cache \
+    VLLM_CACHE_ROOT=/tmp/vllm \
+    TORCH_EXTENSIONS_DIR=/tmp/torch-extensions \
+    TRITON_CACHE_DIR=/tmp/triton
+
+USER 65532:65532
+ENTRYPOINT ["python3", "/usr/local/bin/project-signal-vllm-canary"]

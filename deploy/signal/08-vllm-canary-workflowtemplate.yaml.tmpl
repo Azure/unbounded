@@ -1,0 +1,118 @@
+{{- if eq (default "false" .VLLMCanaryEnabled) "true" }}
+{{- $image := .VLLMCanaryImage }}
+{{- if not (regexMatch "^[^@[:space:]]+@sha256:[0-9a-f]{64}$" $image) }}
+{{- fail "VLLMCanaryImage must be an immutable sha256 digest reference when the vLLM canary is enabled" }}
+{{- end }}
+{{- if empty .VLLMCanaryCPU }}
+{{- fail "VLLMCanaryCPU is required when the vLLM canary is enabled" }}
+{{- end }}
+{{- if empty .VLLMCanaryMemory }}
+{{- fail "VLLMCanaryMemory is required when the vLLM canary is enabled" }}
+{{- end }}
+{{- if empty .VLLMModelCachePVC }}
+{{- fail "VLLMModelCachePVC is required when the vLLM canary is enabled" }}
+{{- end }}
+{{- if empty .VLLMModelCacheSubPath }}
+{{- fail "VLLMModelCacheSubPath is required when the vLLM canary is enabled" }}
+{{- end }}
+{{- if not (regexMatch "^[A-Za-z0-9_-]+(\\.[A-Za-z0-9_-]+)*(/[A-Za-z0-9_-]+(\\.[A-Za-z0-9_-]+)*)*$" .VLLMModelCacheSubPath) }}
+{{- fail "VLLMModelCacheSubPath must be a safe relative path when the vLLM canary is enabled" }}
+{{- end }}
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: project-signal-vllm-canary-v1
+  namespace: {{ default "project-signal" .Namespace }}
+  labels:
+    app.kubernetes.io/name: project-signal-vllm-canary
+    app.kubernetes.io/part-of: project-signal
+    signal.unbounded-cloud.io/cache-access: sequential-rwo
+spec:
+  entrypoint: canary
+  serviceAccountName: project-signal-vllm-workload
+  automountServiceAccountToken: true
+  arguments:
+    parameters:
+      - name: invocation-id
+      - name: run-uid
+      - name: plan-digest
+      - name: stage-id
+      - name: stage-order
+      - name: test-json
+      - name: parameters-json
+      - name: participants-json
+      - name: participant-roles-json
+      - name: primary-participant-node-name
+      - name: resolved-inputs-json
+      - name: result-configmap
+  templates:
+    - name: canary
+      retryStrategy:
+        limit: "0"
+      nodeSelector:
+        kubernetes.io/hostname: "{{`{{workflow.parameters.primary-participant-node-name}}`}}"
+      tolerations:
+        - key: node.kubernetes.io/unschedulable
+          operator: Exists
+          effect: NoSchedule
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      container:
+        image: {{ $image }}
+        imagePullPolicy: IfNotPresent
+        args:
+          - --invocation-id={{`{{workflow.parameters.invocation-id}}`}}
+          - --run-uid={{`{{workflow.parameters.run-uid}}`}}
+          - --plan-digest={{`{{workflow.parameters.plan-digest}}`}}
+          - --stage-id={{`{{workflow.parameters.stage-id}}`}}
+          - --stage-order={{`{{workflow.parameters.stage-order}}`}}
+          - --test-json={{`{{workflow.parameters.test-json}}`}}
+          - --parameters-json={{`{{workflow.parameters.parameters-json}}`}}
+          - --participants-json={{`{{workflow.parameters.participants-json}}`}}
+          - --participant-roles-json={{`{{workflow.parameters.participant-roles-json}}`}}
+          - --resolved-inputs-json={{`{{workflow.parameters.resolved-inputs-json}}`}}
+          - --result-configmap={{`{{workflow.parameters.result-configmap}}`}}
+          - --model-cache=/models/model
+        env:
+          - name: POD_NAMESPACE
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
+        resources:
+          requests:
+            cpu: {{ .VLLMCanaryCPU }}
+            memory: {{ .VLLMCanaryMemory }}
+            nvidia.com/gpu: "8"
+          limits:
+            cpu: {{ .VLLMCanaryCPU }}
+            memory: {{ .VLLMCanaryMemory }}
+            nvidia.com/gpu: "8"
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          capabilities:
+            drop: [ALL]
+        volumeMounts:
+          - name: model-cache
+            mountPath: /models/model
+            subPath: {{ .VLLMModelCacheSubPath }}
+            readOnly: true
+          - name: tmp
+            mountPath: /tmp
+          - name: shared-memory
+            mountPath: /dev/shm
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: {{ .VLLMModelCachePVC }}
+            readOnly: true
+        - name: tmp
+          emptyDir:
+            sizeLimit: 1Gi
+        - name: shared-memory
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Gi
+{{- end }}
