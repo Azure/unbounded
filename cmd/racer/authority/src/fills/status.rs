@@ -76,8 +76,10 @@ pub fn status(
         && view.listed_cache_uid == view.cache_uid;
     let listed_ok = manifest_current && view.error.is_none();
     let footprint = view.planned_footprint_bytes.unwrap_or(0);
+    let missing_members = view.replicas > view.available_nodes;
     let ready = view.accepted
         && manifest_current
+        && !missing_members
         && progress.resident_bytes >= footprint
         && progress.under_replicated_bytes == 0;
     let was_ready = previous
@@ -97,12 +99,20 @@ pub fn status(
     let short =
         view.accepted && manifest_current && footprint > 0 && progress.resident_bytes < footprint;
     let degraded = if progress.refused_bytes > 0 {
-        Some(("CapacityLost", "nodes refused pinned bytes"))
+        Some(("CapacityLost", "nodes refused pinned bytes".to_owned()))
+    } else if view.accepted && manifest_current && missing_members {
+        Some((
+            "MemberLost",
+            format!(
+                "{} replicas requested but only {} nodes are available",
+                view.replicas, view.available_nodes
+            ),
+        ))
     } else if (was_ready || was_degraded) && (short || progress.under_replicated_bytes > 0) {
         if progress.nodes == 0 || previous_nodes > i64::from(progress.nodes) {
-            Some(("MemberLost", "a node with pins left"))
+            Some(("MemberLost", "a node with pins left".to_owned()))
         } else {
-            Some(("Refilling", "copies are missing"))
+            Some(("Refilling", "copies are missing".to_owned()))
         }
     } else {
         None
@@ -171,15 +181,17 @@ pub fn status(
             "waiting for confirmed copies"
         },
     );
-    let (degraded_reason, degraded_message) = degraded.unwrap_or(("Complete", "healthy"));
+    let degraded_true = degraded.is_some();
+    let (degraded_reason, degraded_message) =
+        degraded.unwrap_or_else(|| ("Complete", "healthy".to_owned()));
     let degraded_condition = condition(
         view,
         previous,
         &now,
         "Degraded",
-        degraded.is_some(),
+        degraded_true,
         degraded_reason,
-        degraded_message,
+        &degraded_message,
     );
 
     let mut status = json!({
@@ -321,6 +333,7 @@ mod tests {
             cache_uid: "22222222-2222-4222-8222-222222222222".into(),
             cache_name: "models".into(),
             replicas: 2,
+            available_nodes: 2,
             max_footprint: 1024,
             resync_secs: 3600,
             manifest: None,
@@ -470,6 +483,33 @@ mod tests {
         reports.insert("p1".into(), report(refused));
         let c = statuses(&status(&v, &reports, None));
         assert_eq!(c["Degraded"], ("True".into(), "CapacityLost".into()));
+    }
+
+    #[test]
+    fn requested_replicas_above_pool_size_are_degraded_and_not_ready() {
+        let mut v = with_manifest(view());
+        // The resident copy covers the whole footprint, so only the missing
+        // replica keeps the fill from being Ready.
+        v.planned_footprint_bytes = Some(100);
+        v.replicas = 2;
+        v.available_nodes = 1;
+        let mut reports = BTreeMap::new();
+        reports.insert("p1".into(), report(progress_for(&v)));
+        let s = status(&v, &reports, None);
+        let c = statuses(&s);
+        assert_eq!(s["footprintBytes"], 100);
+        assert_eq!(s["residentBytes"], 100);
+        assert_eq!(c["Ready"], ("False".into(), "Filling".into()));
+        assert_eq!(c["Degraded"], ("True".into(), "MemberLost".into()));
+        let message = s["conditions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["type"] == "Degraded")
+            .and_then(|c| c["message"].as_str())
+            .unwrap();
+        assert!(message.contains("2 replicas"), "{message}");
+        assert!(message.contains("1 nodes"), "{message}");
     }
 
     #[test]

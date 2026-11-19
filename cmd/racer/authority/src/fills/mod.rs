@@ -53,6 +53,9 @@ pub struct FillView {
     pub cache_uid: String,
     pub cache_name: String,
     pub replicas: u8,
+    /// Nodes in the cache's pool at the publication used for the plan. Zero
+    /// until a publication lists the cache.
+    pub available_nodes: u8,
     pub max_footprint: u64,
     pub resync_secs: u64,
     /// Current manifest, from this process's own listing.
@@ -136,6 +139,7 @@ impl FillView {
             cache_uid: String::new(),
             cache_name,
             replicas,
+            available_nodes: 0,
             max_footprint,
             resync_secs,
             manifest: None,
@@ -189,6 +193,7 @@ fn adopt(mut view: FillView, old: &FillView) -> FillView {
     view.cache_uid = old.cache_uid.clone();
     view.manifest = old.manifest.clone();
     view.membership = old.membership;
+    view.available_nodes = old.available_nodes;
     view.planned_footprint_bytes = old.planned_footprint_bytes;
     view.accepted = old.accepted;
     view.message = old.message.clone();
@@ -480,7 +485,7 @@ async fn list_fills(shared: Rc<Shared>) {
 /// Recompute admission and the footprint plan for every fill from the current
 /// cache catalog and publication.
 pub fn recompute(shared: &Shared) {
-    let (page_size, membership, pool_members) = {
+    let (page_size, membership, pool_sizes) = {
         let serving = shared.serving.borrow();
         match serving.image.as_ref() {
             Some(image) => {
@@ -523,6 +528,11 @@ pub fn recompute(shared: &Shared) {
                 }
                 view.accepted = true;
                 view.message.clear();
+                view.available_nodes = pool_sizes
+                    .get(&racer_wire::control::CacheId(view.cache_uid.clone()))
+                    .map_or(view.replicas, |members| {
+                        u8::try_from(*members).unwrap_or(u8::MAX)
+                    });
             }
             FillCache::CacheNotFound => {
                 view.cache_uid.clear();
@@ -551,14 +561,10 @@ pub fn recompute(shared: &Shared) {
             view.message = "TooManyObjects".into();
             view.planned_footprint_bytes = None;
         } else if let Some(manifest) = &view.manifest {
-            // A fill cannot place more copies than the cache's pool has nodes.
-            let copies = pool_members
-                .get(&racer_wire::control::CacheId(view.cache_uid.clone()))
-                .map_or(view.replicas, |members| {
-                    let members = u8::try_from(*members).unwrap_or(u8::MAX).max(1);
-                    view.replicas.min(members)
-                });
-            let planned = manifest::planned_footprint(manifest, page_size, copies);
+            // Plan every requested replica so admission checks the requested
+            // footprint. Missing pool members are reported as shortfall, not
+            // folded into a smaller target.
+            let planned = manifest::planned_footprint(manifest, page_size, view.replicas);
             view.planned_footprint_bytes = Some(planned);
             if planned > view.max_footprint {
                 view.accepted = false;
