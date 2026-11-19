@@ -16,6 +16,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -35,10 +36,22 @@ const (
 	controllerName    = "machine-ops-controller"
 	scopeFallbackName = "scope"
 
-	errSiteProviderPair = "--site and --provider must be set together"
+	errSiteProviderPair          = "--site and --provider must be set together"
+	errCapacityLeaderElection    = "--enable-capacity requires --leader-elect: the capacity controllers must run under a leader-election lease"
+	errConsumerKindsCapacity     = "--allocation-consumer-kind requires --enable-capacity"
+	errCapacityAPIServerEndpoint = "--enable-capacity requires --api-server-endpoint: allocated hosts bootstrap against it"
 )
 
 func main() {
+	if err := newCommand(run).Execute(); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// newCommand builds the controller command. runController receives the
+// parsed flags.
+func newCommand(runController func(context.Context, config) error) *cobra.Command {
 	var cfg config
 
 	cmd := &cobra.Command{
@@ -48,7 +61,7 @@ func main() {
 			ctx, cancel := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer cancel()
 
-			return run(ctx, cfg)
+			return runController(ctx, cfg)
 		},
 		Version: version.Version + " (commit: " + version.GitCommit + ")",
 	}
@@ -66,13 +79,19 @@ func main() {
 		"Enable the experimental container isolation mode for HostReplace: opt the replacement agent configuration in "+
 			"(Experimental.ContainerIsolation); without it a HostReplace of a Machine that declares spec.isolation container fails")
 
+	cmd.Flags().BoolVar(&cfg.enableCapacity, "enable-capacity", false,
+		"Run the MachineClass and MachineAllocation capacity controllers for providers that declare capacity. "+
+			"Requires --leader-elect, the capacity RBAC bindings and the allocation admission policies")
+	cmd.Flags().StringVar(&cfg.providerConfigNamespace, "provider-config-namespace", unbounded.SystemNamespace(),
+		"Namespace containing MachineClass provider-config and bootstrap files ConfigMaps; used with --enable-capacity")
+	cmd.Flags().StringArrayVar(&cfg.allocationConsumerKinds, "allocation-consumer-kind", nil,
+		"Cluster-scoped consumer kind, as group/version/Kind, whose termination and loss the MachineAllocation controller observes, "+
+			"for example karpenter.sh/v1/NodeClaim. Repeatable; requires --enable-capacity. Empty means consumer loss is never observed")
+
 	cmd.CompletionOptions.DisableDefaultCmd = true
 	cmd.SetVersionTemplate(`{{printf "%s\n" .Version}}`)
 
-	if err := cmd.Execute(); err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
-	}
+	return cmd
 }
 
 type config struct {
@@ -87,6 +106,10 @@ type config struct {
 	providerName              string
 
 	experimentalContainerIsolation bool
+
+	enableCapacity          bool
+	providerConfigNamespace string
+	allocationConsumerKinds []string
 }
 
 func run(ctx context.Context, cfg config) error {
@@ -94,6 +117,11 @@ func run(ctx context.Context, cfg config) error {
 
 	if (cfg.siteName == "") != (cfg.providerName == "") {
 		return errors.New(errSiteProviderPair)
+	}
+
+	capacity, err := capacityOptions(cfg)
+	if err != nil {
+		return err
 	}
 
 	restConfig := ctrl.GetConfigOrDie()
@@ -117,6 +145,41 @@ func run(ctx context.Context, cfg config) error {
 		return err
 	}
 
+	if err := addControllers(mgr, cfg, providers, capacity); err != nil {
+		return err
+	}
+
+	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
+		return fmt.Errorf("add healthz check: %w", err)
+	}
+
+	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
+		return fmt.Errorf("add readyz check: %w", err)
+	}
+
+	ctrl.Log.Info("starting machine-ops-controller",
+		"site", cfg.siteName,
+		"provider", cfg.providerName,
+		"capacity", cfg.enableCapacity,
+		"allocationConsumerKinds", cfg.allocationConsumerKinds,
+		"leaderElectionID", leaderElectionID(cfg))
+
+	if err := mgr.Start(ctx); err != nil {
+		return fmt.Errorf("start manager: %w", err)
+	}
+
+	return nil
+}
+
+// addControllers registers the MachineOperation controller and, when capacity
+// is set, the MachineClass and MachineAllocation controllers for the same
+// providers and scope.
+func addControllers(
+	mgr ctrl.Manager,
+	cfg config,
+	providers []*machineops.Provider,
+	capacity *machineopscontroller.CapacityOptions,
+) error {
 	if err := machineopscontroller.AddToManager(mgr, providers, machineopscontroller.Options{
 		SiteName:                  cfg.siteName,
 		ProviderName:              cfg.providerName,
@@ -129,18 +192,12 @@ func run(ctx context.Context, cfg config) error {
 		return err
 	}
 
-	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
-		return fmt.Errorf("add healthz check: %w", err)
+	if capacity == nil {
+		return nil
 	}
 
-	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
-		return fmt.Errorf("add readyz check: %w", err)
-	}
-
-	ctrl.Log.Info("starting machine-ops-controller", "site", cfg.siteName, "provider", cfg.providerName, "leaderElectionID", leaderElectionID(cfg))
-
-	if err := mgr.Start(ctx); err != nil {
-		return fmt.Errorf("start manager: %w", err)
+	if err := machineopscontroller.AddCapacityToManager(mgr, providers, *capacity); err != nil {
+		return fmt.Errorf("add capacity controllers: %w", err)
 	}
 
 	return nil
@@ -173,6 +230,82 @@ func configuredProviders(providerName string) ([]*machineops.Provider, error) {
 	}
 
 	return []*machineops.Provider{azureProvider}, nil
+}
+
+// capacityOptions returns the options for the capacity controllers, or nil
+// when --enable-capacity is off. The capacity controllers share the scope and
+// the credential Secret namespace of the MachineOperation controller, which
+// the same manager must run because it executes HostAllocate and HostRelease.
+func capacityOptions(cfg config) (*machineopscontroller.CapacityOptions, error) {
+	if !cfg.enableCapacity {
+		if len(cfg.allocationConsumerKinds) > 0 {
+			return nil, errors.New(errConsumerKindsCapacity)
+		}
+
+		return nil, nil
+	}
+
+	if !cfg.leaderElection {
+		return nil, errors.New(errCapacityLeaderElection)
+	}
+
+	// HostAllocate renders the host's bootstrap config, which needs the API
+	// server endpoint. Without it every allocation would stall in a retry
+	// loop that no status reports.
+	if strings.TrimSpace(cfg.apiServerEndpoint) == "" {
+		return nil, errors.New(errCapacityAPIServerEndpoint)
+	}
+
+	if strings.TrimSpace(cfg.providerConfigNamespace) == "" {
+		return nil, errors.New("--provider-config-namespace is required with --enable-capacity")
+	}
+
+	if strings.TrimSpace(cfg.credentialSecretNamespace) == "" {
+		return nil, errors.New("--credential-secret-namespace is required with --enable-capacity")
+	}
+
+	consumerKinds, err := parseConsumerKinds(cfg.allocationConsumerKinds)
+	if err != nil {
+		return nil, err
+	}
+
+	return &machineopscontroller.CapacityOptions{
+		ProviderName:               cfg.providerName,
+		SiteName:                   cfg.siteName,
+		CredentialSecretNamespace:  cfg.credentialSecretNamespace,
+		ProviderConfigNamespace:    cfg.providerConfigNamespace,
+		EnableAllocationController: true,
+		AllocationConsumerKinds:    consumerKinds,
+	}, nil
+}
+
+// parseConsumerKinds parses each value as group/version/Kind, or version/Kind
+// for the core group.
+func parseConsumerKinds(values []string) ([]schema.GroupVersionKind, error) {
+	var kinds []schema.GroupVersionKind
+
+	for _, value := range values {
+		parts := strings.Split(strings.TrimSpace(value), "/")
+		if len(parts) == 2 {
+			parts = append([]string{""}, parts...)
+		}
+
+		if len(parts) != 3 || parts[1] == "" || parts[2] == "" {
+			return nil, fmt.Errorf("--allocation-consumer-kind %q must be group/version/Kind", value)
+		}
+
+		kind := schema.GroupVersionKind{Group: parts[0], Version: parts[1], Kind: parts[2]}
+
+		for _, existing := range kinds {
+			if existing.GroupKind() == kind.GroupKind() {
+				return nil, fmt.Errorf("--allocation-consumer-kind %q repeats %s", value, kind.GroupKind())
+			}
+		}
+
+		kinds = append(kinds, kind)
+	}
+
+	return kinds, nil
 }
 
 func leaderElectionID(cfg config) string {

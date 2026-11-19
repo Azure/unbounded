@@ -60,7 +60,9 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["configmaps"]
-    resourceNames: ["kube-root-ca.crt"]
+    # kube-root-ca.crt is the cluster CA for bootstrap config.
+    # aks-cluster-metadata is read to detect an AKS control plane.
+    resourceNames: ["kube-root-ca.crt", "aks-cluster-metadata"]
     verbs: ["get"]
 
 ---
