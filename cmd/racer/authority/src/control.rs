@@ -81,10 +81,23 @@ impl ReportState {
             self.encoded = None;
             return Ok(());
         };
+        // A node may reconcile more fills than one report can carry. Keep a
+        // deterministic prefix and leave the rest out of the annotation; their
+        // pins stay in place, and `pinnable_bytes` already accounts for them.
+        let mut fills = self.fills.clone();
+        fills.sort_by(|a, b| {
+            (&a.fill, a.generation, a.membership, &a.digest).cmp(&(
+                &b.fill,
+                b.generation,
+                b.membership,
+                &b.digest,
+            ))
+        });
+        fills.truncate(rails::MAX_REPORT_FILLS);
         let report = Report {
             shares,
             rdma_nics: self.rdma_nics.clone(),
-            fills: self.fills.clone(),
+            fills,
             pinnable_bytes: self.pinnable_bytes,
         };
         self.encoded =
@@ -771,5 +784,48 @@ impl Handle {
 impl Drop for Handle {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn progress(i: usize) -> FillProgress {
+        FillProgress {
+            fill: format!("11111111-1111-4111-8111-{i:012}"),
+            generation: 1,
+            digest: "ab".repeat(32),
+            membership: 1,
+            owned_pages: 1,
+            pinned_pages: 1,
+            owned_bytes: 10,
+            pinned_bytes: 10,
+            refused_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn refresh_bounds_fills_to_the_report_limit() {
+        let mut state = ReportState {
+            shares: NonZeroU32::new(8),
+            fills: (0..17).rev().map(progress).collect(),
+            pinnable_bytes: Some(4096),
+            ..Default::default()
+        };
+        state.refresh().unwrap();
+        let report = rails::parse_report(state.encoded.as_deref().unwrap()).unwrap();
+        assert_eq!(report.fills.len(), rails::MAX_REPORT_FILLS);
+        let uids: Vec<&str> = report.fills.iter().map(|f| f.fill.as_str()).collect();
+        let expected: Vec<String> = (0..rails::MAX_REPORT_FILLS)
+            .map(progress)
+            .map(|p| p.fill)
+            .collect();
+        assert_eq!(
+            uids,
+            expected.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+        // The headroom was computed over every fill, including the omitted one.
+        assert_eq!(report.pinnable_bytes, Some(4096));
     }
 }
