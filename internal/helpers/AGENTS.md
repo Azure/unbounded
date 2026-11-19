@@ -8,10 +8,10 @@ fails if you do.
 
 All of these must be true:
 
-- **Two or more components use it.** A component is a directory under `cmd/`. Code under `internal/` or `pkg/` counts
-  for the component it belongs to, and code under `hack/` does not count. Count only direct imports by a component's
-  own code, not imports that arrive through another component's package. Net's binaries count as one component, since
-  #1175 groups them under `cmd/net/`. To list the packages that import a helper:
+- **Two or more components use it.** The root `AGENTS.md` defines a component, under `cmd/`. Code under `internal/` or
+  `pkg/` counts for the component it belongs to, and code under `hack/` does not count. Count only direct imports by a
+  component's own code, not imports that arrive through another component's package. To list the packages that import
+  a helper:
 
   ```sh
   go list -f '{{range .Imports}}{{if eq . "github.com/Azure/unbounded/internal/helpers/<name>"}}{{$.ImportPath}}{{"\n"}}{{end}}{{end}}' ./...

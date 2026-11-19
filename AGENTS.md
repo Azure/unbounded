@@ -6,49 +6,42 @@ and at the edge, without being limited by the location of your control plane.
 
 ## Repository Structure
 
-unbounded-kube is organized into several directories:
+The tree is the source of truth for what exists. This section says what each top-level directory is for, so it does
+not list their contents.
 
-- `api/` - where API definitions for custom resources are located.
-  - `machina/v1alpha3/` - Machine CRD types (unbounded-cloud.io group).
-  - `net/v1alpha1/` - Net CRD types (net.unbounded-cloud.io group): Site, GatewayPool, SitePeering, etc.
+- `api/` - API types, one directory per group and version, such as `api/machina/v1alpha3/`: CRD types, and wire
+  schemas such as gRPC protobufs. Deepcopy code, CRDs and protobuf code are generated from each package's
+  `go:generate` directives by `make generate`.
 - `bin/` - where generated binary artifacts should be placed.
 - `bpf/` - eBPF C programs for network encapsulation (compiled with clang).
-- `cmd/` - where the sources for each binary artifact are located. Each subdirectory corresponds to a binary artifact.
-  - `agent` - sources for the unbounded-agent.
-  - `gantry` - sources for the gantry peer-to-peer OCI distribution agent.
-  - `inventory` - sources for the inventory controller.
-  - `kubectl-unbounded` - sources for the `kubectl unbounded` plugin (includes `net` subcommand).
-  - `machina` - sources for the machina controller.
-  - `metalman` - sources for the metalman controller.
-  - `unbounded-net-controller` - sources for the unbounded-net network controller.
-  - `unbounded-net-node` - sources for the unbounded-net node agent.
-  - `unbounded-net-routeplan-debug` - debugging tool for route plans.
-  - `unping` - health check probe utility.
-  - `unroute` - eBPF route inspection utility.
-- `deploy/` - component manifests for deploying on a Kubernetes cluster.
-  - `machina/` - machina controller manifest templates (*.yaml.tmpl) plus generated CRDs under `crd/`; rendered output lives under `machina/rendered/` (gitignored, produced by `make machina-manifests`).
-  - `gantry/` - gantry DaemonSet, ConfigMap, and ServiceAccount manifests.
-  - `karpenter/` - rendered Karpenter plugin manifests under `karpenter/rendered/` (gitignored, produced by `make karpenter-manifests`); the template lives in the plugin module.
-  - `net/` - unbounded-net controller and node manifest templates (*.yaml.tmpl); rendered output lives under `net/rendered/` (gitignored, produced by `make net-manifests`).
+- `cmd/` - one directory per component. A component is a directory under `cmd/`: the binary it builds and the code
+  only it uses. Net's binaries (`cmd/unbounded-net-*`, `cmd/unbounded-ipam`, `cmd/unping` and `cmd/unroute`) count as
+  one component, since #1175 groups them under `cmd/net/`. Directories with a `Cargo.toml` are Rust crates, and the Go
+  rules in the `AGENTS.md` files do not apply to them. Much component code still lives under `internal/` and `pkg/` until #1175
+  moves it.
+- `deploy/` - manifests and manifest templates, one directory per component or plugin, such as `deploy/machina/`. Most
+  render with `make <name>-manifests` into `deploy/<name>/rendered/`, which is gitignored; `make help` lists the
+  targets.
 - `designs/` - design documents, proposals, and internal planning documentation for the project.
 - `docs/` - public web site documentation only. Do not place design documents, plans, or ad-hoc internal docs here.
+- `e2e/` - end-to-end suites, one directory per suite, such as `e2e/gantry/`. The suites build only with `-tags e2e`;
+  support packages such as `e2e/gantry/fixture` do not need the tag.
 - `frontend/` - React/TypeScript web UI for network topology visualization (built with Vite).
-- `hack/` - where development tools and scripts are located.
-  - `cmd/` - development tools that are built as Go binaries (forge, render-manifests). `render-manifests` is a generic Go template renderer driven by repeatable `--set key=value` flags; templates rely on sprig's `default` for fallbacks.
+- `hack/` - development tools and scripts. Code here is not a component.
+  - `cmd/` - development tools built as Go binaries, such as forge and `render-manifests`. `render-manifests` is a
+    generic Go template renderer driven by repeatable `--set key=value` flags; templates rely on sprig's `default` for
+    fallbacks.
   - `scripts/` - operational and development shell scripts.
-  - `scratch/` - scratch space for quick go experiments.
-- `images/` - where OCI image definitions and related assets for building container images are located.
-- `e2e/` - end-to-end integration test suites.
-  - `gantry/` - kind-based e2e tests for gantry (guarded by `//go:build e2e`).
+  - `scratch/` - scratch space for quick Go experiments.
+- `images/` - OCI image definitions and related assets for building container images.
 - `internal/` - code shared by more than one component that no single component owns: project conventions
   (`internal/<name>`) and small generic helpers (`internal/helpers/<name>`). Read `internal/AGENTS.md` before adding a
-  package here. Most packages here today are component code that #1175 moves into `cmd/<component>/`, for example:
-  - `gantry/` - gantry shared packages (21 sub-packages: config, mirror, transfer, discovery, coord, hrw, coldstart, members, metrics, etc.). Includes `internal/gantry/proto/coord/v1/` for the libp2p coordination RPC messages (pull intent, please-pull); kept under internal/ so the wire schema isn't an exported API surface.
-  - `net/` - unbounded-net shared packages (APIs, controllers, networking, metrics, webhooks, etc.).
+  package here. Most packages here today are component code that #1175 moves into `cmd/<component>/`.
+- `pkg/` - public Go libraries that other repositories import, such as `pkg/racersdk`. Export only what those users
+  need.
 - `plugins/` - integrations that are their own Go modules because their upstream pins different library versions.
-  - `karpenter/` - the Unbounded Karpenter plugin: upstream Karpenter compiled with a cloud provider that uses only
-    MachineClass and MachineAllocation. It must not import the root module; it projects the API fields it uses and
-    checks them against the generated CRDs.
+  The Karpenter plugin (`plugins/karpenter/`) must not import the root module; it projects the API fields it uses and
+  checks them against the generated CRDs.
 - `tmp/` - project local temporary directory for intermediate stuff that will be cleaned up quickly.
 
 ## Building and Testing
