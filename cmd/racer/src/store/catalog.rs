@@ -2352,7 +2352,7 @@ mod tests {
         let mut ticket = index.reserve_page_for(&page).unwrap();
         assert!(ticket.pinned);
         let (lease, location) = ticket.append(&page, &segments, 512).unwrap();
-        drop(lease);
+        // The pending append holds the segment until it publishes.
         assert!(segments.pinned(location.segment).unwrap());
         ticket
             .publish(
@@ -2363,6 +2363,8 @@ mod tests {
                 },
             )
             .unwrap();
+        drop(lease);
+        assert!(segments.pinned(location.segment).unwrap());
         assert!(index.is_pinned(&page));
         assert_eq!(index.held_page_expiry(&page), Some(until));
         assert!(!index.can_evict(location.segment));

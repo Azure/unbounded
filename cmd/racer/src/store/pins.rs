@@ -156,6 +156,9 @@ impl Pins {
                 self.segment_released(previous);
             }
             *self.segment_pages.entry(segment).or_insert(0) += 1;
+            if let Some(segments) = &self.segments {
+                let _ = segments.pin_segment(segment);
+            }
         }
     }
 

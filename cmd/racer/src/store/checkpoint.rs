@@ -1626,7 +1626,7 @@ mod budget_tests {
         let geometry = CheckpointGeometry::new(2 * 4096, 4096, 2, alignment).unwrap();
         let store = Segments::from_geometry(geometry.allocation_geometry().unwrap()).unwrap();
         drop(store.append(2048).unwrap());
-        drop(store.append_in(2048, true).unwrap());
+        let _pinned = store.append_in(2048, true).unwrap();
         let image = CheckpointImage {
             version: CHECKPOINT_VERSION,
             page_size: racer_wire::object::PageSize::DEFAULT,

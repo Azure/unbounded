@@ -1444,9 +1444,12 @@ mod tests {
                     index.cancel(ticket);
                     error
                 })?;
-        drop(lease);
         let written = index.write_complete(writing);
-        index.publish(written)
+        let removed = index.publish(written)?;
+        // A published pin record keeps the segment after the append lease.
+        segments.pin_segment(lease.id())?;
+        drop(lease);
+        Ok(removed)
     }
 
     #[test]

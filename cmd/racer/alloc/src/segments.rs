@@ -85,6 +85,21 @@ pub struct SegmentLease {
     start: u64,
 
     end: u64,
+
+    /// Slot table and pinned tail for an append into the pinned class. They let
+    /// a canceled or failed pinned write release its pending flag even when no
+    /// pin record was published, and even after the table itself is gone.
+    pinned: Option<PinnedAppend>,
+}
+
+/// Shared state a pinned append needs to clear its slot when it ends without a
+/// published pin. Kept separate so an ordinary lease borrows nothing.
+struct PinnedAppend {
+    slots: Rc<RefCell<Vec<Slot>>>,
+
+    pinned_open: Rc<Cell<Option<usize>>>,
+
+    position: usize,
 }
 
 impl SegmentLease {
@@ -134,6 +149,27 @@ impl Drop for SegmentLease {
     /// Release exactly the one lease count acquired during construction.
     fn drop(&mut self) {
         self.count.set(self.count.get() - 1);
+        let Some(pinned) = self.pinned.take() else {
+            return;
+        };
+        // Last pending pinned append with no published record returns the
+        // segment to the ordinary class, so a canceled write cannot pin it
+        // forever.
+        let mut slots = pinned.slots.borrow_mut();
+        let Some(slot) = slots.get_mut(pinned.position) else {
+            return;
+        };
+        slot.pinned_pending = slot.pinned_pending.saturating_sub(1);
+        if slot.pinned_pending != 0 || slot.pinned_published || slot.pinned_charged {
+            return;
+        }
+        slot.image.pinned = false;
+        if pinned.pinned_open.get() == Some(pinned.position) {
+            if slot.image.state == SegmentState::Open {
+                slot.image.state = SegmentState::Sealed;
+            }
+            pinned.pinned_open.set(None);
+        }
     }
 }
 
@@ -144,6 +180,24 @@ struct Slot {
     usage_group: usize,
 
     leases: Rc<Cell<usize>>,
+
+    /// Appends into the pinned class whose writes are still in flight.
+    pinned_pending: usize,
+
+    /// A published pin record owns this segment's pinned class.
+    pinned_published: bool,
+
+    /// A pin holder counts this segment against the pin budget. An ordinary
+    /// segment holding resident pinned pages uses this instead of claiming the
+    /// pinned class.
+    pinned_charged: bool,
+}
+
+impl Slot {
+    /// Whether reclaim must skip this segment for a pending or published pin.
+    fn is_pinned(&self) -> bool {
+        self.image.pinned || self.pinned_charged
+    }
 }
 
 /// Holds a freeze independently of the table's lifetime. Dropping it thaws the table.
@@ -191,7 +245,7 @@ pub struct Segments {
 
     geometry: Cell<Option<SegmentGeometry>>,
 
-    slots: RefCell<Vec<Slot>>,
+    slots: Rc<RefCell<Vec<Slot>>>,
 
     frozen: Rc<Cell<bool>>,
 
@@ -205,7 +259,7 @@ pub struct Segments {
     open: Cell<Option<usize>>,
 
     /// Appendable tail of the pinned class. Shared appends only use `open`.
-    pinned_open: Cell<Option<usize>>,
+    pinned_open: Rc<Cell<Option<usize>>>,
 
     free: RefCell<BTreeSet<usize>>,
 
@@ -223,13 +277,13 @@ impl Segments {
         Self {
             segment_bytes,
             geometry: Cell::new(None),
-            slots: RefCell::new(Vec::new()),
+            slots: Rc::new(RefCell::new(Vec::new())),
             frozen: Rc::new(Cell::new(false)),
             appends_frozen: Rc::new(Cell::new(false)),
             table: TableIdentity::new(),
             restore_epoch: Cell::new(0),
             open: Cell::new(None),
-            pinned_open: Cell::new(None),
+            pinned_open: Rc::new(Cell::new(None)),
             free: RefCell::new(BTreeSet::new()),
             evicting: Cell::new(0),
             usage: RefCell::new(Vec::new()),
@@ -356,6 +410,9 @@ impl Segments {
                     pinned: false,
                 },
                 leases: Rc::new(Cell::new(0)),
+                pinned_pending: 0,
+                pinned_published: false,
+                pinned_charged: false,
             })
             .collect();
         *self.free.borrow_mut() = (0..count).collect();
@@ -386,7 +443,7 @@ impl Segments {
         }
         let mut slots = self.slots_mut();
         let tail = if pinned {
-            &self.pinned_open
+            self.pinned_open.as_ref()
         } else {
             &self.open
         };
@@ -422,7 +479,7 @@ impl Segments {
             .checked_add(length as u64)
             .ok_or(Error::InvalidConfiguration)?;
         // All fallible checks, including lease-counter overflow, precede mutation.
-        let lease = self.take_lease(slot, used_bytes)?;
+        let lease = self.take_lease(slot, used_bytes, pinned)?;
         if usable_open.is_none() {
             if let Some(previous) = previous_open {
                 slots[previous].image.state = SegmentState::Sealed;
@@ -432,7 +489,10 @@ impl Segments {
         tail.set(Some(position));
         let slot = &mut slots[position];
         slot.image.state = SegmentState::Open;
-        slot.image.pinned = pinned;
+        if pinned {
+            slot.pinned_pending += 1;
+            slot.image.pinned = true;
+        }
         slot.image.used_bytes = used_bytes;
         self.usage.borrow_mut()[slot.usage_group].1 += length as u64;
         if slot.image.used_bytes == self.segment_bytes {
@@ -463,7 +523,7 @@ impl Segments {
     }
 
     /// Capture a checked prefix and increment its counter before publishing a lease.
-    fn take_lease(&self, slot: &Slot, used_bytes: u64) -> Result<SegmentLease> {
+    fn take_lease(&self, slot: &Slot, used_bytes: u64, pinned: bool) -> Result<SegmentLease> {
         let start = slot
             .image
             .id
@@ -472,6 +532,17 @@ impl Segments {
             .ok_or(Error::Corrupt)?;
         let end = start.checked_add(used_bytes).ok_or(Error::Corrupt)?;
         let geometry = self.geometry().ok_or(Error::Unavailable)?;
+        let pinned = pinned.then(|| {
+            Self::position(slot.image.id).map(|position| PinnedAppend {
+                slots: self.slots.clone(),
+                pinned_open: self.pinned_open.clone(),
+                position,
+            })
+        });
+        let pinned = match pinned {
+            Some(pinned) => Some(pinned?),
+            None => None,
+        };
         slot.leases
             .set(slot.leases.get().checked_add(1).ok_or(Error::Busy)?);
         Ok(SegmentLease {
@@ -482,6 +553,7 @@ impl Segments {
             geometry,
             start,
             end,
+            pinned,
         })
     }
 
@@ -501,7 +573,7 @@ impl Segments {
         {
             return Err(Error::Stale);
         }
-        self.take_lease(slot, slot.image.used_bytes)
+        self.take_lease(slot, slot.image.used_bytes, false)
     }
 
     /// Stop new leases for a sealed slot; repeating eviction is harmless.
@@ -517,7 +589,7 @@ impl Segments {
         }
         let mut slots = self.slots_mut();
         let slot = slots.get_mut(Self::position(id)?).ok_or(Error::Corrupt)?;
-        if slot.image.pinned
+        if slot.is_pinned()
             || !matches!(
                 slot.image.state,
                 SegmentState::Sealed | SegmentState::Evicting
@@ -557,6 +629,9 @@ impl Segments {
         );
         slot.image.state = SegmentState::Free;
         slot.image.pinned = false;
+        slot.pinned_pending = 0;
+        slot.pinned_published = false;
+        slot.pinned_charged = false;
         self.evicting.set(self.evicting.get() - 1);
         self.usage.borrow_mut()[slot.usage_group].1 -= slot.image.used_bytes;
         slot.image.used_bytes = 0;
@@ -687,6 +762,9 @@ impl Segments {
                 self.evicting.set(self.evicting.get() + 1);
             }
             usage[slot.usage_group].1 += image.used_bytes;
+            slot.pinned_pending = 0;
+            slot.pinned_published = image.pinned;
+            slot.pinned_charged = false;
             slot.image = image;
         }
         self.restore_epoch.set(epoch);
@@ -756,12 +834,12 @@ impl Segments {
         self.slots.borrow().len()
     }
 
-    /// Segments currently reserved for the pinned page class.
+    /// Segments currently reserved for or charged to the pinned page class.
     pub fn pinned_count(&self) -> usize {
         self.slots
             .borrow()
             .iter()
-            .filter(|slot| slot.image.pinned)
+            .filter(|slot| slot.is_pinned())
             .count()
     }
 
@@ -774,13 +852,42 @@ impl Segments {
             .ok_or(Error::Corrupt)
     }
 
-    /// Whether `id` belongs to the pinned class.
+    /// Whether `id` is protected by a pending or published pin.
     pub fn pinned(&self, id: SegmentId) -> Result<bool> {
         self.slots
             .borrow()
             .get(Self::position(id)?)
-            .map(|slot| slot.image.pinned)
+            .map(Slot::is_pinned)
             .ok_or(Error::Corrupt)
+    }
+
+    /// Record that a pin holder counts `id`. A segment already in the pinned
+    /// class gains a published owner. A sealed ordinary segment joins the
+    /// pinned class. A shared open tail is only charged, so it keeps its
+    /// allocation class and its unused append space.
+    pub fn pin_segment(&self, id: SegmentId) -> Result<()> {
+        let position = Self::position(id)?;
+        let mut slots = self.slots_mut();
+        let slot = slots.get_mut(position).ok_or(Error::Corrupt)?;
+        if slot.image.pinned {
+            slot.pinned_published = true;
+            return Ok(());
+        }
+        match slot.image.state {
+            SegmentState::Sealed => {
+                slot.pinned_published = true;
+                slot.image.pinned = true;
+            }
+            SegmentState::Open if self.open.get() == Some(position) => {
+                slot.pinned_charged = true;
+            }
+            SegmentState::Open => {
+                slot.pinned_published = true;
+                slot.image.pinned = true;
+            }
+            SegmentState::Free | SegmentState::Evicting => return Err(Error::Corrupt),
+        }
+        Ok(())
     }
 
     /// Return a pinned segment to the shared, evictable class. A pinned open
@@ -792,6 +899,11 @@ impl Segments {
         let position = Self::position(id)?;
         let mut slots = self.slots_mut();
         let slot = slots.get_mut(position).ok_or(Error::Corrupt)?;
+        slot.pinned_published = false;
+        slot.pinned_charged = false;
+        if slot.pinned_pending != 0 {
+            return Ok(());
+        }
         if self.pinned_open.get() == Some(position) {
             self.pinned_open.set(None);
             if slot.image.state == SegmentState::Open {
@@ -809,6 +921,9 @@ impl Segments {
         let mut slots = self.slots_mut();
         for slot in slots.iter_mut() {
             slot.image.pinned = false;
+            slot.pinned_pending = 0;
+            slot.pinned_published = false;
+            slot.pinned_charged = false;
         }
     }
 }
@@ -1257,11 +1372,56 @@ mod tests {
         let s = segments(1024, 3);
         let (shared, _) = s.append(512).unwrap();
         drop(s.append_in(1024, true).unwrap());
+        // Without a published pin the dropped append no longer claims the
+        // pinned class, but it still self-sealed.
         assert_eq!(s.state(SegmentId(1)), Ok(SegmentState::Sealed));
-        assert!(s.pinned(SegmentId(1)).unwrap());
+        assert!(!s.pinned(SegmentId(1)).unwrap());
         assert_eq!(s.state(SegmentId(0)), Ok(SegmentState::Open));
         assert_eq!(s.append(512).unwrap().0.id(), shared.id());
         assert_eq!(s.append_in(512, true).unwrap().0.id(), SegmentId(2));
+    }
+
+    /// A pinned append that is dropped before publication releases the class
+    /// again, including a pinned open tail it sealed.
+    #[test]
+    fn canceled_pinned_append_returns_the_segment_to_the_shared_class() {
+        let s = segments(1024, 2);
+        let (lease, _) = s.append_in(512, true).unwrap();
+        assert!(s.pinned(SegmentId(0)).unwrap());
+        assert_eq!(s.pinned_count(), 1);
+        drop(lease);
+        assert!(!s.pinned(SegmentId(0)).unwrap());
+        assert_eq!(s.pinned_count(), 0);
+        assert_eq!(s.state(SegmentId(0)), Ok(SegmentState::Sealed));
+        s.begin_evict(SegmentId(0)).unwrap();
+        s.recycle(SegmentId(0)).unwrap();
+        assert_eq!(s.free_count(), 2);
+
+        // A failed full append behaves the same way and stays reclaimable.
+        let (lease, _) = s.append_in(1024, true).unwrap();
+        let id = lease.id();
+        assert_eq!(s.state(id), Ok(SegmentState::Sealed));
+        assert!(s.pinned(id).unwrap());
+        drop(lease);
+        assert!(!s.pinned(id).unwrap());
+        s.begin_evict(id).unwrap();
+    }
+
+    /// A published pin record keeps a segment pinned even after the append
+    /// lease is dropped, and releasing the record makes it reclaimable.
+    #[test]
+    fn published_pin_keeps_the_segment_until_released() {
+        let s = segments(1024, 2);
+        let (lease, _) = s.append_in(512, true).unwrap();
+        s.pin_segment(SegmentId(0)).unwrap();
+        drop(lease);
+        assert!(s.pinned(SegmentId(0)).unwrap());
+        assert_eq!(s.pinned_count(), 1);
+        assert_eq!(s.begin_evict(SegmentId(0)), Err(Error::Busy));
+        s.clear_pinned(SegmentId(0)).unwrap();
+        assert!(!s.pinned(SegmentId(0)).unwrap());
+        assert_eq!(s.pinned_count(), 0);
+        s.begin_evict(SegmentId(0)).unwrap();
     }
 
     /// clear_pinned seals a pinned tail and returns the segment to reclaim.
@@ -1269,6 +1429,7 @@ mod tests {
     fn clear_pinned_seals_the_tail_and_clears_the_flag() {
         let s = segments(1024, 2);
         let (lease, _) = s.append_in(512, true).unwrap();
+        s.pin_segment(SegmentId(0)).unwrap();
         drop(lease);
         assert!(s.pinned(SegmentId(0)).unwrap());
         s.clear_pinned(SegmentId(0)).unwrap();
@@ -1281,12 +1442,32 @@ mod tests {
         s.clear_pinned(SegmentId(0)).unwrap();
     }
 
+    /// Charging a resident page's ordinary segment counts against the pin
+    /// budget without claiming the pinned allocation class.
+    #[test]
+    fn resident_pin_charge_uses_the_budget_but_not_the_pinned_class() {
+        let s = segments(1024, 2);
+        drop(s.append_in(512, false).unwrap());
+        assert!(!s.pinned(SegmentId(0)).unwrap());
+        s.pin_segment(SegmentId(0)).unwrap();
+        assert!(s.pinned(SegmentId(0)).unwrap());
+        assert_eq!(s.pinned_count(), 1);
+        assert_eq!(s.begin_evict(SegmentId(0)), Err(Error::Busy));
+        s.clear_pinned(SegmentId(0)).unwrap();
+        assert!(!s.pinned(SegmentId(0)).unwrap());
+        assert_eq!(s.pinned_count(), 0);
+    }
+
     /// Recovery accepts one open tail of each class and preserves the flag.
     #[test]
     fn restore_accepts_two_open_tails_and_rejects_pinned_free() {
         let s = segments(1024, 4);
         drop(s.append(512).unwrap());
-        drop(s.append_in(512, true).unwrap());
+        let (lease, _) = s.append_in(512, true).unwrap();
+        // Publish a record for the pinned tail so recovery sees both classes;
+        // dropping the lease afterwards must not clear a published flag.
+        s.pin_segment(SegmentId(1)).unwrap();
+        drop(lease);
         let image = s.snapshot();
         assert_eq!(image[0].state, SegmentState::Open);
         assert_eq!(image[1].state, SegmentState::Open);
