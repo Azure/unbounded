@@ -202,8 +202,8 @@ verify that `nvidia-smi -L` lists GPUs before retrying bootstrap.
 | Check | Severity when failing | What it validates |
 |---|---|---|
 | `api-server-reachable` | Error | Cluster CA data and bootstrap credentials are valid enough to use, the configured API server endpoint is well formed, and the host can reach the API server `/readyz` endpoint. API server responses with status 500 or higher are fatal. |
-| `kubelet-bind-address` | Error or warning | Checks kubelet's `0.0.0.0:10250` port in the shared host network namespace. A listener owned by the host kubelet service that bootstrap will stop is a warning; other foreign listeners are errors. |
-| `containerd-metrics-bind-address` | Error or warning | Checks containerd's configured metrics port, currently `0.0.0.0:10257`, in the shared host network namespace. A listener owned by the host containerd service that bootstrap will stop is a warning; other foreign listeners are errors. |
+| `kubelet-bind-address` | Error | No TCP listener occupies kubelet's `0.0.0.0:10250` port in the shared host network namespace. |
+| `containerd-metrics-bind-address` | Error | No TCP listener occupies containerd's configured metrics port, currently `0.0.0.0:10257`, in the shared host network namespace. |
 
 ### Rootfs and Artifact Checks
 

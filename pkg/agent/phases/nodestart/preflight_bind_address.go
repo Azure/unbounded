@@ -17,7 +17,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/Azure/unbounded/pkg/agent/isolation/none"
 	"github.com/Azure/unbounded/pkg/agent/preflight"
 )
 
@@ -39,43 +38,6 @@ type bindAddressChecker struct {
 	log         *slog.Logger
 	inspect     func(address string) (string, bool, error)
 	owned       func() bool
-	deactivated func() bool
-}
-
-func listenerOwnedByService(procRoot, address, unit, binary string) bool {
-	_, portText, err := net.SplitHostPort(address)
-	if err != nil {
-		return false
-	}
-
-	port, err := strconv.ParseUint(portText, 10, 16)
-	if err != nil {
-		return false
-	}
-
-	wanted := map[string]struct{}{}
-	for _, table := range []string{"tcp", "tcp6"} {
-		data, err := os.ReadFile(filepath.Join(procRoot, "net", table))
-		if errors.Is(err, fs.ErrNotExist) && table == "tcp6" {
-			continue
-		}
-		if err != nil {
-			return false
-		}
-		for inode := range listenerSocketInodes(data, uint16(port)) {
-			wanted[inode] = struct{}{}
-		}
-	}
-
-	matched := map[string]bool{}
-	for _, owner := range socketOwners(procRoot, wanted) {
-		if !none.ServiceOwnsProcess(procRoot, strconv.Itoa(owner.pid), unit, binary) {
-			return false
-		}
-		matched[owner.inode] = true
-	}
-
-	return len(wanted) > 0 && len(matched) == len(wanted)
 }
 
 // CheckBindAddress verifies no TCP listener currently occupies an address's
@@ -179,10 +141,6 @@ func (c bindAddressChecker) Check(context.Context) []preflight.Result {
 	if occupied {
 		if c.owned != nil && c.owned() {
 			return preflight.ResultsOK(c.name, c.address, c.description+" belongs to this installation")
-		}
-
-		if c.deactivated != nil && c.deactivated() {
-			return preflight.ResultsWarning(c.name, c.address, "%s is in use by a host service that bootstrap will stop", c.description)
 		}
 
 		if owner != "" {
