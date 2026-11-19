@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	centerpivotmanifests "github.com/Azure/unbounded/deploy/centerpivot"
 	gantrymanifests "github.com/Azure/unbounded/deploy/gantry"
 	machinamanifests "github.com/Azure/unbounded/deploy/machina"
 	netmanifests "github.com/Azure/unbounded/deploy/net"
@@ -26,6 +27,7 @@ func TestEmbeddedManifestsHaveNoLatestImageTags(t *testing.T) {
 		"net":             netmanifests.Manifests,
 		"gantry":          gantrymanifests.Manifests,
 		"token-refresher": tokenrefreshermanifests.Manifests,
+		"centerpivot":     centerpivotmanifests.Manifests,
 	}
 
 	for name, manifests := range sets {

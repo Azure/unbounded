@@ -28,6 +28,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/cmd/centerpivot/operatorcomponent"
 	"github.com/Azure/unbounded/internal/operator/component"
 	"github.com/Azure/unbounded/internal/operator/components/gantry"
 	"github.com/Azure/unbounded/internal/operator/components/machina"
@@ -99,6 +100,7 @@ func DefaultRegistry() *component.Registry {
 			gantry.New(),
 			tokenrefresher.New(),
 			racer.New(),
+			operatorcomponent.New(),
 			metalman.NewBootstrap(),
 		},
 		Site: []component.SiteComponent{

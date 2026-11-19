@@ -449,7 +449,7 @@ func TestDefaultRegistryIsValidAndComplete(t *testing.T) {
 		t.Fatalf("DefaultRegistry is invalid: %v", err)
 	}
 
-	wantConditions := map[string]bool{"NetReady": false, "MachinaReady": false, "GantryReady": false, "TokenRefresherReady": false, "MetalmanReady": false, "RacerReady": false}
+	wantConditions := map[string]bool{"NetReady": false, "MachinaReady": false, "GantryReady": false, "TokenRefresherReady": false, "MetalmanReady": false, "RacerReady": false, "CenterPivotReady": false}
 
 	for _, c := range reg.Cluster {
 		wantConditions[c.ConditionType()] = true
@@ -941,6 +941,13 @@ func TestOverrideKindsMatchWhatComponentsPlan(t *testing.T) {
 				Metalman:       &unboundedv1alpha3.MetalmanComponentSpec{SiteComponentSpec: enabled()},
 				Gantry:         &unboundedv1alpha3.GantryComponentSpec{SiteComponentSpec: enabled()},
 				TokenRefresher: &unboundedv1alpha3.TokenRefresherComponentSpec{SiteComponentSpec: enabled()},
+				CenterPivot: &unboundedv1alpha3.CenterPivotComponentSpec{
+					SiteComponentSpec: enabled(),
+					NebraskaURL:       "https://nebraska.example.com/v1/update",
+					Apps: []unboundedv1alpha3.CenterPivotApp{
+						{Name: "acl", AppID: "11111111-2222-3333-4444-555555555555"},
+					},
+				},
 			},
 		},
 	}}

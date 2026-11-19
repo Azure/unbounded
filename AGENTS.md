@@ -15,6 +15,8 @@ unbounded-kube is organized into several directories:
 - `bpf/` - eBPF C programs for network encapsulation (compiled with clang).
 - `cmd/` - where the sources for each binary artifact are located. Each subdirectory corresponds to a binary artifact.
   - `agent` - sources for the unbounded-agent.
+  - `centerpivot` - sources for centerpivot, which updates Azure Container Linux nodes from Nebraska; see its
+    `AGENTS.md`.
   - `gantry` - sources for the gantry peer-to-peer OCI distribution agent.
   - `inventory` - sources for the inventory controller.
   - `kubectl-unbounded` - sources for the `kubectl unbounded` plugin (includes `net` subcommand).
@@ -78,6 +80,9 @@ unbounded-kube is organized into several directories:
 
 - Do not cross cmd/ package boundaries. For example, `cmd/agent` should not import from `cmd/machina`. If you need to
   share code between these packages, put it in `internal/`.
+  The exception is `cmd/centerpivot`, which keeps all its Go code under itself: other code may import only its two
+  exported packages, `cmd/centerpivot/operatorcomponent` and `cmd/centerpivot/hostagent`. See
+  `cmd/centerpivot/AGENTS.md`.
 - Do not use em-dashes (`—`) in comments, strings, or any source/config files. Use a plain ASCII hyphen (`-`)
   or rephrase the sentence instead.
 - Write American English, not British. Use `behavior`, `initialize`, `labeled`, `catalog`, `defense`, `judgment`,

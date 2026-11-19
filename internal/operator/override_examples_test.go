@@ -20,6 +20,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	centerpivotmanifests "github.com/Azure/unbounded/deploy/centerpivot"
 	gantrymanifests "github.com/Azure/unbounded/deploy/gantry"
 	machinamanifests "github.com/Azure/unbounded/deploy/machina"
 	netmanifests "github.com/Azure/unbounded/deploy/net"
@@ -42,6 +43,7 @@ var componentManifests = map[string]fs.FS{
 	"machina":         machinamanifests.Manifests,
 	"gantry":          gantrymanifests.Manifests,
 	"token-refresher": tokenrefreshermanifests.Manifests,
+	"centerpivot":     centerpivotmanifests.Manifests,
 }
 
 // componentContainerNames returns the container names an example may refer to
@@ -612,7 +614,7 @@ func TestDocumentedComponentKindsMatchTheTable(t *testing.T) {
 		t.Fatalf("read %s: %v", doc, err)
 	}
 
-	for _, component := range []string{"net", "machina", "gantry", "metalman", "token-refresher"} {
+	for _, component := range []string{"net", "machina", "gantry", "metalman", "token-refresher", "centerpivot"} {
 		kinds := override.ComponentKinds(component)
 		if len(kinds) == 0 {
 			t.Fatalf("override.ComponentKinds(%q) is empty; the test is looking at the wrong names", component)

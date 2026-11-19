@@ -60,7 +60,7 @@ func TestBuildBOM(t *testing.T) {
 		t.Fatalf("chart reference = %q, want %q", got, want)
 	}
 
-	if got, want := bom.Images[0].Reference, "registry.example.com/project/gantry:v1.2.3"; got != want {
+	if got, want := bom.Images[0].Reference, "registry.example.com/project/centerpivot:v1.2.3"; got != want {
 		t.Fatalf("first image reference = %q, want %q", got, want)
 	}
 

@@ -1,0 +1,122 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: centerpivot
+  namespace: {{ default "unbounded-system" .Namespace }}
+  labels:
+    app.kubernetes.io/name: centerpivot
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: centerpivot
+  labels:
+    app.kubernetes.io/name: centerpivot
+rules:
+  # The centerpivot-node-restriction admission policy limits the Node and
+  # Machine changes to the updating taint, the update request, and the state.
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: ["unbounded-cloud.io"]
+    resources: ["machines"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: ["unbounded-cloud.io"]
+    resources: ["sites", "machineoperations"]
+    verbs: ["get", "list", "watch"]
+  # The drain, with kubectl drain's rules.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/eviction"]
+    verbs: ["create"]
+  - apiGroups: ["apps"]
+    resources: ["daemonsets", "deployments", "replicasets", "statefulsets"]
+    verbs: ["get"]
+  - apiGroups: ["events.k8s.io"]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: centerpivot
+  labels:
+    app.kubernetes.io/name: centerpivot
+subjects:
+  - kind: ServiceAccount
+    name: centerpivot
+    namespace: {{ default "unbounded-system" .Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: centerpivot
+---
+# Leader election, and the Sites' CA ConfigMaps.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: centerpivot
+  namespace: {{ default "unbounded-system" .Namespace }}
+  labels:
+    app.kubernetes.io/name: centerpivot
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: centerpivot
+  namespace: {{ default "unbounded-system" .Namespace }}
+  labels:
+    app.kubernetes.io/name: centerpivot
+subjects:
+  - kind: ServiceAccount
+    name: centerpivot
+    namespace: {{ default "unbounded-system" .Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: centerpivot
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: centerpivot-node-info
+  namespace: {{ default "unbounded-system" .Namespace }}
+  labels:
+    app.kubernetes.io/name: centerpivot-node-info
+---
+# The centerpivot-node-info-restriction admission policy limits this to the
+# agent-info annotation of the pod's own Node.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: centerpivot-node-info
+  labels:
+    app.kubernetes.io/name: centerpivot-node-info
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: centerpivot-node-info
+  labels:
+    app.kubernetes.io/name: centerpivot-node-info
+subjects:
+  - kind: ServiceAccount
+    name: centerpivot-node-info
+    namespace: {{ default "unbounded-system" .Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: centerpivot-node-info

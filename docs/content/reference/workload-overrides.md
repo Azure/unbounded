@@ -100,10 +100,10 @@ data:
 
 | Field | Required | Meaning |
 |---|---|---|
-| `component` | yes | `net`, `machina`, `gantry`, `token-refresher` or `metalman`. |
+| `component` | yes | `net`, `machina`, `gantry`, `token-refresher`, `racer`, `centerpivot` or `metalman`. |
 | `kind` | yes | The kind that component emits. With `component` this selects matching workloads. A pair the component cannot produce, such as `machina`/`DaemonSet`, is rejected rather than left to match nothing. |
 | `name` | no | Exact workload name, not a container name. Omit to match all workloads of the selected component and kind. For example, `name: gantry` excludes the `gantry-overlaybd-config` DaemonSet. Requires an operator version supporting this field. |
-| `sites` | no | **Per-Site components only**, meaning `metalman`. Naming it on `net`, `machina`, `gantry` or `token-refresher` is an error, because those are cluster singletons and there is one of each for the whole cluster. **Omit it to match every Site.** An empty list is an error, since it is far likelier to be a mistake than an intent to match nothing. |
+| `sites` | no | **Per-Site components only**, meaning `metalman`. Naming it on `net`, `machina`, `gantry`, `token-refresher`, `racer` or `centerpivot` is an error, because those are cluster singletons and there is one of each for the whole cluster. **Omit it to match every Site.** An empty list is an error, since it is far likelier to be a mistake than an intent to match nothing. |
 | `patch` | no | A strategic merge patch against the whole workload object, so `metadata.labels`, `metadata.annotations`, `spec.replicas` and the pod template are all reachable. |
 | `extraArgs` | no | Arguments to append, keyed by container name. See below. |
 | `addContainers` | no | Names of containers this entry intends to create rather than modify. |
@@ -115,7 +115,7 @@ A document can also set `images`, next to `overrides`, for the one image no
 workload the operator emits declares. See
 [Overriding the managed kube-proxy image](#overriding-the-managed-kube-proxy-image).
 
-Each component emits one kind, except `net` and `racer`:
+Each component emits one kind, except `net`, `racer` and `centerpivot`:
 
 | Component | Kinds | Per-Site |
 |---|---|---|
@@ -124,6 +124,7 @@ Each component emits one kind, except `net` and `racer`:
 | `gantry` | `DaemonSet` | no |
 | `token-refresher` | `Deployment` | no |
 | `racer` | `Deployment` and `DaemonSet` | no |
+| `centerpivot` | `Deployment` and `DaemonSet` | no |
 | `metalman` | `Deployment` | yes |
 
 ### Always use `extraArgs` to add arguments

@@ -472,6 +472,12 @@ func HostIsImageManaged() bool {
 	return HostDistroIsImageManaged(detectHostDistro())
 }
 
+// HostIsAzureContainerLinux reports whether the host runs Azure Container
+// Linux.
+func HostIsAzureContainerLinux() bool {
+	return detectHostDistro() == hostDistroAzureContainerLinux
+}
+
 // HostDistroIsImageManaged reports whether a detected host distro is
 // image-managed. Split out from HostIsImageManaged so it can be tested without
 // a real /etc/os-release.

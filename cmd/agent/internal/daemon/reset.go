@@ -15,6 +15,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
+	"github.com/Azure/unbounded/cmd/centerpivot/hostagent"
 	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/internal/fsutil"
 	"github.com/Azure/unbounded/internal/hostroot"
@@ -291,6 +292,7 @@ func resetResourcesOn(log *slog.Logger, h resetHost) phases.Task {
 		// every boot, so it is host-global rather than part of a mode's
 		// teardown. reload-systemd below picks up the removal.
 		reset.RemoveNFTablesFlush(log),
+		hostagent.RemoveTridentACLAgentConfig(log),
 		// Before the artifacts, so a failure stops the reset while the host is
 		// still recognizably installed.
 		RemoveFirstBootBootstrapUnit(log),

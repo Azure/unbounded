@@ -28,6 +28,7 @@ import (
 const bomSchemaVersion = 2
 
 var releaseImageNames = []string{
+	"centerpivot",
 	"gantry",
 	"gantry-node-config",
 	"host-azurelinux3",

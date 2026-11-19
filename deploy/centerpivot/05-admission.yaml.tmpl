@@ -1,0 +1,155 @@
+# What centerpivot's two service accounts may change, beyond what RBAC can
+# say. The CEL expressions compare whole maps and lists, so fields added in
+# later Kubernetes versions are protected too.
+---
+# centerpivot may change only its updating taint and the update request on
+# Nodes, and a request may name only the Nebraska URL and one of the app IDs of
+# a Site that enables it. The operator sets allowedSources from the Sites: one
+# pair of JSON fragments, "server":<url> and "appId":<id>, per app. The request's JSON is
+# written without spaces, and the agent rejects duplicate fields, so a
+# fragment can only match the field it names.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: centerpivot-node-restriction
+  labels:
+    app.kubernetes.io/name: centerpivot
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["UPDATE"]
+        resources: ["nodes"]
+  matchConditions:
+    - name: is-centerpivot
+      expression: "request.userInfo.username == 'system:serviceaccount:{{ default "unbounded-system" .Namespace }}:centerpivot'"
+  variables:
+    - name: allowedSources
+      expression: "[]"
+  validations:
+    - expression: "object.status == oldObject.status"
+      message: "centerpivot may not change a Node's status"
+    - expression: "object.metadata.?labels.orValue({}) == oldObject.metadata.?labels.orValue({})"
+      message: "centerpivot may not change a Node's labels"
+    - expression: >-
+        object.spec.all(k, k == 'taints' || (k in oldObject.spec && object.spec[k] == oldObject.spec[k])) &&
+        oldObject.spec.all(k, k == 'taints' || (k in object.spec && oldObject.spec[k] == object.spec[k])) &&
+        object.spec.?taints.orValue([]).filter(t, t.key != 'centerpivot.unbounded-cloud.io/updating') ==
+          oldObject.spec.?taints.orValue([]).filter(t, t.key != 'centerpivot.unbounded-cloud.io/updating') &&
+        object.spec.?taints.orValue([]).filter(t, t.key == 'centerpivot.unbounded-cloud.io/updating').all(t,
+          t.effect == 'NoSchedule' && t.?value.orValue('') == '') &&
+        object.spec.?taints.orValue([]).filter(t, t.key == 'centerpivot.unbounded-cloud.io/updating').size() <= 1
+      message: "centerpivot may only add or remove its updating taint"
+    - expression: >-
+        object.metadata.?annotations.orValue({}).all(k, k == 'centerpivot.unbounded-cloud.io/update-request' ||
+          (k in oldObject.metadata.?annotations.orValue({}) && object.metadata.annotations[k] == oldObject.metadata.annotations[k])) &&
+        oldObject.metadata.?annotations.orValue({}).all(k, k == 'centerpivot.unbounded-cloud.io/update-request' ||
+          (k in object.metadata.?annotations.orValue({}) && oldObject.metadata.annotations[k] == object.metadata.annotations[k]))
+      message: "centerpivot may only change a Node's update-request annotation"
+    - expression: >-
+        !('centerpivot.unbounded-cloud.io/update-request' in object.metadata.?annotations.orValue({})) ||
+        object.metadata.annotations['centerpivot.unbounded-cloud.io/update-request'] ==
+          oldObject.metadata.?annotations.orValue({})[?'centerpivot.unbounded-cloud.io/update-request'].orValue('') ||
+        variables.allowedSources.exists(s,
+          object.metadata.annotations['centerpivot.unbounded-cloud.io/update-request'].contains(s[0]) &&
+          object.metadata.annotations['centerpivot.unbounded-cloud.io/update-request'].contains(s[1]))
+      message: "centerpivot may only name the Nebraska URL and an app ID of a Site that enables it"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: centerpivot-node-restriction
+  labels:
+    app.kubernetes.io/name: centerpivot
+spec:
+  policyName: centerpivot-node-restriction
+  validationActions: ["Deny"]
+---
+# centerpivot may change only its state annotation on Machines.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: centerpivot-machine-restriction
+  labels:
+    app.kubernetes.io/name: centerpivot
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["unbounded-cloud.io"]
+        apiVersions: ["*"]
+        operations: ["UPDATE"]
+        resources: ["machines"]
+  matchConditions:
+    - name: is-centerpivot
+      expression: "request.userInfo.username == 'system:serviceaccount:{{ default "unbounded-system" .Namespace }}:centerpivot'"
+  validations:
+    - expression: >-
+        object.spec == oldObject.spec &&
+        object.?status.orValue({}) == oldObject.?status.orValue({}) &&
+        object.metadata.?labels.orValue({}) == oldObject.metadata.?labels.orValue({})
+      message: "centerpivot may not change a Machine's spec, status, or labels"
+    - expression: >-
+        object.metadata.?annotations.orValue({}).all(k, k == 'centerpivot.unbounded-cloud.io/state' ||
+          (k in oldObject.metadata.?annotations.orValue({}) && object.metadata.annotations[k] == oldObject.metadata.annotations[k])) &&
+        oldObject.metadata.?annotations.orValue({}).all(k, k == 'centerpivot.unbounded-cloud.io/state' ||
+          (k in object.metadata.?annotations.orValue({}) && oldObject.metadata.annotations[k] == object.metadata.annotations[k]))
+      message: "centerpivot may only change a Machine's state annotation"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: centerpivot-machine-restriction
+  labels:
+    app.kubernetes.io/name: centerpivot
+spec:
+  policyName: centerpivot-machine-restriction
+  validationActions: ["Deny"]
+---
+# centerpivot-node-info may change only the agent-info annotation, and only on
+# the Node its pod's token is bound to.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: centerpivot-node-info-restriction
+  labels:
+    app.kubernetes.io/name: centerpivot-node-info
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["UPDATE"]
+        resources: ["nodes"]
+  matchConditions:
+    - name: is-centerpivot-node-info
+      expression: "request.userInfo.username == 'system:serviceaccount:{{ default "unbounded-system" .Namespace }}:centerpivot-node-info'"
+  validations:
+    - expression: >-
+        request.userInfo.extra[?'authentication.kubernetes.io/node-name'][0].orValue('') == object.metadata.name &&
+        request.userInfo.extra[?'authentication.kubernetes.io/node-uid'][0].orValue('') == object.metadata.uid
+      message: "centerpivot-node-info may only change its own Node"
+    - expression: >-
+        object.spec == oldObject.spec &&
+        object.status == oldObject.status &&
+        object.metadata.?labels.orValue({}) == oldObject.metadata.?labels.orValue({})
+      message: "centerpivot-node-info may not change a Node's spec, status, or labels"
+    - expression: >-
+        object.metadata.?annotations.orValue({}).all(k, k == 'centerpivot.unbounded-cloud.io/agent-info' ||
+          (k in oldObject.metadata.?annotations.orValue({}) && object.metadata.annotations[k] == oldObject.metadata.annotations[k])) &&
+        oldObject.metadata.?annotations.orValue({}).all(k, k == 'centerpivot.unbounded-cloud.io/agent-info' ||
+          (k in object.metadata.?annotations.orValue({}) && oldObject.metadata.annotations[k] == object.metadata.annotations[k]))
+      message: "centerpivot-node-info may only change a Node's agent-info annotation"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: centerpivot-node-info-restriction
+  labels:
+    app.kubernetes.io/name: centerpivot-node-info
+spec:
+  policyName: centerpivot-node-info-restriction
+  validationActions: ["Deny"]

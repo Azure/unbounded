@@ -23,6 +23,7 @@ import (
 	"strings"
 	"testing"
 
+	centerpivotmanifests "github.com/Azure/unbounded/deploy/centerpivot"
 	gantrymanifests "github.com/Azure/unbounded/deploy/gantry"
 	machinamanifests "github.com/Azure/unbounded/deploy/machina"
 	netmanifests "github.com/Azure/unbounded/deploy/net"
@@ -42,6 +43,9 @@ type Set struct {
 
 // The rendered sets that tests read.
 var (
+	CenterPivot = Set{
+		Dir: "deploy/centerpivot/rendered", Target: "centerpivot-manifests", FS: centerpivotmanifests.Manifests,
+	}
 	Gantry = Set{
 		Dir: "deploy/gantry/rendered", Target: "gantry-manifests", FS: gantrymanifests.Manifests,
 	}
