@@ -17,8 +17,8 @@ not list their contents.
 - `cmd/` - one directory per component. A component is a directory under `cmd/`: the binary it builds and the code
   only it uses. Net's binaries (`cmd/unbounded-net-*`, `cmd/unbounded-ipam`, `cmd/unping` and `cmd/unroute`) count as
   one component, since #1175 groups them under `cmd/net/`. Directories with a `Cargo.toml` are Rust crates, and the Go
-  rules in the `AGENTS.md` files do not apply to them. Much component code still lives under `internal/` and `pkg/` until #1175
-  moves it.
+  rules in the `AGENTS.md` files do not apply to them. Much component code still lives under `internal/` and `pkg/`
+  until #1175 moves it.
 - `deploy/` - manifests and manifest templates, one directory per component or plugin, such as `deploy/machina/`. Most
   render with `make <name>-manifests` into `deploy/<name>/rendered/`, which is gitignored; `make help` lists the
   targets.
