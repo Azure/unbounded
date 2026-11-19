@@ -12,7 +12,7 @@ Everything that is not specific to Azure comes from the public SDK:
 | Package | What it gives a provider |
 |---|---|
 | `pkg/machineops` | The provider registration: `NewProvider`, the operation callbacks (`WithImmediateOperation`, `WithLongRunningOperation`) and the capacity callbacks (`WithCapacity`). |
-| `pkg/machineops/controller` | The reconcilers. `AddToManager` runs MachineOperations; `AddCapacityToManager` runs MachineClasses and MachineAllocations. |
+| `pkg/machineops/controller` | The reconcilers. `AddToManager` runs MachineOperations. `AddCapacityToManager` runs MachineClasses and, only with `CapacityOptions.EnableAllocationController`, MachineAllocations. `main.go` sets it whenever `--enable-capacity` is on. |
 
 ## Layout
 
@@ -33,8 +33,10 @@ whose scopes share a provider and a Site.
 One controller can serve several providers. `azureProviders` in `main.go`
 returns a list for that reason: a second Azure compute mode, such as virtual
 machine scale sets, is a second provider with its own name in the same binary,
-and `--provider` selects one of them for a deployment. A Machine reaches a
-provider other than `AzureVM` through `spec.host.external`.
+and `--provider` selects one of them for a deployment. A Machine names its
+provider in `spec.host.external.provider`. A Machine with no `spec.host`
+owner can still name it in the deprecated `spec.provider`, with the host in
+`spec.providerID`. `spec.host.azure` always means `AzureVM`.
 
 ## Writing a controller for another provider
 
@@ -59,10 +61,17 @@ provider other than `AzureVM` through `spec.host.external`.
 3. Replace `azureProviders` in `main.go` with your registration, and change
    `controllerName`. It names the leader-election lease, so two controllers
    that keep the same name in one namespace would exclude each other.
-4. Replace the two imports that only exist inside this repository:
-   `internal/unbounded` supplies the default namespace of three flags, and
-   `internal/version` supplies the version string.
-5. Take the manifests from `deploy/machine-ops`:
+4. Replace what only exists inside this repository:
+   - `main.go` imports `internal/unbounded` for the default namespace of
+     three flags and `internal/version` for the version string.
+   - `main_test.go` imports `internal/unbounded` too.
+   - `envtest_test.go` loads the CRDs from `../../deploy/machina/crd`, a path
+     relative to this directory. Point it at your copy of the CRDs.
+5. Take the manifests from `deploy/machine-ops`. They are Go templates that
+   use sprig functions, and `hack/cmd/render-manifests` renders them
+   (`make machine-ops-manifests`). Outside this repository, render them with
+   that tool or turn them into plain manifests.
+   - `00` creates the namespace. Install it once.
    - `01` to `03` and `08` belong to one controller. Copy them and set
      `ControllerName` and `ControllerImage`.
    - `04` to `07` are the capacity roles and admission policies, and `09` is
@@ -72,6 +81,67 @@ provider other than `AzureVM` through `spec.host.external`.
    - `01` and `03` contain Azure and AKS specifics to replace: the workload
      identity annotation and label, the node affinity and the API server
      annotation.
+   - `02` names the `aks-cluster-metadata` ConfigMap. Keep that rule on every
+     platform: the SDK reads the ConfigMap to detect an AKS control plane
+     when it builds bootstrap data, and treats only "not found" as "not AKS".
+   - `02` grants no access to provider-owned objects. A provider registered
+     with `WithProviderMachineKind` must add `get` on its own cluster-scoped
+     Machine kind, because the engine reads that object when an operation
+     starts.
+   - `EnableCapacity=true` also needs `APIServerEndpoint`. `03` passes
+     `--api-server-endpoint` only when the value is set, and the controller
+     refuses to start with `--enable-capacity` and no endpoint.
+
+## The provider contract
+
+The doc comments in `pkg/machineops` are the reference. These are the rules
+they state, with the type to read for each.
+
+- Begin is repeated. The engine calls it again with the same `OperationUID`
+  until it has stored the handle: after an ordinary error, after a restart,
+  and when the returned `OperationID` is empty. Every call must return a
+  handle for the same logical operation (`BeginFunc`).
+- The handle never changes. What Begin returns is the only state the engine
+  keeps for Poll, and Poll cannot update it. It is stored in the
+  MachineOperation status, and the API sets no maximum length. Keep it small
+  and put no secrets in it (`ProviderOperation`).
+- Poll is repeated after it finished. The engine applies a result before it
+  records the terminal phase, and it polls again when either write fails.
+  Poll must then give the same terminal answer (`PollFunc`).
+- The provider owns deadlines. The engine never times an operation out. It
+  retries ordinary Begin and Poll errors without limit. After 75 minutes, by
+  default, it sets the `ProviderOperationStalled` condition and polls every
+  5 minutes, whatever `RequeueAfter` the provider returns. Return a
+  `PermanentError` or a `Failed` `PollResult` to end an operation (`Options`
+  in `pkg/machineops/controller` has the three intervals).
+- An immediate operation has no retries. Every Execute error ends it with the
+  reason `ExecutionFailed`, and the reason of a `PermanentError` is ignored
+  (`ExecuteFunc`).
+- A host operation's failure reason is free-form, and the engine makes it a
+  valid condition reason. A `HostAllocate` reason must be a
+  `MachineAllocationFailureReason` value, or the MachineAllocation reports
+  another one in its place (`PermanentError`).
+- Host operations on one Machine run one at a time, oldest first.
+  `request.ProviderID` is read from the Machine on every call and is not
+  part of the handle, so Poll must check that the handle still names the same
+  host. `hostTarget` in `provider.go` does.
+- `HostAllocate` sends its create from Begin, because the user data and the
+  provider config arrive only there. The engine records a `PermanentError`
+  from a Begin that may have run before as unknown ownership, so
+  `BeginAllocate` returns a handle that records Azure's refusal and Poll
+  reports it (`WithCapacity`).
+
+Credentials reach a provider as `request.Auth`. The engine takes the one
+`MachineOperationCredential` whose `spec.siteName` is the Machine's site label
+(`unbounded-cloud.io/site`) and whose `spec.provider` is the Machine's
+provider. `Auth.Mode` is its `spec.auth.mode`, and `Auth.SecretData` is the
+data of the Secret it references, if it references one. The provider defines
+the keys: this one reads `tenantID`, `clientID` and `clientSecret` in
+`ExternalPlugin` mode. When no credential matches, more than one does, or the
+Secret is missing or outside the credential namespace, a host operation
+without a stored handle fails with a reason that starts with `Auth`. One with
+a handle stays in progress and is tried again every 5 minutes by default, so
+it resumes once the credential is repaired.
 
 ## Identity and permissions
 

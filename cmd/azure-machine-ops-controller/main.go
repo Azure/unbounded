@@ -8,9 +8,11 @@
 // owns the MachineOperation, MachineClass and MachineAllocation reconcilers.
 //
 // A controller for another provider copies this command and replaces
-// azureProviders. Apart from the provider itself, the only packages it cannot
-// import from outside this repository are internal/unbounded, for the default
-// namespace of the flags, and internal/version, for the version string.
+// azureProviders. Apart from the provider itself, the only packages this file
+// cannot import from outside this repository are internal/unbounded, for the
+// default namespace of the flags, and internal/version, for the version
+// string. The README lists what else in this directory is tied to the
+// repository.
 package main
 
 import (

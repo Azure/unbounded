@@ -24,21 +24,45 @@ const (
 	OperationModeLongRunning OperationMode = "LongRunning"
 )
 
-// ExecuteFunc executes an immediate provider operation.
+// ExecuteFunc executes an immediate provider operation. Every error it
+// returns ends the operation with the reason ExecutionFailed: nothing is
+// retried, and a PermanentError's Reason is ignored. An operation that needs
+// retries or its own failure reasons must be long-running.
 type ExecuteFunc func(context.Context, OperationRequest) (OperationResult, error)
 
 // BeginFunc starts a long-running provider operation. It must be idempotent for
 // a stable OperationRequest.OperationUID: repeated calls must return a usable
 // handle for the same logical operation until that handle has been persisted.
+//
+// The engine calls Begin again after an ordinary error, after a result with
+// an empty ProviderOperation.OperationID, and when it could not store the
+// handle, for example because the controller restarted. Ordinary errors are
+// retried at the poll interval without limit. A PermanentError ends the
+// operation.
 type BeginFunc func(context.Context, OperationRequest) (BeginResult, error)
 
 // PollFunc observes a previously accepted long-running provider operation.
-// Ordinary errors are retried with the same persisted handle. A PermanentError
-// terminates the MachineOperation.
+// Ordinary errors are retried with the same persisted handle, without limit.
+// A PermanentError terminates the MachineOperation.
+//
+// The handle is the one Begin returned and it never changes: a PollResult
+// cannot replace it. A Poll that takes several steps reads its progress from
+// what the provider reports, not from the handle.
+//
+// Poll must give the same terminal answer when it is called again. The engine
+// applies a result before it records the terminal phase, and when either
+// write fails it polls the same handle again.
+//
+// The engine never times an operation out (see Options in
+// pkg/machineops/controller). The provider owns deadlines: it ends an
+// operation by returning a PermanentError or a Failed result.
 type PollFunc func(context.Context, OperationRequest, ProviderOperation) (PollResult, error)
 
 // CleanupFunc performs optional provider cleanup after an operation result has
-// been applied to the Machine.
+// been applied to the Machine. It runs before the terminal phase is recorded.
+// For a long-running operation an error from it, or from recording the phase,
+// makes the engine poll again, so Cleanup can be called more than once and
+// must be idempotent.
 type CleanupFunc func(context.Context, OperationRequest, OperationResult) error
 
 // Provider is an immutable registration of one provider's supported
@@ -142,6 +166,10 @@ func NewProvider(name string, options ...ProviderOption) (*Provider, error) {
 }
 
 // WithImmediateOperation registers an operation executed by one callback.
+// Any error from the callback fails the operation (see ExecuteFunc). The
+// engine does not call it again once the operation is InProgress unless it is
+// declared ReplaySafe, so use it only for a call that completes before it
+// returns.
 func WithImmediateOperation(
 	kind unboundedv1alpha3.OperationKind,
 	execute ExecuteFunc,

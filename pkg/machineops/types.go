@@ -72,9 +72,16 @@ type OperationResult struct {
 }
 
 // ProviderOperation is the provider-neutral representation of a resumable
-// external operation.
+// external operation: the handle Begin returns and every Poll receives.
 type ProviderOperation struct {
+	// OperationID identifies the operation. It is required: the engine
+	// treats a Begin that returns it empty as a retryable Begin error.
 	OperationID string
+	// ResumeToken is opaque provider data. It is the only state the engine
+	// keeps for Poll, and Poll cannot change it. It is stored in the
+	// MachineOperation status, so it must hold no secrets. The API sets no
+	// maximum length, but the status is one etcd object: keep the token
+	// small and bound its size.
 	ResumeToken string
 }
 
@@ -82,8 +89,10 @@ type ProviderOperation struct {
 // callback. The controller may invoke Begin again with the same OperationUID
 // until a handle for the same logical operation has been persisted.
 type BeginResult struct {
-	Operation    ProviderOperation
-	Message      string
+	Operation ProviderOperation
+	Message   string
+	// RequeueAfter is the wait before the first Poll. Zero means the
+	// controller's poll interval.
 	RequeueAfter time.Duration
 }
 
@@ -101,16 +110,37 @@ const (
 // PollResult describes one status observation for a resumable provider
 // operation.
 type PollResult struct {
-	State        ProviderOperationState
-	Result       OperationResult
-	Reason       string
-	Message      string
+	State  ProviderOperationState
+	Result OperationResult
+	// Reason is the failure reason of a Failed or Canceled result. Empty
+	// means the State. It follows the rules of PermanentError.Reason.
+	Reason  string
+	Message string
+	// RequeueAfter is the wait before the next Poll of an InProgress
+	// result. Zero means the controller's poll interval. It is ignored once
+	// the operation is stalled.
 	RequeueAfter time.Duration
 }
 
 // PermanentError reports that retrying a provider callback cannot make
 // progress. Providers should return ordinary errors for transient failures.
+//
+// From Begin and from Poll it ends the operation. ResolveClassFunc and
+// PlanAllocationFunc document their own use of it. An immediate operation's
+// Execute has no use for it: every Execute error is terminal and Reason is
+// ignored (see ExecuteFunc).
 type PermanentError struct {
+	// Reason becomes the reason of the operation's Completed condition.
+	// Empty means PermanentProviderFailure from Begin and
+	// PermanentPollFailure from Poll.
+	//
+	// A host operation's reason is free-form. The engine makes it a valid
+	// condition reason, so use CamelCase without spaces or punctuation.
+	//
+	// A HostAllocate reason should be a
+	// v1alpha3.MachineAllocationFailureReason value. The MachineAllocation
+	// reports any other reason as AuthFailed when it starts with Auth and
+	// otherwise, in almost every case, as ProviderFailed.
 	Reason string
 	Err    error
 }

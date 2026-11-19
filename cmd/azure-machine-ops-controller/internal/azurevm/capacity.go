@@ -106,10 +106,11 @@ func providerConflict(err error) error {
 	}
 }
 
-// beforeCreate classifies a failed Azure read that precedes the VM create.
-// Nothing exists yet, so a read Azure refuses for the credential ends the
-// allocation as AuthFailed instead of being retried without end; every other
-// failure is returned unchanged and retried.
+// beforeCreate classifies a failed Azure read in a Begin that has changed
+// nothing yet: the reads that precede the VM create of an allocation, and the
+// first read of the VM in a host operation. A read Azure refuses for the
+// credential ends the operation as AuthFailed instead of being retried
+// without end; every other failure is returned unchanged and retried.
 func beforeCreate(err error) error {
 	if _, ok := errors.AsType[*azidentity.AuthenticationFailedError](err); ok {
 		return authFailed(err)
