@@ -1079,10 +1079,9 @@ mod tests {
             });
             apply(&shared, &mut inv, Kind::Pods, "MODIFIED", &pod);
             assert!(
-                shared.pods.borrow()["u1"]
+                !shared.pods.borrow()["u1"]
                     .annotations
-                    .get(annotations::FILLS)
-                    .is_none()
+                    .contains_key(annotations::FILLS)
             );
             apply(&shared, &mut inv, Kind::Pods, "DELETED", &pod);
             assert!(shared.pods.borrow().is_empty());
