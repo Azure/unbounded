@@ -818,14 +818,24 @@ pub(crate) mod security {
         assert_eq!(&opened, b"abc");
     }
     pub(crate) fn keys_for(env: &racer_io::Env, caches: &[CacheId]) -> Keyring {
-        let (_, _, roots) = issued();
-        let keys = Keyring::new(
+        let keys = empty_keys(env);
+        keys.install(initial_bundle(caches)).unwrap();
+        keys
+    }
+    /// A keyring with no bundle installed yet, as on a node that has not
+    /// fetched its keys.
+    pub(crate) fn empty_keys(env: &racer_io::Env) -> Keyring {
+        Keyring::new(
             ClusterId(CLUSTER.into()),
             NodeId(NODE.into()),
             Arc::new(KeyEpochs::with_clock(crate::enrollment::wall_clock(
                 &env.ctx.clock,
             ))),
-        );
+        )
+    }
+    /// The bundle [`keys_for`] installs.
+    pub(crate) fn initial_bundle(caches: &[CacheId]) -> KeyringBundle {
+        let (_, _, roots) = issued();
         let mut initial = rotation_bundle(1, roots);
         // rotation_bundle(1) intentionally has different suffixes and material,
         // just like later epochs, rather than reusing the unrotated seed bundle.
@@ -850,8 +860,7 @@ pub(crate) mod security {
                     .push(CacheEncryptionKey::new(key, state, material));
             }
         }
-        keys.install(initial).unwrap();
-        keys
+        initial
     }
     pub(crate) fn rotation_bundle(generation: u64, roots: Vec<Vec<u8>>) -> KeyringBundle {
         KeyringBundle {

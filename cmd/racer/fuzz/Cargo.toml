@@ -18,6 +18,7 @@ libfuzzer-sys = "0.4"
 http1 = { path = "../http" }
 peer-wire = { path = "../peer-wire" }
 racer-wire = { path = "../wire" }
+racer-core = { path = "../core" }
 racer = { path = ".." }
 page-alloc = { path = "../alloc" }
 
@@ -62,6 +63,27 @@ bench = false
 [[bin]]
 name = "checkpoint"
 path = "fuzz_targets/checkpoint.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "write_head"
+path = "fuzz_targets/write_head.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "write_journal"
+path = "fuzz_targets/write_journal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "write_journal_file"
+path = "fuzz_targets/write_journal_file.rs"
 test = false
 doc = false
 bench = false

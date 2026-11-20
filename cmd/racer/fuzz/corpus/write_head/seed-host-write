@@ -1,0 +1,7 @@
+POST /v1/objects/00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff/host-write HTTP/1.1
+Host: racer
+Content-Length: 0
+If-None-Match: *
+Racer-Source-Offset: 0
+Racer-Source-Length: 8192
+

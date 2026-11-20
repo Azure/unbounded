@@ -33,6 +33,7 @@ Issues = "https://github.com/Azure/unbounded/issues"
 
 [project.optional-dependencies]
 torch = ["torch"]
+dcp = ["torch>=2.4"]
 test = ["pytest"]
 
 [tool.setuptools.packages.find]

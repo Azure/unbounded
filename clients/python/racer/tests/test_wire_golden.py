@@ -136,3 +136,50 @@ def test_direct_head_from_rust_is_accepted():
     seq.accept(wire.decode_frame(wire.encode_frame(1, 0, 3, 3)))
     seq.accept(wire.decode_frame(wire.encode_frame(2, 1, 3, 0)))
     assert seq.complete
+
+
+# Write heads match pkg/racersdk/internal/wire/write_test.go (TestWriteHeadGolden).
+WRITE_KEY = "00" * 31 + "ab"
+WRITE_META = '{"schema":1,"bucket":"b","key":"k"}'
+WRITE_CTX = "Racer-Metadata: " + WRITE_META + "\r\nAuthorization: Bearer t\r\n\r\n"
+
+
+@pytest.mark.parametrize(
+    "kind,kwargs,want",
+    [
+        (
+            "put",
+            {"length": 5},
+            "PUT /v1/objects/" + WRITE_KEY + " HTTP/1.1\r\nHost: racer\r\nContent-Length: 5\r\nIf-None-Match: *\r\n" + WRITE_CTX,
+        ),
+        (
+            "put",
+            {"length": 5, "replicas": 2, "upload": "never", "hold_seconds": 60, "content_type": "a/b"},
+            "PUT /v1/objects/" + WRITE_KEY + " HTTP/1.1\r\nHost: racer\r\nContent-Length: 5\r\nIf-None-Match: *\r\n"
+            "Racer-Durability: replicas=2\r\nRacer-Upload: never\r\nRacer-Hold-Seconds: 60\r\nRacer-Content-Type: a/b\r\n" + WRITE_CTX,
+        ),
+        (
+            "host-write",
+            {"length": 7, "source_offset": 4096, "durability_origin": True},
+            "POST /v1/objects/" + WRITE_KEY + "/host-write HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nIf-None-Match: *\r\n"
+            "Racer-Source-Offset: 4096\r\nRacer-Source-Length: 7\r\nRacer-Durability: origin\r\n" + WRITE_CTX,
+        ),
+        ("persist", {}, "POST /v1/objects/" + WRITE_KEY + "/persist HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\n" + WRITE_CTX),
+        ("delete", {}, "DELETE /v1/objects/" + WRITE_KEY + " HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\n" + WRITE_CTX),
+    ],
+)
+def test_write_heads_match_go(kind, kwargs, want):
+    got = wire.write_head(kind, WRITE_KEY, metadata=WRITE_META, authorization="Bearer t", **kwargs)
+    assert got == want.encode()
+
+
+def test_write_created_response_is_accepted():
+    raw = b'HTTP/1.1 201 Created\r\nETag: "racer-0123456789abcdef0123456789abcdef"\r\nRacer-Upload-State: pending\r\nContent-Length: 0\r\n\r\n'
+    r = wire.parse_write_response(wire.parse_response_head(raw), "put")
+    assert (r.status, r.etag, r.upload_state) == (201, '"racer-0123456789abcdef0123456789abcdef"', "pending")
+
+
+def test_write_busy_response_is_accepted():
+    raw = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nRetry-After: 1\r\nRacer-Write-Error: dirty-cap\r\n\r\n"
+    r = wire.parse_write_response(wire.parse_response_head(raw), "put")
+    assert (r.status, r.error, r.retry_after) == (503, "dirty-cap", 1.0)

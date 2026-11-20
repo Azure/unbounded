@@ -787,6 +787,63 @@ const BASE: &[Var] = &[
         Value("5"),
         "Tries per page.",
     ),
+    // Writes.
+    var(
+        "RACER_WRITE_WINDOW_PAGES",
+        Group::Writes,
+        uint(1, 64, COUNT),
+        Value("8"),
+        "Pages one write keeps in flight to their owners.",
+    ),
+    var(
+        "RACER_WRITE_LEASE_SECS",
+        Group::Writes,
+        uint(5, 3600, SECS),
+        Value("60"),
+        "Write session lease; the writer renews it every third of the lease, and an expired session is aborted.",
+    ),
+    var(
+        "RACER_WRITE_GROUP_COMMIT_MICROS",
+        Group::Writes,
+        uint(0, 100_000, Unit::Micros),
+        Value("500"),
+        "Longest wait to batch written pages into one durability barrier; `0` syncs each page alone.",
+    ),
+    var(
+        "RACER_WRITE_JOURNAL_BYTES",
+        Group::Writes,
+        uint(MIB, 1 << 34, BYTES),
+        Value("67108864"),
+        "Write journal size per I/O worker that triggers compaction.",
+    ),
+    var(
+        "RACER_WRITE_ORPHAN_SECS",
+        Group::Writes,
+        uint(60, 604_800, SECS),
+        Value("3600"),
+        "Age after which a held written page whose session no page-zero member knows is released.",
+    ),
+    var(
+        "RACER_WRITE_HOLDER_GRACE_SECS",
+        Group::Writes,
+        uint(0, 86_400, SECS),
+        Value("300"),
+        "How long a holder of an un-uploaded written page may be missing from its pool before the coordinator drops it and re-replicates; a page whose every holder is missing waits for one to return instead of failing.",
+    ),
+    var(
+        "RACER_WRITE_ALIAS_SECS",
+        Group::Writes,
+        uint(3600, 2_592_000, SECS),
+        Value("604800"),
+        "Reserved for mapping an uploaded object's origin version to its Racer version; not used yet.",
+    ),
+    var(
+        "RACER_WRITE_UPLOAD_ATTEMPTS",
+        Group::Writes,
+        uint(1, 100, COUNT),
+        Value("10"),
+        "Upload tries per written object before it is marked `failed`.",
+    ),
     // Timeouts.
     var(
         "RACER_REQUEST_TIMEOUT_MS",
@@ -907,7 +964,7 @@ const BASE: &[Var] = &[
         Group::Kubernetes,
         uint(1, racer_wire::control::MAX_RETAINED_PAGE_KEYS as u64, COUNT),
         Value("7"),
-        "Readable page keys per cache: the active key plus older decrypt keys. Read by the authority. Lowering it never drops keys at once: extra decrypt keys are dropped at the next key rotation.",
+        "Readable page keys per cache: the active key plus older decrypt keys. Read by the authority. Lowering it never drops keys at once: extra decrypt keys are dropped at the next key rotation. Caches with writes enabled always keep at least 2 (the active key and the previous one), so written pages can be rekeyed within one rotation interval.",
     )),
     control(var(
         "RACER_PAGE_BYTES",

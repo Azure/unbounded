@@ -536,6 +536,7 @@ fn delayed_retained_metadata_is_dropped_after_switching_to_passthrough() {
         let mut lookup = service.copy_only(
             MetadataSelector::Pinned(version.etag.clone()),
             &f.context,
+            &membership,
             &f.scope,
         );
         let first = directory.as_remote(|| lookup.as_mut().poll(&mut cx));

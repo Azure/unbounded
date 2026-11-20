@@ -100,6 +100,7 @@ pub mod cluster {
         Config {
             spill: Default::default(),
             prefetch: Default::default(),
+            writes: Default::default(),
             send_tag_pair: None,
             page_hedge: Default::default(),
             replica_selection: Default::default(),
@@ -302,7 +303,15 @@ pub const SCENARIOS: &[&str] = &[
     "listeners-survive-queue-pressure",
     "concurrent-relayed-layers",
     "concurrent-relayed-layers-opaque",
+    "writes",
+    "writes-four-nodes",
+    "writes-holder-loss",
+    "writes-membership-churn",
 ];
+
+/// Write scenarios [`run`] accepts that are not in [`SCENARIOS`]: they need
+/// WP8 repair and failover, so the default run skips them.
+pub use writes::GATED as GATED_SCENARIOS;
 
 /// Runs app scenario `name` (see [`SCENARIOS`]) with `seed` and up to
 /// `steps` generated actions (generated scenarios only; 0 means one full
@@ -310,6 +319,7 @@ pub const SCENARIOS: &[&str] = &[
 /// resource bounds, release at quiescence, stranded work) is a panic, which
 /// becomes `Err` carrying the panic message.
 pub fn run(name: &str, seed: u64, steps: usize) -> std::result::Result<Run, String> {
+    let requested = steps;
     let steps = if steps == 0 {
         WEIGHTED_ACTIONS.len()
     } else {
@@ -363,6 +373,15 @@ pub fn run(name: &str, seed: u64, steps: usize) -> std::result::Result<Run, Stri
             }
             "concurrent-relayed-layers-opaque" => {
                 fixed(scenarios::concurrent_relayed_layers_opaque_opt_in_pressure_and_recovery)
+            }
+            write if write.starts_with("writes") => {
+                FIXED_DIGEST.with(|d| *d.borrow_mut() = Some(Sha256::new()));
+                writes::run(write, seed, requested.min(512));
+                FIXED_DIGEST
+                    .with(|d| d.borrow_mut().take())
+                    .expect("fixed digest is active")
+                    .finalize()
+                    .into()
             }
             other => panic!("unknown app scenario {other}"),
         }
@@ -425,6 +444,9 @@ fn racer_entropy_replay_bytes_are_stable() {
 mod faults;
 mod scenarios;
 mod traffic;
+#[cfg(test)]
+mod write_tests;
+mod writes;
 
 #[derive(Clone, Copy, Debug)]
 enum Action {
@@ -635,6 +657,7 @@ fn cache(id: usize) -> CacheDefinition {
         priority: racer_wire::control::DEFAULT_PRIORITY,
         mode: racer_wire::control::CacheMode::Cached,
         origin: None,
+        writes: None,
     }
 }
 
@@ -931,6 +954,14 @@ struct Harness {
     payload_regression: bool,
     opaque_relay: bool,
     concurrent_layers: bool,
+    /// Write settings published for the cache (`None`: writes disabled).
+    writes: Option<racer_wire::control::WriteDefinition>,
+    /// Published cache mode.
+    mode: racer_wire::control::CacheMode,
+    /// Published cluster page size.
+    page_size: racer_wire::object::PageSize,
+    /// Workers per added node (`None`: one or two, at random).
+    workers: Option<usize>,
 }
 thread_local! {
     /// While a fixed scenario runs, every dropped [`Harness`] folds its replay
@@ -993,6 +1024,10 @@ impl Harness {
             payload_regression: false,
             opaque_relay: false,
             concurrent_layers: false,
+            writes: None,
+            mode: racer_wire::control::CacheMode::Cached,
+            page_size: racer_wire::object::PageSize::DEFAULT,
+            workers: None,
         }
     }
     fn update(&mut self, object: usize) {
@@ -1084,7 +1119,10 @@ impl Harness {
             config.limits.client_connections = NonZeroUsize::new(512).unwrap();
             config.limits.connections_per_neighbor = NonZeroUsize::new(16).unwrap();
         }
-        let worker_count = 1 + self.rng.pick(2);
+        let worker_count = match self.workers {
+            Some(count) => count,
+            None => 1 + self.rng.pick(2),
+        };
         self.coverage.trace.record(format!(
             "node:{id}:{restart:?}:{worker_count}:{}",
             self.generation
@@ -1129,6 +1167,7 @@ impl Harness {
         let control = app.control.take();
         self.generation += 1;
         let mut publication = publication(&config, self.generation, vec![self.definition(id)]);
+        publication.page_size = self.page_size;
         publication.membership_version = MembershipVersion(self.generation);
         publication.members = self.members().into_iter().map(Into::into).collect();
         publication.members.push(member(&config).into());
@@ -1245,6 +1284,8 @@ impl Harness {
     fn definition(&self, id: usize) -> CacheDefinition {
         let mut definition = cache(id);
         definition.id = CacheId(format!("33333333-3333-4333-8333-{:012x}", self.cache_epoch));
+        definition.writes = self.writes.clone();
+        definition.mode = self.mode;
         definition
     }
     fn bundle(&self, config: &Config, _generation: u64) -> wire::KeyringBundle {
@@ -1283,6 +1324,7 @@ impl Harness {
         let definitions: Vec<_> = self.nodes.iter().map(|n| self.definition(n.id)).collect();
         for (node, definition) in self.nodes.iter_mut().zip(definitions) {
             let mut p = publication(&node.config, self.generation, vec![definition]);
+            p.page_size = self.page_size;
             p.membership_version = MembershipVersion(self.generation);
             p.members = members.iter().cloned().map(Into::into).collect();
             node.workers[0].app.snapshots.apply(p).unwrap();

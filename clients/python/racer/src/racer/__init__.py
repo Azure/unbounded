@@ -10,10 +10,14 @@ from .client import (
     Client,
     Metadata,
     ReadResult,
+    WriteResult,
     forget_modes,
     socket_path_for,
 )
 from .errors import (
+    Busy,
+    Conflict,
+    Exists,
     NotFound,
     PrefetchError,
     ProtocolError,
@@ -21,7 +25,10 @@ from .errors import (
     StatusError,
     TruncatedError,
     UnsatisfiableRange,
+    UploadFailed,
     VersionUnavailable,
+    WriteError,
+    WritesDisabled,
 )
 from ._wire import PAGE_SIZE
 from .prefetch import (
@@ -43,7 +50,10 @@ __all__ = [
     "HOST",
     "PAGE_SIZE",
     "STREAM",
+    "Busy",
     "Client",
+    "Conflict",
+    "Exists",
     "HostBuffer",
     "Metadata",
     "NotFound",
@@ -62,7 +72,11 @@ __all__ = [
     "StatusError",
     "TruncatedError",
     "UnsatisfiableRange",
+    "UploadFailed",
     "VersionUnavailable",
+    "WriteError",
+    "WriteResult",
+    "WritesDisabled",
     "canonical_json",
     "forget_modes",
     "object_key",

@@ -62,6 +62,16 @@ impl AzureTransport for Rc<Fake> {
         })
     }
 
+    fn exchange_body<'a>(
+        &'a self,
+        _url: &'a AzureContainerUrl,
+        _head: MessageHead,
+        _body: &'a [u8],
+        _scope: &'a RequestScope,
+    ) -> Operation<'a, FakeExchange> {
+        Box::pin(async { Err(Error::Internal) })
+    }
+
     fn retain(&self, live: &[&OriginDefinition]) {
         self.retained.borrow_mut().push(live.len());
     }

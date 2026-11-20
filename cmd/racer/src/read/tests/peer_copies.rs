@@ -6317,3 +6317,112 @@ fn a_peer_joining_a_waiter_capped_flight_hears_flight_full() {
     assert_eq!(target.origin.calls.get(), 0);
     drop(held);
 }
+
+/// Write operations authenticate but are not served yet (WP5): the node
+/// rejects them like a receiver that predates them, without touching the
+/// cache, the origin, or other peers.
+#[test]
+fn write_operations_on_a_cache_without_writes_change_nothing() {
+    use crate::peer::protocol::{SessionId, WriteAction, WriteStore};
+    use crate::peer::server::LocalPageService;
+    let clock = racer_io::SimClock::new(933);
+    let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
+    let mut s = SuccessorFixture::new(&env);
+    let version = s.f.page.version.clone();
+    let session = SessionId([5; 16]);
+    use racer_core::write::WriteReply;
+    let operations = [
+        (
+            PeerOperation::WriteSession {
+                object: version.object.clone(),
+                etag: None,
+                action: Box::new(WriteAction::Status { wait_millis: 0 }),
+            },
+            WriteReply::Unknown,
+        ),
+        (
+            PeerOperation::WriteUpload {
+                version: version.clone(),
+                session,
+                pages: vec![0],
+            },
+            WriteReply::Failed,
+        ),
+        (
+            PeerOperation::WriteStore {
+                version: version.clone(),
+                store: Box::new(WriteStore {
+                    session,
+                    pages: vec![0],
+                    length: 1,
+                    page_size: crate::model::PageSize::DEFAULT,
+                    content_type: None,
+                    source: node(0),
+                    hold_until_millis: 1,
+                }),
+            },
+            WriteReply::Failed,
+        ),
+        (
+            PeerOperation::WriteRelease {
+                version,
+                session,
+                pages: vec![0],
+                keep: false,
+            },
+            WriteReply::Released,
+        ),
+    ];
+    let from = s.index(None);
+    for (operation, expected) in operations {
+        s.ids += 1;
+        let attempt = crate::model::AttemptId([s.ids; 16]);
+        let acquire = matches!(
+            operation,
+            PeerOperation::WriteSession { .. } | PeerOperation::WriteUpload { .. }
+        );
+        let mut origin =
+            s.f.fill
+                .dependencies
+                .credentials
+                .seal(&s.f.context, attempt, &s.f.scope)
+                .unwrap();
+        if !acquire {
+            origin.metadata = None;
+            origin.authorization = None;
+        }
+        let request = PeerRequest {
+            operation,
+            route: crate::topology::RouteBudget {
+                membership: s.f.membership.version,
+                request: s.f.scope.request,
+                attempt,
+                destination: node(s.peers.local),
+                visited: vec![node(from)],
+                remaining_links: 4,
+                remaining_attempts: u32::from(acquire) * 4,
+                deadline: s.f.scope.deadline,
+            },
+            origin,
+        };
+        let (signed, _) = s.peers.signing[from].sign_request(request).unwrap();
+        let admitted = s.peers.signing[s.peers.local]
+            .verify_request(signed)
+            .unwrap();
+        let coordinator = s.coordinator.clone();
+        let f = &mut s.f;
+        let result = drive(
+            coordinator.serve_peer(admitted, f.membership.clone(), &f.scope),
+            &mut f.engine,
+            &f.crypto,
+            f.fill.drivers(),
+        );
+        // A cache without `writes` neither opens, stores, nor uploads.
+        match result {
+            Ok(PeerResponse::Write(reply)) => assert_eq!(reply, expected),
+            other => panic!("unexpected {:?}", other.map(|r| r.kind())),
+        }
+    }
+    assert_eq!(s.f.origin.calls.get(), 0);
+    assert!(s.peers.calls.borrow().is_empty());
+}

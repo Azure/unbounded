@@ -45,6 +45,7 @@ pub mod telemetry;
 pub mod topology;
 pub mod uds_endpoint;
 pub mod worker;
+pub mod write;
 
 #[cfg(feature = "subscription-interop")]
 mod subscription_interop;

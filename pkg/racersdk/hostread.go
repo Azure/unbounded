@@ -210,7 +210,7 @@ func (c *Client) hostRead(conn *clientConn, file *os.File, head []byte, o wire.H
 func sendWithFile(conn net.Conn, head []byte, file *os.File) error {
 	unixConn, ok := conn.(*net.UnixConn)
 	if !ok {
-		return errors.New("host-read needs a Unix socket connection")
+		return errors.New("descriptor passing needs a Unix socket connection")
 	}
 
 	raw, err := file.SyscallConn()

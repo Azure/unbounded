@@ -1654,6 +1654,11 @@ impl Fixture {
     }
 
     fn restart(self, env: &racer_io::Env) -> Self {
+        self.restart_after(env, || {})
+    }
+
+    /// [`Self::restart`], running `between` after every old owner dropped.
+    fn restart_after(self, env: &racer_io::Env, between: impl FnOnce()) -> Self {
         let Self {
             metrics,
             store,
@@ -1666,7 +1671,30 @@ impl Fixture {
         assert!(store.writer.is_idle());
         assert_eq!(reactor.in_flight(), 0);
         drop((store, reactor, pool, segments, admission, metrics));
+        between();
         Self::in_directory(env, _directory)
+    }
+    /// [`Self::restart_after`] with `availability` for the restarted store.
+    fn restart_with(
+        self,
+        env: &racer_io::Env,
+        between: impl FnOnce(),
+        availability: Rc<crate::control::Availability>,
+    ) -> Self {
+        let Self {
+            metrics,
+            store,
+            admission,
+            reactor,
+            pool,
+            segments,
+            _directory,
+        } = self;
+        assert!(store.writer.is_idle());
+        assert_eq!(reactor.in_flight(), 0);
+        drop((store, reactor, pool, segments, admission, metrics));
+        between();
+        Self::assemble(env, _directory, availability)
     }
 }
 fn scope(env: &racer_io::Env) -> RequestScope {
@@ -5946,6 +5974,7 @@ fn over_share_fixture(env: &racer_io::Env) -> (Fixture, CacheId, CacheId) {
         priority,
         mode: racer_wire::control::CacheMode::Cached,
         origin: None,
+        writes: None,
     };
     f.store
         .writer
@@ -6047,6 +6076,7 @@ fn cache_definition(id: &str, name: &str) -> racer_wire::control::CacheDefinitio
         priority: 1,
         mode: racer_wire::control::CacheMode::Cached,
         origin: None,
+        writes: None,
     }
 }
 
@@ -6192,6 +6222,7 @@ fn owned_reclaim_never_lets_unheld_over_share_page_take_under_share_write() {
         priority,
         mode: racer_wire::control::CacheMode::Cached,
         origin: None,
+        writes: None,
     };
     writer
         .retention()
@@ -6475,4 +6506,768 @@ fn ciphertext_held_reports_staging_exclusive_and_writer_only_pins() {
     assert!(!f.store.writer.pins_only_writer(&page, &shared.ciphertext));
     drop(reader);
     assert!(!f.store.writer.pins_only_writer(&id, &shared.ciphertext));
+}
+
+mod written {
+    //! Durable written pages: segments, barriers, journal, and recovery.
+    use super::*;
+    use crate::store::writes::LostReason;
+    use crate::store::writes::WriteRecovery;
+    use crate::store::writes::WrittenEntry;
+    use racer_core::write::SessionId;
+    use racer_io::sim::Fault;
+    use racer_io::sim::SimOs;
+    use std::time::SystemTime;
+
+    const LAYOUT: [u8; 32] = [7; 32];
+    const COMPACT: u64 = 64 << 20;
+
+    fn sim() -> (SimOs, racer_io::Env) {
+        let simulation = SimOs::new();
+        let env = racer_io::Env::sim(&simulation, racer_io::WorkerCtx::host());
+        (simulation, env)
+    }
+
+    fn hold() -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(4_000_000_000)
+    }
+
+    fn opened(env: &racer_io::Env) -> Fixture {
+        let f = Fixture::new(env);
+        open(&f);
+        f
+    }
+
+    fn open(f: &Fixture) {
+        let _ = futures::executor::block_on(f.store.open()).unwrap();
+        f.reactor.init().unwrap();
+    }
+
+    fn recover(f: &Fixture, env: &racer_io::Env, layout: [u8; 32], compact: u64) -> WriteRecovery {
+        drive(
+            &f.reactor,
+            f.store
+                .writer
+                .recover_written(&f._directory.0, layout, compact, &scope(env)),
+        )
+        .unwrap()
+    }
+
+    fn persist(f: &Fixture, env: &racer_io::Env, copy: CiphertextCopy) -> Result<WrittenEntry> {
+        drive(
+            &f.reactor,
+            f.store
+                .writer
+                .persist_written(copy, SessionId([1; 16]), hold(), &scope(env)),
+        )
+    }
+
+    fn read(f: &Fixture, env: &racer_io::Env, id: &PageId) -> Option<Vec<u8>> {
+        drive(&f.reactor, f.store.reader.read(id, &scope(env)))
+            .unwrap()
+            .map(|copy| copy.ciphertext.bytes().to_vec())
+    }
+
+    fn id(copy: &CiphertextCopy) -> PageId {
+        copy.ciphertext.envelope().page.clone()
+    }
+
+    use std::time::UNIX_EPOCH;
+
+    /// A rekey writes the page under the new key as a new record, keeps its
+    /// session and hold, moves the pin, and survives a restart; it refuses a
+    /// copy under the current key and pages not written here.
+    #[test]
+    fn rekey_replaces_the_record_and_moves_the_pin() {
+        use crate::test_support::security::keys;
+        use crate::test_support::security::rotation_bundle;
+        use racer_wire::control::CacheKeyPurpose;
+        use racer_wire::control::CacheKeyState;
+        let (simulation, env) = sim();
+        let keys = Rc::new(keys(&env));
+        let roots = (*keys.peer_trust_roots().unwrap()).clone();
+        let cache = CacheId(crate::test_support::security::CACHE.into());
+        let availability = crate::control::for_caches(&env, keys.clone(), vec![cache.clone()]);
+        let f = Fixture::assemble(&env, Directory::new(), availability);
+        open(&f);
+        recover(&f, &env, LAYOUT, COMPACT);
+        let copy = f.copy(1, 100);
+        let page = id(&copy);
+        let old_key = copy.ciphertext.envelope().key_id;
+        let before = persist(&f, &env, copy.clone()).unwrap();
+        let rekey = |copy: CiphertextCopy| {
+            drive(&f.reactor, f.store.writer.rekey_written(copy, &scope(&env)))
+        };
+        // The current key: nothing to do.
+        assert_eq!(rekey(copy.clone()).err(), Some(Error::InvalidRequest));
+        // Rotate: generation 2 is active, generation 1 decrypt-only.
+        let mut bundle = rotation_bundle(2, roots);
+        let mut old = None;
+        for record in &bundle.cache_keys {
+            if record.key.purpose == CacheKeyPurpose::Page {
+                old = Some(record.key.clone());
+            }
+        }
+        let new_key = old.unwrap().id;
+        bundle
+            .cache_keys
+            .push(racer_wire::control::CacheEncryptionKey::new(
+                racer_wire::control::CacheKeyRef {
+                    cache: cache.clone(),
+                    id: old_key,
+                    purpose: CacheKeyPurpose::Page,
+                },
+                CacheKeyState::Decrypt,
+                zeroize::Zeroizing::new([7; 32]),
+            ));
+        keys.install(bundle).unwrap();
+        let mut fresh = f.copy(1, 100);
+        std::sync::Arc::get_mut(&mut fresh.ciphertext.inner)
+            .unwrap()
+            .envelope
+            .key_id = new_key;
+        let after = rekey(fresh.clone()).unwrap().unwrap();
+        assert_ne!(after.location, before.location);
+        assert_eq!(after.session, before.session);
+        assert_eq!(after.hold_until, before.hold_until);
+        let index = f.store.writer.index();
+        let indexed = index.lookup(&page).unwrap().unwrap();
+        assert_eq!(indexed.location, after.location);
+        assert_eq!(indexed.key_id, new_key);
+        assert_eq!(f.store.writer.written(&page), Some(after.clone()));
+        if after.location.segment != before.location.segment {
+            assert_eq!(index.segment_pins(before.location.segment), 0);
+        }
+        assert_eq!(index.segment_pins(after.location.segment), 1);
+        assert_eq!(f.store.writer.written_pages().len(), 1);
+        // A page not written here is not rekeyed.
+        let mut other = f.copy(2, 100);
+        std::sync::Arc::get_mut(&mut other.ciphertext.inner)
+            .unwrap()
+            .envelope
+            .key_id = new_key;
+        assert_eq!(rekey(other).unwrap(), None);
+        // The journal replays the new record.
+        let f = f.restart_after(&env, || simulation.disk().crash().unwrap());
+        open(&f);
+        let recovered = recover(&f, &env, LAYOUT, COMPACT);
+        assert!(recovered.lost.is_empty(), "{:?}", recovered.lost);
+        assert_eq!(
+            f.store.writer.written(&page).map(|e| e.location),
+            Some(after.location)
+        );
+    }
+
+    /// A node restarts before its keyring arrives. Its written pages are
+    /// restored and indexed anyway, a key sweep does not drop them, and they
+    /// read once the keys are installed. Before the fix they were reported
+    /// `unindexed` and stayed pinned but unreadable until hold expiry.
+    #[test]
+    fn written_pages_recovered_before_the_keyring_read_once_it_arrives() {
+        use crate::test_support::security::empty_keys;
+        use crate::test_support::security::initial_bundle;
+        let (simulation, env) = sim();
+        let cache = CacheId(crate::test_support::security::CACHE.into());
+        let f = opened(&env);
+        recover(&f, &env, LAYOUT, COMPACT);
+        let copy = f.copy(1, 100);
+        let page = id(&copy);
+        let entry = persist(&f, &env, copy).unwrap();
+        let keys = Rc::new(empty_keys(&env));
+        let availability = crate::control::for_caches(&env, keys.clone(), vec![cache.clone()]);
+        let f = f.restart_with(&env, || simulation.disk().crash().unwrap(), availability);
+        open(&f);
+        let recovered = recover(&f, &env, LAYOUT, COMPACT);
+        assert_eq!(recovered.restored, vec![page.clone()]);
+        assert!(recovered.unindexed.is_empty() && recovered.lost.is_empty());
+        let index = f.store.writer.index();
+        // Not readable without its key, and not swept for lacking it.
+        assert!(index.lookup(&page).unwrap().is_none());
+        assert_eq!(index.sweep_unavailable(64), 0);
+        keys.install(initial_bundle(&[cache])).unwrap();
+        assert_eq!(index.sweep_unavailable(64), 0);
+        assert_eq!(
+            index.lookup(&page).unwrap().unwrap().location,
+            entry.location
+        );
+        assert_eq!(read(&f, &env, &page), Some(vec![1; 116]));
+    }
+
+    #[test]
+    fn writes_need_a_recovered_journal() {
+        let (_simulation, env) = sim();
+        let f = opened(&env);
+        assert_eq!(persist(&f, &env, f.copy(1, 100)), Err(Error::Unavailable));
+        assert!(f.store.writer.write_journal().is_none());
+        recover(&f, &env, LAYOUT, COMPACT);
+        assert_eq!(
+            drive(
+                &f.reactor,
+                f.store
+                    .writer
+                    .recover_written(&f._directory.0, LAYOUT, COMPACT, &scope(&env))
+            )
+            .err(),
+            Some(Error::InvalidConfiguration)
+        );
+    }
+
+    #[test]
+    fn durable_written_page_is_pinned_readable_and_survives_a_crash_and_cold_start() {
+        let (simulation, env) = sim();
+        let f = opened(&env);
+        let empty = recover(&f, &env, LAYOUT, COMPACT);
+        assert!(empty.restored.is_empty() && empty.lost.is_empty());
+        let copy = f.copy(1, 100);
+        let page = id(&copy);
+        let cache = page.version.object.cache.clone();
+        let entry = persist(&f, &env, copy.clone()).unwrap();
+        assert_eq!(read(&f, &env, &page), Some(vec![1; 116]));
+        let index = f.store.writer.index();
+        assert_eq!(
+            index.lookup(&page).unwrap().unwrap().location,
+            entry.location
+        );
+        assert_eq!(index.segment_pins(entry.location.segment), 1);
+        assert!(!index.can_evict(entry.location.segment));
+        assert_eq!(f.store.writer.dirty_bytes(&cache), entry.disk_bytes);
+        assert_eq!(f.store.writer.written(&page), Some(entry.clone()));
+        assert_eq!(
+            f.store.writer.written_pages(),
+            vec![(page.clone(), entry.clone())]
+        );
+        let journal = f.store.writer.write_journal().unwrap();
+        assert_eq!(journal.barriers(), 1);
+        // Idempotent: a repeated store only extends the hold.
+        let later = hold() + Duration::from_secs(60);
+        let again = drive(
+            &f.reactor,
+            f.store
+                .writer
+                .persist_written(copy, SessionId([1; 16]), later, &scope(&env)),
+        )
+        .unwrap();
+        assert_eq!(again.location, entry.location);
+        assert_eq!(again.hold_until, later);
+        assert_eq!(index.segment_pins(entry.location.segment), 1);
+        assert_eq!(f.store.writer.dirty_bytes(&cache), entry.disk_bytes);
+        drop(journal);
+
+        // Power loss with no checkpoint: a cold start restores from the journal.
+        let f = f.restart_after(&env, || simulation.disk().crash().unwrap());
+        open(&f);
+        let recovered = recover(&f, &env, LAYOUT, COMPACT);
+        assert_eq!(recovered.restored, vec![page.clone()]);
+        assert!(recovered.lost.is_empty() && recovered.unindexed.is_empty());
+        assert_eq!(read(&f, &env, &page), Some(vec![1; 116]));
+        let restored = f.store.writer.written(&page).unwrap();
+        assert_eq!(restored.location, entry.location);
+        assert_eq!(restored.hold_until, later);
+        assert_eq!(f.store.writer.dirty_bytes(&cache), entry.disk_bytes);
+        let index = f.store.writer.index();
+        assert_eq!(index.segment_pins(entry.location.segment), 1);
+        assert_eq!(
+            f.segments.state(entry.location.segment).unwrap(),
+            SegmentState::Sealed
+        );
+        // The adopted segment is never handed out again while live.
+        let other = persist(&f, &env, f.copy(2, 100)).unwrap();
+        assert_ne!(other.location.extent, entry.location.extent);
+    }
+
+    #[test]
+    fn fsync_failure_fails_the_write_journals_nothing_and_loses_only_that_page() {
+        let (simulation, env) = sim();
+        let f = opened(&env);
+        recover(&f, &env, LAYOUT, COMPACT);
+        let kept = f.copy(1, 100);
+        let kept_id = id(&kept);
+        persist(&f, &env, kept).unwrap();
+        let failed = f.copy(2, 100);
+        let failed_id = id(&failed);
+        simulation.inject("fsync", Fault::Errno(libc::EIO)).unwrap();
+        assert!(persist(&f, &env, failed).is_err());
+        let journal = f.store.writer.write_journal().unwrap();
+        assert!(
+            journal.failure().is_some(),
+            "a failed barrier poisons the journal"
+        );
+        assert_eq!(journal.state().pages.len(), 1);
+        assert!(f.store.writer.written(&failed_id).is_none());
+        assert!(f.store.writer.index().lookup(&failed_id).unwrap().is_none());
+        // Later writes fail until the worker restarts.
+        assert!(persist(&f, &env, f.copy(3, 100)).is_err());
+        drop(journal);
+        let f = f.restart_after(&env, || simulation.disk().crash().unwrap());
+        open(&f);
+        let recovered = recover(&f, &env, LAYOUT, COMPACT);
+        assert_eq!(recovered.restored, vec![kept_id.clone()]);
+        assert!(
+            recovered.lost.is_empty(),
+            "an unjournaled page is not reported"
+        );
+        assert!(read(&f, &env, &failed_id).is_none());
+        assert_eq!(read(&f, &env, &kept_id), Some(vec![1; 116]));
+        persist(&f, &env, f.copy(3, 100)).unwrap();
+    }
+
+    #[test]
+    fn torn_journal_tail_is_dropped_and_rewritten() {
+        let (simulation, env) = sim();
+        let f = opened(&env);
+        recover(&f, &env, LAYOUT, COMPACT);
+        let copy = f.copy(1, 100);
+        let page = id(&copy);
+        persist(&f, &env, copy).unwrap();
+        let path = f
+            ._directory
+            .0
+            .join(crate::store::journal::DIRECTORY)
+            .join(crate::store::journal::file_name(0));
+        let f = f.restart_after(&env, || {
+            let mut bytes = simulation.read_file(&path).unwrap();
+            bytes.extend_from_slice(&[0, 0, 1, 0, 1, 2, 3]);
+            simulation.write_file(&path, &bytes).unwrap();
+        });
+        open(&f);
+        let recovered = recover(&f, &env, LAYOUT, COMPACT);
+        assert_eq!(recovered.torn_bytes, 7);
+        assert_eq!(recovered.restored, vec![page]);
+        let journal = f.store.writer.write_journal().unwrap();
+        let bytes = simulation.read_file(&path).unwrap();
+        assert_eq!(bytes.len() as u64, journal.len());
+        assert_eq!(journal.fold_file(&bytes).torn_bytes, 0);
+    }
+
+    #[test]
+    fn geometry_change_reports_every_page_lost_and_keeps_sessions() {
+        let (_simulation, env) = sim();
+        let f = opened(&env);
+        recover(&f, &env, LAYOUT, COMPACT);
+        let copy = f.copy(1, 100);
+        let page = id(&copy);
+        persist(&f, &env, copy).unwrap();
+        let journal = f.store.writer.write_journal().unwrap();
+        drive(
+            &f.reactor,
+            journal.append(
+                racer_core::write::JournalRecord::Abort {
+                    cache: "other".into(),
+                    key: [0; 32],
+                    etag: "\"x\"".into(),
+                },
+                None,
+            ),
+        )
+        .unwrap();
+        drop(journal);
+        let f = f.restart(&env);
+        open(&f);
+        let recovered = recover(&f, &env, [8; 32], COMPACT);
+        assert!(recovered.restored.is_empty());
+        assert_eq!(recovered.lost.len(), 1);
+        assert_eq!(recovered.lost[0].page, Some(page.clone()));
+        assert_eq!(recovered.lost[0].reason, LostReason::LayoutChanged);
+        assert!(f.store.writer.written_pages().is_empty());
+        assert!(read(&f, &env, &page).is_none());
+        // The rewritten journal is bound to the new layout and lists nothing.
+        let f = f.restart(&env);
+        open(&f);
+        let recovered = recover(&f, &env, [8; 32], COMPACT);
+        assert!(recovered.lost.is_empty() && recovered.restored.is_empty());
+    }
+
+    #[test]
+    fn corrupt_record_header_is_reported_lost_and_unpinned() {
+        let (simulation, env) = sim();
+        let f = opened(&env);
+        recover(&f, &env, LAYOUT, COMPACT);
+        let copy = f.copy(1, 100);
+        let page = id(&copy);
+        let entry = persist(&f, &env, copy).unwrap();
+        let slab = f._directory.0.join("worker-0-slab-0.dat");
+        let f = f.restart_after(&env, || {
+            simulation
+                .disk()
+                .corrupt(
+                    &slab,
+                    entry.location.extent.offset() + 40,
+                    &[0xff; 4],
+                    racer_io::sim::DiskState::Both,
+                )
+                .unwrap();
+        });
+        open(&f);
+        let recovered = recover(&f, &env, LAYOUT, COMPACT);
+        assert!(recovered.restored.is_empty());
+        assert_eq!(recovered.lost.len(), 1);
+        assert_eq!(recovered.lost[0].page, Some(page.clone()));
+        assert_eq!(recovered.lost[0].reason, LostReason::Corrupt);
+        assert!(read(&f, &env, &page).is_none());
+        assert_eq!(
+            f.store.writer.index().segment_pins(entry.location.segment),
+            0
+        );
+        // Lost pages are dropped from the journal; the next start is clean.
+        let f = f.restart(&env);
+        open(&f);
+        let recovered = recover(&f, &env, LAYOUT, COMPACT);
+        assert!(recovered.lost.is_empty() && recovered.restored.is_empty());
+    }
+
+    #[test]
+    fn release_keeps_the_page_readable_and_drop_removes_it() {
+        let (_simulation, env) = sim();
+        let f = opened(&env);
+        recover(&f, &env, LAYOUT, COMPACT);
+        let a = f.copy(1, 100);
+        let b = f.copy(2, 100);
+        let (a_id, b_id) = (id(&a), id(&b));
+        let cache = a_id.version.object.cache.clone();
+        let a_entry = persist(&f, &env, a).unwrap();
+        let b_entry = persist(&f, &env, b).unwrap();
+        assert_eq!(a_entry.location.segment, b_entry.location.segment);
+        let segment = a_entry.location.segment;
+        let index = f.store.writer.index();
+        assert_eq!(index.segment_pins(segment), 2);
+        assert!(drive(&f.reactor, f.store.writer.release_written(&a_id)).unwrap());
+        assert!(!drive(&f.reactor, f.store.writer.release_written(&a_id)).unwrap());
+        assert_eq!(read(&f, &env, &a_id), Some(vec![1; 116]));
+        assert_eq!(index.segment_pins(segment), 1);
+        assert!(!index.can_evict(segment));
+        assert_eq!(f.store.writer.dirty_bytes(&cache), b_entry.disk_bytes);
+        assert!(drive(&f.reactor, f.store.writer.drop_written(&b_id)).unwrap());
+        assert!(read(&f, &env, &b_id).is_none());
+        assert_eq!(index.segment_pins(segment), 0);
+        assert!(index.can_evict(segment));
+        assert_eq!(f.store.writer.dirty_bytes(&cache), 0);
+        assert!(f.store.writer.written_pages().is_empty());
+        // Released pages are not restored as written after a restart.
+        let f = f.restart(&env);
+        open(&f);
+        let recovered = recover(&f, &env, LAYOUT, COMPACT);
+        assert!(recovered.restored.is_empty() && recovered.lost.is_empty());
+    }
+
+    #[test]
+    fn hold_deadlines_set_extend_and_expire() {
+        let (_simulation, env) = sim();
+        let f = opened(&env);
+        recover(&f, &env, LAYOUT, COMPACT);
+        let copy = f.copy(1, 100);
+        let page = id(&copy);
+        persist(&f, &env, copy).unwrap();
+        let soon = UNIX_EPOCH + Duration::from_secs(1_000);
+        assert!(f.store.writer.expired_written(soon).is_empty());
+        assert!(drive(&f.reactor, f.store.writer.set_written_hold(&page, soon)).unwrap());
+        assert_eq!(f.store.writer.expired_written(soon), vec![page.clone()]);
+        assert!(
+            f.store
+                .writer
+                .expired_written(soon - Duration::from_secs(1))
+                .is_empty()
+        );
+        let missing = f.copy(9, 1);
+        assert!(
+            !drive(
+                &f.reactor,
+                f.store.writer.set_written_hold(&id(&missing), soon)
+            )
+            .unwrap()
+        );
+        let f = f.restart(&env);
+        open(&f);
+        recover(&f, &env, LAYOUT, COMPACT);
+        assert_eq!(f.store.writer.written(&page).unwrap().hold_until, soon);
+    }
+
+    #[test]
+    fn written_segments_are_never_evicted_while_live() {
+        let (_simulation, env) = sim();
+        let f = opened(&env);
+        recover(&f, &env, LAYOUT, COMPACT);
+        let index = f.store.writer.index();
+        index.set_page_capacity(64).unwrap();
+        let written = f.copy(1, 100);
+        let page = id(&written);
+        let entry = persist(&f, &env, written).unwrap();
+        // Fill the cache tail far past the slab: eviction must turn over
+        // cache segments only.
+        let request = scope(&env);
+        for number in 2..=8 {
+            f.enqueue(f.copy(number, 15 << 20)).unwrap();
+            drive(&f.reactor, f.store.writer.progress(8, &request)).unwrap();
+        }
+        f.store.eviction.reclaim_now().ok();
+        assert_eq!(read(&f, &env, &page), Some(vec![1; 116]));
+        assert_eq!(
+            f.segments.state(entry.location.segment).unwrap(),
+            SegmentState::Sealed
+        );
+        assert!(!index.can_evict(entry.location.segment));
+    }
+
+    #[test]
+    fn dirty_cap_refuses_the_write_that_would_exceed_it() {
+        let (_simulation, env) = sim();
+        let f = opened(&env);
+        recover(&f, &env, LAYOUT, COMPACT);
+        f.store.writer.index().set_page_capacity(64).unwrap();
+        let cache = CacheId(crate::test_support::security::CACHE.into());
+        let limit = f.store.writer.dirty_limit(&cache);
+        assert_eq!(limit, 64 * 1024 * 1024 * 30 / 100);
+        let mut number = 1;
+        let refused = loop {
+            let before = f.store.writer.dirty_bytes(&cache);
+            match persist(&f, &env, f.copy(number, 1 << 20)) {
+                Ok(entry) => {
+                    assert!(before + entry.disk_bytes <= limit);
+                    number += 1;
+                }
+                Err(error) => break (error, before),
+            }
+        };
+        assert_eq!(refused.0, Error::Overloaded);
+        let record = f.store.writer.written_pages()[0].1.disk_bytes;
+        assert!(refused.1 + record > limit);
+        assert!(refused.1 <= limit);
+        // Releasing makes room again.
+        let first = f.store.writer.written_pages()[0].0.clone();
+        drive(&f.reactor, f.store.writer.release_written(&first)).unwrap();
+        persist(&f, &env, f.copy(number, 1 << 20)).unwrap();
+    }
+
+    #[test]
+    fn concurrent_writes_cannot_overshoot_the_dirty_cap() {
+        let (_simulation, env) = sim();
+        let f = opened(&env);
+        recover(&f, &env, LAYOUT, COMPACT);
+        f.store.writer.index().set_page_capacity(64).unwrap();
+        let cache = CacheId(crate::test_support::security::CACHE.into());
+        let limit = f.store.writer.dirty_limit(&cache);
+        let request = scope(&env);
+        // Far more concurrent stores than the cap admits.
+        let copies: Vec<_> = (1..=40).map(|n| f.copy(n, 1 << 20)).collect();
+        let writes = futures::future::join_all(copies.into_iter().map(|copy| {
+            f.store
+                .writer
+                .persist_written(copy, SessionId([1; 16]), hold(), &request)
+        }));
+        let results = drive(&f.reactor, async { Ok(writes.await) }).unwrap();
+        assert!(results.iter().any(Result::is_ok));
+        assert!(
+            results
+                .iter()
+                .filter_map(|r| r.as_ref().err())
+                .all(|e| *e == Error::Overloaded)
+        );
+        assert!(results.iter().any(|r| r.is_err()), "cap never applied");
+        assert!(f.store.writer.dirty_bytes(&cache) <= limit);
+        assert_eq!(f.store.writer.writes.reserved(&cache), 0);
+    }
+
+    #[test]
+    fn concurrent_writes_share_one_group_commit() {
+        let (_simulation, env) = sim();
+        let f = opened(&env);
+        recover(&f, &env, LAYOUT, COMPACT);
+        let request = scope(&env);
+        let copies: Vec<_> = (1..=6).map(|n| f.copy(n, 100)).collect();
+        let writes = futures::future::join_all(copies.into_iter().map(|copy| {
+            f.store
+                .writer
+                .persist_written(copy, SessionId([1; 16]), hold(), &request)
+        }));
+        let results = drive(&f.reactor, async { Ok(writes.await) }).unwrap();
+        assert!(results.iter().all(Result::is_ok));
+        let barriers = f.store.writer.write_journal().unwrap().barriers();
+        assert!(barriers < 6, "{barriers} barriers for 6 writes");
+        assert_eq!(f.store.writer.written_pages().len(), 6);
+    }
+
+    #[test]
+    fn compaction_keeps_only_live_state_and_round_trips() {
+        let (simulation, env) = sim();
+        let f = opened(&env);
+        // Compact after every commit.
+        recover(&f, &env, LAYOUT, 1);
+        let copies: Vec<_> = (1..=4).map(|n| f.copy(n, 100)).collect();
+        let ids: Vec<_> = copies.iter().map(id).collect();
+        for copy in copies {
+            persist(&f, &env, copy).unwrap();
+        }
+        drive(&f.reactor, f.store.writer.release_written(&ids[0])).unwrap();
+        drive(&f.reactor, f.store.writer.drop_written(&ids[1])).unwrap();
+        let journal = f.store.writer.write_journal().unwrap();
+        let path = f
+            ._directory
+            .0
+            .join(crate::store::journal::DIRECTORY)
+            .join(crate::store::journal::file_name(0));
+        let bytes = simulation.read_file(&path).unwrap();
+        let folded = journal.fold_file(&bytes);
+        assert_eq!(folded.state.pages.len(), 2);
+        assert!(folded.state.sequence > 1);
+        // Exactly a checkpoint and the two live pages remain.
+        let (records, _) =
+            racer_core::write::journal::replay(&bytes[racer_core::write::journal::HEADER_BYTES..]);
+        assert_eq!(records.len(), 3);
+        drop(journal);
+        let f = f.restart_after(&env, || simulation.disk().crash().unwrap());
+        open(&f);
+        let mut restored = recover(&f, &env, LAYOUT, 1).restored;
+        restored.sort_by_key(|page| page.version.object.key.0);
+        assert_eq!(restored, ids[2..].to_vec());
+    }
+
+    /// Rekey evacuation moves a current-key record off its segment: the pin
+    /// moves, the session and hold stay, a stale source is a no-op, and the
+    /// journal replays the new location.
+    #[test]
+    fn relocate_moves_a_written_record_and_its_pin() {
+        let (simulation, env) = sim();
+        let f = opened(&env);
+        recover(&f, &env, LAYOUT, COMPACT);
+        let copy = f.copy(1, 100);
+        let page = id(&copy);
+        let before = persist(&f, &env, copy.clone()).unwrap();
+        let relocate = |from| {
+            drive(
+                &f.reactor,
+                f.store
+                    .writer
+                    .relocate_written(copy.clone(), from, &scope(&env)),
+            )
+        };
+        let after = relocate(before.location.clone()).unwrap().unwrap();
+        assert_ne!(after.location, before.location);
+        assert_eq!(after.session, before.session);
+        assert_eq!(after.hold_until, before.hold_until);
+        assert_eq!(f.store.writer.written(&page), Some(after.clone()));
+        let index = f.store.writer.index();
+        assert_eq!(
+            index.lookup(&page).unwrap().unwrap().location,
+            after.location
+        );
+        assert_eq!(index.segment_pins(after.location.segment), 1);
+        assert_eq!(f.store.writer.pinned_segments(), 1);
+        // Already moved: nothing to do.
+        assert_eq!(relocate(before.location.clone()).unwrap(), None);
+        assert_eq!(f.store.writer.written(&page), Some(after.clone()));
+        let f = f.restart_after(&env, || simulation.disk().crash().unwrap());
+        open(&f);
+        let recovered = recover(&f, &env, LAYOUT, COMPACT);
+        assert!(recovered.lost.is_empty(), "{:?}", recovered.lost);
+        assert_eq!(
+            f.store.writer.written(&page).unwrap().location,
+            after.location
+        );
+        assert_eq!(read(&f, &env, &page), Some(vec![1; 116]));
+    }
+
+    /// A checkpoint fills the page index with cache mappings; a page written
+    /// after it must still be indexed on restart, evicting disposable cache
+    /// mappings rather than leaving the journaled page unreadable.
+    #[test]
+    fn restored_written_page_evicts_checkpoint_mappings_from_a_full_index() {
+        let (simulation, env) = sim();
+        let f = opened(&env);
+        recover(&f, &env, LAYOUT, COMPACT);
+        // Room for the write too, so it does not recycle a cache segment.
+        f.store.writer.index().set_page_capacity(5).unwrap();
+        let request = scope(&env);
+        for number in 2..=5 {
+            f.enqueue(f.copy(number, 100)).unwrap();
+            drive(&f.reactor, f.store.writer.progress(8, &request)).unwrap();
+        }
+        assert_eq!(f.store.writer.index().page_count(), 4);
+        let image = drive(&f.reactor, f.store.checkpoint.snapshot_shard()).unwrap();
+        f.store.checkpoint.finish_snapshot();
+        let copy = f.copy(1, 100);
+        let page = id(&copy);
+        let entry = persist(&f, &env, copy).unwrap();
+        assert_eq!(f.store.writer.index().page_count(), 5);
+        let f = f.restart_after(&env, || simulation.disk().crash().unwrap());
+        open(&f);
+        // The restarted node indexes fewer pages: the cut alone fills it.
+        f.store.writer.index().set_page_capacity(4).unwrap();
+        drive(&f.reactor, f.store.recovery.install_shard(Some(image))).unwrap();
+        assert_eq!(f.store.writer.index().page_count(), 4);
+        let recovered = recover(&f, &env, LAYOUT, COMPACT);
+        assert!(recovered.lost.is_empty(), "{:?}", recovered.lost);
+        assert!(recovered.unindexed.is_empty());
+        assert_eq!(recovered.restored, vec![page.clone()]);
+        assert_eq!(read(&f, &env, &page), Some(vec![1; 116]));
+        let index = f.store.writer.index();
+        assert!(index.page_count() <= 4);
+        assert_eq!(index.segment_pins(entry.location.segment), 1);
+    }
+
+    /// Checkpoint, recycle a segment, write a page into its new generation,
+    /// and crash before the next checkpoint. The checkpoint restores the
+    /// segment at its older generation; the journal record supersedes it,
+    /// the stale checkpoint mapping is dropped, and the page survives.
+    #[test]
+    fn journal_supersedes_a_segment_recycled_after_the_checkpoint() {
+        let (simulation, env) = sim();
+        let f = opened(&env);
+        recover(&f, &env, LAYOUT, COMPACT);
+        let first = f.copy(1, 100);
+        let old_page = id(&first);
+        let old = persist(&f, &env, first).unwrap();
+        let segment = old.location.segment;
+        assert!(drive(&f.reactor, f.store.writer.release_written(&old_page)).unwrap());
+        // The cut holds the segment at the old generation with `old_page`.
+        let image = drive(&f.reactor, f.store.checkpoint.snapshot_shard()).unwrap();
+        f.store.checkpoint.finish_snapshot();
+        let index = f.store.writer.index();
+        let mapped = index.lookup(&old_page).unwrap().unwrap().location;
+        index.forget_stale(&old_page, &mapped);
+        f.segments.seal_open();
+        f.segments.begin_evict(segment).unwrap();
+        f.segments.recycle(segment).unwrap();
+        let copy = f.copy(2, 100);
+        let page = id(&copy);
+        let entry = persist(&f, &env, copy).unwrap();
+        assert_eq!(entry.location.segment, segment);
+        assert!(entry.location.generation.0 > old.location.generation.0);
+        let f = f.restart_after(&env, || simulation.disk().crash().unwrap());
+        open(&f);
+        drive(&f.reactor, f.store.recovery.install_shard(Some(image))).unwrap();
+        let index = f.store.writer.index();
+        assert!(index.lookup(&old_page).unwrap().is_some());
+        let recovered = recover(&f, &env, LAYOUT, COMPACT);
+        assert!(recovered.lost.is_empty(), "{:?}", recovered.lost);
+        assert_eq!(recovered.restored, vec![page.clone()]);
+        assert_eq!(read(&f, &env, &page), Some(vec![2; 116]));
+        assert_eq!(
+            f.store.writer.written(&page).unwrap().location,
+            entry.location
+        );
+        assert!(index.lookup(&old_page).unwrap().is_none());
+        assert_eq!(index.segment_pins(segment), 1);
+    }
+
+    #[test]
+    fn checkpointed_restart_restores_written_pages_through_the_journal() {
+        let (_simulation, env) = sim();
+        let f = opened(&env);
+        recover(&f, &env, LAYOUT, COMPACT);
+        // Checkpoint before the write: the written segment is free in the cut.
+        let image = drive(&f.reactor, f.store.checkpoint.snapshot_shard()).unwrap();
+        f.store.checkpoint.finish_snapshot();
+        let copy = f.copy(1, 100);
+        let page = id(&copy);
+        let entry = persist(&f, &env, copy).unwrap();
+        let f = f.restart(&env);
+        open(&f);
+        drive(&f.reactor, f.store.recovery.install_shard(Some(image))).unwrap();
+        let recovered = recover(&f, &env, LAYOUT, COMPACT);
+        assert_eq!(recovered.restored, vec![page.clone()]);
+        assert_eq!(read(&f, &env, &page), Some(vec![1; 116]));
+        assert_eq!(
+            f.store.writer.index().segment_pins(entry.location.segment),
+            1
+        );
+    }
 }

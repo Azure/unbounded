@@ -139,3 +139,36 @@ impl<U: Origin, T: AzureTransport, K: AzureTokenSource> Origin for OriginRouter<
         })
     }
 }
+
+/// Uploads go to the cache's native origin; caches without one (adapter
+/// socket origins) do not accept uploads yet.
+impl<U: Origin, T: AzureTransport, K: AzureTokenSource> super::upload::UploadSink
+    for OriginRouter<U, T, K>
+{
+    fn put_block<'a>(
+        &'a self,
+        context: &'a OriginContext,
+        block_id: &'a [u8; 64],
+        plaintext: &'a [u8],
+        scope: &'a RequestScope,
+    ) -> Operation<'a, ()> {
+        match self.native(&context.object) {
+            Some((azure, ..)) => azure.put_block(context, block_id, plaintext, scope),
+            None => Box::pin(async { Err(Error::NotImplemented) }),
+        }
+    }
+
+    fn put_block_list<'a>(
+        &'a self,
+        context: &'a OriginContext,
+        block_ids: &'a [[u8; 64]],
+        content_type: Option<&'a str>,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, std::result::Result<crate::model::StrongEtag, super::upload::CommitConflict>>
+    {
+        match self.native(&context.object) {
+            Some((azure, ..)) => azure.put_block_list(context, block_ids, content_type, scope),
+            None => Box::pin(async { Err(Error::NotImplemented) }),
+        }
+    }
+}

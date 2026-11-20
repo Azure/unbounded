@@ -21,11 +21,13 @@
 //! than queue. `request_timeout` narrows the caller's deadline for the whole
 //! operation, including token acquisition.
 
+pub mod crc64;
 pub mod identity;
 pub mod request;
 pub mod response;
 pub mod tokens;
 pub mod transport;
+pub mod upload;
 
 use self::identity::AzureObject;
 use self::request::{AzureMethod, ByteRange};
@@ -144,6 +146,16 @@ pub trait AzureTransport {
         &'a self,
         url: &'a AzureContainerUrl,
         head: MessageHead,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, Self::Exchange>;
+
+    /// Like [`AzureTransport::exchange`], but send `body` after `head`, which
+    /// must carry `Content-Length: body.len()`. Used by uploads.
+    fn exchange_body<'a>(
+        &'a self,
+        url: &'a AzureContainerUrl,
+        head: MessageHead,
+        body: &'a [u8],
         scope: &'a RequestScope,
     ) -> Operation<'a, Self::Exchange>;
 
@@ -425,24 +437,43 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
         if_match: Option<&StrongEtag>,
     ) -> Result<T::Exchange> {
         let url = &definition.azure.container_url;
+        self.send_with(
+            definition,
+            begun,
+            |bearer, now| request::head(url, &begun.object, method, range, if_match, bearer, now),
+            None,
+        )
+        .await
+    }
+
+    /// Send one request built by `build(bearer, now)`, with `body` when set.
+    /// The head is rebuilt per attempt so a retry carries a fresh date and
+    /// token. A 401 earns one retry when the token source says it may help.
+    async fn send_with(
+        &self,
+        definition: &OriginDefinition,
+        begun: &Begun,
+        build: impl Fn(Option<&[u8]>, SystemTime) -> Result<MessageHead>,
+        body: Option<&[u8]>,
+    ) -> Result<T::Exchange> {
+        let url = &definition.azure.container_url;
         let credential = &definition.azure.credential;
         let mut retried = false;
         loop {
             let token = self.tokens.bearer(credential, &begun.scope).await?;
-            let head = request::head(
-                url,
-                &begun.object,
-                method,
-                range,
-                if_match,
+            let head = build(
                 token.as_ref().map(BearerToken::as_bytes),
                 begun.scope.clock().wall_now(),
             )?;
-            let exchange = self
-                .transport
-                .exchange(url, head, &begun.scope)
-                .await
-                .map_err(transport_error)?;
+            let exchange = match body {
+                None => self.transport.exchange(url, head, &begun.scope).await,
+                Some(body) => {
+                    self.transport
+                        .exchange_body(url, head, body, &begun.scope)
+                        .await
+                }
+            }
+            .map_err(transport_error)?;
             begun.scope.check()?;
             if retried || status(exchange.head())? != 401 {
                 return Ok(exchange);

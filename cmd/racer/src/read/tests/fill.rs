@@ -679,6 +679,7 @@ fn optional_persistence_owned_dirty_pressure_keeps_disk_share_order() {
         priority,
         mode: racer_wire::control::CacheMode::Cached,
         origin: None,
+        writes: None,
     };
     let weigh = |under_priority, over_priority| {
         policy.weights().update(&[
@@ -2957,6 +2958,7 @@ mod pressure {
                 priority,
                 mode: racer_wire::control::CacheMode::Cached,
                 origin: None,
+                writes: None,
             };
             let weigh = |under_priority, over_priority| {
                 admission.policy().weights().update(&[
@@ -3410,6 +3412,7 @@ impl Fixture {
                 priority: racer_wire::control::DEFAULT_PRIORITY,
                 mode: racer_wire::control::CacheMode::Cached,
                 origin: None,
+                writes: None,
             }],
             page_size: racer_wire::object::PageSize::DEFAULT,
         };
@@ -3792,6 +3795,7 @@ pub(super) fn adapter_client(
                     priority: racer_wire::control::DEFAULT_PRIORITY,
                     mode: racer_wire::control::CacheMode::Cached,
                     origin: None,
+                    writes: None,
                 }],
                 page_size: racer_wire::object::PageSize::DEFAULT,
             }

@@ -64,10 +64,34 @@ impl PendingWrite {
         segments: &Segments,
         length: usize,
     ) -> Result<(SegmentLease, RecordLocation)> {
+        self.append_in(segments, length, false)
+    }
+
+    /// [`Self::append`] into the dedicated written-record tail.
+    pub fn append_written(
+        &mut self,
+        segments: &Segments,
+        length: usize,
+    ) -> Result<(SegmentLease, RecordLocation)> {
+        self.append_in(segments, length, true)
+    }
+
+    fn append_in(
+        &mut self,
+        segments: &Segments,
+        length: usize,
+        written: bool,
+    ) -> Result<(SegmentLease, RecordLocation)> {
         let Stage::Reserved(ticket) = std::mem::replace(&mut self.stage, Stage::Done) else {
             return Err(crate::Error::InvalidConfiguration);
         };
-        let appended = self.index.borrow_mut().append(segments, ticket, length);
+        let appended = if written {
+            self.index
+                .borrow_mut()
+                .append_written(segments, ticket, length)
+        } else {
+            self.index.borrow_mut().append(segments, ticket, length)
+        };
         match appended {
             Ok((lease, writing)) => {
                 let location = writing.location();

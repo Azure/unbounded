@@ -145,6 +145,23 @@ impl PageTicket {
             .append(segments, length)
     }
 
+    /// [`Self::append`] into the dedicated written-record tail, so the record
+    /// shares its segment only with other written records.
+    pub fn append_written(
+        &mut self,
+        page: &PageId,
+        segments: &Segments,
+        length: usize,
+    ) -> Result<(page_alloc::SegmentLease, RecordLocation)> {
+        if self.reservation.is_none() {
+            self.reservation = Some(self.index.state_mut().pages.reserve(page)?);
+        }
+        self.reservation
+            .as_mut()
+            .expect("reserved page")
+            .append_written(segments, length)
+    }
+
     /// Publish the completed write at the location [`Self::append`] returned.
     pub fn publish(mut self, page: PageId, entry: IndexedPage) -> Result<()> {
         if std::mem::take(&mut self.counted) {
@@ -884,6 +901,10 @@ impl Index {
             .pages
             .set_hash_key(page_alloc::intern::KeyedState::from_bytes(key))
     }
+    /// Pages currently mapped.
+    pub fn page_count(&self) -> usize {
+        self.state.borrow().pages.len()
+    }
     pub fn page_capacity(&self) -> usize {
         self.page_capacity.get()
     }
@@ -971,6 +992,18 @@ impl Index {
     pub fn publish(&self, page: PageId, entry: IndexedPage) -> Result<()> {
         self.publish_with(page, entry, None)
     }
+    /// [`Self::publish`] of a durable written page restored from the write
+    /// journal. Only cache admission is required, not its page key: a node
+    /// restarts before its keyring is installed, and a written page skipped
+    /// here would stay pinned but never served. [`Self::lookup`] still
+    /// requires the key, so the page becomes readable once it is installed.
+    pub fn publish_written(&self, page: PageId, entry: IndexedPage) -> Result<()> {
+        if !self.availability.cache(&page.version.object.cache) {
+            return Err(Error::MissingKey);
+        }
+        let mut reservation = None;
+        self.insert(page, entry, &mut reservation)
+    }
     /// [`Self::publish`] of a reserved write, or of a validated location
     /// when `reservation` is `None`. A reservation is always consumed.
     fn publish_with(
@@ -997,6 +1030,14 @@ impl Index {
         {
             return Ok(());
         }
+        self.insert(page, entry, reservation)
+    }
+    fn insert(
+        &self,
+        page: PageId,
+        entry: IndexedPage,
+        reservation: &mut Option<super::pages::Reservation>,
+    ) -> Result<()> {
         Self::validate_descriptor(&entry.metadata)?;
         let payload_bytes = u64::from(entry.metadata.page_length_in(&page, entry.page_size)?);
         let mut state = self.state_mut();
@@ -1094,6 +1135,11 @@ impl Index {
         self.state_mut().current.clear();
         Ok(())
     }
+    /// Drop one object's volatile current pointer (a deleted or uploaded
+    /// written object), preserving its version descriptors.
+    pub fn invalidate_current(&self, object: &ObjectId) {
+        self.state_mut().current.remove(object);
+    }
     /// Reclaim standalone catalog entries and any pointers depending on them.
     /// Page-attached descriptors follow page eviction instead; no page is removed.
     pub fn evict_metadata(&self, entries: usize) -> Result<usize> {
@@ -1108,7 +1154,8 @@ impl Index {
     /// Drop published pages whose cache or page key is no longer admitted,
     /// examining at most `budget` entries in age order. Idle until the keyring
     /// generation changes, then resumes each call until one pass completes.
-    /// Held pages are kept; their hold decides their lifetime. Returns the
+    /// Held pages and records in pinned (written) segments are kept; their
+    /// hold or pin decides their lifetime. Returns the
     /// number of pages removed.
     pub fn sweep_unavailable(&self, budget: usize) -> usize {
         let generation = self.availability.key_generation();
@@ -1134,7 +1181,13 @@ impl Index {
         let examined = visited.len();
         self.key_sweep
             .set((generation, (examined == budget).then_some(next)));
-        let stale: Vec<_> = visited.into_iter().flatten().collect();
+        // Written records (pinned segments) outlive a key change: the write
+        // service rekeys or drops them, and their pin decides their lifetime.
+        let stale: Vec<_> = visited
+            .into_iter()
+            .flatten()
+            .filter(|(_, location)| self.segment_pins(location.segment) == 0)
+            .collect();
         let removed = stale.len();
         for (page, location) in stale {
             self.remove_if_matches(&page, &location);
@@ -1144,6 +1197,21 @@ impl Index {
     pub fn remove_if_matches(&self, page: &PageId, location: &RecordLocation) {
         let mut s = self.state_mut();
         s.pages.remove(page, Some(location));
+    }
+    /// Remove `page` mapped at `location` whose bytes are gone, releasing its
+    /// retention charge as an eviction would.
+    pub fn forget_stale(&self, page: &PageId, location: &RecordLocation) {
+        let bytes = {
+            let state = self.state.borrow();
+            let Some(view) = state.pages.get(page) else {
+                return;
+            };
+            view.metadata.page_length_in(page, view.page_size).ok()
+        };
+        if let Some(bytes) = bytes {
+            self.retention().evicted(page, u64::from(bytes));
+        }
+        self.remove_if_matches(page, location);
     }
     pub fn snapshot(&self) -> Result<IndexSnapshot> {
         let s = self.state.borrow();
@@ -1331,6 +1399,19 @@ impl Index {
     pub fn segment_empty(&self, segment: SegmentId) -> bool {
         self.state.borrow().pages.segment_empty(segment)
     }
+    /// Keep `segment` from eviction for one live written record. Pins do not
+    /// change checkpoint content: the write journal restores them.
+    pub fn pin_segment(&self, segment: SegmentId, count: usize) -> Result<()> {
+        self.state_cursor().pages.pin_segment(segment, count)
+    }
+    /// Drop one written-record pin of `segment`.
+    pub fn unpin_segment(&self, segment: SegmentId) -> Result<()> {
+        self.state_cursor().pages.unpin_segment(segment)
+    }
+    /// Written-record pins on `segment`.
+    pub fn segment_pins(&self, segment: SegmentId) -> u32 {
+        self.state.borrow().pages.segment_pins(segment)
+    }
     /// Sum live payload value, not padded disk size. At most 256 mappings are
     /// inspected per segment. Larger segments use a conservative upper bound for
     /// the unseen suffix; this is a preference, never an eviction exemption.
@@ -1476,7 +1557,9 @@ impl Index {
     #[cfg(test)]
     pub(crate) fn can_evict(&self, segment: SegmentId) -> bool {
         let state = self.state.borrow();
-        state.pages.can_reclaim(segment) && !state.pages.segment_held(segment)
+        state.pages.can_reclaim(segment)
+            && !state.pages.segment_held(segment)
+            && state.pages.segment_pins(segment) == 0
     }
     /// Test helper: remove up to `budget` pages of an evictable `segment`.
     #[cfg(test)]
@@ -3017,6 +3100,7 @@ mod priority_tests {
             priority,
             mode: racer_wire::control::CacheMode::Cached,
             origin: None,
+            writes: None,
         }
     }
 
