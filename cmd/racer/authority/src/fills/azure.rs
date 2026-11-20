@@ -642,16 +642,28 @@ enum Token<'a> {
 
 struct Scanner<'a> {
     rest: &'a str,
+    pending_end: Option<&'a str>,
+    open: Vec<&'a str>,
 }
 
 impl<'a> Scanner<'a> {
     fn new(xml: &'a str) -> Self {
-        Self { rest: xml }
+        Self {
+            rest: xml,
+            pending_end: None,
+            open: Vec::new(),
+        }
     }
 
     fn next(&mut self) -> Result<Option<Token<'a>>, XmlError> {
+        if let Some(name) = self.pending_end.take() {
+            return Ok(Some(Token::End(name)));
+        }
         loop {
             if self.rest.is_empty() {
+                if !self.open.is_empty() {
+                    return Err(XmlError);
+                }
                 return Ok(None);
             }
             let Some(at) = self.rest.find('<') else {
@@ -682,7 +694,7 @@ impl<'a> Scanner<'a> {
             self.rest = &self.rest[end + 1..];
             if let Some(name) = tag.strip_prefix('/') {
                 let name = name.trim();
-                if name.is_empty() {
+                if name.is_empty() || self.open.pop() != Some(name) {
                     return Err(XmlError);
                 }
                 return Ok(Some(Token::End(name)));
@@ -692,6 +704,11 @@ impl<'a> Scanner<'a> {
             let name = name.split('/').next().ok_or(XmlError)?;
             if name.is_empty() {
                 return Err(XmlError);
+            }
+            if tag.trim_end().ends_with('/') {
+                self.pending_end = Some(name);
+            } else {
+                self.open.push(name);
             }
             return Ok(Some(Token::Start(name)));
         }
@@ -877,6 +894,44 @@ mod tests {
                 .unwrap()
                 .replace("0x8CBFF45D8A29A19", bad);
             assert_eq!(parse_list(xml.as_bytes()), Err(XmlError), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn self_closing_elements_end_capture_before_following_whitespace() {
+        let xml = br#"<EnumerationResults><Blobs><Blob>
+            <Name>one</Name><Properties><Etag>0x12</Etag>
+            <Content-Length>1</Content-Length><Content-Type />
+            </Properties></Blob></Blobs><NextMarker />
+            </EnumerationResults>"#;
+        let page = parse_list(xml).unwrap();
+        assert_eq!(page.blobs.len(), 1);
+        assert_eq!(page.blobs[0].content_type, None);
+        assert_eq!(page.next_marker, "");
+        for xml in [
+            "<EnumerationResults />",
+            "<EnumerationResults><Blobs/>\n<NextMarker/>\n</EnumerationResults>",
+        ] {
+            assert_eq!(parse_list(xml.as_bytes()).unwrap(), Page::default());
+        }
+        for xml in [
+            "<EnumerationResults><Blobs><Blob /></Blobs></EnumerationResults>",
+            "<EnumerationResults><Blobs /></Blobs></EnumerationResults>",
+            "<EnumerationResults><Blobs></EnumerationResults>",
+            "<EnumerationResults><Blobs/>",
+        ] {
+            assert_eq!(parse_list(xml.as_bytes()), Err(XmlError), "{xml}");
+        }
+        for field in ["Etag", "Content-Length"] {
+            let xml = String::from_utf8(xml.to_vec()).unwrap().replace(
+                if field == "Etag" {
+                    "<Etag>0x12</Etag>"
+                } else {
+                    "<Content-Length>1</Content-Length>"
+                },
+                &format!("<{field} />"),
+            );
+            assert_eq!(parse_list(xml.as_bytes()), Err(XmlError), "{field}");
         }
     }
 
