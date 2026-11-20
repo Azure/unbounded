@@ -435,7 +435,7 @@ impl Index {
         pages: &super::holds::HoldPages,
         until: std::time::SystemTime,
     ) -> Result<super::pins::PinEpoch> {
-        self.reserve_pin_inner(fill, version, pages, until, true)
+        self.reserve_pin_inner(fill, version, pages, until)
     }
 
     fn reserve_pin_inner(
@@ -444,7 +444,6 @@ impl Index {
         version: &ObjectVersion,
         pages: &super::holds::HoldPages,
         until: std::time::SystemTime,
-        add_holders: bool,
     ) -> Result<super::pins::PinEpoch> {
         let monotonic = super::pins::Pins::deadline(until, &self.clock)?;
         if !self.available(&version.object.cache) {
@@ -537,8 +536,7 @@ impl Index {
         {
             return Err(Error::Overloaded);
         }
-        if add_holders
-            && let Some(old) = old
+        if let Some(old) = old
             && pages.iter().any(|number| {
                 old.holders
                     .get(&number)
@@ -597,10 +595,8 @@ impl Index {
                     );
                 }
             }
-            if add_holders {
-                for number in pages.iter() {
-                    pin.holders.get_mut(&number).expect("member").count += 1;
-                }
+            for number in pages.iter() {
+                pin.holders.get_mut(&number).expect("member").count += 1;
             }
         }
         pins.note_deadline(&key, previous_deadline, monotonic);
@@ -624,16 +620,32 @@ impl Index {
         version: &ObjectVersion,
         until: std::time::SystemTime,
     ) -> Result<()> {
-        let pages = self
-            .pins
-            .borrow()
+        let monotonic = super::pins::Pins::deadline(until, &self.clock)?;
+        if !self.available(&version.object.cache) {
+            return Err(Error::MissingKey);
+        }
+        let now = self.clock.now();
+        let key = (fill, version.clone());
+        let mut pins = self.pins.borrow_mut();
+        let pin = pins
             .entries
-            .get(&(fill, version.clone()))
-            .filter(|pin| pin.live(&self.clock))
-            .map(|pin| pin.pages.iter().copied().collect())
+            .get_mut(&key)
+            .filter(|pin| now < pin.monotonic)
             .ok_or(Error::Unavailable)?;
-        self.reserve_pin_inner(fill, version, &pages, until, false)
-            .map(drop)
+        let previous = pin.monotonic;
+        let until = pin.until.max(until);
+        let monotonic = previous.max(monotonic);
+        if pin.until == until && previous == monotonic {
+            return Ok(());
+        }
+        // Renewal only updates an existing live entry. Re-entering reservation
+        // could sweep this entry after a second clock observation and recreate
+        // its pages without any reader holders.
+        let _state = self.state_mut();
+        pin.until = until;
+        pin.monotonic = monotonic;
+        pins.note_deadline(&key, Some(previous), monotonic);
+        Ok(())
     }
 
     /// Drop one holder from each of `pages` taken under `epoch`. Pages that
@@ -2828,6 +2840,83 @@ mod tests {
             }
         }
         assert!(index.pins.borrow().page_fills.is_empty());
+    }
+
+    #[test]
+    fn pin_renewal_preserves_holders_and_never_recreates_an_expired_entry() {
+        use super::super::pins::FillId;
+        let clock = racer_io::SimClock::new(41);
+        let ctx = clock.ctx(0);
+        let env = racer_io::Env::new(racer_io::Driver::Uring, ctx.clone());
+        let segments = Rc::new(segments(1024, 8));
+        let index = Rc::new(index(&env, 16));
+        index.set_page_capacity(16).unwrap();
+        index.set_pin_capacity_percent(100).unwrap();
+        let _clock = SegmentClock::new(index.clone(), segments, 1);
+        let version = descriptor("renewal-boundary", 17).version;
+        let first = ctx.clock.wall_now() + std::time::Duration::from_secs(10);
+        let later = first + std::time::Duration::from_secs(20);
+        let epoch = index
+            .reserve_pin_pages(FillId(1), &version, &page_set(&[0]), first)
+            .unwrap();
+        index
+            .reserve_pin_pages(FillId(1), &version, &page_set(&[0]), first)
+            .unwrap();
+        clock.advance(std::time::Duration::from_secs(9));
+        index.renew_pin(FillId(1), &version, later).unwrap();
+        {
+            let pins = index.pins.borrow();
+            let pin = &pins.entries[&(FillId(1), version.clone())];
+            let holder = pin.holders[&crate::model::PageNumber(0)];
+            assert_eq!(holder.count, 2);
+            assert_eq!(holder.since, epoch);
+            assert_eq!(pin.ids.len(), 1);
+            assert_eq!(pins.members, 1);
+            assert_eq!(pins.expirations.len(), 1);
+        }
+        index.release_pin_pages(FillId(1), &version, &page_set(&[0]), epoch);
+        clock.advance(std::time::Duration::from_secs(1));
+        index.expire_pins(usize::MAX);
+        assert_eq!(
+            index.pins.borrow().entries.len(),
+            1,
+            "old deadline was removed"
+        );
+        clock.advance(std::time::Duration::from_secs(20));
+        let generation = index.generation();
+        assert_eq!(
+            index.renew_pin(
+                FillId(1),
+                &version,
+                later + std::time::Duration::from_secs(60)
+            ),
+            Err(Error::Unavailable)
+        );
+        assert_eq!(
+            index.generation(),
+            generation,
+            "failed renewal does not mutate"
+        );
+        assert_eq!(
+            index.pins.borrow().entries[&(FillId(1), version.clone())].holders
+                [&crate::model::PageNumber(0)]
+                .count,
+            1
+        );
+        // Releasing after the exact expiry boundary must not underflow a
+        // zero-holder entry recreated by renewal.
+        index.release_pin_pages(FillId(1), &version, &page_set(&[0]), epoch);
+        assert!(index.pins.borrow().entries.is_empty());
+        assert_eq!(index.state.borrow().pages.holds_unused(), 0);
+        assert_eq!(
+            index.renew_pin(
+                FillId(1),
+                &version,
+                later + std::time::Duration::from_secs(60)
+            ),
+            Err(Error::Unavailable)
+        );
+        assert!(index.pins.borrow().entries.is_empty());
     }
 
     #[test]
