@@ -56,6 +56,8 @@ pub enum ManifestError {
     TooManyObjects,
     /// A listed blob has an identity or ETag the wire cannot carry.
     InvalidObject,
+    /// The total logical length cannot be represented without overflow.
+    LogicalBytesOverflow,
 }
 
 /// Build a manifest from a raw listing. Objects are filtered by `prefixes`
@@ -95,7 +97,10 @@ pub fn build(
         }
     }
     objects.sort_by_key(|a| a.key);
-    let logical_bytes = objects.iter().map(|o| o.length).sum();
+    let logical_bytes = objects
+        .iter()
+        .try_fold(0u64, |total, object| total.checked_add(object.length))
+        .ok_or(ManifestError::LogicalBytesOverflow)?;
     Ok(Manifest {
         digest: digest(&objects),
         logical_bytes,
@@ -248,6 +253,39 @@ mod tests {
         // Each object is one page at 16 bytes, times 2 replicas.
         assert_eq!(planned_footprint(&m, 16, 2), 3 * 16 * 2);
         assert_eq!(planned_footprint(&m, 4, 1), (4 + 4 + 4) as u64);
+    }
+
+    #[test]
+    fn logical_bytes_overflow_rejects_instead_of_wrapping_or_saturating() {
+        let at_limit = [object("a", "\"e\"", u64::MAX - 1), object("b", "\"e\"", 1)];
+        assert_eq!(
+            build("models", &at_limit, &["".into()], 1)
+                .unwrap()
+                .logical_bytes,
+            u64::MAX
+        );
+        let over_limit = [object("a", "\"e\"", u64::MAX), object("b", "\"e\"", 1)];
+        assert_eq!(
+            build("models", &over_limit, &["".into()], 1),
+            Err(ManifestError::LogicalBytesOverflow)
+        );
+        // Duplicate listings do not contribute their lengths twice.
+        let duplicates = [
+            object("a", "\"e\"", u64::MAX),
+            object("a", "\"e\"", u64::MAX),
+        ];
+        assert_eq!(
+            build("models", &duplicates, &["".into()], 1)
+                .unwrap()
+                .logical_bytes,
+            u64::MAX
+        );
+        assert_eq!(
+            build("models", &over_limit, &["absent/".into()], 1)
+                .unwrap()
+                .logical_bytes,
+            0
+        );
     }
 
     #[test]

@@ -464,7 +464,7 @@ async fn list_fills(shared: Rc<Shared>) {
                             view.failures = view.failures.saturating_add(1);
                             view.next_list = Some(now + LIST_BACKOFF);
                         }
-                        Err(ManifestError::InvalidObject) => {
+                        Err(ManifestError::InvalidObject | ManifestError::LogicalBytesOverflow) => {
                             view.error = Some("ListFailed".into());
                             view.failures = view.failures.saturating_add(1);
                             view.next_list = Some(now + LIST_BACKOFF);
