@@ -684,6 +684,15 @@ impl<'a> Scanner<'a> {
                 self.rest = &self.rest[at..];
                 return Ok(Some(Token::Text(text)));
             }
+            // Comment contents are not attributes: quotes and '>' are literal.
+            if let Some(comment) = self.rest.strip_prefix("<!--") {
+                let end = comment.find("-->").ok_or(XmlError)?;
+                if comment[..end].contains("--") {
+                    return Err(XmlError);
+                }
+                self.rest = &comment[end + 3..];
+                continue;
+            }
             let mut quote = None;
             let Some(end) = self.rest.char_indices().find_map(|(at, ch)| {
                 match (quote, ch) {
@@ -697,13 +706,6 @@ impl<'a> Scanner<'a> {
                 return Err(XmlError);
             };
             let tag = &self.rest[1..end];
-            if let Some(comment) = tag.strip_prefix("!--") {
-                if !comment.contains("--") {
-                    return Err(XmlError);
-                }
-                self.rest = &self.rest[end + 1..];
-                continue;
-            }
             if tag.starts_with('?') || tag.starts_with('!') {
                 self.rest = &self.rest[end + 1..];
                 continue;
@@ -1059,6 +1061,16 @@ mod tests {
                 blob(attributes, "x")
             );
             assert_eq!(parse_list(xml.as_bytes()), Err(XmlError), "{attributes}");
+        }
+    }
+
+    #[test]
+    fn xml_comments_do_not_parse_quotes_or_greater_than_as_markup() {
+        let xml = PAGE.replace("<Blobs>", "<!-- don't parse > or \" here -->\n<Blobs>");
+        assert_eq!(parse_list(xml.as_bytes()), parse_list(PAGE.as_bytes()));
+        for comment in ["<!-- unfinished", "<!-- bad -- comment -->"] {
+            let xml = PAGE.replace("<Blobs>", &format!("{comment}<Blobs>"));
+            assert_eq!(parse_list(xml.as_bytes()), Err(XmlError));
         }
     }
 
