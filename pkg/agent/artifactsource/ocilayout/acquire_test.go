@@ -6,6 +6,7 @@ package ocilayout
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
@@ -15,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/net/http2"
 	"oras.land/oras-go/v2/registry/remote"
 	"oras.land/oras-go/v2/registry/remote/auth"
 	"oras.land/oras-go/v2/registry/remote/retry"
@@ -272,6 +274,34 @@ func TestCopyRegistryImageWithRetryUsesFreshLayout(t *testing.T) {
 
 	if layoutDir != layoutDirs[1] {
 		t.Fatalf("layoutDir = %q, want %q", layoutDir, layoutDirs[1])
+	}
+}
+
+func TestCopyRegistryImageWithRetryRetriesHTTP2StreamError(t *testing.T) {
+	var attempts int
+
+	layoutDir, err := copyRegistryImageWithRetry(
+		context.Background(),
+		func(string) error {
+			attempts++
+			if attempts == 1 {
+				return fmt.Errorf("copy failed: %w", http2.StreamError{
+					StreamID: 13,
+					Code:     http2.ErrCodeProtocol,
+				})
+			}
+
+			return nil
+		},
+		func(context.Context, time.Duration) error { return nil },
+	)
+	if err != nil {
+		t.Fatalf("copyRegistryImageWithRetry() error = %v", err)
+	}
+	defer os.RemoveAll(layoutDir) //nolint:errcheck // test cleanup
+
+	if attempts != 2 {
+		t.Fatalf("copy attempts = %d, want 2", attempts)
 	}
 }
 

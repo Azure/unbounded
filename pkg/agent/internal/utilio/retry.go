@@ -9,6 +9,8 @@ import (
 	"io"
 	"net"
 	"syscall"
+
+	"golang.org/x/net/http2"
 )
 
 // IsRetryableNetworkError reports whether err represents a transient network or
@@ -23,6 +25,13 @@ func IsRetryableNetworkError(err error) bool {
 	}
 
 	if errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+
+	// A mid-body HTTP/2 stream reset is a transient failure. net/http reports
+	// these through an internal type that converts to http2.StreamError.
+	var streamErr http2.StreamError
+	if errors.As(err, &streamErr) {
 		return true
 	}
 
