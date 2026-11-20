@@ -502,16 +502,16 @@ async fn watch(t: Rc<Term_>, kind: Kind) {
                     Ok(Some(e)) => {
                         backoff = 1;
                         rv = str_at(&e.object, &["metadata", "resourceVersion"]).to_owned();
-                        if e.kind != "BOOKMARK" {
-                            if apply(
+                        if e.kind != "BOOKMARK"
+                            && apply(
                                 &t.shared,
                                 &mut t.inventory.borrow_mut(),
                                 kind,
                                 &e.kind,
                                 &e.object,
-                            ) {
-                                t.changed.notify();
-                            }
+                            )
+                        {
+                            t.changed.notify();
                         }
                     }
                     Ok(None) => break,
