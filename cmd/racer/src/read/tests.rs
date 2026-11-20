@@ -6,7 +6,7 @@ use racer_wire::control::CacheId;
 mod fill;
 
 /// Keep a live cache graph for mailbox admission tests without activating listeners.
-pub(super) fn admission_coordinator(env: &racer_io::Env) -> (Rc<Coordinator>, impl Sized) {
+pub(crate) fn admission_coordinator(env: &racer_io::Env) -> (Rc<Coordinator>, impl Sized) {
     let f = fill::fixture(env);
     let (local, endpoint, _) = f.read_graph(
         env,

@@ -150,7 +150,10 @@ impl FillShare {
 struct Inflight {
     fill: String,
     generation: u64,
+    object: usize,
     page: u64,
+    attempt: u32,
+    epoch: PinEpoch,
     accounted: u64,
     version: ObjectVersion,
     future: Pin<Box<dyn Future<Output = Result<PageResult>>>>,
@@ -175,7 +178,8 @@ struct LocalFill {
     owned_bytes: u64,
     pinned_bytes: u64,
     refused_bytes: u64,
-    retry_at: Instant,
+    /// Failed pages ordered by deadline, independent of the manifest cursor.
+    retries: BTreeMap<(Instant, usize, u64), u32>,
 }
 
 impl LocalFill {
@@ -199,14 +203,13 @@ enum ScanStep {
     Exhausted,
     /// The visit budget ran out with pages unexamined; a wakeup was requested.
     Budget,
-    /// This worker owns the page, and the cursor stayed on it so a failed fetch
-    /// retries it.
+    /// This worker owns the page; the cursor has advanced past it.
     Owned(FillObject, u64),
 }
 
 /// Visit at most [`SCAN_BUDGET`] manifest pages from `state`'s cursor,
 /// including pages `owned` rejects. Returns the first owned page without
-/// advancing past it; `finish` advances once the fetch succeeds.
+/// losing failed pages: launch and finish queue them separately for retry.
 fn scan_fill(
     cx: &mut Context<'_>,
     state: &mut LocalFill,
@@ -228,6 +231,7 @@ fn scan_fill(
         visited += 1;
         let number = state.page;
         if owned(&object, number)? {
+            state.page += 1;
             return Ok(ScanStep::Owned(object, number));
         }
         state.page += 1;
@@ -314,7 +318,7 @@ impl FillController {
     }
 
     /// Adopt new fills and drop fills that disappeared or changed.
-    fn refresh(&mut self, now: Instant) {
+    fn refresh(&mut self, _now: Instant) {
         let views = (self.fills)();
         let mut seen = BTreeSet::new();
         for view in views {
@@ -367,7 +371,7 @@ impl FillController {
                         owned_bytes: 0,
                         pinned_bytes: 0,
                         refused_bytes: 0,
-                        retry_at: now,
+                        retries: BTreeMap::new(),
                     },
                 );
             }
@@ -409,32 +413,39 @@ impl FillController {
                 continue;
             }
             let state = self.local.get_mut(&uid).expect("listed locally");
-            if now < state.retry_at {
-                continue;
-            }
             let cache = state.cache.clone();
             let replicas = state.replicas;
-            let step = scan_fill(cx, state, page_size, |object, number| {
-                let page = PageId {
-                    version: ObjectVersion {
-                        object: ObjectId {
-                            cache: cache.clone(),
-                            key: object.key,
+            let retry = state
+                .retries
+                .first_key_value()
+                .and_then(|(key, _)| (key.0 <= now).then_some(*key));
+            let (object_index, object, page_number, attempt) = if let Some(key) = retry {
+                let attempt = state.retries.remove(&key).expect("listed retry");
+                (key.1, state.manifest.objects[key.1].clone(), key.2, attempt)
+            } else {
+                let step = scan_fill(cx, state, page_size, |object, number| {
+                    let page = PageId {
+                        version: ObjectVersion {
+                            object: ObjectId {
+                                cache: cache.clone(),
+                                key: object.key,
+                            },
+                            etag: object.etag.clone(),
                         },
-                        etag: object.etag.clone(),
-                    },
-                    number: PageNumber(number),
+                        number: PageNumber(number),
+                    };
+                    let ranked = coordinator
+                        .rank_position(membership.clone(), &page)
+                        .is_some_and(|position| position < usize::from(replicas));
+                    if !ranked {
+                        return Ok(false);
+                    }
+                    Ok(directory.page_owner(&page)? == worker)
+                })?;
+                let ScanStep::Owned(object, page_number) = step else {
+                    continue;
                 };
-                let ranked = coordinator
-                    .rank_position(membership.clone(), &page)
-                    .is_some_and(|position| position < usize::from(replicas));
-                if !ranked {
-                    return Ok(false);
-                }
-                Ok(directory.page_owner(&page)? == worker)
-            })?;
-            let ScanStep::Owned(object, page_number) = step else {
-                continue;
+                (state.object, object, page_number, 0)
             };
             let id = fill_id(&uid);
             let version = ObjectVersion {
@@ -466,13 +477,17 @@ impl FillController {
                     if state.refused.insert(page.clone()) {
                         state.refused_bytes = state.refused_bytes.saturating_add(page_size);
                     }
-                    state.retry_at = now + RETRY;
+                    state
+                        .retries
+                        .insert((now + RETRY, object_index, page_number), attempt + 1);
                     continue;
                 }
                 Err(Error::MissingKey) => {
                     // The cache has no page key yet. Nothing is pinned and
                     // no capacity was refused; try again later.
-                    state.retry_at = now + RETRY;
+                    state
+                        .retries
+                        .insert((now + RETRY, object_index, page_number), attempt + 1);
                     continue;
                 }
                 Err(error) => return Err(error),
@@ -511,7 +526,10 @@ impl FillController {
             self.inflight.push(Inflight {
                 fill: uid,
                 generation: state.generation,
+                object: object_index,
                 page: page_number,
+                attempt,
+                epoch,
                 accounted: page_size,
                 version,
                 future,
@@ -520,8 +538,8 @@ impl FillController {
         Ok(())
     }
 
-    /// Record finished fetches. Success advances the fill; failure releases the
-    /// page reservation and retries it later.
+    /// Record finished fetches. Failure releases the page reservation and queues
+    /// it for retry without moving the manifest cursor backward.
     fn finish(&mut self, cx: &mut Context<'_>) {
         let mut index = 0;
         while index < self.inflight.len() {
@@ -536,6 +554,13 @@ impl FillController {
                     if state.generation != work.generation {
                         continue;
                     }
+                    let page = PageId {
+                        version: work.version.clone(),
+                        number: PageNumber(work.page),
+                    };
+                    if state.pins.get(&page) != Some(&work.epoch) {
+                        continue;
+                    }
                     match result {
                         Ok(PageResult::Resident | PageResult::Admitted) => {
                             let id = PageId {
@@ -547,8 +572,6 @@ impl FillController {
                                 state.pinned_bytes =
                                     state.pinned_bytes.saturating_add(work.accounted);
                             }
-                            state.page = work.page + 1;
-                            state.retry_at = self.clock.now();
                         }
                         Ok(PageResult::Deferred { .. }) | Ok(PageResult::Failed(_)) | Err(_) => {
                             let id = PageId {
@@ -570,7 +593,10 @@ impl FillController {
                                     epoch,
                                 );
                             }
-                            state.retry_at = self.clock.now() + RETRY;
+                            state.retries.insert(
+                                (self.clock.now() + RETRY, work.object, work.page),
+                                work.attempt + 1,
+                            );
                         }
                     }
                 }
@@ -731,8 +757,164 @@ mod tests {
             owned_bytes: 0,
             pinned_bytes: 0,
             refused_bytes: 0,
-            retry_at: Instant::now(),
+            retries: BTreeMap::new(),
         }
+    }
+
+    /// Real placement, worker directory, and pin index; tests script only the
+    /// prefetch completion so reservation and controller transitions stay real.
+    fn controller(env: &racer_io::Env, pages: u64) -> (FillController, impl Sized) {
+        let (coordinator, graph) = crate::read::tests::admission_coordinator(env);
+        let cache = CacheId("33333333-3333-4333-8333-333333333333".into());
+        let keys = Rc::new(crate::test_support::security::keys_for(
+            env,
+            std::slice::from_ref(&cache),
+        ));
+        let index = Rc::new(Index::new(
+            WorkerId(0),
+            16,
+            crate::control::for_caches(env, keys, vec![cache.clone()]),
+            env.ctx.clock.clone(),
+        ));
+        index.set_page_capacity(16).unwrap();
+        let segments = Rc::new(page_alloc::Segments::new(1024));
+        segments
+            .configure(8192, 8, page_alloc::Alignment::new(512, 512, 512).unwrap())
+            .unwrap();
+        let _clock = crate::store::catalog::SegmentClock::new(index.clone(), segments, 1);
+        let now = env.ctx.clock.now();
+        let mut state = local(vec![fill_object(1, pages * crate::model::PAGE_BYTES)]);
+        state.cache = cache;
+        let controller = FillController {
+            worker: WorkerId(0),
+            fills: Arc::new(Vec::new),
+            report: Arc::new(|_, _| {}),
+            share: Arc::new(FillShare::new()),
+            index,
+            coordinator,
+            clock: env.ctx.clock.clone(),
+            local: BTreeMap::from([("fill".into(), state)]),
+            inflight: Vec::new(),
+            next_refresh: now + REFRESH,
+            next_report: now + REPORT,
+            next_renew: now + RENEW,
+        };
+        (controller, graph)
+    }
+
+    fn complete(controller: &mut FillController, result: Result<PageResult>) {
+        assert_eq!(controller.inflight.len(), 1);
+        controller.inflight[0].future = Box::pin(std::future::ready(result));
+        controller.finish(&mut Context::from_waker(futures::task::noop_waker_ref()));
+    }
+
+    #[test]
+    fn failed_page_releases_reservation_and_later_pages_fill_before_retry_recovers() {
+        let env = racer_io::Env::host();
+        let (mut controller, _graph) = controller(&env, 2);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let now = controller.clock.now();
+        controller.launch(&mut cx, now).unwrap();
+        assert_eq!(controller.inflight[0].page, 0);
+        let page = PageId {
+            version: controller.inflight[0].version.clone(),
+            number: PageNumber(0),
+        };
+        assert!(controller.index.is_pinned(&page), "reserve before fetching");
+        complete(&mut controller, Err(Error::Io));
+        assert!(!controller.index.is_pinned(&page));
+        assert_eq!(controller.local["fill"].pinned_pages, 0);
+        assert_eq!(controller.local["fill"].refused_bytes, 0);
+        controller.launch(&mut cx, now).unwrap();
+        assert_eq!(
+            controller.inflight[0].page, 1,
+            "failed page must not block scan"
+        );
+        complete(&mut controller, Ok(PageResult::Admitted));
+        controller.launch(&mut cx, now).unwrap();
+        assert!(controller.inflight.is_empty(), "retry must respect backoff");
+        let retry = controller.local["fill"]
+            .retries
+            .first_key_value()
+            .unwrap()
+            .0
+            .0;
+        controller.launch(&mut cx, retry).unwrap();
+        assert_eq!(controller.inflight[0].page, 0);
+        complete(&mut controller, Ok(PageResult::Resident));
+        let state = &controller.local["fill"];
+        assert_eq!(state.owned_pages, 2, "retry cannot count ownership twice");
+        assert_eq!(state.pinned_pages, 2);
+        assert_eq!(state.pinned_bytes, 2 * crate::model::PAGE_BYTES);
+        assert!(state.retries.is_empty());
+        controller.forget("fill");
+        assert!(!controller.index.is_pinned(&page));
+    }
+
+    #[test]
+    fn reservation_refusals_are_deduplicated_and_clear_on_recovery() {
+        let env = racer_io::Env::host();
+        let (mut controller, _graph) = controller(&env, 1);
+        controller.index.set_pin_capacity_percent(0).unwrap();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        controller.launch(&mut cx, controller.clock.now()).unwrap();
+        for _ in 0..3 {
+            assert!(controller.inflight.is_empty());
+            let retry = controller.local["fill"]
+                .retries
+                .first_key_value()
+                .unwrap()
+                .0
+                .0;
+            controller.launch(&mut cx, retry).unwrap();
+            assert_eq!(
+                controller.local["fill"].refused_bytes,
+                crate::model::PAGE_BYTES
+            );
+            assert_eq!(controller.local["fill"].owned_pages, 1);
+        }
+        controller.index.set_pin_capacity_percent(50).unwrap();
+        let retry = controller.local["fill"]
+            .retries
+            .first_key_value()
+            .unwrap()
+            .0
+            .0;
+        controller.launch(&mut cx, retry).unwrap();
+        assert_eq!(controller.local["fill"].refused_bytes, 0);
+        complete(&mut controller, Ok(PageResult::Admitted));
+        assert_eq!(controller.local["fill"].pinned_pages, 1);
+    }
+
+    #[test]
+    fn stale_completion_cannot_credit_or_release_a_replacement_reservation() {
+        let env = racer_io::Env::host();
+        let (mut controller, _graph) = controller(&env, 1);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let now = controller.clock.now();
+        controller.launch(&mut cx, now).unwrap();
+        let mut stale = controller.inflight.pop().unwrap();
+        let replacement = controller.local["fill"].manifest.objects.clone();
+        let cache = controller.local["fill"].cache.clone();
+        controller.forget("fill");
+        let mut state = local(replacement);
+        state.cache = cache;
+        controller.local.insert("fill".into(), state);
+        controller.launch(&mut cx, now).unwrap();
+        let page = PageId {
+            version: stale.version.clone(),
+            number: PageNumber(0),
+        };
+        assert_ne!(stale.epoch, controller.inflight[0].epoch);
+        controller.inflight[0].future = Box::pin(std::future::pending());
+        stale.future = Box::pin(std::future::ready(Ok(PageResult::Admitted)));
+        controller.inflight.push(stale);
+        controller.finish(&mut cx);
+        assert_eq!(controller.local["fill"].pinned_pages, 0);
+        assert!(controller.index.is_pinned(&page));
+        assert_eq!(controller.inflight.len(), 1);
+        complete(&mut controller, Ok(PageResult::Admitted));
+        assert_eq!(controller.local["fill"].pinned_pages, 1);
     }
 
     #[test]
@@ -780,9 +962,8 @@ mod tests {
         assert_eq!(turns, 2);
         assert_eq!(selected.0.key, CacheKey([2; 32]));
         assert_eq!(selected.1, owned_page);
-        // The launch path fetches from this cursor and finish advances it, so a
-        // failed fetch retries the same page.
-        assert_eq!(state.page, owned_page);
+        // A failed fetch is queued separately and cannot stall this cursor.
+        assert_eq!(state.page, owned_page + 1);
         assert!(!wake.0.load(std::sync::atomic::Ordering::SeqCst));
     }
 
@@ -815,7 +996,10 @@ mod tests {
         let work = |fill: &str, page: u64| Inflight {
             fill: fill.to_owned(),
             generation: 1,
+            object: 0,
             page,
+            attempt: 0,
+            epoch: PinEpoch::default(),
             accounted: 1024,
             version: version.clone(),
             future: pending(),
