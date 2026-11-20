@@ -53,9 +53,6 @@ pub struct Session {
     /// Managed-mode report sink and the last rails it accepted.
     report: RefCell<Option<(super::Report, Option<Vec<wire::RailMapping>>)>>,
 
-    /// Managed-mode fill progress sink.
-    fill_report: RefCell<Option<super::FillReport>>,
-
     /// Rails persisted before the node serves peers, reported by
     /// [`Session::mark_serving`]. The primary admits a new member only once
     /// its Pod reports, so the report must not precede the peer listener.
@@ -428,7 +425,6 @@ impl Session {
             rails,
             shares,
             report: RefCell::new(None),
-            fill_report: RefCell::new(None),
             unreported: RefCell::new(None),
             serving: std::cell::Cell::new(false),
             endpoint,
@@ -509,23 +505,6 @@ impl Session {
     /// Report shares and rails to managed cluster control whenever rails change.
     pub fn set_report(&self, report: super::Report) {
         *self.report.borrow_mut() = Some((report, None));
-    }
-
-    /// Install the managed fill progress sink.
-    pub fn set_fill_report(&self, report: super::FillReport) {
-        *self.fill_report.borrow_mut() = Some(report);
-    }
-
-    /// Forward per-fill progress to managed cluster control. The sink only
-    /// enqueues; it is merged into the next Pod report with shares and rails.
-    pub fn report_fill_progress(
-        &self,
-        fills: Vec<racer_authority::FillProgress>,
-        pinnable_bytes: Option<u64>,
-    ) {
-        if let Some(report) = self.fill_report.borrow().as_ref() {
-            report(fills, pinnable_bytes);
-        }
     }
 
     /// The peer listener is open: report the rails held back so far. A

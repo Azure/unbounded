@@ -1998,7 +1998,6 @@ impl WorkerApplication {
         ));
         if let Some(managed) = &config.managed_control {
             control.set_report(managed.report.clone());
-            control.set_fill_report(managed.fill_report.clone());
         }
         control
             .attach_io(io)
