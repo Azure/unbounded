@@ -166,6 +166,26 @@ pub fn status(
         None
     };
 
+    let admission_message = match view.message.as_str() {
+        "CacheNotFound" => format!("ClusterCache {:?} was not found", view.cache_name),
+        "UnsupportedCache" => format!(
+            "ClusterCache {:?} uses passthrough mode and cannot retain pins",
+            view.cache_name
+        ),
+        "UnsupportedOrigin" => format!(
+            "ClusterCache {:?} does not have a supported Azure origin",
+            view.cache_name
+        ),
+        "ExceedsMaxFootprint" => format!(
+            "planned footprint of {footprint} bytes exceeds maxFootprint of {} bytes",
+            view.max_footprint
+        ),
+        "TooManyObjects" => format!(
+            "origin selection exceeds the {} object manifest limit",
+            super::MAX_FILL_OBJECTS
+        ),
+        _ => "fill admission has not succeeded".to_owned(),
+    };
     let accepted = condition(
         view,
         previous,
@@ -180,13 +200,29 @@ pub fn status(
         if view.accepted {
             "admission succeeded"
         } else {
-            &view.message
+            &admission_message
         },
     );
     let list_reason = match view.error.as_deref() {
         Some("Forbidden") => "Forbidden",
+        Some("TooManyObjects") => "TooManyObjects",
         Some(_) => "ListFailed",
         None => "ListFailed",
+    };
+    let listing_message = match view.error.as_deref() {
+        Some("Forbidden") => format!(
+            "origin listing for ClusterCache {:?} was forbidden; check origin credentials and permissions",
+            view.cache_name
+        ),
+        Some("TooManyObjects") => format!(
+            "origin selection exceeds the {} object manifest limit; narrow spec.prefixes",
+            super::MAX_FILL_OBJECTS
+        ),
+        Some(_) => format!(
+            "origin listing for ClusterCache {:?} failed; a retry is scheduled",
+            view.cache_name
+        ),
+        None => "manifest is not listed yet".to_owned(),
     };
     let listed = condition(
         view,
@@ -197,10 +233,8 @@ pub fn status(
         if listed_ok { "Listed" } else { list_reason },
         if listed_ok {
             "manifest is current"
-        } else if view.error.is_some() {
-            list_reason
         } else {
-            "manifest is not listed yet"
+            &listing_message
         },
     );
     let progressing = condition(
@@ -674,6 +708,36 @@ mod tests {
             first["conditions"][0]["lastTransitionTime"],
             later["conditions"][0]["lastTransitionTime"]
         );
+    }
+
+    #[test]
+    fn rejection_and_listing_diagnostics_explain_the_reason() {
+        for reason in [
+            "CacheNotFound",
+            "UnsupportedCache",
+            "UnsupportedOrigin",
+            "ExceedsMaxFootprint",
+            "TooManyObjects",
+        ] {
+            let mut v = view();
+            v.accepted = false;
+            v.message = reason.into();
+            let s = status(&v, &BTreeMap::new(), None);
+            let c = previous_condition(Some(&s), "Accepted").unwrap();
+            assert_eq!(c["reason"], reason);
+            assert_ne!(c["message"], reason);
+            assert!(c["message"].as_str().unwrap().contains(' '));
+        }
+        for reason in ["Forbidden", "ListFailed", "TooManyObjects"] {
+            let mut v = view();
+            v.error = Some(reason.into());
+            let s = status(&v, &BTreeMap::new(), None);
+            let c = previous_condition(Some(&s), "Listed").unwrap();
+            assert_eq!(c["reason"], reason);
+            assert_eq!(c["status"], "False");
+            assert_ne!(c["message"], reason);
+            assert!(c["message"].as_str().unwrap().contains(' '));
+        }
     }
 
     const DS: &str = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
