@@ -654,6 +654,12 @@ async fn reconcile(t: &Rc<Term_>) -> Result<(), StateError> {
         service_account: shared.config.service_account.clone(),
     };
     *shared.ownership.borrow_mut() = ownership.clone();
+    if ready {
+        // A newly elected primary may still be serving an image installed
+        // as a follower. Do not interpret its incomplete member mirrors as
+        // lost pins until this term has read every input used by status.
+        *shared.fill_status_term.borrow_mut() = Some(t.shell.borrow().term().clone());
+    }
 
     let cluster = shared.cluster.borrow().clone();
     let policy = Policy::from(shared.config.rotation);

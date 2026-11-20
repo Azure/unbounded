@@ -312,6 +312,7 @@ impl Authority {
                 fills_synced: Default::default(),
                 fills_caches: RefCell::new(Default::default()),
                 fills_caches_synced: Default::default(),
+                fill_status_term: Default::default(),
                 nodes: RefCell::new(Default::default()),
                 pods: RefCell::new(Default::default()),
                 ownership: RefCell::new(Default::default()),

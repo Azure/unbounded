@@ -141,6 +141,9 @@ pub struct Shared {
     pub pods: RefCell<BTreeMap<String, PodInfo>>,
     /// Live DaemonSet ownership, mirrored for fill status member selection.
     pub ownership: RefCell<Ownership>,
+    /// Primary term whose Pod/Node lists and DaemonSet ownership have all
+    /// been read. Mirrors from an earlier term must not drive fill status.
+    pub fill_status_term: RefCell<Option<crate::rules::state::Term>>,
 }
 
 impl Shared {
@@ -294,6 +297,7 @@ pub(crate) mod tests {
             nodes: RefCell::new(BTreeMap::new()),
             pods: RefCell::new(BTreeMap::new()),
             ownership: RefCell::new(Ownership::default()),
+            fill_status_term: RefCell::new(None),
         })
     }
 }

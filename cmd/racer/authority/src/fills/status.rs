@@ -358,7 +358,10 @@ fn condition(
 /// different UID or generation than the snapshot is skipped: the snapshot
 /// describes an older object, so its status must not be written.
 pub async fn reconcile(shared: &Shared, cursor: &mut usize) {
-    if shared.primary_term(rt::now()).is_none()
+    let Some(term) = shared.primary_term(rt::now()) else {
+        return;
+    };
+    if shared.fill_status_term.borrow().as_ref() != Some(&term)
         || !shared.fills_synced.get()
         || !shared.fills_caches_synced.get()
     {
@@ -414,6 +417,10 @@ pub async fn reconcile(shared: &Shared, cursor: &mut usize) {
         let next = status(view, &reports, previous);
         if previous == Some(&next) {
             continue;
+        }
+        // A GET may have outlived this primary term or its Lease freshness.
+        if shared.primary_term(rt::now()).as_ref() != Some(&term) || shared.stopping.get() {
+            return;
         }
         let body = json!({
             "apiVersion": "racer.unbounded-cloud.io/v1alpha1",
@@ -855,6 +862,43 @@ mod tests {
     }
 
     #[test]
+    fn status_waits_for_this_terms_member_inventory_and_ownership() {
+        crate::kube::fake::run(|api, kube| async move {
+            let shared = crate::shared::tests::shared(kube);
+            let term = crate::rules::state::Term {
+                lease_uid: "lease".into(),
+                transitions: 2,
+                holder: "p1/00".into(),
+            };
+            shared.is_primary.set(true);
+            *shared.term.borrow_mut() = Some((
+                term.clone(),
+                crate::rules::state::Freshness::confirmed(rt::now(), Duration::from_secs(3600)),
+            ));
+            shared.fills_synced.set(true);
+            shared.fills_caches_synced.set(true);
+            let v = with_manifest(view());
+            shared.fills.borrow_mut().insert(v.uid.clone(), v.clone());
+            api.put_object(
+                &paths::cluster_cache_fill(&v.name),
+                json!({"metadata": {"name": v.name, "uid": v.uid, "generation": v.generation}}),
+            );
+            let mut cursor = 0;
+            let start = api.requests().len();
+            reconcile(&shared, &mut cursor).await;
+            assert_eq!(api.requests().len(), start, "unsynced member mirrors");
+            let mut old = term.clone();
+            old.transitions -= 1;
+            *shared.fill_status_term.borrow_mut() = Some(old);
+            reconcile(&shared, &mut cursor).await;
+            assert_eq!(api.requests().len(), start, "previous term's mirrors");
+            *shared.fill_status_term.borrow_mut() = Some(term);
+            reconcile(&shared, &mut cursor).await;
+            assert!(api.requests()[start..].iter().any(|(m, _)| m == "PUT"));
+        });
+    }
+
+    #[test]
     fn round_robin_cursor_advances_after_a_failed_status_write() {
         crate::kube::fake::run(|api, kube| async move {
             let shared = crate::shared::tests::shared(kube);
@@ -869,6 +913,7 @@ mod tests {
             ));
             shared.fills_synced.set(true);
             shared.fills_caches_synced.set(true);
+            *shared.fill_status_term.borrow_mut() = shared.primary_term(rt::now());
             for name in ["fill-a", "fill-b"] {
                 let mut v = view();
                 v.name = name.into();
@@ -929,6 +974,7 @@ mod tests {
             ));
             shared.fills_synced.set(true);
             shared.fills_caches_synced.set(true);
+            *shared.fill_status_term.borrow_mut() = shared.primary_term(rt::now());
 
             let mut v = view();
             v.name = "fill".into();
