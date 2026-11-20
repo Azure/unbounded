@@ -686,18 +686,10 @@ impl Index {
     /// Release up to `budget` expired pins. Runs on the same maintenance path
     /// as [`Self::expire_holds`].
     pub fn expire_pins(&self, budget: usize) {
-        {
-            let pins = self.pins.borrow();
-            // A zero count is a segment clear a frozen table deferred. A
-            // frozen table cannot clear it, so skip the mutation until thaw.
-            let retry = !pins.segment_pages.is_empty()
-                && pins
-                    .segments
-                    .as_ref()
-                    .is_none_or(|segments| !segments.reuse_frozen());
-            if pins.entries.is_empty() && !retry {
-                return;
-            }
+        // Inspect only the earliest expiry and deferred-clear index before
+        // borrowing state mutably: an idle turn must preserve checkpoint skip.
+        if !self.pins.borrow().maintenance_due(self.clock.now(), budget) {
+            return;
         }
         let mut state = self.state_mut();
         let mut pins = self.pins.borrow_mut();
@@ -2499,13 +2491,20 @@ mod tests {
             "still charged against the budget"
         );
         // A maintenance turn during the freeze must not lose the release.
+        let generation = index.generation();
         index.expire_pins(usize::MAX);
+        assert_eq!(
+            index.generation(),
+            generation,
+            "a frozen retry does not mutate"
+        );
         assert!(segments.pinned(segment).unwrap());
         assert_eq!(segments.pinned_count(), 1);
         assert!(index.pins.borrow().deferred.contains(&segment));
         drop(freeze);
         // With no pin entries left, the sweep still retries the pending clear.
         index.expire_pins(usize::MAX);
+        assert_ne!(index.generation(), generation, "thaw clears the segment");
         assert!(!segments.pinned(segment).unwrap());
         assert_eq!(segments.pinned_count(), 0);
         assert!(index.pins.borrow().deferred.is_empty());
@@ -2723,6 +2722,15 @@ mod tests {
                 )
                 .unwrap();
         }
+        let generation = index.generation();
+        for _ in 0..10 {
+            index.expire_pins(usize::MAX);
+        }
+        assert_eq!(
+            index.generation(),
+            generation,
+            "live pins do not dirty idle checkpoints"
+        );
         {
             let pins = index.pins.borrow();
             assert_eq!(pins.expirations.len(), 3);
@@ -2737,8 +2745,18 @@ mod tests {
         }
         clock.advance(std::time::Duration::from_secs(11));
         index.expire_pins(0);
+        assert_eq!(
+            index.generation(),
+            generation,
+            "zero budget does not mutate expired entries"
+        );
         assert_eq!(index.pins.borrow().entries.len(), 128);
         index.expire_pins(1);
+        assert_ne!(
+            index.generation(),
+            generation,
+            "expiry dirties checkpoint state"
+        );
         assert_eq!(index.pins.borrow().entries.len(), 127);
         index.expire_pins(1);
         assert_eq!(index.pins.borrow().entries.len(), 126);

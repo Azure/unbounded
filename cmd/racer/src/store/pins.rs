@@ -399,9 +399,22 @@ impl Pins {
         }
     }
 
-    /// Release up to `budget` entries due at `now`, reporting each. Also
-    /// retries segment clears a checkpoint freeze deferred; those do not use
-    /// the expiry budget.
+    /// Whether maintenance can change any pin or segment state now.
+    pub(super) fn maintenance_due(&self, now: Instant, budget: usize) -> bool {
+        (budget != 0
+            && self
+                .expirations
+                .first_key_value()
+                .is_some_and(|(at, _)| *at <= now))
+            || (!self.deferred.is_empty()
+                && self
+                    .segments
+                    .as_ref()
+                    .is_none_or(|segments| !segments.reuse_frozen()))
+    }
+
+    /// Release up to `budget` due entries, reporting each. Also retry segment
+    /// clears a checkpoint freeze deferred; those do not use the expiry budget.
     pub(super) fn expire(
         &mut self,
         pages: &mut Pages,
