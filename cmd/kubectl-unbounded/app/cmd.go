@@ -12,6 +12,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	netcmd "github.com/Azure/unbounded/cmd/kubectl-unbounded/app/net"
+	signalcmd "github.com/Azure/unbounded/cmd/kubectl-unbounded/app/signal"
 	"github.com/Azure/unbounded/internal/version"
 )
 
@@ -27,6 +28,7 @@ func Run() {
 	root.AddCommand(machineCommandGroup())
 	root.AddCommand(gantryCommandGroup())
 	root.AddCommand(netcmd.Command())
+	root.AddCommand(signalcmd.Command())
 	root.AddCommand(overridesCommandGroup())
 	root.AddCommand(installCommand())
 	root.AddCommand(version.Command())
