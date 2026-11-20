@@ -482,15 +482,20 @@ impl FillController {
                         .insert((now + RETRY, object_index, page_number), attempt + 1);
                     continue;
                 }
-                Err(Error::MissingKey) => {
-                    // The cache has no page key yet. Nothing is pinned and
-                    // no capacity was refused; try again later.
+                Err(_) => {
+                    // This is background work. An unavailable page key or an
+                    // index/configuration failure must not stop the worker's
+                    // foreground service or lose this page from the plan.
+                    // Only an explicit capacity refusal contributes refused
+                    // bytes; another error clears an earlier refusal.
+                    if state.refused.remove(&page) {
+                        state.refused_bytes = state.refused_bytes.saturating_sub(page_size);
+                    }
                     state
                         .retries
                         .insert((now + RETRY, object_index, page_number), attempt + 1);
                     continue;
                 }
-                Err(error) => return Err(error),
             };
             state.pins.insert(page.clone(), epoch);
             state.versions.insert(version.clone());
@@ -884,6 +889,78 @@ mod tests {
         assert_eq!(controller.local["fill"].refused_bytes, 0);
         complete(&mut controller, Ok(PageResult::Admitted));
         assert_eq!(controller.local["fill"].pinned_pages, 1);
+    }
+
+    #[test]
+    fn unexpected_reservation_errors_do_not_fail_the_worker_or_lose_the_page() {
+        let env = racer_io::Env::host();
+        let (mut controller, _graph) = controller(&env, 1);
+        let cache = controller.local["fill"].cache.clone();
+        let keys = Rc::new(crate::test_support::security::keys_for(
+            &env,
+            std::slice::from_ref(&cache),
+        ));
+        // A live cache with no segment binding produces InvalidConfiguration,
+        // not Overloaded or MissingKey, in the real reservation implementation.
+        controller.index = Rc::new(Index::new(
+            WorkerId(0),
+            16,
+            crate::control::for_caches(&env, keys, vec![cache]),
+            env.ctx.clock.clone(),
+        ));
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        controller.poll(&mut cx).unwrap();
+        assert!(controller.inflight.is_empty());
+        assert_eq!(controller.local["fill"].retries.len(), 1);
+        assert_eq!(controller.local["fill"].refused_bytes, 0);
+        assert!(controller.local["fill"].pins.is_empty());
+        let segments = Rc::new(page_alloc::Segments::new(1024));
+        segments
+            .configure(8192, 8, page_alloc::Alignment::new(512, 512, 512).unwrap())
+            .unwrap();
+        let _clock =
+            crate::store::catalog::SegmentClock::new(controller.index.clone(), segments, 1);
+        let retry = controller.local["fill"]
+            .retries
+            .first_key_value()
+            .unwrap()
+            .0
+            .0;
+        controller.launch(&mut cx, retry).unwrap();
+        complete(&mut controller, Ok(PageResult::Admitted));
+        assert_eq!(controller.local["fill"].owned_pages, 1);
+        assert_eq!(controller.local["fill"].pinned_pages, 1);
+    }
+
+    #[test]
+    fn missing_key_clears_an_earlier_capacity_refusal_without_crediting_progress() {
+        let env = racer_io::Env::host();
+        let (mut controller, _graph) = controller(&env, 1);
+        controller.index.set_pin_capacity_percent(0).unwrap();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        controller.launch(&mut cx, controller.clock.now()).unwrap();
+        assert_eq!(
+            controller.local["fill"].refused_bytes,
+            crate::model::PAGE_BYTES
+        );
+        let keys = Rc::new(crate::test_support::security::keys_for(&env, &[]));
+        controller.index = Rc::new(Index::new(
+            WorkerId(0),
+            16,
+            crate::control::for_caches(&env, keys, vec![]),
+            env.ctx.clock.clone(),
+        ));
+        let retry = controller.local["fill"]
+            .retries
+            .first_key_value()
+            .unwrap()
+            .0
+            .0;
+        controller.launch(&mut cx, retry).unwrap();
+        assert!(controller.inflight.is_empty());
+        assert_eq!(controller.local["fill"].refused_bytes, 0);
+        assert_eq!(controller.local["fill"].pinned_pages, 0);
+        assert_eq!(controller.local["fill"].retries.len(), 1);
     }
 
     #[test]
