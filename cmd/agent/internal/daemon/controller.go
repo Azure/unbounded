@@ -90,6 +90,36 @@ func (r *repaveReconciler) markHandedOff() {
 	r.handoff.set()
 }
 
+// daemonCacheOptions returns the manager's cache options. The daemon keeps its
+// cache intentionally small: it only needs the local Node for node-label
+// selector matching and delete-triggered repave, plus the local Machine as
+// fallback selector state before the Node has joined. When the API server
+// supports selecting MachineOperations by spec.machineRef, the MachineOperation
+// cache is filtered too, so its informer's list and watch carry only this
+// machine's operations. The field selector is what keeps the traffic to one
+// agent independent of the size of the fleet. One cache serves both the watch
+// and every cached read, because the agent never needs an operation that does
+// not name its machine.
+func daemonCacheOptions(machineName, nodeName string, machineRefSelectable bool) ctrlcache.Options {
+	byObject := map[client.Object]ctrlcache.ByObject{
+		&corev1.Node{}: {
+			Field: fields.OneTermEqualSelector("metadata.name", nodeName),
+		},
+		&v1alpha3.Machine{}: {
+			Field: fields.OneTermEqualSelector("metadata.name", machineName),
+		},
+		&v1alpha3.MachineConfigurationVersion{}: {},
+	}
+
+	if machineRefSelectable {
+		byObject[&v1alpha3.MachineOperation{}] = ctrlcache.ByObject{
+			Field: daemon.MachineRefFieldSelector(machineName),
+		}
+	}
+
+	return ctrlcache.Options{ByObject: byObject}
+}
+
 func runController(
 	ctx context.Context,
 	log *slog.Logger,
@@ -99,27 +129,14 @@ func runController(
 	nodeOperator nodeOperator,
 	installation *installstate.Store,
 	handoff *handoffState,
+	machineRefSelectable bool,
 ) error {
 	mgr, err := ctrl.NewManager(restCfg, manager.Options{
 		Scheme: newScheme(),
 		Metrics: metricsserver.Options{
 			BindAddress: "0",
 		},
-		Cache: ctrlcache.Options{
-			// Keep the daemon cache intentionally small. The daemon only needs
-			// the local Node for node-label selector matching and delete-triggered
-			// repave, plus the local Machine as fallback selector state before the
-			// Node has joined.
-			ByObject: map[client.Object]ctrlcache.ByObject{
-				&corev1.Node{}: {
-					Field: fields.OneTermEqualSelector("metadata.name", nodeName),
-				},
-				&v1alpha3.Machine{}: {
-					Field: fields.OneTermEqualSelector("metadata.name", machineName),
-				},
-				&v1alpha3.MachineConfigurationVersion{}: {},
-			},
-		},
+		Cache: daemonCacheOptions(machineName, nodeName, machineRefSelectable),
 	})
 	if err != nil {
 		return fmt.Errorf("create daemon manager: %w", err)
@@ -142,6 +159,7 @@ func runController(
 		agentUpgradeLockPath: goalstates.DaemonAgentUpgradeLockPath,
 		requestRestart:       func() { stopManager(ErrRestartRequested) },
 		handoff:              handoff,
+		machineRefSelectable: machineRefSelectable,
 	}
 
 	machineOperationReconciler, err := daemon.NewMachinaMachineOperationReconcilerWithReader(

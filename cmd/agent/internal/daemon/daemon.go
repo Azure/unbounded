@@ -193,6 +193,19 @@ func run(ctx context.Context, log *slog.Logger, opts runOptions) error {
 		log.Warn("failed to publish and clear AgentUpgrade daemon signals", "error", err)
 	}
 
+	// Ask once, with the uncached client, before the manager builds its cache:
+	// when the API server accepts spec.machineRef selection, the cache and
+	// every live list are narrowed to this machine's operations, so the
+	// traffic to one agent stays independent of the size of the fleet.
+	machineRefSelectable, err := daemon.MachineRefSelectable(ctx, kubeClient, active.Config.MachineName)
+	if err != nil {
+		return fmt.Errorf("check MachineOperation spec.machineRef selection: %w", err)
+	}
+
+	if !machineRefSelectable {
+		log.Warn("the API server does not support selecting MachineOperations by spec.machineRef; the agent is watching all of them, which does not scale")
+	}
+
 	rebootHandler, err := daemon.NewHostSoftRebootHandler(
 		kubeClient,
 		kubeClient,
@@ -200,6 +213,7 @@ func run(ctx context.Context, log *slog.Logger, opts runOptions) error {
 		hostSoftRebootTarget{machineName: active.Config.MachineName},
 		runOpts.NodeOperator,
 		&atomic.Bool{},
+		machineRefSelectable,
 	)
 	if err == nil {
 		err = rebootHandler.PublishStartup(ctx)
@@ -217,7 +231,7 @@ func run(ctx context.Context, log *slog.Logger, opts runOptions) error {
 		return ErrRestartRequested
 	}
 
-	return runController(ctx, log, controllerCfg, active.Config.MachineName, active.Config.NodeName, runOpts.NodeOperator, runOpts.installation, handoff)
+	return runController(ctx, log, controllerCfg, active.Config.MachineName, active.Config.NodeName, runOpts.NodeOperator, runOpts.installation, handoff, machineRefSelectable)
 }
 
 // discoverAndMigrate finds the active node under installation ownership and

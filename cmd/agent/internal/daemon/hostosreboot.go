@@ -55,6 +55,7 @@ func (t *machineOperationTarget) reconcileHostSoftReboot(ctx context.Context, st
 		hostSoftRebootTarget{machineName: t.machineName, generation: machine.Generation},
 		t.nodeOperator,
 		&t.rebootRequested,
+		t.machineRefSelectable,
 	)
 	if err != nil {
 		return ctrl.Result{}, err
