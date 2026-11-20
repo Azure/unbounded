@@ -53,11 +53,9 @@ Keep component code private by default. To share code, follow
 
 ## Rust
 
-- `cmd/racer/` - the Racer dataplane. Use `make racer-fmt`, `make racer-lint` and `make racer-rust-test`.
-  Shared test fixtures live in `cmd/racer/tests/support/`.
-- `cmd/racer-object/` - the sidecar. `make racer-object-test` checks formatting, runs Clippy and runs the tests.
-- `cmd/racer-loadgen/performance/` - the performance harness. From that directory, use `bash run.sh build` and then
-  `bash run.sh run`.
+- Keep Rust code and its test fixtures with the component that owns them.
+- Use `make help` to find formatting, Clippy, and test targets for the component you changed. If there is no target,
+  use the crate's own build or test instructions.
 
 ## Coding Standards
 
