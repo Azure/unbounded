@@ -368,7 +368,9 @@ fn collection(t: &Term_, kind: Kind) -> String {
     }
 }
 
-fn apply(shared: &Shared, inv: &mut Inventory, kind: Kind, event: &str, v: &Value) {
+/// Apply every update to the status mirror, but wake membership reconciliation
+/// only for inputs it consumes. Fill progress has its own status loop.
+fn apply(shared: &Shared, inv: &mut Inventory, kind: Kind, event: &str, v: &Value) -> bool {
     let key = str_at(v, &["metadata", "uid"]).to_owned();
     let deleted = event == "DELETED";
     match kind {
@@ -389,8 +391,13 @@ fn apply(shared: &Shared, inv: &mut Inventory, kind: Kind, event: &str, v: &Valu
                 shared.pods.borrow_mut().remove(&key);
             } else {
                 let pod = PodInfo::from_json(v);
+                let changed = inv
+                    .pods
+                    .get(&key)
+                    .is_none_or(|old| pod_reconcile_changed(old, &pod));
                 shared.pods.borrow_mut().insert(key.clone(), pod.clone());
                 inv.pods.insert(key, pod);
+                return changed;
             }
         }
         Kind::Caches => {
@@ -401,6 +408,28 @@ fn apply(shared: &Shared, inv: &mut Inventory, kind: Kind, event: &str, v: &Valu
             }
         }
     }
+    true
+}
+
+fn pod_reconcile_changed(old: &PodInfo, new: &PodInfo) -> bool {
+    old.namespace != new.namespace
+        || old.name != new.name
+        || old.uid != new.uid
+        || old.node_name != new.node_name
+        || old.pod_ip != new.pod_ip
+        || old.phase != new.phase
+        || old.deleting != new.deleting
+        || old.creation != new.creation
+        || old.service_account != new.service_account
+        || old.owner != new.owner
+        || !old
+            .annotations
+            .iter()
+            .filter(|(key, _)| key.as_str() != annotations::FILLS)
+            .eq(new
+                .annotations
+                .iter()
+                .filter(|(key, _)| key.as_str() != annotations::FILLS))
 }
 
 /// List then watch one collection, relisting on 410 or errors.
@@ -474,14 +503,15 @@ async fn watch(t: Rc<Term_>, kind: Kind) {
                         backoff = 1;
                         rv = str_at(&e.object, &["metadata", "resourceVersion"]).to_owned();
                         if e.kind != "BOOKMARK" {
-                            apply(
+                            if apply(
                                 &t.shared,
                                 &mut t.inventory.borrow_mut(),
                                 kind,
                                 &e.kind,
                                 &e.object,
-                            );
-                            t.changed.notify();
+                            ) {
+                                t.changed.notify();
+                            }
                         }
                     }
                     Ok(None) => break,
@@ -1059,7 +1089,7 @@ mod tests {
                     },
                 },
             });
-            apply(&shared, &mut inv, Kind::Pods, "ADDED", &pod);
+            assert!(apply(&shared, &mut inv, Kind::Pods, "ADDED", &pod));
             assert_eq!(
                 shared
                     .pods
@@ -1077,13 +1107,21 @@ mod tests {
                     "annotations": {annotations::REPORT: r#"{"shares":4,"rdma_nics":[]}"#},
                 },
             });
-            apply(&shared, &mut inv, Kind::Pods, "MODIFIED", &pod);
+            assert!(!apply(&shared, &mut inv, Kind::Pods, "MODIFIED", &pod));
             assert!(
                 !shared.pods.borrow()["u1"]
                     .annotations
                     .contains_key(annotations::FILLS)
             );
-            apply(&shared, &mut inv, Kind::Pods, "DELETED", &pod);
+            // Membership reports and lifecycle changes must still wake the
+            // primary even when fill progress changes in the same event.
+            let mut changed = pod.clone();
+            changed["metadata"]["annotations"][annotations::REPORT] =
+                json!(r#"{"shares":8,"rdma_nics":[]}"#);
+            assert!(apply(&shared, &mut inv, Kind::Pods, "MODIFIED", &changed));
+            changed["status"]["phase"] = json!("Failed");
+            assert!(apply(&shared, &mut inv, Kind::Pods, "MODIFIED", &changed));
+            assert!(apply(&shared, &mut inv, Kind::Pods, "DELETED", &pod));
             assert!(shared.pods.borrow().is_empty());
         });
     }
