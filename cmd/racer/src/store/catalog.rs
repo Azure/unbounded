@@ -607,7 +607,9 @@ impl Index {
             *pins.segment_pages.entry(segment).or_insert(0) += 1;
             // A resident page pins its existing segment immediately, so the
             // budget sees the same segments a stored pinned page would charge.
-            let _ = segments.pin_segment(segment);
+            segments
+                .pin_segment(segment)
+                .expect("validated resident pin must reference a live segment");
         }
         Ok(epoch)
     }
@@ -2917,6 +2919,26 @@ mod tests {
             Err(Error::Unavailable)
         );
         assert!(index.pins.borrow().entries.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "stored pinned page must reference a live segment")]
+    fn publishing_a_pinned_page_to_a_free_segment_is_an_invariant_failure() {
+        use super::super::pins::FillId;
+        let env = racer_io::Env::host();
+        let segments = Rc::new(segments(1024, 4));
+        let index = Rc::new(index(&env, 8));
+        index.set_page_capacity(8).unwrap();
+        index.set_pin_capacity_percent(100).unwrap();
+        let _clock = SegmentClock::new(index.clone(), segments, 1);
+        let (page, entry) = indexed(descriptor("invalid-pinned-location", 17), 0);
+        let until = env.ctx.clock.wall_now() + std::time::Duration::from_secs(60);
+        index
+            .reserve_pin_pages(FillId(1), &page.version, &page_set(&[0]), until)
+            .unwrap();
+        // Publication requires a validated append location. A free segment
+        // violates that contract and must not silently lose pin protection.
+        index.publish(page, entry).unwrap();
     }
 
     #[test]

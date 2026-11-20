@@ -286,7 +286,9 @@ impl Pins {
             }
             *self.segment_pages.entry(segment).or_insert(0) += 1;
             if let Some(segments) = &self.segments {
-                let _ = segments.pin_segment(segment);
+                segments
+                    .pin_segment(segment)
+                    .expect("stored pinned page must reference a live segment");
             }
         }
     }
