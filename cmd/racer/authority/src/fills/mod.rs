@@ -505,25 +505,12 @@ async fn list_fills(shared: Rc<Shared>) {
                         Ok(manifest) => {
                             install_manifest(&shared, view, manifest, generation, cache_uid, now)
                         }
-                        Err(ManifestError::TooManyObjects) => {
-                            // Keep the previous manifest, as on a list failure.
-                            view.error = Some("TooManyObjects".into());
-                            view.failures = view.failures.saturating_add(1);
-                            view.next_list = Some(now + LIST_BACKOFF);
-                        }
-                        Err(ManifestError::InvalidObject | ManifestError::LogicalBytesOverflow) => {
-                            view.error = Some("ListFailed".into());
-                            view.failures = view.failures.saturating_add(1);
-                            view.next_list = Some(now + LIST_BACKOFF);
+                        Err(error) => {
+                            listing_failed(&shared, view, ListingFailure::Invalid(error), now)
                         }
                     },
                     Err(e) => {
-                        view.error = Some(e.reason().into());
-                        view.failures = view.failures.saturating_add(1);
-                        let backoff = LIST_BACKOFF
-                            .saturating_mul(1 << view.failures.min(5))
-                            .min(RETRY_MAX);
-                        view.next_list = Some(now + backoff);
+                        listing_failed(&shared, view, ListingFailure::Origin(e), now);
                     }
                 }
                 // Installing a manifest recomputes this view's admission.
@@ -537,6 +524,45 @@ async fn list_fills(shared: Rc<Shared>) {
         }
         rt::sleep(TICK).await;
     }
+}
+
+/// A deterministic invalid listing is unlikely to change on a short retry;
+/// revisit it at resync (or immediately after a spec/cache identity change).
+/// Transport/service failures use capped exponential backoff with equal jitter.
+#[derive(Clone, Copy)]
+enum ListingFailure {
+    Invalid(ManifestError),
+    Origin(azure::ListError),
+}
+
+fn listing_failed(shared: &Shared, view: &mut FillView, failure: ListingFailure, now: Instant) {
+    view.error = Some(
+        match failure {
+            ListingFailure::Invalid(ManifestError::TooManyObjects) => "TooManyObjects",
+            ListingFailure::Invalid(ManifestError::InvalidObject) => "ListFailed",
+            ListingFailure::Origin(error) => error.reason(),
+        }
+        .into(),
+    );
+    view.failures = view.failures.saturating_add(1);
+    let delay = if matches!(failure, ListingFailure::Invalid(_)) {
+        Duration::from_secs(view.resync_secs)
+    } else {
+        let ceiling = LIST_BACKOFF
+            .saturating_mul(1 << view.failures.saturating_sub(1).min(5))
+            .min(RETRY_MAX);
+        ceiling / 2 + list_jitter(shared, view.failures, ceiling / 2)
+    };
+    view.next_list = Some(now + delay);
+}
+
+fn list_jitter(shared: &Shared, stream: u32, max: Duration) -> Duration {
+    crate::rules::seat::jitter(
+        &shared.config.pod_uid,
+        &mut **shared.rng.borrow_mut(),
+        stream,
+        max,
+    )
 }
 
 /// Refresh admission every [`TICK`] independently of origin listing.
@@ -733,7 +759,8 @@ fn install_manifest(
     view.error = None;
     view.failures = 0;
     view.next_list = Some(now + Duration::from_secs(view.resync_secs));
-    view.listing.converge_after = Some(now + CONVERGENCE_DELAY);
+    view.listing.converge_after =
+        Some(now + CONVERGENCE_DELAY + list_jitter(shared, 0, LIST_BACKOFF));
     recompute_view(shared, view);
 }
 
@@ -858,6 +885,8 @@ mod tests {
             view.listed_cache_uid = cache_uid.into();
             // Deliberately stale, as left by the previous manifest.
             view.planned_footprint_bytes = Some(1);
+            view.failures = 5;
+            view.error = Some("ListFailed".into());
 
             let new = manifest::build(
                 "models",
@@ -890,6 +919,8 @@ mod tests {
             assert_eq!(view.listed_generation, Some(generation));
             assert_eq!(view.listed_cache_uid, cache_uid);
             assert!(view.error.is_none());
+            assert_eq!(view.failures, 0);
+            assert!(view.next_list.unwrap() > rt::now() + RETRY_MAX);
             assert!(view.accepted);
         });
     }
@@ -946,6 +977,78 @@ mod tests {
         assert!(!view.needs_list(now + CONVERGENCE_DELAY, false, &view.cache_uid));
         view.failures = 0;
         assert!(!view.needs_list(now + CONVERGENCE_DELAY, false, "another-cache"));
+    }
+
+    #[test]
+    fn invalid_listings_wait_for_resync_and_spec_changes_reset_the_deadline() {
+        crate::kube::fake::run(|_api, kube| async move {
+            let shared = crate::shared::tests::shared(kube);
+            let now = rt::now();
+            for error in [ManifestError::TooManyObjects, ManifestError::InvalidObject] {
+                let mut view = listed_view(now);
+                let previous = view.manifest.clone();
+                listing_failed(&shared, &mut view, ListingFailure::Invalid(error), now);
+                assert_eq!(view.manifest, previous);
+                assert_eq!(
+                    view.next_list,
+                    Some(now + Duration::from_secs(view.resync_secs))
+                );
+                assert!(!view.needs_list(now + RETRY_MAX, false, &view.cache_uid));
+                assert!(view.needs_list(
+                    now + Duration::from_secs(view.resync_secs),
+                    false,
+                    &view.cache_uid
+                ));
+                let mut json = fill_json("");
+                json["metadata"]["generation"] = serde_json::json!(view.generation + 1);
+                let changed = adopt(FillView::from_json(&json).unwrap(), &view);
+                assert!(changed.needs_list(now, false, &view.cache_uid));
+                assert!(changed.manifest.is_none());
+                assert_eq!(changed.failures, 0);
+            }
+        });
+    }
+
+    #[test]
+    fn transient_list_failures_back_off_with_bounded_jitter_and_keep_the_manifest() {
+        crate::kube::fake::run(|_api, kube| async move {
+            let shared = crate::shared::tests::shared(kube);
+            let now = rt::now();
+            let mut view = listed_view(now);
+            let previous = view.manifest.clone();
+            let mut delays = Vec::new();
+            for attempt in 1..=12u32 {
+                listing_failed(
+                    &shared,
+                    &mut view,
+                    ListingFailure::Origin(azure::ListError::Failed),
+                    now,
+                );
+                let ceiling = LIST_BACKOFF
+                    .saturating_mul(1 << (attempt - 1).min(5))
+                    .min(RETRY_MAX);
+                let delay = view.next_list.unwrap() - now;
+                assert!(delay >= ceiling / 2 && delay <= ceiling);
+                assert!(!view.needs_list(now, false, &view.cache_uid));
+                assert!(view.needs_list(now + delay, false, &view.cache_uid));
+                assert_eq!(view.manifest, previous);
+                delays.push(delay);
+            }
+            assert!(
+                delays[3..].windows(2).any(|p| p[0] != p[1]),
+                "retry delays must have jitter"
+            );
+            view.failures = u32::MAX;
+            listing_failed(
+                &shared,
+                &mut view,
+                ListingFailure::Origin(azure::ListError::Forbidden),
+                now,
+            );
+            assert_eq!(view.failures, u32::MAX);
+            assert_eq!(view.error.as_deref(), Some("Forbidden"));
+            assert!(view.next_list.unwrap() <= now + RETRY_MAX);
+        });
     }
 
     #[test]

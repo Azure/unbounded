@@ -257,6 +257,11 @@ replica count.
 - **Origin listing fails or is forbidden**: `Accepted` stays true if admission
   already succeeded, `Listed` becomes false, and the previous manifest keeps
   serving the fill until the next successful resync.
+- **Listing is too large or contains an invalid object**: retain the previous
+  manifest and retry at `resyncInterval`, not on the transient-failure cadence.
+  A spec or cache identity change resets that deadline. Transient listing
+  failures retry with capped exponential backoff and jitter; a primary digest
+  hint does not override a failure deadline.
 - **Origin unavailable while filling**: missing pages stay missing; the fill
   stays `Progressing` or `Degraded` and retries on the next reconcile.
 - **Pinned budget exhausted**: the node stops pinning, reports
