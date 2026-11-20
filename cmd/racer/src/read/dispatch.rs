@@ -406,6 +406,12 @@ impl WorkerDirectory {
             .writer
             .index()
             .set_hold_capacity_percent(self.spill_config().retained_percent)?;
+        local
+            .fill
+            .dependencies
+            .writer
+            .index()
+            .set_pin_capacity_percent(self.spill_config().pinned_percent)?;
         let mailbox = self.mailbox(worker)?.clone();
         {
             let mut bound = self.local.borrow_mut();

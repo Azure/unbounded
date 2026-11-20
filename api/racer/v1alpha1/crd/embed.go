@@ -6,7 +6,7 @@ package crd
 
 import "embed"
 
-// Manifests contains the authoritative generated ClusterCache CRD.
+// Manifests contains the authoritative generated Racer CRDs.
 //
 //go:embed *.yaml
 var Manifests embed.FS

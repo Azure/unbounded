@@ -5041,6 +5041,55 @@ mod checkpoint {
     }
 
     #[test]
+    fn pinned_tails_normalize_to_v4_without_changing_live_ownership() {
+        let env = racer_io::Env::host();
+        let mut cut = image(&env, 3);
+        let segments = Segments::from_geometry(
+            page_alloc::SegmentGeometry::new(
+                geometry().slab_bytes,
+                geometry().segment_bytes,
+                geometry().segment_count,
+                geometry().alignment().unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        drop(segments.append(4096).unwrap());
+        let (pinned, _) = segments.append_in(4096, true).unwrap();
+        segments.pin_segment(pinned.id()).unwrap();
+        drop(pinned);
+        let live = segments.snapshot();
+        assert_eq!(live[0].state, SegmentState::Open);
+        assert_eq!(live[1].state, SegmentState::Open);
+        assert!(live[1].pinned);
+        cut.shards[0].segments = live.clone();
+        let location = &mut cut.shards[0].index.entries[0].1.location;
+        location.segment = page_alloc::SegmentId(1);
+        location.extent = Extent::new(geometry().segment_bytes, 4096).unwrap();
+        let bytes = encode(&cut).unwrap();
+        assert_eq!(&bytes[8..12], &4u32.to_le_bytes());
+        let restored = decode(&bytes).unwrap();
+        let normalized = &restored.shards[0].segments;
+        assert_eq!(normalized[0].state, SegmentState::Open);
+        assert_eq!(normalized[1].state, SegmentState::Sealed);
+        assert!(normalized.iter().all(|segment| !segment.pinned));
+        assert_eq!(normalized[1].used_bytes, live[1].used_bytes);
+        assert_eq!(normalized[1].generation, live[1].generation);
+        assert_eq!(restored.shards[0].index.entries.len(), 1);
+        assert_eq!(
+            restored.shards[0].index.entries[0].1.location.segment,
+            page_alloc::SegmentId(1)
+        );
+        assert_eq!(
+            restored.shards[0].index.entries[0].1.location.extent,
+            cut.shards[0].index.entries[0].1.location.extent
+        );
+        assert_eq!(encode(&restored).unwrap(), bytes);
+        assert_eq!(segments.snapshot(), live);
+        assert!(segments.pinned(page_alloc::SegmentId(1)).unwrap());
+    }
+
+    #[test]
     fn invalid_cluster_is_rejected_on_encode_and_decode() {
         let env = racer_io::Env::host();
         for bad in [
@@ -5413,7 +5462,7 @@ mod checkpoint {
         let mut corrupt = encoded.clone();
         corrupt[20] ^= 1;
         assert!(checkpoint_format::decode(&corrupt).is_err());
-        for (offset, value) in [(8, 5u32), (12, 1), (32, u32::MAX)] {
+        for (offset, value) in [(8, CHECKPOINT_VERSION + 1), (12, 1), (32, u32::MAX)] {
             let mut corrupt = encoded.clone();
             corrupt[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
             resign(&mut corrupt);
@@ -6375,6 +6424,45 @@ fn retention_sweep_drops_pages_whose_key_left_the_keyring() {
     }
     assert_eq!(removed, 3);
     assert!(memory.resident().is_empty());
+}
+
+#[test]
+fn sweep_unavailable_keeps_a_pinned_page_whose_key_left_the_keyring() {
+    use crate::control::for_caches;
+    use crate::store::holds::HoldPages;
+    use crate::store::pins::FillId;
+    use crate::test_support::security::keys;
+    use crate::test_support::security::rotation_bundle;
+    let env = racer_io::Env::host();
+    let keys = Rc::new(keys(&env));
+    let cache = CacheId(crate::test_support::security::CACHE.into());
+    let availability = for_caches(&env, keys.clone(), vec![cache]);
+    let f = Fixture::assemble(&env, Directory::new(), availability);
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().unwrap();
+    let index = f.store.writer.index();
+    let copy = f.copy(1, 3);
+    let version = copy.metadata.version.clone();
+    f.enqueue(copy).unwrap();
+    drive(&f.reactor, f.store.writer.progress(1, &scope(&env))).unwrap();
+    assert_eq!(index.snapshot().unwrap().entries.len(), 1);
+    let until = racer_io::Clock::host().wall_now() + std::time::Duration::from_secs(60);
+    let epoch = index
+        .reserve_pin_pages(FillId(1), &version, &HoldPages::prefix(1), until)
+        .unwrap();
+    // Retiring the page key starts a sweep pass that must skip the pinned page.
+    let mut next = rotation_bundle(2, (*keys.peer_trust_roots().unwrap()).clone());
+    next.cache_keys.clear();
+    keys.install(next).unwrap();
+    assert_eq!(index.sweep_unavailable(1), 0);
+    assert_eq!(index.snapshot().unwrap().entries.len(), 1);
+    index.release_pin_pages(FillId(1), &version, &HoldPages::prefix(1), epoch);
+    // A new key generation restarts the sweep pass at the oldest page.
+    let mut next = rotation_bundle(3, (*keys.peer_trust_roots().unwrap()).clone());
+    next.cache_keys.clear();
+    keys.install(next).unwrap();
+    assert_eq!(index.sweep_unavailable(1), 1);
+    assert!(index.snapshot().unwrap().entries.is_empty());
 }
 
 /// Pools aligned only to a 512-byte device unit pad bodies short of the 4 KiB

@@ -476,6 +476,15 @@ impl Coordinator {
             .map(|snapshot| snapshot.membership.clone())
     }
 
+    /// Fill planning inputs from this node's adopted publication, if available.
+    pub(crate) fn fill_context(&self) -> Option<racer_authority::FillContext> {
+        self.snapshots
+            .current()
+            .ok()
+            .flatten()
+            .map(|snapshot| snapshot.fill_context(&self.local_node()))
+    }
+
     /// The membership for work on `cache`, or `Unavailable` when the cache is
     /// not published or not ready.
     pub(crate) fn cache_membership(
@@ -508,6 +517,18 @@ impl Coordinator {
 
     pub(crate) fn local_node(&self) -> racer_wire::control::NodeId {
         self.fill.dependencies.candidates.node.clone()
+    }
+
+    /// The local node's position in the current ranking of `page`.
+    pub(crate) fn rank_position(
+        &self,
+        membership: std::sync::Arc<crate::topology::Membership>,
+        page: &crate::model::PageId,
+    ) -> Option<usize> {
+        self.fill
+            .dependencies
+            .candidates
+            .rank_position(membership, page)
     }
 
     /// The page's rank-0 owner within its cache's pool, the same ranking reads use.

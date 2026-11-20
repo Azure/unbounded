@@ -20,6 +20,8 @@ use racer_io::sim::{Fault, SimOs};
 use racer_io::{Operation, Scope};
 #[path = "support/clock.rs"]
 mod clock;
+#[path = "support/pinned.rs"]
+mod pinned;
 
 use clock::{SegmentClock, SegmentEntries};
 use std::{
@@ -822,6 +824,7 @@ impl GeometryModel {
                 generation: Generation(1),
                 state: SegmentState::Sealed,
                 used_bytes: bytes,
+                pinned: false,
             });
         }
         assert_eq!(segments.snapshot(), expected);

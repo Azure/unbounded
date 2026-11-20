@@ -502,6 +502,13 @@ const BASE: &[Var] = &[
         Value("50"),
         "Spill-hold cap of each I/O worker, as a percentage of its segments and page-index capacity.",
     )),
+    per_worker(var(
+        "RACER_PINNED_SEGMENT_PERCENT",
+        Group::Storage,
+        uint(0, 100, Unit::Percent),
+        Value("50"),
+        "Cache-fill pin cap of each I/O worker, as a percentage of its segments and page-index capacity; `0` disables pins.",
+    )),
     var(
         "RACER_RANGE_SPILL_PAGES",
         Group::Storage,

@@ -204,6 +204,10 @@ pub struct NodeState {
 
     /// Node-wide monotonic and wall time.
     clock: racer_io::Clock,
+
+    /// Node-wide fill progress, written by every worker and reported by the
+    /// control worker.
+    fill_share: Arc<crate::fill::FillShare>,
 }
 
 impl Default for NodeState {
@@ -269,6 +273,7 @@ impl NodeState {
             observations: Observations::default(),
             native: native::NativeNode::default(),
             clock: clock.clone(),
+            fill_share: Arc::new(crate::fill::FillShare::new()),
             azure: crate::origin::azure::AzureNode::unconfigured(),
             pressure: Default::default(),
         })
@@ -1004,6 +1009,9 @@ pub struct WorkerApplication {
     runtime: WorkerRuntime,
 
     control: Option<Rc<Session>>,
+
+    /// ClusterCacheFill pinning, absent outside managed mode.
+    fills: Option<crate::fill::FillController>,
 
     snapshots: Rc<PublicationTarget>,
 
@@ -1743,6 +1751,16 @@ impl WorkerApplication {
         telemetry.failures = node.failures.clone();
         telemetry.metrics = metrics;
         telemetry.health = node.observations.health.clone();
+        let fills = config.managed_control.as_ref().map(|managed| {
+            crate::fill::FillController::new(
+                worker,
+                managed,
+                node.fill_share.clone(),
+                store.writer.index().clone(),
+                coordinator.clone(),
+                node.clock.clone(),
+            )
+        });
         if worker == node.control_worker {
             let controller = node
                 .profiling
@@ -1761,6 +1779,7 @@ impl WorkerApplication {
             worker,
             runtime,
             control,
+            fills,
             snapshots,
             keys,
             store,
@@ -2280,6 +2299,7 @@ impl WorkerApplication {
             let refreshed = scope(&self.ctx().clock, self.timeout)
                 .and_then(|turn| self.refresh_snapshot(&turn));
             stage_result(worker, "snapshot-refresh", refreshed)?;
+            stage_result(worker, "fills", self.poll_fills(cx))?;
         }
         let now = self.ctx().now();
         if now >= self.next_health {
@@ -2308,8 +2328,9 @@ impl WorkerApplication {
             .sweep_unavailable(racer_core::cache::EXPIRY_BATCH);
         let index = self.store.writer.index();
         index.sweep_unavailable(racer_core::cache::EXPIRY_BATCH);
-        // Release expired hard holds, a bounded batch per turn.
+        // Release expired hard holds and fill pins, a bounded batch per turn.
         index.expire_holds(racer_core::cache::EXPIRY_BATCH);
+        index.expire_pins(racer_core::cache::EXPIRY_BATCH);
         self.memory.buffers().maintain_idle_buffers(now);
     }
 
@@ -2620,6 +2641,14 @@ impl WorkerApplication {
                     .await
                     .map(|_| ())
             }));
+        }
+        Ok(())
+    }
+
+    /// Advance the ClusterCacheFill pin controller, if managed mode installed one.
+    fn poll_fills(&mut self, cx: &mut Context<'_>) -> Result<()> {
+        if let Some(fills) = self.fills.as_mut() {
+            fills.poll(cx)?;
         }
         Ok(())
     }

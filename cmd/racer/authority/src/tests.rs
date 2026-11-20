@@ -94,6 +94,9 @@ impl FakeCluster {
             peer_port: 8082,
             page_size: racer_wire::object::PageSize::DEFAULT,
             rotation: Rotation::default(),
+            trust_bundle: "/etc/ssl/certs/ca-certificates.crt".into(),
+            azure_authority_host: "https://login.microsoftonline.com/".into(),
+            azure_federated_token_file: None,
         }
     }
 

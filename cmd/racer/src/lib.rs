@@ -20,6 +20,7 @@ pub mod drivers;
 pub mod enrollment;
 pub mod error;
 pub mod fd_limit;
+pub mod fill;
 pub mod gpu;
 pub mod gpu_landing;
 pub mod gpu_slot;

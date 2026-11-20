@@ -418,6 +418,7 @@ impl Config {
         let mut config = Self {
             spill: crate::read::spill::Config {
                 retained_percent: size("RACER_RETAINED_SEGMENT_PERCENT")?,
+                pinned_percent: size("RACER_PINNED_SEGMENT_PERCENT")?,
                 range_spill_pages: size("RACER_RANGE_SPILL_PAGES")?,
             },
             prefetch: crate::prefetch::Config {
@@ -695,7 +696,7 @@ impl Config {
         };
         backstop(
             self.spill.validate(),
-            "RACER_RETAINED_SEGMENT_PERCENT, RACER_RANGE_SPILL_PAGES",
+            "RACER_RETAINED_SEGMENT_PERCENT, RACER_PINNED_SEGMENT_PERCENT, RACER_RANGE_SPILL_PAGES",
         )?;
         backstop(self.prefetch.validate(), "RACER_PREFETCH_*")?;
         backstop(self.page_hedge.validate(), "RACER_PAGE_HEDGE_*")?;
@@ -1141,6 +1142,9 @@ fn authority(
             v.unsigned("RACER_PAGE_BYTES").expect("defaulted"),
         )
         .map_err(|_| ConfigError::new("RACER_PAGE_BYTES", "must be a power of two"))?,
+        trust_bundle: config.origin.trust_bundle.clone(),
+        azure_authority_host: config.origin.azure_authority_host.clone(),
+        azure_federated_token_file: config.origin.azure_federated_token_file.clone(),
     };
     control.validate().map_err(|error| {
         ConfigError::new(
@@ -1481,7 +1485,12 @@ mod tests {
         }
         // Per-worker variables carry the suffix; node-wide ones do not.
         for var in TABLE {
-            if var.scope == spec::Scope::PerWorker && var.name != "RACER_RETAINED_SEGMENT_PERCENT" {
+            if var.scope == spec::Scope::PerWorker
+                && !matches!(
+                    var.name,
+                    "RACER_RETAINED_SEGMENT_PERCENT" | "RACER_PINNED_SEGMENT_PERCENT"
+                )
+            {
                 assert!(var.name.ends_with("_PER_WORKER"), "{}", var.name);
             }
             if var.name.ends_with("_PER_WORKER") {
@@ -2133,20 +2142,33 @@ mod tests {
     #[test]
     fn spill_defaults_and_environment_limits_are_bounded() {
         let spill = parse(&[]).unwrap().spill;
-        assert_eq!((spill.retained_percent, spill.range_spill_pages), (50, 0));
+        assert_eq!(
+            (
+                spill.retained_percent,
+                spill.pinned_percent,
+                spill.range_spill_pages
+            ),
+            (50, 50, 0)
+        );
         let spill = parse(&[
             ("RACER_RETAINED_SEGMENT_PERCENT", "100"),
+            ("RACER_PINNED_SEGMENT_PERCENT", "0"),
             ("RACER_RANGE_SPILL_PAGES", "1024"),
         ])
         .unwrap()
         .spill;
         assert_eq!(
-            (spill.retained_percent, spill.range_spill_pages),
-            (100, 1024)
+            (
+                spill.retained_percent,
+                spill.pinned_percent,
+                spill.range_spill_pages
+            ),
+            (100, 0, 1024)
         );
         for (name, value) in [
             ("RACER_RETAINED_SEGMENT_PERCENT", "0"),
             ("RACER_RETAINED_SEGMENT_PERCENT", "101"),
+            ("RACER_PINNED_SEGMENT_PERCENT", "101"),
             ("RACER_RANGE_SPILL_PAGES", "1025"),
         ] {
             assert!(parse(&[(name, value)]).is_err(), "{name}={value}");

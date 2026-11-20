@@ -201,6 +201,54 @@ mod tests {
         CacheKey(sha2::Sha256::digest(bytes).into())
     }
 
+    /// Keep the independent authority encoder aligned without making the
+    /// authority depend on dataplane implementation details.
+    #[test]
+    fn fill_identity_matches_origin_encoding_and_validation() {
+        let controls: String = (0..=0x1f).map(|c| char::from_u32(c).unwrap()).collect();
+        let max_key = "k".repeat(1024);
+        let unicode_at_limit = "雪".repeat(341);
+        let unicode_over_limit = "雪".repeat(342);
+        let long_key = "k".repeat(1025);
+        let long_bucket = "b".repeat(256);
+        for bucket in [
+            "models",
+            "Legacy_Bucket-9.example",
+            "",
+            ".",
+            "..",
+            "a/b",
+            "buckét",
+            &long_bucket,
+        ] {
+            for name in [
+                "plain",
+                "a/../b%2Fc +雪",
+                "<a>&b",
+                "q\"s\\",
+                "\u{2028}\u{2029}😀",
+                &controls,
+                &max_key,
+                &unicode_at_limit,
+                &unicode_over_limit,
+                &long_key,
+                "",
+            ] {
+                let fill = racer_authority::fills::identity::canonical(bucket, name);
+                let origin = canonical(bucket, name, "");
+                assert_eq!(fill.is_ok(), origin.is_ok(), "{bucket:?} {name:?}");
+                if let (Ok((fill_bytes, fill_key)), Ok((origin_bytes, origin_key))) = (fill, origin)
+                {
+                    assert_eq!(fill_bytes, origin_bytes, "{bucket:?} {name:?}");
+                    assert_eq!(fill_key.0, origin_key.0, "{bucket:?} {name:?}");
+                    let decoded = decode(&fill_bytes, &origin_key, bucket).unwrap();
+                    assert_eq!(decoded.key, name);
+                    assert!(decoded.version_id.is_empty());
+                }
+            }
+        }
+    }
+
     /// Port of Go `TestNewRequestCanonicalIdentity`.
     #[test]
     fn canonical_identity_matches_go_golden() {

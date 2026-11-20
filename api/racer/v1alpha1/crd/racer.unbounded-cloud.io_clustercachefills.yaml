@@ -1,0 +1,286 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.1
+  name: clustercachefills.racer.unbounded-cloud.io
+spec:
+  group: racer.unbounded-cloud.io
+  names:
+    kind: ClusterCacheFill
+    listKind: ClusterCacheFillList
+    plural: clustercachefills
+    shortNames:
+    - ccfill
+    singular: clustercachefill
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.cacheName
+      name: Cache
+      type: string
+    - jsonPath: .spec.replicas
+      name: Replicas
+      type: integer
+    - jsonPath: .status.footprintBytes
+      name: Footprint
+      type: integer
+    - jsonPath: .status.residentBytes
+      name: Resident
+      type: integer
+    - jsonPath: .status.conditions[?(@.type=="Accepted")].status
+      name: Accepted
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="Ready")].status
+      name: Ready
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="Degraded")].status
+      name: Degraded
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          ClusterCacheFill pre-fetches a set of objects into a ClusterCache and keeps
+          them resident on disk. Admission checks the planned footprint against the
+          fill's own limit, not available cluster capacity. Nodes pin pages on a best
+          effort basis within their local budgets; pinned pages are not evicted to
+          make room for other data. Fills cover caches that
+          read directly from object storage (spec.origin); caches served by a
+          self-deployed origin, and passthrough caches, are rejected.
+
+          A fill names blob-name prefixes, not Racer keys. Racer keys are hashes and
+          have no meaningful prefix, so the control plane lists the cache's origin to
+          expand the prefixes into object names before it pins anything.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: Spec selects the cache, the origin objects to pin, and the
+              reservation.
+            properties:
+              cacheName:
+                description: |-
+                  CacheName names the ClusterCache to fill. The cache must set
+                  spec.origin and must not set spec.passthrough. Changing the cache
+                  requires a new ClusterCacheFill.
+                maxLength: 82
+                minLength: 1
+                pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                type: string
+                x-kubernetes-validations:
+                - message: cacheName is immutable; create a new ClusterCacheFill for
+                    a different cache
+                  rule: self == oldSelf
+              maxFootprint:
+                description: |-
+                  MaxFootprint is the largest reserved pinned payload, in bytes, that the
+                  fill may plan cluster-wide. It counts every page of every replica, with
+                  each object rounded up to a whole page, so it bounds the planned
+                  reservation rather than the object size. Actual disk use can be higher
+                  because a pinned segment keeps its unused tail; the per-worker pin
+                  budget bounds that overhead. A larger selection fails admission with
+                  ExceedsMaxFootprint; it is never truncated. This limit does not reserve
+                  cluster capacity. The value is a positive, integral byte count no greater
+                  than 9223372036854775807, not a Kubernetes resource quantity string.
+                format: int64
+                minimum: 1
+                type: integer
+              prefixes:
+                description: |-
+                  Prefixes are blob-name prefixes in the cache's container. Every object
+                  whose name starts with one of them is pinned, including objects added
+                  later on the next resync. An empty string selects the whole container.
+                  Prefixes are blob names, not Racer keys. At most 16 distinct prefixes
+                  are allowed, each at most 1024 Unicode characters. Overlapping prefixes
+                  are allowed. A single fill lists at most 8192 objects; a larger selection
+                  is rejected rather than silently truncated.
+                items:
+                  maxLength: 1024
+                  type: string
+                maxItems: 16
+                minItems: 1
+                type: array
+                x-kubernetes-list-type: set
+              replicas:
+                default: 2
+                description: |-
+                  Replicas is the number of pinned copies of each page, across distinct
+                  Racer nodes. A fill with more replicas survives the loss of up to
+                  replicas-1 nodes without going to the origin. Only values from 1 to 3
+                  are accepted because Racer keeps at most three owners per page. When
+                  unset, 2.
+                format: int32
+                maximum: 3
+                minimum: 1
+                type: integer
+              resyncInterval:
+                default: 1h
+                description: |-
+                  ResyncInterval bounds how long the listed object set may go stale. It
+                  must be between 1m and 24h. Missing pages are retried on a short
+                  backoff independently. When unset, 1h.
+                type: string
+                x-kubernetes-validations:
+                - message: resyncInterval must be between 1m and 24h
+                  rule: duration(self) >= duration('60s') && duration(self) <= duration('86400s')
+            required:
+            - cacheName
+            - maxFootprint
+            - prefixes
+            type: object
+          status:
+            description: |-
+              Status reports the reservation and its progress. It is written by the
+              Racer control plane.
+            properties:
+              cacheUID:
+                description: |-
+                  CacheUID records the ClusterCache UID the manifest was listed against.
+                  A different UID means the fill must list and pin from scratch.
+                type: string
+              conditions:
+                description: |-
+                  Conditions describe admission, listing, and residency. Active condition
+                  types are Accepted, Listed, Progressing, Ready, and Degraded.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              footprintBytes:
+                description: |-
+                  FootprintBytes is the page-rounded pinned payload the fill reserves
+                  cluster-wide, in bytes, including every replica. While Accepted is true
+                  it is at most spec.maxFootprint.
+                format: int64
+                type: integer
+              manifest:
+                description: Manifest describes the listed object set.
+                properties:
+                  digest:
+                    description: |-
+                      Digest identifies the listed object set. Pages are pinned against a
+                      digest, so a resync that changes objects rolls to a new manifest.
+                    type: string
+                  listedAt:
+                    description: ListedAt is when the object set was last listed.
+                    format: date-time
+                    type: string
+                  logicalBytes:
+                    description: |-
+                      LogicalBytes is the summed size of the listed objects, before padding,
+                      encryption, or replication.
+                    format: int64
+                    type: integer
+                  objects:
+                    description: Objects is the number of listed objects.
+                    format: int32
+                    type: integer
+                type: object
+              nodes:
+                description: |-
+                  Nodes is the number of member nodes that reported progress for the
+                  current manifest and membership.
+                format: int32
+                type: integer
+              observedGeneration:
+                description: ObservedGeneration is the spec generation this status
+                  describes.
+                format: int64
+                type: integer
+              residentBytes:
+                description: |-
+                  ResidentBytes is the page-rounded pinned payload size, in bytes, summed
+                  over every confirmed copy. It reaches FootprintBytes when the fill is
+                  Ready.
+                format: int64
+                type: integer
+              underReplicatedBytes:
+                description: |-
+                  UnderReplicatedBytes is max(0, FootprintBytes - ResidentBytes), including
+                  copies missing because their owners no longer report progress.
+                format: int64
+                type: integer
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
