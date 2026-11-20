@@ -136,9 +136,14 @@ Every Racer process lists independently. The primary writes its digest to
 `status.manifest.digest`; a node includes its own digest in its progress
 report, and the primary counts only reports whose digest and spec generation
 match its own. A node that listed a different set does not corrupt the
-accounting; it simply is not counted until the next resync aligns it. Each
-process re-lists at `resyncInterval`; a failed list retries with backoff, so a
-skew resolves without a distribution channel.
+accounting; it is not counted until its listing aligns. A non-primary process
+uses the primary's status digest for the current spec generation and cache UID
+as a convergence hint. A successful but different listing retries after a
+bounded delay instead of waiting for `resyncInterval`; repeated mismatches do
+not spin. Failed lists retain their own backoff. This does not distribute an
+immutable manifest: a continuously changing origin can still prevent agreement,
+and a node cannot reconstruct object versions no longer returned by the origin.
+Matching listings otherwise re-list at `resyncInterval`.
 
 This trades N list calls per resync for having no manifest wire format, no
 ConfigMap, or manifest-distribution RBAC. Listing needs a credential with list permission

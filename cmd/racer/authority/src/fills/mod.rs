@@ -35,6 +35,18 @@ const TICK: Duration = Duration::from_secs(5);
 /// Backoff after a failed origin listing.
 const LIST_BACKOFF: Duration = Duration::from_secs(10);
 
+/// A successful but different listing follows the primary without waiting for
+/// the full resync interval. This is a hint, not a distributed snapshot.
+const CONVERGENCE_DELAY: Duration = Duration::from_secs(20);
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ListingState {
+    /// Cache UID and manifest digest observed in status for this generation.
+    primary_manifest: Option<(String, String)>,
+    /// Earliest retry of a successful listing that differs from the primary.
+    converge_after: Option<Instant>,
+}
+
 /// Default replicas and resync interval, matching the CRD defaults.
 const DEFAULT_REPLICAS: u8 = 2;
 const DEFAULT_RESYNC_SECS: u64 = 3600;
@@ -80,6 +92,7 @@ pub struct FillView {
     pub(crate) next_list: Option<Instant>,
     /// Current listing failure streak.
     pub(crate) failures: u32,
+    pub(crate) listing: ListingState,
 }
 
 impl FillView {
@@ -156,20 +169,51 @@ impl FillView {
             listed_cache_uid: String::new(),
             next_list: None,
             failures: 0,
+            listing: ListingState {
+                primary_manifest: primary_manifest(v, generation),
+                converge_after: None,
+            },
         })
     }
 
     /// Whether this process needs to list the origin now. `next_list` is
     /// cleared when a spec or cache change invalidates the manifest and is set
     /// to the next resync or to a backoff deadline after a failure.
-    fn needs_list(&self, now: Instant) -> bool {
+    fn needs_list(&self, now: Instant, primary: bool, cache_uid: &str) -> bool {
         self.next_list.is_none_or(|at| now >= at)
+            || (!primary
+                && self.failures == 0
+                && self.listing.converge_after.is_none_or(|at| now >= at)
+                && self.manifest.as_ref().is_some_and(|manifest| {
+                    self.listing
+                        .primary_manifest
+                        .as_ref()
+                        .is_some_and(|(cache, digest)| {
+                            cache == cache_uid && digest != &manifest.digest
+                        })
+                }))
     }
 
     /// Whether a listing is for the current spec and cache.
     fn listing_current(&self, generation: u64, cache_uid: &str) -> bool {
         self.generation == generation && self.cache_uid == cache_uid
     }
+}
+
+/// Status is only a convergence hint when it describes the current spec and
+/// identifies the cache. Ignore incomplete or malformed status on watch events.
+fn primary_manifest(v: &Value, generation: u64) -> Option<(String, String)> {
+    if v.pointer("/status/observedGeneration")?.as_u64()? != generation {
+        return None;
+    }
+    let cache = v.pointer("/status/cacheUID")?.as_str()?;
+    let digest = v.pointer("/status/manifest/digest")?.as_str()?;
+    (racer_wire::control::valid_uuid(cache)
+        && digest.len() == 64
+        && digest
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+    .then(|| (cache.to_owned(), digest.to_owned()))
 }
 
 /// Snapshot of the current fills, sorted by name, for the dataplane.
@@ -211,6 +255,7 @@ fn adopt(mut view: FillView, old: &FillView) -> FillView {
     view.listed_cache_uid = old.listed_cache_uid.clone();
     view.next_list = old.next_list;
     view.failures = old.failures;
+    view.listing.converge_after = old.listing.converge_after;
     if old.generation != view.generation || old.cache_name != view.cache_name {
         view.manifest = None;
         view.error = None;
@@ -218,6 +263,7 @@ fn adopt(mut view: FillView, old: &FillView) -> FillView {
         view.listed_cache_uid.clear();
         view.next_list = None;
         view.failures = 0;
+        view.listing.converge_after = None;
     }
     view
 }
@@ -419,16 +465,17 @@ async fn list_fills(shared: Rc<Shared>) {
                         else {
                             return None;
                         };
-                        view.needs_list(now).then(|| {
-                            (
-                                view.uid.clone(),
-                                view.generation,
-                                uid,
-                                origin.azure.container_url,
-                                origin.azure.credential,
-                                view.prefixes.clone(),
-                            )
-                        })
+                        view.needs_list(now, shared.is_primary.get(), &uid)
+                            .then(|| {
+                                (
+                                    view.uid.clone(),
+                                    view.generation,
+                                    uid,
+                                    origin.azure.container_url,
+                                    origin.azure.credential,
+                                    view.prefixes.clone(),
+                                )
+                            })
                     })
                     .collect::<Vec<_>>()
             };
@@ -686,6 +733,7 @@ fn install_manifest(
     view.error = None;
     view.failures = 0;
     view.next_list = Some(now + Duration::from_secs(view.resync_secs));
+    view.listing.converge_after = Some(now + CONVERGENCE_DELAY);
     recompute_view(shared, view);
 }
 
@@ -858,6 +906,80 @@ mod tests {
                 "maxFootprint": 1_000_000_000,
             },
         })
+    }
+
+    fn listed_view(now: Instant) -> FillView {
+        let mut view = FillView::from_json(&fill_json("")).unwrap();
+        view.cache_uid = "22222222-2222-4222-8222-222222222222".into();
+        view.manifest = Some(Arc::new(manifest::build("models", &[], &[], 1).unwrap()));
+        view.listed_generation = Some(view.generation);
+        view.listed_cache_uid = view.cache_uid.clone();
+        view.next_list = Some(now + Duration::from_secs(view.resync_secs));
+        view.listing.converge_after = Some(now + CONVERGENCE_DELAY);
+        view.listing.primary_manifest = Some((view.cache_uid.clone(), "a".repeat(64)));
+        view
+    }
+
+    #[test]
+    fn successful_digest_mismatch_retries_before_resync_without_spinning() {
+        let now = Instant::now();
+        let mut view = listed_view(now);
+        assert!(!view.needs_list(now, false, &view.cache_uid));
+        assert!(view.needs_list(now + CONVERGENCE_DELAY, false, &view.cache_uid));
+        // A primary must not chase its own older status digest.
+        assert!(!view.needs_list(now + CONVERGENCE_DELAY, true, &view.cache_uid));
+        view.listing.primary_manifest.as_mut().unwrap().1 =
+            view.manifest.as_ref().unwrap().digest.clone();
+        assert!(!view.needs_list(now + CONVERGENCE_DELAY, false, &view.cache_uid));
+        assert!(view.needs_list(
+            now + Duration::from_secs(view.resync_secs),
+            false,
+            &view.cache_uid
+        ));
+    }
+
+    #[test]
+    fn convergence_hint_does_not_override_failure_backoff_or_cache_identity() {
+        let now = Instant::now();
+        let mut view = listed_view(now);
+        view.failures = 1;
+        assert!(!view.needs_list(now + CONVERGENCE_DELAY, false, &view.cache_uid));
+        view.failures = 0;
+        assert!(!view.needs_list(now + CONVERGENCE_DELAY, false, "another-cache"));
+    }
+
+    #[test]
+    fn watch_updates_adopt_local_state_but_read_the_new_primary_hint() {
+        let now = Instant::now();
+        let old = listed_view(now);
+        let mut json = fill_json("");
+        json["status"] = serde_json::json!({
+            "observedGeneration": old.generation,
+            "cacheUID": old.cache_uid,
+            "manifest": {"digest": "b".repeat(64)},
+        });
+        let view = adopt(FillView::from_json(&json).unwrap(), &old);
+        assert_eq!(view.manifest, old.manifest);
+        assert_eq!(view.next_list, old.next_list);
+        assert_eq!(view.listing.converge_after, old.listing.converge_after);
+        assert_eq!(view.listing.primary_manifest.unwrap().1, "b".repeat(64));
+        json["status"]["observedGeneration"] = serde_json::json!(old.generation + 1);
+        assert!(
+            FillView::from_json(&json)
+                .unwrap()
+                .listing
+                .primary_manifest
+                .is_none()
+        );
+        json["status"]["observedGeneration"] = serde_json::json!(old.generation);
+        json["status"]["manifest"]["digest"] = serde_json::json!("bad-digest");
+        assert!(
+            FillView::from_json(&json)
+                .unwrap()
+                .listing
+                .primary_manifest
+                .is_none()
+        );
     }
 
     #[test]

@@ -404,6 +404,7 @@ mod tests {
 
     fn view() -> FillView {
         FillView {
+            listing: Default::default(),
             uid: "11111111-1111-4111-8111-111111111111".into(),
             name: "fill".into(),
             generation: 2,
