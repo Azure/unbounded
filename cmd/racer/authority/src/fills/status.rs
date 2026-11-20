@@ -122,15 +122,15 @@ fn member_reports<'a>(
     reports
 }
 
-/// Compute the `status` object for one fill. `previous` is the status read
-/// from the API, used only to keep `lastTransitionTime` and to detect a fill
-/// that was Ready and is now short.
 #[cfg(test)]
 fn status(view: &FillView, reports: &BTreeMap<String, String>, previous: Option<&Value>) -> Value {
     let progress = aggregate(reports, view);
     status_with_progress(view, progress, previous)
 }
 
+/// Compute status using same-generation completion history from the API.
+/// Initial progress stays complete during later refills; condition transition
+/// timestamps are retained whenever their boolean status is unchanged.
 fn status_with_progress(view: &FillView, progress: Progress, previous: Option<&Value>) -> Value {
     let now = election::now_micro(rt::wall_now());
     let manifest_current = view.manifest.is_some()
@@ -166,8 +166,8 @@ fn status_with_progress(view: &FillView, progress: Progress, previous: Option<&V
         .unwrap_or(0);
     // A member that leaves takes its report with it, so the remaining reports
     // cannot show the shortfall through `under_replicated_bytes`: compare
-    // confirmed bytes with the footprint instead. Only a fill that was once
-    // complete is Degraded, so initial filling stays Progressing alone.
+    // confirmed bytes with the footprint instead. Completion-based degradation
+    // starts only after the initial fill; explicit capacity refusal is immediate.
     let short =
         view.accepted && manifest_current && footprint > 0 && progress.resident_bytes < footprint;
     let degraded = if progress.refused_bytes > 0 {
@@ -954,6 +954,23 @@ mod tests {
     }
 
     #[test]
+    fn report_selection_preserves_eligibility_and_uid_tie_breaks() {
+        let v = with_manifest(view());
+        let real = report(progress_for(&v));
+        let mut no_ip = managed_pod("newest", "2025-01-01T00:00:00Z", &real, DS);
+        no_ip.pod_ip.clear();
+        let pods = pod_map(vec![
+            managed_pod("a", "2024-01-01T00:00:00Z", "old-report", DS),
+            managed_pod("z", "2024-01-01T00:00:00Z", &real, DS),
+            no_ip,
+        ]);
+        let members = [member()];
+        let reports = member_reports(&pods, &node_map(), &ownership(), &members);
+        assert_eq!(reports[NODE_UID], real);
+        assert_eq!(aggregate(&reports, &v).nodes, 1);
+    }
+
+    #[test]
     fn new_fill_is_admitted_before_its_first_status_write() {
         crate::kube::fake::run(|api, kube| async move {
             let shared = crate::shared::tests::shared(kube);
@@ -1075,6 +1092,22 @@ mod tests {
             *shared.fill_status_term.borrow_mut() = Some(term);
             reconcile(&shared, &mut cursor).await;
             assert!(api.requests()[start..].iter().any(|(m, _)| m == "PUT"));
+
+            // Even a synced primary cannot write after a GET outlives its
+            // Lease freshness. Force a dirty object and delay that read.
+            let path = paths::cluster_cache_fill(&v.name);
+            let mut dirty = api.object(&path).unwrap();
+            dirty.as_object_mut().unwrap().remove("status");
+            api.put_object(&path, dirty);
+            let term = shared.primary_term(rt::now()).unwrap();
+            *shared.term.borrow_mut() = Some((
+                term,
+                crate::rules::state::Freshness::confirmed(rt::now(), Duration::from_millis(10)),
+            ));
+            api.delay_gets(Arc::new(std::sync::atomic::AtomicU64::new(30)));
+            let start = api.requests().len();
+            reconcile(&shared, &mut cursor).await;
+            assert!(api.requests()[start..].iter().all(|(m, _)| m == "GET"));
         });
     }
 
