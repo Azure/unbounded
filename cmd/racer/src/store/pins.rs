@@ -7,11 +7,11 @@
 use super::pages::Pages;
 use crate::error::{Error, Result};
 use crate::model::{ObjectVersion, PageId, PageNumber};
-use crate::runtime::HashMap;
+use crate::runtime::{HashMap, HashSet};
 use page_alloc::SegmentId;
 use page_alloc::Segments;
 use page_alloc::disk_index::{HoldId, PageSlot};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -97,7 +97,7 @@ impl Pins {
         Self {
             entries: HashMap::default(),
             expirations: BTreeMap::new(),
-            deferred: HashSet::new(),
+            deferred: HashSet::default(),
             page_fills: HashMap::default(),
             owners: HashMap::default(),
             members: 0,

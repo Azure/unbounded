@@ -576,7 +576,7 @@ impl Index {
                     monotonic,
                     pages: std::collections::BTreeSet::new(),
                     holders: HashMap::default(),
-                    ids: std::collections::HashSet::new(),
+                    ids: HashSet::default(),
                 });
             pin.until = until;
             pin.monotonic = monotonic;
@@ -2796,6 +2796,52 @@ mod tests {
         let pins = index.pins.borrow();
         assert!(pins.entries.is_empty());
         assert!(pins.expirations.is_empty());
+    }
+
+    #[test]
+    fn same_seed_pin_expiry_ties_release_in_the_same_order() {
+        use super::super::pins::FillId;
+
+        fn release_order(seed: u64) -> Vec<FillId> {
+            let clock = racer_io::SimClock::new(seed);
+            let ctx = clock.ctx(0);
+            let env = racer_io::Env::new(racer_io::Driver::Uring, ctx.clone());
+            let segments = Rc::new(segments(1024, 8));
+            let index = Rc::new(index(&env, 128));
+            index.set_page_capacity(128).unwrap();
+            index.set_pin_capacity_percent(100).unwrap();
+            let _clock = SegmentClock::new(index.clone(), segments, 1);
+            let version = descriptor("expiry-ties", 17).version;
+            let ttl = std::time::Duration::from_secs(10);
+            let until = ctx.clock.wall_now() + ttl;
+            for fill in 0..64 {
+                index
+                    .reserve_pin_pages(FillId(fill), &version, &page_set(&[0]), until)
+                    .unwrap();
+            }
+            assert_eq!(
+                index.pins.borrow().expirations.len(),
+                1,
+                "all deadlines tie"
+            );
+            clock.advance(ttl);
+            let mut order = Vec::new();
+            let mut pins = index.pins.borrow_mut();
+            let mut state = index.state_mut();
+            while pins.expire(&mut state.pages, &ctx.clock, 3, |(fill, _)| {
+                order.push(fill)
+            }) != 0
+            {}
+            assert_eq!(order.len(), 64);
+            assert!(pins.entries.is_empty());
+            assert!(pins.expirations.is_empty());
+            assert_eq!(state.pages.holds_unused(), 0);
+            order
+        }
+
+        for seed in [43, 47] {
+            assert_eq!(release_order(seed), release_order(seed), "seed {seed}");
+        }
     }
 
     #[test]
