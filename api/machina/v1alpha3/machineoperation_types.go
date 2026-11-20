@@ -4,10 +4,13 @@
 package v1alpha3
 
 import (
+	"time"
+
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
 func init() {
@@ -22,6 +25,8 @@ func init() {
 // +kubebuilder:object:root=true
 // +kubebuilder:resource:scope=Cluster,shortName=mop
 // +kubebuilder:subresource:status
+// +kubebuilder:selectablefield:JSONPath=".spec.machineRef"
+// +kubebuilder:selectablefield:JSONPath=".status.phase"
 // +kubebuilder:printcolumn:name="Machine",type="string",JSONPath=".spec.machineRef"
 // +kubebuilder:printcolumn:name="Operation",type="string",JSONPath=".spec.operationKind"
 // +kubebuilder:printcolumn:name="Phase",type="string",JSONPath=".status.phase"
@@ -33,6 +38,10 @@ func init() {
 // +kubebuilder:validation:XValidation:rule="(has(oldSelf.spec) && has(oldSelf.spec.allocationRef)) || !has(self.spec) || !has(self.spec.allocationRef)",message="allocationRef cannot be added after creation",fieldPath=".spec.allocationRef"
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.status) || !has(oldSelf.status.allocation) || (has(self.status) && has(self.status.allocation) && self.status.allocation == oldSelf.status.allocation)",message="allocation is immutable once set",fieldPath=".status.allocation"
 // +kubebuilder:validation:XValidation:rule="!has(self.status) || !has(self.status.allocation) || (has(self.spec) && self.spec.operationKind == 'HostAllocate')",message="allocation is allowed only for HostAllocate",fieldPath=".status.allocation"
+// +kubebuilder:validation:XValidation:rule="(has(oldSelf.spec) && has(oldSelf.spec.machineSelector)) == (has(self.spec) && has(self.spec.machineSelector)) && (!has(oldSelf.spec) || !has(oldSelf.spec.machineSelector) || (has(self.spec) && has(self.spec.machineSelector) && self.spec.machineSelector == oldSelf.spec.machineSelector))",message="machineSelector cannot be changed, added or removed after creation",fieldPath=".spec.machineSelector"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.spec) || !has(oldSelf.spec.machineSelector) || (has(self.spec) && self.spec == oldSelf.spec)",message="spec is immutable for a selector operation",fieldPath=".spec"
+// +kubebuilder:validation:XValidation:rule="!has(self.spec) || !has(self.spec.suspend) || !self.spec.suspend || (has(oldSelf.spec) && has(oldSelf.spec.suspend) && oldSelf.spec.suspend)",message="suspend can be set only when the operation is created",fieldPath=".spec.suspend"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.spec) || !has(self.spec) || (has(oldSelf.spec.machineRef) ? oldSelf.spec.machineRef : '') == (has(self.spec.machineRef) ? self.spec.machineRef : '')",message="machineRef cannot be changed",fieldPath=".spec.machineRef"
 
 // MachineOperation represents a discrete operation to be performed on a
 // Machine. MachineOperations are created by CLI commands or controllers and
@@ -119,6 +128,32 @@ func (k OperationKind) IsAllocationOperation() bool {
 	return k == OperationHostAllocate || k == OperationHostRelease
 }
 
+// MachineOperationParentUIDLabel is set on a child MachineOperation to the UID
+// of the selector operation that created it. The UID is used because an
+// operation name can be longer than a label value may be; the child's owner
+// reference carries the parent's name.
+const MachineOperationParentUIDLabel = "unbounded-cloud.io/parent-operation-uid"
+
+// Reasons a selector operation or one of its targets reports.
+const (
+	// OperationReasonNoMachinesMatched means the selector matched no Machine
+	// when a controller resolved it.
+	OperationReasonNoMachinesMatched = "NoMachinesMatched"
+
+	// OperationReasonNotPickedUp means no agent or provider controller
+	// started a child operation within the pickup timeout, so the controller
+	// that created the child failed it.
+	OperationReasonNotPickedUp = "NotPickedUp"
+
+	// OperationReasonRolloutStopped means the rollout started no further
+	// targets because an earlier target failed.
+	OperationReasonRolloutStopped = "RolloutStopped"
+
+	// OperationReasonTargetFailed means every target finished and at least
+	// one of them failed.
+	OperationReasonTargetFailed = "TargetFailed"
+)
+
 // OperationPhase represents the current phase of a MachineOperation.
 type OperationPhase string
 
@@ -151,7 +186,29 @@ const (
 	// MachineOperationConditionProviderOperationStalled reports that an
 	// accepted external provider operation has exceeded its expected duration.
 	MachineOperationConditionProviderOperationStalled = "ProviderOperationStalled"
+
+	// MachineOperationConditionCompletedChildrenRemoved is True on a finished
+	// selector operation once the children that completed have been removed.
+	// The children that remain did not complete, or completed and carry a
+	// boot media record. It is not set on an operation that retains all its
+	// children or that matched no machine.
+	MachineOperationConditionCompletedChildrenRemoved = "CompletedChildrenRemoved"
+
+	// MachineOperationConditionTargetsResolved is True on a selector
+	// operation once a child operation exists for every Machine its selector
+	// matched. From then on the set of machines does not change.
+	MachineOperationConditionTargetsResolved = "TargetsResolved"
 )
+
+// MachineOperationMachineRefField is the field selector key for
+// spec.machineRef. An agent watches and lists with it so that the API server
+// sends it only the operations that name its machine.
+const MachineOperationMachineRefField = "spec.machineRef"
+
+// MachineOperationReleasedAtAnnotation is the RFC 3339 time at which the
+// controller that created a child operation let it run: when it was created,
+// for a child created released, or when its spec.suspend was cleared.
+const MachineOperationReleasedAtAnnotation = "unbounded-cloud.io/released-at"
 
 // Condition types for MachineOperation targets.
 const (
@@ -246,9 +303,14 @@ type ProviderMachineSnapshot struct {
 // +kubebuilder:validation:XValidation:rule="!(self.operationKind in ['HostAllocate', 'HostRelease']) || (has(self.machineRef) && self.machineRef != \"\")",message="machineRef is required for HostAllocate and HostRelease"
 // +kubebuilder:validation:XValidation:rule="!(self.operationKind in ['HostAllocate', 'HostRelease']) || !has(self.machineSelector)",message="machineSelector is not allowed for HostAllocate and HostRelease"
 // +kubebuilder:validation:XValidation:rule="!(self.operationKind in ['HostAllocate', 'HostRelease']) || !has(self.ttlSecondsAfterFinished)",message="ttlSecondsAfterFinished is not allowed for HostAllocate and HostRelease"
+// +kubebuilder:validation:XValidation:rule="(has(self.machineRef) && self.machineRef != \"\") != has(self.machineSelector)",message="exactly one of machineRef and machineSelector must be set"
+// +kubebuilder:validation:XValidation:rule="!has(self.machineSelector) || (has(self.machineSelector.matchLabels) && size(self.machineSelector.matchLabels) > 0) || (has(self.machineSelector.matchExpressions) && size(self.machineSelector.matchExpressions) > 0)",message="machineSelector must have at least one matchLabels or matchExpressions entry"
+// +kubebuilder:validation:XValidation:rule="!has(self.rollout) || has(self.machineSelector)",message="rollout is allowed only with machineSelector"
+// +kubebuilder:validation:XValidation:rule="!has(self.suspend) || !self.suspend || (!has(self.machineSelector) && !(self.operationKind in ['HostAllocate', 'HostRelease']))",message="suspend is allowed only on a machineRef operation that is not HostAllocate or HostRelease"
 type MachineOperationSpec struct {
-	// MachineRef is the name of the Machine CR this operation targets.
-	// Either machineRef or machineSelector must be set.
+	// MachineRef is the name of the Machine CR this operation targets. Agents
+	// and provider controllers execute only operations that have machineRef.
+	// Exactly one of machineRef and machineSelector must be set.
 	// +optional
 	MachineRef string `json:"machineRef,omitempty"`
 
@@ -258,12 +320,30 @@ type MachineOperationSpec struct {
 	// +optional
 	AllocationRef *UIDReference `json:"allocationRef,omitempty"`
 
-	// MachineSelector selects machines by labels. When set, the
-	// controller creates individual MachineOperation children for
-	// each matched machine. Either machineRef or machineSelector
-	// must be set.
+	// MachineSelector selects Machines by labels for a selector operation.
+	// A controller resolves the selector against Machine labels once and
+	// creates one child MachineOperation with machineRef for each matched
+	// Machine. The children are the per-machine record; this operation's
+	// status carries only counts, in status.summary. Agents and provider
+	// controllers do not resolve the selector. Exactly one of machineRef and
+	// machineSelector must be set.
 	// +optional
 	MachineSelector *metav1.LabelSelector `json:"machineSelector,omitempty"`
+
+	// Rollout sets how a selector operation is paced. Allowed only with
+	// machineSelector. The whole spec of a selector operation is immutable,
+	// so that every machine gets the same operation.
+	// +optional
+	Rollout *MachineOperationRollout `json:"rollout,omitempty"`
+
+	// Suspend holds a machineRef operation: while it is true, no agent or
+	// provider controller starts the operation, and it does not make another
+	// operation on the same machine wait. It can be set only when the
+	// operation is created, and only cleared afterward. A selector operation
+	// creates the children that may not run yet suspended, and clears the
+	// field to release them at its rollout pace.
+	// +optional
+	Suspend bool `json:"suspend,omitempty"`
 
 	// OperationKind is the operation to perform on the target machine.
 	// +kubebuilder:validation:Required
@@ -279,12 +359,145 @@ type MachineOperationSpec struct {
 	Parameters map[string]string `json:"parameters,omitempty"`
 
 	// TTLSecondsAfterFinished limits the lifetime of a completed or failed
-	// MachineOperation. If set, the agent deletes the MachineOperation
-	// this many seconds after it reaches a terminal phase. If unset, the
+	// MachineOperation. If set, the controller that owns the operation
+	// deletes it this many seconds after it reaches a terminal phase: the
+	// selector fan-out controller for a selector operation, and the provider
+	// controller or metalman for the host operations they execute. It is not
+	// enforced for an operation that an agent executes. If unset, the
 	// MachineOperation is kept indefinitely.
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	TTLSecondsAfterFinished *int32 `json:"ttlSecondsAfterFinished,omitempty"`
+}
+
+// IsHeld reports whether o must not be started yet: a machineRef operation
+// with spec.suspend set. No agent or provider controller starts a held
+// operation, and it does not make another operation wait.
+//
+// The answer depends on the spec alone. spec.suspend can only be set when the
+// operation is created and can only be cleared afterward, so a held operation
+// has never started and a released one is never held again. Nothing in the
+// status, which every agent may write, can release an operation.
+func (o *MachineOperation) IsHeld() bool {
+	return o.Spec.Suspend && !o.Spec.IsSelectorOperation()
+}
+
+// QueueTime is when o joined the queue of operations on its machine: the
+// time it was released when it was created held, and its creation time
+// otherwise. An operation that waited, held, for its turn in a rollout does
+// not go ahead of one that started in the meantime.
+func (o *MachineOperation) QueueTime() metav1.Time {
+	if value := o.Annotations[MachineOperationReleasedAtAnnotation]; value != "" {
+		if released, err := time.Parse(time.RFC3339, value); err == nil && released.After(o.CreationTimestamp.Time) {
+			return metav1.NewTime(released)
+		}
+	}
+
+	return o.CreationTimestamp
+}
+
+// IsSelectorOperation reports whether s is a selector operation. A selector
+// operation has machineSelector and no machineRef.
+func (s *MachineOperationSpec) IsSelectorOperation() bool {
+	return s.MachineRef == "" && s.MachineSelector != nil
+}
+
+// MachineOperationRollout sets how a selector operation is paced. It is
+// allowed only on an operation with machineSelector.
+type MachineOperationRollout struct {
+	// MaxConcurrent is how many matched machines may be operated on at
+	// the same time: a number (at least 1) or a percentage of the matched
+	// machines from "1%" to "100%". Defaults to 1.
+	// The number is bounded so that it fits the 32-bit integer the field
+	// decodes into: a larger stored value would fail every typed read of
+	// the object.
+	// +optional
+	// +kubebuilder:default=1
+	// +kubebuilder:validation:XIntOrString
+	// +kubebuilder:validation:XValidation:rule="(type(self) == int && self >= 1 && self <= 2147483647) || (type(self) == string && self.matches('^([1-9][0-9]?|100)%$'))",message="maxConcurrent must be an integer of at least 1 or a percentage from 1% to 100%"
+	MaxConcurrent *intstr.IntOrString `json:"maxConcurrent,omitempty"`
+
+	// OnFailure says what happens after a machine's operation fails.
+	// Stop (the default) starts no further machines. Continue carries on.
+	// +optional
+	// +kubebuilder:default=Stop
+	// +kubebuilder:validation:Enum=Stop;Continue
+	OnFailure RolloutFailurePolicy `json:"onFailure,omitempty"`
+
+	// ChildRetention says which child operations are kept once the selector
+	// operation has finished. Unsuccessful (the default) removes the children
+	// that completed and keeps the rest: the failed ones, and the ones a
+	// stopped rollout never started. A child that completed and carries a
+	// boot media record is kept as well. The counts in status.summary remain.
+	// All keeps every child, for the per-machine record of when each
+	// finished. Deleting the parent, or its ttlSecondsAfterFinished, removes
+	// its children whatever this says.
+	// +optional
+	// +kubebuilder:default=Unsuccessful
+	// +kubebuilder:validation:Enum=Unsuccessful;All
+	ChildRetention ChildRetentionPolicy `json:"childRetention,omitempty"`
+}
+
+// ChildRetentionPolicy says which children of a finished selector operation
+// are kept.
+type ChildRetentionPolicy string
+
+const (
+	// ChildRetentionUnsuccessful keeps only the children that did not
+	// complete.
+	ChildRetentionUnsuccessful ChildRetentionPolicy = "Unsuccessful"
+
+	// ChildRetentionAll keeps every child.
+	ChildRetentionAll ChildRetentionPolicy = "All"
+)
+
+// RolloutFailurePolicy says what a selector operation does after a machine's
+// operation fails.
+type RolloutFailurePolicy string
+
+const (
+	// RolloutFailurePolicyStop starts no further machines after a failure.
+	RolloutFailurePolicyStop RolloutFailurePolicy = "Stop"
+
+	// RolloutFailurePolicyContinue carries on after a failure.
+	RolloutFailurePolicyContinue RolloutFailurePolicy = "Continue"
+)
+
+// MachineOperationSummary counts the children of a selector operation. Every
+// child is in exactly one of held, active, complete and failed.
+type MachineOperationSummary struct {
+	// Total is the number of Machines the selector matched, each with one
+	// child operation.
+	// +kubebuilder:validation:Minimum=0
+	Total int32 `json:"total"`
+
+	// Held is the number of children not yet released to run.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	Held int32 `json:"held,omitempty"`
+
+	// Active is the number of children released and not finished.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	Active int32 `json:"active,omitempty"`
+
+	// Complete is the number of children that completed.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	Complete int32 `json:"complete,omitempty"`
+
+	// Failed is the number of children that failed, including children that
+	// were deleted before they finished.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	Failed int32 `json:"failed,omitempty"`
+
+	// FailedMachines names up to ten of the machines whose child failed, in
+	// name order. List the children for all of them.
+	// +optional
+	// +listType=set
+	// +kubebuilder:validation:MaxItems=10
+	FailedMachines []string `json:"failedMachines,omitempty"`
 }
 
 // MachineOperationStatus defines the observed state of a MachineOperation.
@@ -312,14 +525,19 @@ type MachineOperationStatus struct {
 	// +optional
 	ObservedMachineGeneration int64 `json:"observedMachineGeneration,omitempty"`
 
-	// Targets records the per-machine execution state for this operation.
-	// For single-machine operations this contains one entry. For selector
-	// operations, targets are snapshotted when execution begins and remain
-	// authoritative even if selector matches change later.
+	// Targets records the execution state of a machineRef operation's
+	// machine, in one entry. A selector operation has no targets: its
+	// children carry the per-machine state and Summary carries the counts.
 	// +optional
 	// +listType=map
 	// +listMapKey=machineRef
 	Targets []MachineOperationTargetStatus `json:"targets,omitempty"`
+
+	// Summary counts the children of a selector operation by state. It is set
+	// once every child exists and is the only per-rollout state kept here, so
+	// the size of this object does not depend on how many machines matched.
+	// +optional
+	Summary *MachineOperationSummary `json:"summary,omitempty"`
 
 	// Allocation is the provider's result for a HostAllocate. It is accepted
 	// only on HostAllocate and cannot change or be removed once set.
