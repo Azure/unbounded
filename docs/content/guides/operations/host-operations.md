@@ -211,6 +211,14 @@ made again. A VM that changes after the operation started, for example because
 a disk is attached, is not deleted: the operation fails and a new one replaces
 the VM as it is then.
 
+A user-assigned managed identity stays on the new VM, so the controller's
+Azure identity needs
+`Microsoft.ManagedIdentity/userAssignedIdentities/assign/action` on each one;
+the Managed Identity Operator role grants it. This includes identities that an
+Azure Policy attaches to every VM. Without it Azure rejects the first change
+to the VM, and the operation fails with `AuthFailed` and leaves the VM as it
+was.
+
 Before the delete, the operation changes the VM's delete options so that its
 network interfaces and data disks survive, and tags the VM with
 `unbounded-replace-pending` and `unbounded-replace-restore`. An operation that

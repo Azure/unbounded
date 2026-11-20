@@ -331,11 +331,11 @@ The Azure VM provider handles:
 | `HostHardReboot` | `VirtualMachinesClient.BeginRestart` |
 | `HostPowerOff` | `VirtualMachinesClient.BeginPowerOff` |
 | `HostPowerOn` | `VirtualMachinesClient.BeginStart` |
-| `HostReplace` | `VirtualMachinesClient.Get`, `BeginDelete`, then `BeginCreateOrUpdate` |
+| `HostReplace` | `VirtualMachinesClient.Get`, `BeginCreateOrUpdate` to prepare the VM, `BeginDelete`, then `BeginCreateOrUpdate` to create the replacement |
 
 `HostReplace` for `AzureVM` destructively replaces the VM: it reads the existing VM model, detaches NICs and data disks, deletes the VM resource, and recreates the same VM name with fresh cloud-init custom data that installs `unbounded-agent`. An explicit host image may be an Azure resource ID or a `publisher:offer:sku:version` reference; an omitted image preserves the existing image reference. The old OS disk is not reused. Operation completion means the replacement VM create operation completed; it does not mean the Kubernetes `Node` is Ready. The `Machine` controller continues tracking whether the Kubernetes `Node` disappears and rejoins. Configure `azure-machine-ops-controller --api-server-endpoint` with an API server address reachable from replaced hosts; the generated agent bootstrap config uses that value.
 
-This replacement flow avoids Azure standalone VM `customData` immutability during native reimage. It intentionally destroys host-local state on the old OS disk. The initial implementation retains the existing blocking clone-delete-create flow; a controller crash after deletion can require manual recovery because the captured VM model is not yet durably checkpointed.
+This replacement flow avoids Azure standalone VM `customData` immutability during native reimage. It intentionally destroys host-local state on the old OS disk. The replacement is resumable. Before the VM is touched, the provider records the replacement VM model in the operation's handle, which is stored in the MachineOperation status. It then prepares the VM, deletes it and creates the replacement one step at a time, without waiting for Azure inside a step, and decides each step from what Azure reports. A controller that restarts at any point continues from the stored model and the state of the VM.
 
 Metalman handles bare-metal host operations for Machines with
 `spec.host.netboot.redfish` (or deprecated `spec.pxe.redfish`) and no external

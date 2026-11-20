@@ -21,12 +21,27 @@ import (
 type ClusterInfo = internalmachineops.ClusterInfo
 
 // Options scopes and tunes a MachineOperation provider controller.
+//
+// The controller never times a long-running operation out. It retries
+// ordinary Begin and Poll errors without limit, and it only reports a stalled
+// operation and polls it more slowly. The provider owns deadlines: it ends an
+// operation by returning a machineops.PermanentError or a Failed PollResult.
 type Options struct {
-	SiteName                    string
-	ProviderName                string
-	MaxConcurrentReconciles     int
-	ProviderPollInterval        time.Duration
-	ProviderStallAfter          time.Duration
+	SiteName                string
+	ProviderName            string
+	MaxConcurrentReconciles int
+	// ProviderPollInterval is the wait between Polls when a BeginResult or
+	// PollResult sets no RequeueAfter, and the wait before Begin or Poll is
+	// called again after an ordinary error. 0 means 15s.
+	ProviderPollInterval time.Duration
+	// ProviderStallAfter is how long after its handle was stored an
+	// operation may stay in progress before it is stalled. A stalled
+	// operation gets the ProviderOperationStalled condition on its target
+	// and is polled at ProviderStalledPollInterval, whatever RequeueAfter
+	// the provider returns. It is never ended. 0 means 75m.
+	ProviderStallAfter time.Duration
+	// ProviderStalledPollInterval is the wait between Polls of a stalled
+	// operation. 0 means 5m.
 	ProviderStalledPollInterval time.Duration
 	APIServerEndpoint           string
 	CredentialSecretNamespace   string

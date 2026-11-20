@@ -131,16 +131,16 @@ DRA, reservations, and specialized repair policies remain separate extensions.
 | --- | --- | --- |
 | MachineClass references a Site, provider, immutable ConfigMap, and versioned machine configuration. | `api/machina/v1alpha3/machineclass_types.go:65-116` | Keep provider settings behind a reference. Arbitrary provider-CR references are not implemented. |
 | Allocation inputs are immutable except for the one-way lifecycle intent. | `api/machina/v1alpha3/machineallocation_types.go:95-145` | Changes to an existing request cannot silently launch a different machine. |
-| Class resolution and pure identity planning are separate from long-running effects. | `pkg/machineops/capacity.go:15-109`, `:148-169` | Extend the existing SDK, not a new provider RPC service. |
-| A snapshot is persisted before launch, and launch ensures a Machine before creating HostAllocate. | `internal/capacity/allocation_launch.go:48-130`; `internal/capacity/allocation_controller.go:240-321` | The POC precreates an Unbounded Machine; late binding for inventory providers remains design work. |
+| Class resolution and pure identity planning are separate from long-running effects. | `pkg/machineops/capacity.go:15-74`, `:125-200` | Extend the existing SDK, not a new provider RPC service. |
+| A snapshot is persisted before launch, and launch ensures a Machine before creating HostAllocate. | `internal/machineops/allocation_launch.go:28-63`, `:413-444` | The POC precreates an Unbounded Machine; late binding for inventory providers remains design work. |
 | Karpenter creates one allocation named from the NodeClaim UID. | `plugins/karpenter/internal/provider/provider.go:59-197` | Create retries refer to the same durable request. |
 | Karpenter Delete writes release intent; confirmed release is reported separately. | `plugins/karpenter/internal/provider/inventory.go:177-230` | Accepted deletion is not proof that infrastructure is gone. |
-| Retirement fences the Machine and revokes bootstrap before checking release authorization. | `internal/capacity/allocation_release.go:158-212`, `:247-309` | Deletion, fencing, and safe release are distinct. |
-| Allocation-backed Machines reject HostReplace, HostPowerOff, and HostPowerOn even if the provider registers them. | `internal/machineops/allocation.go:64-96` | Provider capability and permission to operate on a particular Machine are separate; broader support needs lifecycle review. |
-| A recorded allocate operation cannot be silently replaced. | `internal/capacity/allocation_controller.go:247-262`; `internal/machineops/allocation.go:250-268` | Losing the recorded journal requires recovery, not another launch. |
-| Providers record actual attached resources, including results from failed allocation. | `cmd/azure-machine-ops-controller/internal/azurevm/capacity_allocate.go:554-614, :678-755`; AWSEC2 proof of concept, not in this repository | Cleanup cannot be derived from a naming convention alone. |
-| Related-object indexes and selective class watches limit reconciliation fan-out. | `internal/capacity/indexes.go:16-101`; `internal/capacity/setup.go:187-249` | An offering refresh must not wake every healthy allocation. |
-| Provider/Site selection gives controllers separate leader leases; only the Azure VM provider is registered. | `cmd/azure-machine-ops-controller/main.go:216-224, :323-332` | Providers can share code without sharing cloud credentials or a global leader. |
+| Retirement fences the Machine and revokes bootstrap before checking release authorization. | `internal/machineops/allocation_release.go:24-77`, `:98-167` | Deletion, fencing, and safe release are distinct. |
+| Allocation-backed Machines reject HostReplace, HostPowerOff, and HostPowerOn even if the provider registers them. | `internal/machineops/operation_allocation.go:861-880`; `internal/machineops/controller.go:152-154` | Provider capability and permission to operate on a particular Machine are separate; broader support needs lifecycle review. |
+| A recorded allocate operation cannot be silently replaced. | `internal/machineops/allocation_launch.go:389-400`, `:851-858`; `internal/machineops/operation_allocation.go:193-223` | Losing the recorded journal requires recovery, not another launch. |
+| Providers record actual attached resources, including results from failed allocation. | `cmd/azure-machine-ops-controller/internal/azurevm/capacity_allocate.go:557-617, :681-758`; AWSEC2 proof of concept, not in this repository | Cleanup cannot be derived from a naming convention alone. |
+| Watches map related objects to their allocations. The allocation controller has no field index and no selective class watch: every MachineClass event enqueues each allocation that names the class. Only the Karpenter plugin indexes allocations, by UID and consumer. | `internal/machineops/allocation_controller.go:538-622`; `plugins/karpenter/internal/provider/inventory.go:50-63` | An offering refresh must not wake every healthy allocation. The POC does not limit this fan-out yet. |
+| Provider/Site selection gives controllers separate leader leases; only the Azure VM provider is registered. | `cmd/azure-machine-ops-controller/main.go:216-223, :323-332` | Providers can share code without sharing cloud credentials or a global leader. |
 
 The earlier proposal used provider-specific CR references, illustrative
 `requests` and `offerings.items` fields, and a late-binding Machine model.
@@ -219,7 +219,7 @@ autoscaler patch.
 The revision excludes volatile offering observations. A change to launch
 configuration changes the revision; a timestamp refresh alone does not.
 Prices embedded in provider configuration can still change that configuration's
-hash. See `internal/capacity/class_controller.go:351-418`.
+hash. See `internal/machineops/class_inputs.go:42-53`, `:131-139`.
 
 ### 5.2 MachineAllocation: protected demand
 
@@ -477,16 +477,17 @@ both providers remained present while PDBs blocked drain, then released normally
 ### 9.2 Consumer loss is a separate path
 
 If the consumer is confirmed gone, no consumer remains to drain the node. The
-POC cordons orphan Nodes and checks their workloads and reported volume use.
-It deletes only Nodes with no blocking workload/storage observations, respects
-their finalizers, and waits for them to disappear before releasing the host.
+POC handles this in the Karpenter plugin. It cordons orphan Nodes and checks
+their workloads. It authorizes release only when no Node is registered for the
+allocation or no workload Pod is left on its cordoned Nodes, and it deletes the
+Nodes once release is authorized.
 Startup taints are not proof of safety; tolerating workloads can run there
-(`internal/capacity/allocation_release.go:280-429`).
+(`plugins/karpenter/internal/lifecycle/controller.go:303-476`).
 
 An orphan with real workloads requires operator intervention. The controller
 does not force eviction or clear another controller's finalizers. The regression
-test preserves the workload and blocks release until it is removed
-(`internal/capacity/orphan_test.go:103-144`).
+test holds the orphan while a workload Pod is on its Node
+(`plugins/karpenter/internal/lifecycle/controller_test.go:478-544`).
 
 ### 9.3 Cleanup means all owned effects
 
@@ -495,7 +496,7 @@ ENIs, volumes, reservations, and credentials that belong to the allocation.
 Record native identities while ownership is provable, including partial failure
 results. Read both allocation status and its UID-matched allocate operation so a
 delayed status copy does not lose cleanup evidence
-(`internal/machineops/allocation.go:135-244`).
+(`internal/machineops/operation_allocation.go:279-338`, `:356-377`).
 
 Names are insufficient: Azure created a suffixed NIC, and EC2 assigned native
 identities after launch. Missing metadata during creation requires observation,
@@ -513,7 +514,7 @@ The existing operation engine persists provider handles and polls them after
 restart. A crash between remote acceptance and saving the handle can still
 cause Begin to run again. Each adapter must explain how it recovers that window;
 a correlation string alone is not a recovery contract
-(`internal/machineops/resumable.go:29-175`).
+(`internal/machineops/resumable.go:31-123`, `:164-196`).
 
 | Event | Required behavior |
 | --- | --- |
@@ -529,8 +530,8 @@ a correlation string alone is not a recovery contract
 | Release cannot prove ownership or completion | Keep protection and expose the reason; no success-shaped fallback. |
 
 The recorded-operation fence is exercised with both ordinary and lagging-cache
-reads in `internal/capacity/allocate_fence_test.go:84-174`. It is also checked
-before provider Begin, so recreating the operation cannot bypass the controller.
+reads in `internal/machineops/allocation_controller_test.go:591-796`. It is also checked
+before provider Begin (`internal/machineops/operation_allocation.go:193-223`), so recreating the operation cannot bypass the controller.
 
 ### 10.1 What the AWS adapter taught us
 
@@ -667,10 +668,12 @@ The design must not require a whole-cluster or whole-account scan for each
 allocation. Use indexed relationships, targeted provider lookups, shared
 discovery caches, rate limits, and bounded concurrency.
 
-The POC already indexes allocations by UID, class, pending class, and consumer,
-and Nodes by provider ID. Revision changes can wake related allocations;
-offering changes wake pending allocations; timestamp-only refreshes do not fan
-out to healthy allocations (`internal/capacity/setup.go:187-249`).
+The POC does not do this yet for allocations. The allocation controller lists
+allocations from its cache for each watch event, and every MachineClass event
+wakes each allocation that names the class, healthy or not
+(`internal/machineops/allocation_controller.go:538-622`). Only the Karpenter
+plugin indexes allocations, by UID and consumer
+(`plugins/karpenter/internal/provider/inventory.go:50-63`).
 
 Keep bounded offerings in class status initially. Before expanding catalogs,
 define object-size and cardinality limits and reject oversize results explicitly.
@@ -751,8 +754,8 @@ plus both long-running allocation and release operations. A reboot-only
 provider must not advertise capacity; a capacity-only provider must not
 advertise unsupported power or replacement operations. The constructor and
 tests enforce the capacity bundle
-(`pkg/machineops/capacity.go:104-169`;
-`pkg/machineops/capacity_test.go:44-144`).
+(`pkg/machineops/capacity.go:125-173`, `:202-227`;
+`pkg/machineops/capacity_test.go:288-449`).
 
 #### Public callback signatures
 
@@ -777,8 +780,8 @@ type CleanupFunc func(context.Context, OperationRequest, OperationResult) error
 An existing-host operation chooses either one immediate `Execute` callback or
 a resumable `Begin`/`Poll` pair. `HostAllocate` and `HostRelease` always use
 Begin/Poll. Callback types and operation modes are defined in
-`pkg/machineops/provider.go:15-41`; discovery and planning types are in
-`pkg/machineops/capacity.go:87-95`.
+`pkg/machineops/provider.go:16-66`; discovery and planning types are in
+`pkg/machineops/capacity.go:15-74`.
 
 #### Example: one adapter supporting both families
 
@@ -844,7 +847,7 @@ HostReplace; a long-running operation receives it in Begin and in every Poll,
 because a provider that deletes the old host first creates the new one from
 Poll. Providers using an existing provider-owned Machine CR can
 optionally declare its GroupKind with `WithProviderMachineKind`
-(`pkg/machineops/provider.go:47-68`, `:140-220`).
+(`pkg/machineops/provider.go:77-98`, `:168-253`).
 
 #### Requests and results across the boundary
 
@@ -861,9 +864,9 @@ optionally declare its GroupKind with `WithProviderMachineKind`
 | `OperationResult` | Optional changed provider ID, cleanup identity, and allocation result. The shared controller applies the result. |
 | `AllocationResult` | Confirmed native resource ID, actual instance type/zone/image, and provably owned resources with native identities. A failed allocation may still report resources requiring release. |
 
-The full types are in `pkg/machineops/types.go:16-128` and
-`pkg/machineops/capacity.go:15-85`. The shared request builder supplies launch
-inputs only when needed (`internal/machineops/allocation.go:111-182`).
+The full types are in `pkg/machineops/types.go:16-146` and
+`pkg/machineops/capacity.go:15-123`. The shared request builder supplies launch
+inputs only when needed (`internal/machineops/operation_allocation.go:257-271`, `:533-554`).
 Resume tokens and status messages must not contain credentials or user data.
 For capacity, providers must be able to observe and release accepted effects
 using persisted identity/handles and the frozen authority, without depending
@@ -887,7 +890,7 @@ on a subsequently deleted class configuration.
    are retried; `PermanentError` stops retries. Poll can report a terminal
    failed outcome together with an allocation result for cleanup. Immediate
    Execute errors currently fail the operation; they do not use the same retry
-   contract (`internal/machineops/controller.go:224-227`).
+   contract (`internal/machineops/controller.go:237-240`).
 6. **Bound work.** Honor context cancellation, use bounded API calls and shared
    discovery caches, and return polling delays rather than waiting indefinitely
    inside a reconciliation. Do not add account-wide scans per allocation.
@@ -900,7 +903,7 @@ Consumer cancellation fences the allocation; the shared controller settles the
 original operation before release. A provider-observed `Canceled` outcome does
 not prove that partial resources are absent. Optional capabilities and stronger
 recovery guarantees remain subject to sections 10 and 17, not implied by these
-signatures (`internal/machineops/resumable.go:29-279`).
+signatures (`internal/machineops/resumable.go:31-259`).
 
 #### Capability does not bypass lifecycle policy
 
@@ -909,8 +912,8 @@ for every Machine in every state. The shared lifecycle authorizes dispatch.
 In the POC, allocation-backed Machines reject HostReplace, HostPowerOff, and
 HostPowerOn even while active. A fence blocks further host operations except
 release and observation of an already accepted allocation
-(`internal/machineops/allocation.go:64-96`;
-`internal/machineops/controller.go:142-144`).
+(`internal/machineops/operation_allocation.go:861-880`;
+`internal/machineops/controller.go:152-154`).
 
 Supporting power or replacement operations on those Machines needs an explicit
 policy for allocation identity, readiness, bootstrap, and old/new native-resource
@@ -926,7 +929,8 @@ Supply the same `[]*machineops.Provider` registrations to
 reconciliation. The latter selects registrations that declare capacity.
 Scope their provider, Site, credentials, configuration namespace, and consumer
 watch consistently; use one elected writer per scope
-(`pkg/machineops/controller/controller.go:27-84`, `:116-204`).
+(`pkg/machineops/controller/controller.go:23-112`;
+`pkg/machineops/controller/capacity.go:19-146`).
 
 The shared controllers own generic resource creation, snapshots, Machine/Node
 binding, fencing, and release authorization. The provider owns native effects
@@ -934,7 +938,7 @@ and observations. A provider-specific host CR is an optional backend model,
 not a replacement for that shared ownership boundary.
 
 The AzureVM POC already combines existing-host operations and capacity in one
-registration (`cmd/azure-machine-ops-controller/internal/azurevm/provider.go:64-89`;
+registration (`cmd/azure-machine-ops-controller/internal/azurevm/provider.go:63-88`;
 `cmd/azure-machine-ops-controller/internal/azurevm/capacity.go:88-100`). The AWSEC2
 POC registers capacity only; it does not implement host power or replacement
 operations (AWSEC2 proof of concept, not in this repository).

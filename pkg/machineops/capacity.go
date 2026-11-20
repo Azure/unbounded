@@ -139,6 +139,16 @@ type Capacity struct {
 // nothing for the allocation. Once it may have created something, it must
 // return a handle and report the failure, with the owned resources, through
 // Poll (see AllocationResult).
+//
+// HostAllocate differs from HostReplace in two ways. Its
+// AllocationRequest.UserData and ProviderConfig arrive only in Begin, so
+// Begin, not Poll, sends the create. And the engine cannot tell whether an
+// earlier call of a repeated Begin created a host, so it records a
+// PermanentError from a Begin that may have run before as OwnershipUnknown,
+// which holds the allocation for manual recovery. To keep a refusal that
+// created nothing a clean failure after a retried Begin, return a handle
+// that records the refusal and let Poll report Failed with an
+// AllocationResult.
 func WithCapacity(resolveClass ResolveClassFunc, planAllocation PlanAllocationFunc) ProviderOption {
 	return providerOptionFunc(func(provider *Provider) error {
 		if resolveClass == nil {

@@ -30,8 +30,11 @@ operation ignore it.
 
 `azure-machine-ops-controller` owns Azure VM host operations. Other providers
 run their own machine-ops controller. Today it maps `HostPowerOff`,
-`HostPowerOn`, and `HostHardReboot` to Azure VM APIs based on
-`Machine.spec.provider` and `Machine.spec.providerID`. For
+`HostPowerOn`, `HostHardReboot`, and `HostReplace` to Azure VM APIs. It finds
+the VM in `Machine.spec.host.azure.resourceID`, in
+`Machine.spec.host.external` with the provider `AzureVM`, or in the deprecated
+`Machine.spec.provider` and `Machine.spec.providerID` of a Machine with no
+`spec.host` owner. For
 `HostReplace`, a cloud provider implementation should delete and recreate the VM
 using the provider's API and inject the bootstrap configuration through
 cloud-init or an equivalent first-boot mechanism.
