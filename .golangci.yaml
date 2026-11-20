@@ -80,17 +80,17 @@ linters:
   settings:
     depguard:
       rules:
-        # internal/helpers packages are leaves: they import only the standard
-        # library and third-party modules, so depending on one never couples a
-        # component to another. See internal/helpers/AGENTS.md. The pattern is
-        # anchored to the repository root, so an internal/helpers directory
-        # inside a component's own tree is not covered.
+        # The more specific allow entries override the repository-wide deny.
         helpers:
+          list-mode: lax
           files:
             - "${config-path}/internal/helpers/**"
+          allow:
+            - github.com/Azure/unbounded/api/
+            - github.com/Azure/unbounded/internal/
           deny:
             - pkg: github.com/Azure/unbounded
-              desc: internal/helpers packages must not import code from this repository (see internal/helpers/AGENTS.md)
+              desc: shared helpers may import repository packages only from api/ or internal/
     errcheck:
       # Treat type assertion as erroneous operation, though assertions should be avoided in general.
       check-type-assertions: true

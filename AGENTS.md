@@ -6,82 +6,59 @@ and at the edge, without being limited by the location of your control plane.
 
 ## Repository Structure
 
-unbounded-kube is organized into several directories:
+This section says what each top-level directory is for. Look in the directory to see what it contains.
 
-- `api/` - where API definitions for custom resources are located.
-  - `machina/v1alpha3/` - Machine CRD types (unbounded-cloud.io group).
-  - `net/v1alpha1/` - Net CRD types (net.unbounded-cloud.io group): Site, GatewayPool, SitePeering, etc.
-- `bin/` - where generated binary artifacts should be placed.
+- `api/` - API types: Kubernetes CRD types and gRPC protobuf schemas, one directory per group and version, such as
+  `api/machina/v1alpha3/`. Run `make generate` after changing them.
+- `bin/` - build output.
 - `bpf/` - eBPF C programs for network encapsulation (compiled with clang).
-- `cmd/` - where the sources for each binary artifact are located. Each subdirectory corresponds to a binary artifact.
-  - `agent` - sources for the unbounded-agent.
-  - `azure-machine-ops-controller` - machine-ops controller for Azure and the reference for provider controllers; its provider is in its `internal/azurevm`.
-  - `gantry` - sources for the gantry peer-to-peer OCI distribution agent.
-  - `inventory` - sources for the inventory controller.
-  - `kubectl-unbounded` - sources for the `kubectl unbounded` plugin (includes `net` subcommand).
-  - `machina` - sources for the machina controller.
-  - `metalman` - sources for the metalman controller.
-  - `unbounded-net-controller` - sources for the unbounded-net network controller.
-  - `unbounded-net-node` - sources for the unbounded-net node agent.
-  - `unbounded-net-routeplan-debug` - debugging tool for route plans.
-  - `unping` - health check probe utility.
-  - `unroute` - eBPF route inspection utility.
-- `deploy/` - component manifests for deploying on a Kubernetes cluster.
-  - `machina/` - machina controller manifest templates (*.yaml.tmpl) plus generated CRDs under `crd/`; rendered output lives under `machina/rendered/` (gitignored, produced by `make machina-manifests`).
-  - `machine-ops/` - machine-ops controller manifests plus the MachineClass and MachineAllocation RBAC and admission policies; rendered by `make machine-ops-manifests`.
-  - `gantry/` - gantry DaemonSet, ConfigMap, and ServiceAccount manifests.
-  - `karpenter/` - rendered Karpenter plugin manifests under `karpenter/rendered/` (gitignored, produced by `make karpenter-manifests`); the template lives in the plugin module.
-  - `net/` - unbounded-net controller and node manifest templates (*.yaml.tmpl); rendered output lives under `net/rendered/` (gitignored, produced by `make net-manifests`).
-- `designs/` - design documents, proposals, and internal planning documentation for the project.
-- `docs/` - public web site documentation only. Do not place design documents, plans, or ad-hoc internal docs here.
-- `frontend/` - React/TypeScript web UI for network topology visualization (built with Vite).
-- `hack/` - where development tools and scripts are located.
-  - `cmd/` - development tools that are built as Go binaries (forge, render-manifests). `render-manifests` is a generic Go template renderer driven by repeatable `--set key=value` flags; templates rely on sprig's `default` for fallbacks.
-  - `scripts/` - operational and development shell scripts.
-  - `scratch/` - scratch space for quick go experiments.
-- `images/` - where OCI image definitions and related assets for building container images are located.
-- `e2e/` - end-to-end integration test suites.
-  - `gantry/` - kind-based e2e tests for gantry (guarded by `//go:build e2e`).
-- `internal/` - code shared by more than one component that no single component owns: project conventions
-  (`internal/<name>`) and small generic helpers (`internal/helpers/<name>`). Read `internal/AGENTS.md` before adding a
-  package here. Most packages here today are component code that #1175 moves into `cmd/<component>/`, for example:
-  - `gantry/` - gantry shared packages (21 sub-packages: config, mirror, transfer, discovery, coord, hrw, coldstart, members, metrics, etc.). Includes `internal/gantry/proto/coord/v1/` for the libp2p coordination RPC messages (pull intent, please-pull); kept under internal/ so the wire schema isn't an exported API surface.
-  - `net/` - unbounded-net shared packages (APIs, controllers, networking, metrics, webhooks, etc.).
-- `plugins/` - integrations that are their own Go modules because their upstream pins different library versions.
-  - `karpenter/` - the Unbounded Karpenter plugin: upstream Karpenter compiled with a cloud provider that uses only
-    MachineClass and MachineAllocation. It must not import the root module; it projects the API fields it uses and
-    checks them against the generated CRDs.
-- `tmp/` - project local temporary directory for intermediate stuff that will be cleaned up quickly.
+- `clients/` - client libraries in other languages, such as the Python Racer client and vLLM plugin in
+  `clients/python/`.
+- `cmd/` - one directory per component. See "Components" below.
+- `demo/` - example environment setups, such as `demo/nebius-ssh/`.
+- `deploy/` - Kubernetes manifests, one directory per component or plugin, such as `deploy/machina/`. `make help`
+  lists the `-manifests` targets that render them.
+- `designs/` - design documents and internal planning.
+- `docs/` - the public web site only. Do not put design documents or internal notes here.
+- `e2e/` - end-to-end tests, one directory per suite. Build them with `-tags e2e`.
+- `frontend/` - React/TypeScript web UI for network topology (built with Vite).
+- `hack/` - development tools and scripts. These are not components.
+  - `cmd/` - Go development tools, such as forge and `render-manifests`.
+  - `scripts/` - shell scripts.
+  - `scratch/` - space for quick Go experiments.
+- `images/` - container image definitions.
+- `internal/` - shared code that no single component owns. Read `internal/AGENTS.md` before adding anything here.
+- `pkg/` - Go libraries that other repositories import, such as `pkg/racersdk`. Export only what they need.
+- `plugins/` - integrations that are separate Go modules. `plugins/karpenter/` must not import the root module. It
+  keeps its own copy of the API fields it uses, and its tests check them against the generated CRDs.
+- `tmp/` - temporary files. Use it instead of `/tmp`.
 
-## Building and Testing
+### Components
 
-- `make` builds all binaries (kubectl-unbounded, forge, machina, and all net binaries).
-- To build `machina` use `make machina` which runs formatters, lint, tests, and go build.
-- To build `machina` without lint/test use `make machina-build` (used in Containerfiles).
-- To build `metalman` use `make metalman` which runs formatters, lint, tests, and builds the binary.
-- To build `metalman` without lint/test use `make metalman-build` (used in Containerfiles).
-- To build individual net binaries: `make unbounded-net-controller`, `make unbounded-net-node`, `make unbounded-net-routeplan-debug`, `make unping`, `make unroute`.
-- To build `gantry` use `make gantry` which runs tests and builds the binary.
-- To build `gantry` without lint/test use `make gantry-build` (used in Containerfiles).
-- The Karpenter plugin is a nested module, so the root `make fmt`, `make lint`, `make test` and `go build ./...` do not
-  cover it. Use `make karpenter` (lint, test, build), `make karpenter-fmt`, `make karpenter-test`,
-  `make karpenter-manifests` and `make image-karpenter-local`. Do not run `golangci-lint fmt` inside `plugins/`: it
-  resolves paths from the root config and reformats the whole repository.
-- Net-specific build tasks (container images, frontend, eBPF, render) are exposed via `net-` prefixed targets in the main `Makefile` (e.g., `make net-frontend`, `make net-ebpf-build`, `make net-ebpf-generate`, `make net-manifests`). Cluster deploy/undeploy targets live separately under `hack/net/` and are invoked via `make -C hack/net <target>` (e.g., `make -C hack/net deploy`). Run `make help` and `make -C hack/net help` for the full lists.
-- `make generate` runs `go generate ./...` to regenerate deepcopy, CRDs, and protobuf for all packages.
-- `make build` compiles all Go packages (`go build ./...`).
-- `make vulncheck` runs `govulncheck` and fails only on vulnerabilities that are both reachable from our code and have a final-release fix, since those are the ones a production module bump resolves. Reachable ones with no final fix are reported and allowed through; prerelease and Go pseudo-version fixes are also reported but do not block.
-- `make fmt` formats Go source (gofumpt + wsl_v5 blank-line rules); `make lint` runs golangci-lint; `make test` runs all tests.
-- `make test` runs through gotestsum: the output matches `go test -v`, and it ends with every skipped and failed test
-  and its reason. The JSON report is written to `tmp/go-test.json`, and CI turns it into the job summary. Other test
-  targets use `$(GOTEST)`, which also passes `-v`.
-- `make lint` runs the same checks locally and in CI and does NOT auto-fix. Always run `make fmt` before committing to satisfy the linter (gofumpt and wsl_v5 are enforced by `make lint`/CI); do not hand-format.
-- Locally `test` implies `lint`. In CI (`CI=1`), each runs independently.
+A component is one directory under `cmd/`, such as `cmd/machina` or `cmd/racer`. It can hold Go, Rust or both. The
+network binaries (`cmd/unbounded-net-*`, `cmd/unbounded-ipam`, `cmd/unping`, `cmd/unroute`) count as one component.
+
+Some component code still lives in `internal/` and `pkg/`. For example, `internal/gantry` belongs to `cmd/gantry`.
+#1175 moves it into `cmd/`.
+
+## Go
+
+Keep component code private by default. To share code, follow
+[Where new code goes](internal/AGENTS.md#where-new-code-goes).
+
+- Run `make fmt` before committing. `make test` runs lint and tests locally. `make build` compiles the root Go module.
+- Use `make help` for component targets and `make -C hack/net help` for network deployment commands.
+- Karpenter has its own Go module. Use `make karpenter-fmt` to format it and `make karpenter` to lint, test and build
+  it. Do not run `golangci-lint fmt` inside `plugins/`: it reformats the whole repository.
+
+## Rust
+
+- Keep Rust code and its test fixtures with the component that owns them.
+- Use `make help` to find formatting, Clippy, and test targets for the component you changed. If there is no target,
+  use the crate's own build or test instructions.
 
 ## Coding Standards
 
-- Do not cross cmd/ package boundaries. For example, `cmd/agent` should not import from `cmd/machina`. If you need to
-  share code between these packages, follow "Where new code goes" in `internal/AGENTS.md`.
 - Do not use em-dashes (`—`) in comments, strings, or any source/config files. Use a plain ASCII hyphen (`-`)
   or rephrase the sentence instead.
 - Write American English, not British. Use `behavior`, `initialize`, `labeled`, `catalog`, `defense`, `judgment`,
@@ -125,15 +102,13 @@ unbounded-kube is organized into several directories:
     - New dependencies with broad impact.
     - Destructive data or migration changes.
     - Removal of _test.go or Test* functions or subtests.
-    - Adding a project convention package, `internal/<name>` (see `internal/AGENTS.md`).
+    - Adding a project-wide convention in `internal/<name>`.
     - Proceeding when a design doc or comment contradicts the code.
 - **Never**
     - Commit secrets, credentials, or tokens.
     - Edit generated files by hand when a generation workflow exists.
     - Use destructive git operations unless explicitly requested.
-    - Add any other package under `internal/`, including sub-packages inside existing component trees such as
-      `internal/gantry/<new>`. Helpers under `internal/helpers/<name>` are the only exception (see
-      `internal/helpers/AGENTS.md`).
+    - Add a package under `internal/` unless it is an approved convention or a helper in `internal/helpers/<name>`.
     - Go outside the project boundary, for example, DO NOT edit files in user's home directories, add or edit files 
       in /tmp or anywhere else on the host filesystem.
 
