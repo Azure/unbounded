@@ -148,6 +148,13 @@ immutable manifest: a continuously changing origin can still prevent agreement,
 and a node cannot reconstruct object versions no longer returned by the origin.
 Matching listings otherwise re-list at `resyncInterval`.
 
+A plan-only fill edit, such as raising `maxFootprint` or changing `replicas`,
+reuses the valid manifest and listing schedule. Admission and the footprint are
+recomputed for the new generation before the view is exposed; `listedAt` still
+records the original listing completion. Changing prefixes, the named cache,
+the cache UID, or the container URL invalidates the manifest and schedules a new
+listing. A listing from a superseded container URL cannot replace the new plan.
+
 This trades independent listing per participating process for no manifest wire
 format, ConfigMap, or manifest-distribution RBAC. Listing needs a credential with list
 permission on the container, which is broader than blob read. The cache's existing

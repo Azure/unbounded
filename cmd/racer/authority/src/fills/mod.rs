@@ -45,6 +45,8 @@ pub(crate) struct ListingState {
     primary_manifest: Option<(String, String)>,
     /// Earliest retry of a successful listing that differs from the primary.
     converge_after: Option<Instant>,
+    /// Resolved source identity, independent of plan-only fill spec edits.
+    origin: Option<racer_wire::control::AzureContainerUrl>,
 }
 
 /// Local dataplane publication inputs for fill admission and listing. Ordinary
@@ -108,7 +110,7 @@ pub struct FillView {
     pub error: Option<String>,
     /// Prefixes from the spec.
     pub(crate) prefixes: Vec<String>,
-    /// Generation the current manifest was listed for.
+    /// Generation the current manifest is valid for, including plan-only edits.
     pub(crate) listed_generation: Option<u64>,
     /// Cache UID the current manifest was listed against.
     pub(crate) listed_cache_uid: String,
@@ -196,13 +198,14 @@ impl FillView {
             listing: ListingState {
                 primary_manifest: primary_manifest(v, generation),
                 converge_after: None,
+                origin: None,
             },
         })
     }
 
     /// Whether this process needs to list the origin now. A successful digest
     /// mismatch can bring resync forward, but never overrides failure backoff.
-    /// Spec and cache identity changes clear the deadline and manifest.
+    /// Source identity changes clear the deadline and manifest.
     fn needs_list(&self, now: Instant, primary: bool, cache_uid: &str) -> bool {
         self.next_list.is_none_or(|at| now >= at)
             || (!primary
@@ -265,7 +268,8 @@ pub async fn watch(shared: Rc<Shared>) {
 }
 
 /// Carry the process-local listing and admission state from an existing view
-/// into a newly read spec. A changed generation or cache resets the manifest.
+/// into a newly read spec. Only source identity changes reset the manifest;
+/// plan-only generation edits reuse the listing and get fresh admission.
 fn adopt(mut view: FillView, old: &FillView) -> FillView {
     view.cache_uid = old.cache_uid.clone();
     view.manifest = old.manifest.clone();
@@ -280,7 +284,8 @@ fn adopt(mut view: FillView, old: &FillView) -> FillView {
     view.next_list = old.next_list;
     view.failures = old.failures;
     view.listing.converge_after = old.listing.converge_after;
-    if old.generation != view.generation || old.cache_name != view.cache_name {
+    view.listing.origin = old.listing.origin.clone();
+    if old.prefixes != view.prefixes || old.cache_name != view.cache_name {
         view.manifest = None;
         view.error = None;
         view.listed_generation = None;
@@ -288,6 +293,11 @@ fn adopt(mut view: FillView, old: &FillView) -> FillView {
         view.next_list = None;
         view.failures = 0;
         view.listing.converge_after = None;
+        view.listing.origin = None;
+    } else if old.listed_generation == Some(old.generation) {
+        // The object set is unchanged by replicas, footprint, or resync edits.
+        // Mark it current for the new plan without fabricating a new listedAt.
+        view.listed_generation = Some(view.generation);
     }
     view
 }
@@ -330,6 +340,7 @@ async fn watch_fills(shared: Rc<Shared>) {
                     .any(|v| kube::str_at(v, &["metadata", "uid"]) == uid.as_str())
             });
         }
+        recompute(&shared);
         shared.fills_synced.set(true);
         backoff = 1;
         drop(items);
@@ -386,6 +397,9 @@ fn apply_fill(shared: &Shared, event: &str, v: &Value) {
         view = adopt(view, old);
     }
     fills.insert(uid, view);
+    drop(fills);
+    // Apply the new plan and all process-wide admission policy in one turn.
+    recompute(shared);
 }
 
 async fn watch_caches(shared: Rc<Shared>) {
@@ -414,6 +428,7 @@ async fn watch_caches(shared: Rc<Shared>) {
                 caches.insert(info.uid.clone(), info);
             }
         }
+        recompute(&shared);
         shared.fills_caches_synced.set(true);
         backoff = 1;
         drop(items);
@@ -461,6 +476,8 @@ fn apply_cache(shared: &Shared, event: &str, v: &Value) {
     } else {
         caches.insert(info.uid.clone(), info);
     }
+    drop(caches);
+    recompute(shared);
 }
 
 /// One process's listing loop. It never runs in a Kubernetes watch, so a slow
@@ -522,6 +539,7 @@ async fn list_fills(shared: Rc<Shared>) {
                 };
                 if !view.listing_current(generation, &cache_uid)
                     || !should_list(&shared, &cache_uid)
+                    || !listing_origin_current(&shared, view, &url)
                 {
                     continue;
                 }
@@ -565,6 +583,18 @@ async fn list_fills(shared: Rc<Shared>) {
 enum ListingFailure {
     Invalid(ManifestError),
     Origin(azure::ListError),
+}
+
+/// A cache may change its origin while a list is in flight without changing the
+/// fill generation or cache UID. Never install a result from that old source.
+fn listing_origin_current(
+    shared: &Shared,
+    view: &FillView,
+    url: &racer_wire::control::AzureContainerUrl,
+) -> bool {
+    let caches = shared.fills_caches.borrow();
+    matches!(catalog::fill_cache_named(&view.cache_name, &caches),
+        FillCache::Usable { uid, origin, .. } if uid == view.cache_uid && origin.azure.container_url == *url)
 }
 
 fn listing_failed(shared: &Shared, view: &mut FillView, failure: ListingFailure, now: Instant) {
@@ -666,10 +696,17 @@ impl Admission {
         view.membership = self.membership;
         let origin = catalog::fill_cache_named(&view.cache_name, caches);
         match &origin {
-            FillCache::Usable { uid, .. } => {
+            FillCache::Usable { uid, origin, .. } => {
                 let cache_changed = view.cache_uid != *uid;
+                let origin_changed = view
+                    .listing
+                    .origin
+                    .as_ref()
+                    .is_some_and(|url| url != &origin.azure.container_url);
+                view.listing.origin = Some(origin.azure.container_url.clone());
                 view.cache_uid.clone_from(uid);
                 if cache_changed
+                    || origin_changed
                     || (!view.listed_cache_uid.is_empty()
                         && view.listed_cache_uid != view.cache_uid)
                 {
@@ -1095,6 +1132,7 @@ mod tests {
                 ));
                 let mut json = fill_json("");
                 json["metadata"]["generation"] = serde_json::json!(view.generation + 1);
+                json["spec"]["prefixes"] = serde_json::json!(["changed/"]);
                 let changed = adopt(FillView::from_json(&json).unwrap(), &view);
                 assert!(changed.needs_list(now, false, &view.cache_uid));
                 assert!(changed.manifest.is_none());
@@ -1483,6 +1521,97 @@ mod tests {
     }
 
     #[test]
+    fn footprint_only_generation_edits_keep_the_manifest_and_recheck_admission_atomically() {
+        crate::kube::fake::run(|_api, kube| async move {
+            let shared = crate::shared::tests::shared(kube);
+            let now = rt::now();
+            let view = listed_view(now);
+            let uid = view.uid.clone();
+            let cache_uid = view.cache_uid.clone();
+            let manifest = view.manifest.clone().unwrap();
+            let deadline = view.next_list;
+            shared.fills.borrow_mut().insert(uid.clone(), view);
+            apply_cache(
+                &shared,
+                "ADDED",
+                &serde_json::json!({
+                    "metadata": {"uid": cache_uid, "name": "models"},
+                    "spec": {"origin": {"azure": {"containerURL":
+                        "https://acct.blob.core.windows.net/models"}}},
+                }),
+            );
+            assert!(shared.fills.borrow()[&uid].accepted);
+            // Both raising an admitted budget and recovering from a too-small
+            // budget reuse the exact same manifest and listing schedule.
+            for (generation, budget, accepted) in [
+                (1, 2_000_000_000u64, true),
+                (2, 1, false),
+                (3, 2_000_000_000, true),
+            ] {
+                let mut json = fill_json("");
+                json["metadata"]["generation"] = serde_json::json!(generation);
+                json["spec"]["maxFootprint"] = serde_json::json!(budget);
+                apply_fill(&shared, "MODIFIED", &json);
+                let fills = shared.fills.borrow();
+                let current = &fills[&uid];
+                assert_eq!(current.generation, generation);
+                assert_eq!(current.listed_generation, Some(generation));
+                assert_eq!(current.accepted, accepted);
+                assert!(Arc::ptr_eq(current.manifest.as_ref().unwrap(), &manifest));
+                assert_eq!(current.next_list, deadline);
+                assert!(!current.needs_list(now, false, &cache_uid));
+                assert_eq!(
+                    current.planned_footprint_bytes,
+                    Some(manifest::planned_footprint(
+                        &manifest,
+                        shared.config.page_size.get(),
+                        current.replicas
+                    ))
+                );
+                let status = status::status(current, &BTreeMap::new(), None);
+                assert_eq!(status["observedGeneration"], generation);
+                assert_eq!(status["manifest"]["digest"], manifest.digest);
+                assert!(
+                    status["conditions"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|c| c["type"] == "Listed"
+                            && c["status"] == "True"
+                            && c["observedGeneration"] == generation)
+                );
+            }
+            let mut replicas = fill_json("");
+            replicas["metadata"]["generation"] = serde_json::json!(4);
+            replicas["spec"]["replicas"] = serde_json::json!(3);
+            apply_fill(&shared, "MODIFIED", &replicas);
+            {
+                let fills = shared.fills.borrow();
+                assert!(Arc::ptr_eq(
+                    fills[&uid].manifest.as_ref().unwrap(),
+                    &manifest
+                ));
+                assert_eq!(fills[&uid].listed_generation, Some(4));
+                assert_eq!(
+                    fills[&uid].planned_footprint_bytes,
+                    Some(manifest::planned_footprint(
+                        &manifest,
+                        shared.config.page_size.get(),
+                        3
+                    ))
+                );
+            }
+            let mut changed_prefix = fill_json("different/");
+            changed_prefix["metadata"]["generation"] = serde_json::json!(5);
+            apply_fill(&shared, "MODIFIED", &changed_prefix);
+            let fills = shared.fills.borrow();
+            assert!(fills[&uid].manifest.is_none());
+            assert_eq!(fills[&uid].listed_generation, None);
+            assert!(fills[&uid].needs_list(now, false, &cache_uid));
+        });
+    }
+
+    #[test]
     fn unpublished_pools_do_not_reserve_report_slots() {
         crate::kube::fake::run(|_api, kube| async move {
             let shared = crate::shared::tests::shared(kube);
@@ -1510,6 +1639,42 @@ mod tests {
                     .count(),
                 16
             );
+        });
+    }
+
+    #[test]
+    fn changing_the_origin_under_the_same_cache_uid_invalidates_the_manifest_and_inflight_list() {
+        crate::kube::fake::run(|_api, kube| async move {
+            let shared = crate::shared::tests::shared(kube);
+            let now = rt::now();
+            let view = listed_view(now);
+            let uid = view.uid.clone();
+            let cache_uid = view.cache_uid.clone();
+            shared.fills.borrow_mut().insert(uid.clone(), view);
+            let mut cache = serde_json::json!({
+                "metadata": {"uid": cache_uid, "name": "models"},
+                "spec": {"origin": {"azure": {"containerURL":
+                    "https://acct.blob.core.windows.net/models"}}},
+            });
+            apply_cache(&shared, "ADDED", &cache);
+            let old_url = racer_wire::control::AzureContainerUrl::parse(
+                "https://acct.blob.core.windows.net/models",
+            )
+            .unwrap();
+            assert!(listing_origin_current(
+                &shared,
+                &shared.fills.borrow()[&uid],
+                &old_url
+            ));
+            cache["spec"]["origin"]["azure"]["containerURL"] =
+                serde_json::json!("https://other.blob.core.windows.net/models");
+            apply_cache(&shared, "MODIFIED", &cache);
+            let fills = shared.fills.borrow();
+            let view = &fills[&uid];
+            assert_eq!(view.cache_uid, cache_uid);
+            assert!(view.manifest.is_none());
+            assert!(view.needs_list(now, false, &cache_uid));
+            assert!(!listing_origin_current(&shared, view, &old_url));
         });
     }
 
