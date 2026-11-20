@@ -466,7 +466,11 @@ impl Index {
         let segments = pins.segments.clone().ok_or(Error::InvalidConfiguration)?;
         let old = pins.entries.get(&key);
         let previous_deadline = old.map(|pin| pin.monotonic);
-        let members = old.map_or_else(|| pages.clone(), |pin| pin.pages.union(pages));
+        let members: std::collections::BTreeSet<_> = old
+            .into_iter()
+            .flat_map(|pin| pin.pages.iter().copied())
+            .chain(pages.iter())
+            .collect();
         if members.is_empty() {
             return Ok(super::pins::PinEpoch(state.pages.last_hold_id()));
         }
@@ -480,7 +484,7 @@ impl Index {
         // budget, and whether any joining page still needs an append.
         let mut resident_segments = HashSet::default();
         let mut needs_new_segment = false;
-        for number in members.iter() {
+        for number in members.iter().copied() {
             page.number = number;
             let location = state.pages.location(&page);
             if let Some(location) = &location {
@@ -572,15 +576,15 @@ impl Index {
                 .or_insert_with(|| super::pins::Pin {
                     until,
                     monotonic,
-                    pages: super::holds::HoldPages::default(),
+                    pages: std::collections::BTreeSet::new(),
                     holders: HashMap::default(),
-                    ids: Vec::new(),
+                    ids: std::collections::HashSet::new(),
                 });
             pin.until = until;
             pin.monotonic = monotonic;
             pin.pages = members;
             if let Some((id, slots)) = joined.take() {
-                pin.ids.push(id);
+                pin.ids.insert(id);
                 for ((page, slot), counted) in joining.iter().zip(slots).zip(&counted) {
                     pin.holders.insert(
                         page.number,
@@ -626,7 +630,7 @@ impl Index {
             .entries
             .get(&(fill, version.clone()))
             .filter(|pin| pin.live(&self.clock))
-            .map(|pin| pin.pages.clone())
+            .map(|pin| pin.pages.iter().copied().collect())
             .ok_or(Error::Unavailable)?;
         self.reserve_pin_inner(fill, version, &pages, until, false)
             .map(drop)
@@ -2778,6 +2782,52 @@ mod tests {
         let pins = index.pins.borrow();
         assert!(pins.entries.is_empty());
         assert!(pins.expirations.is_empty());
+    }
+
+    #[test]
+    fn pagewise_pin_release_removes_only_its_member_and_disk_hold() {
+        use super::super::pins::FillId;
+        let env = racer_io::Env::host();
+        let segments = Rc::new(segments(1024, 8));
+        let index = Rc::new(index(&env, 512));
+        index.set_page_capacity(512).unwrap();
+        index.set_pin_capacity_percent(100).unwrap();
+        let _clock = SegmentClock::new(index.clone(), segments, 1);
+        let version = descriptor("pagewise-release", 17).version;
+        let until = env.ctx.clock.wall_now() + std::time::Duration::from_secs(60);
+        let mut epochs = Vec::new();
+        for number in 0..256 {
+            epochs.push(
+                index
+                    .reserve_pin_pages(FillId(1), &version, &page_set(&[number]), until)
+                    .unwrap(),
+            );
+        }
+        // Release alternating low/high pages, not just a removable prefix.
+        let order: Vec<_> = (0..128).flat_map(|number| [number, 255 - number]).collect();
+        for (removed, number) in order.into_iter().enumerate() {
+            index.release_pin_pages(
+                FillId(1),
+                &version,
+                &page_set(&[number]),
+                epochs[number as usize],
+            );
+            let pins = index.pins.borrow();
+            let remaining = 255 - removed;
+            assert_eq!(pins.members, remaining);
+            assert_eq!(index.state.borrow().pages.holds_unused(), remaining);
+            if remaining == 0 {
+                assert!(pins.entries.is_empty());
+                assert!(pins.expirations.is_empty());
+            } else {
+                let pin = &pins.entries[&(FillId(1), version.clone())];
+                assert_eq!(pin.pages.len(), remaining);
+                assert_eq!(pin.holders.len(), remaining);
+                assert_eq!(pin.ids.len(), remaining);
+                assert!(!pin.pages.contains(&crate::model::PageNumber(number)));
+            }
+        }
+        assert!(index.pins.borrow().page_fills.is_empty());
     }
 
     #[test]

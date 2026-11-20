@@ -11,7 +11,7 @@ use crate::runtime::HashMap;
 use page_alloc::SegmentId;
 use page_alloc::Segments;
 use page_alloc::disk_index::{HoldId, PageSlot};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -49,11 +49,11 @@ pub(super) struct Pin {
     pub until: SystemTime,
     pub monotonic: Instant,
     /// Pages this fill promised to retain.
-    pub pages: super::holds::HoldPages,
+    pub pages: BTreeSet<PageNumber>,
     /// Holders per member page; the keys are exactly `pages`.
     pub holders: HashMap<PageNumber, PinHolder>,
     /// Live disk index holds of this entry.
-    pub ids: Vec<HoldId>,
+    pub ids: HashSet<HoldId>,
 }
 
 impl Pin {
@@ -244,7 +244,7 @@ impl Pins {
         self.holders_of(page).any(|fill| {
             self.entries
                 .get(&(fill, page.version.clone()))
-                .is_some_and(|pin| pin.live(clock) && pin.pages.contains(page.number))
+                .is_some_and(|pin| pin.live(clock) && pin.pages.contains(&page.number))
         })
     }
 
@@ -252,7 +252,7 @@ impl Pins {
     pub fn expiry(&self, page: &PageId, clock: &racer_io::Clock) -> Option<SystemTime> {
         self.holders_of(page)
             .filter_map(|fill| self.entries.get(&(fill, page.version.clone())))
-            .filter(|pin| pin.live(clock) && pin.pages.contains(page.number))
+            .filter(|pin| pin.live(clock) && pin.pages.contains(&page.number))
             .map(|pin| pin.until)
             .max()
     }
@@ -325,15 +325,14 @@ impl Pins {
             }
             start = end;
         }
-        if !gone.is_empty() {
-            pin.ids.retain(|held| gone.binary_search(held).is_err());
+        for id in &gone {
+            pin.ids.remove(id);
         }
-        let holders = &pin.holders;
-        let before = pin.pages.len();
-        pin.pages.retain(|page| holders.contains_key(&page));
-        let removed = before - pin.pages.len();
+        for number in &dropped {
+            assert!(pin.pages.remove(number), "holder must be a pin member");
+        }
         let empty = pin.pages.is_empty();
-        self.members -= removed;
+        self.members -= dropped.len();
         for id in gone {
             self.owners.remove(&id);
         }
@@ -356,7 +355,7 @@ impl Pins {
         };
         self.forget_deadline(key, pin.monotonic);
         self.members -= pin.pages.len();
-        for number in pin.pages.iter() {
+        for number in pin.pages.iter().copied() {
             self.forget_member(&key.1, number, key.0);
         }
         let segments: Vec<_> = pin
