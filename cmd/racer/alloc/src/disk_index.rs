@@ -31,6 +31,12 @@
 //! and cache lists, plus 8 for the publish-order (age) list that
 //! [`AgeCursor`] walks.
 //!
+//! Pin and joint protection charges are incremental. Each entry transition
+//! changes at most two segment references (old record and unpublished append),
+//! or one missing-page promise. Admission visits only proposed slots; append
+//! tests only its selected segment. Binding an index to an allocation table
+//! walks its segment metadata once, and dropping it returns those references.
+//!
 //! # Callers
 //!
 //! The racer storage worker (`src/store/pages.rs`) interns `PageId -> PageSlot`
@@ -41,8 +47,10 @@
 //! release cannot drop a newer holder. Live hold expiry uses [`Monotonic`]
 //! deadlines only; restart recomputes them from persisted wall times.
 
+use crate::segments::Protection;
 use crate::{Error, Extent, Generation, Result, SegmentId, SegmentLease, SegmentState, Segments};
 use std::collections::{BTreeMap, BTreeSet};
+use std::{cell::RefCell, rc::Rc};
 
 /// Maximum caches a disk index tracks at once: the bound on live [`CacheIdx`] values.
 pub const MAX_CACHES: usize = 4096;
@@ -233,6 +241,8 @@ struct Entry {
 
     holders: u16,
 
+    pins: u16,
+
     cache: u16,
 
     flags: u8,
@@ -251,6 +261,7 @@ impl Entry {
         age_prev: NIL,
         age_next: NIL,
         holders: 0,
+        pins: 0,
         cache: 0,
         flags: 0,
     };
@@ -295,6 +306,10 @@ struct SegmentMeta {
     writes: u32,
 
     heat: u32,
+
+    pin_refs: usize,
+
+    held_refs: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -335,6 +350,8 @@ struct Hold {
     until: Monotonic,
 
     slots: Vec<PageSlot>,
+
+    pinned: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -369,7 +386,14 @@ pub struct DiskIndex {
 
     pin_limit: usize,
 
-    pin_slots: Vec<PageSlot>,
+    protection: Option<Rc<RefCell<Protection>>>,
+
+    pin_missing: usize,
+
+    protection_missing: usize,
+
+    #[cfg(test)]
+    protection_visits: std::cell::Cell<usize>,
 
     protection_limit: usize,
 
@@ -408,7 +432,11 @@ impl DiskIndex {
             holds_unused: 0,
             writing_segments: BTreeMap::new(),
             pin_limit: usize::MAX,
-            pin_slots: Vec::new(),
+            protection: None,
+            pin_missing: 0,
+            protection_missing: 0,
+            #[cfg(test)]
+            protection_visits: std::cell::Cell::new(0),
             protection_limit: usize::MAX,
             hand: 0,
             age_head: NIL,
@@ -441,7 +469,9 @@ impl DiskIndex {
     /// Apply `change` to a slot and keep the hold and capacity counters exact.
     fn update<T>(&mut self, slot: PageSlot, change: impl FnOnce(&mut Self) -> T) -> T {
         let before = self.entries[slot.0 as usize].contribution();
+        self.protection_delta(slot, false);
         let result = change(self);
+        self.protection_delta(slot, true);
         let after = self.entries[slot.0 as usize].contribution();
         match (before.0, after.0) {
             (false, true) => self.holds_unused += 1,
@@ -462,6 +492,81 @@ impl DiskIndex {
             _ => {}
         }
         result
+    }
+
+    /// At most two locations belong to a page during a replacement. A page
+    /// whose append has no location yet charges one whole missing segment.
+    fn protected_locations(&self, slot: PageSlot) -> ([Option<u32>; 2], bool) {
+        let entry = &self.entries[slot.0 as usize];
+        let stored = entry.stored().then_some(entry.segment);
+        let writing = self.writing_segments.get(&slot).map(|id| id.0 as u32);
+        let writing = writing.filter(|id| Some(*id) != stored);
+        ([stored, writing], stored.is_none() && writing.is_none())
+    }
+
+    fn protection_delta(&mut self, slot: PageSlot, add: bool) {
+        let entry = &self.entries[slot.0 as usize];
+        let pin = entry.pins != 0;
+        let held = entry.holders != 0 || pin;
+        if !held {
+            return;
+        }
+        let (locations, missing) = self.protected_locations(slot);
+        for id in locations.into_iter().flatten() {
+            let meta = &mut self.segments[id as usize];
+            if add {
+                meta.pin_refs += usize::from(pin);
+                meta.held_refs += 1;
+            } else {
+                meta.pin_refs -= usize::from(pin);
+                meta.held_refs -= 1;
+            }
+            if let Some(protection) = &self.protection {
+                protection
+                    .borrow_mut()
+                    .refs(id as usize, usize::from(pin), 1, add);
+            }
+        }
+        if missing {
+            if add {
+                self.pin_missing += usize::from(pin);
+                self.protection_missing += 1;
+            } else {
+                self.pin_missing -= usize::from(pin);
+                self.protection_missing -= 1;
+            }
+            if let Some(protection) = &self.protection {
+                protection.borrow_mut().missing(usize::from(pin), 1, add);
+            }
+        }
+    }
+
+    fn bind_protection(&mut self, segments: &Segments) -> Result<Rc<RefCell<Protection>>> {
+        let protection = segments.protection();
+        if let Some(old) = &self.protection {
+            return if Rc::ptr_eq(old, &protection) {
+                Ok(protection)
+            } else {
+                Err(Error::InvalidConfiguration)
+            };
+        }
+        if self
+            .segments
+            .iter()
+            .skip(segments.count())
+            .any(|meta| meta.held_refs != 0)
+        {
+            return Err(Error::Corrupt);
+        }
+        {
+            let mut shared = protection.borrow_mut();
+            for (id, meta) in self.segments.iter().take(segments.count()).enumerate() {
+                shared.refs(id, meta.pin_refs, meta.held_refs, true);
+            }
+            shared.missing(self.pin_missing, self.protection_missing, true);
+        }
+        self.protection = Some(protection.clone());
+        Ok(protection)
     }
 
     fn links(&mut self, slot: u32, list: List) -> (&mut u32, &mut u32) {
@@ -819,8 +924,8 @@ impl DiskIndex {
             cache,
             pinned: _,
         } = ticket;
-        self.writing_segments.remove(&slot);
         self.update(slot, |this| {
+            this.writing_segments.remove(&slot);
             this.entries[slot.0 as usize].flags &= !INFLIGHT
         });
         self.caches[usize::from(cache.idx.0)].inflight -= 1;
@@ -846,36 +951,30 @@ impl DiskIndex {
             return Err((ticket, Error::InvalidConfiguration));
         }
         let pinned = ticket.pinned;
-        let pins_page = pinned || self.pin_slots.binary_search(&ticket.slot).is_ok();
-        let (pin_segments, pin_missing) = if pins_page {
-            match self.protection_parts(segments, &self.pin_slots, false) {
-                Ok(parts) => parts,
-                Err(error) => return Err((ticket, error)),
-            }
-        } else {
-            (BTreeSet::new(), BTreeSet::new())
+        let protection = match self.bind_protection(segments) {
+            Ok(protection) => protection,
+            Err(error) => return Err((ticket, error)),
         };
-        let protects_page = self.is_held(ticket.slot) || pins_page;
-        let (protected, missing) = if protects_page {
-            match self.protection_parts(segments, &[], true) {
-                Ok(parts) => parts,
-                Err(error) => return Err((ticket, error)),
-            }
-        } else {
-            (BTreeSet::new(), BTreeSet::new())
-        };
+        let entry = &self.entries[ticket.slot.0 as usize];
+        let pins_page = pinned || entry.pins != 0;
+        let protects_page = entry.holders != 0 || pins_page;
+        let missing = self.protected_locations(ticket.slot).1;
+        let pin_missing = missing && entry.pins != 0;
+        let held_missing = missing && (entry.holders != 0 || entry.pins != 0);
         let (lease, extent) = match segments.append_in_checked(length, pinned, |id, _| {
+            #[cfg(test)]
+            self.protection_visits.set(self.protection_visits.get() + 1);
+            let shared = protection.borrow();
             if pins_page
-                && pin_segments.len() + pin_missing.len()
-                    - usize::from(pin_missing.contains(&ticket.slot))
-                    + usize::from(!pin_segments.contains(&id.0))
+                && shared.pin_segments + shared.pin_missing - usize::from(pin_missing)
+                    + usize::from(!shared.active(id.0 as usize, true))
                     > self.pin_limit
             {
                 return Err(Error::Busy);
             }
             if protects_page
-                && protected.len() + missing.len() - usize::from(missing.contains(&ticket.slot))
-                    + usize::from(!protected.contains(&id.0))
+                && shared.held_segments + shared.held_missing - usize::from(held_missing)
+                    + usize::from(!shared.active(id.0 as usize, false))
                     > self.protection_limit
             {
                 return Err(Error::Busy);
@@ -886,7 +985,9 @@ impl DiskIndex {
             Err(error) => return Err((ticket, error)),
         };
         self.segments[lease.id().0 as usize].writes += 1;
-        self.writing_segments.insert(ticket.slot, lease.id());
+        self.update(ticket.slot, |this| {
+            this.writing_segments.insert(ticket.slot, lease.id());
+        });
         let location = RecordLocation {
             segment: lease.id(),
             generation: lease.generation(),
@@ -964,6 +1065,7 @@ impl DiskIndex {
             return Err(Error::Corrupt);
         }
         segments.validate(segment, generation, &extent)?;
+        self.bind_protection(segments)?;
         self.store(
             slot,
             cache.idx,
@@ -1042,13 +1144,6 @@ impl DiskIndex {
         self.pin_limit = limit;
     }
 
-    /// Current pin promises, including pages that have not appended yet.
-    pub fn set_pin_slots(&mut self, mut slots: Vec<PageSlot>) {
-        slots.sort_unstable();
-        slots.dedup();
-        self.pin_slots = slots;
-    }
-
     /// Joint hard-hold and pin cap, leaving the worker's free reserve reclaimable.
     pub fn set_protection_limit(&mut self, limit: usize) {
         self.protection_limit = limit;
@@ -1056,54 +1151,77 @@ impl DiskIndex {
 
     /// Charge distinct segments plus one segment for each page still awaiting
     /// an append. Multiple reservations of the same page share that charge.
-    pub fn pin_charge(&self, segments: &Segments, slots: &[PageSlot]) -> Result<usize> {
-        let (protected, missing) = self.protection_parts(segments, slots, false)?;
-        Ok(protected.len() + missing.len())
+    pub fn pin_charge(&mut self, segments: &Segments, slots: &[PageSlot]) -> Result<usize> {
+        self.projected_charge(segments, slots, true)
     }
 
     /// Distinct protected segments and outstanding page promises across both
     /// classes. A shared page or resident segment is charged only once.
-    pub fn protection_charge(&self, segments: &Segments, slots: &[PageSlot]) -> Result<usize> {
-        let (protected, missing) = self.protection_parts(segments, slots, true)?;
-        Ok(protected.len() + missing.len())
+    pub fn protection_charge(&mut self, segments: &Segments, slots: &[PageSlot]) -> Result<usize> {
+        self.projected_charge(segments, slots, false)
     }
 
-    fn protection_parts(
-        &self,
+    fn projected_charge(
+        &mut self,
         segments: &Segments,
         slots: &[PageSlot],
-        include_holds: bool,
-    ) -> Result<(BTreeSet<u64>, BTreeSet<PageSlot>)> {
-        let mut protected = BTreeSet::new();
-        for id in 0..segments.count() {
-            let id = SegmentId(id as u64);
-            if segments.pinned(id)? {
-                protected.insert(id.0);
-            }
-        }
+        pin: bool,
+    ) -> Result<usize> {
+        let protection = self.bind_protection(segments)?;
+        let shared = protection.borrow();
+        let mut additional = BTreeSet::new();
         let mut missing = BTreeSet::new();
-        let held = self
-            .holds
-            .values()
-            .filter(|_| include_holds)
-            .flat_map(|hold| &hold.slots);
-        for slot in slots.iter().chain(held) {
+        for slot in slots {
+            #[cfg(test)]
+            self.protection_visits.set(self.protection_visits.get() + 1);
             let entry = self.entry(*slot)?;
-            if let Some(segment) = self.writing_segments.get(slot) {
-                protected.insert(segment.0);
+            if entry.pins != 0 || (!pin && entry.holders != 0) {
+                continue;
             }
-            if entry.stored() {
-                protected.insert(u64::from(entry.segment));
-            } else if !self.writing_segments.contains_key(slot) {
+            let (locations, absent) = self.protected_locations(*slot);
+            for id in locations.into_iter().flatten() {
+                if id as usize >= segments.count() {
+                    return Err(Error::Corrupt);
+                }
+                if !shared.active(id as usize, pin) {
+                    additional.insert(id);
+                }
+            }
+            if absent {
                 missing.insert(*slot);
             }
         }
-        Ok((protected, missing))
+        let base = if pin {
+            shared.pin_segments + shared.pin_missing
+        } else {
+            shared.held_segments + shared.held_missing
+        };
+        Ok(base + additional.len() + missing.len())
     }
 
     /// Hold `slots` until `until`. Held stored records keep their segments
     /// from eviction; held slots not stored or in flight count as unused.
     pub fn hold(&mut self, slots: &[PageSlot], until: Monotonic, now: Monotonic) -> Result<HoldId> {
+        self.hold_in(slots, until, now, false)
+    }
+
+    /// Like a spill hold, but also owns the page's pin-budget reference.
+    pub fn hold_pinned(
+        &mut self,
+        slots: &[PageSlot],
+        until: Monotonic,
+        now: Monotonic,
+    ) -> Result<HoldId> {
+        self.hold_in(slots, until, now, true)
+    }
+
+    fn hold_in(
+        &mut self,
+        slots: &[PageSlot],
+        until: Monotonic,
+        now: Monotonic,
+        pinned: bool,
+    ) -> Result<HoldId> {
         if until <= now {
             return Err(Error::InvalidConfiguration);
         }
@@ -1116,12 +1234,23 @@ impl DiskIndex {
             }
         }
         for slot in &slots {
-            self.update(*slot, |this| this.entries[slot.0 as usize].holders += 1);
+            self.update(*slot, |this| {
+                let entry = &mut this.entries[slot.0 as usize];
+                entry.holders += 1;
+                entry.pins += u16::from(pinned);
+            });
         }
         self.next_hold += 1;
         let id = HoldId(self.next_hold);
         self.expiry.insert((until, id));
-        self.holds.insert(id, Hold { until, slots });
+        self.holds.insert(
+            id,
+            Hold {
+                until,
+                slots,
+                pinned,
+            },
+        );
         Ok(id)
     }
 
@@ -1137,9 +1266,13 @@ impl DiskIndex {
         Ok(())
     }
 
-    fn drop_slots(&mut self, slots: &[PageSlot]) {
+    fn drop_slots(&mut self, slots: &[PageSlot], pinned: bool) {
         for slot in slots {
-            self.update(*slot, |this| this.entries[slot.0 as usize].holders -= 1);
+            self.update(*slot, |this| {
+                let entry = &mut this.entries[slot.0 as usize];
+                entry.holders -= 1;
+                entry.pins -= u16::from(pinned);
+            });
         }
     }
 
@@ -1147,7 +1280,7 @@ impl DiskIndex {
     pub fn release_hold(&mut self, id: HoldId) -> Result<()> {
         let hold = self.holds.remove(&id).ok_or(Error::Stale)?;
         self.expiry.remove(&(hold.until, id));
-        self.drop_slots(&hold.slots);
+        self.drop_slots(&hold.slots, hold.pinned);
         Ok(())
     }
 
@@ -1185,12 +1318,13 @@ impl DiskIndex {
                 keep
             });
         }
+        let pinned = hold.pinned;
         if hold.slots.is_empty() {
             let until = hold.until;
             self.holds.remove(&id);
             self.expiry.remove(&(until, id));
         }
-        self.drop_slots(&released);
+        self.drop_slots(&released, pinned);
         Ok(())
     }
 
@@ -1216,7 +1350,7 @@ impl DiskIndex {
             }
             let hold = self.holds.remove(&id).expect("expiry tracks live holds");
             self.expiry.remove(&(until, id));
-            self.drop_slots(&hold.slots);
+            self.drop_slots(&hold.slots, hold.pinned);
             expired_hold(id, &hold.slots);
             expired += 1;
         }
@@ -1291,7 +1425,7 @@ impl DiskIndex {
     pub fn can_evict(&self, segment: SegmentId) -> bool {
         self.segments
             .get(segment.0 as usize)
-            .is_some_and(|meta| meta.writes == 0 && meta.held == 0)
+            .is_some_and(|meta| meta.writes == 0 && meta.held_refs == 0)
     }
 
     /// Stored entries in `segment`, most recently stored first. Callers bound
@@ -1442,13 +1576,36 @@ impl DiskIndex {
         let mut segments = vec![(0u32, 0u64, 0u32); self.segments.len()];
         let mut caches = vec![(0u32, 0u64); self.caches.len()];
         let mut holders = vec![0u16; self.entries.len()];
+        let mut pins = vec![0u16; self.entries.len()];
+        let mut protection_refs = vec![(0usize, 0usize); self.segments.len()];
+        let mut pin_missing = 0;
+        let mut held_missing = 0;
         for hold in self.holds.values() {
             for slot in &hold.slots {
                 holders[slot.0 as usize] += 1;
+                pins[slot.0 as usize] += u16::from(hold.pinned);
             }
         }
         for (slot, entry) in self.entries.iter().enumerate() {
             assert_eq!(entry.holders, holders[slot]);
+            assert_eq!(entry.pins, pins[slot]);
+            if entry.holders != 0 {
+                let mut locations = BTreeSet::new();
+                if entry.stored() {
+                    locations.insert(entry.segment);
+                }
+                if let Some(id) = self.writing_segments.get(&PageSlot(slot as u32)) {
+                    locations.insert(id.0 as u32);
+                }
+                if locations.is_empty() {
+                    pin_missing += usize::from(entry.pins != 0);
+                    held_missing += 1;
+                }
+                for id in locations {
+                    protection_refs[id as usize].0 += usize::from(entry.pins != 0);
+                    protection_refs[id as usize].1 += 1;
+                }
+            }
             occupied += usize::from(entry.flags != 0);
             unused += usize::from(entry.holders != 0 && entry.flags == 0);
             if entry.stored() {
@@ -1463,7 +1620,10 @@ impl DiskIndex {
         }
         assert_eq!(occupied, self.occupied);
         assert_eq!(unused, self.holds_unused);
+        assert_eq!(self.pin_missing, pin_missing);
+        assert_eq!(self.protection_missing, held_missing);
         for (index, meta) in self.segments.iter().enumerate() {
+            assert_eq!((meta.pin_refs, meta.held_refs), protection_refs[index]);
             assert_eq!((meta.entries, meta.bytes, meta.held), segments[index]);
             let mut walked = 0;
             let mut cursor = meta.head;
@@ -1499,6 +1659,63 @@ impl DiskIndex {
         assert_eq!((walked, prev), (stored, self.age_tail));
         for cursor in self.cursors {
             assert!(cursor == NIL || self.entries[cursor as usize].stored());
+        }
+    }
+
+    /// Independent slow oracle: reconstruct protection sets from raw entries,
+    /// pending locations, and physical flags, not the incremental counters.
+    #[cfg(test)]
+    fn check_protection(&mut self, segments: &Segments) {
+        self.check_invariants();
+        let mut physical = BTreeSet::new();
+        for id in 0..segments.count() {
+            if segments.pinned(SegmentId(id as u64)).unwrap() {
+                physical.insert(id as u64);
+            }
+        }
+        assert_eq!(physical.len(), segments.pinned_count());
+        for pin in [false, true] {
+            let mut protected = physical.clone();
+            let mut missing = 0;
+            for (slot, entry) in self.entries.iter().enumerate() {
+                if if pin {
+                    entry.pins == 0
+                } else {
+                    entry.holders == 0
+                } {
+                    continue;
+                }
+                let writing = self.writing_segments.get(&PageSlot(slot as u32));
+                if entry.stored() {
+                    protected.insert(u64::from(entry.segment));
+                }
+                if let Some(id) = writing {
+                    protected.insert(id.0);
+                }
+                if !entry.stored() && writing.is_none() {
+                    missing += 1;
+                }
+            }
+            let actual = if pin {
+                self.pin_charge(segments, &[])
+            } else {
+                self.protection_charge(segments, &[])
+            };
+            assert_eq!(actual, Ok(protected.len() + missing));
+        }
+    }
+}
+
+impl Drop for DiskIndex {
+    fn drop(&mut self) {
+        if let Some(protection) = &self.protection {
+            let mut shared = protection.borrow_mut();
+            for (id, meta) in self.segments.iter().enumerate() {
+                if meta.held_refs != 0 {
+                    shared.refs(id, meta.pin_refs, meta.held_refs, false);
+                }
+            }
+            shared.missing(self.pin_missing, self.protection_missing, false);
         }
     }
 }
@@ -1674,7 +1891,9 @@ mod tests {
         let segments = segments(4);
         let mut index = DiskIndex::new(8, 8, 4).unwrap();
         index.set_pin_limit(2);
-        index.set_pin_slots(vec![PageSlot(0), PageSlot(1)]);
+        index
+            .hold_pinned(&[PageSlot(0), PageSlot(1)], Monotonic(10), Monotonic(0))
+            .unwrap();
         let cache = index.add_cache(CacheIdx(0)).unwrap();
         write_pinned(&mut index, &segments, 0, cache, SEGMENT as usize).unwrap();
         assert_eq!(segments.pinned_count(), 1);
@@ -2477,7 +2696,11 @@ mod tests {
                         .map(|_| PageSlot(rng.below(SLOTS as usize) as u32))
                         .collect();
                     let until = Monotonic(now.0 + 1 + rng.below(50) as u64);
-                    let id = index.hold(&slots, until, now).unwrap();
+                    let id = if rng.below(2) == 0 {
+                        index.hold(&slots, until, now).unwrap()
+                    } else {
+                        index.hold_pinned(&slots, until, now).unwrap()
+                    };
                     model
                         .holds
                         .insert(id, (until, slots.iter().map(|s| s.0).collect()));
@@ -2590,6 +2813,7 @@ mod tests {
                     || model.inflight.values().any(|c| c == cache)
             });
             model.check(&index, SLOTS, SEGMENTS as u64);
+            index.check_protection(&segments);
         }
         for ticket in tickets {
             index.cancel(ticket);
@@ -2611,5 +2835,252 @@ mod tests {
         }
         // Published, expired, evicted, caches removed, replaced, stale publications.
         assert!(cfg!(miri) || seen.iter().all(|n| *n > 0), "{seen:?}");
+    }
+
+    #[test]
+    fn protection_lifecycle_matches_slow_sets() {
+        let segments = segments(8);
+        let mut index = DiskIndex::new(16, 16, 8).unwrap();
+        let mut cache = index.add_cache(CacheIdx(0)).unwrap();
+        let spill = index
+            .hold(&[PageSlot(0), PageSlot(1)], Monotonic(20), Monotonic(0))
+            .unwrap();
+        let pin = index
+            .hold_pinned(&[PageSlot(1), PageSlot(2)], Monotonic(30), Monotonic(0))
+            .unwrap();
+        let shared = index
+            .hold_pinned(&[PageSlot(2)], Monotonic(40), Monotonic(0))
+            .unwrap();
+        index.check_protection(&segments);
+        assert_eq!(index.pin_charge(&segments, &[]), Ok(2));
+        assert_eq!(index.protection_charge(&segments, &[]), Ok(3));
+        for stale_publication in [false, true] {
+            let ticket = index.reserve_pinned(PageSlot(2), cache, true).unwrap();
+            let (lease, writing) = index.append(&segments, ticket, 512).unwrap();
+            index.check_protection(&segments);
+            if stale_publication {
+                let written = index.write_complete(writing);
+                index.check_protection(&segments);
+                assert!(!index.remove_cache(cache, 16, |_, _| {}).unwrap());
+                assert_eq!(index.publish(written), Err(Error::Stale));
+                cache = index.add_cache(CacheIdx(0)).unwrap();
+            } else {
+                index.write_failed(writing);
+            }
+            index.check_protection(&segments);
+            // A failed append owns a physical pin until its completion lease
+            // drains, while its still-live promise is missing again.
+            assert_eq!(index.pin_charge(&segments, &[]), Ok(3));
+            drop(lease);
+            index.check_protection(&segments);
+            assert_eq!(index.pin_charge(&segments, &[]), Ok(2));
+        }
+        write_pinned(&mut index, &segments, 1, cache, 512).unwrap();
+        let old = index.get(PageSlot(1)).unwrap().location;
+        write_pinned(&mut index, &segments, 1, cache, SEGMENT as usize).unwrap();
+        index.check_protection(&segments);
+        segments.clear_pinned(old.segment()).unwrap();
+        index.check_protection(&segments);
+        let location = index.get(PageSlot(1)).unwrap().location;
+        assert!(index.remove_if(PageSlot(1), &old).is_none());
+        assert!(index.remove_if(PageSlot(1), &location).is_some());
+        index.check_protection(&segments);
+        segments.clear_pinned(location.segment()).unwrap();
+        index.check_protection(&segments);
+        index.release_hold_slots(pin, &[PageSlot(2)]).unwrap();
+        assert_eq!(
+            index.pin_charge(&segments, &[]),
+            Ok(2),
+            "shared pin survives"
+        );
+        index.release_hold(shared).unwrap();
+        index.check_protection(&segments);
+        assert_eq!(index.pin_charge(&segments, &[]), Ok(1));
+        index
+            .extend_hold(spill, Monotonic(25), Monotonic(0))
+            .unwrap();
+        assert_eq!(index.expire_holds(Monotonic(25), 1), 1);
+        index.check_protection(&segments);
+        assert_eq!(index.protection_charge(&segments, &[]), Ok(1));
+        assert_eq!(index.expire_holds(Monotonic(40), 1), 1);
+        index.check_protection(&segments);
+        assert_eq!(index.protection_charge(&segments, &[]), Ok(0));
+    }
+
+    #[test]
+    fn completed_held_append_is_protected_before_publication() {
+        let segments = segments(2);
+        let mut index = DiskIndex::new(4, 4, 2).unwrap();
+        let cache = index.add_cache(CacheIdx(0)).unwrap();
+        let hold = index
+            .hold(&[PageSlot(0)], Monotonic(10), Monotonic(0))
+            .unwrap();
+        let ticket = index.reserve(PageSlot(0), cache).unwrap();
+        let (lease, writing) = index.append(&segments, ticket, SEGMENT as usize).unwrap();
+        let written = index.write_complete(writing);
+        assert!(!index.can_evict(lease.id()));
+        assert_eq!(
+            index.reclaim(
+                &segments,
+                ReclaimBudget {
+                    free_reserve: 2,
+                    max_visits: 8,
+                    max_entries: 8
+                },
+                |_, _| panic!("held publication evicted")
+            ),
+            Err(Error::Busy)
+        );
+        index.check_protection(&segments);
+        index.publish(written).unwrap();
+        drop(lease);
+        index.release_hold(hold).unwrap();
+        index
+            .reclaim(
+                &segments,
+                ReclaimBudget {
+                    free_reserve: 2,
+                    max_visits: 8,
+                    max_entries: 8,
+                },
+                |_, _| {},
+            )
+            .unwrap();
+        index.check_protection(&segments);
+    }
+
+    #[test]
+    fn protection_tracks_deferred_clears_index_drop_and_recovery() {
+        let segments = segments(4);
+        let mut index = DiskIndex::new(8, 8, 4).unwrap();
+        let cache = index.add_cache(CacheIdx(0)).unwrap();
+        let pin = index
+            .hold_pinned(&[PageSlot(0)], Monotonic(10), Monotonic(0))
+            .unwrap();
+        write_pinned(&mut index, &segments, 0, cache, SEGMENT as usize).unwrap();
+        index.check_protection(&segments);
+        let location = index.get(PageSlot(0)).unwrap().location;
+        let images = segments.snapshot();
+        let frozen = segments.freeze().unwrap();
+        index.release_hold(pin).unwrap();
+        assert_eq!(segments.clear_pinned(location.segment()), Err(Error::Busy));
+        index.check_protection(&segments);
+        assert_eq!(index.pin_charge(&segments, &[]), Ok(1));
+        drop(frozen);
+        segments.clear_pinned(location.segment()).unwrap();
+        index.check_protection(&segments);
+        assert_eq!(index.pin_charge(&segments, &[]), Ok(0));
+        // Recovery uses a new disk index. Its predecessor must not leave
+        // references in the allocation table's shared accounting authority.
+        index
+            .hold_pinned(&[PageSlot(0), PageSlot(1)], Monotonic(10), Monotonic(0))
+            .unwrap();
+        drop(index);
+        segments.restore(images).unwrap();
+        segments.clear_pinned_flags();
+        let mut recovered = DiskIndex::new(8, 8, 4).unwrap();
+        let cache = recovered.add_cache(CacheIdx(0)).unwrap();
+        recovered
+            .restore(
+                &segments,
+                PageSlot(0),
+                cache,
+                location.segment(),
+                location.generation(),
+                location.extent(),
+            )
+            .unwrap();
+        recovered.check_protection(&segments);
+        assert_eq!(recovered.protection_charge(&segments, &[]), Ok(0));
+        let hold = recovered
+            .hold(&[PageSlot(0)], Monotonic(10), Monotonic(0))
+            .unwrap();
+        recovered.check_protection(&segments);
+        assert_eq!(recovered.protection_charge(&segments, &[]), Ok(1));
+        recovered.release_hold(hold).unwrap();
+        let pin = recovered
+            .hold_pinned(&[PageSlot(1)], Monotonic(10), Monotonic(0))
+            .unwrap();
+        let ticket = recovered.reserve_pinned(PageSlot(1), cache, true).unwrap();
+        let (lease, writing) = recovered.append(&segments, ticket, 512).unwrap();
+        recovered.write_failed(writing);
+        recovered.release_hold(pin).unwrap();
+        drop(recovered);
+        assert_eq!(segments.pinned_count(), 1);
+        drop(lease);
+        assert_eq!(segments.pinned_count(), 0);
+        let mut empty = DiskIndex::new(8, 8, 4).unwrap();
+        empty.check_protection(&segments);
+        assert_eq!(empty.protection_charge(&segments, &[]), Ok(0));
+    }
+
+    #[test]
+    fn pagewise_protection_work_is_linear_for_pending_and_stored_pins() {
+        for count in [128usize, 256] {
+            let segments = segments(count + 1);
+            let mut index = DiskIndex::new((count * 2) as u32, count * 2, count + 1).unwrap();
+            index.set_pin_limit(count);
+            index.set_protection_limit(count);
+            let cache = index.add_cache(CacheIdx(0)).unwrap();
+            for slot in 0..count as u32 {
+                assert!(index.pin_charge(&segments, &[PageSlot(slot)]).unwrap() <= count);
+                assert!(
+                    index
+                        .protection_charge(&segments, &[PageSlot(slot)])
+                        .unwrap()
+                        <= count
+                );
+                index
+                    .hold_pinned(&[PageSlot(slot)], Monotonic(10), Monotonic(0))
+                    .unwrap();
+            }
+            assert_eq!(index.protection_visits.get(), count * 2);
+            for slot in 0..count as u32 {
+                write_pinned(&mut index, &segments, slot, cache, 512).unwrap();
+            }
+            assert_eq!(index.protection_visits.get(), count * 3);
+            index.check_protection(&segments);
+            assert_eq!(index.pin_charge(&segments, &[]), Ok(count.div_ceil(8)));
+            for slot in count as u32..(count * 2 - 1) as u32 {
+                assert!(index.pin_charge(&segments, &[PageSlot(slot)]).unwrap() <= count);
+                assert!(
+                    index
+                        .protection_charge(&segments, &[PageSlot(slot)])
+                        .unwrap()
+                        <= count
+                );
+                index
+                    .hold_pinned(&[PageSlot(slot)], Monotonic(10), Monotonic(0))
+                    .unwrap();
+                write_pinned(&mut index, &segments, slot, cache, 512).unwrap();
+            }
+            assert_eq!(index.protection_visits.get(), count * 3 + (count - 1) * 3);
+            index.check_protection(&segments);
+        }
+    }
+
+    #[test]
+    fn protection_binding_and_drop_keep_independent_index_owners() {
+        let foreign = segments(4);
+        let segments = segments(4);
+        let mut first = DiskIndex::new(4, 4, 4).unwrap();
+        let mut second = DiskIndex::new(4, 4, 4).unwrap();
+        first
+            .hold_pinned(&[PageSlot(0)], Monotonic(10), Monotonic(0))
+            .unwrap();
+        second
+            .hold_pinned(&[PageSlot(0)], Monotonic(10), Monotonic(0))
+            .unwrap();
+        assert_eq!(first.pin_charge(&segments, &[]), Ok(1));
+        assert_eq!(second.pin_charge(&segments, &[]), Ok(2));
+        assert_eq!(
+            first.pin_charge(&foreign, &[]),
+            Err(Error::InvalidConfiguration)
+        );
+        drop(first);
+        assert_eq!(second.pin_charge(&segments, &[]), Ok(1));
+        drop(second);
+        let mut empty = DiskIndex::new(4, 4, 4).unwrap();
+        assert_eq!(empty.protection_charge(&segments, &[]), Ok(0));
     }
 }

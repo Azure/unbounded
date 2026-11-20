@@ -102,6 +102,8 @@ struct PinnedAppend {
     generation: Rc<Cell<u64>>,
 
     position: usize,
+
+    protection: Rc<RefCell<Protection>>,
 }
 
 impl SegmentLease {
@@ -169,6 +171,10 @@ impl Drop for SegmentLease {
             .generation
             .set(pinned.generation.get().wrapping_add(1));
         slot.image.pinned = false;
+        pinned
+            .protection
+            .borrow_mut()
+            .physical(pinned.position, false);
         if pinned.pinned_open.get() == Some(pinned.position) {
             if slot.image.state == SegmentState::Open {
                 slot.image.state = SegmentState::Sealed;
@@ -275,6 +281,76 @@ pub struct Segments {
     /// Bumped by every mutable borrow of `slots` and canceled pinned append.
     /// Shared with append leases so their drops cannot bypass checkpoint tracking.
     generation: Rc<Cell<u64>>,
+
+    protection: Rc<RefCell<Protection>>,
+}
+
+#[derive(Debug, Default)]
+struct ProtectedSegment {
+    physical: bool,
+    pins: usize,
+    held: usize,
+}
+
+/// Shared allocation authority for physical flags and disk-index promises.
+/// Indexes add/remove their own references; lease cancellation may change a
+/// physical flag after its index has been dropped.
+#[derive(Debug, Default)]
+pub(crate) struct Protection {
+    segments: Vec<ProtectedSegment>,
+    pub(crate) physical_count: usize,
+    pub(crate) pin_segments: usize,
+    pub(crate) held_segments: usize,
+    pub(crate) pin_missing: usize,
+    pub(crate) held_missing: usize,
+}
+
+impl Protection {
+    pub(crate) fn active(&self, id: usize, pin: bool) -> bool {
+        let segment = &self.segments[id];
+        segment.physical
+            || if pin {
+                segment.pins != 0
+            } else {
+                segment.held != 0
+            }
+    }
+
+    fn change(&mut self, id: usize, change: impl FnOnce(&mut ProtectedSegment)) {
+        let before = (self.active(id, true), self.active(id, false));
+        change(&mut self.segments[id]);
+        let after = (self.active(id, true), self.active(id, false));
+        self.pin_segments = self.pin_segments + usize::from(after.0) - usize::from(before.0);
+        self.held_segments = self.held_segments + usize::from(after.1) - usize::from(before.1);
+    }
+
+    fn physical(&mut self, id: usize, value: bool) {
+        let old = self.segments[id].physical;
+        self.change(id, |segment| segment.physical = value);
+        self.physical_count = self.physical_count + usize::from(value) - usize::from(old);
+    }
+
+    pub(crate) fn refs(&mut self, id: usize, pins: usize, held: usize, add: bool) {
+        self.change(id, |segment| {
+            if add {
+                segment.pins += pins;
+                segment.held += held;
+            } else {
+                segment.pins -= pins;
+                segment.held -= held;
+            }
+        });
+    }
+
+    pub(crate) fn missing(&mut self, pins: usize, held: usize, add: bool) {
+        if add {
+            self.pin_missing += pins;
+            self.held_missing += held;
+        } else {
+            self.pin_missing -= pins;
+            self.held_missing -= held;
+        }
+    }
 }
 
 impl Segments {
@@ -294,6 +370,7 @@ impl Segments {
             evicting: Cell::new(0),
             usage: RefCell::new(Vec::new()),
             generation: Rc::new(Cell::new(0)),
+            protection: Rc::new(RefCell::new(Protection::default())),
         }
     }
 
@@ -405,6 +482,8 @@ impl Segments {
         let geometry = SegmentGeometry::new(capacity, self.segment_bytes, count as u64, alignment)
             .map_err(|_| Error::InvalidConfiguration)?;
         self.geometry.set(Some(geometry));
+        self.protection.borrow_mut().segments =
+            (0..count).map(|_| ProtectedSegment::default()).collect();
         *self.slots_mut() = (0..count)
             .map(|id| Slot {
                 usage_group: 0,
@@ -509,6 +588,7 @@ impl Segments {
         if pinned {
             slot.pinned_pending += 1;
             slot.image.pinned = true;
+            self.protection.borrow_mut().physical(position, true);
         }
         slot.image.used_bytes = used_bytes;
         self.usage.borrow_mut()[slot.usage_group].1 += length as u64;
@@ -555,6 +635,7 @@ impl Segments {
                 pinned_open: self.pinned_open.clone(),
                 generation: self.generation.clone(),
                 position,
+                protection: self.protection.clone(),
             })
         });
         let pinned = match pinned {
@@ -784,6 +865,9 @@ impl Segments {
             slot.pinned_published = image.pinned;
             slot.pinned_charged = false;
             slot.image = image;
+            self.protection
+                .borrow_mut()
+                .physical(slot.image.id.0 as usize, slot.is_pinned());
         }
         self.restore_epoch.set(epoch);
         Ok(())
@@ -854,11 +938,11 @@ impl Segments {
 
     /// Segments currently reserved for or charged to the pinned page class.
     pub fn pinned_count(&self) -> usize {
-        self.slots
-            .borrow()
-            .iter()
-            .filter(|slot| slot.is_pinned())
-            .count()
+        self.protection.borrow().physical_count
+    }
+
+    pub(crate) fn protection(&self) -> Rc<RefCell<Protection>> {
+        self.protection.clone()
     }
 
     /// Inspect a valid slot without granting mutation or lease authority.
@@ -905,6 +989,7 @@ impl Segments {
             }
             SegmentState::Free | SegmentState::Evicting => return Err(Error::Corrupt),
         }
+        self.protection.borrow_mut().physical(position, true);
         Ok(())
     }
 
@@ -929,6 +1014,7 @@ impl Segments {
             }
         }
         slot.image.pinned = false;
+        self.protection.borrow_mut().physical(position, false);
         Ok(())
     }
 
@@ -942,6 +1028,9 @@ impl Segments {
             slot.pinned_pending = 0;
             slot.pinned_published = false;
             slot.pinned_charged = false;
+            self.protection
+                .borrow_mut()
+                .physical(slot.image.id.0 as usize, false);
         }
     }
 }

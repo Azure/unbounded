@@ -166,30 +166,7 @@ impl PageTicket {
                 .count()
                 .saturating_sub(self.index.holds.borrow().free_reserve.max(1)),
         );
-        // Ordinary unprotected writes need no pin-table walk. Each protected
-        // append refreshes this synchronous budget view before using it.
-        let members: Vec<_> = if self.pinned
-            || pins
-                .page_fills
-                .get(&page.version)
-                .is_some_and(|pages| pages.contains_key(&page.number))
-        {
-            pins.page_fills
-                .iter()
-                .flat_map(|(version, pages)| {
-                    pages.keys().map(|number| PageId {
-                        version: version.clone(),
-                        number: *number,
-                    })
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        self.index
-            .state_mut()
-            .pages
-            .set_pin_limit(limit, &members)?;
+        self.index.state_mut().pages.set_pin_limit(limit)?;
         self.index.state_mut().pages.set_protection_limit(
             segments
                 .count()
@@ -585,18 +562,7 @@ impl Index {
         let segment_limit = (segments.count() * pins.percent / 100)
             .min(segments.count().saturating_sub(free_reserve));
         if !joining.is_empty() {
-            let mut committed: HashSet<PageId> = joining.iter().cloned().collect();
-            for (version, pages) in &pins.page_fills {
-                for number in pages.keys() {
-                    committed.insert(PageId {
-                        version: version.clone(),
-                        number: *number,
-                    });
-                }
-            }
-            let projected = state
-                .pages
-                .pin_charge(&segments, &committed.into_iter().collect::<Vec<_>>())?;
+            let projected = state.pages.pin_charge(&segments, &joining)?;
             if projected > segment_limit {
                 return Err(Error::Overloaded);
             }
@@ -629,7 +595,7 @@ impl Index {
         let joined = if joining.is_empty() {
             None
         } else {
-            Some(state.pages.hold(
+            Some(state.pages.hold_pinned(
                 &joining,
                 page_alloc::disk_index::Monotonic(u64::MAX),
                 page_alloc::disk_index::Monotonic(0),

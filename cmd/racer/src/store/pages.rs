@@ -204,18 +204,13 @@ impl Pages {
                 None => missing += 1,
             }
         }
-        Ok(inner.disk.borrow().pin_charge(segments, &slots)? + missing)
+        Ok(inner.disk.borrow_mut().pin_charge(segments, &slots)? + missing)
     }
 
-    pub fn set_pin_limit(&mut self, limit: usize, pages: &[PageId]) -> Result<()> {
+    pub fn set_pin_limit(&mut self, limit: usize) -> Result<()> {
         let inner = self.inner_mut()?;
-        let slots = pages
-            .iter()
-            .filter_map(|page| inner.slots.get(page))
-            .collect();
         let mut disk = inner.disk.borrow_mut();
         disk.set_pin_limit(limit);
-        disk.set_pin_slots(slots);
         Ok(())
     }
 
@@ -238,7 +233,11 @@ impl Pages {
                 None => missing += 1,
             }
         }
-        Ok(inner.disk.borrow().protection_charge(segments, &slots)? + missing)
+        Ok(inner
+            .disk
+            .borrow_mut()
+            .protection_charge(segments, &slots)?
+            + missing)
     }
 
     /// Interned page capacity.
@@ -627,6 +626,25 @@ impl Pages {
         until: Monotonic,
         now: Monotonic,
     ) -> Result<(HoldId, Vec<PageSlot>)> {
+        self.hold_in(pages, until, now, false)
+    }
+
+    pub fn hold_pinned(
+        &mut self,
+        pages: &[PageId],
+        until: Monotonic,
+        now: Monotonic,
+    ) -> Result<(HoldId, Vec<PageSlot>)> {
+        self.hold_in(pages, until, now, true)
+    }
+
+    fn hold_in(
+        &mut self,
+        pages: &[PageId],
+        until: Monotonic,
+        now: Monotonic,
+        pinned: bool,
+    ) -> Result<(HoldId, Vec<PageSlot>)> {
         let inner = self.inner_mut()?;
         let mut slots = Vec::with_capacity(pages.len());
         for page in pages {
@@ -638,7 +656,11 @@ impl Pages {
                 }
             }
         }
-        let held = inner.disk.borrow_mut().hold(&slots, until, now);
+        let held = if pinned {
+            inner.disk.borrow_mut().hold_pinned(&slots, until, now)
+        } else {
+            inner.disk.borrow_mut().hold(&slots, until, now)
+        };
         match held {
             Ok(id) => Ok((id, slots)),
             Err(error) => {
