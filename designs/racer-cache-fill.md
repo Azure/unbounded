@@ -72,7 +72,7 @@ status:
     listedAt: "2026-11-19T10:00:00Z"
   footprintBytes: 151000000000
   residentBytes: 150000000000
-  underReplicatedBytes: 0
+  underReplicatedBytes: 1000000000
   nodes: 8
   conditions: [...]
 ```
@@ -82,9 +82,9 @@ Defaults and validation:
 | Field | Default | Limits |
 | --- | --- | --- |
 | `spec.cacheName` | required | immutable; must name an existing `ClusterCache` |
-| `spec.prefixes` | required | 1 to 16 entries, each at most 1024 bytes; empty string selects the whole container |
+| `spec.prefixes` | required | 1 to 16 distinct entries, each at most 1024 Unicode characters; overlapping prefixes allowed; empty string selects the whole container |
 | `spec.replicas` | 2 | 1 to 3 |
-| `spec.maxFootprint` | required | positive bytes |
+| `spec.maxFootprint` | required | positive int64 byte count, expressed as a YAML number |
 | `spec.resyncInterval` | 1h | 1m to 24h |
 
 `maxFootprint` counts pinned payload, not object size: every object's length
@@ -92,12 +92,17 @@ rounded up to a page, times `replicas`, summed. Actual disk use can be higher
 because a pinned segment keeps its unused tail until the last pin in it is
 released; `RACER_PINNED_SEGMENT_PERCENT` bounds that overhead. A selection that
 would exceed `maxFootprint` is rejected with `ExceedsMaxFootprint`; it is never
-truncated.
+truncated. This checks the fill's own limit, not available cluster capacity;
+each node enforces its local pin budget separately.
 
 ## Listing and the manifest
 
 Every process lists each fill's origin independently, with the cache's
 credential:
+
+Prefixes are a set of distinct strings, each at most 1024 Unicode characters.
+Overlapping prefixes are allowed and matching objects are deduplicated. This
+prefix limit is separate from the byte-based object identity limit below.
 
 1. `GET <containerURL>?restype=container&comp=list&prefix=<p>&marker=<m>`
    for each prefix, following `NextMarker` until the list is complete.
@@ -108,6 +113,18 @@ credential:
    `racer-object` sidecar, and the Python client compute.
 3. Take the ETag, length, and content type from the listing. Azure versioned
    blobs are not expanded; a fill pins the current version of each blob.
+
+Every selected blob must satisfy Racer's schema-1 identity contract: a
+nonempty UTF-8 name of at most 1024 bytes, canonical identity JSON of at most
+8192 bytes, and an ETag accepted by Racer's strong ETag wire type. Names are
+not decoded or normalized. Azure's name limit counts characters, so a legal
+Azure name containing multibyte characters can exceed Racer's byte limit.
+Such archives are unsupported as a whole-fill selection: one unsupported
+selected object fails the entire listing with `ListFailed`, retaining any
+previous manifest for retry. Racer never silently omits it and claims a
+complete reservation. Rename those objects or explicitly narrow the prefixes
+to a supported subset. A logical-byte total that exceeds `u64` also fails
+the listing instead of wrapping or publishing an inexact total.
 
 The manifest is the sorted list of `(key, metadata, etag, content type, length)`
 entries. Its digest is the SHA-256 of a canonical JSON array of
@@ -124,7 +141,7 @@ process re-lists at `resyncInterval`; a failed list retries with backoff, so a
 skew resolves without a distribution channel.
 
 This trades N list calls per resync for having no manifest wire format, no
-ConfigMap, and no added RBAC. Listing needs a credential with list permission
+ConfigMap, or manifest-distribution RBAC. Listing needs a credential with list permission
 on the container, which is broader than blob read. The cache's existing
 credential is used; a fill on a cache whose credential cannot list is rejected
 with `Forbidden` rather than falling back to a partial set.
@@ -189,8 +206,13 @@ pinned page is simply one that eviction cannot choose.
 
 ## Status
 
-The primary writes the status subresource. Every member reports, in its Pod
-`racer.unbounded-cloud.io/report` annotation, one entry per fill it is
+Runtime coordination selects the primary to write the status subresource with
+`update`. All Racer Pods share a ServiceAccount and therefore hold that same
+permission. Neither RBAC nor admission restricts status updates to the current
+primary; primary ownership is not a security boundary.
+
+Every member reports, in its separate Pod
+`racer.unbounded-cloud.io/fills` annotation, one entry per fill it is
 reconciling:
 
 ```json
@@ -200,9 +222,10 @@ reconciling:
 ```
 
 The primary sums the entries whose `generation`, `digest`, and `membership`
-match its own. Reports are size-capped with the rest of the annotation, so a
-node reports at most 16 fills; entries beyond that are dropped from the
-report, not from the pins.
+match its own. Fill reports use the separate 64 KiB fills annotation; the
+membership report retains its 32 KiB limit. Report-slot admission rejects
+excess fills with `TooManyFills` instead of silently omitting admitted fills
+from progress reporting. Each node has at most 16 report slots.
 
 Conditions:
 
@@ -215,8 +238,8 @@ Conditions:
 | `Degraded` | The fill was Ready (or already Degraded) and is now short of copies, or `spec.replicas` exceeds the cache pool's node count | `MemberLost`, `Refilling`, `CapacityLost` |
 
 `footprintBytes` is the planned reservation. `residentBytes` is the summed
-page-rounded payload of confirmed pins. `underReplicatedBytes` is the planned
-footprint minus confirmed resident bytes, so it counts missing nodes, node
+page-rounded payload of confirmed pins. `underReplicatedBytes` is
+`max(0, footprintBytes - residentBytes)`, so it counts missing nodes, node
 capacity refusals, and pages a worker has not visited yet. A `Ready` fill has
 zero `underReplicatedBytes`.
 
@@ -252,8 +275,8 @@ replica count.
   `Forbidden`.
 - One object set per fill, at most 8192 objects. A larger listing is rejected
   with `TooManyObjects` instead of being truncated.
-- At most 16 fills are reported per node; older entries are dropped from the
-  report, not from the pins.
+- At most 16 fills can occupy report slots on a node. Excess fills are rejected
+  with `TooManyFills`, not silently removed from reports.
 - Pins are node-local. Status is the per-fill accounting surface; per-fill
   Prometheus metrics are not added yet, and the existing per-cache disk
   metrics continue to count pinned pages as resident cache data.

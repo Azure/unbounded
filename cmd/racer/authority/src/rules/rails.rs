@@ -83,7 +83,7 @@ struct FillsDto {
     pinnable_bytes: Option<u64>,
 }
 
-/// One fill's progress in the Pod report annotation.
+/// One fill's progress in the separate Pod fills annotation.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct FillProgressDto {
     fill: String,

@@ -416,7 +416,7 @@ impl Authority {
         Ok(())
     }
 
-    /// Report per-fill progress, merged into the next Pod report.
+    /// Report per-fill progress through the separate Pod fills annotation.
     pub fn report_fill_progress(
         &mut self,
         fills: Vec<FillProgress>,
@@ -835,7 +835,7 @@ impl Handle {
         Ok(())
     }
 
-    /// Report per-fill progress, merged into the next Pod report.
+    /// Report per-fill progress through the separate Pod fills annotation.
     pub fn report_fill_progress(
         &self,
         fills: Vec<FillProgress>,

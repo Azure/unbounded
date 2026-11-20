@@ -3,7 +3,7 @@
 //! One controller runs per I/O worker. It reads the process-wide fill view,
 //! fetches the pages this worker owns through the normal prefetch path, and
 //! pins them until the fill changes or disappears. Progress is aggregated per
-//! node and reported through the Pod report annotation.
+//! node and reported through the separate Pod fills annotation.
 //!
 //! Pins are desired state, not durable state: a restart drops them and the
 //! controller establishes them again from the manifest. A membership change

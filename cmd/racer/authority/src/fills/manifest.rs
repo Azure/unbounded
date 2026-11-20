@@ -63,6 +63,8 @@ pub enum ManifestError {
 /// Build a manifest from a raw listing. Objects are filtered by `prefixes`
 /// (a blob matches when its name starts with any prefix; an empty prefix
 /// matches every blob), deduplicated by canonical key, and sorted by key.
+/// Every selected blob must fit Racer's identity and strong ETag bounds. An
+/// unsupported blob rejects the entire listing, never a partial reservation.
 pub fn build(
     container: &str,
     listed: &[ListedObject],
@@ -302,5 +304,23 @@ mod tests {
             build("models", &bad, &["".into()], 1),
             Err(ManifestError::InvalidObject)
         );
+    }
+
+    #[test]
+    fn unsupported_selected_name_rejects_the_whole_listing() {
+        // Azure counts characters, while Racer's schema-1 bound counts bytes.
+        let unusual = format!("archive/{}", "雪".repeat(400));
+        let listed = [
+            object("supported/a", "\"e\"", 1),
+            object(&unusual, "\"e\"", 1),
+        ];
+        assert_eq!(
+            build("models", &listed, &["".into()], 1),
+            Err(ManifestError::InvalidObject)
+        );
+        // An explicitly narrower selection does not validate unrelated blobs.
+        let supported = build("models", &listed, &["supported/".into()], 1).unwrap();
+        assert_eq!(supported.objects.len(), 1);
+        assert_eq!(supported.logical_bytes, 1);
     }
 }

@@ -279,11 +279,30 @@ identity, set `spec.origin.azure.credential.workloadIdentity.tenantID`: the
 fill lister exchanges the projected token for that tenant directly and does
 not discover a tenant from a storage challenge.
 
+Prefixes form a set of distinct strings, each at most 1024 Unicode characters.
+Overlapping prefixes are allowed; matching objects are deduplicated.
+
+Every selected blob must have a nonempty UTF-8 name of at most 1024 bytes,
+canonical Racer identity JSON of at most 8192 bytes, and a supported strong
+ETag. Names are not decoded or normalized. Azure counts name characters, not
+UTF-8 bytes, so some legal Azure names exceed Racer's limit. An archive
+containing such a selected name is unsupported: the entire listing fails
+with `ListFailed`, and any previous manifest is retained for retry. Racer
+does not silently skip objects and reserve only part of the selection. Rename
+unsupported objects or explicitly select a supported subset with narrower
+prefixes.
+
+The primary writes fill status by runtime coordination, not by an exclusive
+authorization grant. All Racer Pods share the `racer` ServiceAccount and can
+update fill status; neither RBAC nor admission checks current primary ownership.
+
 `spec.maxFootprint` bounds the pinned payload the fill may reserve
 cluster-wide, in bytes, counting each object's pages rounded up to the page
 size, times every replica. Actual disk use can be higher because a pinned
 segment keeps its unused tail until its last pin is released. A larger
-selection fails admission with `ExceedsMaxFootprint`; it is never truncated.
+selection fails fill admission with `ExceedsMaxFootprint`; it is never truncated.
+This compares the fill's own limit, not available cluster capacity.
+Set it to a positive int64 byte count as a YAML number, not a quantity string.
 `spec.replicas` is the number of distinct nodes that keep a copy and defaults
 to 2. `spec.resyncInterval` defaults to `1h` and bounds how long the listed
 object set may go stale.
@@ -374,6 +393,9 @@ Each dataplane writes its shares and NIC report to its own Pod's
 `racer.unbounded-cloud.io/report` annotation. Control seats do not write Node
 annotations. Old `enrolled-shares`, `enrolled-rdma-nics`, and
 `last-admitted-member` annotations are no longer runtime state.
+
+Fill progress and pinnable capacity are reported separately in the Pod's
+`racer.unbounded-cloud.io/fills` annotation, not the membership `report` annotation.
 
 Malformed membership annotations retain admitted attributes; invalid new nodes are omitted.
 Site uses current labels. Invalid `block-devices` selectors instead fall back to slab files.
