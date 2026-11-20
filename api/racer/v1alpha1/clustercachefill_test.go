@@ -5,12 +5,15 @@ package v1alpha1
 
 import (
 	"encoding/json"
+	"os"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/yaml"
 )
 
 func TestClusterCacheFillRegistrationAndJSON(t *testing.T) {
@@ -115,5 +118,23 @@ func TestClusterCacheFillEffectiveDefaults(t *testing.T) {
 		}
 
 		require.Equal(t, expected, spec.EffectiveResyncInterval(), interval.String())
+	}
+}
+
+func TestClusterCacheFillCRDPrinterColumns(t *testing.T) {
+	data, err := os.ReadFile("crd/racer.unbounded-cloud.io_clustercachefills.yaml")
+	require.NoError(t, err)
+
+	var crd apiextensionsv1.CustomResourceDefinition
+	require.NoError(t, yaml.Unmarshal(data, &crd))
+	require.Len(t, crd.Spec.Versions, 1)
+
+	columns := make(map[string]string)
+	for _, column := range crd.Spec.Versions[0].AdditionalPrinterColumns {
+		columns[column.Name] = column.JSONPath
+	}
+
+	for _, condition := range []string{FillConditionAccepted, FillConditionReady, FillConditionDegraded} {
+		require.Equal(t, `.status.conditions[?(@.type=="`+condition+`")].status`, columns[condition])
 	}
 }
