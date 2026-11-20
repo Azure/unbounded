@@ -241,7 +241,14 @@ The primary sums the entries whose `generation`, `digest`, and `membership`
 match its own. Fill reports use the separate 64 KiB fills annotation; the
 membership report retains its 32 KiB limit. Report-slot admission rejects
 excess fills with `TooManyFills` instead of silently omitting admitted fills
-from progress reporting. Each node has at most 16 report slots.
+from progress reporting. Each node has at most 16 report slots. Fills with a
+usable cache reserve slots in stable fill UID order on every member of that
+cache's published pool. If any member is full, the fill reserves no slots on
+the other members. Disjoint pools do not compete. Reservations do not depend
+on local origin listings: pending listings and manifests rejected for
+`TooManyObjects` or `ExceedsMaxFootprint` still reserve slots, because ordinary
+members outside that pool do not list its origin. Delete such a fill to release
+its reservation; a cache catalog or pool change also recomputes reservations.
 
 Conditions:
 

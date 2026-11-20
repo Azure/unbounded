@@ -780,9 +780,10 @@ pub fn recompute(shared: &Shared) {
 }
 
 /// Reserve slots in UID order on every node in the fill's published cache pool.
-/// Pending listings reserve slots too. A fill is rejected if any participating
-/// node is full, without spending slots on its other nodes. Disjoint pools do
-/// not compete, and structurally rejected fills do not spend report slots.
+/// Reservations depend only on the cache catalog and publication, not on local
+/// listing results: ordinary nonmembers never list the origin. Pending and
+/// rejected manifests therefore retain reservations. A fill without room on
+/// every pool member spends no slots. Disjoint pools do not compete.
 fn enforce_report_limit(
     admission: &Admission,
     fills: &mut BTreeMap<String, FillView>,
@@ -790,10 +791,11 @@ fn enforce_report_limit(
 ) {
     let mut slots = BTreeMap::<u32, usize>::new();
     for view in fills.values_mut() {
-        // Recompute previous TooManyFills decisions as well, so freed slots
-        // and newly rejected manifests are accounted for in the same pass.
+        // Recompute previous TooManyFills decisions too. A usable cache reserves
+        // slots even when this process rejects its manifest; otherwise a pool
+        // nonmember with no manifest could disagree about overlapping pools.
         admission.admit(view, caches);
-        if !view.accepted {
+        if view.cache_uid.is_empty() {
             continue;
         }
         let Some(members) = admission
@@ -808,8 +810,10 @@ fn enforce_report_limit(
             .iter()
             .any(|node| slots.get(node).copied().unwrap_or(0) >= crate::limits::MAX_REPORT_FILLS)
         {
-            view.accepted = false;
-            view.message = "TooManyFills".into();
+            if view.accepted {
+                view.accepted = false;
+                view.message = "TooManyFills".into();
+            }
             continue;
         }
         for node in members.iter() {
@@ -1510,17 +1514,177 @@ mod tests {
                 // final slot. A per-cache limit would admit all 33 fills.
                 assert!(fills[&last].accepted);
             }
-            // A structurally rejected earlier fill frees node 0's slot. The
-            // overlap is admitted, and node 1's later fill is now rejected.
+            // A locally rejected manifest must not free a shared reservation:
+            // members outside this pool cannot observe its listing result.
             let rejected = format!("11111111-1111-4111-8111-{:012}", 15);
             shared.fills.borrow_mut().get_mut(&rejected).unwrap().error =
                 Some("TooManyObjects".into());
             recompute(&shared);
+            {
+                let fills = shared.fills.borrow();
+                assert_eq!(fills[&rejected].message, "TooManyObjects");
+                assert_eq!(fills[&overlap].message, "TooManyFills");
+                assert!(!fills[&overlap].accepted);
+                assert!(fills[&last].accepted);
+            }
+            // Deletion, unlike a listing result, is visible to every member.
+            shared.fills.borrow_mut().remove(&rejected);
+            recompute(&shared);
             let fills = shared.fills.borrow();
-            assert_eq!(fills[&rejected].message, "TooManyObjects");
             assert!(fills[&overlap].accepted);
             assert_eq!(fills[&last].message, "TooManyFills");
             assert!(!fills[&last].accepted);
+        });
+    }
+
+    #[test]
+    fn overlapping_pool_reservations_agree_across_independent_listing_views() {
+        crate::kube::fake::run(|_api, kube| async move {
+            for too_many_objects in [false, true] {
+                // A primary and two ordinary members see the same catalog and
+                // pools, but node 1 never lists pool A's origin.
+                let views = (0..3)
+                    .map(|role| {
+                        let shared = crate::shared::tests::shared(kube.clone());
+                        for cache in 0..3 {
+                            add_cache(&shared, cache);
+                        }
+                        install_pools(
+                            &shared,
+                            3,
+                            vec![
+                                (Some(vec![0]), vec![0]),
+                                (Some(vec![0, 1]), vec![1]),
+                                (Some(vec![2]), vec![2]),
+                            ],
+                        );
+                        let pools = Admission::read(&shared).pool_members;
+                        shared.is_primary.set(role == 0);
+                        shared.fill_context.replace(Some(FillContext {
+                            membership: 1,
+                            page_size: shared.config.page_size.get(),
+                            pool_members: pools,
+                            local_caches: (0..2)
+                                .filter(|cache| role == 1 || (role == 2 && *cache == 1))
+                                .map(|cache| {
+                                    racer_wire::control::CacheId(format!(
+                                        "22222222-2222-4222-8222-{cache:012}"
+                                    ))
+                                })
+                                .collect(),
+                        }));
+                        if role != 0 {
+                            // Ordinary members have no authoritative image.
+                            shared.serving.borrow_mut().image = None;
+                        }
+                        for i in (0..16).rev() {
+                            let uid = add_pending_fill(&shared, i, 0);
+                            shared
+                                .fills
+                                .borrow_mut()
+                                .get_mut(&uid)
+                                .unwrap()
+                                .max_footprint = 1;
+                        }
+                        let overlap = add_pending_fill(&shared, 16, 1);
+                        let disjoint = add_pending_fill(&shared, 17, 2);
+                        recompute(&shared);
+                        assert_eq!(shared.fills.borrow()[&overlap].message, "TooManyFills");
+
+                        let manifest = manifest::build(
+                            "models",
+                            &[manifest::ListedObject {
+                                name: "object".into(),
+                                etag: "\"version\"".into(),
+                                length: 1,
+                                content_type: None,
+                            }],
+                            &["".into()],
+                            1,
+                        )
+                        .unwrap();
+                        let mut fills = shared.fills.borrow_mut();
+                        for view in fills.values_mut() {
+                            if !should_list(&shared, &view.cache_uid) {
+                                assert!(view.manifest.is_none());
+                                continue;
+                            }
+                            if too_many_objects && view.cache_name == "models-0" {
+                                listing_failed(
+                                    &shared,
+                                    view,
+                                    ListingFailure::Invalid(ManifestError::TooManyObjects),
+                                    rt::now(),
+                                );
+                            } else {
+                                let generation = view.generation;
+                                let cache_uid = view.cache_uid.clone();
+                                install_manifest(
+                                    &shared,
+                                    view,
+                                    manifest.clone(),
+                                    generation,
+                                    cache_uid,
+                                    rt::now(),
+                                );
+                            }
+                        }
+                        // This is the list-install hook, before another task
+                        // can observe the newly installed manifests.
+                        enforce_report_limit(
+                            &Admission::read(&shared),
+                            &mut fills,
+                            &shared.fills_caches.borrow(),
+                        );
+                        assert_eq!(fills[&overlap].replicas, 2);
+                        assert_eq!(fills[&overlap].available_nodes, 2);
+                        assert!(!fills[&overlap].accepted);
+                        assert_eq!(fills[&overlap].message, "TooManyFills");
+                        assert!(fills[&disjoint].accepted);
+                        for view in fills.values().take(16) {
+                            if role == 2 {
+                                assert!(view.accepted);
+                                assert!(view.manifest.is_none());
+                            } else {
+                                assert!(!view.accepted);
+                                assert_eq!(
+                                    view.message,
+                                    if too_many_objects {
+                                        "TooManyObjects"
+                                    } else {
+                                        "ExceedsMaxFootprint"
+                                    }
+                                );
+                            }
+                        }
+                        drop(fills);
+                        (shared, overlap)
+                    })
+                    .collect::<Vec<_>>();
+                for (shared, overlap) in views {
+                    // The periodic hook must make the same reservation, even
+                    // after the primary has rejected every pool A manifest.
+                    recompute(&shared);
+                    assert_eq!(shared.fills.borrow()[&overlap].message, "TooManyFills");
+                    shared.fills.borrow_mut().pop_first();
+                    recompute(&shared);
+                    let fills = shared.fills.borrow();
+                    assert!(fills[&overlap].accepted);
+                    let admission = Admission::read(&shared);
+                    for node in 0..3 {
+                        let reports = fills
+                            .values()
+                            .filter(|view| {
+                                view.accepted
+                                    && admission.pool_members
+                                        [&racer_wire::control::CacheId(view.cache_uid.clone())]
+                                        .contains(&node)
+                            })
+                            .count();
+                        assert!(reports <= crate::limits::MAX_REPORT_FILLS);
+                    }
+                }
+            }
         });
     }
 
