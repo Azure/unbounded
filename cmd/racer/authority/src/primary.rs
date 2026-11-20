@@ -437,7 +437,13 @@ async fn watch(t: Rc<Term_>, kind: Kind) {
     let path = collection(&t, kind);
     let mut backoff = 1u64;
     while t.alive.get() {
-        let (items, mut rv) = match t.shared.api.list(&path, "").await {
+        let response = t.shared.api.list(&path, "").await;
+        // Detached watchers may outlive their term. All control tasks run on
+        // one thread, so this check fences mutations until the next await.
+        if !t.alive.get() {
+            return;
+        }
+        let (items, mut rv) = match response {
             Ok(r) => r,
             Err(KubeError::NotFound) if kind == Kind::Caches => {
                 // CRD not installed: an empty catalog.
@@ -482,7 +488,11 @@ async fn watch(t: Rc<Term_>, kind: Kind) {
         drop(items);
         t.changed.notify();
         loop {
-            let mut w = match t.shared.api.watch(&path, "", &rv).await {
+            let response = t.shared.api.watch(&path, "", &rv).await;
+            if !t.alive.get() {
+                return;
+            }
+            let mut w = match response {
                 Ok(w) => w,
                 Err(e) => {
                     // Back off before relisting so a watch that keeps
@@ -498,7 +508,11 @@ async fn watch(t: Rc<Term_>, kind: Kind) {
                 if !t.alive.get() {
                     return;
                 }
-                match w.next().await {
+                let response = w.next().await;
+                if !t.alive.get() {
+                    return;
+                }
+                match response {
                     Ok(Some(e)) => {
                         backoff = 1;
                         rv = str_at(&e.object, &["metadata", "resourceVersion"]).to_owned();
@@ -1078,6 +1092,241 @@ mod tests {
     }
 
     use super::*;
+    use std::sync::Arc;
+
+    fn watcher_test<F, Fut>(body: F)
+    where
+        F: FnOnce(crate::kube::fake::FakeApi, Rc<Shared>) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let clock = racer_io::ctx::VirtualClock::new();
+        let os = racer_io::sim::SimOs::seeded(1187);
+        let mut ex = rt::Executor::simulated(os, &clock, 1187, 256).unwrap();
+        ex.block_on(async {
+            let api = crate::kube::fake::FakeApi::new();
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tmp/term-watchers");
+            let config =
+                crate::kube::fake::serve_at(api.clone(), &dir, "10.0.0.1:443".parse().unwrap());
+            let kube = Rc::new(crate::kube::Kube::new(config).unwrap());
+            body(api, crate::shared::tests::shared(kube)).await;
+        });
+    }
+
+    fn watcher_term(shared: &Rc<Shared>, transitions: u64) -> Rc<Term_> {
+        Rc::new(Term_ {
+            shared: shared.clone(),
+            seat: Rc::new(seat::new_seat(shared, 0).unwrap()),
+            shell: RefCell::new(Shell::new(
+                Term {
+                    lease_uid: "primary-lease".into(),
+                    transitions,
+                    holder: shared.identity.clone(),
+                },
+                rt::now(),
+            )),
+            object: RefCell::new(Value::Null),
+            alive: Rc::new(Cell::new(true)),
+            inventory: Rc::new(RefCell::new(Inventory::default())),
+            changed: Signal::default(),
+            extra: RefCell::new(BTreeMap::new()),
+            publish: Signal::default(),
+            seat_observer: RefCell::new(Observer::default()),
+            webhook_retired: RefCell::new(BTreeMap::new()),
+            ready_floor: Cell::new(None),
+            membership_changed: Cell::new(None),
+        })
+    }
+
+    fn watcher_object(revision: u64) -> Value {
+        json!({
+            "metadata": {
+                "uid": "member-uid", "name": "member",
+                "labels": {"revision": revision.to_string()},
+                "annotations": {
+                    annotations::FILLS: format!(r#"{{"fills":[],"pinnable_bytes":{revision}}}"#),
+                },
+            },
+            "spec": {"priority": revision},
+            "status": {"phase": if revision == 1 { "Running" } else { "Failed" }},
+        })
+    }
+
+    fn inventory_snapshot(inv: &Inventory) -> String {
+        format!(
+            "{:?}",
+            (
+                &inv.nodes,
+                &inv.pods,
+                &inv.caches,
+                inv.nodes_synced,
+                inv.pods_synced,
+                inv.caches_synced,
+            )
+        )
+    }
+
+    async fn synchronized_successor(shared: &Rc<Shared>) -> Rc<Term_> {
+        let next = watcher_term(shared, 2);
+        for kind in [Kind::Nodes, Kind::Pods, Kind::Caches] {
+            rt::spawn(watch(next.clone(), kind)).unwrap();
+        }
+        rt::timeout(Duration::from_secs(5), async {
+            while !next.inventory.borrow().synced() {
+                rt::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("successor lists must synchronize");
+        let shell = next.shell.borrow();
+        *shared.term.borrow_mut() = Some((shell.term().clone(), shell.lease()));
+        shared.is_primary.set(true);
+        // Model the gate installed by reconcile once this term has read all
+        // membership inputs. The old watcher must not invalidate its mirrors.
+        *shared.fill_status_term.borrow_mut() = Some(shell.term().clone());
+        drop(shell);
+        next
+    }
+
+    async fn finish_stale_watcher(
+        old: &Term_,
+        next: &Term_,
+        pending: impl std::future::Future<Output = ()>,
+    ) {
+        let shared = &next.shared;
+        let mirrors = || format!("{:?}", (&*shared.nodes.borrow(), &*shared.pods.borrow()));
+        let before = mirrors();
+        let old_inventory = inventory_snapshot(&old.inventory.borrow());
+        let next_inventory = inventory_snapshot(&next.inventory.borrow());
+        let old_changed = old.changed.generation();
+        let next_changed = next.changed.generation();
+        let shared_changed = shared.changed.generation();
+        let term = shared.primary_term(rt::now()).unwrap();
+        assert_eq!(shared.fill_status_term.borrow().as_ref(), Some(&term));
+
+        rt::timeout(Duration::from_secs(5), pending)
+            .await
+            .expect("a stale watcher must return on its delayed response");
+
+        assert_eq!(mirrors(), before, "old responses must not change mirrors");
+        assert_eq!(inventory_snapshot(&old.inventory.borrow()), old_inventory);
+        assert_eq!(inventory_snapshot(&next.inventory.borrow()), next_inventory);
+        assert_eq!(old.changed.generation(), old_changed);
+        assert_eq!(next.changed.generation(), next_changed);
+        assert_eq!(shared.changed.generation(), shared_changed);
+        assert_eq!(shared.primary_term(rt::now()), Some(term.clone()));
+        assert_eq!(shared.fill_status_term.borrow().as_ref(), Some(&term));
+        next.alive.set(false);
+    }
+
+    #[test]
+    fn stale_term_list_responses_do_not_replace_successor_mirrors() {
+        for kind in [Kind::Nodes, Kind::Pods, Kind::Caches] {
+            watcher_test(|api, shared| async move {
+                let old = watcher_term(&shared, 1);
+                let path = format!("{}/member", collection(&old, kind));
+                api.put_object(&path, watcher_object(1));
+                api.delay_gets(Arc::new(1000.into()));
+                let mut pending = std::pin::pin!(watch(old.clone(), kind));
+                // Poll only until the server has captured T's LIST. Keeping
+                // this future parked delays its response until T+1 is synced.
+                rt::timeout(Duration::from_secs(5), async {
+                    while api.requests().is_empty() {
+                        assert!(futures::poll!(pending.as_mut()).is_pending());
+                        rt::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                old.alive.set(false);
+                api.delay_gets(Arc::new(0.into()));
+                api.put_object(&path, watcher_object(2));
+                let next = synchronized_successor(&shared).await;
+                finish_stale_watcher(&old, &next, pending).await;
+            });
+        }
+    }
+
+    #[test]
+    fn stale_term_cache_not_found_does_not_clear_inventory_or_notify() {
+        watcher_test(|api, shared| async move {
+            let old = watcher_term(&shared, 1);
+            old.inventory
+                .borrow_mut()
+                .caches
+                .insert("previous".into(), CacheInfo::from_json(&watcher_object(1)));
+            api.delay_gets(Arc::new(1000.into()));
+            api.fail_next(&[404]);
+            let mut pending = std::pin::pin!(watch(old.clone(), Kind::Caches));
+            rt::timeout(Duration::from_secs(5), async {
+                while api.requests().is_empty() {
+                    assert!(futures::poll!(pending.as_mut()).is_pending());
+                    rt::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap();
+            old.alive.set(false);
+            api.delay_gets(Arc::new(0.into()));
+            api.put_object(&format!("{}/member", paths::CACHES), watcher_object(2));
+            let next = synchronized_successor(&shared).await;
+            finish_stale_watcher(&old, &next, pending).await;
+        });
+    }
+
+    #[test]
+    fn stale_term_watch_events_do_not_change_successor_mirrors() {
+        for kind in [Kind::Nodes, Kind::Pods, Kind::Caches] {
+            for event in ["ADDED", "MODIFIED", "DELETED"] {
+                watcher_test(|api, shared| async move {
+                    let old = watcher_term(&shared, 1);
+                    let path = format!("{}/member", collection(&old, kind));
+                    api.put_object(&path, watcher_object(0));
+                    let mut pending = std::pin::pin!(watch(old.clone(), kind));
+                    rt::timeout(Duration::from_secs(5), async {
+                        while old.changed.generation() == 0 {
+                            assert!(futures::poll!(pending.as_mut()).is_pending());
+                            rt::sleep(Duration::from_millis(1)).await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    // A live watch update is a positive control and proves
+                    // the watcher has reached next(), not just watch setup.
+                    api.put_object(&path, watcher_object(1));
+                    rt::timeout(Duration::from_secs(5), async {
+                        while old.changed.generation() < 2 {
+                            assert!(futures::poll!(pending.as_mut()).is_pending());
+                            rt::sleep(Duration::from_millis(1)).await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    old.alive.set(false);
+                    // Queue an event for the suspended old stream. T+1 lists
+                    // the newer object and starts watching after these events.
+                    match event {
+                        "ADDED" => {
+                            api.put_object(
+                                &format!("{}/stale", collection(&old, kind)),
+                                json!({
+                                    "metadata": {"uid": "stale-uid", "name": "stale"},
+                                }),
+                            );
+                        }
+                        "MODIFIED" => {
+                            api.put_object(&path, watcher_object(1));
+                        }
+                        "DELETED" => api.delete_object(&path),
+                        _ => unreachable!(),
+                    }
+                    api.delete_object(&format!("{}/stale", collection(&old, kind)));
+                    api.put_object(&path, watcher_object(2));
+                    let next = synchronized_successor(&shared).await;
+                    finish_stale_watcher(&old, &next, pending).await;
+                });
+            }
+        }
+    }
 
     #[test]
     fn pods_are_mirrored_with_their_annotations() {
