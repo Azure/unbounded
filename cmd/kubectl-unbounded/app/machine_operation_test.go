@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -16,6 +17,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/watch"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -69,6 +71,54 @@ func TestBuildMachineOperationWithSelector(t *testing.T) {
 	require.Equal(t, "gpu", op.Spec.MachineSelector.MatchLabels["role"])
 	require.Len(t, op.Spec.MachineSelector.MatchExpressions, 1)
 	require.Equal(t, "zone", op.Spec.MachineSelector.MatchExpressions[0].Key)
+	require.Nil(t, op.Spec.Rollout)
+}
+
+func TestBuildMachineOperationWithRollout(t *testing.T) {
+	t.Parallel()
+
+	opts := &machineOperationCreateOptions{
+		name:          "reboot-rack-01",
+		kind:          v1alpha3.OperationHostHardReboot,
+		selector:      "topology.unbounded-cloud.io/rack=dc-a.rack-01",
+		maxConcurrent: "3",
+		onFailure:     "Continue",
+		output:        operationOutputName,
+		dryRun:        dryRunNone,
+	}
+
+	require.NoError(t, opts.validate())
+
+	op, err := opts.build()
+	require.NoError(t, err)
+	require.NotNil(t, op.Spec.Rollout)
+	require.NotNil(t, op.Spec.Rollout.MaxConcurrent)
+	require.Equal(t, intstr.Int, op.Spec.Rollout.MaxConcurrent.Type)
+	require.Equal(t, 3, op.Spec.Rollout.MaxConcurrent.IntValue())
+	require.Equal(t, v1alpha3.RolloutFailurePolicyContinue, op.Spec.Rollout.OnFailure)
+}
+
+func TestBuildMachineOperationWithPercentageRollout(t *testing.T) {
+	t.Parallel()
+
+	opts := &machineOperationCreateOptions{
+		name:          "reboot-rack-01",
+		kind:          v1alpha3.OperationHostHardReboot,
+		selector:      "topology.unbounded-cloud.io/rack=dc-a.rack-01",
+		maxConcurrent: "100%",
+		output:        operationOutputName,
+		dryRun:        dryRunNone,
+	}
+
+	require.NoError(t, opts.validate())
+
+	op, err := opts.build()
+	require.NoError(t, err)
+	require.NotNil(t, op.Spec.Rollout)
+	require.NotNil(t, op.Spec.Rollout.MaxConcurrent)
+	require.Equal(t, intstr.String, op.Spec.Rollout.MaxConcurrent.Type)
+	require.Equal(t, "100%", op.Spec.Rollout.MaxConcurrent.StrVal)
+	require.Empty(t, op.Spec.Rollout.OnFailure)
 }
 
 func TestBuildMachineOperationParameters(t *testing.T) {
@@ -104,6 +154,144 @@ func TestValidateMachineOperationRequiresTarget(t *testing.T) {
 	err := opts.validate()
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "exactly one of --machine or --selector")
+}
+
+func TestValidateRolloutFlagsRequireSelector(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		maxConcurrent  string
+		onFailure      string
+		retainChildren bool
+	}{
+		{name: "max-concurrent with machine", maxConcurrent: "3"},
+		{name: "on-failure with machine", onFailure: "Continue"},
+		{name: "both with machine", maxConcurrent: "3", onFailure: "Continue"},
+		{name: "retain-children with machine", retainChildren: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			opts := &machineOperationCreateOptions{
+				name:           "reboot-worker-01",
+				kind:           v1alpha3.OperationHostHardReboot,
+				machine:        "worker-01",
+				maxConcurrent:  tt.maxConcurrent,
+				onFailure:      tt.onFailure,
+				retainChildren: tt.retainChildren,
+				output:         operationOutputName,
+				dryRun:         dryRunNone,
+			}
+
+			err := opts.validate()
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "only allowed with --selector, not with --machine")
+
+			if tt.maxConcurrent != "" {
+				require.Contains(t, err.Error(), "--max-concurrent")
+			}
+
+			if tt.onFailure != "" {
+				require.Contains(t, err.Error(), "--on-failure")
+			}
+
+			if tt.retainChildren {
+				require.Contains(t, err.Error(), "--retain-children")
+			}
+		})
+	}
+}
+
+func TestValidateMaxConcurrent(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		value string
+		want  bool
+	}{
+		{value: "1", want: true},
+		{value: "42", want: true},
+		{value: "1000", want: true},
+		{value: "1%", want: true},
+		{value: "25%", want: true},
+		{value: "100%", want: true},
+		{value: "0"},
+		{value: "-1"},
+		{value: "abc"},
+		{value: "1.5"},
+		{value: "0%"},
+		{value: "05%"},
+		{value: "101%"},
+		{value: "1001%"},
+		{value: "%"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.value, func(t *testing.T) {
+			t.Parallel()
+
+			opts := &machineOperationCreateOptions{
+				name:          "reboot-rack-01",
+				kind:          v1alpha3.OperationHostHardReboot,
+				selector:      "topology.unbounded-cloud.io/rack=dc-a.rack-01",
+				maxConcurrent: tt.value,
+				output:        operationOutputName,
+				dryRun:        dryRunNone,
+			}
+
+			err := opts.validate()
+			if tt.want {
+				require.NoError(t, err)
+
+				return
+			}
+
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "must be an integer of at least 1 or a percentage from 1% to 100%")
+		})
+	}
+}
+
+func TestValidateOnFailure(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		value string
+		want  bool
+	}{
+		{value: "Stop", want: true},
+		{value: "Continue", want: true},
+		{value: "Pause"},
+		{value: "stop"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.value, func(t *testing.T) {
+			t.Parallel()
+
+			opts := &machineOperationCreateOptions{
+				name:      "reboot-rack-01",
+				kind:      v1alpha3.OperationHostHardReboot,
+				selector:  "topology.unbounded-cloud.io/rack=dc-a.rack-01",
+				onFailure: tt.value,
+				output:    operationOutputName,
+				dryRun:    dryRunNone,
+			}
+
+			err := opts.validate()
+			if tt.want {
+				require.NoError(t, err)
+
+				return
+			}
+
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "must be Stop or Continue")
+		})
+	}
 }
 
 func TestValidateAgentUpgradeRequiresDownloadURL(t *testing.T) {
@@ -205,6 +393,169 @@ func TestMachineOperationCreateCommandDryRunYAML(t *testing.T) {
 	require.Contains(t, out, "downloadURL: https://example.com/agent.tar.gz")
 	require.Contains(t, out, "sha256: "+testAgentUpgradeSHA256)
 	require.Contains(t, out, "ttlSecondsAfterFinished: 900")
+}
+
+func TestMachineOperationCreateCommandDryRunRolloutYAML(t *testing.T) {
+	t.Parallel()
+
+	out, err := executeMachineOperationCreateCommand(
+		t,
+		"reboot-rack-01",
+		"--kind", string(v1alpha3.OperationHostHardReboot),
+		"--selector", "topology.unbounded-cloud.io/rack=dc-a.rack-01",
+		"--max-concurrent", "100%",
+		"--on-failure", "Continue",
+		"--dry-run=client",
+		"-o", "yaml",
+	)
+
+	require.NoError(t, err)
+	require.Contains(t, out, "machineSelector:")
+	require.Contains(t, out, "topology.unbounded-cloud.io/rack: dc-a.rack-01")
+	require.Contains(t, out, "rollout:")
+	require.Contains(t, out, "maxConcurrent: 100%")
+	require.Contains(t, out, "onFailure: Continue")
+	require.NotContains(t, out, "childRetention")
+}
+
+func TestMachineOperationCreateCommandMaxFailures(t *testing.T) {
+	t.Parallel()
+
+	base := []string{
+		"reboot-rack-01",
+		"--kind", string(v1alpha3.OperationHostHardReboot),
+		"--selector", "example.com/rack=rack-01",
+		"--dry-run=client",
+		"-o", "yaml",
+	}
+
+	out, err := executeMachineOperationCreateCommand(t, append(base, "--on-failure", "Continue", "--max-failures", "25")...)
+	require.NoError(t, err)
+	require.Contains(t, out, "onFailure: Continue")
+	require.Contains(t, out, "maxFailures: 25")
+
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "without Continue", args: []string{"--max-failures", "25"}, want: "only allowed with --on-failure Continue"},
+		{name: "with Stop", args: []string{"--on-failure", "Stop", "--max-failures", "25"}, want: "only allowed with --on-failure Continue"},
+		{name: "above the ceiling", args: []string{"--on-failure", "Continue", "--max-failures", "1001"}, want: "must be from 1 to 1000"},
+		{name: "negative", args: []string{"--on-failure", "Continue", "--max-failures", "-1"}, want: "must be from 1 to 1000"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := executeMachineOperationCreateCommand(t, append(append([]string{}, base...), tt.args...)...)
+			require.ErrorContains(t, err, tt.want)
+		})
+	}
+}
+
+func TestMachineOperationCreateCommandRetainChildren(t *testing.T) {
+	t.Parallel()
+
+	out, err := executeMachineOperationCreateCommand(
+		t,
+		"reboot-rack-01",
+		"--kind", string(v1alpha3.OperationHostHardReboot),
+		"--selector", "topology.unbounded-cloud.io/rack=dc-a.rack-01",
+		"--retain-children",
+		"--dry-run=client",
+		"-o", "yaml",
+	)
+
+	require.NoError(t, err)
+	require.Contains(t, out, "rollout:")
+	require.Contains(t, out, "childRetention: All")
+	require.NotContains(t, out, "maxConcurrent")
+}
+
+func TestMachineOperationCreateCommandDryRunNumericRolloutYAML(t *testing.T) {
+	t.Parallel()
+
+	out, err := executeMachineOperationCreateCommand(
+		t,
+		"upgrade-rack-01",
+		"--kind", string(v1alpha3.OperationAgentUpgrade),
+		"--selector", "topology.unbounded-cloud.io/rack=dc-a.rack-01",
+		"--param", "downloadURL=https://example.com/unbounded-agent-linux-amd64.tar.gz",
+		"--max-concurrent", "3",
+		"--dry-run=client",
+		"-o", "yaml",
+	)
+
+	require.NoError(t, err)
+	require.Contains(t, out, "rollout:")
+	require.Contains(t, out, "maxConcurrent: 3")
+	require.NotContains(t, out, "onFailure")
+}
+
+func TestMachineOperationCreateCommandRejectsRolloutWithMachine(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "max-concurrent", args: []string{"--max-concurrent", "3"}},
+		{name: "on-failure", args: []string{"--on-failure", "Continue"}},
+		{name: "both", args: []string{"--max-concurrent", "3", "--on-failure", "Continue"}},
+		{name: "retain-children", args: []string{"--retain-children"}},
+		{name: "max-failures", args: []string{"--on-failure", "Continue", "--max-failures", "5"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			args := append(
+				[]string{"reboot-worker-01", "--kind", string(v1alpha3.OperationHostHardReboot), "--machine", "worker-01", "--dry-run=client"},
+				tt.args...,
+			)
+
+			out, err := executeMachineOperationCreateCommand(t, args...)
+
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "only allowed with --selector, not with --machine")
+			require.Empty(t, out)
+		})
+	}
+}
+
+func TestMachineOperationCreateCommandRejectsInvalidRolloutValues(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "max-concurrent zero", args: []string{"--max-concurrent", "0"}},
+		{name: "max-concurrent text", args: []string{"--max-concurrent", "abc"}},
+		{name: "max-concurrent too large for the field", args: []string{"--max-concurrent", "2147483648"}},
+		{name: "max-concurrent over 100%", args: []string{"--max-concurrent", "101%"}},
+		{name: "on-failure unknown", args: []string{"--on-failure", "Pause"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			args := append(
+				[]string{"reboot-rack-01", "--kind", string(v1alpha3.OperationHostHardReboot), "--selector", "topology.unbounded-cloud.io/rack=dc-a.rack-01", "--dry-run=client"},
+				tt.args...,
+			)
+
+			out, err := executeMachineOperationCreateCommand(t, args...)
+
+			require.Error(t, err)
+			require.NotContains(t, err.Error(), "only allowed with --selector")
+			require.Empty(t, out)
+		})
+	}
 }
 
 func TestMachineOperationCreateCommandRejectsNegativeTTLFlag(t *testing.T) {
@@ -455,6 +806,173 @@ func TestWatchMachineOperationUsesResourceVersion(t *testing.T) {
 	require.Error(t, err)
 	require.Equal(t, "12345", c.resourceVersion)
 	require.Equal(t, "metadata.name=op-1", c.fieldSelector)
+}
+
+func selectorOperationParent() *v1alpha3.MachineOperation {
+	return &v1alpha3.MachineOperation{
+		ObjectMeta: metav1.ObjectMeta{Name: "upgrade-rack-01", UID: "parent-uid"},
+		Spec: v1alpha3.MachineOperationSpec{
+			OperationKind: v1alpha3.OperationAgentUpgrade,
+			MachineSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"topology.unbounded-cloud.io/rack": "dc-a.rack-01"},
+			},
+		},
+	}
+}
+
+func selectorOperationWithStatus(parent *v1alpha3.MachineOperation, status v1alpha3.MachineOperationStatus) *v1alpha3.MachineOperation {
+	op := parent.DeepCopy()
+	op.Status = status
+
+	return op
+}
+
+// A selector operation does not list its machines; the wait prints the
+// counts of its children as they change.
+func TestWaitForSelectorOperationReportsCounts(t *testing.T) {
+	t.Parallel()
+
+	parent := selectorOperationParent()
+	summary := func(held, active, complete int32) *v1alpha3.MachineOperationSummary {
+		return &v1alpha3.MachineOperationSummary{Total: 2, Held: held, Active: active, Complete: complete}
+	}
+
+	updates := []*v1alpha3.MachineOperation{
+		selectorOperationWithStatus(parent, v1alpha3.MachineOperationStatus{
+			Phase: v1alpha3.OperationPhaseInProgress, Summary: summary(1, 1, 0),
+		}),
+		// Nothing changed: no second line.
+		selectorOperationWithStatus(parent, v1alpha3.MachineOperationStatus{
+			Phase: v1alpha3.OperationPhaseInProgress, Summary: summary(1, 1, 0),
+		}),
+		selectorOperationWithStatus(parent, v1alpha3.MachineOperationStatus{
+			Phase: v1alpha3.OperationPhaseInProgress, Summary: summary(0, 1, 1),
+		}),
+		selectorOperationWithStatus(parent, v1alpha3.MachineOperationStatus{
+			Phase: v1alpha3.OperationPhaseComplete, Summary: summary(0, 0, 2),
+		}),
+	}
+
+	var out bytes.Buffer
+
+	c := &scriptedOperationWatchClient{initial: parent, updates: updates}
+
+	err := waitForMachineOperation(context.Background(), c, "upgrade-rack-01", &out)
+	require.NoError(t, err)
+
+	got := out.String()
+	require.Contains(t, got, "Operation AgentUpgrade: upgrade-rack-01 in progress...")
+	require.Equal(t, 1, strings.Count(got, "Machines: 2 total, 1 held, 1 active, 0 complete, 0 failed"))
+	require.Contains(t, got, "Machines: 2 total, 0 held, 1 active, 1 complete, 0 failed")
+	require.Contains(t, got, "Machines: 2 total, 0 held, 0 active, 2 complete, 0 failed")
+	require.NotContains(t, got, "Target ")
+	require.Contains(t, got, "ready")
+}
+
+func TestWaitForSelectorOperationFailsWhenParentFails(t *testing.T) {
+	t.Parallel()
+
+	parent := selectorOperationParent()
+
+	updates := []*v1alpha3.MachineOperation{
+		selectorOperationWithStatus(parent, v1alpha3.MachineOperationStatus{
+			Phase:   v1alpha3.OperationPhaseInProgress,
+			Summary: &v1alpha3.MachineOperationSummary{Total: 12, Held: 11, Active: 1},
+		}),
+		selectorOperationWithStatus(parent, v1alpha3.MachineOperationStatus{
+			Phase:   v1alpha3.OperationPhaseFailed,
+			Message: "machines: 12 total, 0 held, 0 active, 0 complete, 12 failed",
+			Summary: &v1alpha3.MachineOperationSummary{
+				Total: 12, Failed: 12,
+				FailedMachines: []string{"w-01", "w-02", "w-03", "w-04", "w-05", "w-06", "w-07", "w-08", "w-09", "w-10"},
+			},
+		}),
+	}
+
+	var out bytes.Buffer
+
+	c := &scriptedOperationWatchClient{initial: parent, updates: updates}
+
+	err := waitForMachineOperation(context.Background(), c, "upgrade-rack-01", &out)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "operation failed")
+	require.Contains(t, err.Error(), "12 failed")
+
+	got := out.String()
+	require.Contains(t, got, "Failed machines: w-01, w-02, w-03, w-04, w-05, w-06, w-07, w-08, w-09, w-10 and 2 more")
+	require.Contains(t, got, "kubectl get machineoperations -l unbounded-cloud.io/parent-operation-uid=parent-uid")
+	require.NotContains(t, got, "ready")
+}
+
+func TestWaitForMachineRefOperationKeepsTargetLine(t *testing.T) {
+	t.Parallel()
+
+	parent := &v1alpha3.MachineOperation{
+		ObjectMeta: metav1.ObjectMeta{Name: "reboot-worker-01"},
+		Spec: v1alpha3.MachineOperationSpec{
+			MachineRef:    "worker-01",
+			OperationKind: v1alpha3.OperationHostHardReboot,
+		},
+		Status: v1alpha3.MachineOperationStatus{
+			Phase:   v1alpha3.OperationPhasePending,
+			Targets: []v1alpha3.MachineOperationTargetStatus{{MachineRef: "worker-01"}},
+		},
+	}
+
+	updates := []*v1alpha3.MachineOperation{
+		selectorOperationWithStatus(parent, v1alpha3.MachineOperationStatus{
+			Phase:   v1alpha3.OperationPhaseInProgress,
+			Targets: []v1alpha3.MachineOperationTargetStatus{{MachineRef: "worker-01", Phase: v1alpha3.OperationPhaseInProgress, Message: "restarting host"}},
+		}),
+		selectorOperationWithStatus(parent, v1alpha3.MachineOperationStatus{
+			Phase:   v1alpha3.OperationPhaseComplete,
+			Targets: []v1alpha3.MachineOperationTargetStatus{{MachineRef: "worker-01", Phase: v1alpha3.OperationPhaseComplete}},
+		}),
+	}
+
+	var out bytes.Buffer
+
+	c := &scriptedOperationWatchClient{initial: parent, updates: updates}
+
+	err := waitForMachineOperation(context.Background(), c, "reboot-worker-01", &out)
+	require.NoError(t, err)
+	require.Contains(t, out.String(), "Target worker-01: InProgress - restarting host")
+	require.NotContains(t, out.String(), "Target worker-01 (")
+}
+
+// scriptedOperationWatchClient serves one stored MachineOperation on Get and
+// replays a fixed sequence of updates on Watch.
+type scriptedOperationWatchClient struct {
+	client.WithWatch
+
+	initial *v1alpha3.MachineOperation
+	updates []*v1alpha3.MachineOperation
+}
+
+func (c *scriptedOperationWatchClient) Get(_ context.Context, key client.ObjectKey, obj client.Object, _ ...client.GetOption) error {
+	op, ok := obj.(*v1alpha3.MachineOperation)
+	if !ok {
+		return fmt.Errorf("unexpected object type %T", obj)
+	}
+
+	if key.Name != c.initial.Name {
+		return fmt.Errorf("operation %s not found", key.Name)
+	}
+
+	*op = *c.initial
+
+	return nil
+}
+
+func (c *scriptedOperationWatchClient) Watch(_ context.Context, _ client.ObjectList, _ ...client.ListOption) (watch.Interface, error) {
+	w := watch.NewFakeWithChanSize(len(c.updates), false)
+	for _, update := range c.updates {
+		w.Modify(update)
+	}
+
+	w.Stop()
+
+	return w, nil
 }
 
 type recordingWatchClient struct {

@@ -310,8 +310,13 @@ stops new starts: a node that is already running is not stopped.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `spec.machineRef` | string | No | Target `Machine` name. Either `machineRef` or `machineSelector` must be set. |
-| `spec.machineSelector` | LabelSelector | No | Selects Machines by label. Supported for agent-handled operations (`NodeReboot`, `AgentUpgrade`, `AgentReset`). Each matching agent independently picks up the operation. Not supported for host operations. |
+| `spec.machineRef` | string | No | Target `Machine` name. Exactly one of `machineRef` and `machineSelector` must be set. Immutable. A selectable field: `--field-selector spec.machineRef=<name>` lists one machine's operations, and each agent watches with it. |
+| `spec.machineSelector` | LabelSelector | No | Selects Machines by Machine labels. Allowed for every operation kind except `HostAllocate` and `HostRelease`. machina-controller matches the selector against Machine labels and creates one child `MachineOperation` with `machineRef` per matching Machine, named `<parent>-<machine>-<suffix>` and owned by the parent. Agents and provider controllers execute only the children. Must not be empty. The whole spec of a selector operation is immutable. |
+| `spec.rollout.maxConcurrent` | intstr | No | How many matched machines may be worked on at the same time: an integer of at least 1 or a percentage from `1%` to `100%` of the matched machines. Default `1`. Allowed only with `machineSelector`. |
+| `spec.rollout.onFailure` | string | No | What happens after a machine's operation fails: `Stop` (default) releases no further machines, the running ones finish, and the parent ends `Failed`; `Continue` carries on until `maxFailures` machines have failed. Allowed only with `machineSelector`. |
+| `spec.rollout.maxFailures` | int32 | No | With `onFailure: Continue`, how many failed machines stop the rollout, from `1` to `1000`. Default `1000`. Machines already running still finish, so more can fail. Allowed only with `onFailure: Continue`. |
+| `spec.rollout.childRetention` | string | No | Which children are kept once the selector operation has finished: `Failed` (default) keeps the children that failed, at most 1000, and removes the completed ones and the held ones a stopped rollout never started; `All` keeps every child. A child that carries a boot media record is kept either way. `status.summary` keeps the counts and is the durable record: a child may be removed any time after it completes. Allowed only with `machineSelector`. |
+| `spec.suspend` | bool | No | Holds a `machineRef` operation: while it is `true` no agent or provider controller starts the operation, and it does not make another operation on the machine wait. It can be set only when the operation is created and only cleared afterward. A selector operation creates the children that may not run yet held and clears the field to release them. `true` is not allowed with `machineSelector`, `HostAllocate` or `HostRelease`. |
 | `spec.operationKind` | string | Yes | One of `NodeReboot`, `AgentUpgrade`, `AgentReset`, `HostHardReboot`, `HostSoftReboot`, `HostPowerOff`, `HostPowerOn`, `HostReplace`. |
 | `spec.parameters` | map[string]string | No | Operation-specific parameters. |
 | `spec.ttlSecondsAfterFinished` | int32 | No | Delete completed or failed operations after this many seconds. |
@@ -319,7 +324,8 @@ stops new starts: a node that is already running is not stopped.
 | `status.message` | string | No | Human-readable status message. |
 | `status.startedAt` | time | No | Operation start timestamp. |
 | `status.completedAt` | time | No | Terminal phase timestamp. |
-| `status.targets` | []TargetStatus | No | Per-Machine target status snapshot used by host operation controllers. |
+| `status.targets` | []TargetStatus | No | State of a `machineRef` operation's machine, in one entry. A selector operation has none: its children carry the per-machine state. |
+| `status.summary` | Summary | No | Selector operations only. Counts of the children: `total`, `held`, `active`, `complete`, `failed`, and `failedMachines` with up to ten names. Set once every child exists. |
 | `status.conditions` | []Condition | No | Operation conditions. `Completed` tracks terminal state. `BootLoaderDownloaded=True` is latched by metalman when a target first downloads the initial PXE boot loader, usually over TFTP. `BootImageWritten` starts as `Unknown` for metalman `HostReplace`, transitions to `False` when the PXE installer requests `disk.img.gz`, and transitions to `True` when the existing `/pxe/disable` completion signal is received. `CloudInitDone` starts as `Unknown`, transitions to `False` when first-boot cloud-init starts, and transitions to `True` on final cloud-init success or `False` with reason `Failed` and a summarized error when cloud-init reports a failure. |
 
 `AgentUpgrade` is handled by the in-host agent and requires `spec.parameters.downloadURL`. The URL may use HTTP or HTTPS and must point to an `unbounded-agent` release tarball. The optional `spec.parameters.sha256` is the expected digest of the compressed archive. The agent verifies the digest when provided, stages the archive's exact `unbounded-agent` member as the inactive blue/green daemon binary, records the previous binary as last known good, and restarts `unbounded-agent-daemon.service`. If systemd cannot keep the upgraded daemon running, `unbounded-agent-daemon-recovery.service` switches the daemon back to the last known good binary.
@@ -339,10 +345,9 @@ This replacement flow avoids Azure standalone VM `customData` immutability durin
 
 Metalman handles bare-metal host operations for Machines with
 `spec.host.netboot.redfish` (or deprecated `spec.pxe.redfish`) and no external
-host owner. Bare-metal host operations may
-target one Machine with `spec.machineRef` or a site-scoped set of Machines with
-`spec.machineSelector`. Selector-based bare-metal host operations must select a
-single metalman site with `unbounded-cloud.io/site=<site>`.
+host owner. Bare-metal host operations may target one Machine with
+`spec.machineRef` or a group of Machines with `spec.machineSelector`, like
+every other operation kind except `HostAllocate` and `HostRelease`.
 
 For host operations, `status.targets[]` is snapshotted when execution starts
 and remains authoritative even if labels later change. Metalman records its
@@ -365,6 +370,28 @@ after a controller restart. Each entry includes:
 | `attempts` | int32 | External action attempts for retryable Redfish operations. |
 | `lastAttemptAt` | time | Most recent external action attempt timestamp. |
 | `providerOperation` | ProviderOperationStatus | Resumable external operation metadata, including provider, operation ID, and an opaque non-secret resume token. |
+
+The whole spec of a selector operation is immutable. Its status can be
+written only by an identity that may create MachineOperations (admission
+policy `unbounded-machineoperation-parent-status`), which node agents may
+not. The same policy covers the status of a held operation.
+
+A selector operation reports these reasons, and its `status.message` repeats
+the counts, for example `machines: 40 total, 30 held, 5 active, 4 complete, 1
+failed`. The condition `TargetsResolved` is `True` once every child exists. The
+condition `ChildrenPruned` is `True` on a finished operation once
+the children it does not keep have been removed: the completed ones, the
+held ones, and failed ones beyond 1000, except those that carry a boot media
+record. It is not set when `spec.rollout.childRetention` is `All` or when no
+machine matched.
+
+| Reason | Meaning |
+|--------|---------|
+| `NoMachinesMatched` | The selector matched no Machine when machina-controller resolved it; the parent fails at once. |
+| `NotPickedUp` | No agent or provider controller took a released child operation for 5 minutes, nor any other child of the same parent in that time, so the controller that created it failed the child. An agent marks an operation `Pending` when it takes it. |
+| `RolloutStopped` | A child failed and `spec.rollout.onFailure` is `Stop`, so no further children were released. The rest never run. |
+| `FailureLimitReached` | `spec.rollout.onFailure` is `Continue` and `spec.rollout.maxFailures` children failed, so no further children were released. |
+| `TargetFailed` | Every child finished and at least one failed. |
 
 ### status
 

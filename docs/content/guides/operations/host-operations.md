@@ -10,23 +10,25 @@ machine. They are handled by `azure-machine-ops-controller` for Azure VMs and by
 `HostSoftReboot`, which the `unbounded-agent` daemon on the host executes.
 
 For metalman-managed bare-metal machines, host operations may target a single
-machine with `spec.machineRef` or multiple machines with `spec.machineSelector`.
-Exactly one metalman instance owns each operation, and the other instances
-ignore it without changing its status:
+machine with `spec.machineRef` or a group of machines with
+`spec.machineSelector`, like every other operation kind except `HostAllocate`
+and `HostRelease`. A selector operation is matched against Machine
+labels by machina-controller, which creates one child operation per matched
+Machine and releases them at the pace in `spec.rollout`. The parent's status
+has counts; each child has its machine's result. Agents and provider
+controllers execute only the child operations.
+
+For `machineRef` operations, exactly one metalman instance owns each
+operation, and the other instances ignore it without changing its status:
 
 - A `machineRef` operation is owned by the metalman instance for the target
   Machine's `unbounded-cloud.io/site`. The default unlabeled metalman instance
   owns operations for Machines that have no site label.
-- A `machineSelector` operation is owned by the metalman instance for the site
-  the selector names, either in `matchLabels` or as a single-value `In`
-  expression on `unbounded-cloud.io/site`. The default unlabeled metalman
-  instance does not support selector-based operations.
 - An operation that mounts boot media is owned by the metalman instance for
   the boot media's site.
 
 An operation that no metalman instance can own is marked `Failed`. This covers
-a selector that names no site or more than one site, and a `machineRef` that
-names a Machine that does not exist.
+a `machineRef` that names a Machine that does not exist.
 
 For Azure VMs, run `azure-machine-ops-controller` scoped to the Machine's site and
 provider, for example `--site=remote --provider=AzureVM`. A scoped controller
