@@ -23,14 +23,16 @@ rules:
   - apiGroups: ["racer.unbounded-cloud.io"]
     resources: ["clustercaches"]
     verbs: ["get", "list", "watch"]
-  # Every process watches fills to pin the pages it owns. The primary writes
-  # fill status; no other write to a fill is granted.
+  # Every process watches fills to pin the pages it owns. Runtime coordination
+  # selects the primary status writer, but every Pod sharing this ServiceAccount
+  # can update fill status. Neither RBAC nor admission enforces primary ownership.
+  # No spec writes are granted, and the status writer needs only PUT (update).
   - apiGroups: ["racer.unbounded-cloud.io"]
     resources: ["clustercachefills"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["racer.unbounded-cloud.io"]
     resources: ["clustercachefills/status"]
-    verbs: ["get", "patch", "update"]
+    verbs: ["update"]
   # Seats authenticate dataplane Pods from their racer-control audience token.
   - apiGroups: ["authentication.k8s.io"]
     resources: ["tokenreviews"]

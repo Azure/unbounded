@@ -178,7 +178,7 @@ func TestRBACGrantsExactly(t *testing.T) {
 		{APIGroups: []string{""}, Resources: []string{"nodes"}, Verbs: []string{"get", "list", "watch"}},
 		{APIGroups: []string{"racer.unbounded-cloud.io"}, Resources: []string{"clustercaches"}, Verbs: []string{"get", "list", "watch"}},
 		{APIGroups: []string{"racer.unbounded-cloud.io"}, Resources: []string{"clustercachefills"}, Verbs: []string{"get", "list", "watch"}},
-		{APIGroups: []string{"racer.unbounded-cloud.io"}, Resources: []string{"clustercachefills/status"}, Verbs: []string{"get", "patch", "update"}},
+		{APIGroups: []string{"racer.unbounded-cloud.io"}, Resources: []string{"clustercachefills/status"}, Verbs: []string{"update"}},
 		{APIGroups: []string{"authentication.k8s.io"}, Resources: []string{"tokenreviews"}, Verbs: []string{"create"}},
 		{APIGroups: []string{"admissionregistration.k8s.io"}, Resources: []string{"mutatingwebhookconfigurations"}, ResourceNames: []string{"racer-object-sidecar-injector"}, Verbs: []string{"get", "patch"}},
 	}, clusterRole.Rules)
