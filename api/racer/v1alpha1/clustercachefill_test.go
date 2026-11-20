@@ -91,6 +91,20 @@ func TestClusterCacheFillStatusJSONAndDeepCopy(t *testing.T) {
 	require.Equal(t, FillReasonComplete, fill.Status.Conditions[0].Reason)
 }
 
+func TestClusterCacheFillTooManyFillsReason(t *testing.T) {
+	condition := metav1.Condition{
+		Type: FillConditionAccepted, Status: metav1.ConditionFalse, Reason: FillReasonTooManyFills,
+	}
+	data, err := json.Marshal(condition)
+	require.NoError(t, err)
+
+	var decoded map[string]any
+	require.NoError(t, json.Unmarshal(data, &decoded))
+	require.Equal(t, "Accepted", decoded["type"])
+	require.Equal(t, "False", decoded["status"])
+	require.Equal(t, "TooManyFills", decoded["reason"])
+}
+
 func TestClusterCacheFillEffectiveDefaults(t *testing.T) {
 	spec := ClusterCacheFillSpec{}
 	require.Equal(t, DefaultFillReplicas, spec.EffectiveReplicas())

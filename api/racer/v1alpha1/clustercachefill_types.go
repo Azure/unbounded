@@ -248,6 +248,10 @@ const (
 	FillReasonOriginUnavailable    = "OriginUnavailable"
 )
 
+// FillReasonTooManyFills means at least one node in the cache pool has no
+// remaining fill report slot. Disjoint pools do not compete for slots.
+const FillReasonTooManyFills = "TooManyFills"
+
 // +kubebuilder:object:root=true
 type ClusterCacheFillList struct {
 	metav1.TypeMeta `json:",inline"`
