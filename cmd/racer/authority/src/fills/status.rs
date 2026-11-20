@@ -148,7 +148,7 @@ pub fn status(
         view.accepted && manifest_current && footprint > 0 && progress.resident_bytes < footprint;
     let degraded = if progress.refused_bytes > 0 {
         Some(("CapacityLost", "nodes refused pinned bytes".to_owned()))
-    } else if view.accepted && manifest_current && missing_members {
+    } else if completed && view.accepted && manifest_current && missing_members {
         Some((
             "MemberLost",
             format!(
@@ -220,6 +220,14 @@ pub fn status(
             "residency is below the planned footprint"
         },
     );
+    let waiting = if missing_members {
+        format!(
+            "{} replicas requested but only {} nodes are available",
+            view.replicas, view.available_nodes
+        )
+    } else {
+        "waiting for confirmed copies".to_owned()
+    };
     let ready_condition = condition(
         view,
         previous,
@@ -230,7 +238,7 @@ pub fn status(
         if ready {
             "every copy is confirmed"
         } else {
-            "waiting for confirmed copies"
+            &waiting
         },
     );
     let degraded_true = degraded.is_some();
@@ -595,7 +603,7 @@ mod tests {
     }
 
     #[test]
-    fn requested_replicas_above_pool_size_are_degraded_and_not_ready() {
+    fn insufficient_initial_pool_is_not_reported_as_member_loss() {
         let mut v = with_manifest(view());
         // The resident copy covers the whole footprint, so only the missing
         // replica keeps the fill from being Ready.
@@ -609,16 +617,25 @@ mod tests {
         assert_eq!(s["footprintBytes"], 100);
         assert_eq!(s["residentBytes"], 100);
         assert_eq!(c["Ready"], ("False".into(), "Filling".into()));
-        assert_eq!(c["Degraded"], ("True".into(), "MemberLost".into()));
+        assert_eq!(c["Degraded"], ("False".into(), "Complete".into()));
+        assert_eq!(c["Progressing"], ("True".into(), "Filling".into()));
         let message = s["conditions"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|c| c["type"] == "Degraded")
+            .find(|c| c["type"] == "Ready")
             .and_then(|c| c["message"].as_str())
             .unwrap();
         assert!(message.contains("2 replicas"), "{message}");
         assert!(message.contains("1 nodes"), "{message}");
+        // The same shortage after initial completion really is MemberLost.
+        v.available_nodes = 2;
+        let ready = status(&v, &reports, None);
+        assert_eq!(statuses(&ready)["Ready"].0, "True");
+        v.available_nodes = 1;
+        let lost = status(&v, &reports, Some(&ready));
+        assert_eq!(statuses(&lost)["Degraded"].1, "MemberLost");
+        assert_eq!(statuses(&lost)["Progressing"].0, "False");
     }
 
     #[test]
