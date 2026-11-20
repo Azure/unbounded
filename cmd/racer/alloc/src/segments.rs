@@ -99,6 +99,8 @@ struct PinnedAppend {
 
     pinned_open: Rc<Cell<Option<usize>>>,
 
+    generation: Rc<Cell<u64>>,
+
     position: usize,
 }
 
@@ -163,6 +165,9 @@ impl Drop for SegmentLease {
         if slot.pinned_pending != 0 || slot.pinned_published || slot.pinned_charged {
             return;
         }
+        pinned
+            .generation
+            .set(pinned.generation.get().wrapping_add(1));
         slot.image.pinned = false;
         if pinned.pinned_open.get() == Some(pinned.position) {
             if slot.image.state == SegmentState::Open {
@@ -267,8 +272,9 @@ pub struct Segments {
 
     usage: RefCell<Vec<(u64, u64)>>,
 
-    /// Bumped by every mutable borrow of `slots`; see [`Segments::generation`].
-    generation: Cell<u64>,
+    /// Bumped by every mutable borrow of `slots` and canceled pinned append.
+    /// Shared with append leases so their drops cannot bypass checkpoint tracking.
+    generation: Rc<Cell<u64>>,
 }
 
 impl Segments {
@@ -287,7 +293,7 @@ impl Segments {
             free: RefCell::new(BTreeSet::new()),
             evicting: Cell::new(0),
             usage: RefCell::new(Vec::new()),
-            generation: Cell::new(0),
+            generation: Rc::new(Cell::new(0)),
         }
     }
 
@@ -536,6 +542,7 @@ impl Segments {
             Self::position(slot.image.id).map(|position| PinnedAppend {
                 slots: self.slots.clone(),
                 pinned_open: self.pinned_open.clone(),
+                generation: self.generation.clone(),
                 position,
             })
         });
@@ -986,6 +993,31 @@ mod tests {
         let before = s.snapshot();
         s.recycle(SegmentId(0)).unwrap();
         changed(&s, &before);
+    }
+
+    #[test]
+    fn canceled_pinned_append_bumps_generation_only_when_the_image_changes() {
+        let s = segments(2048, 2);
+        let (first, _) = s.append_in(512, true).unwrap();
+        let (last, _) = s.append_in(512, true).unwrap();
+        let generation = s.generation();
+        let before = s.snapshot();
+        drop(first);
+        assert_eq!(s.snapshot(), before);
+        assert_eq!(s.generation(), generation);
+        drop(last);
+        assert_ne!(s.snapshot(), before);
+        assert_ne!(s.generation(), generation);
+        assert_eq!(s.state(SegmentId(0)), Ok(SegmentState::Sealed));
+        assert!(!s.pinned(SegmentId(0)).unwrap());
+
+        let (published, _) = s.append_in(512, true).unwrap();
+        s.pin_segment(published.id()).unwrap();
+        let generation = s.generation();
+        let before = s.snapshot();
+        drop(published);
+        assert_eq!(s.snapshot(), before);
+        assert_eq!(s.generation(), generation);
     }
 
     #[test]
