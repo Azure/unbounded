@@ -270,7 +270,7 @@ jobs:
   #   - racer-object                  : sidecars injected by the racer component
   #   - racer-vllm                    : vLLM with the Racer loader; not deployed
   #
-  # machine-ops-controller is omitted on purpose: the operator synthesizes
+  # azure-machine-ops-controller is omitted on purpose: the operator synthesizes
   # metalman per Site instead, so machine-ops is never rolled out here.
   #
   # Anything added to internal/operator/reconciler.go's component list needs an

@@ -16,32 +16,31 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	"github.com/Azure/unbounded/internal/machineops"
-	publicmachineops "github.com/Azure/unbounded/pkg/machineops"
+	"github.com/Azure/unbounded/pkg/machineops"
 )
 
 // PlanAllocation fixes the VM identity before any Azure side effect, so
 // every later step addresses the same deterministic ARM resource.
-func (p *Provider) PlanAllocation(_ context.Context, request publicmachineops.AllocationPlanRequest) (publicmachineops.AllocationPlan, error) {
+func (p *Provider) PlanAllocation(_ context.Context, request machineops.AllocationPlanRequest) (machineops.AllocationPlan, error) {
 	config, err := parseCapacityConfig(request.ProviderConfig.Data)
 	if err != nil {
-		return publicmachineops.AllocationPlan{}, invalidRequest(err)
+		return machineops.AllocationPlan{}, invalidRequest(err)
 	}
 
 	name, err := VMName(request.AllocationUID)
 	if err != nil {
-		return publicmachineops.AllocationPlan{}, invalidRequest(err)
+		return machineops.AllocationPlan{}, invalidRequest(err)
 	}
 
 	if request.HostName != name {
-		return publicmachineops.AllocationPlan{}, invalidRequest(fmt.Errorf("host name %q must equal the allocation VM name %q", request.HostName, name))
+		return machineops.AllocationPlan{}, invalidRequest(fmt.Errorf("host name %q must equal the allocation VM name %q", request.HostName, name))
 	}
 
 	if err := offeringMatchesConfig(request.Offering, config); err != nil {
-		return publicmachineops.AllocationPlan{}, invalidRequest(err)
+		return machineops.AllocationPlan{}, invalidRequest(err)
 	}
 
-	return publicmachineops.AllocationPlan{
+	return machineops.AllocationPlan{
 		ProviderID: "azure://" + vmResourceID(config.SubscriptionID, config.ResourceGroup, name),
 		HostImage:  config.Image,
 	}, nil
@@ -186,32 +185,32 @@ func parseAllocateHandle(token string) (allocateHandle, error) {
 // PermanentError from a replayed Begin as unknown ownership, so reporting the
 // refusal through Poll keeps an out-of-capacity or quota failure that follows
 // a retried Begin a clean, releasable failure.
-func (p *Provider) BeginAllocate(ctx context.Context, request machineops.OperationRequest) (publicmachineops.BeginResult, error) {
+func (p *Provider) BeginAllocate(ctx context.Context, request machineops.OperationRequest) (machineops.BeginResult, error) {
 	target, err := allocationTarget(request)
 	if err != nil {
-		return publicmachineops.BeginResult{}, invalidRequest(err)
+		return machineops.BeginResult{}, invalidRequest(err)
 	}
 
 	config, err := allocationConfig(request, target)
 	if err != nil {
-		return publicmachineops.BeginResult{}, invalidRequest(err)
+		return machineops.BeginResult{}, invalidRequest(err)
 	}
 
 	client, err := p.capacityClient(target.subscriptionID, request.Auth)
 	if err != nil {
-		return publicmachineops.BeginResult{}, fmt.Errorf("create Azure capacity client: %w", err)
+		return machineops.BeginResult{}, fmt.Errorf("create Azure capacity client: %w", err)
 	}
 
 	existing, err := client.GetVM(ctx, target.resourceGroup, target.name, false)
 	if err != nil {
-		return publicmachineops.BeginResult{}, beforeCreate(err)
+		return machineops.BeginResult{}, beforeCreate(err)
 	}
 
 	// A replayed Begin after a lost status write finds its own VM and resumes
 	// observation instead of issuing a second create.
 	if existing != nil {
 		if err := checkVMOwnership(existing, target.uid); err != nil {
-			return publicmachineops.BeginResult{}, providerConflict(err)
+			return machineops.BeginResult{}, providerConflict(err)
 		}
 
 		return beginAllocateResult(target, allocateHandle{}, "adopted existing VM "+target.name)
@@ -224,29 +223,29 @@ func (p *Provider) BeginAllocate(ctx context.Context, request machineops.Operati
 	// create as well.
 	refs, err := createdChildRefs(ctx, client, target)
 	if err != nil {
-		return publicmachineops.BeginResult{}, beforeCreate(err)
+		return machineops.BeginResult{}, beforeCreate(err)
 	}
 
 	children, err := observeChildren(ctx, client, appendChildRef(refs, configuredNICRef(target)))
 	if err != nil {
-		return publicmachineops.BeginResult{}, beforeCreate(err)
+		return machineops.BeginResult{}, beforeCreate(err)
 	}
 
 	for _, child := range children {
 		if child.present {
-			return publicmachineops.BeginResult{}, providerConflict(fmt.Errorf("%s %s already exists before its VM was created", child.kind, child.name))
+			return machineops.BeginResult{}, providerConflict(fmt.Errorf("%s %s already exists before its VM was created", child.kind, child.name))
 		}
 	}
 
 	vm, err := buildAllocationVM(config, request.Allocation, target)
 	if err != nil {
-		return publicmachineops.BeginResult{}, invalidRequest(err)
+		return machineops.BeginResult{}, invalidRequest(err)
 	}
 
 	if err := client.CreateVM(ctx, target.resourceGroup, target.name, vm); err != nil {
 		rejection, definitive := classifyCreateRejection(err)
 		if !definitive {
-			return publicmachineops.BeginResult{}, err
+			return machineops.BeginResult{}, err
 		}
 
 		return beginAllocateResult(target, allocateHandle{Rejected: &rejection}, rejection.describe(target.name))
@@ -257,10 +256,10 @@ func (p *Provider) BeginAllocate(ctx context.Context, request machineops.Operati
 	return beginAllocateResult(target, allocateHandle{AcceptedAt: &acceptedAt}, "creating VM "+target.name)
 }
 
-func beginAllocateResult(target allocationVM, handle allocateHandle, message string) (publicmachineops.BeginResult, error) {
+func beginAllocateResult(target allocationVM, handle allocateHandle, message string) (machineops.BeginResult, error) {
 	token, err := json.Marshal(handle)
 	if err != nil {
-		return publicmachineops.BeginResult{}, fmt.Errorf("encode HostAllocate resume token: %w", err)
+		return machineops.BeginResult{}, fmt.Errorf("encode HostAllocate resume token: %w", err)
 	}
 
 	result := beginResult(target, message)
@@ -298,9 +297,9 @@ func allocationConfig(request machineops.OperationRequest, target allocationVM) 
 	return config, nil
 }
 
-func beginResult(target allocationVM, message string) publicmachineops.BeginResult {
-	return publicmachineops.BeginResult{
-		Operation: publicmachineops.ProviderOperation{
+func beginResult(target allocationVM, message string) machineops.BeginResult {
+	return machineops.BeginResult{
+		Operation: machineops.ProviderOperation{
 			OperationID: target.id(),
 		},
 		Message:      message,
@@ -313,7 +312,7 @@ func beginResult(target allocationVM, message string) publicmachineops.BeginResu
 // resource this allocation owns.
 func buildAllocationVM(
 	config capacityConfig,
-	allocation *publicmachineops.AllocationRequest,
+	allocation *machineops.AllocationRequest,
 	target allocationVM,
 ) (armcompute.VirtualMachine, error) {
 	image, err := parseAzureImageReference(config.Image)
@@ -420,26 +419,26 @@ func buildAllocationVM(
 func (p *Provider) PollAllocate(
 	ctx context.Context,
 	request machineops.OperationRequest,
-	operation publicmachineops.ProviderOperation,
-) (publicmachineops.PollResult, error) {
+	operation machineops.ProviderOperation,
+) (machineops.PollResult, error) {
 	target, err := allocationTarget(request)
 	if err != nil {
-		return publicmachineops.PollResult{}, invalidRequest(err)
+		return machineops.PollResult{}, invalidRequest(err)
 	}
 
 	handle, err := parseAllocateHandle(operation.ResumeToken)
 	if err != nil {
-		return publicmachineops.PollResult{}, invalidRequest(err)
+		return machineops.PollResult{}, invalidRequest(err)
 	}
 
 	client, err := p.capacityClient(target.subscriptionID, request.Auth)
 	if err != nil {
-		return publicmachineops.PollResult{}, fmt.Errorf("create Azure capacity client: %w", err)
+		return machineops.PollResult{}, fmt.Errorf("create Azure capacity client: %w", err)
 	}
 
 	vm, err := client.GetVM(ctx, target.resourceGroup, target.name, false)
 	if err != nil {
-		return publicmachineops.PollResult{}, err
+		return machineops.PollResult{}, err
 	}
 
 	if vm == nil {
@@ -460,8 +459,8 @@ func (p *Provider) PollAllocate(
 	case "deleting":
 		return failedAllocation(ctx, client, vm, target, request, unboundedv1alpha3.FailureProviderFailed, fmt.Sprintf("VM %s is being deleted", target.name))
 	default:
-		return publicmachineops.PollResult{
-			State:        publicmachineops.ProviderOperationStateInProgress,
+		return machineops.PollResult{
+			State:        machineops.ProviderOperationStateInProgress,
 			Message:      fmt.Sprintf("VM %s provisioning state is %s", target.name, valueOrDefault(provisioningState(vm), "unknown")),
 			RequeueAfter: pollInterval,
 		}, nil
@@ -480,11 +479,11 @@ func (p *Provider) absentAllocation(
 	client capacityClient,
 	target allocationVM,
 	handle allocateHandle,
-) (publicmachineops.PollResult, error) {
+) (machineops.PollResult, error) {
 	// A read just after an accepted create may not see the VM yet.
 	if handle.Rejected == nil && handle.AcceptedAt != nil && p.now().Sub(*handle.AcceptedAt) < createVisibilityGrace {
-		return publicmachineops.PollResult{
-			State:        publicmachineops.ProviderOperationStateInProgress,
+		return machineops.PollResult{
+			State:        machineops.ProviderOperationStateInProgress,
 			Message:      fmt.Sprintf("waiting for accepted VM %s to become visible", target.name),
 			RequeueAfter: pollInterval,
 		}, nil
@@ -505,12 +504,12 @@ func (p *Provider) absentAllocation(
 
 	refs, err := createdChildRefs(ctx, client, target)
 	if err != nil {
-		return publicmachineops.PollResult{}, err
+		return machineops.PollResult{}, err
 	}
 
 	children, err := observeChildren(ctx, client, refs)
 	if err != nil {
-		return publicmachineops.PollResult{}, err
+		return machineops.PollResult{}, err
 	}
 
 	var waiting []string
@@ -533,7 +532,7 @@ func (p *Provider) absentAllocation(
 	}
 
 	result := failedPoll(reason, message)
-	result.Result.Allocation = &publicmachineops.AllocationResult{}
+	result.Result.Allocation = &machineops.AllocationResult{}
 
 	return result, nil
 }
@@ -544,9 +543,9 @@ func (p *Provider) absentAllocation(
 // resource settles, so they are visible while it waits. The wait has no
 // deadline of its own, like the wait for a provisioned VM's children: the
 // engine marks the operation stalled and slows its polling.
-func unsettledAllocation(reason unboundedv1alpha3.MachineAllocationFailureReason, message, waitingFor string) publicmachineops.PollResult {
-	return publicmachineops.PollResult{
-		State:        publicmachineops.ProviderOperationStateInProgress,
+func unsettledAllocation(reason unboundedv1alpha3.MachineAllocationFailureReason, message, waitingFor string) machineops.PollResult {
+	return machineops.PollResult{
+		State:        machineops.ProviderOperationStateInProgress,
 		Message:      fmt.Sprintf("%s: %s; waiting for %s", reason, message, waitingFor),
 		RequeueAfter: pollInterval,
 	}
@@ -563,24 +562,24 @@ func provisionedAllocation(
 	vm *armcompute.VirtualMachine,
 	target allocationVM,
 	request machineops.OperationRequest,
-) (publicmachineops.PollResult, error) {
+) (machineops.PollResult, error) {
 	refs, err := vmChildRefs(vm, target)
 	if err != nil {
 		return failedPoll(unboundedv1alpha3.FailureProviderConflict, err.Error()), nil
 	}
 
 	if err := requireProvisionedChildRefs(refs, target); err != nil {
-		return publicmachineops.PollResult{}, err
+		return machineops.PollResult{}, err
 	}
 
 	owned, err := ownedVM(vm, target)
 	if err != nil {
-		return publicmachineops.PollResult{}, err
+		return machineops.PollResult{}, err
 	}
 
 	children, err := observeChildren(ctx, client, refs)
 	if err != nil {
-		return publicmachineops.PollResult{}, err
+		return machineops.PollResult{}, err
 	}
 
 	result := allocationResult(vm, target, request)
@@ -588,7 +587,7 @@ func provisionedAllocation(
 
 	for _, child := range children {
 		if !child.present || child.nativeID == "" {
-			return publicmachineops.PollResult{}, fmt.Errorf("%s %s of provisioned VM %s is not yet observable", child.kind, child.id, target.name)
+			return machineops.PollResult{}, fmt.Errorf("%s %s of provisioned VM %s is not yet observable", child.kind, child.id, target.name)
 		}
 
 		if child.attachedElsewhere(target) {
@@ -599,16 +598,16 @@ func provisionedAllocation(
 		// attachment. That state passes, so it is retried like a child that
 		// is not visible yet.
 		if child.attachedTo == "" {
-			return publicmachineops.PollResult{}, fmt.Errorf("%s %s of provisioned VM %s does not report its attachment yet", child.kind, child.id, target.name)
+			return machineops.PollResult{}, fmt.Errorf("%s %s of provisioned VM %s does not report its attachment yet", child.kind, child.id, target.name)
 		}
 
 		result.OwnedResources = append(result.OwnedResources, child.owned())
 	}
 
-	return publicmachineops.PollResult{
-		State:   publicmachineops.ProviderOperationStateSucceeded,
+	return machineops.PollResult{
+		State:   machineops.ProviderOperationStateSucceeded,
 		Message: fmt.Sprintf("VM %s is provisioned", target.name),
-		Result: publicmachineops.OperationResult{
+		Result: machineops.OperationResult{
 			Allocation: result,
 		},
 	}, nil
@@ -655,16 +654,16 @@ func failedProvisioning(
 	client capacityClient,
 	target allocationVM,
 	request machineops.OperationRequest,
-) (publicmachineops.PollResult, error) {
+) (machineops.PollResult, error) {
 	vm, err := client.GetVM(ctx, target.resourceGroup, target.name, true)
 	if err != nil {
-		return publicmachineops.PollResult{}, err
+		return machineops.PollResult{}, err
 	}
 
 	// The VM vanished between the two reads; the next poll observes its
 	// absence and what it left behind.
 	if vm == nil {
-		return publicmachineops.PollResult{}, fmt.Errorf("VM %s disappeared after its provisioning failed", target.name)
+		return machineops.PollResult{}, fmt.Errorf("VM %s disappeared after its provisioning failed", target.name)
 	}
 
 	if err := checkVMOwnership(vm, target.uid); err != nil {
@@ -697,7 +696,7 @@ func failedAllocation(
 	request machineops.OperationRequest,
 	reason unboundedv1alpha3.MachineAllocationFailureReason,
 	message string,
-) (publicmachineops.PollResult, error) {
+) (machineops.PollResult, error) {
 	refs, refsErr := vmChildRefs(vm, target)
 	if refsErr != nil {
 		return failedPoll(unboundedv1alpha3.FailureProviderConflict, fmt.Sprintf("%s; %v", message, refsErr)), nil
@@ -705,7 +704,7 @@ func failedAllocation(
 
 	created, err := createdChildRefs(ctx, client, target)
 	if err != nil {
-		return publicmachineops.PollResult{}, err
+		return machineops.PollResult{}, err
 	}
 
 	for _, ref := range created {
@@ -714,12 +713,12 @@ func failedAllocation(
 
 	owned, err := ownedVM(vm, target)
 	if err != nil {
-		return publicmachineops.PollResult{}, err
+		return machineops.PollResult{}, err
 	}
 
 	children, err := observeChildren(ctx, client, refs)
 	if err != nil {
-		return publicmachineops.PollResult{}, err
+		return machineops.PollResult{}, err
 	}
 
 	allocation := allocationResult(vm, target, request)
@@ -778,8 +777,8 @@ func allocationResult(
 	vm *armcompute.VirtualMachine,
 	target allocationVM,
 	request machineops.OperationRequest,
-) *publicmachineops.AllocationResult {
-	result := &publicmachineops.AllocationResult{
+) *machineops.AllocationResult {
+	result := &machineops.AllocationResult{
 		ProviderResourceID: target.id(),
 		InstanceType:       request.Allocation.Offering.InstanceType,
 		Zone:               request.Allocation.Offering.Zone,

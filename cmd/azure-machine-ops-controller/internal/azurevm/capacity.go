@@ -17,7 +17,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	publicmachineops "github.com/Azure/unbounded/pkg/machineops"
+	"github.com/Azure/unbounded/pkg/machineops"
 )
 
 // Azure tag keys stamped on every VM this adapter creates. Azure tag names
@@ -91,16 +91,16 @@ func vmResourceID(subscriptionID, resourceGroup, name string) string {
 // Replay is keyed on the allocation UID: the VM name is derived from it and
 // the VM carries it as a tag, so a Begin repeated for any operation UID of
 // the same allocation finds the same VM.
-func (p *Provider) capacityRegistration() []publicmachineops.ProviderOption {
-	return []publicmachineops.ProviderOption{
-		publicmachineops.WithCapacity(p.ResolveClass, p.PlanAllocation),
-		publicmachineops.WithLongRunningOperation(unboundedv1alpha3.OperationHostAllocate, p.BeginAllocate, p.PollAllocate),
-		publicmachineops.WithLongRunningOperation(unboundedv1alpha3.OperationHostRelease, p.BeginRelease, p.PollRelease),
+func (p *Provider) capacityRegistration() []machineops.ProviderOption {
+	return []machineops.ProviderOption{
+		machineops.WithCapacity(p.ResolveClass, p.PlanAllocation),
+		machineops.WithLongRunningOperation(unboundedv1alpha3.OperationHostAllocate, p.BeginAllocate, p.PollAllocate),
+		machineops.WithLongRunningOperation(unboundedv1alpha3.OperationHostRelease, p.BeginRelease, p.PollRelease),
 	}
 }
 
 func providerConflict(err error) error {
-	return &publicmachineops.PermanentError{
+	return &machineops.PermanentError{
 		Reason: string(unboundedv1alpha3.FailureProviderConflict),
 		Err:    err,
 	}
@@ -128,7 +128,7 @@ func beforeCreate(err error) error {
 }
 
 func authFailed(err error) error {
-	return &publicmachineops.PermanentError{
+	return &machineops.PermanentError{
 		Reason: string(unboundedv1alpha3.FailureAuthFailed),
 		Err:    err,
 	}
@@ -213,9 +213,9 @@ func classifyAzureCode(code, message string) unboundedv1alpha3.MachineAllocation
 // failedPoll is a failed poll without an allocation report. A HostAllocate
 // that returns it unchanged declares that it cannot say what the allocation
 // owns.
-func failedPoll(reason unboundedv1alpha3.MachineAllocationFailureReason, message string) publicmachineops.PollResult {
-	return publicmachineops.PollResult{
-		State:   publicmachineops.ProviderOperationStateFailed,
+func failedPoll(reason unboundedv1alpha3.MachineAllocationFailureReason, message string) machineops.PollResult {
+	return machineops.PollResult{
+		State:   machineops.ProviderOperationStateFailed,
 		Reason:  string(reason),
 		Message: message,
 	}

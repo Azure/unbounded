@@ -191,7 +191,7 @@ func stepPushes(push any, outputs string) bool {
 // workflowImages returns every image repository the workflow builds and pushes.
 //
 // Parsing the YAML tree rather than scanning text is deliberate: the comment
-// above nightly's component-images matrix names machine-ops-controller while
+// above nightly's component-images matrix names azure-machine-ops-controller while
 // explaining that it is NOT built there, and lists every component that is. A
 // textual scan reports both as built.
 func workflowImages(t *testing.T, path string) map[string]string {

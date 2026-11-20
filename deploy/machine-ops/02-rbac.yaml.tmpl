@@ -1,4 +1,4 @@
-{{- $controllerName := default "machine-ops-controller" .ControllerName }}
+{{- $controllerName := default "azure-machine-ops-controller" .ControllerName }}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -94,7 +94,13 @@ metadata:
     app.kubernetes.io/component: controller
 rules:
   - apiGroups: [""]
-    resources: ["services", "secrets"]
+    resources: ["services"]
+    resourceNames: ["kube-dns"]
+    verbs: ["get"]
+  # Bootstrap token Secret names (bootstrap-token-<id>) are not known in
+  # advance, so this rule cannot be limited with resourceNames.
+  - apiGroups: [""]
+    resources: ["secrets"]
     verbs: ["get"]
 
 ---

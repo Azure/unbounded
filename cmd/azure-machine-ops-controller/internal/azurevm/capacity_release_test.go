@@ -14,8 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	"github.com/Azure/unbounded/internal/machineops"
-	publicmachineops "github.com/Azure/unbounded/pkg/machineops"
+	"github.com/Azure/unbounded/pkg/machineops"
 )
 
 func TestReleaseDeletesVMAndConfirmsOwnedResources(t *testing.T) {
@@ -31,7 +30,7 @@ func TestReleaseDeletesVMAndConfirmsOwnedResources(t *testing.T) {
 	// A replayed Begin and a poll both observe the delete already issued.
 	_, err = provider.BeginRelease(t.Context(), request)
 	require.NoError(t, err)
-	require.Equal(t, publicmachineops.ProviderOperationStateInProgress, pollRelease(t, provider, request).State)
+	require.Equal(t, machineops.ProviderOperationStateInProgress, pollRelease(t, provider, request).State)
 	require.Equal(t, 1, client.vmDeletes)
 
 	// Azure deleted the VM and, with deleteOption Delete, its children.
@@ -40,7 +39,7 @@ func TestReleaseDeletesVMAndConfirmsOwnedResources(t *testing.T) {
 	delete(client.disks, testDiskName())
 
 	result := pollRelease(t, provider, request)
-	require.Equal(t, publicmachineops.ProviderOperationStateSucceeded, result.State)
+	require.Equal(t, machineops.ProviderOperationStateSucceeded, result.State)
 	require.Nil(t, result.Result.Allocation)
 	require.Zero(t, client.nicDeletes)
 	require.Zero(t, client.diskDeletes)
@@ -61,7 +60,7 @@ func TestReleaseDeletesProvenLeftovers(t *testing.T) {
 	client.disks[testDiskName()].ManagedBy = nil
 
 	result := pollRelease(t, provider, request)
-	require.Equal(t, publicmachineops.ProviderOperationStateInProgress, result.State)
+	require.Equal(t, machineops.ProviderOperationStateInProgress, result.State)
 	require.Contains(t, result.Message, "network interface "+testNICName())
 	require.Equal(t, 1, client.nicDeletes)
 	require.Equal(t, 1, client.diskDeletes)
@@ -70,14 +69,14 @@ func TestReleaseDeletesProvenLeftovers(t *testing.T) {
 	// A replayed Begin and a later poll observe the deletes in progress.
 	_, err = provider.BeginRelease(t.Context(), request)
 	require.NoError(t, err)
-	require.Equal(t, publicmachineops.ProviderOperationStateInProgress, pollRelease(t, provider, request).State)
+	require.Equal(t, machineops.ProviderOperationStateInProgress, pollRelease(t, provider, request).State)
 	require.Equal(t, 1, client.nicDeletes)
 	require.Equal(t, 1, client.diskDeletes)
 
 	delete(client.nics, testNICName())
 	delete(client.disks, testDiskName())
 
-	require.Equal(t, publicmachineops.ProviderOperationStateSucceeded, pollRelease(t, provider, request).State)
+	require.Equal(t, machineops.ProviderOperationStateSucceeded, pollRelease(t, provider, request).State)
 }
 
 // A delete Azure accepted but whose response was lost is not reissued: the
@@ -97,7 +96,7 @@ func TestReleaseLostDeleteAcceptanceSettles(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 1, client.vmDeletes)
 
-	require.Equal(t, publicmachineops.ProviderOperationStateInProgress, pollRelease(t, provider, request).State)
+	require.Equal(t, machineops.ProviderOperationStateInProgress, pollRelease(t, provider, request).State)
 }
 
 // The engine never begins a second HostRelease, so a poll that finds the VM
@@ -108,10 +107,10 @@ func TestReleasePollReissuesDroppedVMDelete(t *testing.T) {
 	request := allocatedVM(t, client, provider)
 
 	result := pollRelease(t, provider, request)
-	require.Equal(t, publicmachineops.ProviderOperationStateInProgress, result.State)
+	require.Equal(t, machineops.ProviderOperationStateInProgress, result.State)
 	require.Equal(t, 1, client.vmDeletes)
 
-	require.Equal(t, publicmachineops.ProviderOperationStateInProgress, pollRelease(t, provider, request).State)
+	require.Equal(t, machineops.ProviderOperationStateInProgress, pollRelease(t, provider, request).State)
 	require.Equal(t, 1, client.vmDeletes)
 }
 
@@ -126,7 +125,7 @@ func TestReleaseAzureErrorsAreRetried(t *testing.T) {
 	_, err := provider.BeginRelease(t.Context(), request)
 	requireTransient(t, err)
 
-	_, err = provider.PollRelease(t.Context(), request, publicmachineops.ProviderOperation{OperationID: testVMID()})
+	_, err = provider.PollRelease(t.Context(), request, machineops.ProviderOperation{OperationID: testVMID()})
 	requireTransient(t, err)
 
 	client.deleteErr = nil
@@ -135,7 +134,7 @@ func TestReleaseAzureErrorsAreRetried(t *testing.T) {
 	_, err = provider.BeginRelease(t.Context(), request)
 	requireTransient(t, err)
 
-	_, err = provider.PollRelease(t.Context(), request, publicmachineops.ProviderOperation{OperationID: testVMID()})
+	_, err = provider.PollRelease(t.Context(), request, machineops.ProviderOperation{OperationID: testVMID()})
 	requireTransient(t, err)
 	require.Zero(t, client.vmDeletes)
 }
@@ -161,7 +160,7 @@ func TestReleaseWithNothingRecordedTouchesNothing(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, testVMID(), begin.Operation.OperationID)
 
-	require.Equal(t, publicmachineops.ProviderOperationStateSucceeded, pollRelease(t, provider, request).State)
+	require.Equal(t, machineops.ProviderOperationStateSucceeded, pollRelease(t, provider, request).State)
 	require.Zero(t, client.reads)
 	require.Zero(t, client.mutations())
 }
@@ -235,7 +234,7 @@ func TestReleaseNeverDeletesUnprovenResources(t *testing.T) {
 		requireConflict(t, err)
 
 		result := pollRelease(t, provider, request)
-		require.Equal(t, publicmachineops.ProviderOperationStateFailed, result.State)
+		require.Equal(t, machineops.ProviderOperationStateFailed, result.State)
 		require.Equal(t, string(unboundedv1alpha3.FailureProviderConflict), result.Reason)
 		require.Equal(t, before, client.mutations())
 	}
@@ -271,7 +270,7 @@ func TestReleaseIgnoresNICUnderConfiguredName(t *testing.T) {
 
 	_, err = provider.BeginRelease(t.Context(), request)
 	require.NoError(t, err)
-	require.Equal(t, publicmachineops.ProviderOperationStateSucceeded, pollRelease(t, provider, request).State)
+	require.Equal(t, machineops.ProviderOperationStateSucceeded, pollRelease(t, provider, request).State)
 	require.Zero(t, client.nicDeletes)
 	require.NotContains(t, client.nicGets, testVMName+nicNameSuffix)
 }
@@ -299,7 +298,7 @@ func TestReleaseRefusesUnrecordedSuffixedNIC(t *testing.T) {
 	require.ErrorContains(t, err, testNICName())
 
 	result := pollRelease(t, provider, request)
-	require.Equal(t, publicmachineops.ProviderOperationStateFailed, result.State)
+	require.Equal(t, machineops.ProviderOperationStateFailed, result.State)
 	require.Equal(t, string(unboundedv1alpha3.FailureProviderConflict), result.Reason)
 	require.Equal(t, before, client.mutations())
 
@@ -307,7 +306,7 @@ func TestReleaseRefusesUnrecordedSuffixedNIC(t *testing.T) {
 	delete(client.nics, testNICName())
 
 	result = pollRelease(t, provider, request)
-	require.Equal(t, publicmachineops.ProviderOperationStateSucceeded, result.State)
+	require.Equal(t, machineops.ProviderOperationStateSucceeded, result.State)
 	require.Contains(t, result.Message, "no NIC or OS disk of the allocation remains")
 	require.Positive(t, client.nicLists)
 }
@@ -325,7 +324,7 @@ func TestReleaseIgnoresOtherAllocationsNICs(t *testing.T) {
 	delete(client.nics, testNICName())
 	delete(client.disks, testDiskName())
 
-	require.Equal(t, publicmachineops.ProviderOperationStateSucceeded, pollRelease(t, provider, request).State)
+	require.Equal(t, machineops.ProviderOperationStateSucceeded, pollRelease(t, provider, request).State)
 	require.Zero(t, client.nicDeletes)
 	require.NotContains(t, client.nicGets, other)
 }
@@ -338,7 +337,7 @@ func TestReleaseRetriesNICListErrors(t *testing.T) {
 	delete(client.vms, testVMName)
 	client.childGetErr = errors.New("timeout")
 
-	_, err := provider.PollRelease(t.Context(), request, publicmachineops.ProviderOperation{OperationID: testVMID()})
+	_, err := provider.PollRelease(t.Context(), request, machineops.ProviderOperation{OperationID: testVMID()})
 	requireTransient(t, err)
 	require.Zero(t, client.nicDeletes)
 	require.Zero(t, client.diskDeletes)
@@ -353,7 +352,7 @@ func TestReleaseRejectsMismatchedTarget(t *testing.T) {
 	_, err := provider.BeginRelease(t.Context(), request)
 	requirePermanent(t, err, unboundedv1alpha3.FailureInvalidRequest)
 
-	_, err = provider.PollRelease(t.Context(), request, publicmachineops.ProviderOperation{})
+	_, err = provider.PollRelease(t.Context(), request, machineops.ProviderOperation{})
 	requirePermanent(t, err, unboundedv1alpha3.FailureInvalidRequest)
 	require.Zero(t, client.vmDeletes)
 }

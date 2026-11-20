@@ -39,7 +39,7 @@ var releaseImageNames = []string{
 	"inventory-inspector",
 	"inventory-viewer",
 	"machina",
-	"machine-ops-controller",
+	"azure-machine-ops-controller",
 	"metalman",
 	"netboot",
 	"netboot-azurelinux",

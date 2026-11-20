@@ -17,7 +17,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	publicmachineops "github.com/Azure/unbounded/pkg/machineops"
+	"github.com/Azure/unbounded/pkg/machineops"
 )
 
 const (
@@ -33,28 +33,28 @@ const (
 // in the configured region and zone, with capacity and availability from the
 // Azure Resource SKU list. Price is the operator-supplied observation, if any.
 // It reads Azure and allocates nothing.
-func (p *Provider) ResolveClass(ctx context.Context, request publicmachineops.ClassRequest) (publicmachineops.ClassResolution, error) {
+func (p *Provider) ResolveClass(ctx context.Context, request machineops.ClassRequest) (machineops.ClassResolution, error) {
 	config, err := parseCapacityConfig(request.ProviderConfig.Data)
 	if err != nil {
-		return publicmachineops.ClassResolution{}, invalidRequest(err)
+		return machineops.ClassResolution{}, invalidRequest(err)
 	}
 
 	client, err := p.capacityClient(config.SubscriptionID, request.Auth)
 	if err != nil {
-		return publicmachineops.ClassResolution{}, fmt.Errorf("create Azure capacity client: %w", err)
+		return machineops.ClassResolution{}, fmt.Errorf("create Azure capacity client: %w", err)
 	}
 
 	observation, err := p.skus.get(ctx, client, config.SubscriptionID, config.Location, p.now())
 	if err != nil {
-		return publicmachineops.ClassResolution{}, err
+		return machineops.ClassResolution{}, err
 	}
 
 	offering, err := buildOffering(config, observation)
 	if err != nil {
-		return publicmachineops.ClassResolution{}, err
+		return machineops.ClassResolution{}, err
 	}
 
-	return publicmachineops.ClassResolution{
+	return machineops.ClassResolution{
 		Offerings: []unboundedv1alpha3.MachineClassOffering{
 			offering,
 		},
@@ -309,7 +309,7 @@ func (p *Provider) now() time.Time {
 }
 
 func invalidRequest(err error) error {
-	return &publicmachineops.PermanentError{
+	return &machineops.PermanentError{
 		Reason: string(unboundedv1alpha3.FailureInvalidRequest),
 		Err:    err,
 	}

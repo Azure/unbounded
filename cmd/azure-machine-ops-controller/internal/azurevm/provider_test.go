@@ -14,7 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	"github.com/Azure/unbounded/internal/machineops"
+	"github.com/Azure/unbounded/pkg/machineops"
 )
 
 func TestParseAzureVMProviderID(t *testing.T) {
