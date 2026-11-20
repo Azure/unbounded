@@ -2,12 +2,12 @@
 //!
 //! One controller runs per I/O worker. It reads the process-wide fill view,
 //! fetches the pages this worker owns through the normal prefetch path, and
-//! pins them until the fill changes or disappears. Progress is aggregated per
+//! pins them while they remain desired. Progress is aggregated per
 //! node and reported through the separate Pod fills annotation.
 //!
 //! Pins are desired state, not durable state: a restart drops them and the
-//! controller establishes them again from the manifest. A membership change
-//! drops the local plan because replica placement changed.
+//! controller establishes them again from the manifest. Plan changes retain
+//! readable pins this worker still owns and release only obsolete pages.
 
 use crate::control::Managed;
 use crate::error::{Error, Result};
@@ -161,6 +161,8 @@ struct Inflight {
 }
 
 struct LocalFill {
+    /// Authority and local membership must agree before launching more work.
+    paused: bool,
     generation: u64,
     digest: String,
     membership: u64,
@@ -198,6 +200,41 @@ impl LocalFill {
         let seed = seed ^ (object as u64).rotate_left(17) ^ page.rotate_left(31);
         let delay = retry_delay(seed, attempt).max(retry_after.unwrap_or_default());
         self.retries.insert((now + delay, object, page), attempt);
+    }
+
+    /// Restart the manifest walk without opening an eviction window for pages
+    /// retained by the replacement plan. Canceled reservations are released:
+    /// only completed pages can be skipped by the next walk.
+    fn reconcile(
+        &mut self,
+        index: &Index,
+        uid: &str,
+        page_size: u64,
+        _now: Instant,
+        mut keep: impl FnMut(&PageId) -> bool,
+    ) {
+        self.pins.retain(|page, epoch| {
+            if self.resident.contains(page) && keep(page) {
+                return true;
+            }
+            let pages = std::iter::once(page.number).collect();
+            index.release_pin_pages(fill_id(uid), &page.version, &pages, *epoch);
+            false
+        });
+        self.resident.retain(|page| self.pins.contains_key(page));
+        self.counted = self.resident.clone();
+        self.versions = self.pins.keys().map(|page| page.version.clone()).collect();
+        self.owned_pages = self.counted.len() as u64;
+        self.owned_bytes = self.owned_pages.saturating_mul(page_size);
+        self.pinned_pages = self.resident.len() as u64;
+        self.pinned_bytes = self.pinned_pages.saturating_mul(page_size);
+        self.refused.clear();
+        self.refused_bytes = 0;
+        self.object = 0;
+        self.page = 0;
+        // Retry object indexes belong to the canceled walk, not its replacement.
+        self.retries.clear();
+        self.fetching = false;
     }
 
     fn progress(&self) -> WorkerProgress {
@@ -323,12 +360,9 @@ impl FillController {
 
     /// Drop a fill and everything this worker pinned for it.
     fn forget(&mut self, fill: &str) {
-        // A forgotten fill can be replaced in place: a membership change, a
-        // manifest resync, or a renewal reset installs a new plan without
-        // changing the spec generation, so `finish` cannot tell a completion
-        // launched for the old plan from one for the new plan. Drop this
-        // fill's receivers so an obsolete completion never credits a page or
-        // advances the replacement plan's cursor.
+        // A rejected fill can become accepted again without a new generation.
+        // Drop its receivers so an obsolete completion never credits a page
+        // or advances the replacement plan's cursor.
         forget_inflight(&mut self.inflight, fill);
         if let Some(state) = self.local.remove(fill) {
             let id = fill_id(fill);
@@ -340,8 +374,8 @@ impl FillController {
         }
     }
 
-    /// Adopt new fills and drop fills that disappeared or changed.
-    fn refresh(&mut self, _now: Instant) {
+    /// Adopt replacement plans without releasing pins they still require.
+    fn refresh(&mut self, now: Instant) {
         let views = (self.fills)();
         let mut seen = BTreeSet::new();
         for view in views {
@@ -354,28 +388,38 @@ impl FillController {
                 self.forget(&view.uid);
                 continue;
             };
-            let local = self
-                .coordinator
-                .current_membership()
-                .map(|m| m.version.0)
-                .unwrap_or(0);
-            if local != membership {
+            seen.insert(view.uid.clone());
+            let Some(current) = self.coordinator.current_membership() else {
+                continue;
+            };
+            if current.version.0 != membership {
                 // The authority planned against a newer membership than this
                 // node has adopted. Wait instead of pinning a stale ranking.
-                self.forget(&view.uid);
+                if let Some(state) = self.local.get_mut(&view.uid) {
+                    state.paused = true;
+                }
                 continue;
             }
-            seen.insert(view.uid.clone());
+            if let Some(state) = self.local.get_mut(&view.uid) {
+                state.paused = false;
+            }
+            let Ok(page_size) = self.coordinator.page_size() else {
+                continue;
+            };
             let stale = self.local.get(&view.uid).is_none_or(|state| {
                 state.generation != view.generation
                     || state.digest != manifest.digest
                     || state.membership != membership
+                    || state.cache.0 != view.cache_uid
+                    || state.replicas != view.replicas.max(1)
             });
             if stale {
-                self.forget(&view.uid);
+                forget_inflight(&mut self.inflight, &view.uid);
+                let old = self.local.remove(&view.uid);
                 self.local.insert(
                     view.uid.clone(),
                     LocalFill {
+                        paused: false,
                         generation: view.generation,
                         digest: manifest.digest.clone(),
                         membership,
@@ -398,6 +442,66 @@ impl FillController {
                         retries: BTreeMap::new(),
                     },
                 );
+                if let Some(mut old) = old {
+                    let state = self.local.get_mut(&view.uid).expect("just inserted");
+                    // is_pinned is page-wide and could be satisfied by another
+                    // fill. Verify this fill's own reservations before reuse.
+                    let live: BTreeSet<_> = old
+                        .versions
+                        .iter()
+                        .filter(|version| {
+                            !matches!(
+                                self.index.renew_pin(
+                                    fill_id(&view.uid),
+                                    version,
+                                    self.clock.wall_now() + PIN_TTL,
+                                ),
+                                Err(Error::Unavailable)
+                            )
+                        })
+                        .cloned()
+                        .collect();
+                    let objects: BTreeMap<_, _> = state
+                        .manifest
+                        .objects
+                        .iter()
+                        .map(|object| {
+                            (
+                                ObjectVersion {
+                                    object: ObjectId {
+                                        cache: state.cache.clone(),
+                                        key: object.key,
+                                    },
+                                    etag: object.etag.clone(),
+                                },
+                                object.length.div_ceil(page_size.get()),
+                            )
+                        })
+                        .collect();
+                    let directory = self.coordinator.prefetch_directory();
+                    old.reconcile(&self.index, &view.uid, page_size.get(), now, |page| {
+                        objects
+                            .get(&page.version)
+                            .is_some_and(|pages| page.number.0 < *pages)
+                            && self
+                                .coordinator
+                                .rank_position(current.clone(), page)
+                                .is_some_and(|rank| rank < usize::from(state.replicas))
+                            && directory
+                                .page_owner(page)
+                                .is_ok_and(|owner| owner == self.worker)
+                            && live.contains(&page.version)
+                            && !matches!(self.index.lookup(page), Ok(None))
+                    });
+                    state.pins = old.pins;
+                    state.resident = old.resident;
+                    state.counted = old.counted;
+                    state.versions = old.versions;
+                    state.owned_pages = old.owned_pages;
+                    state.owned_bytes = old.owned_bytes;
+                    state.pinned_pages = old.pinned_pages;
+                    state.pinned_bytes = old.pinned_bytes;
+                }
             }
         }
         let gone: Vec<String> = self
@@ -460,7 +564,7 @@ impl FillController {
             self.launch_remaining = self.launch_remaining.saturating_sub(1);
             self.launch_after = Some(uid.clone());
             let state = self.local.get_mut(&uid).expect("listed locally");
-            if state.fetching {
+            if state.fetching || state.paused || state.membership != membership.version.0 {
                 continue;
             }
             let cache = state.cache.clone();
@@ -473,6 +577,7 @@ impl FillController {
                 let attempt = state.retries.remove(&key).expect("listed retry");
                 (key.1, state.manifest.objects[key.1].clone(), key.2, attempt)
             } else {
+                let resident = std::mem::take(&mut state.resident);
                 let step = scan_fill(cx, state, page_size, &mut budget, |object, number| {
                     let page = PageId {
                         version: ObjectVersion {
@@ -487,11 +592,13 @@ impl FillController {
                     let ranked = coordinator
                         .rank_position(membership.clone(), &page)
                         .is_some_and(|position| position < usize::from(replicas));
-                    if !ranked {
+                    if !ranked || resident.contains(&page) {
                         return Ok(false);
                     }
                     Ok(directory.page_owner(&page)? == worker)
-                })?;
+                });
+                state.resident = resident;
+                let step = step?;
                 let ScanStep::Owned(object, page_number) = step else {
                     continue;
                 };
@@ -701,27 +808,42 @@ impl FillController {
         }
     }
 
-    /// Extend every live pin. A pin whose page is no longer readable (its page
-    /// key was pruned) invalidates the fill's plan, so the next refresh adopts
-    /// the fill again and fetches every page under the current key.
-    fn renew(&mut self, _now: Instant) {
-        let mut reset = Vec::new();
-        for (uid, state) in &self.local {
+    /// Extend live pins and revisit only pages whose protection or readability
+    /// was lost. Healthy pages keep their original reservation epochs.
+    fn renew(&mut self, now: Instant) {
+        let Ok(page_size) = self.coordinator.page_size() else {
+            return;
+        };
+        for (uid, state) in &mut self.local {
             let id = fill_id(uid);
+            let mut failed = BTreeSet::new();
             for version in &state.versions {
-                let _ = self
-                    .index
-                    .renew_pin(id, version, self.clock.wall_now() + PIN_TTL);
+                // Unavailable means this fill's pin expired or disappeared.
+                // A temporary capacity refusal must not release a live pin.
+                if matches!(
+                    self.index
+                        .renew_pin(id, version, self.clock.wall_now() + PIN_TTL),
+                    Err(Error::Unavailable)
+                ) {
+                    failed.insert(version.clone());
+                }
             }
-            let unreadable = state.resident.iter().any(|page| {
-                matches!(self.index.lookup(page), Ok(None)) || !self.index.is_pinned(page)
-            });
-            if unreadable {
-                reset.push(uid.clone());
+            let lost: BTreeSet<_> = state
+                .resident
+                .iter()
+                .filter(|page| {
+                    failed.contains(&page.version)
+                        || matches!(self.index.lookup(page), Ok(None))
+                        || !self.index.is_pinned(page)
+                })
+                .cloned()
+                .collect();
+            if !lost.is_empty() {
+                forget_inflight(&mut self.inflight, uid);
+                state.reconcile(&self.index, uid, page_size.get(), now, |page| {
+                    !lost.contains(page)
+                });
             }
-        }
-        for uid in reset {
-            self.forget(&uid);
         }
     }
 
@@ -847,6 +969,7 @@ mod tests {
     fn local(objects: Vec<FillObject>) -> LocalFill {
         let digest = "aa".repeat(32);
         LocalFill {
+            paused: false,
             generation: 1,
             digest: digest.clone(),
             membership: 1,
@@ -1323,6 +1446,537 @@ mod tests {
             *calls.borrow(),
             (0..2 * SCAN_BUDGET + 3).collect::<Vec<_>>()
         );
+    }
+
+    struct Fixture {
+        controller: FillController,
+        views: Arc<Mutex<Vec<racer_authority::FillView>>>,
+        segments: Rc<page_alloc::Segments>,
+        _worker: crate::test_support::ReadWorker,
+    }
+
+    fn fixture(env: &racer_io::Env) -> Fixture {
+        let mut state = local(vec![fill_object(1, 2 * crate::model::PAGE_BYTES)]);
+        state.cache = CacheId(crate::test_support::security::CACHE.into());
+        let metadata = page_metadata(
+            None,
+            ObjectVersion {
+                object: ObjectId {
+                    cache: state.cache.clone(),
+                    key: state.manifest.objects[0].key,
+                },
+                etag: state.manifest.objects[0].etag.clone(),
+            },
+            2 * crate::model::PAGE_BYTES,
+        )
+        .for_pin();
+        let admission = Rc::new(flow_control::Quotas::new(
+            crate::admission::AdmissionPolicy::new(
+                crate::test_support::cluster::config(false).limits,
+            ),
+        ));
+        let reactor = Rc::new(crate::runtime::Reactor::new(admission.clone(), env));
+        let delivery = Rc::new(crate::http::Delivery::new(
+            reactor.clone(),
+            Duration::from_secs(2),
+        ));
+        let worker = crate::test_support::ReadWorker::new(
+            env,
+            racer_wire::control::CacheDefinition {
+                id: state.cache.clone(),
+                name: "cache".into(),
+                client_socket: "/run/racer/cache/client/socket".into(),
+                origin_socket: "/run/racer/cache/origin/socket".into(),
+                priority: 1,
+                mode: racer_wire::control::CacheMode::Cached,
+                origin: None,
+            },
+            metadata,
+            admission,
+            reactor,
+            delivery,
+            1,
+        );
+        let index = Rc::new(Index::new(
+            WorkerId(0),
+            16,
+            crate::test_support::availability(env),
+            env.ctx.clock.clone(),
+        ));
+        index.set_page_capacity(16).unwrap();
+        index.set_pin_capacity_percent(100).unwrap();
+        let segments = Rc::new(page_alloc::Segments::new(4096));
+        segments
+            .configure(
+                4096 * 8,
+                8,
+                page_alloc::Alignment::new(512, 512, 512).unwrap(),
+            )
+            .unwrap();
+        let _clock = crate::store::catalog::SegmentClock::new(index.clone(), segments.clone(), 1);
+        let mut view = racer_authority::FillView::from_json(&serde_json::json!({
+            "metadata": {"uid": "11111111-1111-4111-8111-111111111111", "name": "fill", "generation": 1},
+            "spec": {"cacheName": "cache", "prefixes": ["/"], "maxFootprint": 100000000}
+        })).unwrap();
+        view.cache_uid = state.cache.0.clone();
+        view.replicas = 1;
+        view.manifest = Some(state.manifest);
+        view.membership = Some(worker.membership.version.0);
+        view.accepted = true;
+        let views = Arc::new(Mutex::new(vec![view]));
+        let controller = FillController {
+            worker: WorkerId(0),
+            fills: Arc::new({
+                let views = views.clone();
+                move || views.lock().unwrap().clone()
+            }),
+            report: Arc::new(|_, _| {}),
+            share: Arc::new(FillShare::new()),
+            index,
+            coordinator: worker.coordinator.clone(),
+            clock: env.ctx.clock.clone(),
+            local: BTreeMap::new(),
+            inflight: VecDeque::new(),
+            launch_after: None,
+            launch_remaining: 0,
+            finish_remaining: 0,
+            next_refresh: env.ctx.clock.now(),
+            next_report: env.ctx.clock.now() + REPORT,
+            next_renew: env.ctx.clock.now() + RENEW,
+        };
+        Fixture {
+            controller,
+            views,
+            segments,
+            _worker: worker,
+        }
+    }
+
+    impl Fixture {
+        fn uid(&self) -> String {
+            self.views.lock().unwrap()[0].uid.clone()
+        }
+
+        fn adopt(&mut self) {
+            self.controller.refresh(self.controller.clock.now());
+        }
+
+        /// Install a real readable disk-index entry and one completed fill pin.
+        fn complete(&mut self, number: u64) -> (PageId, PinEpoch) {
+            let uid = self.uid();
+            let state = self.controller.local.get_mut(&uid).unwrap();
+            let object = &state.manifest.objects[0];
+            let page = PageId {
+                version: ObjectVersion {
+                    object: ObjectId {
+                        cache: state.cache.clone(),
+                        key: object.key,
+                    },
+                    etag: object.etag.clone(),
+                },
+                number: PageNumber(number),
+            };
+            let epoch = self
+                .controller
+                .index
+                .reserve_pin_pages(
+                    fill_id(&uid),
+                    &page.version,
+                    &std::iter::once(page.number).collect(),
+                    self.controller.clock.wall_now() + PIN_TTL,
+                )
+                .unwrap();
+            let (lease, extent) = self.segments.append_in(512, true).unwrap();
+            let location = crate::store::catalog::RecordLocation {
+                segment: lease.id(),
+                generation: lease.generation(),
+                extent,
+            };
+            self.controller
+                .index
+                .publish(
+                    page.clone(),
+                    crate::store::catalog::IndexedPage {
+                        page_size: racer_wire::object::PageSize::DEFAULT,
+                        metadata: page_metadata(None, page.version.clone(), object.length),
+                        key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
+                        location,
+                    },
+                )
+                .unwrap();
+            drop(lease);
+            state.pins.insert(page.clone(), epoch);
+            state.resident.insert(page.clone());
+            state.counted.insert(page.clone());
+            state.versions.insert(page.version.clone());
+            state.pinned_pages += 1;
+            state.owned_pages += 1;
+            state.pinned_bytes += crate::model::PAGE_BYTES;
+            state.owned_bytes += crate::model::PAGE_BYTES;
+            (page, epoch)
+        }
+    }
+
+    #[test]
+    fn controller_plan_changes_preserve_owned_pin_epochs() {
+        let env = racer_io::Env::host();
+        let mut f = fixture(&env);
+        f.adopt();
+        let uid = f.uid();
+        let (page, epoch) = f.complete(0);
+        let (removed, _) = f.complete(1);
+        // A max-footprint-only edit changes generation, not desired pages.
+        {
+            let mut views = f.views.lock().unwrap();
+            views[0].generation += 1;
+            views[0].max_footprint += 1;
+        }
+        f.adopt();
+        assert_eq!(f.controller.local[&uid].pins[&page], epoch);
+        assert!(f.controller.index.is_pinned(&removed));
+        // A new manifest retains one page and removes the other.
+        {
+            let mut views = f.views.lock().unwrap();
+            let manifest = Arc::make_mut(views[0].manifest.as_mut().unwrap());
+            manifest.digest = "bb".repeat(32);
+            manifest.objects[0].length = crate::model::PAGE_BYTES;
+        }
+        f.adopt();
+        assert_eq!(f.controller.local[&uid].pins[&page], epoch);
+        assert!(!f.controller.index.is_pinned(&removed));
+        // A cluster-membership revision with unchanged placement keeps pins.
+        f.controller.local.get_mut(&uid).unwrap().membership = 0;
+        f.adopt();
+        assert_eq!(f.controller.local[&uid].pins[&page], epoch);
+        assert_eq!(f.controller.local[&uid].pinned_pages, 1);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        f.controller.launch(&mut cx, env.ctx.clock.now()).unwrap();
+        assert!(
+            f.controller.inflight.is_empty(),
+            "retained pages must not reserve another holder"
+        );
+        f.controller.forget(&uid);
+        assert!(
+            !f.controller.index.is_pinned(&page),
+            "one release must remove the sole holder"
+        );
+    }
+
+    #[test]
+    fn controller_replacement_cancels_same_generation_inflight() {
+        let env = racer_io::Env::host();
+        let mut f = fixture(&env);
+        {
+            let mut views = f.views.lock().unwrap();
+            Arc::make_mut(views[0].manifest.as_mut().unwrap())
+                .objects
+                .push(fill_object(2, crate::model::PAGE_BYTES));
+        }
+        f.adopt();
+        let uid = f.uid();
+        let (page, epoch) = f.complete(0);
+        let abandoned = PageId {
+            version: page.version.clone(),
+            number: PageNumber(1),
+        };
+        let reservation = f
+            .controller
+            .index
+            .reserve_pin_pages(
+                fill_id(&uid),
+                &abandoned.version,
+                &std::iter::once(abandoned.number).collect(),
+                env.ctx.clock.wall_now() + PIN_TTL,
+            )
+            .unwrap();
+        f.controller
+            .local
+            .get_mut(&uid)
+            .unwrap()
+            .pins
+            .insert(abandoned.clone(), reservation);
+        let state = f.controller.local.get_mut(&uid).unwrap();
+        state.fetching = true;
+        state.retries.insert((env.ctx.clock.now(), 1, 0), 2);
+        f.controller.inflight.push_back(Inflight {
+            fill: uid.clone(),
+            generation: 1,
+            object: 0,
+            page: 1,
+            attempt: 0,
+            epoch: reservation,
+            accounted: crate::model::PAGE_BYTES,
+            version: page.version.clone(),
+            future: Box::pin(async { Ok(PageResult::Admitted) }),
+        });
+        {
+            let mut views = f.views.lock().unwrap();
+            let manifest = Arc::make_mut(views[0].manifest.as_mut().unwrap());
+            manifest.digest = "cc".repeat(32);
+            manifest.objects.truncate(1);
+        }
+        f.adopt();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        f.controller.finish(&mut cx);
+        assert!(f.controller.inflight.is_empty());
+        assert_eq!(f.controller.local[&uid].page, 0);
+        assert_eq!(f.controller.local[&uid].pins[&page], epoch);
+        assert_eq!(f.controller.local[&uid].pinned_pages, 1);
+        assert!(
+            f.controller.local[&uid].retries.is_empty(),
+            "replacement must discard old object indexes"
+        );
+        assert!(!f.controller.local[&uid].fetching);
+        assert!(
+            !f.controller.index.is_pinned(&abandoned),
+            "canceled fetch reservations must be swept"
+        );
+        f.controller.launch(&mut cx, env.ctx.clock.now()).unwrap();
+        assert_eq!(f.controller.inflight.len(), 1);
+        assert_eq!(f.controller.inflight[0].object, 0);
+        assert_eq!(f.controller.inflight[0].page, 1);
+        assert_eq!(f.controller.local[&uid].pins[&page], epoch);
+    }
+
+    #[test]
+    fn renewal_repair_clears_retries_and_restarts_canceled_fetch_without_unpinning_healthy_pages() {
+        let env = racer_io::Env::host();
+        let mut f = fixture(&env);
+        {
+            let mut views = f.views.lock().unwrap();
+            Arc::make_mut(views[0].manifest.as_mut().unwrap())
+                .objects
+                .push(fill_object(2, crate::model::PAGE_BYTES));
+        }
+        f.adopt();
+        let uid = f.uid();
+        let (healthy, epoch) = f.complete(0);
+        let (missing, _) = f.complete(1);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        f.controller.launch(&mut cx, env.ctx.clock.now()).unwrap();
+        assert_eq!(f.controller.inflight.len(), 1);
+        let work = &f.controller.inflight[0];
+        assert_eq!(work.object, 1);
+        let canceled = PageId {
+            version: work.version.clone(),
+            number: PageNumber(work.page),
+        };
+        f.controller
+            .local
+            .get_mut(&uid)
+            .unwrap()
+            .retries
+            .insert((env.ctx.clock.now(), 0, 1), 3);
+        let location = f
+            .controller
+            .index
+            .lookup(&missing)
+            .unwrap()
+            .unwrap()
+            .location;
+        f.controller.index.remove_if_matches(&missing, &location);
+        f.controller.renew(env.ctx.clock.now());
+        let state = &f.controller.local[&uid];
+        assert!(!state.fetching);
+        assert!(state.retries.is_empty());
+        assert_eq!((state.object, state.page), (0, 0));
+        assert_eq!(state.pins[&healthy], epoch);
+        assert!(f.controller.inflight.is_empty());
+        assert!(!f.controller.index.is_pinned(&missing));
+        assert!(!f.controller.index.is_pinned(&canceled));
+        f.controller.launch(&mut cx, env.ctx.clock.now()).unwrap();
+        assert_eq!(f.controller.inflight.len(), 1);
+        assert_eq!(f.controller.inflight[0].object, 0);
+        assert_eq!(f.controller.inflight[0].page, 1);
+        assert_eq!(f.controller.local[&uid].pins[&healthy], epoch);
+        assert!(f.controller.local[&uid].fetching);
+    }
+
+    #[test]
+    fn controller_waits_for_membership_without_unpinning_then_releases_rejected_or_deleted() {
+        for rejected in [false, true] {
+            let env = racer_io::Env::host();
+            let mut f = fixture(&env);
+            f.adopt();
+            let uid = f.uid();
+            let (page, _) = f.complete(0);
+            f.views.lock().unwrap()[0].membership = Some(2);
+            f.adopt();
+            assert!(f.controller.index.is_pinned(&page));
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            f.controller.launch(&mut cx, env.ctx.clock.now()).unwrap();
+            assert!(
+                f.controller.inflight.is_empty(),
+                "wait for the authority's membership before fetching"
+            );
+            if rejected {
+                f.views.lock().unwrap()[0].accepted = false;
+            } else {
+                f.views.lock().unwrap().clear();
+            }
+            f.adopt();
+            assert!(f.controller.local.is_empty());
+            assert!(!f.controller.index.is_pinned(&page));
+            assert!(f.controller.share.report().0.is_empty());
+            assert!(!f.controller.local.contains_key(&uid));
+        }
+    }
+
+    #[test]
+    fn controller_renew_repairs_one_missing_page_without_releasing_healthy_pages() {
+        let sim = racer_io::SimClock::new(1187);
+        let env = racer_io::Env::new(racer_io::Driver::Uring, sim.ctx(0));
+        let mut f = fixture(&env);
+        f.adopt();
+        let uid = f.uid();
+        let (healthy, epoch) = f.complete(0);
+        let (missing, _) = f.complete(1);
+        let location = f
+            .controller
+            .index
+            .lookup(&missing)
+            .unwrap()
+            .unwrap()
+            .location;
+        f.controller.index.remove_if_matches(&missing, &location);
+        sim.advance(RENEW);
+        f.controller.renew(env.ctx.clock.now());
+        assert_eq!(f.controller.local[&uid].pins[&healthy], epoch);
+        assert!(f.controller.index.is_pinned(&healthy));
+        assert!(!f.controller.index.is_pinned(&missing));
+        assert_eq!(f.controller.local[&uid].pinned_pages, 1);
+        assert_eq!(
+            f.controller.local[&uid].pinned_bytes,
+            crate::model::PAGE_BYTES
+        );
+        assert_eq!(
+            f.controller.index.pin_expiry(&healthy),
+            Some(env.ctx.clock.wall_now() + PIN_TTL)
+        );
+        sim.advance(PIN_TTL);
+        f.controller.renew(env.ctx.clock.now());
+        assert!(f.controller.local[&uid].pins.is_empty());
+        assert_eq!(f.controller.local[&uid].pinned_pages, 0);
+        assert!(!f.controller.index.is_pinned(&healthy));
+    }
+
+    #[test]
+    fn reconcile_releases_only_pages_rejected_by_replacement_ownership() {
+        let env = racer_io::Env::host();
+        let mut f = fixture(&env);
+        f.adopt();
+        let uid = f.uid();
+        let (kept, epoch) = f.complete(0);
+        let (moved, _) = f.complete(1);
+        f.controller.local.get_mut(&uid).unwrap().reconcile(
+            &f.controller.index,
+            &uid,
+            crate::model::PAGE_BYTES,
+            env.ctx.clock.now(),
+            |page| page == &kept,
+        );
+        assert_eq!(f.controller.local[&uid].pins[&kept], epoch);
+        assert!(f.controller.index.is_pinned(&kept));
+        assert!(!f.controller.index.is_pinned(&moved));
+    }
+
+    #[test]
+    fn controller_new_object_version_releases_old_pins() {
+        let env = racer_io::Env::host();
+        let mut f = fixture(&env);
+        f.adopt();
+        let uid = f.uid();
+        let (page, _) = f.complete(0);
+        {
+            let mut views = f.views.lock().unwrap();
+            let manifest = Arc::make_mut(views[0].manifest.as_mut().unwrap());
+            manifest.digest = "dd".repeat(32);
+            manifest.objects[0].etag = StrongEtag::test_value("v2");
+        }
+        f.adopt();
+        assert!(f.controller.local[&uid].pins.is_empty());
+        assert_eq!(f.controller.local[&uid].owned_pages, 0);
+        assert!(!f.controller.index.is_pinned(&page));
+        assert!(
+            f.controller.index.lookup(&page).unwrap().is_some(),
+            "release must not delete cached data"
+        );
+    }
+
+    #[test]
+    fn dropping_controller_releases_retained_pins() {
+        let env = racer_io::Env::host();
+        let mut f = fixture(&env);
+        f.adopt();
+        let (page, _) = f.complete(0);
+        f.views.lock().unwrap()[0].generation += 1;
+        f.adopt();
+        let index = f.controller.index.clone();
+        assert!(index.is_pinned(&page));
+        drop(f);
+        assert!(!index.is_pinned(&page));
+    }
+
+    #[test]
+    fn controller_capacity_refusal_does_not_discard_a_live_readable_pin() {
+        let env = racer_io::Env::host();
+        let mut f = fixture(&env);
+        f.controller.index.set_pin_capacity_percent(50).unwrap();
+        f.adopt();
+        let uid = f.uid();
+        let (page, epoch) = f.complete(0);
+        // A refused reservation must not invalidate an existing completed pin.
+        let more = (1..=8).map(PageNumber).collect();
+        assert!(matches!(
+            f.controller.index.reserve_pin_pages(
+                fill_id(&uid),
+                &page.version,
+                &more,
+                env.ctx.clock.wall_now() + PIN_TTL
+            ),
+            Err(Error::Overloaded)
+        ));
+        f.controller.renew(env.ctx.clock.now());
+        assert_eq!(f.controller.local[&uid].pins[&page], epoch);
+        f.views.lock().unwrap()[0].generation += 1;
+        f.adopt();
+        assert_eq!(f.controller.local[&uid].pins[&page], epoch);
+        assert!(f.controller.index.is_pinned(&page));
+    }
+
+    #[test]
+    fn controller_expired_pin_is_not_hidden_by_another_fills_live_pin() {
+        let sim = racer_io::SimClock::new(1188);
+        let env = racer_io::Env::new(racer_io::Driver::Uring, sim.ctx(0));
+        let mut f = fixture(&env);
+        f.adopt();
+        let uid = f.uid();
+        let (page, _) = f.complete(0);
+        sim.advance(PIN_TTL);
+        let pages = std::iter::once(page.number).collect();
+        let other = f
+            .controller
+            .index
+            .reserve_pin_pages(
+                fill_id("other"),
+                &page.version,
+                &pages,
+                env.ctx.clock.wall_now() + PIN_TTL,
+            )
+            .unwrap();
+        assert!(f.controller.index.is_pinned(&page));
+        f.views.lock().unwrap()[0].generation += 1;
+        f.adopt();
+        assert!(f.controller.local[&uid].pins.is_empty());
+        assert_eq!(f.controller.local[&uid].pinned_pages, 0);
+        assert!(
+            f.controller.index.is_pinned(&page),
+            "reconciliation must not release another fill"
+        );
+        f.controller
+            .index
+            .release_pin_pages(fill_id("other"), &page.version, &pages, other);
+        assert!(!f.controller.index.is_pinned(&page));
     }
 
     #[test]
