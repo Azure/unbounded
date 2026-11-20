@@ -5296,14 +5296,14 @@ mod checkpoint {
             }],
         };
         let bytes = checkpoint_format::encode(&image).unwrap();
-        assert_eq!(bytes.len(), 254);
-        let digest: String = bytes[222..]
+        assert_eq!(bytes.len(), 252);
+        let digest: String = bytes[220..]
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect();
         assert_eq!(
             digest,
-            "909bcb3e77b5b46dee0eff0db007b058b5641cbb2c380536dbca7f30c1427e3c"
+            "bbf59ea8dd0c1f31c0790d92da22835a5d1ab13391ea37c16c8a5dbc824376bf"
         );
     }
 
@@ -5312,20 +5312,20 @@ mod checkpoint {
         let env = racer_io::Env::host();
         let bytes = checkpoint_format::encode(&image(&env, 7)).unwrap();
         // image(7) layout: header 32 + cluster UUID 36 + shard count 4 + worker 2 + geometry 80
-        // + segment count 4 + two segments 52 + page count 4 + descriptor 92
+        // + segment count 4 + two segments 50 + page count 4 + descriptor 92
         // (36-byte cache, 32-byte key, 4-byte quoted ETag, length 8, three
         // string lengths 12) + page fields 56 (page number, key ID, segment,
         // generation, extent offset and length) + descriptor count 4 + the
-        // standalone "empty" descriptor 95 + hold count 4 = 465 body bytes,
+        // standalone "empty" descriptor 95 + hold count 4 = 463 body bytes,
         // then the digest.
-        assert_eq!(bytes.len(), 497);
-        let digest: String = bytes[465..]
+        assert_eq!(bytes.len(), 495);
+        let digest: String = bytes[463..]
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect();
         assert_eq!(
             digest,
-            "9b3c9202c65a91ef1b93ca0360e1fb8cf29e8ece277cd252ba31974eed9e7af6"
+            "23b6ac07a293ccf5f5ea277ec59980d3fc5a82b66a68b0a2190100ec07e51caa"
         );
         let decoded = checkpoint_format::decode(&bytes).unwrap();
         assert_eq!(decoded.shards[0].index.entries.len(), 1);

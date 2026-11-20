@@ -1622,8 +1622,8 @@ mod budget_tests {
         }
     }
 
-    /// A cut may record both open tails; the pinned flag round-trips through
-    /// encoding and recovery clears it because pins are not persisted.
+    /// Live cuts retain both open tails and pin flags. Encoding normalizes pin
+    /// ownership away; recovery also clears flags when given a live cut directly.
     #[test]
     fn pinned_flag_round_trips_and_recovery_clears_it() {
         let alignment = Alignment::new(512, 512, 512).unwrap();
@@ -1650,11 +1650,21 @@ mod budget_tests {
         let encoded = encode(&image).unwrap();
         let mut decoded = decode(&encoded).unwrap();
         assert!(
-            decoded.shards[0]
+            image.shards[0]
                 .segments
                 .iter()
                 .any(|segment| segment.pinned)
         );
+        assert!(
+            decoded.shards[0]
+                .segments
+                .iter()
+                .all(|segment| !segment.pinned)
+        );
+        assert_eq!(decoded.shards[0].segments[1].state, SegmentState::Sealed);
+        // Standalone recovery accepts caller-owned live snapshots too. Its
+        // explicit clear must not depend on the disk decoder having run first.
+        decoded.shards[0].segments = image.shards[0].segments.clone();
         let env = racer_io::Env::host();
         let index = Rc::new(Index::new(
             WorkerId(0),
