@@ -11,6 +11,8 @@ import (
 	"net"
 	"syscall"
 	"testing"
+
+	"golang.org/x/net/http2"
 )
 
 func TestIsRetryableNetworkError(t *testing.T) {
@@ -26,6 +28,11 @@ func TestIsRetryableNetworkError(t *testing.T) {
 		{name: "connection refused", err: &net.OpError{Op: "dial", Err: syscall.ECONNREFUSED}, want: true},
 		{name: "DNS", err: &net.DNSError{Err: "temporary failure", Name: "registry.example.test"}, want: true},
 		{name: "unexpected EOF", err: fmt.Errorf("read blob: %w", io.ErrUnexpectedEOF), want: true},
+		{
+			name: "HTTP/2 stream reset",
+			err:  fmt.Errorf("copy blob: %w", http2.StreamError{StreamID: 13, Code: http2.ErrCodeProtocol}),
+			want: true,
+		},
 		{name: "canceled", err: context.Canceled, want: false},
 		{name: "deadline", err: context.DeadlineExceeded, want: false},
 		{name: "permanent", err: errors.New("unauthorized"), want: false},
