@@ -151,6 +151,7 @@ func watchMachineOperationFromResourceVersion(ctx context.Context, c client.With
 
 	seenConditions := map[string]conditionState{}
 	seenTargets := map[string]string{}
+	lastSummary := ""
 
 	for ev := range watcher.ResultChan() {
 		if ev.Type == watch.Error {
@@ -169,6 +170,7 @@ func watchMachineOperationFromResourceVersion(ctx context.Context, c client.With
 		phase := op.Status.Phase
 		reportConditionTransitions(out, op.Status.Conditions, seenConditions)
 		reportTargetTransitions(out, op.Status.Targets, seenTargets)
+		lastSummary = reportSummaryChange(out, op.Status.Summary, lastSummary)
 
 		if phase != lastPhase {
 			switch phase {
@@ -185,6 +187,8 @@ func watchMachineOperationFromResourceVersion(ctx context.Context, c client.With
 
 		if op.Status.IsTerminal() {
 			if phase == v1alpha3.OperationPhaseFailed {
+				reportFailedMachines(out, op)
+
 				return fmt.Errorf("operation failed: %s", op.Status.Message)
 			}
 
@@ -222,6 +226,43 @@ func reportTargetTransitions(out io.Writer, targets []v1alpha3.MachineOperationT
 
 		printStep(out, fmt.Sprintf("Target %s: %s", key, text))
 	}
+}
+
+// reportSummaryChange prints the counts of a selector operation's children
+// when they change, and returns what it printed last. A selector operation
+// does not list its machines: each has a child operation of its own.
+func reportSummaryChange(out io.Writer, summary *v1alpha3.MachineOperationSummary, last string) string {
+	if summary == nil {
+		return last
+	}
+
+	text := fmt.Sprintf("Machines: %d total, %d held, %d active, %d complete, %d failed",
+		summary.Total, summary.Held, summary.Active, summary.Complete, summary.Failed)
+	if text != last {
+		printStep(out, text)
+	}
+
+	return text
+}
+
+// reportFailedMachines names the failed machines a selector operation
+// recorded, which is at most ten, and says how to list every child.
+func reportFailedMachines(out io.Writer, op *v1alpha3.MachineOperation) {
+	if op.Status.Summary == nil {
+		return
+	}
+
+	if failed := op.Status.Summary.FailedMachines; len(failed) > 0 {
+		suffix := ""
+		if int(op.Status.Summary.Failed) > len(failed) {
+			suffix = fmt.Sprintf(" and %d more", int(op.Status.Summary.Failed)-len(failed))
+		}
+
+		printStep(out, fmt.Sprintf("Failed machines: %s%s", strings.Join(failed, ", "), suffix))
+	}
+
+	printStep(out, fmt.Sprintf("List the operation of each machine with: kubectl get machineoperations -l %s=%s",
+		v1alpha3.MachineOperationParentUIDLabel, op.UID))
 }
 
 func stageText(stage v1alpha3.OperationStage) string {
