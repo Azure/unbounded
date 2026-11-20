@@ -123,7 +123,11 @@ fn member_reports<'a>(
 }
 
 #[cfg(test)]
-fn status(view: &FillView, reports: &BTreeMap<String, String>, previous: Option<&Value>) -> Value {
+pub(super) fn status(
+    view: &FillView,
+    reports: &BTreeMap<String, String>,
+    previous: Option<&Value>,
+) -> Value {
     let progress = aggregate(reports, view);
     status_with_progress(view, progress, previous)
 }
