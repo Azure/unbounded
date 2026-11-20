@@ -56,6 +56,7 @@ func TestMachinaMachineOperationReconcilerDispatchesTarget(t *testing.T) {
 	op := &machinav1alpha3.MachineOperation{
 		ObjectMeta: metav1.ObjectMeta{Name: "op-1"},
 		Spec: machinav1alpha3.MachineOperationSpec{
+			MachineRef:    "machine-1",
 			OperationKind: machinav1alpha3.OperationNodeReboot,
 		},
 	}
@@ -248,7 +249,10 @@ func TestMachinaMachineOperationReconcilerReturnsTargetError(t *testing.T) {
 	machine := &machinav1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "machine-1", Generation: 7}}
 	op := &machinav1alpha3.MachineOperation{
 		ObjectMeta: metav1.ObjectMeta{Name: "op-1"},
-		Spec:       machinav1alpha3.MachineOperationSpec{OperationKind: machinav1alpha3.OperationNodeReboot},
+		Spec: machinav1alpha3.MachineOperationSpec{
+			MachineRef:    "machine-1",
+			OperationKind: machinav1alpha3.OperationNodeReboot,
+		},
 	}
 
 	reconciler, err := NewMachinaMachineOperationReconciler(
@@ -290,12 +294,10 @@ func TestMachinaMachineOperationReconcilerMapsMachineRef(t *testing.T) {
 	}
 }
 
-func TestMachinaMachineOperationReconcilerMapsNodeSelector(t *testing.T) {
+func TestMachinaMachineOperationReconcilerIgnoresNodeSelector(t *testing.T) {
 	t.Parallel()
 
-	reconciler := newTestMachinaMachineOperationReconciler(t, fakeMachineOperationClient(&corev1.Node{
-		ObjectMeta: metav1.ObjectMeta{Name: "node-1", Labels: map[string]string{"pool": "edge"}},
-	}))
+	target := &recordingMachineOperationTargetState{}
 	op := &machinav1alpha3.MachineOperation{
 		ObjectMeta: metav1.ObjectMeta{Name: "op-1"},
 		Spec: machinav1alpha3.MachineOperationSpec{
@@ -304,18 +306,44 @@ func TestMachinaMachineOperationReconcilerMapsNodeSelector(t *testing.T) {
 		},
 	}
 
-	requests := reconciler.mapMachineOperation(context.Background(), op)
-	if len(requests) != 1 {
-		t.Fatalf("requests = %#v, want one", requests)
+	reconciler, err := NewMachinaMachineOperationReconciler(
+		fakeMachineOperationClient(&corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: "node-1", Labels: map[string]string{"pool": "edge"}},
+		}, op),
+		"machine-1",
+		"node-1",
+		MachineOperationHandlers{machinav1alpha3.OperationNodeReboot: target.reconcile},
+	)
+	if err != nil {
+		t.Fatalf("NewMachinaMachineOperationReconciler: %v", err)
+	}
+
+	if requests := reconciler.mapMachineOperation(context.Background(), op); len(requests) != 0 {
+		t.Fatalf("requests = %#v, want none", requests)
+	}
+
+	if _, err := reconciler.ReconcileMachineOperation(context.Background(), "op-1"); err != nil {
+		t.Fatalf("ReconcileMachineOperation: %v", err)
+	}
+
+	if target.called {
+		t.Fatalf("operation = %#v, want none", target.operation)
+	}
+
+	var updated machinav1alpha3.MachineOperation
+	if err := reconciler.client.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated); err != nil {
+		t.Fatalf("get MachineOperation: %v", err)
+	}
+
+	if updated.Status.Phase != "" {
+		t.Fatalf("phase = %s, want empty", updated.Status.Phase)
 	}
 }
 
-func TestMachinaMachineOperationReconcilerMapsMachineSelectorFallback(t *testing.T) {
+func TestMachinaMachineOperationReconcilerIgnoresMachineSelector(t *testing.T) {
 	t.Parallel()
 
-	reconciler := newTestMachinaMachineOperationReconciler(t, fakeMachineOperationClient(&machinav1alpha3.Machine{
-		ObjectMeta: metav1.ObjectMeta{Name: "machine-1", Labels: map[string]string{"pool": "edge"}},
-	}))
+	target := &recordingMachineOperationTargetState{}
 	op := &machinav1alpha3.MachineOperation{
 		ObjectMeta: metav1.ObjectMeta{Name: "op-1"},
 		Spec: machinav1alpha3.MachineOperationSpec{
@@ -324,9 +352,86 @@ func TestMachinaMachineOperationReconcilerMapsMachineSelectorFallback(t *testing
 		},
 	}
 
-	requests := reconciler.mapMachineOperation(context.Background(), op)
-	if len(requests) != 1 {
-		t.Fatalf("requests = %#v, want one", requests)
+	reconciler, err := NewMachinaMachineOperationReconciler(
+		fakeMachineOperationClient(&machinav1alpha3.Machine{
+			ObjectMeta: metav1.ObjectMeta{Name: "machine-1", Labels: map[string]string{"pool": "edge"}},
+		}, op),
+		"machine-1",
+		"node-1",
+		MachineOperationHandlers{machinav1alpha3.OperationNodeReboot: target.reconcile},
+	)
+	if err != nil {
+		t.Fatalf("NewMachinaMachineOperationReconciler: %v", err)
+	}
+
+	if requests := reconciler.mapMachineOperation(context.Background(), op); len(requests) != 0 {
+		t.Fatalf("requests = %#v, want none", requests)
+	}
+
+	if _, err := reconciler.ReconcileMachineOperation(context.Background(), "op-1"); err != nil {
+		t.Fatalf("ReconcileMachineOperation: %v", err)
+	}
+
+	if target.called {
+		t.Fatalf("operation = %#v, want none", target.operation)
+	}
+
+	var updated machinav1alpha3.MachineOperation
+	if err := reconciler.client.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated); err != nil {
+		t.Fatalf("get MachineOperation: %v", err)
+	}
+
+	if updated.Status.Phase != "" {
+		t.Fatalf("phase = %s, want empty", updated.Status.Phase)
+	}
+}
+
+func TestMachinaMachineOperationReconcilerIgnoresSelectorOnlyHostSoftReboot(t *testing.T) {
+	t.Parallel()
+
+	target := &recordingMachineOperationTargetState{}
+	op := &machinav1alpha3.MachineOperation{
+		ObjectMeta: metav1.ObjectMeta{Name: "op-1"},
+		Spec: machinav1alpha3.MachineOperationSpec{
+			MachineSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"pool": "edge"}},
+			OperationKind:   machinav1alpha3.OperationHostSoftReboot,
+		},
+	}
+
+	reconciler, err := NewMachinaMachineOperationReconciler(
+		fakeMachineOperationClient(
+			&machinav1alpha3.Machine{
+				ObjectMeta: metav1.ObjectMeta{Name: "machine-1", Labels: map[string]string{"pool": "edge"}},
+			},
+			op,
+		),
+		"machine-1",
+		"node-1",
+		MachineOperationHandlers{machinav1alpha3.OperationHostSoftReboot: target.reconcile},
+	)
+	if err != nil {
+		t.Fatalf("NewMachinaMachineOperationReconciler: %v", err)
+	}
+
+	if requests := reconciler.mapMachineOperation(context.Background(), op); len(requests) != 0 {
+		t.Fatalf("requests = %#v, want none", requests)
+	}
+
+	if _, err := reconciler.ReconcileMachineOperation(context.Background(), "op-1"); err != nil {
+		t.Fatalf("ReconcileMachineOperation: %v", err)
+	}
+
+	if target.called {
+		t.Fatalf("operation = %#v, want none", target.operation)
+	}
+
+	var updated machinav1alpha3.MachineOperation
+	if err := reconciler.client.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated); err != nil {
+		t.Fatalf("get MachineOperation: %v", err)
+	}
+
+	if updated.Status.Phase != "" {
+		t.Fatalf("phase = %s, want empty", updated.Status.Phase)
 	}
 }
 
@@ -375,6 +480,184 @@ func TestMachinaMachineOperationReconcilerIgnoresUnsupportedMatchingOperation(t 
 	requests := reconciler.mapMachineOperation(context.Background(), op)
 	if len(requests) != 0 {
 		t.Fatalf("requests = %#v, want nil", requests)
+	}
+}
+
+// A finished operation keeps its result, with one exception: a failure
+// replaces a completion. An agent upgrade that was reported complete and then
+// rolled back reports its failure that way. Nothing replaces a failure.
+func TestFinishMachineOperationOnAFinishedOperation(t *testing.T) {
+	completedAt := metav1.NewTime(time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC))
+
+	tests := []struct {
+		name      string
+		stored    machinav1alpha3.OperationPhase
+		late      machinav1alpha3.OperationPhase
+		wantPhase machinav1alpha3.OperationPhase
+		wantWrite bool
+	}{
+		{name: "Failed stays Failed after a late completion", stored: machinav1alpha3.OperationPhaseFailed, late: machinav1alpha3.OperationPhaseComplete, wantPhase: machinav1alpha3.OperationPhaseFailed},
+		{name: "Failed stays as it was after a late failure", stored: machinav1alpha3.OperationPhaseFailed, late: machinav1alpha3.OperationPhaseFailed, wantPhase: machinav1alpha3.OperationPhaseFailed},
+		{name: "Complete stays as it was after a late completion", stored: machinav1alpha3.OperationPhaseComplete, late: machinav1alpha3.OperationPhaseComplete, wantPhase: machinav1alpha3.OperationPhaseComplete},
+		{name: "Complete becomes Failed after a late failure", stored: machinav1alpha3.OperationPhaseComplete, late: machinav1alpha3.OperationPhaseFailed, wantPhase: machinav1alpha3.OperationPhaseFailed, wantWrite: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			op := &machinav1alpha3.MachineOperation{
+				ObjectMeta: metav1.ObjectMeta{Name: "op-1"},
+				Spec:       machinav1alpha3.MachineOperationSpec{MachineRef: "machine-1", OperationKind: machinav1alpha3.OperationAgentUpgrade},
+				Status: machinav1alpha3.MachineOperationStatus{
+					Phase:       tt.stored,
+					Message:     "already finished",
+					CompletedAt: &completedAt,
+				},
+			}
+
+			c := fakeMachineOperationClient(op)
+
+			err := FinishMachineOperation(context.Background(), c, MachineOperation{Name: "op-1"}, MachineOperationResult[int64]{
+				Phase:   tt.late,
+				Reason:  "Late",
+				Message: "late result",
+			})
+			if err != nil {
+				t.Fatalf("FinishMachineOperation: %v", err)
+			}
+
+			var updated machinav1alpha3.MachineOperation
+			if err := c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated); err != nil {
+				t.Fatalf("get MachineOperation: %v", err)
+			}
+
+			if updated.Status.Phase != tt.wantPhase {
+				t.Fatalf("phase = %q, want %q", updated.Status.Phase, tt.wantPhase)
+			}
+
+			wantMessage := "already finished"
+			if tt.wantWrite {
+				wantMessage = "late result"
+			}
+
+			if updated.Status.Message != wantMessage {
+				t.Fatalf("message = %q, want %q", updated.Status.Message, wantMessage)
+			}
+		})
+	}
+}
+
+// An operation that finished before the agent started it is not run: its
+// creator gave up waiting, and running it now would act on the machine with
+// nothing left to report to.
+func TestReconcileMachineOperationDoesNotRunAFinishedOperation(t *testing.T) {
+	op := &machinav1alpha3.MachineOperation{
+		ObjectMeta: metav1.ObjectMeta{Name: "op-1"},
+		Spec:       machinav1alpha3.MachineOperationSpec{MachineRef: "machine-1", OperationKind: machinav1alpha3.OperationNodeReboot},
+	}
+	c := fakeMachineOperationClient(op)
+
+	ran := false
+	handlers := MachineOperationHandlers{
+		machinav1alpha3.OperationNodeReboot: func(ctx context.Context, store MachineOperationStore[int64], operation MachineOperation) (ctrl.Result, error) {
+			// The creator fails the operation between the agent reading it
+			// and starting it.
+			var latest machinav1alpha3.MachineOperation
+			if err := c.Get(ctx, client.ObjectKey{Name: operation.Name}, &latest); err != nil {
+				return ctrl.Result{}, err
+			}
+
+			latest.Status.Phase = machinav1alpha3.OperationPhaseFailed
+			latest.Status.Message = "not picked up"
+
+			if err := c.Status().Update(ctx, &latest); err != nil {
+				return ctrl.Result{}, err
+			}
+
+			if err := store.MarkInProgress(ctx, operation, "restarting"); err != nil {
+				return ctrl.Result{}, err
+			}
+
+			ran = true
+
+			return ctrl.Result{}, nil
+		},
+	}
+
+	reconciler, err := NewMachinaMachineOperationReconciler(c, "machine-1", "machine-1", handlers)
+	if err != nil {
+		t.Fatalf("NewMachinaMachineOperationReconciler: %v", err)
+	}
+
+	result, err := reconciler.ReconcileMachineOperation(context.Background(), "op-1")
+	if err != nil {
+		t.Fatalf("ReconcileMachineOperation: %v", err)
+	}
+
+	if result != (ctrl.Result{}) {
+		t.Fatalf("result = %#v, want no requeue", result)
+	}
+
+	if ran {
+		t.Fatal("the handler ran an operation that was already Failed")
+	}
+
+	var updated machinav1alpha3.MachineOperation
+	if err := c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated); err != nil {
+		t.Fatalf("get MachineOperation: %v", err)
+	}
+
+	if updated.Status.Phase != machinav1alpha3.OperationPhaseFailed || updated.Status.Message != "not picked up" {
+		t.Fatalf("status = %q %q, want the failure left as it was", updated.Status.Phase, updated.Status.Message)
+	}
+}
+
+// The agent marks an operation it has taken as Pending before the handler can
+// decide to wait, so its creator can tell a busy agent from an absent one.
+func TestReconcileMachineOperationAcknowledgesBeforeTheHandler(t *testing.T) {
+	op := &machinav1alpha3.MachineOperation{
+		ObjectMeta: metav1.ObjectMeta{Name: "op-1"},
+		Spec:       machinav1alpha3.MachineOperationSpec{MachineRef: "machine-1", OperationKind: machinav1alpha3.OperationNodeReboot},
+	}
+	c := fakeMachineOperationClient(op)
+
+	var seen machinav1alpha3.OperationPhase
+
+	handlers := MachineOperationHandlers{
+		machinav1alpha3.OperationNodeReboot: func(ctx context.Context, _ MachineOperationStore[int64], operation MachineOperation) (ctrl.Result, error) {
+			var latest machinav1alpha3.MachineOperation
+			if err := c.Get(ctx, client.ObjectKey{Name: operation.Name}, &latest); err != nil {
+				return ctrl.Result{}, err
+			}
+
+			seen = latest.Status.Phase
+
+			// The handler waits, for example for a lock, and writes nothing.
+			return ctrl.Result{RequeueAfter: time.Second}, nil
+		},
+	}
+
+	reconciler, err := NewMachinaMachineOperationReconciler(c, "machine-1", "machine-1", handlers)
+	if err != nil {
+		t.Fatalf("NewMachinaMachineOperationReconciler: %v", err)
+	}
+
+	if _, err := reconciler.ReconcileMachineOperation(context.Background(), "op-1"); err != nil {
+		t.Fatalf("ReconcileMachineOperation: %v", err)
+	}
+
+	if seen != machinav1alpha3.OperationPhasePending {
+		t.Fatalf("phase when the handler ran = %q, want Pending", seen)
+	}
+
+	var updated machinav1alpha3.MachineOperation
+	if err := c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated); err != nil {
+		t.Fatalf("get MachineOperation: %v", err)
+	}
+
+	if updated.Status.Phase != machinav1alpha3.OperationPhasePending || updated.Status.StartedAt != nil {
+		t.Fatalf("status = %q startedAt %v, want Pending and not started", updated.Status.Phase, updated.Status.StartedAt)
 	}
 }
 
@@ -428,4 +711,66 @@ func fakeMachineOperationClient(objs ...client.Object) client.Client {
 		WithStatusSubresource(&machinav1alpha3.MachineOperation{}).
 		WithObjects(objs...).
 		Build()
+}
+
+// A held operation names this machine but must not run yet. The agent leaves
+// it alone, without acknowledging it, until spec.suspend is cleared.
+func TestMachinaMachineOperationReconcilerWaitsForAHeldOperation(t *testing.T) {
+	t.Parallel()
+
+	ran := 0
+	op := &machinav1alpha3.MachineOperation{
+		ObjectMeta: metav1.ObjectMeta{Name: "op-1"},
+		Spec: machinav1alpha3.MachineOperationSpec{
+			MachineRef:    "machine-1",
+			Suspend:       true,
+			OperationKind: machinav1alpha3.OperationNodeReboot,
+		},
+	}
+	c := fakeMachineOperationClient(op)
+
+	reconciler, err := NewMachinaMachineOperationReconciler(c, "machine-1", "node-1", MachineOperationHandlers{
+		machinav1alpha3.OperationNodeReboot: func(context.Context, MachineOperationStore[int64], MachineOperation) (ctrl.Result, error) {
+			ran++
+			return ctrl.Result{}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewMachinaMachineOperationReconciler: %v", err)
+	}
+
+	if requests := reconciler.mapMachineOperation(context.Background(), op); len(requests) != 0 {
+		t.Fatalf("requests for a held operation = %#v, want none", requests)
+	}
+
+	if _, err := reconciler.ReconcileMachineOperation(context.Background(), "op-1"); err != nil {
+		t.Fatalf("ReconcileMachineOperation: %v", err)
+	}
+
+	var held machinav1alpha3.MachineOperation
+	if err := c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &held); err != nil {
+		t.Fatalf("get MachineOperation: %v", err)
+	}
+
+	if ran != 0 || held.Status.Phase != "" {
+		t.Fatalf("held operation: ran %d times, phase %q; want untouched", ran, held.Status.Phase)
+	}
+
+	// Released: the update is enqueued and the operation runs.
+	held.Spec.Suspend = false
+	if err := c.Update(context.Background(), &held); err != nil {
+		t.Fatalf("release MachineOperation: %v", err)
+	}
+
+	if requests := reconciler.mapMachineOperation(context.Background(), &held); len(requests) != 1 {
+		t.Fatalf("requests for a released operation = %#v, want one", requests)
+	}
+
+	if _, err := reconciler.ReconcileMachineOperation(context.Background(), "op-1"); err != nil {
+		t.Fatalf("ReconcileMachineOperation: %v", err)
+	}
+
+	if ran != 1 {
+		t.Fatalf("released operation ran %d times, want 1", ran)
+	}
 }

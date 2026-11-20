@@ -11,6 +11,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -229,6 +230,278 @@ func TestMachineOperationReconciler_SkipsOperationForDifferentSite(t *testing.T)
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
 	require.Empty(t, updated.Status.Phase)
 	require.Empty(t, updated.Status.Conditions)
+}
+
+// A selector operation belongs to the fan-out controller, which creates a
+// machineRef operation per Machine. The engine leaves it alone in every
+// phase: no status, no provider call, and no TTL deletion.
+func TestMachineOperationReconciler_IgnoresSelectorOperation(t *testing.T) {
+	t.Parallel()
+
+	selector := &metav1.LabelSelector{MatchLabels: map[string]string{"topology.unbounded-cloud.io/rack": "dc-a.rack-01"}}
+	ttl := int32(0)
+	completed := metav1.NewTime(fixedOperationNow().Add(-time.Hour))
+
+	tests := []struct {
+		name   string
+		mutate func(*unboundedv1alpha3.MachineOperation)
+	}{
+		{name: "not started", mutate: func(*unboundedv1alpha3.MachineOperation) {}},
+		{name: "in progress", mutate: func(op *unboundedv1alpha3.MachineOperation) {
+			op.Status.Phase = unboundedv1alpha3.OperationPhaseInProgress
+		}},
+		{name: "terminal with an expired TTL", mutate: func(op *unboundedv1alpha3.MachineOperation) {
+			op.Spec.TTLSecondsAfterFinished = &ttl
+			op.Status.Phase = unboundedv1alpha3.OperationPhaseComplete
+			op.Status.CompletedAt = &completed
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			s := newOperationTestScheme(t)
+			machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
+			machine.Labels["topology.unbounded-cloud.io/rack"] = "dc-a.rack-01"
+
+			op := newMachineOperation("op-1", "", unboundedv1alpha3.OperationHostHardReboot)
+			op.Spec.MachineSelector = selector
+			tt.mutate(op)
+
+			want := op.Status.DeepCopy()
+			provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostHardReboot: true}}
+
+			c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op).WithStatusSubresource(op).Build()
+			reconciler := &MachineOperationReconciler{
+				Client:    c,
+				Providers: []*Provider{newRecordingProviderRegistration(provider)},
+				Now:       fixedOperationNow,
+			}
+
+			result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "op-1"}})
+			require.NoError(t, err)
+			require.Equal(t, ctrl.Result{}, result)
+			require.Empty(t, provider.calls)
+
+			var updated unboundedv1alpha3.MachineOperation
+			require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
+			require.Equal(t, want.Phase, updated.Status.Phase)
+			require.Empty(t, updated.Status.Targets)
+			require.Empty(t, updated.Status.Conditions)
+		})
+	}
+}
+
+// A held machineRef operation is not started: while spec.suspend is set the
+// engine writes no status, makes no provider call and adds no target, the
+// same way it leaves a selector operation to the fan-out controller. An
+// operation that has already started, or that is terminal, is not held.
+func TestMachineOperationReconciler_IgnoresHeldOperation(t *testing.T) {
+	t.Parallel()
+
+	startedAt := fixedOperationNow()
+	ttl := int32(0)
+	completed := metav1.NewTime(fixedOperationNow().Add(-time.Hour))
+
+	tests := []struct {
+		name        string
+		mutate      func(*unboundedv1alpha3.MachineOperation)
+		wantGone    bool
+		wantStarted bool
+	}{
+		{
+			name:   "not started",
+			mutate: func(*unboundedv1alpha3.MachineOperation) {},
+		},
+		{
+			name: "pending",
+			mutate: func(op *unboundedv1alpha3.MachineOperation) {
+				op.Status.Phase = unboundedv1alpha3.OperationPhasePending
+			},
+		},
+		{
+			// Every agent may write any operation's status. A status that
+			// claims the operation started does not release it.
+			name: "forged in-progress status is still held",
+			mutate: func(op *unboundedv1alpha3.MachineOperation) {
+				op.Status.Phase = unboundedv1alpha3.OperationPhaseInProgress
+				op.Status.StartedAt = ptrTo(startedAt)
+			},
+		},
+		{
+			name: "forged terminal status is still held",
+			mutate: func(op *unboundedv1alpha3.MachineOperation) {
+				op.Spec.TTLSecondsAfterFinished = &ttl
+				op.Status.Phase = unboundedv1alpha3.OperationPhaseComplete
+				op.Status.CompletedAt = &completed
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			s := newOperationTestScheme(t)
+			machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
+
+			op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostHardReboot)
+			op.Spec.Suspend = true
+			tt.mutate(op)
+
+			wantPhase := op.Status.Phase
+			wantStartedAt := op.Status.StartedAt.DeepCopy()
+			provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostHardReboot: true}}
+
+			c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op).WithStatusSubresource(op).Build()
+			reconciler := &MachineOperationReconciler{
+				Client:    c,
+				Providers: []*Provider{newRecordingProviderRegistration(provider)},
+				Now:       fixedOperationNow,
+			}
+
+			result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "op-1"}})
+			require.NoError(t, err)
+			require.Empty(t, provider.calls)
+
+			if tt.wantStarted {
+				// The started operation keeps running as usual.
+				require.Equal(t, ctrl.Result{}, result)
+
+				var updated unboundedv1alpha3.MachineOperation
+				require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
+				require.Equal(t, unboundedv1alpha3.OperationPhaseInProgress, updated.Status.Phase)
+				require.True(t, updated.Status.StartedAt.Equal(&startedAt))
+				require.Nil(t, updated.Status.CompletedAt)
+				require.Len(t, updated.Status.Targets, 1)
+
+				return
+			}
+
+			require.Equal(t, ctrl.Result{}, result)
+
+			var updated unboundedv1alpha3.MachineOperation
+
+			err = c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated)
+
+			if tt.wantGone {
+				require.True(t, apierrors.IsNotFound(err))
+
+				return
+			}
+
+			require.NoError(t, err)
+			require.Equal(t, wantPhase, updated.Status.Phase)
+			require.True(t, wantStartedAt.Equal(updated.Status.StartedAt), "the engine writes nothing to a held operation")
+			require.Empty(t, updated.Status.Targets)
+			require.Empty(t, updated.Status.Conditions)
+		})
+	}
+}
+
+// The operation is not terminal when Reconcile reads it, but the controller
+// that created it fails it before the engine marks it InProgress: the engine
+// must not start it and must not report an error.
+func TestMachineOperationReconcilerSkipsOperationThatFinishedBeforeMarkingInProgress(t *testing.T) {
+	t.Parallel()
+
+	message := "NotPickedUp: no agent started the operation within the pickup timeout"
+	s := newOperationTestScheme(t)
+	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
+	machine.Generation = 3
+	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostPowerOn)
+	credential := newWorkloadIdentityCredential("cred-a", "site-a", unboundedv1alpha3.ExternalProviderAzureVM)
+	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostPowerOn: true}}
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, credential).WithStatusSubresource(op).
+		WithInterceptorFuncs(finishedOperationInterceptor(op.Name, message)).Build()
+	reconciler := &MachineOperationReconciler{Client: c, Providers: []*Provider{newRecordingProviderRegistration(provider)}, Now: fixedOperationNow}
+
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+	require.NoError(t, err)
+	require.Equal(t, ctrl.Result{}, result)
+	require.Empty(t, provider.calls)
+
+	var updated unboundedv1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &updated))
+	require.Equal(t, unboundedv1alpha3.OperationPhaseFailed, updated.Status.Phase)
+	require.Equal(t, message, updated.Status.Message)
+}
+
+// finishedOperationInterceptor fails the operation on the first read after the
+// engine initialized its target, simulating the controller that created it
+// giving up between the reconciler's read and its InProgress write. The first
+// reads stay non-terminal.
+func finishedOperationInterceptor(name, message string) interceptor.Funcs {
+	return interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if err := c.Get(ctx, key, obj, opts...); err != nil {
+				return err
+			}
+
+			op, ok := obj.(*unboundedv1alpha3.MachineOperation)
+			if !ok || key.Name != name || len(op.Status.Targets) == 0 || op.Status.IsTerminal() {
+				return nil
+			}
+
+			latest := op.DeepCopy()
+			latest.Status.Phase = unboundedv1alpha3.OperationPhaseFailed
+			latest.Status.Message = message
+			latest.Status.CompletedAt = ptrTo(fixedOperationNow())
+
+			return c.Status().Update(ctx, latest)
+		},
+	}
+}
+
+// A held machineRef operation is not started. The release clears
+// spec.suspend, which bumps the generation; the update predicate then
+// re-enqueues the operation and the engine runs it as usual.
+func TestMachineOperationReconciler_ExecutesHeldOperationOnceReleased(t *testing.T) {
+	t.Parallel()
+
+	s := newOperationTestScheme(t)
+	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
+	machine.Generation = 3
+	machine.Spec.Provider = ""
+	machine.Spec.ProviderID = ""
+	machine.Spec.Host = &unboundedv1alpha3.HostSpec{Azure: &unboundedv1alpha3.AzureHostSpec{
+		ResourceID: "azure:///subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/machine-1",
+	}}
+	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostHardReboot)
+	op.Spec.Suspend = true
+	credential := newWorkloadIdentityCredential("cred-a", "site-a", unboundedv1alpha3.ExternalProviderAzureVM)
+	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostHardReboot: true}}
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, credential).WithStatusSubresource(op).Build()
+	reconciler := &MachineOperationReconciler{Client: c, Providers: []*Provider{newRecordingProviderRegistration(provider)}, Now: fixedOperationNow}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "op-1"}}
+
+	// Held: no status write, no provider call.
+	result, err := reconciler.Reconcile(context.Background(), req)
+	require.NoError(t, err)
+	require.Equal(t, ctrl.Result{}, result)
+	require.Empty(t, provider.calls)
+
+	var held unboundedv1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &held))
+	require.Equal(t, unboundedv1alpha3.MachineOperationStatus{}, held.Status)
+
+	// Release.
+	held.Spec.Suspend = false
+	require.NoError(t, c.Update(context.Background(), &held))
+
+	result, err = reconciler.Reconcile(context.Background(), req)
+	require.NoError(t, err)
+	require.Equal(t, ctrl.Result{}, result)
+	require.Equal(t, []string{"HostHardReboot:machine-1:azure:///subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/machine-1"}, provider.calls)
+
+	var updated unboundedv1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
+	require.Equal(t, unboundedv1alpha3.OperationPhaseComplete, updated.Status.Phase)
+	require.NotNil(t, updated.Status.StartedAt)
+	require.NotNil(t, updated.Status.CompletedAt)
 }
 
 func TestMachineOperationReconciler_SkipsOperationForDifferentProviderScope(t *testing.T) {
@@ -972,6 +1245,27 @@ func TestShouldReconcileOperationUpdateIgnoresNonterminalStatusWrites(t *testing
 	terminalUpdate.Status.Phase = unboundedv1alpha3.OperationPhaseComplete
 	terminalUpdate.Status.CompletedAt = &completedAt
 	require.True(t, shouldReconcileOperationUpdate(statusUpdate, terminalUpdate))
+}
+
+// Clearing spec.suspend is a spec change, so it bumps the generation and the
+// update predicate re-enqueues the operation: the release is reconciled.
+func TestShouldReconcileOperationUpdateReconcilesHeldOperationRelease(t *testing.T) {
+	t.Parallel()
+
+	held := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostHardReboot)
+	held.Generation = 1
+	held.Spec.Suspend = true
+	require.True(t, shouldReconcileOperation(held), "the create event enqueues the held operation; Reconcile skips it while it is held")
+
+	released := held.DeepCopy()
+	released.Generation = 2
+	released.Spec.Suspend = false
+	require.True(t, shouldReconcileOperationUpdate(held, released), "the release bumps the generation")
+
+	reHeld := released.DeepCopy()
+	reHeld.Generation = 3
+	reHeld.Spec.Suspend = true
+	require.True(t, shouldReconcileOperationUpdate(released, reHeld), "re-holding is a spec change too")
 }
 
 type recordingProvider struct {

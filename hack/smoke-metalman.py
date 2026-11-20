@@ -971,18 +971,14 @@ def create_machine_operation(
     name: str,
     kind: str,
     *,
-    machine_ref: str | None = NODE_NAME,
-    site_selector: str | None = None,
+    machine_ref: str = NODE_NAME,
     ttl_seconds: int = 3600,
 ) -> str:
     spec: dict[str, Any] = {
         "operationKind": kind,
+        "machineRef": machine_ref,
         "ttlSecondsAfterFinished": ttl_seconds,
     }
-    if site_selector is not None:
-        spec["machineSelector"] = {"matchLabels": {f"{API_GROUP}/site": site_selector}}
-    elif machine_ref is not None:
-        spec["machineRef"] = machine_ref
 
     operation = {
         "apiVersion": API_VERSION,
@@ -1054,12 +1050,9 @@ def run_operation_smoke_suite() -> None:
     wait_node_boot_id_changed(NODE_NAME, boot_id, timeout=600)
     boot_id = get_node_boot_id(NODE_NAME)
 
-    reboot = create_machine_operation(
-        "smoke-selector-host-reboot",
-        "HostHardReboot",
-        machine_ref=None,
-        site_selector=SITE,
-    )
+    # By machineRef: this environment runs metalman without machina-controller,
+    # which is what turns a selector operation into per-machine operations.
+    reboot = create_machine_operation("smoke-host-reboot", "HostHardReboot")
     wait_machine_operation_complete(reboot, timeout=600)
     wait_vm_state("running", timeout=180)
     wait_k8s_node(NODE_NAME, timeout=300)

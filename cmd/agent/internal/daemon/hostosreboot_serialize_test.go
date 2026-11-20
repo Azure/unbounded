@@ -154,7 +154,7 @@ func TestReconcileHostSoftReboot_WaitingDoesNotRewriteStatus(t *testing.T) {
 	}
 
 	assert.Zero(t, op.rebootCalls)
-	assert.Equal(t, 1, updates, "the waiting message is written once")
+	assert.Equal(t, 2, updates, "the acknowledgment and the waiting message are each written once")
 }
 
 func TestReconcileHostSoftReboot_ListFailsDoesNotReboot(t *testing.T) {
@@ -177,7 +177,7 @@ func TestReconcileHostSoftReboot_ListFailsDoesNotReboot(t *testing.T) {
 	assert.Zero(t, op.rebootCalls)
 
 	unchanged := getMachineOperation(t, c, "op-soft")
-	assert.Empty(t, unchanged.Status.Phase)
+	assert.Equal(t, v1alpha3.OperationPhasePending, unchanged.Status.Phase, "acknowledged, not started")
 }
 
 func TestReconcileHostSoftReboot_IgnoresUnrelatedOperations(t *testing.T) {
@@ -208,7 +208,7 @@ func TestReconcileHostSoftReboot_UsesAPIReader(t *testing.T) {
 	apiReader := fakeStatusClient(machine, hostSoftRebootOperation("op-soft"), outOfBandOperation("op-oob", "test-machine", v1alpha3.OperationHostHardReboot))
 	target := &machineOperationTarget{Client: c, apiReader: apiReader, log: discardLogger()}
 	host := &fakeNodeOperator{bootID: "boot-1"}
-	handler, err := agentdaemon.NewHostSoftRebootHandler(c, target.reader(), target.log, hostSoftRebootTarget{machineName: machine.Name, generation: machine.Generation, labels: machine.Labels}, host, &atomic.Bool{})
+	handler, err := agentdaemon.NewHostSoftRebootHandler(c, target.reader(), target.log, hostSoftRebootTarget{machineName: machine.Name, generation: machine.Generation}, host, &atomic.Bool{})
 	require.NoError(t, err)
 
 	result, err := handler.Reconcile(context.Background(), nil, agentdaemon.MachineOperation{Name: "op-soft"})
@@ -218,7 +218,7 @@ func TestReconcileHostSoftReboot_UsesAPIReader(t *testing.T) {
 	assert.Zero(t, host.rebootCalls)
 
 	target.apiReader = nil
-	handler, err = agentdaemon.NewHostSoftRebootHandler(c, target.reader(), target.log, hostSoftRebootTarget{machineName: machine.Name, generation: machine.Generation, labels: machine.Labels}, host, &atomic.Bool{})
+	handler, err = agentdaemon.NewHostSoftRebootHandler(c, target.reader(), target.log, hostSoftRebootTarget{machineName: machine.Name, generation: machine.Generation}, host, &atomic.Bool{})
 	require.NoError(t, err)
 	result, err = handler.Reconcile(context.Background(), nil, agentdaemon.MachineOperation{Name: "op-soft"})
 	require.NoError(t, err)
@@ -226,18 +226,15 @@ func TestReconcileHostSoftReboot_UsesAPIReader(t *testing.T) {
 	assert.Equal(t, 1, host.rebootCalls)
 }
 
-func TestReconcileHostSoftReboot_ReadsMachineFromAPIReader(t *testing.T) {
-	// The cached Machine lacks the label that the API server has, so only
-	// the fresh Machine matches the pending selector-based operation.
-	cached := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "test-machine", Generation: 4}}
-	fresh := cached.DeepCopy()
-	fresh.Labels = map[string]string{"rack": "a"}
-	outOfBand := outOfBandOperation("op-oob", "", v1alpha3.OperationHostPowerOff)
-	outOfBand.Spec.MachineSelector = &metav1.LabelSelector{MatchLabels: map[string]string{"rack": "a"}}
+func TestReconcileHostSoftReboot_ChecksOutOfBandOperationsInAPIReader(t *testing.T) {
+	// The cached client has not seen the out-of-band operation, so only the
+	// API reader finds it and holds the HostSoftReboot.
+	machine := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "test-machine", Generation: 4}}
+	outOfBand := outOfBandOperation("op-oob", "test-machine", v1alpha3.OperationHostPowerOff)
 
 	op := &fakeNodeOperator{bootID: "boot-1"}
-	c := fakeStatusClient(cached, hostSoftRebootOperation("op-soft"))
-	apiReader := fakeStatusClient(fresh, outOfBand)
+	c := fakeStatusClient(machine, hostSoftRebootOperation("op-soft"))
+	apiReader := fakeStatusClient(machine, outOfBand)
 	reconciler := newTestMachinaMachineOperationReconcilerWithLockPath(
 		t, c, op, filepath.Join(t.TempDir(), "agent-upgrade.lock"), apiReader,
 	)
@@ -250,6 +247,63 @@ func TestReconcileHostSoftReboot_ReadsMachineFromAPIReader(t *testing.T) {
 	waiting := getMachineOperation(t, c, "op-soft")
 	assert.Equal(t, v1alpha3.OperationPhasePending, waiting.Status.Phase)
 	assert.Equal(t, "waiting for out-of-band host operation op-oob", waiting.Status.Message)
+}
+
+func TestReconcileHostSoftReboot_DoesNotWaitForAParentOperation(t *testing.T) {
+	// A rack-wide HostPowerOff lists this machine as a pending target. Only
+	// the machineRef operation it creates for this machine acts on the host,
+	// so the parent alone does not hold the HostSoftReboot.
+	machine := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "test-machine", Generation: 4}}
+	parent := &v1alpha3.MachineOperation{
+		ObjectMeta: metav1.ObjectMeta{Name: "op-rack"},
+		Spec: v1alpha3.MachineOperationSpec{
+			MachineSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"rack": "a"}},
+			OperationKind:   v1alpha3.OperationHostPowerOff,
+		},
+		Status: v1alpha3.MachineOperationStatus{
+			Phase: v1alpha3.OperationPhaseInProgress,
+			Targets: []v1alpha3.MachineOperationTargetStatus{
+				{MachineRef: "test-machine", Phase: v1alpha3.OperationPhasePending},
+			},
+		},
+	}
+
+	op := &fakeNodeOperator{bootID: "boot-1"}
+	c := fakeStatusClient(machine, hostSoftRebootOperation("op-soft"))
+	apiReader := fakeStatusClient(machine, parent)
+	reconciler := newTestMachinaMachineOperationReconcilerWithLockPath(
+		t, c, op, filepath.Join(t.TempDir(), "agent-upgrade.lock"), apiReader,
+	)
+
+	_, err := reconciler.ReconcileMachineOperation(context.Background(), "op-soft")
+	require.NoError(t, err)
+	assert.Equal(t, 1, op.rebootCalls, "a parent operation must not hold the reboot")
+}
+
+func TestReconcileHostSoftReboot_IgnoresSelectorOnlyOperation(t *testing.T) {
+	// A machineSelector that matches this machine's labels is no longer a
+	// match: the operation has no machineRef naming this machine.
+	machine := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-machine", Generation: 4, Labels: map[string]string{"rack": "a"}},
+	}
+	selectorOp := &v1alpha3.MachineOperation{
+		ObjectMeta: metav1.ObjectMeta{Name: "op-selector"},
+		Spec: v1alpha3.MachineOperationSpec{
+			MachineSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"rack": "a"}},
+			OperationKind:   v1alpha3.OperationHostSoftReboot,
+		},
+	}
+	op := &fakeNodeOperator{bootID: "boot-1"}
+	c := fakeStatusClient(machine, selectorOp)
+	reconciler := newTestMachinaMachineOperationReconciler(t, c, op)
+
+	result, err := reconciler.ReconcileMachineOperation(context.Background(), "op-selector")
+	require.NoError(t, err)
+	assert.Zero(t, result.RequeueAfter)
+	assert.Zero(t, op.rebootCalls, "a selector-only operation must not reboot the host")
+
+	unchanged := getMachineOperation(t, c, "op-selector")
+	assert.Empty(t, unchanged.Status.Phase)
 }
 
 func TestReconcileHostSoftReboot_IgnoresAllocationOperations(t *testing.T) {

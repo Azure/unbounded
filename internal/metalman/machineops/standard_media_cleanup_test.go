@@ -42,7 +42,8 @@ func standardMediaDiscoveryFailures() []standardMediaDiscoveryFailure {
 		}
 	}
 
-	return append(failures,
+	return append(
+		failures,
 		standardMediaDiscoveryFailure{
 			name: "license", path: "/redfish/v1/Managers/1/VirtualMedia", status: http.StatusForbidden,
 			body: `{"error":{"code":"SMC.1.0.OemLicenseNotPassed"}}`,
