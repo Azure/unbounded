@@ -23,6 +23,7 @@ import (
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/unbounded"
+	"github.com/Azure/unbounded/pkg/machineops/fanout"
 )
 
 var scheme = runtime.NewScheme()
@@ -100,6 +101,13 @@ func RunManager(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("setup Machine configuration binding controller: %w", err)
 	}
 
+	// Setup the MachineOperation fan-out controller - resolves a selector
+	// operation into one machineRef operation per matched Machine. Agents
+	// and provider controllers execute only those.
+	if err := fanout.AddToManager(mgr, fanout.Options{}); err != nil {
+		return fmt.Errorf("setup MachineOperation fan-out controller: %w", err)
+	}
+
 	daemonCSRApprover, err := NewDaemonCSRApprover(mgr.GetClient(), mgr.GetAPIReader(), kubeClient)
 	if err != nil {
 		return fmt.Errorf("create daemon CSR approver controller: %w", err)
@@ -129,6 +137,12 @@ func RunManager(ctx context.Context, cfg Config) error {
 
 func machinaCacheOptions() cache.Options {
 	return cache.Options{
+		// The cache holds every Machine and, for the selector fan-out, every
+		// MachineOperation: one per machine while a fleet-wide operation
+		// runs. Nothing here reads managedFields, which are a third or more
+		// of such small objects, so they are dropped before an object is
+		// stored.
+		DefaultTransform: cache.TransformStripManagedFields(),
 		ByObject: map[client.Object]cache.ByObject{
 			// Limit Secret caching to bootstrap tokens in kube-system and
 			// Machina-managed secrets in the controller's own namespace.
