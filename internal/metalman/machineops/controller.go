@@ -39,8 +39,6 @@ const (
 	siteLabel = "unbounded-cloud.io/site"
 
 	reasonSucceeded                = "Succeeded"
-	reasonInvalidTargetScope       = "InvalidTargetScope"
-	reasonNoMatchingOwnedMachines  = "NoMatchingOwnedMachines"
 	reasonMachineNotFound          = "MachineNotFound"
 	reasonUnsupportedTarget        = "UnsupportedTarget"
 	reasonTargetNoLongerOwned      = "TargetNoLongerOwned"
@@ -155,6 +153,12 @@ func (r *Reconciler) operationsForMachine(ctx context.Context, obj client.Object
 }
 
 func shouldReconcile(op *v1alpha3.MachineOperation) bool {
+	// Metalman only handles machineRef operations, including TTL cleanup. A
+	// selector operation is expanded into machineRef operations elsewhere.
+	if op.Spec.MachineRef == "" {
+		return false
+	}
+
 	if op.Spec.OperationKind.IsAllocationOperation() {
 		return false
 	}
@@ -172,10 +176,26 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
+	// Metalman only handles machineRef operations, including TTL cleanup. A
+	// selector operation is expanded into machineRef operations elsewhere.
+	if op.Spec.MachineRef == "" {
+		slog.DebugContext(ctx, "ignoring operation without machineRef", "machineOperation", op.Name)
+		return ctrl.Result{}, nil
+	}
+
 	// HostAllocate and HostRelease act on a MachineAllocation. Metalman never
 	// executes or deletes them.
 	if op.Spec.OperationKind.IsAllocationOperation() {
 		slog.DebugContext(ctx, "ignoring allocation operation", "machineOperation", op.Name, "operationKind", op.Spec.OperationKind)
+		return ctrl.Result{}, nil
+	}
+
+	// A held machineRef operation is not started: metalman writes no status,
+	// adds no finalizer and installs no boot media while spec.suspend is set.
+	// The release changes the spec, which bumps the generation, so the update
+	// predicate re-enqueues the operation.
+	if op.IsHeld() {
+		slog.DebugContext(ctx, "ignoring held operation: it has not started and spec.suspend is set", "machineOperation", op.Name)
 		return ctrl.Result{}, nil
 	}
 
@@ -265,11 +285,7 @@ func (r *Reconciler) snapshotTargets(ctx context.Context, op *v1alpha3.MachineOp
 	}
 
 	if len(targets) == 0 {
-		if op.Spec.MachineRef != "" {
-			return false, nil
-		}
-
-		return true, r.finishOperation(ctx, op.Name, v1alpha3.OperationPhaseFailed, reasonNoMatchingOwnedMachines, "no owned bare-metal Machines matched the operation target")
+		return false, nil
 	}
 
 	now := r.now()
@@ -298,94 +314,47 @@ func (r *Reconciler) snapshotTargets(ctx context.Context, op *v1alpha3.MachineOp
 }
 
 func (r *Reconciler) resolveTargets(ctx context.Context, op *v1alpha3.MachineOperation) ([]v1alpha3.Machine, error) {
-	if op.Spec.MachineRef != "" {
-		reader := r.APIReader
-		if reader == nil {
-			reader = r.Client
+	if op.Spec.MachineRef == "" {
+		return nil, nil
+	}
+
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+
+	var machine v1alpha3.Machine
+	if err := reader.Get(ctx, client.ObjectKey{Name: op.Spec.MachineRef}, &machine); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, operationError{reason: reasonMachineNotFound, message: fmt.Sprintf("Machine %s not found", op.Spec.MachineRef)}
 		}
 
-		var machine v1alpha3.Machine
-		if err := reader.Get(ctx, client.ObjectKey{Name: op.Spec.MachineRef}, &machine); err != nil {
-			if apierrors.IsNotFound(err) {
-				return nil, operationError{reason: reasonMachineNotFound, message: fmt.Sprintf("Machine %s not found", op.Spec.MachineRef)}
-			}
-
-			return nil, fmt.Errorf("get Machine %s: %w", op.Spec.MachineRef, err)
-		}
-
-		if !r.ownsMachine(&machine) {
-			return nil, nil
-		}
-
-		if isExternalProviderMachine(&machine) {
-			return nil, nil
-		}
-
-		if !isBareMetalRedfishMachine(&machine) {
-			return nil, operationError{reason: reasonUnsupportedTarget, message: fmt.Sprintf("Machine %s is not a bare-metal Redfish target", machine.Name)}
-		}
-
-		return []v1alpha3.Machine{machine}, nil
+		return nil, fmt.Errorf("get Machine %s: %w", op.Spec.MachineRef, err)
 	}
 
-	if op.Spec.MachineSelector == nil {
-		return nil, operationError{reason: reasonInvalidTargetScope, message: "spec.machineRef or spec.machineSelector is required"}
+	if !r.ownsMachine(&machine) {
+		return nil, nil
 	}
 
-	if err := r.validateSelectorScope(op.Spec.MachineSelector); err != nil {
-		return nil, err
+	if isExternalProviderMachine(&machine) {
+		return nil, nil
 	}
 
-	selector, err := metav1.LabelSelectorAsSelector(op.Spec.MachineSelector)
-	if err != nil {
-		return nil, operationError{reason: reasonInvalidTargetScope, message: fmt.Sprintf("invalid machineSelector: %v", err)}
+	if !isBareMetalRedfishMachine(&machine) {
+		return nil, operationError{reason: reasonUnsupportedTarget, message: fmt.Sprintf("Machine %s is not a bare-metal Redfish target", machine.Name)}
 	}
 
-	var list v1alpha3.MachineList
-	if err := r.List(ctx, &list, client.MatchingLabelsSelector{Selector: selector}); err != nil {
-		return nil, fmt.Errorf("list Machines for selector: %w", err)
-	}
-
-	targets := make([]v1alpha3.Machine, 0, len(list.Items))
-	for _, machine := range list.Items {
-		if !r.ownsMachine(&machine) || !isBareMetalRedfishMachine(&machine) {
-			continue
-		}
-
-		targets = append(targets, machine)
-	}
-
-	sort.Slice(targets, func(i, j int) bool { return targets[i].Name < targets[j].Name })
-
-	return targets, nil
-}
-
-func (r *Reconciler) validateSelectorScope(selector *metav1.LabelSelector) error {
-	if r.Site == "" {
-		return operationError{reason: reasonInvalidTargetScope, message: "selector-based host operations require a non-empty metalman site"}
-	}
-
-	sites := selectorSites(selector)
-	if len(sites) > 1 {
-		return operationError{reason: reasonInvalidTargetScope, message: fmt.Sprintf("machineSelector names more than one %s: %s", siteLabel, strings.Join(sites, ", "))}
-	}
-
-	if len(sites) == 1 && sites[0] == r.Site {
-		return nil
-	}
-
-	return operationError{reason: reasonInvalidTargetScope, message: fmt.Sprintf("machineSelector must include %s=%s", siteLabel, r.Site)}
+	return []v1alpha3.Machine{machine}, nil
 }
 
 // ownsOperation reports whether this metalman instance may write status for
-// op. Operations that belong to a site are owned by exactly one instance:
+// op. Metalman only handles operations with spec.machineRef:
 //   - an operation with boot media is owned by the site that installed it;
-//   - a machineRef operation is owned by the site of its Machine, read live;
-//   - a selector operation is owned by the one site its selector names.
+//   - a machineRef operation is owned by the site of its Machine, read live.
 //
-// No instance can own an operation that names no site, names more than one
-// site, or targets a Machine that does not exist. Every instance fails such an
-// operation, because the result is the same whichever instance writes it.
+// No instance can own an operation that targets a Machine that does not exist.
+// Every instance fails such an operation, because the result is the same
+// whichever instance writes it.
 func (r *Reconciler) ownsOperation(ctx context.Context, op *v1alpha3.MachineOperation) (bool, error) {
 	if sites := mediaSites(op); len(sites) > 0 {
 		return slices.Contains(sites, r.Site), nil
@@ -404,43 +373,7 @@ func (r *Reconciler) ownsOperation(ctx context.Context, op *v1alpha3.MachineOper
 		return r.ownsMachine(&machine), nil
 	}
 
-	if op.Spec.MachineSelector != nil {
-		sites := selectorSites(op.Spec.MachineSelector)
-		if len(sites) != 1 {
-			return true, nil
-		}
-
-		return sites[0] == r.Site, nil
-	}
-
 	return true, nil
-}
-
-// selectorSites returns the sorted, distinct non-empty site names that
-// selector requires, from matchLabels and from single-value In expressions.
-// Other expressions do not name a site because they can match more than one.
-func selectorSites(selector *metav1.LabelSelector) []string {
-	var sites []string
-
-	add := func(site string) {
-		if site != "" && !slices.Contains(sites, site) {
-			sites = append(sites, site)
-		}
-	}
-
-	if site, ok := selector.MatchLabels[siteLabel]; ok {
-		add(site)
-	}
-
-	for _, expr := range selector.MatchExpressions {
-		if expr.Key == siteLabel && expr.Operator == metav1.LabelSelectorOpIn && len(expr.Values) == 1 {
-			add(expr.Values[0])
-		}
-	}
-
-	sort.Strings(sites)
-
-	return sites
 }
 
 // mediaSites returns the distinct sites that installed boot media for op.
@@ -1155,14 +1088,9 @@ func (r *Reconciler) aggregateStatus(op *v1alpha3.MachineOperation) {
 	setCompletedCondition(op, metav1.ConditionFalse, "InProgress", message)
 }
 
-// setObservedMachineGeneration records the generation of the Machine a
-// completed machineRef operation acted on. Selector operations act on several
-// Machines, so only their per-target observedGeneration is set.
+// setObservedMachineGeneration records the generation of the Machine that a
+// completed machineRef operation acted on.
 func setObservedMachineGeneration(op *v1alpha3.MachineOperation) {
-	if op.Spec.MachineRef == "" {
-		return
-	}
-
 	for _, target := range op.Status.Targets {
 		if target.MachineRef == op.Spec.MachineRef && target.ObservedGeneration > 0 {
 			op.Status.ObservedMachineGeneration = target.ObservedGeneration
@@ -1218,6 +1146,18 @@ func (r *Reconciler) olderConflictingOperation(ctx context.Context, op *v1alpha3
 
 func (r *Reconciler) operationConflictKeys(ctx context.Context, op *v1alpha3.MachineOperation) (map[string]struct{}, error) {
 	keys := map[string]struct{}{}
+
+	// A selector operation contributes no conflict keys and never blocks a
+	// machineRef operation.
+	if op.Spec.MachineRef == "" {
+		return keys, nil
+	}
+
+	// A held operation is not started, so it contributes no conflict keys
+	// and never blocks a newer operation on the same Machine.
+	if op.IsHeld() {
+		return keys, nil
+	}
 
 	if len(op.Status.Targets) > 0 {
 		for _, target := range op.Status.Targets {
@@ -1323,8 +1263,11 @@ func conflictingOperationBefore(a, b *v1alpha3.MachineOperation) bool {
 }
 
 func operationBefore(a, b *v1alpha3.MachineOperation) bool {
-	if !a.CreationTimestamp.Equal(&b.CreationTimestamp) {
-		return a.CreationTimestamp.Before(&b.CreationTimestamp)
+	// An operation that was held for its turn in a rollout joins the queue
+	// when it is released, so it waits for one that started in the meantime.
+	aQueued, bQueued := a.QueueTime(), b.QueueTime()
+	if !aQueued.Equal(&bQueued) {
+		return aQueued.Before(&bQueued)
 	}
 
 	return a.Name < b.Name

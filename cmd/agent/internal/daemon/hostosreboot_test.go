@@ -87,7 +87,7 @@ func TestReconcileHostOSReboot_RebootsOnlyOnce(t *testing.T) {
 	assert.Equal(t, 1, op.rebootCalls)
 
 	second := getMachineOperation(t, c, "op-2")
-	assert.Empty(t, second.Status.Phase, "the daemon after the reboot picks up op-2")
+	assert.Equal(t, v1alpha3.OperationPhasePending, second.Status.Phase, "the daemon after the reboot picks up op-2")
 }
 
 func TestReconcileHostOSReboot_RebootCommandFails(t *testing.T) {
@@ -158,7 +158,7 @@ func TestReconcileHostOSReboot_DefersOtherOperations(t *testing.T) {
 	assert.False(t, op.restartCalled, "a NodeReboot must not start while the host is going down")
 
 	deferred := getMachineOperation(t, c, "op-node-reboot")
-	assert.Empty(t, deferred.Status.Phase, "the daemon after the reboot picks up the NodeReboot")
+	assert.Equal(t, v1alpha3.OperationPhasePending, deferred.Status.Phase, "the daemon after the reboot picks up the NodeReboot")
 }
 
 func TestReconcileHostOSReboot_DaemonStoppingLeavesInProgress(t *testing.T) {

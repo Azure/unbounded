@@ -394,3 +394,88 @@ func TestStatusQueueIgnoresTerminalAndNonHostReplaceOperations(t *testing.T) {
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: nonReplace.Name}, &updatedNonReplace))
 	require.Nil(t, apimeta.FindStatusCondition(updatedNonReplace.Status.Conditions, v1alpha3.MachineOperationConditionBootImageWritten))
 }
+
+// A held HostReplace is not started, so server-observed milestones are not
+// recorded on it. The same operation receives them once it is released.
+func TestStatusQueueIgnoresAHeldOperation(t *testing.T) {
+	t.Parallel()
+
+	s := testScheme(t)
+	machine := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "machine-1", Generation: 4}}
+	held := testOperation("op-held", v1alpha3.OperationHostReplace)
+	held.Spec.MachineRef = machine.Name
+	held.Spec.Suspend = true
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, held).WithStatusSubresource(held).Build()
+	queue := &StatusQueue{Client: c, Now: fixedNow}
+
+	require.NoError(t, queue.RecordBootImageWritten(context.Background(), machine.Name))
+
+	for queue.processNextUpdate(context.Background()) {
+	}
+
+	var updated v1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: held.Name}, &updated))
+	require.Equal(t, v1alpha3.MachineOperationStatus{}, updated.Status)
+
+	// Released: the same operation receives the milestone.
+	updated.Spec.Suspend = false
+	require.NoError(t, c.Update(context.Background(), &updated))
+
+	require.NoError(t, queue.RecordBootImageWritten(context.Background(), machine.Name))
+
+	for queue.processNextUpdate(context.Background()) {
+	}
+
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: held.Name}, &updated))
+	written := apimeta.FindStatusCondition(updated.Status.Conditions, v1alpha3.MachineOperationConditionBootImageWritten)
+	require.NotNil(t, written)
+	require.Equal(t, metav1.ConditionTrue, written.Status)
+}
+
+// A selector HostReplace is older than the machineRef operation created for
+// a machine and lists the same machine. Boot milestones belong on the
+// machineRef operation, which is the one metalman runs and waits on.
+func TestStatusQueueRecordsOnTheMachineRefOperationNotItsParent(t *testing.T) {
+	t.Parallel()
+
+	s := testScheme(t)
+
+	parent := testOperation("replace-rack", v1alpha3.OperationHostReplace)
+	parent.CreationTimestamp = metav1.NewTime(fixedNow().Add(-time.Hour))
+	parent.Spec.MachineRef = ""
+	parent.Spec.MachineSelector = &metav1.LabelSelector{MatchLabels: map[string]string{"topology.unbounded-cloud.io/rack": "dc-a.rack-01"}}
+	parent.Status.Phase = v1alpha3.OperationPhaseInProgress
+	parent.Status.Targets = []v1alpha3.MachineOperationTargetStatus{{
+		MachineRef: "machine-1",
+		Phase:      v1alpha3.OperationPhaseInProgress,
+	}}
+
+	child := testOperation("replace-rack-machine-1", v1alpha3.OperationHostReplace)
+	child.CreationTimestamp = metav1.NewTime(fixedNow().Add(-time.Minute))
+	child.Spec.MachineRef = "machine-1"
+	child.Status.Phase = v1alpha3.OperationPhaseInProgress
+	child.Status.Targets = []v1alpha3.MachineOperationTargetStatus{{
+		MachineRef: "machine-1",
+		Phase:      v1alpha3.OperationPhaseInProgress,
+	}}
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(parent, child).WithStatusSubresource(parent, child).Build()
+	queue := &StatusQueue{Client: c, Now: fixedNow}
+
+	require.NoError(t, queue.RecordBootImageWritten(context.Background(), "machine-1"))
+
+	for queue.processNextUpdate(context.Background()) {
+	}
+
+	var updatedParent v1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: parent.Name}, &updatedParent))
+	require.Nil(t, apimeta.FindStatusCondition(updatedParent.Status.Conditions, v1alpha3.MachineOperationConditionBootImageWritten))
+
+	var updatedChild v1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: child.Name}, &updatedChild))
+
+	written := apimeta.FindStatusCondition(updatedChild.Status.Conditions, v1alpha3.MachineOperationConditionBootImageWritten)
+	require.NotNil(t, written)
+	require.Equal(t, metav1.ConditionTrue, written.Status)
+}

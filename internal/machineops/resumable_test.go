@@ -13,9 +13,11 @@ import (
 
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	metav1validation "k8s.io/apimachinery/pkg/apis/meta/v1/validation"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -494,6 +496,147 @@ func TestLongRunningOperationWaitsForOlderConflictingOperation(t *testing.T) {
 	require.Zero(t, provider.beginCalls)
 }
 
+// op-a was created first but released last, so it joined the queue after op-b
+// started: it waits for op-b, and op-b does not wait for it.
+func TestLongRunningOperationWaitsForOlderOperationByQueueTime(t *testing.T) {
+	t.Parallel()
+
+	machine, releasedLate, credential := newResumableTestObjects("machine-1", "op-a")
+	releasedLate.CreationTimestamp = metav1.NewTime(fixedOperationNow().Add(-2 * time.Minute))
+	releasedLate.Annotations = map[string]string{
+		unboundedv1alpha3.MachineOperationReleasedAtAnnotation: fixedOperationNow().Format(time.RFC3339),
+	}
+	createdInBetween := newMachineOperation("op-b", machine.Name, unboundedv1alpha3.OperationHostHardReboot)
+	createdInBetween.CreationTimestamp = metav1.NewTime(fixedOperationNow().Add(-time.Minute))
+	createdInBetween.Status.Phase = unboundedv1alpha3.OperationPhaseInProgress
+	provider := &recordingLongRunningProvider{beginResults: []publicmachineops.BeginResult{{
+		Operation: publicmachineops.ProviderOperation{OperationID: "provider-op-1"},
+	}}}
+	c := fake.NewClientBuilder().WithScheme(newOperationTestScheme(t)).WithObjects(machine, releasedLate, createdInBetween, credential).WithStatusSubresource(releasedLate, createdInBetween).Build()
+	reconciler := newResumableTestReconciler(c, provider)
+
+	// The operation released last waits for the one that started in the meantime.
+	reconcileOperation(t, reconciler, releasedLate.Name)
+
+	var waiting unboundedv1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: releasedLate.Name}, &waiting))
+	require.Equal(t, unboundedv1alpha3.OperationPhasePending, waiting.Status.Phase)
+	require.Contains(t, waiting.Status.Message, "waiting for older host operation op-b")
+	require.Empty(t, waiting.Status.Targets)
+	require.Zero(t, provider.beginCalls)
+
+	// The operation that started in the meantime does not wait for it.
+	reconcileOperation(t, reconciler, createdInBetween.Name)
+
+	var updated unboundedv1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: createdInBetween.Name}, &updated))
+	require.Equal(t, unboundedv1alpha3.OperationPhaseInProgress, updated.Status.Phase)
+	require.NotContains(t, updated.Status.Message, "waiting for older host operation")
+	require.Len(t, updated.Status.Targets, 1)
+	require.Equal(t, unboundedv1alpha3.OperationStageWaitingProvider, updated.Status.Targets[0].Stage)
+	require.Equal(t, 1, provider.beginCalls)
+}
+
+// operationBefore orders a machine's queue by queue time, not creation time:
+// an operation created early and released late waits for one created in the
+// meantime, the same queue time is broken by name, and without the released-at
+// annotation the creation time decides.
+func TestOperationBeforeUsesQueueTime(t *testing.T) {
+	t.Parallel()
+
+	createdEarly := newMachineOperation("op-early", "machine-1", unboundedv1alpha3.OperationHostHardReboot)
+	createdEarly.CreationTimestamp = metav1.NewTime(fixedOperationNow().Add(-2 * time.Minute))
+	createdEarly.Annotations = map[string]string{
+		unboundedv1alpha3.MachineOperationReleasedAtAnnotation: fixedOperationNow().Format(time.RFC3339),
+	}
+	createdInBetween := newMachineOperation("op-between", "machine-1", unboundedv1alpha3.OperationHostHardReboot)
+	createdInBetween.CreationTimestamp = metav1.NewTime(fixedOperationNow().Add(-time.Minute))
+
+	require.True(t, operationBefore(createdInBetween, createdEarly), "the operation released later is behind the one created in the meantime")
+	require.False(t, operationBefore(createdEarly, createdInBetween))
+
+	tieA := newMachineOperation("op-tie-a", "machine-1", unboundedv1alpha3.OperationHostHardReboot)
+	tieA.CreationTimestamp = createdInBetween.CreationTimestamp
+	tieB := newMachineOperation("op-tie-b", "machine-1", unboundedv1alpha3.OperationHostHardReboot)
+	tieB.CreationTimestamp = createdInBetween.CreationTimestamp
+
+	require.True(t, operationBefore(tieA, tieB), "operations with the same queue time are ordered by name")
+	require.False(t, operationBefore(tieB, tieA))
+
+	withoutA := newMachineOperation("op-without-a", "machine-1", unboundedv1alpha3.OperationHostHardReboot)
+	withoutA.CreationTimestamp = createdInBetween.CreationTimestamp
+	withoutB := newMachineOperation("op-without-b", "machine-1", unboundedv1alpha3.OperationHostHardReboot)
+	withoutB.CreationTimestamp = fixedOperationNow()
+
+	require.True(t, operationBefore(withoutA, withoutB), "without the annotation the creation time decides")
+	require.False(t, operationBefore(withoutB, withoutA))
+
+	malformed := newMachineOperation("op-malformed", "machine-1", unboundedv1alpha3.OperationHostHardReboot)
+	malformed.CreationTimestamp = createdInBetween.CreationTimestamp
+	malformed.Annotations = map[string]string{
+		unboundedv1alpha3.MachineOperationReleasedAtAnnotation: "not-a-time",
+	}
+
+	require.True(t, operationBefore(malformed, withoutB), "an unreadable released-at annotation falls back to the creation time")
+}
+
+// The operation is not terminal when Reconcile reads it, but the controller
+// that created it fails it before the engine marks it InProgress: the engine
+// must not start it and must not report an error.
+func TestLongRunningOperationSkippedWhenItFinishedBeforeMarkingInProgress(t *testing.T) {
+	t.Parallel()
+
+	message := "NotPickedUp: no provider started the operation within the pickup timeout"
+	machine, op, credential := newResumableTestObjects("machine-1", "op-1")
+	provider := &recordingLongRunningProvider{}
+	c := fake.NewClientBuilder().WithScheme(newOperationTestScheme(t)).WithObjects(machine, op, credential).WithStatusSubresource(op).
+		WithInterceptorFuncs(finishedOperationInterceptor(op.Name, message)).Build()
+	reconciler := newResumableTestReconciler(c, provider)
+
+	reconcileOperation(t, reconciler, op.Name)
+
+	require.Zero(t, provider.beginCalls)
+	require.Empty(t, provider.pollCalls)
+
+	var updated unboundedv1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &updated))
+	require.Equal(t, unboundedv1alpha3.OperationPhaseFailed, updated.Status.Phase)
+	require.Equal(t, message, updated.Status.Message)
+	require.Len(t, updated.Status.Targets, 1)
+	require.Nil(t, updated.Status.Targets[0].ProviderOperation)
+}
+
+// A held operation is not started, so it never makes a newer operation on
+// the same Machine wait for it, and it is not started itself.
+func TestHeldOperationDoesNotDelayNewerOperation(t *testing.T) {
+	t.Parallel()
+
+	machine, older, credential := newResumableTestObjects("machine-1", "op-a")
+	older.CreationTimestamp = metav1.NewTime(fixedOperationNow().Add(-time.Minute))
+	older.Spec.Suspend = true
+	newer := newMachineOperation("op-b", machine.Name, unboundedv1alpha3.OperationHostHardReboot)
+	newer.CreationTimestamp = fixedOperationNow()
+	provider := &recordingLongRunningProvider{beginResults: []publicmachineops.BeginResult{{
+		Operation: publicmachineops.ProviderOperation{OperationID: "provider-op-1"},
+	}}}
+	c := fake.NewClientBuilder().WithScheme(newOperationTestScheme(t)).WithObjects(machine, older, newer, credential).WithStatusSubresource(older, newer).Build()
+	reconciler := newResumableTestReconciler(c, provider)
+
+	reconcileOperation(t, reconciler, newer.Name)
+
+	var updated unboundedv1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: newer.Name}, &updated))
+	require.Equal(t, unboundedv1alpha3.OperationPhaseInProgress, updated.Status.Phase)
+	require.NotContains(t, updated.Status.Message, "waiting for older host operation")
+	require.Len(t, updated.Status.Targets, 1)
+	require.Equal(t, unboundedv1alpha3.OperationStageWaitingProvider, updated.Status.Targets[0].Stage)
+	require.Equal(t, 1, provider.beginCalls)
+
+	var held unboundedv1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: older.Name}, &held))
+	require.Equal(t, unboundedv1alpha3.MachineOperationStatus{}, held.Status)
+}
+
 func TestMixedOperationStrategiesSerializeConflicts(t *testing.T) {
 	t.Parallel()
 
@@ -896,4 +1039,155 @@ func TestHostOperationDoesNotWaitForAllocationOperation(t *testing.T) {
 			require.Zero(t, allocation.planCalls)
 		})
 	}
+}
+
+// When the API server supports the spec.machineRef field selector, the engine
+// lists only the machine's operations and considers only what is returned.
+func TestListOperationsForMachineUsesFieldSelector(t *testing.T) {
+	t.Parallel()
+
+	machineOps := []client.Object{
+		newMachineOperation("op-machine-1-a", "machine-1", unboundedv1alpha3.OperationHostHardReboot),
+		newMachineOperation("op-machine-1-b", "machine-1", unboundedv1alpha3.OperationHostHardReboot),
+		newMachineOperation("op-other-machine", "other-machine", unboundedv1alpha3.OperationHostHardReboot),
+	}
+	selectors := []string{}
+	c := fake.NewClientBuilder().
+		WithScheme(newOperationTestScheme(t)).
+		WithIndex(&unboundedv1alpha3.MachineOperation{}, unboundedv1alpha3.MachineOperationMachineRefField, machineRefIndexer).
+		WithObjects(machineOps...).
+		WithInterceptorFuncs(interceptor.Funcs{
+			List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+				var options client.ListOptions
+				for _, opt := range opts {
+					opt.ApplyToList(&options)
+				}
+
+				if options.FieldSelector != nil {
+					selectors = append(selectors, options.FieldSelector.String())
+				}
+
+				return c.List(ctx, list, opts...)
+			},
+		}).
+		Build()
+	reconciler := &MachineOperationReconciler{Client: c}
+
+	operations, err := reconciler.listOperationsForMachine(context.Background(), "machine-1")
+	require.NoError(t, err)
+	require.ElementsMatch(t, []string{"op-machine-1-a", "op-machine-1-b"}, operationNames(operations))
+	require.Equal(t, []string{"spec.machineRef=machine-1"}, selectors)
+}
+
+// An API server that rejects the spec.machineRef field selector gets an
+// unfiltered list, filtered in memory; the selector is never tried again, so
+// the cost stays proportional to the machine count instead of the fleet.
+func TestListOperationsForMachineFallsBackWhenSelectorIsRejected(t *testing.T) {
+	t.Parallel()
+
+	machine1 := newMachineOperation("op-machine-1", "machine-1", unboundedv1alpha3.OperationHostHardReboot)
+	other := newMachineOperation("op-other-machine", "other-machine", unboundedv1alpha3.OperationHostHardReboot)
+	useSelector := []bool{}
+	c := fake.NewClientBuilder().
+		WithScheme(newOperationTestScheme(t)).
+		WithObjects(machine1, other).
+		WithInterceptorFuncs(interceptor.Funcs{
+			List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+				var options client.ListOptions
+				for _, opt := range opts {
+					opt.ApplyToList(&options)
+				}
+
+				useSelector = append(useSelector, options.FieldSelector != nil)
+
+				if options.FieldSelector != nil {
+					return apierrors.NewBadRequest("field label not supported: spec.machineRef")
+				}
+
+				return c.List(ctx, list, opts...)
+			},
+		}).
+		Build()
+	reconciler := &MachineOperationReconciler{Client: c}
+
+	operations, err := reconciler.listOperationsForMachine(context.Background(), "machine-1")
+	require.NoError(t, err)
+	require.Equal(t, []string{"op-machine-1"}, operationNames(operations))
+	require.Equal(t, []bool{true, false}, useSelector, "the selector list is rejected and the fallback lists everything")
+
+	// The fallback latches: the selector is not tried again.
+	operations, err = reconciler.listOperationsForMachine(context.Background(), "machine-1")
+	require.NoError(t, err)
+	require.Equal(t, []string{"op-machine-1"}, operationNames(operations))
+	require.Equal(t, []bool{true, false, false}, useSelector)
+}
+
+// An error that is not a selector rejection is returned as is: the fallback is
+// not used and the selector is tried again on the next list.
+func TestListOperationsForMachineReturnsOtherErrors(t *testing.T) {
+	machineOperations := schema.GroupResource{Group: unboundedv1alpha3.GroupVersion.Group, Resource: "machineoperations"}
+
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{name: "forbidden", err: apierrors.NewForbidden(machineOperations, "machine-1", errors.New("list MachineOperations is forbidden"))},
+		{name: "generic", err: errors.New("connection reset")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			machine1 := newMachineOperation("op-machine-1", "machine-1", unboundedv1alpha3.OperationHostHardReboot)
+			other := newMachineOperation("op-other-machine", "other-machine", unboundedv1alpha3.OperationHostHardReboot)
+			useSelector := []bool{}
+			c := fake.NewClientBuilder().
+				WithScheme(newOperationTestScheme(t)).
+				WithObjects(machine1, other).
+				WithInterceptorFuncs(interceptor.Funcs{
+					List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+						var options client.ListOptions
+						for _, opt := range opts {
+							opt.ApplyToList(&options)
+						}
+
+						useSelector = append(useSelector, options.FieldSelector != nil)
+
+						if options.FieldSelector != nil {
+							return tc.err
+						}
+
+						return c.List(ctx, list, opts...)
+					},
+				}).
+				Build()
+			reconciler := &MachineOperationReconciler{Client: c}
+
+			operations, err := reconciler.listOperationsForMachine(context.Background(), "machine-1")
+			require.Error(t, err)
+			require.Empty(t, operations)
+			require.Equal(t, []bool{true}, useSelector, "the error is returned and the fallback is not used")
+
+			_, err = reconciler.listOperationsForMachine(context.Background(), "machine-1")
+			require.Error(t, err)
+			require.Equal(t, []bool{true, true}, useSelector, "the selector is tried again")
+		})
+	}
+}
+
+func machineRefIndexer(obj client.Object) []string {
+	op, ok := obj.(*unboundedv1alpha3.MachineOperation)
+	if !ok || op.Spec.MachineRef == "" {
+		return nil
+	}
+
+	return []string{op.Spec.MachineRef}
+}
+
+func operationNames(operations []unboundedv1alpha3.MachineOperation) []string {
+	names := make([]string, 0, len(operations))
+	for _, operation := range operations {
+		names = append(names, operation.Name)
+	}
+
+	return names
 }

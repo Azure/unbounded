@@ -149,12 +149,8 @@ func (r *Reconciler) canReleaseMediaFinalizer(ctx context.Context, op *v1alpha3.
 		return false, nil
 	}
 
-	// Before BootMedia is saved, targets have no site. Use the selector or
-	// fresh Machine labels. Missing Machines do not prove ownership.
-	if op.Spec.MachineSelector != nil {
-		return r.validateSelectorScope(op.Spec.MachineSelector) == nil, nil
-	}
-
+	// Before BootMedia is saved, targets have no site. Use fresh Machine
+	// labels. Missing Machines do not prove ownership.
 	names := []string{op.Spec.MachineRef}
 	for _, target := range op.Status.Targets {
 		names = append(names, target.MachineRef)

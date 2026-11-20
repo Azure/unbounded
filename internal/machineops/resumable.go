@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/util/retry"
@@ -49,6 +50,10 @@ func (r *MachineOperationReconciler) reconcileResumableOperation(
 
 	message := fmt.Sprintf("executing %s via %s", op.Spec.OperationKind, providerMatch.provider.Name())
 	if err := r.ensureOperationInProgress(ctx, client.ObjectKey{Name: op.Name}, op, message); err != nil {
+		if errors.Is(err, errOperationFinished) {
+			return ctrl.Result{}, nil
+		}
+
 		return ctrl.Result{}, err
 	}
 
@@ -412,14 +417,20 @@ func (r *MachineOperationReconciler) olderConflictingOperation(
 		return "", err
 	}
 
-	var operations unboundedv1alpha3.MachineOperationList
-	if err := r.List(ctx, &operations); err != nil {
-		return "", fmt.Errorf("list MachineOperations: %w", err)
+	operations, err := r.listOperationsForMachine(ctx, op.Spec.MachineRef)
+	if err != nil {
+		return "", err
 	}
 
 	var oldest *unboundedv1alpha3.MachineOperation
 
-	for _, candidate := range operations.Items {
+	for _, candidate := range operations {
+		// A held operation is not started, so it never makes another
+		// operation on the same Machine wait for it.
+		if candidate.IsHeld() {
+			continue
+		}
+
 		if candidate.Name == op.Name || candidate.Status.IsTerminal() || !isHostOperation(candidate.Spec.OperationKind) {
 			continue
 		}
@@ -445,9 +456,58 @@ func (r *MachineOperationReconciler) olderConflictingOperation(
 	return "", nil
 }
 
+// listOperationsForMachine lists the MachineOperations that name one Machine.
+// This runs for every host operation, and a selector operation makes one
+// operation per machine, so listing them all each time would cost the square
+// of the fleet. spec.machineRef is a selectable field: the API server
+// returns only this machine's operations. An API server or CRD from before
+// that rejects the selector; then, and from then on, everything is listed
+// and filtered here.
+func (r *MachineOperationReconciler) listOperationsForMachine(ctx context.Context, machineName string) ([]unboundedv1alpha3.MachineOperation, error) {
+	var operations unboundedv1alpha3.MachineOperationList
+
+	if !r.machineRefNotSelectable.Load() {
+		err := r.List(ctx, &operations, client.MatchingFields{unboundedv1alpha3.MachineOperationMachineRefField: machineName})
+		if err == nil {
+			return operations.Items, nil
+		}
+
+		if !apierrors.IsBadRequest(err) && !isMissingFieldIndex(err) {
+			return nil, fmt.Errorf("list MachineOperations for Machine %s: %w", machineName, err)
+		}
+
+		r.machineRefNotSelectable.Store(true)
+		log.FromContext(ctx).Info("the API server does not support selecting MachineOperations by spec.machineRef; listing all of them for every host operation, which does not scale")
+	}
+
+	if err := r.List(ctx, &operations); err != nil {
+		return nil, fmt.Errorf("list MachineOperations: %w", err)
+	}
+
+	filtered := operations.Items[:0]
+
+	for _, operation := range operations.Items {
+		if operation.Spec.MachineRef == machineName {
+			filtered = append(filtered, operation)
+		}
+	}
+
+	return filtered, nil
+}
+
+// isMissingFieldIndex reports the error a cache-backed or in-memory client
+// returns for a field selector it has no index for. Such a client holds
+// every MachineOperation already, so filtering here costs no API call.
+func isMissingFieldIndex(err error) bool {
+	return strings.Contains(err.Error(), "no index with name") || strings.Contains(err.Error(), "Index with name")
+}
+
 func operationBefore(a, b *unboundedv1alpha3.MachineOperation) bool {
-	if !a.CreationTimestamp.Equal(&b.CreationTimestamp) {
-		return a.CreationTimestamp.Before(&b.CreationTimestamp)
+	// An operation that was held for its turn in a rollout joins the queue
+	// when it is released, so it waits for one that started in the meantime.
+	aQueued, bQueued := a.QueueTime(), b.QueueTime()
+	if !aQueued.Equal(&bQueued) {
+		return aQueued.Before(&bQueued)
 	}
 
 	return a.Name < b.Name

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -47,6 +48,11 @@ type Provider = publicmachineops.Provider
 // externally controlled machines.
 type MachineOperationReconciler struct {
 	client.Client
+
+	// machineRefNotSelectable is set once the API server has rejected the
+	// spec.machineRef field selector. See listOperationsForMachine.
+	machineRefNotSelectable atomic.Bool
+
 	RESTMapper                  apimeta.RESTMapper
 	Providers                   []*Provider
 	SiteName                    string
@@ -96,16 +102,28 @@ func (r *MachineOperationReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, nil
 	}
 
+	// A selector operation is a parent: the fan-out controller resolves it
+	// into one machineRef operation per Machine and owns its status and its
+	// TTL. This controller only executes the machineRef operations.
+	if op.Spec.IsSelectorOperation() {
+		logger.V(1).Info("ignoring selector operation: the fan-out controller creates a machineRef operation per Machine", "operation", op.Name)
+		return ctrl.Result{}, nil
+	}
+
+	// A held machineRef operation is not started: no executor starts it,
+	// writes its status, adds a finalizer or serves boot media while
+	// spec.suspend is set. The release changes the spec, which bumps the
+	// generation, so the update predicate re-enqueues the operation.
+	if op.IsHeld() {
+		logger.V(1).Info("ignoring held operation: it has not started and spec.suspend is set", "operation", op.Name)
+		return ctrl.Result{}, nil
+	}
+
 	if op.Status.IsTerminal() {
 		return r.reconcileTerminal(ctx, &op)
 	}
 
 	if op.Spec.MachineRef == "" {
-		if op.Spec.MachineSelector != nil {
-			logger.V(1).Info("selector-based operation not handled by external power controller", "operation", op.Name)
-			return ctrl.Result{}, nil
-		}
-
 		return r.failOperation(ctx, &op, "InvalidSpec", "spec.machineRef is required")
 	}
 
@@ -217,6 +235,10 @@ func (r *MachineOperationReconciler) reconcileSupportedOperation(
 
 	message := fmt.Sprintf("executing %s via %s", op.Spec.OperationKind, providerMatch.provider.Name())
 	if err := r.ensureOperationInProgress(ctx, opKey, op, message); err != nil {
+		if errors.Is(err, errOperationFinished) {
+			return ctrl.Result{}, nil
+		}
+
 		return ctrl.Result{}, err
 	}
 
@@ -530,6 +552,10 @@ func (r *MachineOperationReconciler) reconcileTerminal(ctx context.Context, op *
 	return ctrl.Result{}, nil
 }
 
+// errOperationFinished is returned when an operation reached a terminal phase
+// between being read and being started.
+var errOperationFinished = errors.New("machine operation is already finished")
+
 func (r *MachineOperationReconciler) markInProgress(ctx context.Context, op *unboundedv1alpha3.MachineOperation, message string) error {
 	message = statusmsg.TruncateCondition(message)
 
@@ -537,6 +563,12 @@ func (r *MachineOperationReconciler) markInProgress(ctx context.Context, op *unb
 		var latest unboundedv1alpha3.MachineOperation
 		if err := r.Get(ctx, client.ObjectKeyFromObject(op), &latest); err != nil {
 			return err
+		}
+
+		// The operation finished since it was read, for example because the
+		// controller that created it gave up waiting. It must not be started.
+		if latest.Status.IsTerminal() {
+			return errOperationFinished
 		}
 
 		now := r.now()
