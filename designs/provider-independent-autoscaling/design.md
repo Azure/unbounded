@@ -840,9 +840,11 @@ For immediate operations, use `WithImmediateOperation(kind, execute)`.
 `ReplaySafe()` is an explicit claim that repeating that immediate operation
 after interruption is safe; it must not be added simply to enable retries.
 `RequiresReplaceUserData()` requests shared bootstrap rendering for
-HostReplace. Providers using an existing provider-owned Machine CR can
+HostReplace; a long-running operation receives it in Begin and in every Poll,
+because a provider that deletes the old host first creates the new one from
+Poll. Providers using an existing provider-owned Machine CR can
 optionally declare its GroupKind with `WithProviderMachineKind`
-(`pkg/machineops/provider.go:47-68`, `:140-209`).
+(`pkg/machineops/provider.go:47-68`, `:140-220`).
 
 #### Requests and results across the boundary
 
