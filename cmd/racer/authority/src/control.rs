@@ -100,7 +100,9 @@ impl ReportState {
             // Producers can race inventory changes. Never let one invalid
             // progress sample retain the entire previous residency snapshot.
             // The codec stays strict; publication discards samples separately.
-            fills.retain(FillProgress::valid);
+            // Non-pool fills can be scanned with no owned pages. They must not
+            // spend slots reserved for fills this node actually participates in.
+            fills.retain(|fill| fill.valid() && (fill.owned_pages != 0 || fill.owned_bytes != 0));
             fills.sort_by(|a, b| {
                 (&a.fill, a.generation, a.membership, &a.digest).cmp(&(
                     &b.fill,
@@ -1086,6 +1088,25 @@ mod tests {
                 .fills
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn zero_ownership_samples_do_not_spend_report_slots() {
+        let outer = Outer::new();
+        let mut fills = (0..20)
+            .map(|i| FillProgress {
+                owned_pages: 0,
+                owned_bytes: 0,
+                pinned_pages: 0,
+                pinned_bytes: 0,
+                ..progress(i)
+            })
+            .collect::<Vec<_>>();
+        fills.push(progress(20));
+        outer.set_fill_progress(fills, Some(1000)).unwrap();
+        let report = rails::parse_fills(&outer.fills_string().unwrap()).unwrap();
+        assert_eq!(report.fills, vec![progress(20)]);
+        assert_eq!(report.pinnable_bytes, Some(1000));
     }
 
     #[test]

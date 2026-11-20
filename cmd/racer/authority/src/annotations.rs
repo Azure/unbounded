@@ -75,8 +75,10 @@ pub const REPORT: &str = "racer.unbounded-cloud.io/report";
 /// Pod itself. It is separate from [`REPORT`] so an older primary, which
 /// rejects fields it does not know, keeps reading the membership report
 /// unchanged while ignoring this annotation.
-/// Admission reserves at most `limits::MAX_REPORT_FILLS` slots per node across
-/// all caches in fill UID order; excess fills are rejected as `TooManyFills`.
+/// Admission reserves at most `limits::MAX_REPORT_FILLS` slots on each cache
+/// pool member across all caches in fill UID order. A fill that cannot fit on
+/// every member is rejected as `TooManyFills`. Zero-ownership samples do not
+/// consume annotation entries.
 pub const FILLS: &str = "racer.unbounded-cloud.io/fills";
 
 /// Node annotation set by an administrator. Overrides the Pod report.

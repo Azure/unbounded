@@ -481,7 +481,11 @@ async fn list_fills(shared: Rc<Shared>) {
                 }
                 // Installing a manifest recomputes this view's admission.
                 // Reapply the node-wide report budget before exposing it.
-                enforce_report_limit(&mut fills, &shared.fills_caches.borrow());
+                enforce_report_limit(
+                    &Admission::read(&shared),
+                    &mut fills,
+                    &shared.fills_caches.borrow(),
+                );
             }
         }
         rt::sleep(TICK).await;
@@ -505,25 +509,26 @@ async fn admit_fills(shared: Rc<Shared>) {
 struct Admission {
     page_size: u64,
     membership: Option<u64>,
-    pool_sizes: BTreeMap<racer_wire::control::CacheId, usize>,
+    pool_members: BTreeMap<racer_wire::control::CacheId, Arc<[u32]>>,
 }
 
 impl Admission {
     /// Read the page size and publication admission is computed against.
     fn read(shared: &Shared) -> Self {
-        let (page_size, membership, pool_sizes) = {
+        let (page_size, membership, pool_members) = {
             let serving = shared.serving.borrow();
             match serving.image.as_ref() {
                 Some(image) => {
                     let publication = &image.publication;
                     let mut pools = BTreeMap::new();
                     for pool in &publication.pools {
-                        let members = pool
+                        let members: Arc<[u32]> = pool
                             .members
-                            .as_ref()
-                            .map_or(publication.members.len(), Vec::len);
+                            .clone()
+                            .unwrap_or_else(|| (0..publication.members.len() as u32).collect())
+                            .into();
                         for cache in &pool.caches {
-                            pools.insert(cache.clone(), members);
+                            pools.insert(cache.clone(), members.clone());
                         }
                     }
                     (
@@ -538,7 +543,7 @@ impl Admission {
         Self {
             page_size,
             membership,
-            pool_sizes,
+            pool_members,
         }
     }
 
@@ -561,10 +566,10 @@ impl Admission {
                 view.accepted = true;
                 view.message.clear();
                 view.available_nodes = self
-                    .pool_sizes
+                    .pool_members
                     .get(&racer_wire::control::CacheId(view.cache_uid.clone()))
                     .map_or(view.replicas, |members| {
-                        u8::try_from(*members).unwrap_or(u8::MAX)
+                        u8::try_from(members.len()).unwrap_or(u8::MAX)
                     });
             }
             FillCache::CacheNotFound => {
@@ -615,30 +620,44 @@ pub fn recompute(shared: &Shared) {
     let admission = Admission::read(shared);
     let caches = shared.fills_caches.borrow();
     let mut fills = shared.fills.borrow_mut();
-    for view in fills.values_mut() {
-        admission.admit(view, &caches);
-    }
-    enforce_report_limit(&mut fills, &caches);
+    enforce_report_limit(&admission, &mut fills, &caches);
 }
 
-/// Reserve report slots in UID order across all caches, not independently per
-/// cache. Every usable fill reserves a slot even while its listing is pending,
-/// so listing completion order cannot change which fills are admitted.
+/// Reserve slots in UID order on every node in the fill's published cache pool.
+/// Pending listings reserve slots too. A fill is rejected if any participating
+/// node is full, without spending slots on its other nodes. Disjoint pools do
+/// not compete, and structurally rejected fills do not spend report slots.
 fn enforce_report_limit(
+    admission: &Admission,
     fills: &mut BTreeMap<String, FillView>,
     caches: &BTreeMap<String, CacheInfo>,
 ) {
-    let mut slots = 0;
+    let mut slots = BTreeMap::<u32, usize>::new();
     for view in fills.values_mut() {
-        if matches!(
-            catalog::fill_cache_named(&view.cache_name, caches),
-            FillCache::Usable { .. }
-        ) {
-            slots += 1;
-            if slots > crate::limits::MAX_REPORT_FILLS {
-                view.accepted = false;
-                view.message = "TooManyFills".into();
-            }
+        // Recompute previous TooManyFills decisions as well, so freed slots
+        // and newly rejected manifests are accounted for in the same pass.
+        admission.admit(view, caches);
+        if !view.accepted {
+            continue;
+        }
+        let Some(members) = admission
+            .pool_members
+            .get(&racer_wire::control::CacheId(view.cache_uid.clone()))
+        else {
+            // Until the cache is published there is no membership plan to pin
+            // or report. Admission will reserve slots when a pool appears.
+            continue;
+        };
+        if members
+            .iter()
+            .any(|node| slots.get(node).copied().unwrap_or(0) >= crate::limits::MAX_REPORT_FILLS)
+        {
+            view.accepted = false;
+            view.message = "TooManyFills".into();
+            continue;
+        }
+        for node in members.iter() {
+            *slots.entry(*node).or_default() += 1;
         }
     }
 }
@@ -674,6 +693,76 @@ fn install_manifest(
 mod tests {
     use super::*;
     use crate::rules::catalog::CacheInfo;
+
+    fn add_cache(shared: &Shared, i: usize) {
+        let uid = format!("22222222-2222-4222-8222-{i:012}");
+        shared.fills_caches.borrow_mut().insert(
+            uid.clone(),
+            CacheInfo::from_json(&serde_json::json!({
+                "metadata": {"uid": uid, "name": format!("models-{i}")},
+                "spec": {"origin": {"azure": {"containerURL":
+                    "https://acct.blob.core.windows.net/models"}}},
+            })),
+        );
+    }
+
+    fn add_pending_fill(shared: &Shared, i: usize, cache: usize) -> String {
+        let mut value = fill_json("");
+        let uid = format!("11111111-1111-4111-8111-{i:012}");
+        value["metadata"]["uid"] = serde_json::json!(uid);
+        value["spec"]["cacheName"] = serde_json::json!(format!("models-{cache}"));
+        let view = FillView::from_json(&value).unwrap();
+        shared.fills.borrow_mut().insert(uid.clone(), view);
+        uid
+    }
+
+    fn install_pools(shared: &Shared, nodes: usize, pools: Vec<(Option<Vec<u32>>, Vec<usize>)>) {
+        use crate::rules::publication::Image;
+        use racer_wire::control as wire;
+        let caches = shared
+            .fills_caches
+            .borrow()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let publication = wire::Publication {
+            schema_version: wire::SCHEMA_VERSION,
+            cluster: wire::ClusterId("33333333-3333-4333-8333-333333333333".into()),
+            sequence: wire::PublicationSequence(1),
+            membership_version: wire::MembershipVersion(1),
+            members: (0..nodes)
+                .map(|i| wire::Member {
+                    node: wire::NodeId(format!("44444444-4444-4444-8444-{i:012}")),
+                    shares: std::num::NonZeroU32::MIN,
+                    peer_endpoint: format!("192.0.2.{}:8082", i + 1),
+                    rails: vec![],
+                    site: String::new(),
+                })
+                .collect(),
+            caches: catalog::build(&caches).unwrap().caches,
+            pools: pools
+                .into_iter()
+                .enumerate()
+                .map(|(i, (members, caches))| wire::Pool {
+                    id: if members.is_none() {
+                        wire::PoolId::default_pool()
+                    } else {
+                        wire::PoolId(format!("sel-{i:032x}"))
+                    },
+                    rank: if members.is_none() { 0 } else { 1 << 32 },
+                    members,
+                    caches: caches
+                        .into_iter()
+                        .map(|i| wire::CacheId(format!("22222222-2222-4222-8222-{i:012}")))
+                        .collect(),
+                })
+                .collect(),
+            page_size: shared.config.page_size,
+        };
+        let encoded = wire::encode_publication(&publication).unwrap();
+        shared.serving.borrow_mut().image =
+            Some(Image::new(Default::default(), publication, encoded, None));
+    }
 
     #[test]
     fn replacing_a_manifest_recomputes_admission_before_it_is_visible() {
@@ -786,6 +875,7 @@ mod tests {
                     })),
                 );
             }
+            install_pools(&shared, 1, vec![(None, vec![0, 1])]);
             // Reverse insertion order and alternate caches: the bound is on
             // this node's entire inventory, with stable UID ordering.
             for i in (0..20).rev() {
@@ -832,12 +922,118 @@ mod tests {
                     cache_uid,
                     rt::now(),
                 );
-                enforce_report_limit(&mut fills, &shared.fills_caches.borrow());
+                enforce_report_limit(
+                    &Admission::read(&shared),
+                    &mut fills,
+                    &shared.fills_caches.borrow(),
+                );
             }
             check();
             shared.fills.borrow_mut().pop_first();
             recompute(&shared);
             check();
+        });
+    }
+
+    #[test]
+    fn disjoint_pools_do_not_compete_for_report_slots() {
+        crate::kube::fake::run(|_api, kube| async move {
+            let shared = crate::shared::tests::shared(kube);
+            for i in (0..17).rev() {
+                add_cache(&shared, i);
+                add_pending_fill(&shared, i, i);
+            }
+            install_pools(
+                &shared,
+                17,
+                (0..17).map(|i| (Some(vec![i as u32]), vec![i])).collect(),
+            );
+            recompute(&shared);
+            let fills = shared.fills.borrow();
+            assert_eq!(fills.len(), 17);
+            assert!(
+                fills
+                    .values()
+                    .all(|view| view.accepted && view.manifest.is_none())
+            );
+            assert!(fills.values().all(|view| view.available_nodes == 1));
+        });
+    }
+
+    #[test]
+    fn overlapping_pools_share_slots_and_rejections_do_not_spend_them() {
+        crate::kube::fake::run(|_api, kube| async move {
+            let shared = crate::shared::tests::shared(kube);
+            for i in 0..3 {
+                add_cache(&shared, i);
+            }
+            install_pools(
+                &shared,
+                2,
+                vec![
+                    (Some(vec![0]), vec![0]),
+                    (Some(vec![1]), vec![1]),
+                    (Some(vec![0, 1]), vec![2]),
+                ],
+            );
+            // Pending listings reserve slots: node 1 has 15, node 0 has 16.
+            for i in (0..31).rev() {
+                add_pending_fill(&shared, i, usize::from(i < 15));
+            }
+            let overlap = add_pending_fill(&shared, 31, 2);
+            let last = add_pending_fill(&shared, 32, 1);
+            recompute(&shared);
+            {
+                let fills = shared.fills.borrow();
+                assert_eq!(fills.values().filter(|view| view.accepted).count(), 32);
+                assert_eq!(fills[&overlap].message, "TooManyFills");
+                assert!(!fills[&overlap].accepted);
+                // Rejecting the overlap at node 0 must not consume node 1's
+                // final slot. A per-cache limit would admit all 33 fills.
+                assert!(fills[&last].accepted);
+            }
+            // A structurally rejected earlier fill frees node 0's slot. The
+            // overlap is admitted, and node 1's later fill is now rejected.
+            let rejected = format!("11111111-1111-4111-8111-{:012}", 15);
+            shared.fills.borrow_mut().get_mut(&rejected).unwrap().error =
+                Some("TooManyObjects".into());
+            recompute(&shared);
+            let fills = shared.fills.borrow();
+            assert_eq!(fills[&rejected].message, "TooManyObjects");
+            assert!(fills[&overlap].accepted);
+            assert_eq!(fills[&last].message, "TooManyFills");
+            assert!(!fills[&last].accepted);
+        });
+    }
+
+    #[test]
+    fn unpublished_pools_do_not_reserve_report_slots() {
+        crate::kube::fake::run(|_api, kube| async move {
+            let shared = crate::shared::tests::shared(kube);
+            add_cache(&shared, 0);
+            for i in 0..17 {
+                add_pending_fill(&shared, i, 0);
+            }
+            recompute(&shared);
+            assert!(
+                shared
+                    .fills
+                    .borrow()
+                    .values()
+                    .all(|view| view.accepted && view.membership.is_none())
+            );
+            // Once publication supplies an applicable node, slots are bounded.
+            install_pools(&shared, 1, vec![(None, vec![0])]);
+            recompute(&shared);
+            assert_eq!(
+                shared
+                    .fills
+                    .borrow()
+                    .values()
+                    .filter(|view| view.accepted)
+                    .count(),
+                16
+            );
         });
     }
 
