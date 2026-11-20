@@ -155,7 +155,7 @@ Per-node layout:
 
 The agent exposes two distinct wire surfaces. They are versioned independently.
 
-**Coordination RPCs (libp2p stream).** `pull_intent_query` and `please_pull` are carried as length-prefixed protobuf messages over libp2p streams. Single protocol ID `/gantry/coord/1.1.0`; one stream per request/response pair, closed after the response is written. Schema lives in `cmd/gantry/internal/proto/coord/v1/coord.proto`. Forward-compat policy: additive changes bump the minor, and breaking changes bump the major (`/gantry/coord/2.0.0`). gRPC is intentionally avoided  -  `go-msgio` length-delimited framing is sufficient and avoids HTTP-over-libp2p complexity. The message envelope uses `oneof` so a single protocol handler dispatches both RPC kinds:
+**Coordination RPCs (libp2p stream).** `pull_intent_query` and `please_pull` are carried as length-prefixed protobuf messages over libp2p streams. Single protocol ID `/gantry/coord/1.1.0`; one stream per request/response pair, closed after the response is written. Schema lives in `internal/gantry/proto/coord/v1/coord.proto`. Forward-compat policy: additive changes bump the minor, and breaking changes bump the major (`/gantry/coord/2.0.0`). gRPC is intentionally avoided  -  `go-msgio` length-delimited framing is sufficient and avoids HTTP-over-libp2p complexity. The message envelope uses `oneof` so a single protocol handler dispatches both RPC kinds:
 
 ```proto
 syntax = "proto3";

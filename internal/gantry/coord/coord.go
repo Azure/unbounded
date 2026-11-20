@@ -47,11 +47,11 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	coordv1 "github.com/Azure/unbounded/cmd/gantry/internal/proto/coord/v1"
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/inflight"
 	"github.com/Azure/unbounded/internal/gantry/oci"
+	coordv1 "github.com/Azure/unbounded/internal/gantry/proto/coord/v1"
 	"github.com/Azure/unbounded/internal/gantry/registryauth"
 )
 

@@ -16,8 +16,8 @@ import (
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
 
-	"github.com/Azure/unbounded/cmd/gantry/internal/coord"
 	"github.com/Azure/unbounded/internal/gantry/chaircall"
+	"github.com/Azure/unbounded/internal/gantry/coord"
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/registryauth"
