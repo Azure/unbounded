@@ -8,192 +8,104 @@ import (
 	"time"
 )
 
-// testMonitor creates a linkStatsMonitor with a controllable clock and
-// pre-populated previous state so tests can call collectDirect without
-// shelling out to ip(8).
-func testMonitor(now time.Time) *linkStatsMonitor {
-	m := newLinkStatsMonitor(30 * time.Second)
-	m.nowFunc = func() time.Time { return now }
-
-	return m
-}
-
-// collectDirect injects counters directly and runs the warning-expiry logic
-// that normally lives in collect(), avoiding the need for real network
-// namespaces.
-func collectDirect(m *linkStatsMonitor, current map[string]linkCounters) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	now := m.nowFunc()
-
-	for key, cur := range current {
-		prev, ok := m.previous[key]
-		if !ok {
-			continue
-		}
-
-		if deltas := detectIncrements(prev, cur, m.rateThreshold); len(deltas) > 0 {
-			m.lastWarning[key] = warningEntry{
-				message:  "interface " + key + ": incremented",
-				lastSeen: now,
-			}
-		}
-	}
-
-	for key := range m.lastWarning {
-		if _, ok := current[key]; !ok {
-			delete(m.lastWarning, key)
-		}
-	}
-
-	var warnings []string
-
-	for key, entry := range m.lastWarning {
-		if now.Sub(entry.lastSeen) >= m.warningTimeout {
-			delete(m.lastWarning, key)
-			continue
-		}
-
-		warnings = append(warnings, entry.message)
-	}
-
-	m.previous = current
-	m.warnings = warnings
-}
-
 func TestWarningAppearsOnIncrement(t *testing.T) {
-	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	m := testMonitor(now)
+	m := newLinkStatsMonitor(30 * time.Second)
 
 	// Baseline: no previous, so no warnings.
-	baseline := map[string]linkCounters{
-		"/wg51820": {TxErrors: 100},
-	}
-	collectDirect(m, baseline)
+	m.update(map[string]linkCounters{"/wg51820": {TxErrors: 100}})
 
 	if len(m.GetWarnings()) != 0 {
 		t.Fatal("expected no warnings on first collection")
 	}
 
-	// Increment tx_errors.
-	incremented := map[string]linkCounters{
-		"/wg51820": {TxErrors: 200},
-	}
-	collectDirect(m, incremented)
+	m.update(map[string]linkCounters{"/wg51820": {TxErrors: 200}})
 
-	if len(m.GetWarnings()) != 1 {
-		t.Fatalf("expected 1 warning, got %d", len(m.GetWarnings()))
+	got := m.GetWarnings()
+	if len(got) != 1 || got[0] != "interface /wg51820: tx_errors +100" {
+		t.Fatalf("expected one tx_errors warning, got %v", got)
 	}
 }
 
-func TestWarningPersistsWhenCounterStopsIncrementing(t *testing.T) {
-	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	m := testMonitor(now)
+// TestWarningClearsWhenCounterGoesFlat reproduces the incident where
+// "interface /wg51821: tx_errors +12" kept being reported every interval
+// after the tunnel recovered although the raw counter was flat.
+func TestWarningClearsWhenCounterGoesFlat(t *testing.T) {
+	m := newLinkStatsMonitor(30 * time.Second)
 
-	baseline := map[string]linkCounters{"/wg51820": {TxErrors: 100}}
-	collectDirect(m, baseline)
+	m.update(map[string]linkCounters{"/wg51821": {TxErrors: 100, TxDropped: 7}})
 
-	// Increment once.
-	now = now.Add(30 * time.Second)
-	m.nowFunc = func() time.Time { return now }
-	collectDirect(m, map[string]linkCounters{"/wg51820": {TxErrors: 200}})
+	// Counter increases once.
+	m.update(map[string]linkCounters{"/wg51821": {TxErrors: 112, TxDropped: 7}})
 
-	if len(m.GetWarnings()) != 1 {
-		t.Fatal("expected warning after increment")
+	if got := m.GetWarnings(); len(got) != 1 || got[0] != "interface /wg51821: tx_errors +12" {
+		t.Fatalf("expected one tx_errors +12 warning, got %v", got)
 	}
 
-	// Counters stay flat for 2 minutes -- warning should persist.
-	now = now.Add(2 * time.Minute)
-	m.nowFunc = func() time.Time { return now }
-	collectDirect(m, map[string]linkCounters{"/wg51820": {TxErrors: 200}})
+	// Counters stay flat for several intervals: nothing is reported.
+	for i := range 5 {
+		m.update(map[string]linkCounters{"/wg51821": {TxErrors: 112, TxDropped: 7}})
 
-	if len(m.GetWarnings()) != 1 {
-		t.Fatal("expected warning to persist within timeout")
-	}
-}
-
-func TestWarningClearsAfterTimeout(t *testing.T) {
-	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	m := testMonitor(now)
-
-	baseline := map[string]linkCounters{"/wg51820": {TxErrors: 100}}
-	collectDirect(m, baseline)
-
-	// Increment once.
-	now = now.Add(30 * time.Second)
-	m.nowFunc = func() time.Time { return now }
-	collectDirect(m, map[string]linkCounters{"/wg51820": {TxErrors: 200}})
-
-	if len(m.GetWarnings()) != 1 {
-		t.Fatal("expected warning after increment")
-	}
-
-	// Advance past the 5-minute timeout with no new increments.
-	now = now.Add(5 * time.Minute)
-	m.nowFunc = func() time.Time { return now }
-	collectDirect(m, map[string]linkCounters{"/wg51820": {TxErrors: 200}})
-
-	if len(m.GetWarnings()) != 0 {
-		t.Fatal("expected warning to be cleared after 5-minute timeout")
+		if got := m.GetWarnings(); len(got) != 0 {
+			t.Fatalf("interval %d: expected no warnings for flat counters, got %v", i, got)
+		}
 	}
 }
 
-func TestWarningRefreshedByNewIncrement(t *testing.T) {
-	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	m := testMonitor(now)
+func TestWarningReportsEachIntervalDelta(t *testing.T) {
+	m := newLinkStatsMonitor(30 * time.Second)
 
-	baseline := map[string]linkCounters{"/wg51820": {TxErrors: 100}}
-	collectDirect(m, baseline)
+	m.update(map[string]linkCounters{"/wg51820": {TxErrors: 100}})
+	m.update(map[string]linkCounters{"/wg51820": {TxErrors: 200}})
+	m.update(map[string]linkCounters{"/wg51820": {TxErrors: 230}})
 
-	// First increment.
-	now = now.Add(30 * time.Second)
-	m.nowFunc = func() time.Time { return now }
-	collectDirect(m, map[string]linkCounters{"/wg51820": {TxErrors: 200}})
+	if got := m.GetWarnings(); len(got) != 1 || got[0] != "interface /wg51820: tx_errors +30" {
+		t.Fatalf("expected the delta of the latest interval only, got %v", got)
+	}
+}
 
-	// 4 minutes later, another increment refreshes the timer.
-	now = now.Add(4 * time.Minute)
-	m.nowFunc = func() time.Time { return now }
-	collectDirect(m, map[string]linkCounters{"/wg51820": {TxErrors: 300}})
+func TestWarningIgnoresIncrementBelowThreshold(t *testing.T) {
+	m := newLinkStatsMonitor(30 * time.Second)
 
-	// 3 more minutes (7.5 min since first increment, 3 min since last).
-	now = now.Add(3 * time.Minute)
-	m.nowFunc = func() time.Time { return now }
-	collectDirect(m, map[string]linkCounters{"/wg51820": {TxErrors: 300}})
+	m.update(map[string]linkCounters{"/wg51820": {TxErrors: 100}})
+	m.update(map[string]linkCounters{"/wg51820": {TxErrors: 100 + defaultRateThreshold - 1}})
 
-	if len(m.GetWarnings()) != 1 {
-		t.Fatal("expected warning to still be active -- timer was refreshed")
+	if got := m.GetWarnings(); len(got) != 0 {
+		t.Fatalf("expected no warnings below threshold, got %v", got)
+	}
+}
+
+func TestWarningNotReportedOnCounterReset(t *testing.T) {
+	m := newLinkStatsMonitor(30 * time.Second)
+
+	m.update(map[string]linkCounters{"/wg51820": {TxErrors: 1000}})
+
+	// Interface recreated: counters restart from zero.
+	m.update(map[string]linkCounters{"/wg51820": {TxErrors: 3}})
+
+	if got := m.GetWarnings(); len(got) != 0 {
+		t.Fatalf("expected counter reset to be ignored, got %v", got)
 	}
 
-	// 5 more minutes since last increment -- should clear.
-	now = now.Add(2*time.Minute + 1*time.Second)
-	m.nowFunc = func() time.Time { return now }
-	collectDirect(m, map[string]linkCounters{"/wg51820": {TxErrors: 300}})
+	// The reset value becomes the new baseline.
+	m.update(map[string]linkCounters{"/wg51820": {TxErrors: 20}})
 
-	if len(m.GetWarnings()) != 0 {
-		t.Fatal("expected warning to clear after timeout from last increment")
+	if got := m.GetWarnings(); len(got) != 1 || got[0] != "interface /wg51820: tx_errors +17" {
+		t.Fatalf("expected delta from reset baseline, got %v", got)
 	}
 }
 
 func TestWarningRemovedWhenInterfaceDisappears(t *testing.T) {
-	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	m := testMonitor(now)
+	m := newLinkStatsMonitor(30 * time.Second)
 
-	baseline := map[string]linkCounters{"/wg51820": {TxErrors: 100}}
-	collectDirect(m, baseline)
-
-	now = now.Add(30 * time.Second)
-	m.nowFunc = func() time.Time { return now }
-	collectDirect(m, map[string]linkCounters{"/wg51820": {TxErrors: 200}})
+	m.update(map[string]linkCounters{"/wg51820": {TxErrors: 100}})
+	m.update(map[string]linkCounters{"/wg51820": {TxErrors: 200}})
 
 	if len(m.GetWarnings()) != 1 {
 		t.Fatal("expected warning")
 	}
 
 	// Interface disappears.
-	now = now.Add(30 * time.Second)
-	m.nowFunc = func() time.Time { return now }
-	collectDirect(m, map[string]linkCounters{})
+	m.update(map[string]linkCounters{})
 
 	if len(m.GetWarnings()) != 0 {
 		t.Fatal("expected warning to be removed when interface disappears")
@@ -225,5 +137,14 @@ func TestDetectIncrementsThreshold(t *testing.T) {
 
 	if deltas[0] != "tx_dropped +10" {
 		t.Fatalf("unexpected delta: %s", deltas[0])
+	}
+}
+
+func TestDetectIncrementsFlatAndReset(t *testing.T) {
+	prev := linkCounters{TxErrors: 10, RxDropped: 50}
+	cur := linkCounters{TxErrors: 10, RxDropped: 2}
+
+	if deltas := detectIncrements(prev, cur, 0); len(deltas) != 0 {
+		t.Fatalf("expected no deltas for flat or reset counters, got %v", deltas)
 	}
 }

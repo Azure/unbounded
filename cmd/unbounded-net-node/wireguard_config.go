@@ -7,7 +7,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
+	"slices"
 	"sort"
 
 	"k8s.io/klog/v2"
@@ -69,6 +71,40 @@ func (state *wireGuardState) removeGatewayInterfaceState(iface string) {
 	delete(state.gatewayLinkManagers, iface)
 	delete(state.gatewayWireguardManagers, iface)
 	state.clearGatewayPeerMetadataLocked(iface)
+}
+
+// repairWireGuardDrift compares the kernel configuration of every managed
+// WireGuard interface (mesh, per-gateway and assignment/transit) with the
+// configuration last applied to it and repairs what differs. It runs on the
+// reconcile path that skips configureWireGuard because the desired state did
+// not change, so kernel-side changes are not left in place until the next
+// desired-state change. The main case is an explicit peer endpoint that
+// WireGuard roamed elsewhere; endpoints learned for peers configured without
+// one are left alone.
+func repairWireGuardDrift(state *wireGuardState) error {
+	state.mu.Lock()
+
+	managers := make([]*unboundednetnetlink.WireGuardManager, 0, 1+len(state.gatewayWireguardManagers))
+	if state.wireguardManager != nil {
+		managers = append(managers, state.wireguardManager)
+	}
+
+	for _, iface := range slices.Sorted(maps.Keys(state.gatewayWireguardManagers)) {
+		if manager := state.gatewayWireguardManagers[iface]; manager != nil {
+			managers = append(managers, manager)
+		}
+	}
+	state.mu.Unlock()
+
+	var errs []error
+
+	for _, manager := range managers {
+		if _, err := manager.RepairDrift(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	return errors.Join(errs...)
 }
 
 // configureWireGuard sets up WireGuard interfaces and configures peers
@@ -164,6 +200,11 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 			if err := state.linkManager.DeleteLink(); err != nil {
 				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove unused WireGuard interface %s: %w", iface, err))
 			}
+		}
+
+		if state.wireguardManager != nil {
+			// The mesh interface is gone on purpose; stop enforcing its peers.
+			state.wireguardManager.ResetDesired()
 		}
 		// Tear down any tracked or kernel-resident gateway wg* interfaces.
 		cleanupErr = errors.Join(cleanupErr, removeUnmanagedWireGuardInterfaces(cfg, state, nil, iface))
