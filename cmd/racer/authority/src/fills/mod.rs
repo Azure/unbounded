@@ -479,6 +479,9 @@ async fn list_fills(shared: Rc<Shared>) {
                         view.next_list = Some(now + backoff);
                     }
                 }
+                // Installing a manifest recomputes this view's admission.
+                // Reapply the node-wide report budget before exposing it.
+                enforce_report_limit(&mut fills, &shared.fills_caches.borrow());
             }
         }
         rt::sleep(TICK).await;
@@ -615,6 +618,29 @@ pub fn recompute(shared: &Shared) {
     for view in fills.values_mut() {
         admission.admit(view, &caches);
     }
+    enforce_report_limit(&mut fills, &caches);
+}
+
+/// Reserve report slots in UID order across all caches, not independently per
+/// cache. Every usable fill reserves a slot even while its listing is pending,
+/// so listing completion order cannot change which fills are admitted.
+fn enforce_report_limit(
+    fills: &mut BTreeMap<String, FillView>,
+    caches: &BTreeMap<String, CacheInfo>,
+) {
+    let mut slots = 0;
+    for view in fills.values_mut() {
+        if matches!(
+            catalog::fill_cache_named(&view.cache_name, caches),
+            FillCache::Usable { .. }
+        ) {
+            slots += 1;
+            if slots > crate::limits::MAX_REPORT_FILLS {
+                view.accepted = false;
+                view.message = "TooManyFills".into();
+            }
+        }
+    }
 }
 
 /// Recompute one fill from the current cache catalog and publication.
@@ -743,6 +769,67 @@ mod tests {
                 "maxFootprint": 1_000_000_000,
             },
         })
+    }
+
+    #[test]
+    fn report_slots_bound_admission_across_caches_and_recover_after_deletion() {
+        crate::kube::fake::run(|_api, kube| async move {
+            let shared = crate::shared::tests::shared(kube);
+            for i in 0..2 {
+                let uid = format!("22222222-2222-4222-8222-{i:012}");
+                shared.fills_caches.borrow_mut().insert(
+                    uid.clone(),
+                    CacheInfo::from_json(&serde_json::json!({
+                        "metadata": {"uid": uid, "name": format!("models-{i}")},
+                        "spec": {"origin": {"azure": {"containerURL":
+                            "https://acct.blob.core.windows.net/models"}}},
+                    })),
+                );
+            }
+            // Reverse insertion order and alternate caches: the bound is on
+            // this node's entire inventory, with stable UID ordering.
+            for i in (0..20).rev() {
+                let mut value = fill_json("");
+                value["metadata"]["uid"] =
+                    serde_json::json!(format!("11111111-1111-4111-8111-{i:012}"));
+                value["spec"]["cacheName"] = serde_json::json!(format!("models-{}", i % 2));
+                let view = FillView::from_json(&value).unwrap();
+                shared.fills.borrow_mut().insert(view.uid.clone(), view);
+            }
+            recompute(&shared);
+            let check = || {
+                let fills = shared.fills.borrow();
+                assert_eq!(fills.values().filter(|v| v.accepted).count(), 16);
+                for (i, view) in fills.values().enumerate() {
+                    assert_eq!(view.accepted, i < crate::limits::MAX_REPORT_FILLS);
+                    if !view.accepted {
+                        assert_eq!(view.message, "TooManyFills");
+                    }
+                }
+            };
+            check();
+            // A successful listing must not bypass admission until the next
+            // periodic recompute.
+            {
+                let mut fills = shared.fills.borrow_mut();
+                let view = fills.last_entry().unwrap().into_mut();
+                let generation = view.generation;
+                let cache_uid = view.cache_uid.clone();
+                install_manifest(
+                    &shared,
+                    view,
+                    manifest::build("models", &[], &["".into()], 1).unwrap(),
+                    generation,
+                    cache_uid,
+                    rt::now(),
+                );
+                enforce_report_limit(&mut fills, &shared.fills_caches.borrow());
+            }
+            check();
+            shared.fills.borrow_mut().pop_first();
+            recompute(&shared);
+            check();
+        });
     }
 
     #[test]

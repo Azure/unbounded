@@ -88,9 +88,8 @@ impl ReportState {
             ),
             None => None,
         };
-        // A node may reconcile more fills than one annotation can carry. Keep a
-        // deterministic prefix and leave the rest out of the annotation; their
-        // pins stay in place, and `pinnable_bytes` already accounts for them.
+        // Admission reserves bounded report slots across all caches. Keep the
+        // encoder strict as a backstop instead of silently omitting live fills.
         let fills_encoded = if self.fills.is_empty()
             && self.pinnable_bytes.is_none()
             && self.fills_encoded.is_none()
@@ -110,7 +109,6 @@ impl ReportState {
                     &b.digest,
                 ))
             });
-            fills.truncate(rails::MAX_REPORT_FILLS);
             Some(
                 rails::encode_fills(&Fills {
                     fills,
@@ -964,6 +962,11 @@ mod tests {
             pinnable_bytes: Some(4096),
             ..Default::default()
         };
+        // An unexpected producer overrun must be explicit, not a successful
+        // report that silently strands the seventeenth admitted fill.
+        assert!(state.refresh().is_err());
+        assert!(state.fills_encoded.is_none());
+        state.fills.pop();
         state.refresh().unwrap();
         assert_eq!(
             state.report.as_deref().unwrap(),
@@ -972,7 +975,7 @@ mod tests {
         let fills = rails::parse_fills(state.fills_encoded.as_deref().unwrap()).unwrap();
         assert_eq!(fills.fills.len(), rails::MAX_REPORT_FILLS);
         let uids: Vec<&str> = fills.fills.iter().map(|f| f.fill.as_str()).collect();
-        let expected: Vec<String> = (0..rails::MAX_REPORT_FILLS)
+        let expected: Vec<String> = (1..=rails::MAX_REPORT_FILLS)
             .map(progress)
             .map(|p| p.fill)
             .collect();
@@ -980,7 +983,7 @@ mod tests {
             uids,
             expected.iter().map(String::as_str).collect::<Vec<_>>()
         );
-        // The headroom was computed over every fill, including the omitted one.
+        // Headroom remains independent of report ordering.
         assert_eq!(fills.pinnable_bytes, Some(4096));
     }
 }
