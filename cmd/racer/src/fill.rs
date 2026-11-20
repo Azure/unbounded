@@ -1044,7 +1044,7 @@ mod tests {
         state.cache = cache;
         let controller = FillController {
             worker: WorkerId(0),
-            fills: Arc::new(Vec::new),
+            fills: Arc::new(|_| Vec::new()),
             report: Arc::new(|_, _| {}),
             share: Arc::new(FillShare::new()),
             index,
@@ -1615,7 +1615,7 @@ mod tests {
             worker: WorkerId(0),
             fills: Arc::new({
                 let views = views.clone();
-                move || views.lock().unwrap().clone()
+                move |_| views.lock().unwrap().clone()
             }),
             report: Arc::new(|_, _| {}),
             share: Arc::new(FillShare::new()),
