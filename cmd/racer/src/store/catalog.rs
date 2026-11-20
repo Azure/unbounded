@@ -477,6 +477,8 @@ impl Index {
     /// against `RACER_PINNED_SEGMENT_PERCENT`, not the spill cap. The set
     /// merges with earlier pins of the same fill and version; every call adds
     /// one reader holder to each requested page.
+    /// Pin or joint protection budget exhaustion is `Overloaded`. Shared index
+    /// pressure that bounded reclaim cannot resolve is `Unavailable` instead.
     pub fn reserve_pin_pages(
         self: &Rc<Self>,
         fill: super::pins::FillId,
@@ -503,7 +505,7 @@ impl Index {
         }
         match self.reserve_pin_admission(fill, version, pages, until)? {
             PinAdmission::Reserved(epoch) => Ok(epoch),
-            PinAdmission::IndexFull => Err(Error::Overloaded),
+            PinAdmission::IndexFull => Err(Error::Unavailable),
         }
     }
 
@@ -2835,6 +2837,45 @@ mod tests {
         );
         assert_eq!(segments.snapshot(), before);
         assert!(index.lookup(&warm).unwrap().is_some());
+    }
+
+    #[test]
+    fn unreclaimable_index_pressure_is_not_a_pin_budget_rejection() {
+        use super::super::pins::FillId;
+        let env = racer_io::Env::host();
+        let segments = Rc::new(segments(1024, 8));
+        let index = Rc::new(index(&env, 16));
+        index.set_page_capacity(2).unwrap();
+        index.set_hold_capacity_percent(100).unwrap();
+        index.set_pin_capacity_percent(100).unwrap();
+        let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
+        let (first, first_entry) = indexed(descriptor("first", 17), 0);
+        let (second, second_entry) = indexed(descriptor("second", 17), 1);
+        drop(segments.append(1024).unwrap());
+        drop(segments.append(1024).unwrap());
+        index.publish(first.clone(), first_entry).unwrap();
+        index.publish(second.clone(), second_entry).unwrap();
+        let until = index.clock().wall_now() + std::time::Duration::from_secs(60);
+        let first_epoch = index
+            .reserve_hold_pages(&first.version, &page_set(&[0]), until)
+            .unwrap();
+        index
+            .reserve_hold_pages(&second.version, &page_set(&[0]), until)
+            .unwrap();
+        let version = descriptor("fill", 17).version;
+        assert_eq!(
+            index.reserve_pin_pages(FillId(1), &version, &page_set(&[0]), until),
+            Err(Error::Unavailable)
+        );
+        assert!(index.lookup(&first).unwrap().is_some());
+        assert!(index.lookup(&second).unwrap().is_some());
+        assert!(index.pins.borrow().entries.is_empty());
+        index.release_hold_pages(&first.version, &page_set(&[0]), first_epoch);
+        index
+            .reserve_pin_pages(FillId(1), &version, &page_set(&[0]), until)
+            .unwrap();
+        assert!(index.lookup(&first).unwrap().is_none());
+        assert!(index.lookup(&second).unwrap().is_some());
     }
 
     /// A page shared by several fills and versions stays pinned until the last
