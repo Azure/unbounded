@@ -689,6 +689,26 @@ async fn bound_to_installation(shared: &Shared, uid: &str) -> Result<(), Error> 
     Ok(())
 }
 
+/// Minimum spacing for advisory capacity and increasing fill progress. Lost
+/// residency and changed identities bypass this delay to withdraw old claims.
+const FILLS_REPORT_INTERVAL: Duration = Duration::from_secs(30);
+
+fn fills_can_wait(written: &str, wanted: &str) -> bool {
+    let (Ok(old), Ok(new)) = (rails::parse_fills(written), rails::parse_fills(wanted)) else {
+        return false;
+    };
+    old.fills.iter().all(|previous| {
+        new.fills.iter().any(|current| {
+            previous.fill == current.fill
+                && previous.generation == current.generation
+                && previous.membership == current.membership
+                && previous.digest == current.digest
+                && previous.pinned_pages <= current.pinned_pages
+                && previous.pinned_bytes <= current.pinned_bytes
+        })
+    })
+}
+
 /// Patch this Pod's report and fills annotations whenever a new encoding
 /// arrives. Each annotation has its own written value and backoff, so a
 /// failure on one does not rewrite the other.
@@ -697,8 +717,10 @@ async fn reporter(shared: Rc<Shared>, outer: Arc<Outer>, signal: Signal) {
     let mut written_fills: Option<String> = None;
     let mut backoff_report = 1;
     let mut backoff_fills = 1;
+    let mut next_fills = rt::now();
     while !shared.stopping.get() {
         let generation = signal.generation();
+        let mut next = rt::now() + Duration::from_secs(60);
         // Set when an annotation we want to publish is still unwritten after
         // its attempt. A new Node needs its report to be admitted, so a
         // transient failure must retry after the backoff slept above, not
@@ -725,6 +747,15 @@ async fn reporter(shared: Rc<Shared>, outer: Arc<Outer>, signal: Signal) {
             if written.as_ref() == Some(&wanted) {
                 continue;
             }
+            if key == annotations::FILLS
+                && rt::now() < next_fills
+                && written
+                    .as_deref()
+                    .is_some_and(|previous| fills_can_wait(previous, &wanted))
+            {
+                next = next.min(next_fills);
+                continue;
+            }
             let patch = json!({"metadata": {"annotations": {key: wanted}}});
             match shared
                 .api
@@ -737,6 +768,9 @@ async fn reporter(shared: Rc<Shared>, outer: Arc<Outer>, signal: Signal) {
                 Ok(_) => {
                     *written = Some(wanted);
                     *backoff = 1;
+                    if key == annotations::FILLS {
+                        next_fills = rt::now() + FILLS_REPORT_INTERVAL;
+                    }
                 }
                 Err(_) => {
                     dirty = true;
@@ -749,7 +783,7 @@ async fn reporter(shared: Rc<Shared>, outer: Arc<Outer>, signal: Signal) {
             // The per-annotation backoff already ran; retry immediately.
             continue;
         }
-        let _ = rt::timeout(Duration::from_secs(60), signal.changed(generation)).await;
+        let _ = rt::deadline(next, signal.changed(generation)).await;
     }
 }
 
@@ -916,6 +950,106 @@ mod tests {
             signal.notify();
             rt::sleep(Duration::from_millis(10)).await;
         });
+    }
+
+    #[test]
+    fn reporter_coalesces_growth_but_withdraws_residency_without_delay() {
+        let clock = racer_io::ctx::VirtualClock::new();
+        let os = racer_io::sim::SimOs::seeded(7);
+        let mut ex = Executor::simulated(os, &clock, 7, 64).unwrap();
+        ex.block_on(async {
+            let api = crate::kube::fake::FakeApi::new();
+            let config = crate::kube::fake::serve_at(
+                api.clone(),
+                std::path::Path::new("/kube"),
+                "10.0.0.1:443".parse().unwrap(),
+            );
+            let kube = Rc::new(Kube::new(config).unwrap());
+            let shared = crate::shared::tests::shared(kube);
+            let pod = paths::pod(&shared.config.namespace, &shared.config.pod_name);
+            api.put_object(&pod, json!({"metadata": {"name": "p1"}}));
+            let outer = Outer::new();
+            let signal = Signal::default();
+            let mut sample = progress(1);
+            sample.owned_pages = 100;
+            sample.owned_bytes = 1000;
+            outer
+                .set_fill_progress(vec![sample.clone()], Some(1000))
+                .unwrap();
+            rt::spawn(reporter(shared.clone(), outer.clone(), signal.clone())).unwrap();
+            rt::sleep(Duration::from_secs(1)).await;
+            let patches = || api.requests().iter().filter(|(m, _)| m == "PATCH").count();
+            assert_eq!(patches(), 1);
+            for i in 2..6 {
+                sample.pinned_pages = i;
+                sample.pinned_bytes = i * 10;
+                outer
+                    .set_fill_progress(vec![sample.clone()], Some(1000 - i * 10))
+                    .unwrap();
+                signal.notify();
+                rt::sleep(Duration::from_secs(5)).await;
+            }
+            assert_eq!(patches(), 1);
+            // Membership reporting does not wait behind deferred fill growth.
+            outer.set_report(8, Vec::new()).unwrap();
+            signal.notify();
+            rt::sleep(Duration::from_secs(1)).await;
+            assert_eq!(patches(), 2);
+            // The final sample lands at the deadline without another signal.
+            rt::sleep(Duration::from_secs(10)).await;
+            assert_eq!(patches(), 3);
+            let current = || {
+                rails::parse_fills(
+                    api.object(&pod).unwrap()["metadata"]["annotations"][annotations::FILLS]
+                        .as_str()
+                        .unwrap(),
+                )
+                .unwrap()
+            };
+            assert_eq!(current().fills[0], sample);
+            sample.pinned_pages = 0;
+            sample.pinned_bytes = 0;
+            outer
+                .set_fill_progress(vec![sample.clone()], Some(1000))
+                .unwrap();
+            signal.notify();
+            rt::sleep(Duration::from_secs(1)).await;
+            assert_eq!(patches(), 4);
+            assert_eq!(current().fills[0], sample);
+            // Removal also bypasses the spacing, including the final fill.
+            outer.set_fill_progress(Vec::new(), None).unwrap();
+            signal.notify();
+            rt::sleep(Duration::from_secs(1)).await;
+            assert_eq!(patches(), 5);
+            assert!(current().fills.is_empty());
+            shared.stopping.set(true);
+            signal.notify();
+            rt::sleep(Duration::from_millis(10)).await;
+        });
+    }
+
+    #[test]
+    fn changed_fill_identity_cannot_be_coalesced() {
+        let previous = progress(1);
+        let encode = |sample| {
+            rails::encode_fills(&Fills {
+                fills: vec![sample],
+                pinnable_bytes: None,
+            })
+            .unwrap()
+        };
+        let old = encode(previous.clone());
+        assert!(fills_can_wait(&old, &old));
+        let mut changed = previous.clone();
+        changed.generation += 1;
+        assert!(!fills_can_wait(&old, &encode(changed)));
+        let mut changed = previous.clone();
+        changed.membership += 1;
+        assert!(!fills_can_wait(&old, &encode(changed)));
+        let mut changed = previous;
+        changed.digest = "cd".repeat(32);
+        assert!(!fills_can_wait(&old, &encode(changed)));
+        assert!(!fills_can_wait(&old, "malformed"));
     }
 
     #[test]
