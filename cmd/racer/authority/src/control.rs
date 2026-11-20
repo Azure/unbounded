@@ -91,10 +91,17 @@ impl ReportState {
         // A node may reconcile more fills than one annotation can carry. Keep a
         // deterministic prefix and leave the rest out of the annotation; their
         // pins stay in place, and `pinnable_bytes` already accounts for them.
-        let fills_encoded = if self.fills.is_empty() && self.pinnable_bytes.is_none() {
+        let fills_encoded = if self.fills.is_empty()
+            && self.pinnable_bytes.is_none()
+            && self.fills_encoded.is_none()
+        {
             None
         } else {
             let mut fills = self.fills.clone();
+            // Producers can race inventory changes. Never let one invalid
+            // progress sample retain the entire previous residency snapshot.
+            // The codec stays strict; publication discards samples separately.
+            fills.retain(FillProgress::valid);
             fills.sort_by(|a, b| {
                 (&a.fill, a.generation, a.membership, &a.digest).cmp(&(
                     &b.fill,
@@ -911,6 +918,42 @@ mod tests {
             signal.notify();
             rt::sleep(Duration::from_millis(10)).await;
         });
+    }
+
+    #[test]
+    fn refresh_discards_only_invalid_progress_and_replaces_stale_claims() {
+        let outer = Outer::new();
+        outer
+            .set_fill_progress(vec![progress(1), progress(2)], Some(10))
+            .unwrap();
+        let mut invalid = progress(1);
+        invalid.pinned_pages = invalid.owned_pages + 1;
+        let mut updated = progress(2);
+        updated.pinned_pages = 0;
+        updated.pinned_bytes = 0;
+        outer
+            .set_fill_progress(vec![invalid.clone(), updated.clone()], Some(5))
+            .unwrap();
+        let report = rails::parse_fills(&outer.fills_string().unwrap()).unwrap();
+        assert_eq!(report.fills, vec![updated]);
+        assert_eq!(report.pinnable_bytes, Some(5));
+        outer.set_fill_progress(vec![invalid], None).unwrap();
+        assert!(
+            rails::parse_fills(&outer.fills_string().unwrap())
+                .unwrap()
+                .fills
+                .is_empty()
+        );
+        // Dropping the final fill must publish an empty snapshot too, rather
+        // than treating None as a request to leave the old annotation intact.
+        outer.set_fill_progress(vec![progress(1)], None).unwrap();
+        outer.set_fill_progress(Vec::new(), None).unwrap();
+        assert!(
+            rails::parse_fills(&outer.fills_string().unwrap())
+                .unwrap()
+                .fills
+                .is_empty()
+        );
     }
 
     #[test]

@@ -179,7 +179,7 @@ pub fn parse_fills(s: &str) -> Result<Fills, wire::Error> {
     }
     let d: FillsDto = serde_json::from_str(s).map_err(|_| wire::Error::InvalidRequest)?;
     let mut fills = Vec::new();
-    for value in d.fills.into_iter().take(MAX_REPORT_FILLS) {
+    for value in d.fills {
         // A malformed entry must not drop the node or the other fills. Each
         // entry is decoded on its own, so an unknown future entry shape is
         // ignored rather than failing the whole annotation.
@@ -200,6 +200,9 @@ pub fn parse_fills(s: &str) -> Result<Fills, wire::Error> {
         // Bounds are checked only after a successful decode.
         if progress.valid() {
             fills.push(progress);
+            if fills.len() == MAX_REPORT_FILLS {
+                break;
+            }
         }
     }
     Ok(Fills {
@@ -391,6 +394,17 @@ pub(crate) mod tests {
         let parsed = parse_fills(&invalid.to_string()).unwrap();
         assert_eq!(parsed.fills.len(), 1);
         assert_eq!(parsed.fills[0].fill, fill);
+        // Invalid entries do not spend valid progress slots. The byte limit
+        // still bounds the work when consuming an untrusted annotation.
+        let valid: Value = serde_json::from_str(&s).unwrap();
+        let mut entries = vec![json!({"future": true}); MAX_REPORT_FILLS];
+        entries.push(valid["fills"][0].clone());
+        assert_eq!(
+            parse_fills(&json!({"fills": entries}).to_string())
+                .unwrap()
+                .fills,
+            vec![progress.clone()]
+        );
         // Encoding rejects invalid or over-count entries.
         let mut too_many = fills.clone();
         too_many.fills = (0..MAX_REPORT_FILLS + 1)
