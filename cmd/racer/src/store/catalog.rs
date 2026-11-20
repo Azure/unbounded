@@ -1531,7 +1531,9 @@ impl Index {
     }
     pub fn remove_if_matches(&self, page: &PageId, location: &RecordLocation) {
         let mut s = self.state_mut();
-        s.pages.remove(page, Some(location));
+        if s.pages.remove(page, Some(location)) {
+            self.pins.borrow_mut().note_removed(page, location.segment);
+        }
     }
     pub fn snapshot(&self) -> Result<IndexSnapshot> {
         let s = self.state.borrow();
@@ -2736,6 +2738,90 @@ mod tests {
             assert!(!pin.pages.contains(&crate::model::PageNumber(count as u64)));
             assert_eq!(pin.until, later);
             assert_eq!(pins.members, count);
+        }
+    }
+
+    #[test]
+    fn invalidated_shared_pin_can_refill_at_its_segment_cap() {
+        use super::super::pins::FillId;
+        for frozen in [false, true] {
+            let env = racer_io::Env::host();
+            let segments = Rc::new(segments(1024, 2));
+            let index = Rc::new(index(&env, 4));
+            index.set_page_capacity(4).unwrap();
+            index.set_hold_capacity_percent(100).unwrap();
+            let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
+            let (page, entry) = indexed(descriptor("invalidated-pin", 17), 0);
+            let until = index.clock().wall_now() + std::time::Duration::from_secs(60);
+            let first = index
+                .reserve_pin_pages(FillId(1), &page.version, &page_set(&[0]), until)
+                .unwrap();
+            let second = index
+                .reserve_pin_pages(FillId(2), &page.version, &page_set(&[0]), until)
+                .unwrap();
+            let spill = index
+                .reserve_hold_pages(&page.version, &page_set(&[0]), until)
+                .unwrap();
+            let mut ticket = index.reserve_page_for(&page).unwrap();
+            let (lease, old) = ticket.append(&page, &segments, 1024).unwrap();
+            ticket
+                .publish(
+                    page.clone(),
+                    IndexedPage {
+                        location: old.clone(),
+                        ..entry.clone()
+                    },
+                )
+                .unwrap();
+            drop(lease);
+            let mut stale = old.clone();
+            stale.generation = Generation(stale.generation.0 + 1);
+            index.remove_if_matches(&page, &stale);
+            assert!(index.lookup(&page).unwrap().is_some());
+            assert_eq!(segments.pinned_count(), 1);
+            let guard = frozen.then(|| segments.freeze().unwrap());
+            index.remove_if_matches(&page, &old);
+            assert!(index.lookup(&page).unwrap().is_none());
+            assert!(index.is_pinned(&page));
+            {
+                let pins = index.pins.borrow();
+                for fill in [FillId(1), FillId(2)] {
+                    assert_eq!(
+                        pins.entries[&(fill, page.version.clone())].holders[&page.number].counted,
+                        None
+                    );
+                }
+                assert_eq!(pins.deferred.contains(&old.segment), frozen);
+            }
+            assert_eq!(segments.pinned_count(), usize::from(frozen));
+            drop(guard);
+            index.expire_pins(16);
+            assert_eq!(segments.pinned_count(), 0);
+            let mut ticket = index.reserve_page_for(&page).unwrap();
+            let (lease, replacement) = ticket.append(&page, &segments, 1024).unwrap();
+            ticket
+                .publish(
+                    page.clone(),
+                    IndexedPage {
+                        location: replacement.clone(),
+                        ..entry
+                    },
+                )
+                .unwrap();
+            drop(lease);
+            assert_ne!(replacement.segment, old.segment);
+            index.remove_if_matches(&page, &old);
+            assert_eq!(index.lookup(&page).unwrap().unwrap().location, replacement);
+            index.release_pin_pages(FillId(1), &page.version, &page_set(&[0]), first);
+            assert_eq!(segments.pinned_count(), 1);
+            index.release_pin_pages(FillId(2), &page.version, &page_set(&[0]), second);
+            assert_eq!(segments.pinned_count(), 0);
+            assert!(
+                !index.can_evict(replacement.segment),
+                "spill hold still owns it"
+            );
+            index.release_hold_pages(&page.version, &page_set(&[0]), spill);
+            assert!(index.can_evict(replacement.segment));
         }
     }
 

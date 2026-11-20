@@ -293,6 +293,27 @@ impl Pins {
         }
     }
 
+    /// Invalidation removes stored ownership, not the promise to retain the
+    /// page. Every holder must count the replacement when it is published.
+    pub(super) fn note_removed(&mut self, page: &PageId, segment: SegmentId) {
+        let fills: Vec<_> = self.holders_of(page).collect();
+        let mut removed = 0;
+        for fill in fills {
+            if let Some(holder) = self
+                .entries
+                .get_mut(&(fill, page.version.clone()))
+                .and_then(|pin| pin.holders.get_mut(&page.number))
+                .filter(|holder| holder.counted == Some(segment))
+            {
+                holder.counted = None;
+                removed += 1;
+            }
+        }
+        for _ in 0..removed {
+            self.segment_released(segment);
+        }
+    }
+
     /// Remove one page from one entry, releasing its disk holders.
     pub(super) fn drop_holders(
         &mut self,
