@@ -60,6 +60,10 @@ pub struct Index {
     /// Cache-fill pins, charged against their own cap.
     pins: RefCell<super::pins::Pins>,
 
+    /// Requested members examined by pin admission, excluding budget walks.
+    #[cfg(test)]
+    pin_member_visits: Cell<usize>,
+
     /// Bumped on every mutable borrow of `state` or `holds` through
     /// [`Self::state_mut`] and [`Self::holds_mut`]; see [`Self::generation`].
     generation: Cell<u64>,
@@ -536,12 +540,7 @@ impl Index {
         let segments = pins.segments.clone().ok_or(Error::InvalidConfiguration)?;
         let old = pins.entries.get(&key);
         let previous_deadline = old.map(|pin| pin.monotonic);
-        let members: std::collections::BTreeSet<_> = old
-            .into_iter()
-            .flat_map(|pin| pin.pages.iter().copied())
-            .chain(pages.iter())
-            .collect();
-        if members.is_empty() {
+        if pages.is_empty() && old.is_none() {
             return Ok(PinAdmission::Reserved(super::pins::PinEpoch(
                 state.pages.last_hold_id(),
             )));
@@ -552,7 +551,11 @@ impl Index {
         };
         let mut joining = Vec::new();
         let mut joining_unused = 0;
-        for number in members.iter().copied() {
+        // Existing members already own their disk holds. Examine only the
+        // request, not the growing fill/version membership on every page.
+        for number in pages.iter() {
+            #[cfg(test)]
+            self.pin_member_visits.set(self.pin_member_visits.get() + 1);
             page.number = number;
             let location = state.pages.location(&page);
             if let Some(location) = &location {
@@ -581,26 +584,27 @@ impl Index {
         let free_reserve = free_reserve.max(1);
         let segment_limit = (segments.count() * pins.percent / 100)
             .min(segments.count().saturating_sub(free_reserve));
-        let mut committed: HashSet<PageId> = joining.iter().cloned().collect();
-        for (version, pages) in &pins.page_fills {
-            for number in pages.keys() {
-                committed.insert(PageId {
-                    version: version.clone(),
-                    number: *number,
-                });
+        if !joining.is_empty() {
+            let mut committed: HashSet<PageId> = joining.iter().cloned().collect();
+            for (version, pages) in &pins.page_fills {
+                for number in pages.keys() {
+                    committed.insert(PageId {
+                        version: version.clone(),
+                        number: *number,
+                    });
+                }
             }
-        }
-        let projected = state
-            .pages
-            .pin_charge(&segments, &committed.into_iter().collect::<Vec<_>>())?;
-        if !joining.is_empty() && projected > segment_limit {
-            return Err(Error::Overloaded);
-        }
-        if !joining.is_empty()
-            && state.pages.protection_charge(&segments, &joining)?
+            let projected = state
+                .pages
+                .pin_charge(&segments, &committed.into_iter().collect::<Vec<_>>())?;
+            if projected > segment_limit {
+                return Err(Error::Overloaded);
+            }
+            if state.pages.protection_charge(&segments, &joining)?
                 > segments.count().saturating_sub(free_reserve)
-        {
-            return Err(Error::Overloaded);
+            {
+                return Err(Error::Overloaded);
+            }
         }
         if let Some(old) = old
             && pages.iter().any(|number| {
@@ -652,10 +656,10 @@ impl Index {
                 });
             pin.until = until;
             pin.monotonic = monotonic;
-            pin.pages = members;
             if let Some((id, slots)) = joined.take() {
                 pin.ids.insert(id);
                 for ((page, slot), counted) in joining.iter().zip(slots).zip(&counted) {
+                    pin.pages.insert(page.number);
                     pin.holders.insert(
                         page.number,
                         super::pins::PinHolder {
@@ -1212,6 +1216,8 @@ impl Index {
             )),
             holds: RefCell::new(super::holds::Holds::new(&clock)),
             pins: RefCell::new(super::pins::Pins::new(&clock)),
+            #[cfg(test)]
+            pin_member_visits: Cell::new(0),
             generation: Cell::new(0),
             key_sweep: Cell::default(),
         }
@@ -2708,6 +2714,63 @@ mod tests {
             index.reserve_pin_pages(FillId(4), &version, &page_set(&[2]), until),
             Err(Error::Overloaded)
         );
+    }
+
+    /// Membership bookkeeping is proportional to the request, not the fill's
+    /// accumulated pages. This counter excludes the separate budget walks.
+    #[test]
+    fn pagewise_pin_membership_visits_only_requested_pages() {
+        use super::super::pins::FillId;
+        for count in [64usize, 128] {
+            let env = racer_io::Env::host();
+            let segments = Rc::new(segments(1024, count + 1));
+            let index = Rc::new(index(&env, count * 2));
+            index.set_page_capacity(count * 2).unwrap();
+            index.set_pin_capacity_percent(100).unwrap();
+            let _clock = SegmentClock::new(index.clone(), segments, 1);
+            let version = descriptor("pagewise", 17).version;
+            let until = index.clock().wall_now() + std::time::Duration::from_secs(60);
+            let key = (FillId(1), version.clone());
+            for number in 0..count as u64 {
+                index
+                    .reserve_pin_pages(FillId(1), &version, &page_set(&[number]), until)
+                    .unwrap();
+            }
+            assert_eq!(index.pin_member_visits.get(), count);
+            {
+                let pins = index.pins.borrow();
+                let pin = &pins.entries[&key];
+                assert_eq!(pin.pages.len(), count);
+                assert_eq!(pin.holders.len(), count);
+                assert_eq!(pin.ids.len(), count);
+                assert_eq!(pins.members, count);
+                assert!(pin.holders.values().all(|holder| holder.count == 1));
+            }
+            // Repeating one member adds a reader but no membership or hold.
+            index
+                .reserve_pin_pages(FillId(1), &version, &page_set(&[0]), until)
+                .unwrap();
+            assert_eq!(index.pin_member_visits.get(), count + 1);
+            let later = until + std::time::Duration::from_secs(1);
+            index
+                .reserve_pin_pages(FillId(1), &version, &page_set(&[]), later)
+                .unwrap();
+            assert_eq!(index.pin_member_visits.get(), count + 1);
+            // Failure of a mixed old/new request must leave both untouched.
+            assert_eq!(
+                index.reserve_pin_pages(FillId(1), &version, &page_set(&[0, count as u64]), later),
+                Err(Error::Overloaded)
+            );
+            assert_eq!(index.pin_member_visits.get(), count + 3);
+            let pins = index.pins.borrow();
+            let pin = &pins.entries[&key];
+            assert_eq!(pin.pages.len(), count);
+            assert_eq!(pin.ids.len(), count);
+            assert_eq!(pin.holders[&crate::model::PageNumber(0)].count, 2);
+            assert!(!pin.pages.contains(&crate::model::PageNumber(count as u64)));
+            assert_eq!(pin.until, later);
+            assert_eq!(pins.members, count);
+        }
     }
 
     #[test]
