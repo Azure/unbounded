@@ -934,7 +934,7 @@ and observations. A provider-specific host CR is an optional backend model,
 not a replacement for that shared ownership boundary.
 
 The AzureVM POC already combines existing-host operations and capacity in one
-registration (`cmd/azure-machine-ops-controller/internal/azurevm/provider.go:40-96`;
+registration (`cmd/azure-machine-ops-controller/internal/azurevm/provider.go:64-89`;
 `cmd/azure-machine-ops-controller/internal/azurevm/capacity.go:88-100`). The AWSEC2
 POC registers capacity only; it does not implement host power or replacement
 operations (AWSEC2 proof of concept, not in this repository).

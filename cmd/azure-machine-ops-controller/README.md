@@ -48,6 +48,14 @@ provider other than `AzureVM` through `spec.host.external`.
    restart. Use `WithImmediateOperation` only for a call that completes before
    it returns; the engine does not run it again once it is in progress unless
    it is declared `ReplaySafe`.
+
+   An operation with several steps, such as a replacement that deletes a host
+   and creates it again, takes one step per Poll and waits for nothing.
+   `host_replace.go` is the example: Begin changes nothing and returns
+   everything a later Poll needs in the handle, so the engine has stored it
+   before the host is touched. Do not put secrets in the handle. The engine
+   builds the replacement bootstrap data again for every Poll of an operation
+   registered with `RequiresReplaceUserData`.
 3. Replace `azureProviders` in `main.go` with your registration, and change
    `controllerName`. It names the leader-election lease, so two controllers
    that keep the same name in one namespace would exclude each other.
