@@ -80,16 +80,17 @@ linters:
   settings:
     depguard:
       rules:
-        # The more specific api/ prefix overrides the repository-wide deny.
+        # The more specific allow entries override the repository-wide deny.
         helpers:
           list-mode: lax
           files:
             - "${config-path}/internal/helpers/**"
           allow:
             - github.com/Azure/unbounded/api/
+            - github.com/Azure/unbounded/internal/
           deny:
             - pkg: github.com/Azure/unbounded
-              desc: helpers may import only api/ packages from this repository
+              desc: shared helpers may import repository packages only from api/ or internal/
     errcheck:
       # Treat type assertion as erroneous operation, though assertions should be avoided in general.
       check-type-assertions: true
