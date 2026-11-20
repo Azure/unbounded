@@ -193,6 +193,25 @@ impl Pages {
         self.stored
     }
 
+    /// Segment commitments of current and proposed pin members.
+    pub fn pin_charge(&mut self, segments: &Segments, pages: &[PageId]) -> Result<usize> {
+        let inner = self.inner_mut()?;
+        let mut slots = Vec::new();
+        let mut missing = 0;
+        for page in pages {
+            match inner.slots.get(page) {
+                Some(slot) => slots.push(slot),
+                None => missing += 1,
+            }
+        }
+        Ok(inner.disk.borrow().pin_charge(segments, &slots)? + missing)
+    }
+
+    pub fn set_pin_limit(&mut self, limit: usize) -> Result<()> {
+        self.inner_mut()?.disk.borrow_mut().set_pin_limit(limit);
+        Ok(())
+    }
+
     /// Interned page capacity.
     #[cfg(test)]
     pub fn slots(&self) -> u32 {

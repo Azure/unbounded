@@ -150,6 +150,14 @@ impl PageTicket {
             }
             self.reservation = Some(self.index.state_mut().pages.reserve(page, self.pinned)?);
         }
+        let pins = self.index.pins.borrow();
+        let limit = (segments.count() * pins.percent / 100).min(
+            segments
+                .count()
+                .saturating_sub(self.index.holds.borrow().free_reserve.max(1)),
+        );
+        self.index.state_mut().pages.set_pin_limit(limit)?;
+        drop(pins);
         self.reservation
             .as_mut()
             .expect("reserved page")
@@ -479,10 +487,6 @@ impl Index {
         };
         let mut joining = Vec::new();
         let mut joining_unused = 0;
-        // Resident pages that would newly count their segment against the pin
-        // budget, and whether any joining page still needs an append.
-        let mut resident_segments = HashSet::default();
-        let mut needs_new_segment = false;
         for number in members.iter().copied() {
             page.number = number;
             let location = state.pages.location(&page);
@@ -493,13 +497,6 @@ impl Index {
             }
             if old.is_none_or(|pin| !pin.holders.contains_key(&number)) {
                 joining_unused += usize::from(!state.pages.occupied(&page));
-                match location {
-                    Some(location) if !segments.pinned(location.segment).unwrap_or(false) => {
-                        resident_segments.insert(location.segment);
-                    }
-                    None => needs_new_segment = true,
-                    Some(_) => {}
-                }
                 joining.push(page.clone());
             }
         }
@@ -518,15 +515,18 @@ impl Index {
         let free_reserve = free_reserve.max(1);
         let segment_limit = (segments.count() * pins.percent / 100)
             .min(segments.count().saturating_sub(free_reserve));
-        let mut projected = segments
-            .pinned_count()
-            .saturating_add(resident_segments.len());
-        if needs_new_segment {
-            // A joining page that is not resident may claim a new pinned
-            // segment. Reserve that headroom rather than admitting equality
-            // with the cap and overshooting on the later append.
-            projected = projected.saturating_add(1);
+        let mut committed: HashSet<PageId> = joining.iter().cloned().collect();
+        for (version, pages) in &pins.page_fills {
+            for number in pages.keys() {
+                committed.insert(PageId {
+                    version: version.clone(),
+                    number: *number,
+                });
+            }
         }
+        let projected = state
+            .pages
+            .pin_charge(&segments, &committed.into_iter().collect::<Vec<_>>())?;
         if !joining.is_empty() && projected > segment_limit {
             return Err(Error::Overloaded);
         }
@@ -2600,6 +2600,42 @@ mod tests {
             .reserve_pin_pages(FillId(3), &missing, &page_set(&[0]), until)
             .unwrap();
         index.release_pin_pages(FillId(2), &b.version, &page_set(&[0]), b_epoch);
+    }
+
+    #[test]
+    fn pin_budget_counts_each_missing_page_and_pending_reservation() {
+        use super::super::pins::FillId;
+        let env = racer_io::Env::host();
+        let segments = Rc::new(segments(1024, 4));
+        let index = Rc::new(index(&env, 16));
+        index.set_page_capacity(16).unwrap();
+        let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
+        let version = descriptor("pending", 17).version;
+        let until = index.clock().wall_now() + std::time::Duration::from_secs(60);
+        assert_eq!(
+            index.reserve_pin_pages(FillId(1), &version, &page_set(&[0, 1, 2]), until),
+            Err(Error::Overloaded)
+        );
+        let first = index
+            .reserve_pin_pages(FillId(1), &version, &page_set(&[0]), until)
+            .unwrap();
+        index
+            .reserve_pin_pages(FillId(2), &version, &page_set(&[1]), until)
+            .unwrap();
+        assert_eq!(segments.pinned_count(), 0);
+        assert_eq!(
+            index.reserve_pin_pages(FillId(3), &version, &page_set(&[2]), until),
+            Err(Error::Overloaded)
+        );
+        // Another fill sharing a pending page needs no additional segment.
+        index
+            .reserve_pin_pages(FillId(3), &version, &page_set(&[0]), until)
+            .unwrap();
+        index.release_pin_pages(FillId(1), &version, &page_set(&[0]), first);
+        assert_eq!(
+            index.reserve_pin_pages(FillId(4), &version, &page_set(&[2]), until),
+            Err(Error::Overloaded)
+        );
     }
 
     /// A page shared by several fills and versions stays pinned until the last

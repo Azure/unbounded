@@ -437,6 +437,16 @@ impl Segments {
     /// Append into the tail of `pinned`'s allocation class. Shared and pinned
     /// appends never share a tail and never seal each other's tail on rollover.
     pub fn append_in(&self, length: usize, pinned: bool) -> Result<(SegmentLease, Extent)> {
+        self.append_in_checked(length, pinned, |_, _| Ok(()))
+    }
+
+    /// Check the selected segment before consuming space or rotating a tail.
+    pub(crate) fn append_in_checked(
+        &self,
+        length: usize,
+        pinned: bool,
+        check: impl FnOnce(SegmentId, bool) -> Result<()>,
+    ) -> Result<(SegmentLease, Extent)> {
         if self.appends_frozen.get() {
             return Err(Error::Busy);
         }
@@ -471,6 +481,7 @@ impl Segments {
             },
         };
         let slot = &slots[position];
+        check(slot.image.id, slot.is_pinned())?;
         let offset = slot
             .image
             .id

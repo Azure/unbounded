@@ -364,6 +364,11 @@ pub struct DiskIndex {
 
     holds_unused: usize,
 
+    /// Locations of unpublished appends, including completed writes awaiting publication.
+    writing_segments: BTreeMap<PageSlot, SegmentId>,
+
+    pin_limit: usize,
+
     hand: usize,
 
     age_head: u32,
@@ -397,6 +402,8 @@ impl DiskIndex {
             expiry: BTreeSet::new(),
             next_hold: 0,
             holds_unused: 0,
+            writing_segments: BTreeMap::new(),
+            pin_limit: usize::MAX,
             hand: 0,
             age_head: NIL,
             age_tail: NIL,
@@ -806,6 +813,7 @@ impl DiskIndex {
             cache,
             pinned: _,
         } = ticket;
+        self.writing_segments.remove(&slot);
         self.update(slot, |this| {
             this.entries[slot.0 as usize].flags &= !INFLIGHT
         });
@@ -832,11 +840,18 @@ impl DiskIndex {
             return Err((ticket, Error::InvalidConfiguration));
         }
         let pinned = ticket.pinned;
-        let (lease, extent) = match segments.append_in(length, pinned) {
+        let charged = segments.pinned_count();
+        let (lease, extent) = match segments.append_in_checked(length, pinned, |_, already| {
+            if pinned && !already && charged >= self.pin_limit {
+                return Err(Error::Busy);
+            }
+            Ok(())
+        }) {
             Ok(appended) => appended,
             Err(error) => return Err((ticket, error)),
         };
         self.segments[lease.id().0 as usize].writes += 1;
+        self.writing_segments.insert(ticket.slot, lease.id());
         let location = RecordLocation {
             segment: lease.id(),
             generation: lease.generation(),
@@ -986,6 +1001,36 @@ impl DiskIndex {
     }
 
     // ---- holds ----
+
+    /// Bound new pinned segments at append time, including replacement writes.
+    pub fn set_pin_limit(&mut self, limit: usize) {
+        self.pin_limit = limit;
+    }
+
+    /// Charge distinct segments plus one segment for each page still awaiting
+    /// an append. Multiple reservations of the same page share that charge.
+    pub fn pin_charge(&self, segments: &Segments, slots: &[PageSlot]) -> Result<usize> {
+        let mut protected = BTreeSet::new();
+        for id in 0..segments.count() {
+            let id = SegmentId(id as u64);
+            if segments.pinned(id)? {
+                protected.insert(id.0);
+            }
+        }
+        let mut missing = BTreeSet::new();
+        for slot in slots {
+            let entry = self.entry(*slot)?;
+            if let Some(segment) = self.writing_segments.get(slot) {
+                protected.insert(segment.0);
+            }
+            if entry.stored() {
+                protected.insert(u64::from(entry.segment));
+            } else if !self.writing_segments.contains_key(slot) {
+                missing.insert(*slot);
+            }
+        }
+        Ok(protected.len() + missing.len())
+    }
 
     /// Hold `slots` until `until`. Held stored records keep their segments
     /// from eviction; held slots not stored or in flight count as unused.
@@ -1477,6 +1522,33 @@ mod tests {
         assert!(index.get(PageSlot(0)).is_some());
         assert!(index.get(PageSlot(1)).is_none());
         assert_eq!(segments.state(SegmentId(0)), Ok(SegmentState::Sealed));
+    }
+
+    #[test]
+    fn pinned_append_enforces_cap_but_shares_existing_tail() {
+        let segments = segments(4);
+        let mut index = DiskIndex::new(8, 8, 4).unwrap();
+        index.set_pin_limit(1);
+        let cache = index.add_cache(CacheIdx(0)).unwrap();
+        write_pinned(&mut index, &segments, 0, cache, 512).unwrap();
+        write_pinned(&mut index, &segments, 1, cache, 512).unwrap();
+        assert_eq!(segments.pinned_count(), 1);
+        let before = segments.snapshot();
+        let ticket = index.reserve_pinned(PageSlot(2), cache, true).unwrap();
+        let (ticket, error) = index
+            .append(&segments, ticket, SEGMENT as usize)
+            .err()
+            .unwrap();
+        assert_eq!(error, Error::Busy);
+        assert_eq!(segments.snapshot(), before);
+        index.cancel(ticket);
+        // A replacement may not bypass the cap either.
+        assert_eq!(
+            write_pinned(&mut index, &segments, 0, cache, SEGMENT as usize),
+            Err(Error::Busy)
+        );
+        assert_eq!(segments.snapshot(), before);
+        index.check_invariants();
     }
 
     fn walk(index: &mut DiskIndex, cursor: AgeCursor, limit: usize) -> Vec<u32> {
