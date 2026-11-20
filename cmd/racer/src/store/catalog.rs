@@ -465,6 +465,7 @@ impl Index {
         }
         let segments = pins.segments.clone().ok_or(Error::InvalidConfiguration)?;
         let old = pins.entries.get(&key);
+        let previous_deadline = old.map(|pin| pin.monotonic);
         let members = old.map_or_else(|| pages.clone(), |pin| pin.pages.union(pages));
         if members.is_empty() {
             return Ok(super::pins::PinEpoch(state.pages.last_hold_id()));
@@ -565,13 +566,16 @@ impl Index {
             .collect();
         let mut joined = joined;
         {
-            let pin = pins.entries.entry(key).or_insert_with(|| super::pins::Pin {
-                until,
-                monotonic,
-                pages: super::holds::HoldPages::default(),
-                holders: HashMap::default(),
-                ids: Vec::new(),
-            });
+            let pin = pins
+                .entries
+                .entry(key.clone())
+                .or_insert_with(|| super::pins::Pin {
+                    until,
+                    monotonic,
+                    pages: super::holds::HoldPages::default(),
+                    holders: HashMap::default(),
+                    ids: Vec::new(),
+                });
             pin.until = until;
             pin.monotonic = monotonic;
             pin.pages = members;
@@ -595,6 +599,7 @@ impl Index {
                 }
             }
         }
+        pins.note_deadline(&key, previous_deadline, monotonic);
         if let Some((id, _)) = joined {
             pins.owners.insert(id, (fill, version.clone()));
         }
@@ -2497,11 +2502,13 @@ mod tests {
         index.expire_pins(usize::MAX);
         assert!(segments.pinned(segment).unwrap());
         assert_eq!(segments.pinned_count(), 1);
+        assert!(index.pins.borrow().deferred.contains(&segment));
         drop(freeze);
         // With no pin entries left, the sweep still retries the pending clear.
         index.expire_pins(usize::MAX);
         assert!(!segments.pinned(segment).unwrap());
         assert_eq!(segments.pinned_count(), 0);
+        assert!(index.pins.borrow().deferred.is_empty());
         assert!(index.can_evict(segment));
     }
 
@@ -2682,6 +2689,77 @@ mod tests {
         let pins = index.pins.borrow();
         assert!(pins.entries.is_empty());
         assert!(pins.page_fills.is_empty(), "sweep drops reverse index rows");
+    }
+
+    #[test]
+    fn pin_expiry_index_tracks_renewals_releases_and_bounded_sweeps() {
+        use super::super::pins::FillId;
+        let clock = racer_io::SimClock::new(37);
+        let ctx = clock.ctx(0);
+        let env = racer_io::Env::new(racer_io::Driver::Uring, ctx.clone());
+        let segments = Rc::new(segments(1024, 8));
+        let index = Rc::new(index(&env, 256));
+        index.set_page_capacity(256).unwrap();
+        index.set_pin_capacity_percent(100).unwrap();
+        let _clock = SegmentClock::new(index.clone(), segments, 1);
+        let version = descriptor("ordered-expiry", 17).version;
+        let now = ctx.clock.wall_now();
+        for fill in 0..128 {
+            index
+                .reserve_pin_pages(
+                    FillId(fill),
+                    &version,
+                    &page_set(&[0]),
+                    now + std::time::Duration::from_secs(if fill < 2 { 10 } else { 60 }),
+                )
+                .unwrap();
+        }
+        for seconds in 61..80 {
+            index
+                .renew_pin(
+                    FillId(127),
+                    &version,
+                    now + std::time::Duration::from_secs(seconds),
+                )
+                .unwrap();
+        }
+        {
+            let pins = index.pins.borrow();
+            assert_eq!(pins.expirations.len(), 3);
+            assert_eq!(
+                pins.expirations
+                    .values()
+                    .map(|keys| keys.len())
+                    .sum::<usize>(),
+                128
+            );
+            assert!(pins.deferred.is_empty());
+        }
+        clock.advance(std::time::Duration::from_secs(11));
+        index.expire_pins(0);
+        assert_eq!(index.pins.borrow().entries.len(), 128);
+        index.expire_pins(1);
+        assert_eq!(index.pins.borrow().entries.len(), 127);
+        index.expire_pins(1);
+        assert_eq!(index.pins.borrow().entries.len(), 126);
+        index.expire_pins(usize::MAX);
+        assert_eq!(
+            index.pins.borrow().entries.len(),
+            126,
+            "future pins are untouched"
+        );
+        let epoch = super::super::pins::PinEpoch(index.state.borrow().pages.last_hold_id());
+        index.release_pin_pages(FillId(127), &version, &page_set(&[0]), epoch);
+        assert_eq!(
+            index.pins.borrow().expirations.len(),
+            1,
+            "release removes its deadline"
+        );
+        clock.advance(std::time::Duration::from_secs(60));
+        index.expire_pins(usize::MAX);
+        let pins = index.pins.borrow();
+        assert!(pins.entries.is_empty());
+        assert!(pins.expirations.is_empty());
     }
 
     #[test]

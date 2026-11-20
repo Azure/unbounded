@@ -11,6 +11,7 @@ use crate::runtime::HashMap;
 use page_alloc::SegmentId;
 use page_alloc::Segments;
 use page_alloc::disk_index::{HoldId, PageSlot};
+use std::collections::{BTreeMap, HashSet};
 use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -67,6 +68,11 @@ impl Pin {
 /// not consume the spill-hold cap.
 pub(super) struct Pins {
     pub entries: HashMap<(FillId, ObjectVersion), Pin>,
+    /// Ordered live deadlines. Renewal replaces the old deadline rather than
+    /// accumulating stale work for a later maintenance turn.
+    pub expirations: BTreeMap<Instant, HashSet<(FillId, ObjectVersion)>>,
+    /// Only zero-count segments whose clear a checkpoint freeze deferred.
+    pub deferred: HashSet<SegmentId>,
     /// Reverse index of member pages: version -> page -> fills whose entry
     /// contains that page. Lookups visit only the fills listed here instead of
     /// scanning every entry. Expired but unswept entries stay indexed until
@@ -90,12 +96,41 @@ impl Pins {
     pub fn new(_clock: &racer_io::Clock) -> Self {
         Self {
             entries: HashMap::default(),
+            expirations: BTreeMap::new(),
+            deferred: HashSet::new(),
             page_fills: HashMap::default(),
             owners: HashMap::default(),
             members: 0,
             segments: None,
             segment_pages: HashMap::default(),
             percent: DEFAULT_PIN_PERCENT,
+        }
+    }
+
+    pub(super) fn note_deadline(
+        &mut self,
+        key: &(FillId, ObjectVersion),
+        previous: Option<Instant>,
+        deadline: Instant,
+    ) {
+        if previous == Some(deadline) {
+            return;
+        }
+        if let Some(previous) = previous {
+            self.forget_deadline(key, previous);
+        }
+        self.expirations
+            .entry(deadline)
+            .or_default()
+            .insert(key.clone());
+    }
+
+    fn forget_deadline(&mut self, key: &(FillId, ObjectVersion), deadline: Instant) {
+        if let Some(keys) = self.expirations.get_mut(&deadline) {
+            keys.remove(key);
+            if keys.is_empty() {
+                self.expirations.remove(&deadline);
+            }
         }
     }
 
@@ -172,25 +207,35 @@ impl Pins {
     /// the thaw instead of leaving the table protected forever.
     fn clear_released(&mut self, segment: SegmentId) {
         let Some(segments) = self.segments.clone() else {
+            self.deferred.remove(&segment);
             self.segment_pages.remove(&segment);
             return;
         };
         if matches!(segments.clear_pinned(segment), Err(page_alloc::Error::Busy)) {
+            self.deferred.insert(segment);
             return;
         }
+        self.deferred.remove(&segment);
         self.segment_pages.remove(&segment);
     }
 
     /// Retry segment clears a checkpoint freeze deferred.
     fn retry_released(&mut self) {
-        let pending: Vec<_> = self
-            .segment_pages
-            .iter()
-            .filter(|(_, count)| **count == 0)
-            .map(|(segment, _)| *segment)
-            .collect();
+        if self
+            .segments
+            .as_ref()
+            .is_some_and(|segments| segments.reuse_frozen())
+        {
+            return;
+        }
+        let pending: Vec<_> = self.deferred.iter().copied().collect();
         for segment in pending {
-            self.clear_released(segment);
+            if self.segment_pages.get(&segment) == Some(&0) {
+                self.clear_released(segment);
+            } else {
+                // A new holder may have reclaimed the segment before thaw.
+                self.deferred.remove(&segment);
+            }
         }
     }
 
@@ -293,7 +338,8 @@ impl Pins {
             self.owners.remove(&id);
         }
         if empty {
-            self.entries.remove(key);
+            let pin = self.entries.remove(key).expect("empty pin");
+            self.forget_deadline(key, pin.monotonic);
         }
         for number in dropped {
             self.forget_member(&key.1, number, key.0);
@@ -308,6 +354,7 @@ impl Pins {
         let Some(pin) = self.entries.remove(key) else {
             return;
         };
+        self.forget_deadline(key, pin.monotonic);
         self.members -= pin.pages.len();
         for number in pin.pages.iter() {
             self.forget_member(&key.1, number, key.0);
@@ -363,17 +410,19 @@ impl Pins {
         mut expired: impl FnMut((FillId, ObjectVersion)),
     ) -> usize {
         self.retry_released();
-        let due: Vec<_> = self
-            .entries
-            .iter()
-            .filter(|(_, pin)| !pin.live(clock))
-            .map(|(key, _)| key.clone())
-            .take(budget)
-            .collect();
-        let count = due.len();
-        for key in due {
+        let now = clock.now();
+        let mut count = 0;
+        while count < budget {
+            let Some((deadline, keys)) = self.expirations.first_key_value() else {
+                break;
+            };
+            if *deadline > now {
+                break;
+            }
+            let key = keys.iter().next().expect("deadline has pins").clone();
             self.drop_key(pages, &key);
             expired(key);
+            count += 1;
         }
         count
     }
