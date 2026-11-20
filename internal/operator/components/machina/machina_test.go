@@ -553,6 +553,8 @@ Apply ClusterRole/unbounded-daemon-controller-machine
 Apply ClusterRoleBinding/unbounded-daemon-controller-machine
 Apply ClusterRoleBinding/unbounded-bootstrapper-node
 Apply ClusterRoleBinding/unbounded-bootstrapper-node-autoapprove
+Apply ValidatingAdmissionPolicy/unbounded-machineoperation-parent-status
+Apply ValidatingAdmissionPolicyBinding/unbounded-machineoperation-parent-status
 `
 
 	if got := plan.Summary(); got != want {
@@ -581,7 +583,9 @@ func TestExecutionOrderGolden(t *testing.T) {
 	}
 
 	// Identity, then the config the Deployment mounts, then the Deployment,
-	// then the Service that fronts it.
+	// then the Service that fronts it. Admission policies come last, as for
+	// every component; the one here guards the status of selector
+	// MachineOperations that the fan-out controller in the Deployment keeps.
 	want := `Apply ServiceAccount/unbounded-system/machina-controller
 Apply Role/unbounded-system/machina-controller
 Apply RoleBinding/unbounded-system/machina-controller
@@ -594,6 +598,8 @@ Apply ClusterRoleBinding/unbounded-bootstrapper-node-autoapprove
 CreateIfAbsent ConfigMap/unbounded-system/machina-config
 Apply Service/unbounded-system/machina-controller
 Apply Deployment/unbounded-system/machina-controller
+Apply ValidatingAdmissionPolicy/unbounded-machineoperation-parent-status
+Apply ValidatingAdmissionPolicyBinding/unbounded-machineoperation-parent-status
 `
 
 	if got != want {

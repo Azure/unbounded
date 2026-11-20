@@ -34,6 +34,7 @@ NODE_LABEL_KEY = "unbounded-cloud.io/smoke-test"
 NODE_LABEL_VALUE = "metalman"
 METALMAN_NAMESPACE = "unbounded-system"
 METALMAN_CONTROLLER_SA = "metalman-controller"
+MACHINA_CONTROLLER_SA = "machina-controller"
 VM_NAME = "unbounded-metal-smoke"
 NET_NAME = "unbounded-metal-smoke"
 SUBNET = "192.168.200"
@@ -61,6 +62,7 @@ AGENT_IMAGE_NAME = f"localhost:{REGISTRY_PORT}/unbounded/agent-ubuntu2404:smoke"
 # bridge IP so the VM can reach the registry over the virtual network.
 AGENT_IMAGE_NAME_VM = f"{SERVER_IP}:{REGISTRY_PORT}/unbounded/agent-ubuntu2404:smoke"
 BINARY = REPO_ROOT / "bin" / "metalman"
+MACHINA_BINARY = REPO_ROOT / "bin" / "machina"
 AGENT_BINARY = REPO_ROOT / "bin" / "unbounded-agent"
 KUBECTL_UNBOUNDED = REPO_ROOT / "bin" / "kubectl-unbounded"
 SERIAL_SOCK = TMPDIR / "console.sock"
@@ -990,6 +992,50 @@ def create_machine_operation(
     return name
 
 
+def create_selector_operation(name: str, kind: str, site: str, *, ttl_seconds: int = 3600) -> str:
+    operation = {
+        "apiVersion": API_VERSION,
+        "kind": "MachineOperation",
+        "metadata": {"name": name},
+        "spec": {
+            "operationKind": kind,
+            "machineSelector": {"matchLabels": {f"{API_GROUP}/site": site}},
+            "ttlSecondsAfterFinished": ttl_seconds,
+        },
+    }
+    kubectl(["apply", "-f", "-"], input=json.dumps(operation).encode(), stdout=DEVNULL)
+    return name
+
+
+def wait_selector_operation_complete(name: str, *, machines: int, timeout: int = 1800) -> None:
+    """Wait for a selector operation. Its status carries counts, not targets."""
+    log(f"  Waiting for selector MachineOperation '{name}' to complete...")
+    for elapsed in range(timeout):
+        check_procs()
+        result = subprocess.run(
+            [KUBECTL, "get", f"machineoperations.{API_GROUP}", name, "-o", "json"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            status = json.loads(result.stdout).get("status", {})
+            phase = status.get("phase", "")
+            message = status.get("message", "")
+            summary = status.get("summary", {})
+            if phase == "Complete":
+                if summary.get("total") != machines or summary.get("complete") != machines:
+                    die(f"MachineOperation '{name}' completed with unexpected summary: {summary}")
+                log(f"  MachineOperation '{name}' completed: {message}")
+                return
+            if phase == "Failed":
+                die(f"MachineOperation '{name}' failed: {message}; summary={summary}")
+            if elapsed > 0 and elapsed % 30 == 0:
+                log(f"    ({elapsed}s) MachineOperation phase={phase or 'empty'} message={message or 'empty'}")
+        elif elapsed > 0 and elapsed % 30 == 0:
+            log(f"    ({elapsed}s) MachineOperation '{name}' not found yet")
+        time.sleep(1)
+    die(f"Timed out waiting for MachineOperation '{name}'")
+
+
 def run_kubectl_unbounded_operation(args: list[str], log_name: str) -> subprocess.Popen[Any]:
     proc = spawn([str(KUBECTL_UNBOUNDED), "machine", *args], TMPDIR / log_name)
     log(f"  kubectl-unbounded {' '.join(args)} PID={proc.pid}")
@@ -1050,10 +1096,10 @@ def run_operation_smoke_suite() -> None:
     wait_node_boot_id_changed(NODE_NAME, boot_id, timeout=600)
     boot_id = get_node_boot_id(NODE_NAME)
 
-    # By machineRef: this environment runs metalman without machina-controller,
-    # which is what turns a selector operation into per-machine operations.
-    reboot = create_machine_operation("smoke-host-reboot", "HostHardReboot")
-    wait_machine_operation_complete(reboot, timeout=600)
+    # By selector: machina-controller creates one operation for the machine
+    # and metalman executes it.
+    reboot = create_selector_operation("smoke-selector-host-reboot", "HostHardReboot", SITE)
+    wait_selector_operation_complete(reboot, machines=1, timeout=600)
     wait_vm_state("running", timeout=180)
     wait_k8s_node(NODE_NAME, timeout=300)
     wait_node_boot_id_changed(NODE_NAME, boot_id, timeout=600)
@@ -1210,8 +1256,12 @@ def main() -> None:
     log("Rendering machina and net manifests")
     run(["make", "machina-manifests", "net-manifests"], cwd=str(REPO_ROOT))
 
-    log("Building metalman, kubectl-unbounded, and unbounded-agent (parallel)")
+    log("Building metalman, machina, kubectl-unbounded, and unbounded-agent (parallel)")
     go_builds: list[tuple[str, subprocess.Popen[Any]]] = [
+        ("machina", subprocess.Popen(
+            ["go", "build", "-o", str(MACHINA_BINARY), "./cmd/machina"],
+            cwd=str(REPO_ROOT),
+        )),
         ("metalman", subprocess.Popen(
             ["go", "build", "-o", str(BINARY), "./cmd/metalman"],
             cwd=str(REPO_ROOT),
@@ -1240,6 +1290,12 @@ def main() -> None:
     kubectl(["apply", "--server-side", "--force-conflicts", "-f", str(REPO_ROOT / "deploy" / "machina" / "rendered" / "01-namespace.yaml")])
     kubectl(["apply", "--server-side", "--force-conflicts", "-f", str(REPO_ROOT / "deploy" / "machina" / "crd")])
     kubectl(["apply", "--server-side", "--force-conflicts", "-f", str(REPO_ROOT / "deploy" / "machina" / "rendered" / "06-metalman-rbac.yaml")])
+    # machina-controller turns a selector MachineOperation into one operation
+    # per machine, which metalman then executes. It needs its role and the
+    # policy that guards the status of selector operations.
+    kubectl(["apply", "--server-side", "--force-conflicts", "-f", str(REPO_ROOT / "deploy" / "machina" / "rendered" / "02-rbac.yaml")])
+    kubectl(["apply", "--server-side", "--force-conflicts", "-f",
+             str(REPO_ROOT / "deploy" / "machina" / "rendered" / "08-machineoperation-parent-status-policy.yaml")])
     # Earlier releases auto-approved any kubelet client CSR from metalman tokens.
     run_quiet([KUBECTL, "delete", "clusterrolebinding", "metalman:node-autoapprove-bootstrap", "--ignore-not-found"], check=True)
 
@@ -1372,6 +1428,22 @@ def main() -> None:
         *metalman_isolation_args(),
     ], TMPDIR / "serve.log")
     log(f"  serve PID={proc.pid}")
+
+    log("Starting machina-controller")
+    machina_kubeconfig = TMPDIR / "machina-controller.kubeconfig"
+    write_service_account_kubeconfig(METALMAN_NAMESPACE, MACHINA_CONTROLLER_SA, machina_kubeconfig)
+    machina_config = TMPDIR / "machina-config.yaml"
+    # metalman's health probe already listens on 8081.
+    machina_config.write_text(
+        f'apiServerEndpoint: "{server_url}"\n'
+        'metricsAddr: "127.0.0.1:18080"\nprobeAddr: "127.0.0.1:18081"\nenableLeaderElection: false\n',
+        encoding="utf-8",
+    )
+    machina_proc = spawn([
+        "env", f"KUBECONFIG={machina_kubeconfig}", f"POD_NAMESPACE={METALMAN_NAMESPACE}",
+        str(MACHINA_BINARY), "controller", f"--config={machina_config}",
+    ], TMPDIR / "machina.log")
+    log(f"  machina-controller PID={machina_proc.pid}")
 
     time.sleep(2)
     check_procs()

@@ -1,0 +1,55 @@
+# Makes two kinds of MachineOperation status writable only by an identity
+# that may also create MachineOperations: the status of a selector operation,
+# and the status of a held operation.
+#
+# Selector operation (a parent). The fan-out controller in machina-controller
+# keeps its record of a rollout there: the counts, whether every child exists
+# (the TargetsResolved condition) and the phase. Without this policy any
+# identity that may update machineoperations/status, such as the agent daemon
+# group, which reports the operations it runs itself, could mark a parent
+# resolved or finished, or forge its counts.
+#
+# Held operation (spec.suspend is true). It has not started, so no executor
+# has anything to report on it. A status written on it by anyone else would
+# be believed later: marked Complete, the machine would be skipped; marked
+# InProgress, it would hold a place in the rollout for good.
+#
+# An identity that may create MachineOperations could run the same operation
+# on any machine directly, so it gains nothing by either write. The
+# machina-controller role grants create. The agent daemon role does not, and
+# must never be granted it.
+#
+# Only the status subresource matches: the API server drops status on create
+# and on an update of the main resource. A machineRef operation that is not
+# held is not affected, so an agent or provider controller reports the
+# operations it runs as before.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: unbounded-machineoperation-parent-status
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups:
+          - "unbounded-cloud.io"
+        apiVersions:
+          - "*"
+        operations:
+          - "UPDATE"
+        resources:
+          - "machineoperations/status"
+  validations:
+    - expression: "!(has(object.spec.machineSelector) || (has(object.spec.suspend) && object.spec.suspend)) || authorizer.group('unbounded-cloud.io').resource('machineoperations').check('create').allowed()"
+      message: "only an identity allowed to create machineoperations may write the status of a selector operation or of a held operation"
+      reason: Forbidden
+
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: unbounded-machineoperation-parent-status
+spec:
+  policyName: unbounded-machineoperation-parent-status
+  validationActions:
+    - "Deny"

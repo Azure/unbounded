@@ -9,6 +9,9 @@ on:
       - cmd/agent/**
       - cmd/metalman/**
       - internal/metalman/**
+      - cmd/machina/**
+      - pkg/machineops/fanout/**
+      - deploy/machina/*.tmpl
       - api/machina/v1alpha3/**
       - deploy/machina/crd/**
       - images/agent-ubuntu2404/**
@@ -28,6 +31,9 @@ on:
       - cmd/agent/**
       - cmd/metalman/**
       - internal/metalman/**
+      - cmd/machina/**
+      - pkg/machineops/fanout/**
+      - deploy/machina/*.tmpl
       - api/machina/v1alpha3/**
       - deploy/machina/crd/**
       - images/agent-ubuntu2404/**
