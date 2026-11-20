@@ -852,6 +852,162 @@ pub fn http_date(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        thread::{self, JoinHandle},
+    };
+
+    fn mock_list_server(
+        responses: Vec<(u16, String)>,
+    ) -> (AzureContainerUrl, JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = AzureContainerUrl::parse(&format!(
+            "http://{}/devstoreaccount1/models",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (status, body) in responses {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "missing list request");
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(error) => panic!("accept: {error}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                while find(&request, b"\r\n\r\n").is_none() {
+                    let mut buf = [0; 1024];
+                    let n = stream.read(&mut buf).unwrap();
+                    assert!(n > 0, "incomplete request");
+                    request.extend_from_slice(&buf[..n]);
+                    assert!(request.len() < 64 * 1024);
+                }
+                requests.push(String::from_utf8(request).unwrap());
+                write!(stream, "HTTP/1.1 {status} Mock\r\nContent-Length: {}\r\nContent-Type: application/xml\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+            requests
+        });
+        (url, server)
+    }
+
+    fn list_from_mock(
+        url: &AzureContainerUrl,
+        prefixes: &[String],
+    ) -> Result<Vec<ListedObject>, ListError> {
+        let client = Client {
+            settings: Settings {
+                trust_bundle: PathBuf::new(),
+                authority_host: String::new(),
+                federated_token_file: None,
+            },
+            trust: None,
+            tokens: RefCell::new(BTreeMap::new()),
+        };
+        // Spawn the operation as production does. The task waker notifies the
+        // reactor when the DNS helper thread completes; block_on's test-only
+        // flag waker does not interrupt a parked io_uring wait.
+        let mut executor = rt::Executor::new(32).unwrap();
+        let result = std::rc::Rc::new(RefCell::new(None));
+        let completed = result.clone();
+        let url = url.clone();
+        let prefixes = prefixes.to_vec();
+        executor.enter(|| {
+            rt::spawn(async move {
+                *completed.borrow_mut() = Some(
+                    client
+                        .list(&url, &AzureCredential::Anonymous, "test", &prefixes)
+                        .await,
+                );
+            })
+            .unwrap();
+        });
+        executor.run(|| result.borrow().is_some());
+        result.borrow_mut().take().unwrap()
+    }
+
+    #[test]
+    fn client_lists_all_pages_and_prefixes_with_opaque_markers() {
+        let last = PAGE.replace("<NextMarker>next+/=</NextMarker>", "<NextMarker />\n");
+        let (url, server) = mock_list_server(vec![
+            // Azure may return no blobs and still require another request.
+            (200, "<EnumerationResults><Blobs /><NextMarker>next+/=&amp;</NextMarker></EnumerationResults>".into()),
+            (200, last.clone()),
+            (200, last),
+        ]);
+        let objects = list_from_mock(&url, &["a/ +&".into(), "a/".into()]).unwrap();
+        assert_eq!(objects, parse_list(PAGE.as_bytes()).unwrap().blobs);
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 3);
+        let base = "GET /devstoreaccount1/models?restype=container&comp=list&maxresults=5000";
+        assert!(requests[0].starts_with(&format!("{base}&prefix=a%2F%20%2B%26 HTTP/1.1\r\n")));
+        assert!(requests[1].starts_with(&format!(
+            "{base}&prefix=a%2F%20%2B%26&marker=next%2B%2F%3D%26 HTTP/1.1\r\n"
+        )));
+        assert!(requests[2].starts_with(&format!("{base}&prefix=a%2F HTTP/1.1\r\n")));
+        for request in requests {
+            let request = request.to_ascii_lowercase();
+            assert!(request.contains(&format!("\r\nx-ms-version: {AZURE_SERVICE_VERSION}\r\n")));
+            assert!(request.contains("\r\naccept: application/xml\r\n"));
+            assert!(request.contains(&format!("\r\nhost: {}\r\n", url.host_header())));
+            assert!(!request.contains("\r\nauthorization:"));
+        }
+    }
+
+    #[test]
+    fn client_maps_http_errors_and_discards_partial_listings() {
+        for (status, expected) in [
+            (401, ListError::Forbidden),
+            (403, ListError::Forbidden),
+            (404, ListError::Failed),
+            (429, ListError::Failed),
+            (500, ListError::Failed),
+            (503, ListError::Failed),
+        ] {
+            let (url, server) = mock_list_server(vec![
+                (200, PAGE.into()),
+                (status, "<Error><Code>ServiceError</Code></Error>".into()),
+            ]);
+            assert_eq!(
+                list_from_mock(&url, &[String::new()]),
+                Err(expected),
+                "{status}"
+            );
+            let requests = server.join().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert!(!requests[0].contains("&prefix="));
+            assert!(requests[1].contains("&marker=next%2B%2F%3D "));
+        }
+    }
+
+    #[test]
+    fn client_rejects_bad_xml_without_returning_partial_results() {
+        for body in [
+            "<EnumerationResults><Blobs>",
+            "<EnumerationResults><Blobs><Blob><Name Encoded='true'>bad%GG</Name><Etag>0x12</Etag><Content-Length>1</Content-Length></Blob></Blobs></EnumerationResults>",
+            "<EnumerationResults><Blobs><Blob><Name>bad</Name><Etag>W/\"0x12\"</Etag><Content-Length>1</Content-Length></Blob></Blobs></EnumerationResults>",
+        ] {
+            let (url, server) = mock_list_server(vec![(200, PAGE.into()), (200, body.into())]);
+            assert_eq!(
+                list_from_mock(&url, &[String::new()]),
+                Err(ListError::Failed)
+            );
+            assert_eq!(server.join().unwrap().len(), 2);
+        }
+    }
 
     const PAGE: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <EnumerationResults ServiceEndpoint="https://a.blob.core.windows.net/" ContainerName="models">
