@@ -67,6 +67,13 @@ impl ClusterControl for Embedded {
     fn fills(&self) -> Vec<racer_authority::FillView> {
         self.0.fills()
     }
+
+    fn fills_for(
+        &self,
+        context: Option<racer_authority::FillContext>,
+    ) -> Vec<racer_authority::FillView> {
+        self.0.fills_for(context)
+    }
 }
 
 fn run() -> std::result::Result<(), (&'static str, Error)> {

@@ -132,7 +132,10 @@ entries. Its digest is the SHA-256 of a canonical JSON array of
 outside the digest because it is not part of a page's identity. Two processes
 that list the same object versions produce the same digest.
 
-Every Racer process lists independently. The primary writes its digest to
+The primary and each cache's pool members list independently. Other nodes wait
+without listing; pool membership and admission inputs come from the publication
+the local dataplane adopted, not an independent selector evaluation. The primary
+lists even when it is outside the pool so it can write status. It writes its digest to
 `status.manifest.digest`; a node includes its own digest in its progress
 report, and the primary counts only reports whose digest and spec generation
 match its own. A node that listed a different set does not corrupt the
@@ -145,9 +148,9 @@ immutable manifest: a continuously changing origin can still prevent agreement,
 and a node cannot reconstruct object versions no longer returned by the origin.
 Matching listings otherwise re-list at `resyncInterval`.
 
-This trades N list calls per resync for having no manifest wire format, no
-ConfigMap, or manifest-distribution RBAC. Listing needs a credential with list permission
-on the container, which is broader than blob read. The cache's existing
+This trades independent listing per participating process for no manifest wire
+format, ConfigMap, or manifest-distribution RBAC. Listing needs a credential with list
+permission on the container, which is broader than blob read. The cache's existing
 credential is used; a fill on a cache whose credential cannot list is rejected
 with `Forbidden` rather than falling back to a partial set.
 

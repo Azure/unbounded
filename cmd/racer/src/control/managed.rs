@@ -44,6 +44,14 @@ pub trait ClusterControl: Send + Sync + 'static {
     fn fills(&self) -> Vec<racer_authority::FillView> {
         Vec::new()
     }
+
+    /// Supply the local dataplane publication inputs while reading fills.
+    fn fills_for(
+        &self,
+        _context: Option<racer_authority::FillContext>,
+    ) -> Vec<racer_authority::FillView> {
+        self.fills()
+    }
 }
 
 /// Cluster state returned once cluster control has initialized or joined it.
@@ -147,7 +155,7 @@ fn start_with(
         fill_report: std::sync::Arc::new(move |progress, pinnable| {
             fill_reporter.report_fill_progress(progress, pinnable)
         }),
-        fills: std::sync::Arc::new(move || fills.fills()),
+        fills: std::sync::Arc::new(move |context| fills.fills_for(context)),
         block_devices: bootstrapped.block_devices,
     };
     adopt(config, bootstrapped.cluster, managed)
@@ -300,7 +308,7 @@ mod tests {
             endpoints: Default::default(),
             report: std::sync::Arc::new(|_, _| {}),
             fill_report: std::sync::Arc::new(|_, _| {}),
-            fills: std::sync::Arc::new(Vec::new),
+            fills: std::sync::Arc::new(|_| Vec::new()),
             block_devices: Some("nvme*".into()),
         }
     }

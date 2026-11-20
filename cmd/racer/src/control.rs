@@ -96,7 +96,9 @@ pub type Report = Arc<dyn Fn(u32, Vec<wire::RailMapping>) + Send + Sync>;
 pub type FillReport = Arc<dyn Fn(Vec<racer_authority::FillProgress>, Option<u64>) + Send + Sync>;
 
 /// Read the process-wide ClusterCacheFill view from cluster control.
-pub type Fills = Arc<dyn Fn() -> Vec<racer_authority::FillView> + Send + Sync>;
+pub type Fills = Arc<
+    dyn Fn(Option<racer_authority::FillContext>) -> Vec<racer_authority::FillView> + Send + Sync,
+>;
 
 /// Managed-mode bindings from the embedded authority service.
 #[derive(Clone)]
@@ -168,6 +170,27 @@ pub struct Snapshot {
     content_hash: [u8; 32],
 
     membership_hash: [u8; 32],
+}
+
+impl Snapshot {
+    /// Process-local fill inputs from the publication the dataplane adopted.
+    pub(crate) fn fill_context(&self, node: &wire::NodeId) -> racer_authority::FillContext {
+        racer_authority::FillContext {
+            membership: self.membership.version.0,
+            page_size: self.page_size.get(),
+            pool_sizes: self
+                .caches
+                .iter()
+                .map(|cache| (cache.id.clone(), self.membership.pool_size(&cache.id)))
+                .collect(),
+            local_caches: self
+                .caches
+                .iter()
+                .filter(|cache| self.membership.serves(&cache.id, node))
+                .map(|cache| cache.id.clone())
+                .collect(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3376,6 +3399,35 @@ mod caches_tests {
             mode: racer_wire::control::CacheMode::default(),
             origin: None,
         }
+    }
+
+    #[test]
+    fn fill_context_contains_pool_sizes_and_only_locally_served_caches() {
+        use crate::topology::tests::pool_tests::{NARROW, pooled};
+        let membership = Arc::new(pooled(7, 3, vec![1], None));
+        let mut snapshot = Snapshot::membership_fixture(membership.clone());
+        snapshot.caches = Arc::new(Caches::new(vec![
+            definition("wide", 0),
+            definition(NARROW, 0),
+        ]));
+        let wide = CacheId("wide".into());
+        let narrow = CacheId(NARROW.into());
+        let outside = snapshot.fill_context(&membership.members()[0].node);
+        assert_eq!(outside.membership, 7);
+        assert_eq!(outside.page_size, snapshot.page_size.get());
+        assert_eq!(outside.pool_sizes[&wide], 3);
+        assert_eq!(outside.pool_sizes[&narrow], 1);
+        assert!(outside.local_caches.contains(&wide));
+        assert!(!outside.local_caches.contains(&narrow));
+        let inside = snapshot.fill_context(&membership.members()[1].node);
+        assert!(inside.local_caches.contains(&narrow));
+        let absent = snapshot.fill_context(&wire::NodeId("not-a-member".into()));
+        assert!(absent.local_caches.is_empty());
+        snapshot.membership = Arc::new(pooled(8, 3, Vec::new(), Some(&membership)));
+        let empty = snapshot.fill_context(&membership.members()[1].node);
+        assert_eq!(empty.membership, 8);
+        assert_eq!(empty.pool_sizes[&narrow], 0);
+        assert!(!empty.local_caches.contains(&narrow));
     }
 
     #[test]

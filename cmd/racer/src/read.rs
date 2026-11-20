@@ -476,6 +476,15 @@ impl Coordinator {
             .map(|snapshot| snapshot.membership.clone())
     }
 
+    /// Fill planning inputs from this node's adopted publication, if available.
+    pub(crate) fn fill_context(&self) -> Option<racer_authority::FillContext> {
+        self.snapshots
+            .current()
+            .ok()
+            .flatten()
+            .map(|snapshot| snapshot.fill_context(&self.local_node()))
+    }
+
     /// The membership for work on `cache`, or `Unavailable` when the cache is
     /// not published or not ready.
     pub(crate) fn cache_membership(

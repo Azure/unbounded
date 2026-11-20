@@ -127,6 +127,8 @@ pub struct Shared {
     pub auth_budget: RefCell<crate::rules::authz::ApiBudget>,
     /// Process-wide ClusterCacheFills by UID.
     pub fills: RefCell<BTreeMap<String, crate::fills::FillView>>,
+    /// Publication adopted by the local dataplane, including its cache pools.
+    pub fill_context: RefCell<Option<crate::fills::FillContext>>,
     /// ClusterCacheFills listed at least once, or the CRD is absent.
     pub fills_synced: Cell<bool>,
     /// Process-wide ClusterCaches by UID, for fill cache resolution.
@@ -285,6 +287,7 @@ pub(crate) mod tests {
             authz: Default::default(),
             auth_budget: Default::default(),
             fills: RefCell::new(BTreeMap::new()),
+            fill_context: RefCell::new(None),
             fills_synced: Cell::new(false),
             fills_caches: RefCell::new(BTreeMap::new()),
             fills_caches_synced: Cell::new(false),

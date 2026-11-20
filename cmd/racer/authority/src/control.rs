@@ -61,6 +61,7 @@ struct Outer {
     report_generation: AtomicU64,
     /// Latest fill snapshot, for [`Handle::fills`].
     fills: Mutex<Vec<FillView>>,
+    fill_context: Mutex<Option<fills::FillContext>>,
     stop: AtomicBool,
     diagnostics: Mutex<Diagnostics>,
 }
@@ -307,6 +308,7 @@ impl Authority {
                 authz: Default::default(),
                 auth_budget: Default::default(),
                 fills: RefCell::new(Default::default()),
+                fill_context: RefCell::new(None),
                 fills_synced: Default::default(),
                 fills_caches: RefCell::new(Default::default()),
                 fills_caches_synced: Default::default(),
@@ -330,7 +332,7 @@ impl Authority {
                 outer.clone(),
                 report_signal.clone(),
             ))?;
-            // Fill state is process-wide: every process lists its fills.
+            // Fill state is process-wide; only the primary and pool members list.
             rt::spawn(fills::watch(shared.clone()))?;
             rt::spawn(fills::status::run(shared.clone()))?;
             rt::spawn(publish_fills(shared.clone(), outer.clone()))?;
@@ -491,6 +493,7 @@ impl Outer {
             report: Mutex::new(ReportState::default()),
             report_generation: AtomicU64::new(0),
             fills: Mutex::new(Vec::new()),
+            fill_context: Mutex::new(None),
             stop: AtomicBool::new(false),
             diagnostics: Mutex::new(Diagnostics::default()),
         })
@@ -570,6 +573,12 @@ impl Outer {
 /// Mirror the process-wide fill snapshot for [`Handle::fills`].
 async fn publish_fills(shared: Rc<Shared>, outer: Arc<Outer>) {
     while !shared.stopping.get() {
+        *shared.fill_context.borrow_mut() = outer
+            .fill_context
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        fills::recompute(&shared);
         outer.publish_fills(crate::fills::snapshot(&shared));
         rt::sleep(Duration::from_secs(2)).await;
     }
@@ -855,6 +864,17 @@ impl Handle {
             .clone()
     }
 
+    /// Supply the dataplane's adopted pool view and read process-wide fills.
+    pub fn fills_for(&self, context: Option<fills::FillContext>) -> Vec<FillView> {
+        *self
+            .outer
+            .fill_context
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = context;
+        self.notifier.notify();
+        self.fills()
+    }
+
     pub fn diagnostics(&self) -> Diagnostics {
         self.outer.diagnostics()
     }
@@ -890,6 +910,32 @@ impl Drop for Handle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fill_snapshot_loop_adopts_local_pool_context() {
+        crate::kube::fake::run(|_api, kube| async move {
+            let shared = crate::shared::tests::shared(kube);
+            let outer = Outer::new();
+            let cache = racer_wire::control::CacheId("22222222-2222-4222-8222-222222222222".into());
+            *outer.fill_context.lock().unwrap() = Some(fills::FillContext {
+                membership: 7,
+                page_size: 4096,
+                pool_sizes: [(cache.clone(), 2)].into(),
+                local_caches: [cache.clone()].into(),
+            });
+            rt::spawn(publish_fills(shared.clone(), outer.clone())).unwrap();
+            rt::sleep(Duration::from_millis(10)).await;
+            let adopted = shared.fill_context.borrow().clone().unwrap();
+            assert_eq!(adopted.membership, 7);
+            assert!(adopted.local_caches.contains(&cache));
+            assert_eq!(adopted.pool_sizes[&cache], 2);
+            // Losing the local publication closes listing eligibility again.
+            *outer.fill_context.lock().unwrap() = None;
+            rt::sleep(Duration::from_secs(3)).await;
+            assert!(shared.fill_context.borrow().is_none());
+            shared.stopping.set(true);
+        });
+    }
 
     fn progress(i: usize) -> FillProgress {
         FillProgress {

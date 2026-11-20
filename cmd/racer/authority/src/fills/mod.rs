@@ -1,7 +1,7 @@
 //! ClusterCacheFill control-plane state, listing, and status.
 //!
-//! Every Racer process watches ClusterCacheFills and ClusterCaches and lists
-//! its fills independently. The primary additionally writes fill status. Fill
+//! Every Racer process watches ClusterCacheFills and ClusterCaches. The primary
+//! and each cache's pool members list independently; the primary writes status. Fill
 //! state is process-local: it is never in the publication, the committed
 //! record, or a member record.
 
@@ -20,7 +20,7 @@ use crate::{
 };
 use serde_json::Value;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     rc::Rc,
     sync::Arc,
     time::{Duration, Instant},
@@ -45,6 +45,30 @@ pub(crate) struct ListingState {
     primary_manifest: Option<(String, String)>,
     /// Earliest retry of a successful listing that differs from the primary.
     converge_after: Option<Instant>,
+}
+
+/// Local dataplane publication inputs for fill admission and listing. Ordinary
+/// members do not load a seat's serving image, so they supply the publication
+/// they actually adopted. This is process-local, never a Pod annotation.
+#[derive(Clone, Debug)]
+pub struct FillContext {
+    pub membership: u64,
+    pub page_size: u64,
+    pub pool_sizes: BTreeMap<racer_wire::control::CacheId, usize>,
+    pub local_caches: BTreeSet<racer_wire::control::CacheId>,
+}
+
+fn should_list(shared: &Shared, cache_uid: &str) -> bool {
+    shared.is_primary.get()
+        || shared
+            .fill_context
+            .borrow()
+            .as_ref()
+            .is_some_and(|context| {
+                context
+                    .local_caches
+                    .contains(&racer_wire::control::CacheId(cache_uid.into()))
+            })
 }
 
 /// Default replicas and resync interval, matching the CRD defaults.
@@ -176,9 +200,9 @@ impl FillView {
         })
     }
 
-    /// Whether this process needs to list the origin now. `next_list` is
-    /// cleared when a spec or cache change invalidates the manifest and is set
-    /// to the next resync or to a backoff deadline after a failure.
+    /// Whether this process needs to list the origin now. A successful digest
+    /// mismatch can bring resync forward, but never overrides failure backoff.
+    /// Spec and cache identity changes clear the deadline and manifest.
     fn needs_list(&self, now: Instant, primary: bool, cache_uid: &str) -> bool {
         self.next_list.is_none_or(|at| now >= at)
             || (!primary
@@ -465,6 +489,9 @@ async fn list_fills(shared: Rc<Shared>) {
                         else {
                             return None;
                         };
+                        if !should_list(&shared, &uid) {
+                            return None;
+                        }
                         view.needs_list(now, shared.is_primary.get(), &uid)
                             .then(|| {
                                 (
@@ -483,6 +510,9 @@ async fn list_fills(shared: Rc<Shared>) {
                 if shared.stopping.get() {
                     return;
                 }
+                if !should_list(&shared, &cache_uid) {
+                    continue;
+                }
                 let key = format!("{cache_uid}/{fill_uid}");
                 let result = client.list(&url, &credential, &key, &prefixes).await;
                 let now = rt::now();
@@ -490,7 +520,9 @@ async fn list_fills(shared: Rc<Shared>) {
                 let Some(view) = fills.get_mut(&fill_uid) else {
                     continue;
                 };
-                if !view.listing_current(generation, &cache_uid) {
+                if !view.listing_current(generation, &cache_uid)
+                    || !should_list(&shared, &cache_uid)
+                {
                     continue;
                 }
                 match result {
@@ -588,6 +620,15 @@ struct Admission {
 impl Admission {
     /// Read the page size and publication admission is computed against.
     fn read(shared: &Shared) -> Self {
+        if !shared.is_primary.get() {
+            if let Some(context) = shared.fill_context.borrow().as_ref() {
+                return Self {
+                    page_size: context.page_size,
+                    membership: Some(context.membership),
+                    pool_members: context.pool_members.clone(),
+                };
+            }
+        }
         let (page_size, membership, pool_members) = {
             let serving = shared.serving.borrow();
             match serving.image.as_ref() {
@@ -626,9 +667,14 @@ impl Admission {
         let origin = catalog::fill_cache_named(&view.cache_name, caches);
         match &origin {
             FillCache::Usable { uid, .. } => {
+                let cache_changed = view.cache_uid != *uid;
                 view.cache_uid.clone_from(uid);
-                if !view.listed_cache_uid.is_empty() && view.listed_cache_uid != view.cache_uid {
-                    // A recreated or replaced cache invalidates the manifest.
+                if cache_changed
+                    || (!view.listed_cache_uid.is_empty()
+                        && view.listed_cache_uid != view.cache_uid)
+                {
+                    // A recreated or replaced cache invalidates both a manifest
+                    // and a failure deadline, including an initial failed list.
                     view.manifest = None;
                     view.error = None;
                     view.listed_generation = None;
@@ -755,6 +801,7 @@ fn install_manifest(
 ) {
     view.manifest = Some(Arc::new(manifest));
     view.listed_generation = Some(generation);
+    view.cache_uid.clone_from(&cache_uid);
     view.listed_cache_uid = cache_uid;
     view.error = None;
     view.failures = 0;
@@ -983,6 +1030,40 @@ mod tests {
     }
 
     #[test]
+    fn successful_relists_that_still_disagree_get_a_fresh_convergence_deadline() {
+        crate::kube::fake::run(|_api, kube| async move {
+            let shared = crate::shared::tests::shared(kube);
+            let mut now = rt::now();
+            let mut view = listed_view(now);
+            let cache = CacheInfo::from_json(&serde_json::json!({
+                "metadata": {"uid": view.cache_uid, "name": "models"},
+                "spec": {"origin": {"azure": {"containerURL":
+                    "https://acct.blob.core.windows.net/models"}}},
+            }));
+            shared
+                .fills_caches
+                .borrow_mut()
+                .insert(cache.uid.clone(), cache);
+            for _ in 0..3 {
+                let manifest = view.manifest.as_ref().unwrap().as_ref().clone();
+                let generation = view.generation;
+                let cache_uid = view.cache_uid.clone();
+                install_manifest(&shared, &mut view, manifest, generation, cache_uid, now);
+                let deadline = view.listing.converge_after.unwrap();
+                assert!(deadline >= now + CONVERGENCE_DELAY);
+                assert!(deadline <= now + CONVERGENCE_DELAY + LIST_BACKOFF);
+                assert!(!view.needs_list(
+                    deadline - Duration::from_millis(1),
+                    false,
+                    &view.cache_uid
+                ));
+                assert!(view.needs_list(deadline, false, &view.cache_uid));
+                now = deadline;
+            }
+        });
+    }
+
+    #[test]
     fn convergence_hint_does_not_override_failure_backoff_or_cache_identity() {
         let now = Instant::now();
         let mut view = listed_view(now);
@@ -1105,6 +1186,119 @@ mod tests {
             assert!(!view.accepted);
             assert_eq!(view.message, "TooManyObjects");
             assert_eq!(view.planned_footprint_bytes, None);
+        });
+    }
+
+    #[test]
+    fn only_primary_and_adopted_pool_members_list_origins() {
+        crate::kube::fake::run(|_api, kube| async move {
+            let shared = crate::shared::tests::shared(kube);
+            let cache = racer_wire::control::CacheId("22222222-2222-4222-8222-222222222222".into());
+            assert!(
+                !should_list(&shared, &cache.0),
+                "wait for a local publication"
+            );
+            shared.fill_context.replace(Some(FillContext {
+                membership: 7,
+                page_size: shared.config.page_size.get(),
+                pool_sizes: [(cache.clone(), 2)].into(),
+                local_caches: BTreeSet::new(),
+            }));
+            assert!(!should_list(&shared, &cache.0));
+            shared
+                .fill_context
+                .borrow_mut()
+                .as_mut()
+                .unwrap()
+                .local_caches
+                .insert(cache.clone());
+            assert!(should_list(&shared, &cache.0));
+            shared
+                .fill_context
+                .borrow_mut()
+                .as_mut()
+                .unwrap()
+                .local_caches
+                .clear();
+            assert!(
+                !should_list(&shared, &cache.0),
+                "leaving a pool stops listing"
+            );
+            shared.is_primary.set(true);
+            assert!(
+                should_list(&shared, &cache.0),
+                "primary lists even outside the pool"
+            );
+        });
+    }
+
+    #[test]
+    fn ordinary_member_admission_uses_its_dataplane_publication() {
+        crate::kube::fake::run(|_api, kube| async move {
+            let shared = crate::shared::tests::shared(kube);
+            assert!(shared.serving.borrow().image.is_none());
+            let cache = racer_wire::control::CacheId("22222222-2222-4222-8222-222222222222".into());
+            shared.fill_context.replace(Some(FillContext {
+                membership: 7,
+                page_size: 4096,
+                pool_sizes: [(cache, 1)].into(),
+                local_caches: BTreeSet::new(),
+            }));
+            let admission = Admission::read(&shared);
+            assert_eq!(admission.membership, Some(7));
+            assert_eq!(admission.page_size, 4096);
+            assert_eq!(
+                admission.pool_sizes.values().copied().collect::<Vec<_>>(),
+                vec![1]
+            );
+            // The primary must continue to plan against its authoritative image,
+            // not a dataplane publication that can lag its next commit.
+            shared.is_primary.set(true);
+            assert_eq!(Admission::read(&shared).membership, None);
+        });
+    }
+
+    #[test]
+    fn replacing_cache_identity_resets_a_rejected_listing() {
+        crate::kube::fake::run(|_api, kube| async move {
+            let shared = crate::shared::tests::shared(kube);
+            let now = rt::now();
+            let cache = CacheInfo::from_json(&serde_json::json!({
+                "metadata": {"uid": "33333333-3333-4333-8333-333333333333", "name": "models"},
+                "spec": {"origin": {"azure": {"containerURL":
+                    "https://acct.blob.core.windows.net/models"}}},
+            }));
+            shared
+                .fills_caches
+                .borrow_mut()
+                .insert(cache.uid.clone(), cache);
+            for previously_listed in [true, false] {
+                let mut view = listed_view(now);
+                let old_cache = view.cache_uid.clone();
+                let generation = view.generation;
+                if !previously_listed {
+                    view.manifest = None;
+                    view.listed_cache_uid.clear();
+                    view.listed_generation = None;
+                }
+                listing_failed(
+                    &shared,
+                    &mut view,
+                    ListingFailure::Invalid(ManifestError::TooManyObjects),
+                    now,
+                );
+                recompute_view(&shared, &mut view);
+                assert_ne!(view.cache_uid, old_cache);
+                assert!(view.manifest.is_none());
+                assert!(view.error.is_none());
+                assert_eq!(view.failures, 0);
+                assert!(view.needs_list(now, false, &view.cache_uid));
+                assert!(
+                    !view.listing_current(generation, &old_cache),
+                    "discard the old cache's in-flight result"
+                );
+                assert!(!view.listing_current(generation + 1, &view.cache_uid));
+            }
         });
     }
 

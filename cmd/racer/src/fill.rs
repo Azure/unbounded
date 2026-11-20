@@ -379,7 +379,7 @@ impl FillController {
 
     /// Adopt replacement plans without releasing pins they still require.
     fn refresh(&mut self, now: Instant) {
-        let views = (self.fills)();
+        let views = (self.fills)(self.coordinator.fill_context());
         let mut seen = BTreeSet::new();
         for view in views {
             if !view.accepted {

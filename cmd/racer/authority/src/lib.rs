@@ -65,7 +65,7 @@ pub mod webhook;
 
 pub use config::{Config, Rotation, SeatPolicy};
 pub use control::{Authority, Bootstrap, Diagnostics, Handle, Role, start};
-pub use fills::{FillObject, FillView, Manifest};
+pub use fills::{FillContext, FillObject, FillView, Manifest};
 pub use racer_io::exec::Next;
 pub use shared::PrimaryView;
 
