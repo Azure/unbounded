@@ -50,8 +50,26 @@ func registryAuthWorkloadEvents(env *component.Env, match func(client.Object) bo
 			oldDS, oldOK := ev.ObjectOld.(*appsv1.DaemonSet)
 			newDS, newOK := ev.ObjectNew.(*appsv1.DaemonSet)
 
-			return oldOK && newOK && match(newDS) && newDS.Name == registryAuthName &&
-				registryAuthWorkloadReady(oldDS) != registryAuthWorkloadReady(newDS)
+			if !oldOK || !newOK || !match(newDS) || newDS.Name != registryAuthName {
+				return false
+			}
+
+			// Fire on the all-Ready boolean change, or on the transition to a
+			// fully rolled-out but fully unavailable state (the RegistryAuthFailed
+			// criterion). The latter ensures a degradation from partial to zero
+			// availability still triggers a plan, while ordinary rollout progress
+			// (both states partially available) is ignored.
+			oldReady := registryAuthWorkloadReady(oldDS)
+			newReady := registryAuthWorkloadReady(newDS)
+
+			if oldReady != newReady {
+				return true
+			}
+
+			oldFailed := registryAuthFullyUnavailable(oldDS)
+			newFailed := registryAuthFullyUnavailable(newDS)
+
+			return oldFailed != newFailed
 		},
 	}
 }
@@ -60,6 +78,18 @@ func registryAuthWorkloadReady(ds *appsv1.DaemonSet) bool {
 	return ds.Status.ObservedGeneration >= ds.Generation &&
 		ds.Status.UpdatedNumberScheduled == ds.Status.DesiredNumberScheduled &&
 		ds.Status.NumberAvailable == ds.Status.DesiredNumberScheduled
+}
+
+// registryAuthFullyUnavailable reports whether the DaemonSet is fully rolled out
+// (all scheduled nodes updated) with zero available installers, the state the
+// RegistryAuthFailed condition asserts. It is a distinct boolean from
+// registryAuthWorkloadReady so the watch predicate can fire on the transition
+// into this state even though both are "not all Ready."
+func registryAuthFullyUnavailable(ds *appsv1.DaemonSet) bool {
+	return ds.Status.ObservedGeneration >= ds.Generation &&
+		ds.Status.DesiredNumberScheduled > 0 &&
+		ds.Status.UpdatedNumberScheduled == ds.Status.DesiredNumberScheduled &&
+		ds.Status.NumberAvailable == 0
 }
 
 func planRegistryAuth(ctx context.Context, env *component.Env) ([]component.Operation, *component.Result, error) {
@@ -170,18 +200,22 @@ func planRegistryAuth(ctx context.Context, env *component.Env) ([]component.Oper
 
 	result := component.NotReady("RegistryAuthInstalling", "installing the stock ACR credential provider on opted-in Flex nodes; inspect DaemonSet/"+registryAuthName+" and its pod logs")
 
-	// A rolled-out DaemonSet whose installers are all NotReady is a terminal
-	// failure, not an install in progress: every targeted node's installer has
-	// reported that it cannot configure the kubelet (unsupported layout, feature
-	// gate disabled, or restart budget exhausted). Surface it as a distinct
-	// condition reason so it stops reading as an infinite install.
+	// A fully rolled-out DaemonSet with zero available installers is a failure,
+	// not an install in progress: every targeted node's installer is reporting
+	// that it cannot configure the kubelet (unsupported layout, disabled feature
+	// gate, or exhausted restart budget). The condition is only asserted once
+	// the rollout is complete (all scheduled nodes updated) and the observed
+	// generation matches, so a transient zero during a pod recreation is not
+	// mistaken for a terminal failure. Partial availability (some Ready, some
+	// failed) is reported via the pod logs; the Site condition surfaces the
+	// all-unavailable case as a distinct reason.
 	if workloadMatches && existing.Spec.Template.Annotations[registryAuthHash] == digest &&
 		existing.Status.ObservedGeneration >= existing.Generation &&
 		existing.Status.DesiredNumberScheduled > 0 &&
 		existing.Status.UpdatedNumberScheduled == existing.Status.DesiredNumberScheduled &&
 		existing.Status.NumberAvailable == 0 {
 		result = component.NotReady("RegistryAuthFailed",
-			"stock ACR credential provider cannot be configured on targeted Flex nodes; every installer reports failure; inspect DaemonSet/"+registryAuthName+" pod logs for the reason (unsupported node layout, disabled feature gate, or exhausted restart budget)")
+			"no registry-auth installer is ready on any targeted Flex node; inspect DaemonSet/"+registryAuthName+" pod logs for the per-node reason (unsupported node layout, disabled feature gate, or exhausted restart budget)")
 	}
 
 	if workloadMatches && existing.Spec.Template.Annotations[registryAuthHash] == digest && registryAuthWorkloadReady(&existing) &&

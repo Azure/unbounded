@@ -136,6 +136,25 @@ func TestProbeNodeLayoutAcceptsRunningKubelet(t *testing.T) {
 	require.NoError(t, probeNodeLayout(t.Context(), root))
 }
 
+func TestRunNodeExternalModeIsNoOpOnUnsupportedLayout(t *testing.T) {
+	// External (teardown) mode must not be blocked by the unsupported-layout
+	// probe: on a node with no agent kubelet unit and no owned files, detach is
+	// a no-op reconciliation, not ErrUnsupportedKubeletLayout. This is what lets
+	// the supported detach converge on the very unsupported nodes the probe
+	// introduces.
+	root := t.TempDir()
+	external := `{"mode":"external"}`
+	// A bounded context so the loop would exit if it entered steady reconciliation.
+	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
+	defer cancel()
+
+	// RunNode in external mode on an unsupported layout must not fail fast with
+	// the unsupported-layout error; it reconciles (a no-op) until the context
+	// expires, at which point runNode returns nil.
+	err := RunNode(ctx, NodeOptions{Root: root, ConfigJSON: external, Listen: "127.0.0.1:0"})
+	require.NoError(t, err, "external mode must reconcile to completion, not fail on an unsupported layout")
+}
+
 func TestProbeNodeLayoutReportsAmbiguousKubelet(t *testing.T) {
 	// Two kubelet processes in the root is ambiguous and must be reported as an
 	// error, not treated as a supported node.

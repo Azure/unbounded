@@ -431,6 +431,28 @@ func TestRegistryAuthReadinessEventsIgnoreIntermediateRolloutProgress(t *testing
 	require.True(t, p.Update(event.UpdateEvent{ObjectOld: old, ObjectNew: newer}))
 }
 
+func TestRegistryAuthReadinessEventsFireOnTransitionToFullyUnavailable(t *testing.T) {
+	env := testEnv(t)
+	p := registryAuthWorkloadEvents(env, env.InNamespaceNamed(registryAuthName, daemonSetName))
+
+	// A fully rolled-out DaemonSet with 3 of 4 available (partial failure) is
+	// "not all Ready" but not yet "fully unavailable."
+	old := &appsv1.DaemonSet{ObjectMeta: ownedAuthMetadata()}
+	old.Generation = 2
+	old.Status = appsv1.DaemonSetStatus{ObservedGeneration: 2, DesiredNumberScheduled: 4, UpdatedNumberScheduled: 4, NumberAvailable: 3}
+
+	// Degrading to zero available (fully unavailable) must fire, even though
+	// both states are "not all Ready."
+	newer := old.DeepCopy()
+	newer.Status.NumberAvailable = 0
+	require.True(t, p.Update(event.UpdateEvent{ObjectOld: old, ObjectNew: newer}))
+
+	// Recovering to one available must also fire (leaving fully unavailable).
+	old = newer.DeepCopy()
+	newer.Status.NumberAvailable = 1
+	require.True(t, p.Update(event.UpdateEvent{ObjectOld: old, ObjectNew: newer}))
+}
+
 func TestRegistryAuthMigratesLegacyHelperResourcesOnlyAfterRollout(t *testing.T) {
 	env := testEnv(t, authSource(""))
 	operations, _, err := planRegistryAuth(t.Context(), env)

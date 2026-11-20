@@ -6,6 +6,7 @@ package registryauth
 import (
 	"context"
 	"errors"
+	"os"
 	"testing"
 	"time"
 
@@ -125,6 +126,142 @@ func TestRestartBudgetResetsOnNewRevision(t *testing.T) {
 	before := s.count()
 	_ = s.i.Reconcile(context.Background(), cfg)
 	require.Equal(t, before+1, s.count(), "a new revision must allow a fresh restart")
+}
+
+func TestFailedRestartConsumesBudget(t *testing.T) {
+	// A failed or timed-out systemctl restart must consume the budget, so it is
+	// not re-issued on every tick. The budget bounds attempts, not successes.
+	i, _, restarts := installerFixture(t)
+	i.Revision = "rev-1"
+	i.KubeletArgs = func() ([]string, error) {
+		return []string{"/usr/local/bin/kubelet", "--config=/var/lib/kubelet/config.yaml"}, nil
+	}
+
+	now := time.Now().Add(time.Hour)
+	i.now = func() time.Time { return now }
+
+	cfg := testManagedConfig(t)
+
+	// The first reconcile issues a restart that fails. Wrap the fixture's
+	// counting HostCommand so the failed attempt is still counted.
+	counting := i.HostCommand
+	i.HostCommand = func(_ context.Context, args ...string) error {
+		if args[0] == "restart" {
+			*restarts++
+
+			return errors.New("systemctl timed out")
+		}
+
+		return counting(context.Background(), args...)
+	}
+
+	err := i.Reconcile(context.Background(), cfg)
+	require.ErrorContains(t, err, "systemctl timed out")
+	require.Equal(t, 1, *restarts, "the attempt is charged even though the restart failed")
+
+	i.HostCommand = counting
+
+	// Keep reconciling, advancing the clock past each backoff window. The total
+	// number of (failing) restarts must be bounded by the budget, not grow on
+	// every tick. The first attempt is immediate by design, so the backoff gates
+	// attempts from the second onward; what must hold is the overall cap.
+	for range 10 * restartBudget {
+		err := i.Reconcile(context.Background(), cfg)
+		if errors.Is(err, ErrRestartBudgetExhausted) {
+			break
+		}
+
+		now = now.Add(time.Hour)
+	}
+
+	require.Equal(t, restartBudget, *restarts, "failed restarts must be bounded by the budget")
+}
+
+func TestCorruptBackoffFailsClosed(t *testing.T) {
+	// An unreadable or corrupt .restart-backoff must fail closed with a
+	// diagnostic, not silently reset the budget to fresh.
+	i, _, restarts := installerFixture(t)
+	i.Revision = "rev-1"
+	i.KubeletArgs = func() ([]string, error) {
+		return []string{"/usr/local/bin/kubelet", "--config=/var/lib/kubelet/config.yaml"}, nil
+	}
+	now := time.Now().Add(time.Hour)
+	i.now = func() time.Time { return now }
+
+	cfg := testManagedConfig(t)
+
+	// Establish ownership first so the install dir is owned and the restart
+	// block is reached before a foreign-ownership refusal.
+	i.KubeletArgs = func() ([]string, error) {
+		return []string{
+			"/usr/local/bin/kubelet", "--config=/var/lib/kubelet/config.yaml",
+			"--image-credential-provider-config=" + providerConfigPath, "--image-credential-provider-bin-dir=" + installDir + "/bin",
+		}, nil
+	}
+
+	require.NoError(t, i.Reconcile(context.Background(), cfg))
+
+	baseline := *restarts
+
+	// Now corrupt the persisted budget. The next reconcile must fail closed with
+	// a diagnostic rather than treating the corrupt state as a fresh budget.
+	require.NoError(t, os.WriteFile(i.path(backoffPath), []byte("{corrupt json"), 0o600))
+
+	// Force a restart to be needed so the restart block (and the backoff read)
+	// is reached.
+	i.KubeletArgs = func() ([]string, error) {
+		return []string{"/usr/local/bin/kubelet", "--config=/var/lib/kubelet/config.yaml"}, nil
+	}
+
+	err := i.Reconcile(context.Background(), cfg)
+	require.ErrorContains(t, err, "restart backoff state")
+	require.Equal(t, baseline, *restarts, "a corrupt budget must not be treated as a fresh one")
+}
+
+func TestExhaustedBudgetAcknowledgesLaterRecovery(t *testing.T) {
+	// A kubelet that recovers and activates the managed flags after the restart
+	// budget is spent must be observed as healthy on the next reconciliation,
+	// without another disruptive restart and without a terminal failure. The
+	// budget bounds disruption, not observation.
+	i, _, restarts := installerFixture(t)
+	i.Revision = "rev-1"
+
+	activated := false
+	i.KubeletArgs = func() ([]string, error) {
+		if activated {
+			return []string{
+				"/usr/local/bin/kubelet", "--config=/var/lib/kubelet/config.yaml",
+				"--image-credential-provider-config=" + providerConfigPath, "--image-credential-provider-bin-dir=" + installDir + "/bin",
+			}, nil
+		}
+
+		return []string{"/usr/local/bin/kubelet", "--config=/var/lib/kubelet/config.yaml"}, nil
+	}
+
+	now := time.Now().Add(time.Hour)
+	i.now = func() time.Time { return now }
+
+	cfg := testManagedConfig(t)
+
+	// Exhaust the budget while the kubelet has not activated the flags.
+	for range restartBudget {
+		_ = i.Reconcile(context.Background(), cfg)
+		now = now.Add(time.Hour) // clear any backoff window so the next attempt is not clock-gated
+	}
+
+	// The kubelet now activates the flags (recovered). The next reconciliation
+	// must acknowledge activation without issuing another restart and without
+	// returning a terminal failure.
+	before := *restarts
+	activated = true
+
+	require.NoError(t, i.Reconcile(context.Background(), cfg))
+	require.Equal(t, before, *restarts, "observing a recovered kubelet must not restart it again")
+
+	// The budget is cleared, so a subsequent reconciliation is steady and
+	// budget-free.
+	require.NoError(t, i.Reconcile(context.Background(), cfg))
+	require.Equal(t, before, *restarts)
 }
 
 func TestRestartBudgetPersistsAcrossInstallerRestart(t *testing.T) {

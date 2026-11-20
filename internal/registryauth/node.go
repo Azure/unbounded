@@ -24,16 +24,20 @@ import (
 
 var ErrKubeletNotRunning = errors.New("no running kubelet found; waiting before configuring node authentication")
 
-// ErrUnsupportedKubeletLayout reports that the kubelet the installer operates on
-// is not the agent-managed host kubelet it is designed to configure. This is
-// the nspawn case: the node's kubelet runs inside a systemd-nspawn machine, in a
-// separate PID namespace and under a different systemd manager, so it is neither
-// visible in the host /proc nor restartable via `chroot <host> systemctl`.
+// ErrUnsupportedKubeletLayout reports that there is no agent-managed kubelet
+// unit at the installer's node root, so the installer has nothing to configure.
+// The installer is designed for a node whose kubelet is the agent-managed host
+// kubelet (unit at <root>/etc/systemd/system/kubelet.service, restartable via
+// `chroot <root> systemctl`). When that unit is absent the kubelet is not where
+// the installer can reach it - for example, it may run inside an isolated node
+// layout such as a systemd-nspawn machine, in a separate PID namespace under a
+// different systemd manager - and no retry on this node root can succeed.
 //
 // Unlike ErrKubeletNotRunning (a transient "the kubelet is down, keep waiting"),
-// this is a terminal condition: no retry on this node layout can succeed, so the
-// installer reports it as a failure instead of waiting forever.
-var ErrUnsupportedKubeletLayout = errors.New("kubelet is not the agent-managed host kubelet (nspawn or other isolated node); managed ACR authentication is not supported on this node layout; inspect the node or use external authentication")
+// this is a terminal condition for the managed path: the installer reports it as
+// a failure instead of waiting forever. The probe logs the exact proc contents
+// and unit state so the operator can confirm whether the node root is correct.
+var ErrUnsupportedKubeletLayout = errors.New("no agent-managed kubelet unit at the node root; the kubelet is not where the managed installer can reach it; inspect the node root and /proc or use external authentication")
 
 type NodeOptions struct {
 	Root         string
@@ -70,8 +74,14 @@ func RunNode(ctx context.Context, opts NodeOptions) error {
 	}
 	installer.KubeletArgs = func() ([]string, error) { return RunningKubeletArgs(opts.Root) }
 
-	if err := probeNodeLayout(ctx, opts.Root); err != nil {
-		return err
+	// The layout probe gates installation only. External (teardown) mode is
+	// ownership-aware and is a no-op on a node with no managed files, so it must
+	// not be blocked by an unsupported layout: the supported detach operation has
+	// to be able to converge on the very unsupported nodes this probe introduces.
+	if cfg.Mode == IdentityBindingMode {
+		if err := probeNodeLayout(ctx, opts.Root); err != nil {
+			return err
+		}
 	}
 
 	return runNode(ctx, opts.Listen, cfg.Mode, func(reconcileCtx context.Context) error {
@@ -275,32 +285,54 @@ func probeNodeLayout(ctx context.Context, root string) error {
 	return nil
 }
 
-// probeProc reports whether the procfs the installer scans is populated, which
-// distinguishes "no kubelet running" from "wrong root / PID namespace".
+// probeProc reports the procfs the installer scans, distinguishing "no kubelet
+// running" from "wrong root / PID namespace" from "proc unreadable". It lists
+// every candidate process name it could read and counts the read failures, so a
+// log line shows whether the scanned namespace is empty (wrong root), populated
+// but lacking a kubelet (down), or only partially readable (mount problem).
 func probeProc(root string) string {
-	entries, err := os.ReadDir(filepath.Join(root, "proc"))
+	proc := filepath.Join(root, "proc")
+
+	entries, err := os.ReadDir(proc)
 	if err != nil {
-		return fmt.Sprintf("unreadable: %v", err)
+		return fmt.Sprintf("proc unreadable: %v", err)
 	}
 
-	kubelet, others := 0, 0
+	kubelet, readable, unreadable := 0, 0, 0
+	names := []string{}
 
 	for _, entry := range entries {
-		comm, err := os.ReadFile(filepath.Join(root, "proc", entry.Name(), "comm"))
+		comm, err := os.ReadFile(filepath.Join(proc, entry.Name(), "comm"))
 		if err != nil {
-			others++
+			unreadable++
 
 			continue
 		}
 
-		if strings.TrimSpace(string(comm)) == "kubelet" {
+		// /proc/self, /proc/thread-self and the like are symlinks; only numeric
+		// PIDs are real processes.
+		first := entry.Name()[0]
+		if first < '0' || first > '9' {
+			readable++
+
+			continue
+		}
+
+		name := strings.TrimSpace(string(comm))
+		readable++
+
+		if name == "kubelet" {
 			kubelet++
-		} else {
-			others++
+
+			continue
+		}
+
+		if len(names) < 5 {
+			names = append(names, name)
 		}
 	}
 
-	return fmt.Sprintf("procs=%d kubelet=%d", kubelet+others, kubelet)
+	return fmt.Sprintf("proc=%q readable=%d unreadable=%d kubelet=%d sample=%v", proc, readable, unreadable, kubelet, names)
 }
 
 // unitShape reports the ExecStart line of the kubelet unit (truncated) so a log

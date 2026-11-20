@@ -6,6 +6,9 @@ package app
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +18,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/rest"
 
 	"github.com/Azure/unbounded/internal/registryauth"
 )
@@ -32,10 +36,26 @@ func detachFixture(t *testing.T, managed bool) (*detachACRHandler, *fake.Clients
 
 	source := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "gantry-config", Namespace: ns}, Data: data}
 
+	// The external config hash the operator stamps once the detached policy is active.
+	extCfg, err := registryauth.Derive("upstream_registries: []\n", "mode: external")
+	require.NoError(t, err)
+	extPayload, err := json.Marshal(extCfg)
+	require.NoError(t, err)
+
+	extSum := sha256.Sum256(extPayload)
+	extHash := hex.EncodeToString(extSum[:])
+
 	ds := &appsv1.DaemonSet{
 		ObjectMeta: metav1.ObjectMeta{Name: "gantry-acr-auth", Namespace: ns, Labels: map[string]string{"app.kubernetes.io/name": "gantry-acr-auth"}},
 		Spec: appsv1.DaemonSetSpec{
-			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app.kubernetes.io/name": "gantry-acr-auth"}}, Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app.kubernetes.io/name": "gantry-acr-auth"}}, Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "configure", Image: "unbounded-operator"}}}},
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app.kubernetes.io/name": "gantry-acr-auth"}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels:      map[string]string{"app.kubernetes.io/name": "gantry-acr-auth"},
+					Annotations: map[string]string{detachHashKey: extHash},
+				},
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "configure", Image: "unbounded-operator"}}},
+			},
 		},
 	}
 
@@ -50,6 +70,7 @@ func detachFixture(t *testing.T, managed bool) (*detachACRHandler, *fake.Clients
 	h := &detachACRHandler{
 		namespace: ns, timeout: 5 * time.Second, client: client, clusterID: attachClusterID,
 		removeAzure: false, out: &bytes.Buffer{},
+		restConfig: &rest.Config{Host: "https://test-aks-0000000000000000.azmk8s.io"},
 	}
 	h.runAzure = func(_ context.Context, subscriptionID string, args ...string) ([]byte, error) {
 		calls = append(calls, strings.Join(args, " "))
@@ -59,7 +80,15 @@ func detachFixture(t *testing.T, managed bool) (*detachACRHandler, *fake.Clients
 		require.Equal(t, clusterID.SubscriptionID, subscriptionID)
 
 		switch args[0] {
+		case "aks":
+			// verifyClusterMatchesKubeconfig calls `aks show`.
+			require.Equal(t, "show", args[1])
+			return []byte(`{"id":"` + h.clusterID + `","fqdn":"test-aks-0000000000000000.azmk8s.io","privateFqdn":""}`), nil
 		case "identity":
+			if args[1] == "list" {
+				return []byte(`[{"id":"/subscriptions/` + subscriptionID + `/resourceGroups/test-rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/gantry-pull-000000","tags":{"unbounded-cluster-id":"` + h.clusterID + `"}}]`), nil
+			}
+
 			require.Equal(t, "delete", args[1])
 			require.Contains(t, args, "--name")
 

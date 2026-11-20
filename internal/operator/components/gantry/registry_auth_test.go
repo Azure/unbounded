@@ -227,7 +227,7 @@ func TestNodeAuthRolledOutButUnavailableReportsFailure(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, result.Ready)
 	require.Equal(t, "RegistryAuthFailed", result.Reason)
-	require.Contains(t, result.Message, "cannot be configured")
+	require.Contains(t, result.Message, "no registry-auth installer is ready")
 }
 
 func TestNodeAuthExternalModeKeepsReconcilerForOwnedFileCleanup(t *testing.T) {
