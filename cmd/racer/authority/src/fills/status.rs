@@ -123,15 +123,19 @@ pub fn status(
         && under_replicated_bytes == 0;
     // Completion history belongs to this spec generation, not the object
     // name: a changed spec starts a new initial fill.
-    let history = previous.filter(|p| {
-        p.get("observedGeneration").and_then(Value::as_u64) == Some(view.generation)
-    });
+    let history = previous
+        .filter(|p| p.get("observedGeneration").and_then(Value::as_u64) == Some(view.generation));
     let was_ready = history
         .map(|p| condition_status(p, "Ready") == Some("True"))
         .unwrap_or(false);
-    let was_degraded = history
-        .map(|p| condition_status(p, "Degraded") == Some("True"))
-        .unwrap_or(false);
+    // Progressing records the initial fill for this generation. Once it
+    // completes it stays False during subsequent refills, including across
+    // primary failover. Degraded alone is not completion history: capacity
+    // can be refused during the initial fill too.
+    let completed = was_ready
+        || history
+            .map(|p| condition_status(p, "Progressing") == Some("False"))
+            .unwrap_or(false);
     let previous_nodes = history
         .and_then(|p| p.get("nodes"))
         .and_then(Value::as_i64)
@@ -152,7 +156,7 @@ pub fn status(
                 view.replicas, view.available_nodes
             ),
         ))
-    } else if (was_ready || was_degraded) && (short || under_replicated_bytes > 0) {
+    } else if completed && (short || under_replicated_bytes > 0) {
         if progress.nodes == 0 || previous_nodes > i64::from(progress.nodes) {
             Some(("MemberLost", "a node with pins left".to_owned()))
         } else {
@@ -204,10 +208,14 @@ pub fn status(
         previous,
         &now,
         "Progressing",
-        !ready,
-        if ready { "Complete" } else { "Filling" },
-        if ready {
-            "fill is complete"
+        !ready && !completed,
+        if ready || completed {
+            "Complete"
+        } else {
+            "Filling"
+        },
+        if ready || completed {
+            "initial fill for this generation is complete"
         } else {
             "residency is below the planned footprint"
         },
@@ -554,6 +562,11 @@ mod tests {
         reports.insert("p1".into(), report(short));
         let c = statuses(&status(&v, &reports, Some(&s)));
         assert_eq!(c["Degraded"], ("True".into(), "Refilling".into()));
+        assert_eq!(c["Progressing"], ("False".into(), "Complete".into()));
+        let degraded = status(&v, &reports, Some(&s));
+        let still_short = status(&v, &reports, Some(&degraded));
+        assert_eq!(statuses(&still_short)["Progressing"].0, "False");
+        assert_eq!(statuses(&still_short)["Degraded"].0, "True");
         // Was Ready, no node reports: Degraded MemberLost.
         let c = statuses(&status(&v, &BTreeMap::new(), Some(&s)));
         assert_eq!(c["Degraded"], ("True".into(), "MemberLost".into()));
@@ -567,6 +580,18 @@ mod tests {
         reports.insert("p1".into(), report(refused));
         let c = statuses(&status(&v, &reports, None));
         assert_eq!(c["Degraded"], ("True".into(), "CapacityLost".into()));
+        // A refusal before initial completion cannot make the next short
+        // report look like a formerly complete fill.
+        let mut refused = progress_for(&v);
+        refused.pinned_bytes = 50;
+        refused.refused_bytes = 5;
+        reports.insert("p1".into(), report(refused));
+        let initial_refusal = status(&v, &reports, None);
+        assert_eq!(statuses(&initial_refusal)["Progressing"].0, "True");
+        reports.clear();
+        let next = status(&v, &reports, Some(&initial_refusal));
+        assert_eq!(statuses(&next)["Progressing"].0, "True");
+        assert_eq!(statuses(&next)["Degraded"].0, "False");
     }
 
     #[test]
