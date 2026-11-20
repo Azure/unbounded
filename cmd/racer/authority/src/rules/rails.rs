@@ -318,6 +318,7 @@ pub(crate) mod tests {
         // The derived bound is exact for the worst case and fits the limit.
         assert_eq!(s.len(), crate::limits::MAX_REPORT_INVENTORY_BYTES);
         assert!(s.len() <= crate::limits::MAX_REPORT_BYTES);
+        assert_eq!(crate::limits::MAX_REPORT_BYTES, 32 * 1024);
         assert_eq!(parse_report(&s).unwrap(), r);
         // A typical 64-port inventory, the case the old 4 KiB limit rejected.
         let typical = Report {

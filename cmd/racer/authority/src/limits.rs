@@ -203,13 +203,13 @@ pub const MAX_FILLS_INVENTORY_BYTES: usize = r#"{"fills":[]}"#.len()
     + r#","pinnable_bytes":18446744073709551615"#.len();
 
 /// Maximum Pod report annotation length. It is the inventory bound, rounded up
-/// to 64 KiB, well below the 256 KiB Kubernetes limit on all annotations of an
+/// to 32 KiB, well below the 256 KiB Kubernetes limit on all annotations of an
 /// object. `deploy/racer/policies.yaml.tmpl` enforces the same value in UTF-8
 /// bytes; `annotation_limits_match_policy` checks they agree.
-pub const MAX_REPORT_BYTES: usize = 64 * 1024;
+pub const MAX_REPORT_BYTES: usize = 32 * 1024;
 
-/// Maximum Pod fills annotation length, the same 64 KiB cap as
-/// [`MAX_REPORT_BYTES`]. Separate annotations keep the fill bound from
+/// Maximum Pod fills annotation length, capped at 64 KiB.
+/// Separate annotations keep the fill bound from
 /// shrinking the inventory bound the membership report needs.
 pub const MAX_FILLS_BYTES: usize = 64 * 1024;
 
