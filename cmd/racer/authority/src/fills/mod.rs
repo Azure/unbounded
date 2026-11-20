@@ -667,7 +667,7 @@ impl Admission {
                 return;
             }
         }
-        if view.error.as_deref() == Some("TooManyObjects") {
+        if view.error.as_deref() == Some("TooManyObjects") && view.manifest.is_none() {
             view.accepted = false;
             view.message = "TooManyObjects".into();
             view.planned_footprint_bytes = None;
@@ -942,7 +942,20 @@ mod tests {
     fn listed_view(now: Instant) -> FillView {
         let mut view = FillView::from_json(&fill_json("")).unwrap();
         view.cache_uid = "22222222-2222-4222-8222-222222222222".into();
-        view.manifest = Some(Arc::new(manifest::build("models", &[], &[], 1).unwrap()));
+        view.manifest = Some(Arc::new(
+            manifest::build(
+                "models",
+                &[manifest::ListedObject {
+                    name: "object".into(),
+                    etag: "\"version\"".into(),
+                    length: 1,
+                    content_type: None,
+                }],
+                &["".into()],
+                1,
+            )
+            .unwrap(),
+        ));
         view.listed_generation = Some(view.generation);
         view.listed_cache_uid = view.cache_uid.clone();
         view.next_list = Some(now + Duration::from_secs(view.resync_secs));
@@ -1048,6 +1061,50 @@ mod tests {
             assert_eq!(view.failures, u32::MAX);
             assert_eq!(view.error.as_deref(), Some("Forbidden"));
             assert!(view.next_list.unwrap() <= now + RETRY_MAX);
+        });
+    }
+
+    #[test]
+    fn oversized_resync_preserves_admission_of_the_previous_valid_manifest() {
+        crate::kube::fake::run(|_api, kube| async move {
+            let shared = crate::shared::tests::shared(kube);
+            let now = rt::now();
+            let mut view = listed_view(now);
+            let cache = CacheInfo::from_json(&serde_json::json!({
+                "metadata": {"uid": view.cache_uid, "name": "models"},
+                "spec": {"origin": {"azure": {"containerURL":
+                    "https://acct.blob.core.windows.net/models"}}},
+            }));
+            shared
+                .fills_caches
+                .borrow_mut()
+                .insert(view.cache_uid.clone(), cache);
+            recompute_view(&shared, &mut view);
+            assert!(view.accepted);
+            let previous = view.manifest.clone();
+            let footprint = view.planned_footprint_bytes;
+            assert!(footprint.unwrap() > 0);
+            listing_failed(
+                &shared,
+                &mut view,
+                ListingFailure::Invalid(ManifestError::TooManyObjects),
+                now,
+            );
+            recompute_view(&shared, &mut view);
+            assert!(
+                view.accepted,
+                "a failed resync must not release existing pins"
+            );
+            assert_eq!(view.manifest, previous);
+            assert_eq!(view.planned_footprint_bytes, footprint);
+            assert_eq!(view.error.as_deref(), Some("TooManyObjects"));
+
+            // Without a previous valid manifest there is nothing to retain.
+            view.manifest = None;
+            recompute_view(&shared, &mut view);
+            assert!(!view.accepted);
+            assert_eq!(view.message, "TooManyObjects");
+            assert_eq!(view.planned_footprint_bytes, None);
         });
     }
 
