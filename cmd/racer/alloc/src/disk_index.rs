@@ -369,6 +369,10 @@ pub struct DiskIndex {
 
     pin_limit: usize,
 
+    pin_slots: Vec<PageSlot>,
+
+    protection_limit: usize,
+
     hand: usize,
 
     age_head: u32,
@@ -404,6 +408,8 @@ impl DiskIndex {
             holds_unused: 0,
             writing_segments: BTreeMap::new(),
             pin_limit: usize::MAX,
+            pin_slots: Vec::new(),
+            protection_limit: usize::MAX,
             hand: 0,
             age_head: NIL,
             age_tail: NIL,
@@ -840,9 +846,38 @@ impl DiskIndex {
             return Err((ticket, Error::InvalidConfiguration));
         }
         let pinned = ticket.pinned;
-        let charged = segments.pinned_count();
-        let (lease, extent) = match segments.append_in_checked(length, pinned, |_, already| {
-            if pinned && !already && charged >= self.pin_limit {
+        let pins_page = pinned || self.pin_slots.binary_search(&ticket.slot).is_ok();
+        let (pin_segments, pin_missing) = if pins_page {
+            match self.protection_parts(segments, &self.pin_slots, false) {
+                Ok(parts) => parts,
+                Err(error) => return Err((ticket, error)),
+            }
+        } else {
+            (BTreeSet::new(), BTreeSet::new())
+        };
+        let protects_page = self.is_held(ticket.slot) || pins_page;
+        let (protected, missing) = if protects_page {
+            match self.protection_parts(segments, &[], true) {
+                Ok(parts) => parts,
+                Err(error) => return Err((ticket, error)),
+            }
+        } else {
+            (BTreeSet::new(), BTreeSet::new())
+        };
+        let (lease, extent) = match segments.append_in_checked(length, pinned, |id, _| {
+            if pins_page
+                && pin_segments.len() + pin_missing.len()
+                    - usize::from(pin_missing.contains(&ticket.slot))
+                    + usize::from(!pin_segments.contains(&id.0))
+                    > self.pin_limit
+            {
+                return Err(Error::Busy);
+            }
+            if protects_page
+                && protected.len() + missing.len() - usize::from(missing.contains(&ticket.slot))
+                    + usize::from(!protected.contains(&id.0))
+                    > self.protection_limit
+            {
                 return Err(Error::Busy);
             }
             Ok(())
@@ -1007,9 +1042,38 @@ impl DiskIndex {
         self.pin_limit = limit;
     }
 
+    /// Current pin promises, including pages that have not appended yet.
+    pub fn set_pin_slots(&mut self, mut slots: Vec<PageSlot>) {
+        slots.sort_unstable();
+        slots.dedup();
+        self.pin_slots = slots;
+    }
+
+    /// Joint hard-hold and pin cap, leaving the worker's free reserve reclaimable.
+    pub fn set_protection_limit(&mut self, limit: usize) {
+        self.protection_limit = limit;
+    }
+
     /// Charge distinct segments plus one segment for each page still awaiting
     /// an append. Multiple reservations of the same page share that charge.
     pub fn pin_charge(&self, segments: &Segments, slots: &[PageSlot]) -> Result<usize> {
+        let (protected, missing) = self.protection_parts(segments, slots, false)?;
+        Ok(protected.len() + missing.len())
+    }
+
+    /// Distinct protected segments and outstanding page promises across both
+    /// classes. A shared page or resident segment is charged only once.
+    pub fn protection_charge(&self, segments: &Segments, slots: &[PageSlot]) -> Result<usize> {
+        let (protected, missing) = self.protection_parts(segments, slots, true)?;
+        Ok(protected.len() + missing.len())
+    }
+
+    fn protection_parts(
+        &self,
+        segments: &Segments,
+        slots: &[PageSlot],
+        include_holds: bool,
+    ) -> Result<(BTreeSet<u64>, BTreeSet<PageSlot>)> {
         let mut protected = BTreeSet::new();
         for id in 0..segments.count() {
             let id = SegmentId(id as u64);
@@ -1018,7 +1082,12 @@ impl DiskIndex {
             }
         }
         let mut missing = BTreeSet::new();
-        for slot in slots {
+        let held = self
+            .holds
+            .values()
+            .filter(|_| include_holds)
+            .flat_map(|hold| &hold.slots);
+        for slot in slots.iter().chain(held) {
             let entry = self.entry(*slot)?;
             if let Some(segment) = self.writing_segments.get(slot) {
                 protected.insert(segment.0);
@@ -1029,7 +1098,7 @@ impl DiskIndex {
                 missing.insert(*slot);
             }
         }
-        Ok(protected.len() + missing.len())
+        Ok((protected, missing))
     }
 
     /// Hold `slots` until `until`. Held stored records keep their segments
@@ -1548,6 +1617,75 @@ mod tests {
             Err(Error::Busy)
         );
         assert_eq!(segments.snapshot(), before);
+        index.check_invariants();
+    }
+
+    #[test]
+    fn joint_protection_counts_pending_writes_and_shares_segments() {
+        let segments = segments(4);
+        let mut index = DiskIndex::new(8, 8, 4).unwrap();
+        index.set_pin_limit(2);
+        index.set_protection_limit(3);
+        let cache = index.add_cache(CacheIdx(0)).unwrap();
+        write(&mut index, &segments, 0, cache, SEGMENT as usize).unwrap();
+        write(&mut index, &segments, 1, cache, SEGMENT as usize).unwrap();
+        index
+            .hold(
+                &[PageSlot(0), PageSlot(1), PageSlot(2)],
+                Monotonic(10),
+                Monotonic(0),
+            )
+            .unwrap();
+        assert_eq!(index.protection_charge(&segments, &[]), Ok(3));
+        let ticket = index.reserve_pinned(PageSlot(2), cache, true).unwrap();
+        let (lease, writing) = index.append(&segments, ticket, 512).unwrap();
+        assert_eq!(
+            index.protection_charge(&segments, &[]),
+            Ok(3),
+            "an in-flight page is not charged twice"
+        );
+        // A second held page can use the same pinned tail at the joint cap.
+        index
+            .hold(&[PageSlot(3)], Monotonic(10), Monotonic(0))
+            .unwrap();
+        write_pinned(&mut index, &segments, 3, cache, 512).unwrap();
+        assert_eq!(index.protection_charge(&segments, &[]), Ok(3));
+        let before = segments.snapshot();
+        assert_eq!(
+            write_pinned(&mut index, &segments, 4, cache, SEGMENT as usize),
+            Err(Error::Busy)
+        );
+        assert_eq!(segments.snapshot(), before);
+        // Rewriting a held ordinary page must not claim the free reserve.
+        assert_eq!(
+            write(&mut index, &segments, 0, cache, SEGMENT as usize),
+            Err(Error::Busy)
+        );
+        index.write_failed(writing);
+        drop(lease);
+        // The published page still owns the pinned segment; canceling the other
+        // page restores its missing-page commitment instead of losing it.
+        assert_eq!(index.protection_charge(&segments, &[]), Ok(4));
+        index.check_invariants();
+    }
+
+    #[test]
+    fn rewrite_cannot_spend_another_pending_pins_segment() {
+        let segments = segments(4);
+        let mut index = DiskIndex::new(8, 8, 4).unwrap();
+        index.set_pin_limit(2);
+        index.set_pin_slots(vec![PageSlot(0), PageSlot(1)]);
+        let cache = index.add_cache(CacheIdx(0)).unwrap();
+        write_pinned(&mut index, &segments, 0, cache, SEGMENT as usize).unwrap();
+        assert_eq!(segments.pinned_count(), 1);
+        let before = segments.snapshot();
+        assert_eq!(
+            write_pinned(&mut index, &segments, 0, cache, SEGMENT as usize),
+            Err(Error::Busy)
+        );
+        assert_eq!(segments.snapshot(), before);
+        write_pinned(&mut index, &segments, 1, cache, SEGMENT as usize).unwrap();
+        assert_eq!(segments.pinned_count(), 2);
         index.check_invariants();
     }
 

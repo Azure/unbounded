@@ -207,9 +207,38 @@ impl Pages {
         Ok(inner.disk.borrow().pin_charge(segments, &slots)? + missing)
     }
 
-    pub fn set_pin_limit(&mut self, limit: usize) -> Result<()> {
-        self.inner_mut()?.disk.borrow_mut().set_pin_limit(limit);
+    pub fn set_pin_limit(&mut self, limit: usize, pages: &[PageId]) -> Result<()> {
+        let inner = self.inner_mut()?;
+        let slots = pages
+            .iter()
+            .filter_map(|page| inner.slots.get(page))
+            .collect();
+        let mut disk = inner.disk.borrow_mut();
+        disk.set_pin_limit(limit);
+        disk.set_pin_slots(slots);
         Ok(())
+    }
+
+    pub fn set_protection_limit(&mut self, limit: usize) -> Result<()> {
+        self.inner_mut()?
+            .disk
+            .borrow_mut()
+            .set_protection_limit(limit);
+        Ok(())
+    }
+
+    /// Joint commitments of spill holds, pins, and proposed members.
+    pub fn protection_charge(&mut self, segments: &Segments, pages: &[PageId]) -> Result<usize> {
+        let inner = self.inner_mut()?;
+        let mut slots = Vec::new();
+        let mut missing = 0;
+        for page in pages {
+            match inner.slots.get(page) {
+                Some(slot) => slots.push(slot),
+                None => missing += 1,
+            }
+        }
+        Ok(inner.disk.borrow().protection_charge(segments, &slots)? + missing)
     }
 
     /// Interned page capacity.

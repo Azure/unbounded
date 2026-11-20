@@ -156,7 +156,35 @@ impl PageTicket {
                 .count()
                 .saturating_sub(self.index.holds.borrow().free_reserve.max(1)),
         );
-        self.index.state_mut().pages.set_pin_limit(limit)?;
+        // Ordinary unprotected writes need no pin-table walk. Each protected
+        // append refreshes this synchronous budget view before using it.
+        let members: Vec<_> = if self.pinned
+            || pins
+                .page_fills
+                .get(&page.version)
+                .is_some_and(|pages| pages.contains_key(&page.number))
+        {
+            pins.page_fills
+                .iter()
+                .flat_map(|(version, pages)| {
+                    pages.keys().map(|number| PageId {
+                        version: version.clone(),
+                        number: *number,
+                    })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        self.index
+            .state_mut()
+            .pages
+            .set_pin_limit(limit, &members)?;
+        self.index.state_mut().pages.set_protection_limit(
+            segments
+                .count()
+                .saturating_sub(self.index.holds.borrow().free_reserve.max(1)),
+        )?;
         drop(pins);
         self.reservation
             .as_mut()
@@ -348,7 +376,8 @@ impl Index {
                     .map_err(|_| Error::Overloaded)?;
             }
             if old.is_none_or(|hold| !hold.holders.contains_key(&number)) {
-                joining_unused += usize::from(!state.pages.occupied(&page));
+                joining_unused +=
+                    usize::from(!state.pages.occupied(&page) && !state.pages.is_unused_held(&page));
                 joining.push(page.clone());
             }
         }
@@ -360,6 +389,12 @@ impl Index {
             .min(segments.count().saturating_sub(holds.free_reserve.max(1)))
             .min(self.page_capacity.get() * holds.percent / 100);
         if total > limit {
+            return Err(Error::Overloaded);
+        }
+        if !joining.is_empty()
+            && state.pages.protection_charge(&segments, &joining)?
+                > segments.count().saturating_sub(holds.free_reserve.max(1))
+        {
             return Err(Error::Overloaded);
         }
         if state.pages.len() + self.reserved.get() + state.pages.holds_unused() + joining_unused
@@ -496,7 +531,8 @@ impl Index {
                     .map_err(|_| Error::Overloaded)?;
             }
             if old.is_none_or(|pin| !pin.holders.contains_key(&number)) {
-                joining_unused += usize::from(!state.pages.occupied(&page));
+                joining_unused +=
+                    usize::from(!state.pages.occupied(&page) && !state.pages.is_unused_held(&page));
                 joining.push(page.clone());
             }
         }
@@ -528,6 +564,12 @@ impl Index {
             .pages
             .pin_charge(&segments, &committed.into_iter().collect::<Vec<_>>())?;
         if !joining.is_empty() && projected > segment_limit {
+            return Err(Error::Overloaded);
+        }
+        if !joining.is_empty()
+            && state.pages.protection_charge(&segments, &joining)?
+                > segments.count().saturating_sub(free_reserve)
+        {
             return Err(Error::Overloaded);
         }
         // Hard page-slot and index-entry capacity, shared with spill holds.
@@ -2636,6 +2678,77 @@ mod tests {
             index.reserve_pin_pages(FillId(4), &version, &page_set(&[2]), until),
             Err(Error::Overloaded)
         );
+    }
+
+    #[test]
+    fn pins_and_spill_holds_share_a_joint_segment_cap() {
+        use super::super::pins::FillId;
+        for pins_first in [false, true] {
+            let env = racer_io::Env::host();
+            let segments = Rc::new(segments(1024, 4));
+            let index = Rc::new(index(&env, 16));
+            index.set_page_capacity(16).unwrap();
+            let _clock = SegmentClock::new(index.clone(), segments, 1);
+            let version = descriptor("joint", 17).version;
+            let until = index.clock().wall_now() + std::time::Duration::from_secs(60);
+            if pins_first {
+                index
+                    .reserve_pin_pages(FillId(1), &version, &page_set(&[0, 1]), until)
+                    .unwrap();
+                assert_eq!(
+                    index.reserve_hold_pages(&version, &page_set(&[2, 3]), until),
+                    Err(Error::Overloaded)
+                );
+                index
+                    .reserve_hold_pages(&version, &page_set(&[2]), until)
+                    .unwrap();
+            } else {
+                index
+                    .reserve_hold_pages(&version, &page_set(&[0, 1]), until)
+                    .unwrap();
+                assert_eq!(
+                    index.reserve_pin_pages(FillId(1), &version, &page_set(&[2, 3]), until),
+                    Err(Error::Overloaded)
+                );
+                index
+                    .reserve_pin_pages(FillId(1), &version, &page_set(&[2]), until)
+                    .unwrap();
+            }
+            // Sharing an already promised page does not consume the reserve.
+            if pins_first {
+                index
+                    .reserve_hold_pages(&version, &page_set(&[0]), until)
+                    .unwrap();
+            } else {
+                index
+                    .reserve_pin_pages(FillId(1), &version, &page_set(&[0]), until)
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn shared_pending_pages_do_not_charge_index_capacity_twice() {
+        use super::super::pins::FillId;
+        let env = racer_io::Env::host();
+        let segments = Rc::new(segments(1024, 4));
+        let index = Rc::new(index(&env, 16));
+        index.set_page_capacity(2).unwrap();
+        index.set_pin_capacity_percent(100).unwrap();
+        index.set_hold_capacity_percent(100).unwrap();
+        let _clock = SegmentClock::new(index.clone(), segments, 1);
+        let version = descriptor("shared-pending", 17).version;
+        let until = index.clock().wall_now() + std::time::Duration::from_secs(60);
+        index
+            .reserve_pin_pages(FillId(1), &version, &page_set(&[0, 1]), until)
+            .unwrap();
+        index
+            .reserve_hold_pages(&version, &page_set(&[0, 1]), until)
+            .unwrap();
+        index
+            .reserve_pin_pages(FillId(1), &version, &page_set(&[0, 1]), until)
+            .unwrap();
+        assert_eq!(index.hold_unused(), 2);
     }
 
     /// A page shared by several fills and versions stays pinned until the last
