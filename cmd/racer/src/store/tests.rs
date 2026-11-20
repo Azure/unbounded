@@ -5029,7 +5029,7 @@ mod checkpoint {
         let env = racer_io::Env::host();
         let original = image(&env, 3);
         let bytes = encode(&original).unwrap();
-        assert_eq!(CHECKPOINT_VERSION, 5);
+        assert_eq!(CHECKPOINT_VERSION, 4);
         assert_eq!(&bytes[32..68], original.cluster.0.as_bytes());
         let decoded = decode(&bytes).unwrap();
         assert_eq!(decoded.cluster, original.cluster);
@@ -5038,6 +5038,44 @@ mod checkpoint {
         let mut edited = bytes.clone();
         edited[32] = b'4';
         assert!(decode(&edited).is_err());
+    }
+
+    #[test]
+    fn pinned_tails_normalize_to_v4_without_changing_live_ownership() {
+        let env = racer_io::Env::host();
+        let mut cut = image(&env, 3);
+        let segments = Segments::from_geometry(
+            page_alloc::SegmentGeometry::new(
+                geometry().slab_bytes,
+                geometry().segment_bytes,
+                geometry().segment_count,
+                geometry().alignment().unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        drop(segments.append(4096).unwrap());
+        let (pinned, _) = segments.append_in(4096, true).unwrap();
+        segments.pin_segment(pinned.id()).unwrap();
+        drop(pinned);
+        let live = segments.snapshot();
+        assert_eq!(live[0].state, SegmentState::Open);
+        assert_eq!(live[1].state, SegmentState::Open);
+        assert!(live[1].pinned);
+        cut.shards[0].segments = live.clone();
+        let bytes = encode(&cut).unwrap();
+        assert_eq!(&bytes[8..12], &4u32.to_le_bytes());
+        let restored = decode(&bytes).unwrap();
+        let normalized = &restored.shards[0].segments;
+        assert_eq!(normalized[0].state, SegmentState::Open);
+        assert_eq!(normalized[1].state, SegmentState::Sealed);
+        assert!(normalized.iter().all(|segment| !segment.pinned));
+        assert_eq!(normalized[1].used_bytes, live[1].used_bytes);
+        assert_eq!(normalized[1].generation, live[1].generation);
+        assert_eq!(restored.shards[0].index.entries.len(), 1);
+        assert_eq!(encode(&restored).unwrap(), bytes);
+        assert_eq!(segments.snapshot(), live);
+        assert!(segments.pinned(SegmentId(1)).unwrap());
     }
 
     #[test]

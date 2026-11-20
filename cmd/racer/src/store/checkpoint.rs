@@ -724,8 +724,10 @@ pub(crate) fn read_candidates_with_budget(
 // descriptors. Counts and string lengths are u32. A descriptor is cache UTF-8
 // string, key[32], quoted ETag string, length:u64, and a counted ASCII MIME
 // string where zero length means absent. A segment is id:u64, generation:u64,
-// state:u8, used_bytes:u64, pinned:u8, and counted record-offset hold
-// deadlines (offset:u64, seconds:u64, nanos:u32). A page entry is its descriptor,
+// state:u8, used_bytes:u64. Pin ownership is process-local and omitted; pinned
+// open tails are encoded as sealed so v4 readers see at most one open tail.
+// Held pages are counted after standalone descriptors, as entry:u32, ttl_nanos:u64.
+// A page entry is its descriptor,
 // page:u64, key_id[16], segment:u64, generation:u64, offset:u64,
 // disk_length:u64. Encoder ordering is canonical by worker, segment, and full
 // version/page identity. No freshness or payload bytes are serialized.
@@ -734,7 +736,9 @@ pub(crate) fn read_candidates_with_budget(
 // restarts at 1, so they can repeat across clusters. Recovery skips a cut
 // from another cluster. Checkpoints with any other version or cluster are
 // discarded as disposable cache hints.
-pub const CHECKPOINT_VERSION: u32 = 5;
+// Keep v4 readable in both upgrade and rollback directions. Neither live pin
+// ownership nor the pinned allocation class is needed to recover page mappings.
+pub const CHECKPOINT_VERSION: u32 = 4;
 const CLUSTER_BYTES: usize = 36;
 pub const FILE_LAYOUT_DIGEST: [u8; 32] = *b"racer-file-layout-v1\0\0\0\0\0\0\0\0\0\0\0\0";
 /// Largest encoded checkpoint file. Recovery additionally bounds decoded memory
@@ -751,7 +755,7 @@ const MAX_STRING_BYTES: usize = 8192;
 // Shared with decode_with_budget/recovery_memory input.count calls for shards,
 // segments, page entries, standalone descriptors, and held pages.
 const SHARD_BYTES: usize = 98; // worker + geometry + digest + four u32 counts.
-const SEGMENT_BYTES: usize = 26; // id + generation + state + used + pinned.
+const SEGMENT_BYTES: usize = 25; // id + generation + state + used.
 /// Entry index + remaining hold nanoseconds.
 pub(super) const HELD_RECORD_BYTES: usize = 12;
 const DESCRIPTOR_BYTES: usize = 52; // key + length + three u32 string lengths.
@@ -1006,14 +1010,18 @@ pub async fn encode_incremental(image: &CheckpointImage) -> Result<Vec<u8>> {
             }
             out.u64(segment.id.0)?;
             out.u64(segment.generation.0)?;
-            out.bytes(&[match segment.state {
+            let state = if segment.pinned && segment.state == SegmentState::Open {
+                SegmentState::Sealed
+            } else {
+                segment.state
+            };
+            out.bytes(&[match state {
                 SegmentState::Free => 0,
                 SegmentState::Open => 1,
                 SegmentState::Sealed => 2,
                 SegmentState::Evicting => 3,
             }])?;
             out.u64(segment.used_bytes)?;
-            out.bytes(&[u8::from(segment.pinned)])?;
         }
         out.count(shard.index.entries.len())?;
         let mut entries: Vec<_> = shard.index.entries.iter().collect();
@@ -1139,11 +1147,7 @@ pub fn decode_with_budget(bytes: &[u8], budget: usize) -> Result<CheckpointImage
                     _ => return Err(Error::CorruptRecord),
                 },
                 used_bytes: input.u64()?,
-                pinned: match input.take(1)?[0] {
-                    0 => false,
-                    1 => true,
-                    _ => return Err(Error::CorruptRecord),
-                },
+                pinned: false,
             });
         }
         let count = input.count(MAX_ITEMS, PAGE_ENTRY_BYTES)?;

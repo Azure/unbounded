@@ -49,9 +49,9 @@ pub struct SegmentSnapshot {
     /// Aligned occupied prefix, including record padding.
     pub used_bytes: u64,
 
-    /// Whether this segment was claimed by a pinned append. Checkpoints record
-    /// the flag, but recovery clears it: pins are re-established by the fill
-    /// controller after restart.
+    /// Whether this segment was claimed by a pinned append. Live snapshots retain
+    /// this flag; store checkpoints omit it because pins are re-established by
+    /// the fill controller after restart.
     pub pinned: bool,
 }
 
