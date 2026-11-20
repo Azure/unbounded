@@ -58,9 +58,10 @@ type ClusterCacheFillSpec struct {
 	// Prefixes are blob-name prefixes in the cache's container. Every object
 	// whose name starts with one of them is pinned, including objects added
 	// later on the next resync. An empty string selects the whole container.
-	// Prefixes are blob names, not Racer keys. At most 16 prefixes, and a
-	// single fill lists at most 8192 objects; a larger selection is rejected
-	// rather than silently truncated.
+	// Prefixes are blob names, not Racer keys. At most 16 distinct prefixes
+	// are allowed, each at most 1024 Unicode characters. Overlapping prefixes
+	// are allowed. A single fill lists at most 8192 objects; a larger selection
+	// is rejected rather than silently truncated.
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=16
 	// +kubebuilder:validation:items:MaxLength=1024
@@ -85,7 +86,8 @@ type ClusterCacheFillSpec struct {
 	// because a pinned segment keeps its unused tail; the per-worker pin
 	// budget bounds that overhead. A larger selection fails admission with
 	// ExceedsMaxFootprint; it is never truncated. This limit does not reserve
-	// cluster capacity.
+	// cluster capacity. The value is a positive, integral byte count no greater
+	// than 9223372036854775807, not a Kubernetes resource quantity string.
 	// +kubebuilder:validation:Minimum=1
 	MaxFootprint int64 `json:"maxFootprint"`
 

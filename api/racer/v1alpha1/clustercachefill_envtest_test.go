@@ -52,6 +52,7 @@ func TestEnvtestClusterCacheFillValidation(t *testing.T) {
 
 	valid := map[string]map[string]any{
 		"one prefix":              {"cacheName": "models", "prefixes": []any{"llama/"}, "maxFootprint": int64(1)},
+		"maximum footprint":       {"cacheName": "models", "prefixes": []any{"a/"}, "maxFootprint": int64(9223372036854775807)},
 		"whole container":         {"cacheName": "models", "prefixes": []any{""}, "maxFootprint": int64(1 << 30)},
 		"two replicas":            {"cacheName": "models", "prefixes": []any{"a/", "b/"}, "replicas": int64(2), "maxFootprint": int64(1 << 30)},
 		"three replicas":          {"cacheName": "models", "prefixes": []any{"a/"}, "replicas": int64(3), "maxFootprint": int64(1 << 30)},
@@ -83,6 +84,14 @@ func TestEnvtestClusterCacheFillValidation(t *testing.T) {
 			"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q",
 		}, "maxFootprint": int64(1)}, "prefixes"},
 		"zero footprint":     {map[string]any{"cacheName": "models", "prefixes": []any{"a/"}, "maxFootprint": int64(0)}, "maxFootprint"},
+		"zero quantity":      {map[string]any{"cacheName": "models", "prefixes": []any{"a/"}, "maxFootprint": "0Gi"}, "maxFootprint"},
+		"negative quantity":  {map[string]any{"cacheName": "models", "prefixes": []any{"a/"}, "maxFootprint": "-1Gi"}, "maxFootprint"},
+		"fractional byte":    {map[string]any{"cacheName": "models", "prefixes": []any{"a/"}, "maxFootprint": "1m"}, "maxFootprint"},
+		"overflow quantity":  {map[string]any{"cacheName": "models", "prefixes": []any{"a/"}, "maxFootprint": "9223372036854775808"}, "maxFootprint"},
+		"malformed quantity": {map[string]any{"cacheName": "models", "prefixes": []any{"a/"}, "maxFootprint": "1GB"}, "maxFootprint"},
+		"quantity string":    {map[string]any{"cacheName": "models", "prefixes": []any{"a/"}, "maxFootprint": "300Gi"}, "maxFootprint"},
+		"fractional bytes":   {map[string]any{"cacheName": "models", "prefixes": []any{"a/"}, "maxFootprint": 1.5}, "maxFootprint"},
+		"numeric overflow":   {map[string]any{"cacheName": "models", "prefixes": []any{"a/"}, "maxFootprint": float64(9223372036854775808.0)}, "maxFootprint"},
 		"negative footprint": {map[string]any{"cacheName": "models", "prefixes": []any{"a/"}, "maxFootprint": int64(-1)}, "maxFootprint"},
 		"bad replicas":       {map[string]any{"cacheName": "models", "prefixes": []any{"a/"}, "replicas": int64(4), "maxFootprint": int64(1)}, "replicas"},
 		"bad resync short":   {map[string]any{"cacheName": "models", "prefixes": []any{"a/"}, "resyncInterval": "59s", "maxFootprint": int64(1)}, "resyncInterval"},
