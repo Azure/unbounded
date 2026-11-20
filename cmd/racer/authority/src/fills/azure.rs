@@ -21,7 +21,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     net::{SocketAddr, ToSocketAddrs},
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock, Weak, mpsc},
     task::{Poll, Waker},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -31,6 +31,12 @@ pub const AZURE_SERVICE_VERSION: &str = "2026-12-06";
 
 /// One list request deadline.
 const LIST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Leave time for another DNS address if one route silently drops packets.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Bound the address walk and its retained lookup result.
+const MAX_ADDRESSES: usize = 16;
 
 /// Largest list page body accepted.
 const MAX_PAGE_BYTES: usize = 16 * 1024 * 1024;
@@ -432,8 +438,8 @@ async fn exchange(
     let request =
         zeroize::Zeroizing::new(conn::request(method, host_header, target, headers, body));
     rt::timeout(LIST_TIMEOUT, async {
-        let address = resolve(host, port).await?;
-        let tcp = Tcp::connect(address).await.map_err(|_| ListError::Failed)?;
+        let addresses = resolve(host, port).await?;
+        let tcp = connect_addresses(&addresses).await?;
         if https {
             let config = trust.clone().ok_or(ListError::Failed)?;
             let name = ServerName::try_from(host.to_owned()).map_err(|_| ListError::Failed)?;
@@ -478,39 +484,108 @@ fn extend_unique(
     objects.len() > MAX_FILL_OBJECTS
 }
 
-/// Resolve off the control thread so a slow lookup cannot stall the primary
-/// lease or other authority work.
-async fn resolve(host: &str, port: u16) -> Result<SocketAddr, ListError> {
-    let host = host.to_owned();
-    let result = Arc::new(Mutex::new(None));
-    let waker = Arc::new(Mutex::new(None::<Waker>));
-    {
-        let result = Arc::clone(&result);
-        let waker = Arc::clone(&waker);
-        std::thread::Builder::new()
-            .name("racer-fill-resolve".into())
-            .spawn(move || {
-                let address = (host.as_str(), port)
-                    .to_socket_addrs()
-                    .ok()
-                    .and_then(|mut addresses| addresses.next());
-                *lock(&result) = Some(address);
-                if let Some(waker) = lock(&waker).take() {
-                    waker.wake();
-                }
-            })
-            .map_err(|_| ListError::Failed)?;
+async fn connect_addresses(addresses: &[SocketAddr]) -> Result<Tcp, ListError> {
+    for &address in addresses.iter().take(MAX_ADDRESSES) {
+        if let Ok(Ok(tcp)) = rt::timeout(CONNECT_TIMEOUT, Tcp::connect(address)).await {
+            return Ok(tcp);
+        }
     }
+    Err(ListError::Failed)
+}
+
+#[derive(Default)]
+struct ResolveState {
+    addresses: Option<Vec<SocketAddr>>,
+    waker: Option<Waker>,
+}
+
+struct ResolveJob {
+    host: String,
+    port: u16,
+    reply: Weak<Mutex<ResolveState>>,
+}
+
+/// libc resolution is blocking and cannot be canceled. Keep one process-wide
+/// worker and at most one queued job, even when lookup callers time out. A
+/// stuck system resolver therefore cannot accumulate detached OS threads.
+fn resolver() -> Result<&'static mpsc::SyncSender<ResolveJob>, ListError> {
+    static RESOLVER: OnceLock<Result<mpsc::SyncSender<ResolveJob>, ListError>> = OnceLock::new();
+    RESOLVER
+        .get_or_init(|| {
+            let (sender, _worker) = spawn_resolver(|host, port| {
+                (host, port)
+                    .to_socket_addrs()
+                    .map(|addresses| addresses.take(MAX_ADDRESSES).collect())
+                    .unwrap_or_default()
+            })?;
+            Ok(sender)
+        })
+        .as_ref()
+        .map_err(|error| *error)
+}
+
+fn spawn_resolver(
+    mut lookup: impl FnMut(&str, u16) -> Vec<SocketAddr> + Send + 'static,
+) -> Result<(mpsc::SyncSender<ResolveJob>, std::thread::JoinHandle<()>), ListError> {
+    let (sender, receiver) = mpsc::sync_channel::<ResolveJob>(1);
+    let worker = std::thread::Builder::new()
+        .name("racer-fill-resolve".into())
+        .spawn(move || {
+            for job in receiver {
+                // Dropping a timed-out caller cancels a queued lookup and
+                // releases its waker without waiting for libc to return.
+                if job.reply.strong_count() == 0 {
+                    continue;
+                }
+                let addresses = lookup(&job.host, job.port);
+                if let Some(reply) = job.reply.upgrade() {
+                    let waker = {
+                        let mut state = lock(&reply);
+                        state.addresses = Some(addresses);
+                        state.waker.take()
+                    };
+                    if let Some(waker) = waker {
+                        waker.wake();
+                    }
+                }
+            }
+        })
+        .map_err(|_| ListError::Failed)?;
+    Ok((sender, worker))
+}
+
+/// Resolve off the control thread so a slow lookup cannot stall the primary
+/// lease or other authority work. Literals, including IMDS, never need a worker.
+async fn resolve(host: &str, port: u16) -> Result<Vec<SocketAddr>, ListError> {
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+    resolve_with(resolver()?, host, port).await
+}
+
+async fn resolve_with(
+    sender: &mpsc::SyncSender<ResolveJob>,
+    host: &str,
+    port: u16,
+) -> Result<Vec<SocketAddr>, ListError> {
+    let reply = Arc::new(Mutex::new(ResolveState::default()));
+    sender
+        .try_send(ResolveJob {
+            host: host.to_owned(),
+            port,
+            reply: Arc::downgrade(&reply),
+        })
+        .map_err(|_| ListError::Failed)?;
     std::future::poll_fn(move |cx| {
-        if let Some(address) = *lock(&result) {
-            return Poll::Ready(address.ok_or(ListError::Failed));
+        let mut state = lock(&reply);
+        match state.addresses.take() {
+            Some(addresses) if addresses.is_empty() => Poll::Ready(Err(ListError::Failed)),
+            Some(addresses) => Poll::Ready(Ok(addresses)),
+            None => {
+                state.waker = Some(cx.waker().clone());
+                Poll::Pending
+            }
         }
-        *lock(&waker) = Some(cx.waker().clone());
-        // Re-check after publishing the waker so a completion cannot be lost.
-        if let Some(address) = *lock(&result) {
-            return Poll::Ready(address.ok_or(ListError::Failed));
-        }
-        Poll::Pending
     })
     .await
 }
@@ -915,6 +990,135 @@ pub fn http_date(secs: u64) -> String {
         rem / 60 % 60,
         rem % 60
     )
+}
+
+#[cfg(test)]
+mod resolver_tests {
+    use super::*;
+    use std::{future::Future, task::Context};
+
+    #[test]
+    fn literal_addresses_do_not_require_the_resolver_worker() {
+        // Literal resolution needs neither an executor nor a blocking worker.
+        assert_eq!(
+            futures::executor::block_on(resolve("127.0.0.1", 80)),
+            Ok(vec!["127.0.0.1:80".parse().unwrap()])
+        );
+        assert_eq!(
+            futures::executor::block_on(resolve("::1", 443)),
+            Ok(vec!["[::1]:443".parse().unwrap()])
+        );
+    }
+
+    #[test]
+    fn blocked_resolver_has_one_worker_one_queue_slot_and_skips_canceled_jobs() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (sender, worker) = spawn_resolver(move |_, _| {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            vec!["127.0.0.1:80".parse().unwrap()]
+        })
+        .unwrap();
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut first = Box::pin(resolve_with(&sender, "first", 80));
+        assert!(first.as_mut().poll(&mut cx).is_pending());
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // Simulate cancellation by the surrounding request deadline while
+        // libc is still blocked. It must not create another worker.
+        drop(first);
+        let mut queued = Box::pin(resolve_with(&sender, "queued", 80));
+        assert!(queued.as_mut().poll(&mut cx).is_pending());
+        let mut overflow = Box::pin(resolve_with(&sender, "overflow", 80));
+        assert_eq!(
+            overflow.as_mut().poll(&mut cx),
+            Poll::Ready(Err(ListError::Failed))
+        );
+        drop(overflow);
+        drop(queued);
+        drop(sender);
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        // The canceled queued lookup never reached the blocking resolver.
+        assert!(started_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn resolver_delivers_every_address_and_reports_lookup_failure() {
+        let expected = vec!["[::1]:80".parse().unwrap(), "127.0.0.1:80".parse().unwrap()];
+        let addresses = expected.clone();
+        let (sender, worker) = spawn_resolver(move |host, _| {
+            if host == "missing" {
+                Vec::new()
+            } else {
+                addresses.clone()
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            futures::executor::block_on(resolve_with(&sender, "test", 80)),
+            Ok(expected)
+        );
+        assert_eq!(
+            futures::executor::block_on(resolve_with(&sender, "missing", 80)),
+            Err(ListError::Failed)
+        );
+        drop(sender);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn connect_falls_back_after_refusal_and_timeout() {
+        use racer_io::{
+            ctx::VirtualClock,
+            sim::{Fault, SimOs},
+        };
+        use std::{cell::Cell, rc::Rc};
+        for stalled in [false, true] {
+            let clock = VirtualClock::new();
+            let os = SimOs::new();
+            let mut executor = rt::Executor::simulated(os.clone(), &clock, 0, 32).unwrap();
+            let done = Rc::new(Cell::new(false));
+            let completed = done.clone();
+            executor.enter(|| {
+                rt::spawn(async move {
+                    let good: SocketAddr = "127.0.0.1:10001".parse().unwrap();
+                    let _listener = rt::Listener::bind(good).unwrap();
+                    if stalled {
+                        os.inject("connect", Fault::Delay(usize::MAX)).unwrap();
+                    }
+                    let start = rt::now();
+                    assert!(
+                        connect_addresses(&["[::1]:10002".parse().unwrap(), good])
+                            .await
+                            .is_ok()
+                    );
+                    if stalled {
+                        assert!(rt::now() >= start + CONNECT_TIMEOUT);
+                    }
+                    assert!(connect_addresses(&[]).await.is_err());
+                    assert!(
+                        connect_addresses(&["127.0.0.1:10003".parse().unwrap()])
+                            .await
+                            .is_err()
+                    );
+                    completed.set(true);
+                })
+                .unwrap()
+            });
+            // A deliberately stalled simulated operation remains runnable;
+            // drive virtual time explicitly instead of waiting for quiescence.
+            for _ in 0..100 {
+                executor.turn().unwrap();
+                if done.get() {
+                    break;
+                }
+                clock.advance(Duration::from_millis(100)).unwrap();
+            }
+            assert!(done.get(), "address failover did not complete");
+        }
+    }
 }
 
 #[cfg(test)]
