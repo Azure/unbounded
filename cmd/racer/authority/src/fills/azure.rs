@@ -158,10 +158,25 @@ pub struct Client {
 impl Client {
     /// Load the origin trust bundle once.
     pub async fn new(settings: Settings) -> Self {
-        let trust = rt::read_file(&settings.trust_bundle, 1024 * 1024)
-            .await
-            .ok()
-            .and_then(|pem| kube::tls_config(&pem).ok());
+        let trust = match rt::read_file(&settings.trust_bundle, 1024 * 1024).await {
+            Ok(pem) => match kube::tls_config(&pem) {
+                Ok(config) => Some(config),
+                Err(_) => {
+                    eprintln!(
+                        "racer: fill HTTPS listing unavailable: invalid trust bundle {}",
+                        settings.trust_bundle.display()
+                    );
+                    None
+                }
+            },
+            Err(error) => {
+                eprintln!(
+                    "racer: fill HTTPS listing unavailable: cannot read trust bundle {}: {error}",
+                    settings.trust_bundle.display()
+                );
+                None
+            }
+        };
         Self {
             settings,
             trust,
@@ -435,6 +450,11 @@ async fn exchange(
     body: &[u8],
     limit: usize,
 ) -> Result<(u16, Vec<u8>), ListError> {
+    // Initialization already diagnosed this local configuration failure. Do
+    // not spend the request deadline resolving or connecting without roots.
+    if https && trust.is_none() {
+        return Err(ListError::Failed);
+    }
     let request =
         zeroize::Zeroizing::new(conn::request(method, host_header, target, headers, body));
     rt::timeout(LIST_TIMEOUT, async {
@@ -1145,6 +1165,45 @@ mod auth_tests {
             client_id: client.into(),
             tenant_id: Some(tenant.into()),
         }
+    }
+
+    #[test]
+    fn missing_trust_fails_https_before_dns_or_network_io() {
+        // No reactor is installed: reaching DNS, sockets, or a request timer
+        // would panic instead of returning the configuration failure.
+        assert_eq!(
+            futures::executor::block_on(exchange(
+                &None,
+                true,
+                "unused.invalid",
+                443,
+                "unused.invalid",
+                "GET",
+                "/",
+                &[],
+                &[],
+                MAX_SMALL_BODY,
+            )),
+            Err(ListError::Failed)
+        );
+    }
+
+    #[test]
+    fn missing_and_invalid_trust_bundles_leave_https_disabled() {
+        run(async {
+            for path in [
+                concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml/missing"),
+                concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"),
+            ] {
+                let client = Client::new(Settings {
+                    trust_bundle: path.into(),
+                    authority_host: String::new(),
+                    federated_token_file: None,
+                })
+                .await;
+                assert!(client.trust.is_none());
+            }
+        });
     }
 
     #[test]
