@@ -18,8 +18,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	"github.com/Azure/unbounded/internal/machineops"
-	publicmachineops "github.com/Azure/unbounded/pkg/machineops"
+	"github.com/Azure/unbounded/pkg/machineops"
 )
 
 func TestPlanAllocationUsesDeterministicIdentity(t *testing.T) {
@@ -28,7 +27,7 @@ func TestPlanAllocationUsesDeterministicIdentity(t *testing.T) {
 	offering := resolveTestOffering(t, provider)
 	reads := client.reads
 
-	plan, err := provider.PlanAllocation(t.Context(), publicmachineops.AllocationPlanRequest{
+	plan, err := provider.PlanAllocation(t.Context(), machineops.AllocationPlanRequest{
 		AllocationUID:  testAllocationUID,
 		HostName:       testVMName,
 		ProviderConfig: testProviderConfig(),
@@ -40,7 +39,7 @@ func TestPlanAllocationUsesDeterministicIdentity(t *testing.T) {
 	require.Equal(t, reads, client.reads, "planning must not call Azure")
 	require.Zero(t, client.mutations())
 
-	_, err = provider.PlanAllocation(t.Context(), publicmachineops.AllocationPlanRequest{
+	_, err = provider.PlanAllocation(t.Context(), machineops.AllocationPlanRequest{
 		AllocationUID:  testAllocationUID,
 		HostName:       "ub-other",
 		ProviderConfig: testProviderConfig(),
@@ -48,7 +47,7 @@ func TestPlanAllocationUsesDeterministicIdentity(t *testing.T) {
 	})
 	requirePermanent(t, err, unboundedv1alpha3.FailureInvalidRequest)
 
-	_, err = provider.PlanAllocation(t.Context(), publicmachineops.AllocationPlanRequest{
+	_, err = provider.PlanAllocation(t.Context(), machineops.AllocationPlanRequest{
 		AllocationUID: testAllocationUID,
 		HostName:      testVMName,
 		Offering:      offering,
@@ -57,7 +56,7 @@ func TestPlanAllocationUsesDeterministicIdentity(t *testing.T) {
 
 	offering.InstanceType = "Standard_D8s_v3"
 
-	_, err = provider.PlanAllocation(t.Context(), publicmachineops.AllocationPlanRequest{
+	_, err = provider.PlanAllocation(t.Context(), machineops.AllocationPlanRequest{
 		AllocationUID:  testAllocationUID,
 		HostName:       testVMName,
 		ProviderConfig: testProviderConfig(),
@@ -165,7 +164,7 @@ func TestBeginAllocateRejectsInvalidInput(t *testing.T) {
 			request.ProviderID = strings.Replace(request.ProviderID, testResourceGroup, "elsewhere", 1)
 		},
 		"missing provider config": func(request *machineops.OperationRequest) {
-			request.Allocation.ProviderConfig = publicmachineops.ProviderConfig{}
+			request.Allocation.ProviderConfig = machineops.ProviderConfig{}
 		},
 		"host image differs from the config": func(request *machineops.OperationRequest) {
 			request.HostImage = "Canonical:ubuntu-24_04-lts:server:24.04.1"
@@ -327,7 +326,7 @@ func TestBeginAllocateCreateRejections(t *testing.T) {
 
 			result, err := provider.PollAllocate(t.Context(), pollRequestFor(t, request), begin.Operation)
 			require.NoError(t, err)
-			require.Equal(t, publicmachineops.ProviderOperationStateFailed, result.State)
+			require.Equal(t, machineops.ProviderOperationStateFailed, result.State)
 			require.Equal(t, string(test.reason), result.Reason)
 			require.Contains(t, result.Message, "Azure rejected the creation")
 			require.NotNil(t, result.Result.Allocation, "a terminal result reports ownership")
@@ -394,7 +393,7 @@ func TestBeginAllocateRejectionThenRetrySucceeds(t *testing.T) {
 	// Even the stale rejected handle observes the VM that now exists.
 	result, err := provider.PollAllocate(t.Context(), pollRequestFor(t, request), rejected.Operation)
 	require.NoError(t, err)
-	require.Equal(t, publicmachineops.ProviderOperationStateSucceeded, result.State)
+	require.Equal(t, machineops.ProviderOperationStateSucceeded, result.State)
 	require.Equal(t, testOwnedResources(), result.Result.Allocation.OwnedResources)
 }
 
@@ -410,7 +409,7 @@ func TestPollAllocate(t *testing.T) {
 
 	result, err := provider.PollAllocate(t.Context(), pollRequest, begin.Operation)
 	require.NoError(t, err)
-	require.Equal(t, publicmachineops.ProviderOperationStateInProgress, result.State)
+	require.Equal(t, machineops.ProviderOperationStateInProgress, result.State)
 	require.Nil(t, result.Result.Allocation)
 
 	vm := client.vms[testVMName]
@@ -419,7 +418,7 @@ func TestPollAllocate(t *testing.T) {
 
 	result, err = provider.PollAllocate(t.Context(), pollRequest, begin.Operation)
 	require.NoError(t, err)
-	require.Equal(t, publicmachineops.ProviderOperationStateSucceeded, result.State)
+	require.Equal(t, machineops.ProviderOperationStateSucceeded, result.State)
 	require.Equal(t, testVMID(), result.Result.Allocation.ProviderResourceID)
 	require.Equal(t, "Standard_D4s_v3", result.Result.Allocation.InstanceType)
 	require.Equal(t, "eastus2-1", result.Result.Allocation.Zone)
@@ -442,7 +441,7 @@ func TestPollAllocateRefusesChildAttachedElsewhere(t *testing.T) {
 
 	result, err := provider.PollAllocate(t.Context(), request, begin.Operation)
 	require.NoError(t, err)
-	require.Equal(t, publicmachineops.ProviderOperationStateFailed, result.State)
+	require.Equal(t, machineops.ProviderOperationStateFailed, result.State)
 	require.Equal(t, string(unboundedv1alpha3.FailureProviderConflict), result.Reason)
 	require.Nil(t, result.Result.Allocation, "ownership cannot be proved, so none is reported")
 }
@@ -467,7 +466,7 @@ func TestPollAllocateRecordsSuffixedNICFromVMReference(t *testing.T) {
 
 		result, err := provider.PollAllocate(t.Context(), request, begin.Operation)
 		require.NoError(t, err)
-		require.Equal(t, publicmachineops.ProviderOperationStateSucceeded, result.State)
+		require.Equal(t, machineops.ProviderOperationStateSucceeded, result.State)
 		require.Equal(t, testOwnedResources(), result.Result.Allocation.OwnedResources)
 		require.Equal(t, []string{testNICName()}, client.nicGets)
 	}
@@ -489,7 +488,7 @@ func TestPendingAllocationResumesAndReleasesSuffixedNIC(t *testing.T) {
 
 	client.vms[testVMName].Properties.ProvisioningState = new("Succeeded")
 
-	persisted := publicmachineops.ProviderOperation{
+	persisted := machineops.ProviderOperation{
 		OperationID: testVMID(),
 	}
 
@@ -497,7 +496,7 @@ func TestPendingAllocationResumesAndReleasesSuffixedNIC(t *testing.T) {
 
 	allocated, err := restarted.PollAllocate(t.Context(), pollRequestFor(t, request), persisted)
 	require.NoError(t, err)
-	require.Equal(t, publicmachineops.ProviderOperationStateSucceeded, allocated.State)
+	require.Equal(t, machineops.ProviderOperationStateSucceeded, allocated.State)
 	require.Contains(t, allocated.Result.Allocation.OwnedResources, unboundedv1alpha3.ProviderOwnedResource{
 		ID:       testNICID(),
 		NativeID: "nic-guid-" + testVMName,
@@ -516,17 +515,17 @@ func TestPendingAllocationResumesAndReleasesSuffixedNIC(t *testing.T) {
 	client.nics[testNICName()].Properties.VirtualMachine = nil
 
 	stalled := pollRelease(t, restarted, release)
-	require.Equal(t, publicmachineops.ProviderOperationStateInProgress, stalled.State)
+	require.Equal(t, machineops.ProviderOperationStateInProgress, stalled.State)
 	require.Contains(t, stalled.Message, testNICName())
 	require.Equal(t, 1, client.nicDeletes)
 
 	// The delete is in progress and is not sent again.
-	require.Equal(t, publicmachineops.ProviderOperationStateInProgress, pollRelease(t, restarted, release).State)
+	require.Equal(t, machineops.ProviderOperationStateInProgress, pollRelease(t, restarted, release).State)
 	require.Equal(t, 1, client.nicDeletes)
 
 	delete(client.nics, testNICName())
 
-	require.Equal(t, publicmachineops.ProviderOperationStateSucceeded, pollRelease(t, restarted, release).State)
+	require.Equal(t, machineops.ProviderOperationStateSucceeded, pollRelease(t, restarted, release).State)
 	require.Equal(t, 1, client.vmDeletes)
 	require.Zero(t, client.diskDeletes)
 	require.Len(t, client.creates, 1)
@@ -618,7 +617,7 @@ func TestPollAllocateRefusesChildOutsideResourceGroup(t *testing.T) {
 
 	result, err := provider.PollAllocate(t.Context(), request, begin.Operation)
 	require.NoError(t, err)
-	require.Equal(t, publicmachineops.ProviderOperationStateFailed, result.State)
+	require.Equal(t, machineops.ProviderOperationStateFailed, result.State)
 	require.Equal(t, string(unboundedv1alpha3.FailureProviderConflict), result.Reason)
 	require.Nil(t, result.Result.Allocation)
 	require.Empty(t, client.nicGets)
@@ -642,7 +641,7 @@ func TestPollAllocateFailureRecordsOwnedResources(t *testing.T) {
 
 		result, err := provider.PollAllocate(t.Context(), request, begin.Operation)
 		require.NoError(t, err)
-		require.Equal(t, publicmachineops.ProviderOperationStateFailed, result.State)
+		require.Equal(t, machineops.ProviderOperationStateFailed, result.State)
 		require.Equal(t, string(unboundedv1alpha3.FailureProviderFailed), result.Reason)
 		require.Contains(t, result.Message, "OSProvisioningTimedOut")
 		require.NotNil(t, result.Result.Allocation)
@@ -664,9 +663,9 @@ func TestPollAllocateFailureRecordsOwnedResources(t *testing.T) {
 		provider := newTestProvider(client)
 		request := testOperationRequest(t, unboundedv1alpha3.OperationHostAllocate, resolveTestOffering(t, provider))
 
-		result, err := provider.PollAllocate(t.Context(), request, publicmachineops.ProviderOperation{})
+		result, err := provider.PollAllocate(t.Context(), request, machineops.ProviderOperation{})
 		require.NoError(t, err)
-		require.Equal(t, publicmachineops.ProviderOperationStateFailed, result.State)
+		require.Equal(t, machineops.ProviderOperationStateFailed, result.State)
 		require.Equal(t, string(unboundedv1alpha3.FailureInsufficientCapacity), result.Reason)
 		require.Equal(t, testOwnedResources()[:1], result.Result.Allocation.OwnedResources)
 	})
@@ -679,9 +678,9 @@ func TestPollAllocateFailureRecordsOwnedResources(t *testing.T) {
 		provider := newTestProvider(client)
 		request := testOperationRequest(t, unboundedv1alpha3.OperationHostAllocate, resolveTestOffering(t, provider))
 
-		result, err := provider.PollAllocate(t.Context(), request, publicmachineops.ProviderOperation{})
+		result, err := provider.PollAllocate(t.Context(), request, machineops.ProviderOperation{})
 		require.NoError(t, err)
-		require.Equal(t, publicmachineops.ProviderOperationStateFailed, result.State)
+		require.Equal(t, machineops.ProviderOperationStateFailed, result.State)
 		require.Equal(t, testOwnedResources()[:1], result.Result.Allocation.OwnedResources)
 	})
 
@@ -715,9 +714,9 @@ func TestPollAllocateFailureRecordsOwnedResources(t *testing.T) {
 				request := testOperationRequest(t, unboundedv1alpha3.OperationHostAllocate, resolveTestOffering(t, provider))
 
 				for range 2 {
-					result, err := provider.PollAllocate(t.Context(), request, publicmachineops.ProviderOperation{})
+					result, err := provider.PollAllocate(t.Context(), request, machineops.ProviderOperation{})
 					require.NoError(t, err)
-					require.Equal(t, publicmachineops.ProviderOperationStateInProgress, result.State)
+					require.Equal(t, machineops.ProviderOperationStateInProgress, result.State)
 					require.Equal(t, pollInterval, result.RequeueAfter)
 					require.Nil(t, result.Result.Allocation)
 					require.Contains(t, result.Message, string(unboundedv1alpha3.FailureInsufficientCapacity))
@@ -727,9 +726,9 @@ func TestPollAllocateFailureRecordsOwnedResources(t *testing.T) {
 
 				settle.apply(client)
 
-				result, err := provider.PollAllocate(t.Context(), request, publicmachineops.ProviderOperation{})
+				result, err := provider.PollAllocate(t.Context(), request, machineops.ProviderOperation{})
 				require.NoError(t, err)
-				require.Equal(t, publicmachineops.ProviderOperationStateFailed, result.State)
+				require.Equal(t, machineops.ProviderOperationStateFailed, result.State)
 				require.Equal(t, string(unboundedv1alpha3.FailureInsufficientCapacity), result.Reason)
 				require.NotNil(t, result.Result.Allocation)
 				require.Len(t, result.Result.Allocation.OwnedResources, settle.owned)
@@ -746,9 +745,9 @@ func TestPollAllocateFailureRecordsOwnedResources(t *testing.T) {
 		provider := newTestProvider(client)
 		request := testOperationRequest(t, unboundedv1alpha3.OperationHostAllocate, resolveTestOffering(t, provider))
 
-		result, err := provider.PollAllocate(t.Context(), request, publicmachineops.ProviderOperation{})
+		result, err := provider.PollAllocate(t.Context(), request, machineops.ProviderOperation{})
 		require.NoError(t, err)
-		require.Equal(t, publicmachineops.ProviderOperationStateInProgress, result.State)
+		require.Equal(t, machineops.ProviderOperationStateInProgress, result.State)
 	})
 
 	// A child attached to another VM is not a passing state: ownership is
@@ -761,9 +760,9 @@ func TestPollAllocateFailureRecordsOwnedResources(t *testing.T) {
 		provider := newTestProvider(client)
 		request := testOperationRequest(t, unboundedv1alpha3.OperationHostAllocate, resolveTestOffering(t, provider))
 
-		result, err := provider.PollAllocate(t.Context(), request, publicmachineops.ProviderOperation{})
+		result, err := provider.PollAllocate(t.Context(), request, machineops.ProviderOperation{})
 		require.NoError(t, err)
-		require.Equal(t, publicmachineops.ProviderOperationStateFailed, result.State)
+		require.Equal(t, machineops.ProviderOperationStateFailed, result.State)
 		require.Equal(t, string(unboundedv1alpha3.FailureInsufficientCapacity), result.Reason)
 		require.Nil(t, result.Result.Allocation, "an unprovable disk leaves ownership unknown")
 	})
@@ -781,7 +780,7 @@ func TestPollAllocateFailureRecordsOwnedResources(t *testing.T) {
 		client.vms[testVMName].Properties.ProvisioningState = new("Deleting")
 		client.disks[testDiskName()].ManagedBy = nil
 
-		poll := func() publicmachineops.PollResult {
+		poll := func() machineops.PollResult {
 			result, err := provider.PollAllocate(t.Context(), pollRequestFor(t, request), begin.Operation)
 			require.NoError(t, err)
 
@@ -789,7 +788,7 @@ func TestPollAllocateFailureRecordsOwnedResources(t *testing.T) {
 		}
 
 		result := poll()
-		require.Equal(t, publicmachineops.ProviderOperationStateInProgress, result.State)
+		require.Equal(t, machineops.ProviderOperationStateInProgress, result.State)
 		require.Contains(t, result.Message, "is being deleted")
 		require.Contains(t, result.Message, testDiskName())
 
@@ -802,7 +801,7 @@ func TestPollAllocateFailureRecordsOwnedResources(t *testing.T) {
 		}
 
 		result = poll()
-		require.Equal(t, publicmachineops.ProviderOperationStateInProgress, result.State)
+		require.Equal(t, machineops.ProviderOperationStateInProgress, result.State)
 		require.Contains(t, result.Message, testNICName())
 		require.Contains(t, result.Message, testDiskName())
 
@@ -810,7 +809,7 @@ func TestPollAllocateFailureRecordsOwnedResources(t *testing.T) {
 		delete(client.disks, testDiskName())
 
 		result = poll()
-		require.Equal(t, publicmachineops.ProviderOperationStateFailed, result.State)
+		require.Equal(t, machineops.ProviderOperationStateFailed, result.State)
 		require.Equal(t, string(unboundedv1alpha3.FailureProviderFailed), result.Reason)
 		require.NotNil(t, result.Result.Allocation)
 		require.Empty(t, result.Result.Allocation.OwnedResources)
@@ -839,7 +838,7 @@ func TestPollAllocateFailureRecordsOwnedResources(t *testing.T) {
 
 		result, err := provider.PollAllocate(t.Context(), request, begin.Operation)
 		require.NoError(t, err)
-		require.Equal(t, publicmachineops.ProviderOperationStateFailed, result.State)
+		require.Equal(t, machineops.ProviderOperationStateFailed, result.State)
 		require.NotNil(t, result.Result.Allocation)
 		require.ElementsMatch(t, []unboundedv1alpha3.ProviderOwnedResource{
 			testOwnedResources()[0],
@@ -865,12 +864,12 @@ func TestPollAllocateFailureRecordsOwnedResources(t *testing.T) {
 		delete(client.disks, testDiskName())
 		client.nics[testNICName()].Properties.VirtualMachine = nil
 
-		require.Equal(t, publicmachineops.ProviderOperationStateInProgress, pollRelease(t, provider, release).State)
+		require.Equal(t, machineops.ProviderOperationStateInProgress, pollRelease(t, provider, release).State)
 		require.Equal(t, 1, client.nicDeletes)
 
 		delete(client.nics, testNICName())
 
-		require.Equal(t, publicmachineops.ProviderOperationStateSucceeded, pollRelease(t, provider, release).State)
+		require.Equal(t, machineops.ProviderOperationStateSucceeded, pollRelease(t, provider, release).State)
 		require.Equal(t, 1, client.nicDeletes)
 	})
 
@@ -882,9 +881,9 @@ func TestPollAllocateFailureRecordsOwnedResources(t *testing.T) {
 		provider := newTestProvider(client)
 		request := testOperationRequest(t, unboundedv1alpha3.OperationHostAllocate, resolveTestOffering(t, provider))
 
-		result, err := provider.PollAllocate(t.Context(), request, publicmachineops.ProviderOperation{})
+		result, err := provider.PollAllocate(t.Context(), request, machineops.ProviderOperation{})
 		require.NoError(t, err)
-		require.Equal(t, publicmachineops.ProviderOperationStateInProgress, result.State)
+		require.Equal(t, machineops.ProviderOperationStateInProgress, result.State)
 		require.Contains(t, result.Message, testNICName())
 		require.Contains(t, result.Message, string(unboundedv1alpha3.FailureInsufficientCapacity))
 	})
@@ -897,7 +896,7 @@ func TestPollAllocateFailureRecordsOwnedResources(t *testing.T) {
 		provider := newTestProvider(client)
 		request := testOperationRequest(t, unboundedv1alpha3.OperationHostAllocate, resolveTestOffering(t, provider))
 
-		_, err := provider.PollAllocate(t.Context(), request, publicmachineops.ProviderOperation{})
+		_, err := provider.PollAllocate(t.Context(), request, machineops.ProviderOperation{})
 		requireTransient(t, err)
 	})
 
@@ -909,7 +908,7 @@ func TestPollAllocateFailureRecordsOwnedResources(t *testing.T) {
 		provider := newTestProvider(client)
 		request := testOperationRequest(t, unboundedv1alpha3.OperationHostAllocate, resolveTestOffering(t, provider))
 
-		result, err := provider.PollAllocate(t.Context(), request, publicmachineops.ProviderOperation{})
+		result, err := provider.PollAllocate(t.Context(), request, machineops.ProviderOperation{})
 		require.NoError(t, err)
 		require.Len(t, result.Result.Allocation.OwnedResources, 2)
 		require.Equal(t, "disk-guid", result.Result.Allocation.OwnedResources[1].NativeID)
@@ -923,7 +922,7 @@ func TestPollAllocateFailureRecordsOwnedResources(t *testing.T) {
 		provider := newTestProvider(client)
 		request := testOperationRequest(t, unboundedv1alpha3.OperationHostAllocate, resolveTestOffering(t, provider))
 
-		_, err := provider.PollAllocate(t.Context(), request, publicmachineops.ProviderOperation{})
+		_, err := provider.PollAllocate(t.Context(), request, machineops.ProviderOperation{})
 		requireTransient(t, err)
 	})
 }
@@ -1017,6 +1016,52 @@ func TestBeginAllocateFailsWhenAzureRefusesTheCredential(t *testing.T) {
 	}
 }
 
+// A Secret missing clientSecret cannot build a credential, so Begin ends the
+// allocation before anything exists instead of being retried without end.
+func TestBeginAllocateFailsWhenTheCredentialCannotBeBuilt(t *testing.T) {
+	client := newFakeCapacityClient()
+	offering := resolveTestOffering(t, newTestProvider(client))
+
+	provider := &Provider{}
+	request := testOperationRequest(t, unboundedv1alpha3.OperationHostAllocate, offering)
+	request.Auth = authWithoutClientSecret()
+
+	_, err := provider.BeginAllocate(t.Context(), request)
+	requirePermanent(t, err, unboundedv1alpha3.FailureAuthFailed)
+	require.ErrorContains(t, err, "create Azure capacity client")
+	require.ErrorContains(t, err, "clientSecret")
+	require.Zero(t, client.mutations())
+}
+
+// After a VM may exist, a credential that cannot be built stays retryable so
+// an operator can repair it and Poll resumes the operation.
+func TestPollAllocateRetriesWhenTheCredentialCannotBeBuilt(t *testing.T) {
+	client := newFakeCapacityClient()
+	offering := resolveTestOffering(t, newTestProvider(client))
+
+	provider := &Provider{}
+	request := pollRequestFor(t, testOperationRequest(t, unboundedv1alpha3.OperationHostAllocate, offering))
+	request.Auth = authWithoutClientSecret()
+
+	_, err := provider.PollAllocate(t.Context(), request, machineops.ProviderOperation{OperationID: testVMID()})
+	requireTransient(t, err)
+	require.ErrorContains(t, err, "create Azure capacity client")
+	require.ErrorContains(t, err, "clientSecret")
+	require.Zero(t, client.mutations())
+}
+
+// authWithoutClientSecret is an external plugin credential whose Secret is
+// missing the clientSecret key.
+func authWithoutClientSecret() *machineops.OperationAuth {
+	return &machineops.OperationAuth{
+		Mode: unboundedv1alpha3.MachineOperationCredentialAuthExternalPlugin,
+		SecretData: map[string]string{
+			"tenantID": "tenant",
+			"clientID": "client",
+		},
+	}
+}
+
 // Canceled is a terminal Azure provisioning state: the VM and what it
 // references are reported so release can remove them.
 func TestPollAllocateTreatsCanceledAsFailed(t *testing.T) {
@@ -1031,13 +1076,13 @@ func TestPollAllocateTreatsCanceledAsFailed(t *testing.T) {
 
 	result, err := provider.PollAllocate(t.Context(), request, begin.Operation)
 	require.NoError(t, err)
-	require.Equal(t, publicmachineops.ProviderOperationStateFailed, result.State)
+	require.Equal(t, machineops.ProviderOperationStateFailed, result.State)
 	require.NotNil(t, result.Result.Allocation)
 	require.Equal(t, testOwnedResources(), result.Result.Allocation.OwnedResources)
 }
 
 func TestPollAllocateWithoutVM(t *testing.T) {
-	accepted := func(t *testing.T) (*fakeCapacityClient, *Provider, machineops.OperationRequest, publicmachineops.ProviderOperation) {
+	accepted := func(t *testing.T) (*fakeCapacityClient, *Provider, machineops.OperationRequest, machineops.ProviderOperation) {
 		t.Helper()
 
 		client := newFakeCapacityClient()
@@ -1068,7 +1113,7 @@ func TestPollAllocateWithoutVM(t *testing.T) {
 
 		result, err := provider.PollAllocate(t.Context(), request, operation)
 		require.NoError(t, err)
-		require.Equal(t, publicmachineops.ProviderOperationStateInProgress, result.State)
+		require.Equal(t, machineops.ProviderOperationStateInProgress, result.State)
 	})
 
 	t.Run("absent after the grace period owns nothing", func(t *testing.T) {
@@ -1079,7 +1124,7 @@ func TestPollAllocateWithoutVM(t *testing.T) {
 
 		result, err := provider.PollAllocate(t.Context(), request, operation)
 		require.NoError(t, err)
-		require.Equal(t, publicmachineops.ProviderOperationStateFailed, result.State)
+		require.Equal(t, machineops.ProviderOperationStateFailed, result.State)
 		require.Equal(t, string(unboundedv1alpha3.FailureProviderFailed), result.Reason)
 		require.NotNil(t, result.Result.Allocation)
 		require.Empty(t, result.Result.Allocation.OwnedResources)
@@ -1088,9 +1133,9 @@ func TestPollAllocateWithoutVM(t *testing.T) {
 	t.Run("absent with a handle that has no token owns nothing", func(t *testing.T) {
 		_, provider, request, _ := accepted(t)
 
-		result, err := provider.PollAllocate(t.Context(), request, publicmachineops.ProviderOperation{OperationID: testVMID()})
+		result, err := provider.PollAllocate(t.Context(), request, machineops.ProviderOperation{OperationID: testVMID()})
 		require.NoError(t, err)
-		require.Equal(t, publicmachineops.ProviderOperationStateFailed, result.State)
+		require.Equal(t, machineops.ProviderOperationStateFailed, result.State)
 		require.NotNil(t, result.Result.Allocation)
 		require.Empty(t, result.Result.Allocation.OwnedResources)
 	})
@@ -1121,11 +1166,11 @@ func TestPollAllocateWithoutVM(t *testing.T) {
 			client, provider, request, _ := accepted(t)
 			leftover.seed(client)
 
-			operation := publicmachineops.ProviderOperation{OperationID: testVMID()}
+			operation := machineops.ProviderOperation{OperationID: testVMID()}
 
 			result, err := provider.PollAllocate(t.Context(), request, operation)
 			require.NoError(t, err)
-			require.Equal(t, publicmachineops.ProviderOperationStateInProgress, result.State)
+			require.Equal(t, machineops.ProviderOperationStateInProgress, result.State)
 			require.Nil(t, result.Result.Allocation)
 			require.Contains(t, result.Message, leftover.name)
 
@@ -1134,7 +1179,7 @@ func TestPollAllocateWithoutVM(t *testing.T) {
 
 			result, err = provider.PollAllocate(t.Context(), request, operation)
 			require.NoError(t, err)
-			require.Equal(t, publicmachineops.ProviderOperationStateFailed, result.State)
+			require.Equal(t, machineops.ProviderOperationStateFailed, result.State)
 			require.NotNil(t, result.Result.Allocation)
 			require.Empty(t, result.Result.Allocation.OwnedResources)
 		})
@@ -1144,9 +1189,9 @@ func TestPollAllocateWithoutVM(t *testing.T) {
 		client, provider, request, _ := accepted(t)
 		client.nics[testVMName+nicNameSuffix] = testNIC("unrelated-nic", "")
 
-		result, err := provider.PollAllocate(t.Context(), request, publicmachineops.ProviderOperation{OperationID: testVMID()})
+		result, err := provider.PollAllocate(t.Context(), request, machineops.ProviderOperation{OperationID: testVMID()})
 		require.NoError(t, err)
-		require.Equal(t, publicmachineops.ProviderOperationStateFailed, result.State)
+		require.Equal(t, machineops.ProviderOperationStateFailed, result.State)
 		require.NotNil(t, result.Result.Allocation)
 		require.Empty(t, result.Result.Allocation.OwnedResources)
 	})
@@ -1155,9 +1200,9 @@ func TestPollAllocateWithoutVM(t *testing.T) {
 		client, provider, request, _ := accepted(t)
 		client.nics[testNICName()] = testNIC("nic-guid", vmResourceID(testSubscription, testResourceGroup, "other"))
 
-		result, err := provider.PollAllocate(t.Context(), request, publicmachineops.ProviderOperation{OperationID: testVMID()})
+		result, err := provider.PollAllocate(t.Context(), request, machineops.ProviderOperation{OperationID: testVMID()})
 		require.NoError(t, err)
-		require.Equal(t, publicmachineops.ProviderOperationStateFailed, result.State)
+		require.Equal(t, machineops.ProviderOperationStateFailed, result.State)
 		require.Nil(t, result.Result.Allocation)
 		require.Contains(t, result.Message, testNICName())
 	})
@@ -1176,7 +1221,7 @@ func TestPollAllocateWithoutVM(t *testing.T) {
 
 		result, err := provider.PollAllocate(t.Context(), pollRequestFor(t, request), begin.Operation)
 		require.NoError(t, err)
-		require.Equal(t, publicmachineops.ProviderOperationStateInProgress, result.State)
+		require.Equal(t, machineops.ProviderOperationStateInProgress, result.State)
 		require.Contains(t, result.Message, string(unboundedv1alpha3.FailureInsufficientCapacity))
 		require.Contains(t, result.Message, "SkuNotAvailable")
 
@@ -1184,7 +1229,7 @@ func TestPollAllocateWithoutVM(t *testing.T) {
 
 		result, err = provider.PollAllocate(t.Context(), pollRequestFor(t, request), begin.Operation)
 		require.NoError(t, err)
-		require.Equal(t, publicmachineops.ProviderOperationStateFailed, result.State)
+		require.Equal(t, machineops.ProviderOperationStateFailed, result.State)
 		require.Equal(t, string(unboundedv1alpha3.FailureInsufficientCapacity), result.Reason)
 		require.Empty(t, result.Result.Allocation.OwnedResources)
 	})
@@ -1193,7 +1238,7 @@ func TestPollAllocateWithoutVM(t *testing.T) {
 		client, provider, request, _ := accepted(t)
 		client.childGetErr = errors.New("timeout")
 
-		_, err := provider.PollAllocate(t.Context(), request, publicmachineops.ProviderOperation{OperationID: testVMID()})
+		_, err := provider.PollAllocate(t.Context(), request, machineops.ProviderOperation{OperationID: testVMID()})
 		requireTransient(t, err)
 	})
 
@@ -1205,7 +1250,7 @@ func TestPollAllocateWithoutVM(t *testing.T) {
 
 		result, err := provider.PollAllocate(t.Context(), request, operation)
 		require.NoError(t, err)
-		require.Equal(t, publicmachineops.ProviderOperationStateFailed, result.State)
+		require.Equal(t, machineops.ProviderOperationStateFailed, result.State)
 		require.Equal(t, string(unboundedv1alpha3.FailureProviderConflict), result.Reason)
 		require.Nil(t, result.Result.Allocation)
 	})
@@ -1213,7 +1258,7 @@ func TestPollAllocateWithoutVM(t *testing.T) {
 	t.Run("unreadable resume token is permanent", func(t *testing.T) {
 		_, provider, request, _ := accepted(t)
 
-		_, err := provider.PollAllocate(t.Context(), request, publicmachineops.ProviderOperation{
+		_, err := provider.PollAllocate(t.Context(), request, machineops.ProviderOperation{
 			OperationID: testVMID(),
 			ResumeToken: "{not json",
 		})

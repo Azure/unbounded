@@ -447,7 +447,7 @@ Provisional until the node facts in section 13 are collected.
 - Gate: experimental. The agent refuses the mode unless its configuration sets
   `Experimental.ContainerIsolation`; machina provisions it only with
   `experimentalContainerIsolation` (and then opts every agent config it writes
-  in), metalman (`serve-pxe`) and machine-ops-controller (`HostReplace`) do the
+  in), metalman (`serve-pxe`) and azure-machine-ops-controller (`HostReplace`) do the
   same with `--experimental-container-isolation`, sharing
   `provision.CheckIsolationEnabled` with machina, and
   `kubectl unbounded machine manual-bootstrap` needs

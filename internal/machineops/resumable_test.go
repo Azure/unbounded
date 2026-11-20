@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	metav1validation "k8s.io/apimachinery/pkg/apis/meta/v1/validation"
@@ -126,10 +127,11 @@ func TestLongRunningOperationRejectsPersistedHandleFromDifferentProvider(t *test
 	require.Empty(t, provider.pollCalls)
 }
 
-func TestLongRunningOperationPollDoesNotRebuildReplacementBootstrapData(t *testing.T) {
-	t.Parallel()
-
+// newReplaceInProgressObjects returns a HostReplace whose provider handle is
+// already persisted, with the Machine fields its bootstrap data is built from.
+func newReplaceInProgressObjects() (*unboundedv1alpha3.Machine, *unboundedv1alpha3.MachineOperation, *unboundedv1alpha3.MachineOperationCredential) {
 	machine, op, credential := newResumableTestObjects("machine-1", "op-1")
+	machine.Spec.Kubernetes = &unboundedv1alpha3.KubernetesSpec{BootstrapTokenRef: &unboundedv1alpha3.LocalObjectReference{Name: "bootstrap-token-test"}}
 	op.Spec.OperationKind = unboundedv1alpha3.OperationHostReplace
 	op.Status.Phase = unboundedv1alpha3.OperationPhaseInProgress
 	op.Status.Targets = []unboundedv1alpha3.MachineOperationTargetStatus{{
@@ -137,21 +139,128 @@ func TestLongRunningOperationPollDoesNotRebuildReplacementBootstrapData(t *testi
 		Phase:              unboundedv1alpha3.OperationPhaseInProgress,
 		Stage:              unboundedv1alpha3.OperationStageWaitingProvider,
 		ObservedGeneration: machine.Generation,
+		StartedAt:          ptrTo(fixedOperationNow()),
 		ProviderOperation: &unboundedv1alpha3.ProviderOperationStatus{
 			Provider:    testLongRunningProviderName,
 			OperationID: "provider-op-1",
 		},
 	}}
-	provider := &recordingLongRunningProvider{
-		pollResults: []publicmachineops.PollResult{{State: publicmachineops.ProviderOperationStateInProgress}},
-	}
 
-	c := fake.NewClientBuilder().WithScheme(newOperationTestScheme(t)).WithObjects(machine, op, credential).WithStatusSubresource(op).Build()
+	return machine, op, credential
+}
+
+func newBootstrapTokenSecret(tokenSecret string) *corev1.Secret {
+	return &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: metav1.NamespaceSystem, Name: "bootstrap-token-test"},
+		Data: map[string][]byte{
+			"token-id":     []byte("abc123"),
+			"token-secret": []byte(tokenSecret),
+		},
+	}
+}
+
+func TestLongRunningOperationPollReceivesReplacementBootstrapData(t *testing.T) {
+	t.Parallel()
+
+	s := newOperationTestScheme(t)
+	require.NoError(t, corev1.AddToScheme(s))
+
+	machine, op, credential := newReplaceInProgressObjects()
+	secret := newBootstrapTokenSecret("secret456")
+	provider := &recordingLongRunningProvider{}
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, credential, secret).WithStatusSubresource(op).Build()
 	reconciler := newResumableTestReconciler(c, provider)
+	reconciler.ClusterInfo = testClusterInfo()
 
 	reconcileOperation(t, reconciler, op.Name)
 
+	require.Zero(t, provider.beginCalls)
 	require.Equal(t, []string{"provider-op-1"}, provider.pollCalls)
+	require.Len(t, provider.pollReplaceUserData, 1)
+	require.Contains(t, provider.pollReplaceUserData[0], "#cloud-config")
+	require.Contains(t, provider.pollReplaceUserData[0], "abc123.secret456")
+
+	// The data is built again for every Poll, so a Poll that creates the
+	// replacement host uses the bootstrap token as it is then.
+	secret.Data["token-secret"] = []byte("rotated789")
+	require.NoError(t, c.Update(context.Background(), secret))
+
+	reconcileOperation(t, reconciler, op.Name)
+
+	require.Len(t, provider.pollReplaceUserData, 2)
+	require.Contains(t, provider.pollReplaceUserData[1], "abc123.rotated789")
+
+	var updated unboundedv1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &updated))
+	require.NotContains(t, fmt.Sprintf("%+v", updated.Status), "secret456")
+	require.NotContains(t, fmt.Sprintf("%+v", updated.Status), "rotated789")
+}
+
+func TestLongRunningOperationPollsWithoutReplacementBootstrapDataThatCannotBeBuilt(t *testing.T) {
+	t.Parallel()
+
+	s := newOperationTestScheme(t)
+	require.NoError(t, corev1.AddToScheme(s))
+
+	// The bootstrap token Secret is missing, so the data cannot be built. The
+	// provider already accepted the operation, so it is still polled: here it
+	// reports that the replacement host is ready.
+	machine, op, credential := newReplaceInProgressObjects()
+	provider := &recordingLongRunningProvider{
+		pollErrs:    []error{errors.New("replacement user data is not available")},
+		pollResults: []publicmachineops.PollResult{{}, {State: publicmachineops.ProviderOperationStateSucceeded}},
+	}
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, credential).WithStatusSubresource(op).Build()
+	reconciler := newResumableTestReconciler(c, provider)
+	reconciler.ClusterInfo = testClusterInfo()
+
+	// A Poll that needs the data fails and the operation keeps its handle.
+	result := reconcileOperation(t, reconciler, op.Name)
+
+	require.Equal(t, time.Millisecond, result.RequeueAfter)
+	require.Equal(t, []string{""}, provider.pollReplaceUserData)
+
+	var updated unboundedv1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &updated))
+	require.Equal(t, unboundedv1alpha3.OperationPhaseInProgress, updated.Status.Phase)
+	require.NotNil(t, updated.Status.Targets[0].ProviderOperation)
+	require.Contains(t, updated.Status.Targets[0].Message, "replacement user data is not available")
+	require.Contains(t, updated.Status.Targets[0].Message, "bootstrap-token-test", "the status names why the data is missing")
+	require.Equal(t, "test:///nodes/machine-1", provider.pollProviderIDs[0], "the rest of the request is intact")
+
+	// A Poll that only observes completes the operation without it.
+	reconcileOperation(t, reconciler, op.Name)
+
+	require.Zero(t, provider.beginCalls)
+	require.Equal(t, []string{"", ""}, provider.pollReplaceUserData)
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &updated))
+	require.Equal(t, unboundedv1alpha3.OperationPhaseComplete, updated.Status.Phase)
+}
+
+func TestLongRunningOperationFailsWhenReplacementBootstrapDataCannotBeBuiltBeforeBegin(t *testing.T) {
+	t.Parallel()
+
+	s := newOperationTestScheme(t)
+	require.NoError(t, corev1.AddToScheme(s))
+
+	machine, op, credential := newReplaceInProgressObjects()
+	op.Status = unboundedv1alpha3.MachineOperationStatus{}
+	provider := &recordingLongRunningProvider{}
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, credential).WithStatusSubresource(op).Build()
+	reconciler := newResumableTestReconciler(c, provider)
+	reconciler.ClusterInfo = testClusterInfo()
+
+	reconcileOperation(t, reconciler, op.Name)
+
+	require.Zero(t, provider.beginCalls)
+
+	var updated unboundedv1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &updated))
+	require.Equal(t, unboundedv1alpha3.OperationPhaseFailed, updated.Status.Phase)
+	require.Contains(t, updated.Status.Message, "bootstrap-token-test")
 }
 
 func TestLongRunningOperationRecoveryPollsWithoutBeginningAgain(t *testing.T) {
@@ -695,6 +804,8 @@ type recordingLongRunningProvider struct {
 	beginCalls         int
 	pollCalls          []string
 	pollProviderIDs    []string
+	// pollReplaceUserData holds request.ReplaceUserData of each Poll.
+	pollReplaceUserData []string
 }
 
 func (p *recordingLongRunningProvider) Begin(_ context.Context, request OperationRequest) (publicmachineops.BeginResult, error) {
@@ -720,6 +831,8 @@ func (p *recordingLongRunningProvider) Poll(_ context.Context, request Operation
 	p.pollCalls = append(p.pollCalls, operation.OperationID)
 
 	p.pollProviderIDs = append(p.pollProviderIDs, request.ProviderID)
+	p.pollReplaceUserData = append(p.pollReplaceUserData, request.ReplaceUserData)
+
 	if call < len(p.pollErrs) && p.pollErrs[call] != nil {
 		return publicmachineops.PollResult{}, p.pollErrs[call]
 	}

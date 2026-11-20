@@ -58,28 +58,50 @@ func TestConfiguredProvidersRejectsUnknownProvider(t *testing.T) {
 	require.ErrorContains(t, err, `unknown machine-ops provider "CustomProvider"`)
 }
 
-func TestConfiguredProvidersRejectsOCIInstance(t *testing.T) {
-	t.Parallel()
-
-	_, err := configuredProviders("OCIInstance")
-
-	require.ErrorContains(t, err, `unknown machine-ops provider "OCIInstance"`)
-}
-
 func TestLeaderElectionID(t *testing.T) {
 	t.Parallel()
 
-	require.Equal(t, "machine-ops-controller", leaderElectionID(config{}))
+	require.Equal(t, "azure-machine-ops-controller", leaderElectionID(config{}))
 
 	siteA := leaderElectionID(config{providerName: unboundedv1alpha3.ExternalProviderAzureVM, siteName: "site-a"})
 	siteB := leaderElectionID(config{providerName: unboundedv1alpha3.ExternalProviderAzureVM, siteName: "site-b"})
 	exampleSiteA := leaderElectionID(config{providerName: "ExampleCloud", siteName: "site-a"})
 
-	require.NotEqual(t, "machine-ops-controller", siteA)
+	require.NotEqual(t, "azure-machine-ops-controller", siteA)
 	require.NotEqual(t, siteA, siteB)
 	require.NotEqual(t, siteA, exampleSiteA)
 	require.Equal(t, siteA, leaderElectionID(config{providerName: unboundedv1alpha3.ExternalProviderAzureVM, siteName: "site-a"}))
 	require.LessOrEqual(t, len(siteA), 63)
+}
+
+func TestLeaderElectionIDForPartialScopes(t *testing.T) {
+	t.Parallel()
+
+	providerOnly := leaderElectionID(config{providerName: unboundedv1alpha3.ExternalProviderAzureVM})
+	siteOnly := leaderElectionID(config{siteName: "site-a"})
+	both := leaderElectionID(config{providerName: unboundedv1alpha3.ExternalProviderAzureVM, siteName: "site-a"})
+
+	for _, id := range []string{providerOnly, siteOnly, both} {
+		require.NotEqual(t, controllerName, id)
+		require.LessOrEqual(t, len(id), 63)
+	}
+
+	require.NotEqual(t, providerOnly, siteOnly)
+	require.NotEqual(t, providerOnly, both)
+	require.NotEqual(t, siteOnly, both)
+}
+
+func TestProviderScopeDoesNotRequireASite(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := parseFlags(t, "--provider="+unboundedv1alpha3.ExternalProviderAzureVM,
+		"--enable-capacity", "--api-server-endpoint=https://example.invalid:443")
+	require.NoError(t, err)
+
+	capacity, err := capacityOptions(cfg)
+	require.NoError(t, err)
+	require.Equal(t, unboundedv1alpha3.ExternalProviderAzureVM, capacity.ProviderName)
+	require.Empty(t, capacity.SiteName)
 }
 
 func TestSafeNamePartFallsBackForSymbolOnlyScope(t *testing.T) {
@@ -88,7 +110,7 @@ func TestSafeNamePartFallsBackForSymbolOnlyScope(t *testing.T) {
 	part := safeNamePart("!!!")
 
 	require.Contains(t, part, "scope-")
-	require.LessOrEqual(t, len("machine-ops-controller-"+part), 63)
+	require.LessOrEqual(t, len("azure-machine-ops-controller-"+part), 63)
 }
 
 func TestAzureVMRegistrationDeclaresCapacity(t *testing.T) {
@@ -231,11 +253,11 @@ func TestParseConsumerKinds(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, kinds)
 
-	kinds, err = parseConsumerKinds([]string{" karpenter.sh/v1/NodeClaim ", "v1/Pod"})
+	kinds, err = parseConsumerKinds([]string{" karpenter.sh/v1/NodeClaim ", "v1/Node"})
 	require.NoError(t, err)
 	require.Equal(t, []schema.GroupVersionKind{
 		{Group: "karpenter.sh", Version: "v1", Kind: "NodeClaim"},
-		{Version: "v1", Kind: "Pod"},
+		{Version: "v1", Kind: "Node"},
 	}, kinds)
 
 	for _, value := range []string{"", "NodeClaim", "karpenter.sh//NodeClaim", "karpenter.sh/v1/", "a/b/c/d"} {

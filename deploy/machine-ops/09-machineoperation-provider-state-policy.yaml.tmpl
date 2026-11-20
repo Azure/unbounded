@@ -1,0 +1,59 @@
+# Makes status.targets[].providerOperation and status.targets[].input of a
+# MachineOperation writable by an operations controller only. The machine-ops
+# engine reads both back as its own state: it hands providerOperation, with
+# its resumeToken, to the provider's Poll, and builds the provider request
+# from input. Without this policy any identity that may update
+# machineoperations/status, such as the agent daemon group, which reports the
+# operations it runs itself, could rewrite that state on another operation.
+#
+# An operations controller is an identity allowed update on
+# machineoperations/finalizers. The machine-ops controller role and the
+# metalman role grant it, and the agent daemon role does not. cluster-admin
+# and system:masters are allowed everything and pass. Never grant update on
+# machineoperations/finalizers to the agent daemons.
+#
+# The check compares the targets that carry either field, reduced to
+# machineRef and the two fields, in list order. Any other identity can
+# therefore still change every other status field and add or remove a target
+# that has neither field, but cannot add, change or remove the two fields,
+# add or remove a target that carries them, or reorder such targets. The
+# authorizer is asked only when the comparison differs, so a status update
+# that leaves the two fields alone costs no authorization check.
+#
+# Only the status subresource matches: the API server drops status on create
+# and on an update of the main resource.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: unbounded-machineoperation-provider-state
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups:
+          - "unbounded-cloud.io"
+        apiVersions:
+          - "*"
+        operations:
+          - "UPDATE"
+        resources:
+          - "machineoperations/status"
+  variables:
+    - name: oldProviderState
+      expression: "oldObject.?status.?targets.orValue([]).filter(t, has(t.providerOperation) || has(t.input)).map(t, {'machineRef': t.machineRef, ?'providerOperation': t.?providerOperation, ?'input': t.?input})"
+    - name: newProviderState
+      expression: "object.?status.?targets.orValue([]).filter(t, has(t.providerOperation) || has(t.input)).map(t, {'machineRef': t.machineRef, ?'providerOperation': t.?providerOperation, ?'input': t.?input})"
+  validations:
+    - expression: "variables.oldProviderState == variables.newProviderState || authorizer.group('unbounded-cloud.io').resource('machineoperations').subresource('finalizers').check('update').allowed()"
+      message: "only an identity allowed to update machineoperations/finalizers may change providerOperation or input of a status target"
+      reason: Forbidden
+
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: unbounded-machineoperation-provider-state
+spec:
+  policyName: unbounded-machineoperation-provider-state
+  validationActions:
+    - "Deny"

@@ -5,7 +5,7 @@ description: "Power management and host replacement operations."
 ---
 
 Host operations change the power state of the VM, PXE host, or bare-metal
-machine. They are handled by `machine-ops-controller` for cloud VMs and by
+machine. They are handled by `azure-machine-ops-controller` for Azure VMs and by
 `metalman` for PXE/bare-metal machines with BMC. The exception is
 `HostSoftReboot`, which the `unbounded-agent` daemon on the host executes.
 
@@ -28,7 +28,7 @@ An operation that no metalman instance can own is marked `Failed`. This covers
 a selector that names no site or more than one site, and a `machineRef` that
 names a Machine that does not exist.
 
-For cloud VMs, run `machine-ops-controller` scoped to the Machine's site and
+For Azure VMs, run `azure-machine-ops-controller` scoped to the Machine's site and
 provider, for example `--site=remote --provider=AzureVM`. A scoped controller
 only executes operations whose target Machine has the matching
 `unbounded-cloud.io/site` label and `spec.provider`; other controllers ignore
@@ -48,7 +48,7 @@ Machines joined via SSH do not have a cloud provider or BMC backing them.
 for SSH-joined machines because there is no out-of-band API to power-cycle,
 power on, or recreate the machine. Use `HostSoftReboot` to reboot them.
 
-| Operation | Cloud VM | Bare metal (BMC) | SSH-joined |
+| Operation | Azure VM | Bare metal (BMC) | SSH-joined |
 |-----------|----------|-------------------|------------|
 | `HostHardReboot` | Yes | Yes | Not supported |
 | `HostSoftReboot` | Yes (agent) | Yes (agent) | Yes (agent) |
@@ -192,6 +192,37 @@ cluster.
 This is the most disruptive host operation. Use it when you need to replace the
 host OS, change VM sizing, or recover from corruption that a reboot cannot fix.
 
+On Azure the VM is deleted and created again under the same name. It gets a
+new OS disk from the host image, and its network interfaces and managed data
+disks are detached before the delete and attached to the new VM. The operation
+is refused, before anything is changed, for a VM that cannot be recreated this
+way:
+
+- a Windows VM, or a Linux VM that allows password authentication
+- a VM with an unmanaged (VHD) OS disk or data disk
+- a VM whose network interfaces were defined inline with the VM instead of
+  being attached by ID
+- a VM that was not created from an image, when the operation names no host
+  image
+
+VM extensions are not installed on the new VM, and a system-assigned managed
+identity gets a new principal, so role assignments made to the old one must be
+made again. A VM that changes after the operation started, for example because
+a disk is attached, is not deleted: the operation fails and a new one replaces
+the VM as it is then.
+
+Before the delete, the operation changes the VM's delete options so that its
+network interfaces and data disks survive, and tags the VM with
+`unbounded-replace-pending` and `unbounded-replace-restore`. An operation that
+fails while the VM still exists undoes both. If the `MachineOperation` is
+deleted in between, they stay; the next `HostReplace` restores the original
+options from the tags, or refuses the VM if it changed since and tells you
+which tags to remove.
+
+If Azure rejects the new VM after the old one is deleted, for example because
+of quota, the operation fails and the VM must be recreated manually. Its
+network interfaces and data disks are left in place.
+
 ```yaml
 apiVersion: unbounded-cloud.io/v1alpha3
 kind: MachineOperation
@@ -227,10 +258,10 @@ cloud-init times out before the node rejoins.
 **Azure VM** - reads the existing VM model, detaches NICs and data disks,
 deletes the VM resource, and recreates the same VM name with fresh cloud-init
 custom data that installs `unbounded-agent`. The old OS disk is not reused.
-Configure `machine-ops-controller --api-server-endpoint` with an API server
+Configure `azure-machine-ops-controller --api-server-endpoint` with an API server
 address reachable from replaced hosts; the generated agent bootstrap config uses
 that value. A Machine that declares the experimental `spec.isolation: container`
-is replaced only when `machine-ops-controller` runs with
+is replaced only when `azure-machine-ops-controller` runs with
 `--experimental-container-isolation`; see
 [Enabling the container mode]({{< relref "reference/agent/isolation#enabling-the-container-mode" >}}).
 

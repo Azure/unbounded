@@ -190,7 +190,7 @@ func TestCapacityBindsEveryReusableRoleOnce(t *testing.T) {
 	}{
 		"defaults": {
 			data:                    map[string]string{"EnableCapacity": "true"},
-			controllerName:          "machine-ops-controller",
+			controllerName:          "azure-machine-ops-controller",
 			namespace:               "unbounded-system",
 			providerConfigNamespace: "unbounded-system",
 		},

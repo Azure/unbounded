@@ -92,11 +92,11 @@ is enabled:
 | Agent | `"Experimental": {"ContainerIsolation": true}` in the [agent config]({{< relref "reference/agent/configuration" >}}) | The config fails validation, `--isolation container` is rejected, and a change to `container` at a repave is reported `Failed` with reason `ExperimentalNotEnabled` |
 | Machina | `experimentalContainerIsolation: true` in `config.yaml` of the `machina-config` ConfigMap in `unbounded-system`. The operator keeps your edits to that ConfigMap and restarts machina when it changes. For manifests rendered from the repository, `make machina-manifests MACHINA_EXPERIMENTAL_CONTAINER_ISOLATION=true` sets it | Machina does not provision a Machine that declares `container` (it is marked `Failed`), and `IsolationDrift` reports `ExperimentalModeDisabled` |
 | Metalman | `--experimental-container-isolation` on `metalman serve-pxe` (for the operator-managed Deployment, append it with a metalman `extraArgs` [workload override]({{< relref "reference/workload-overrides" >}})) | A `HostReplace` of a Machine that declares `container` fails before any power action (target reason `ExperimentalModeDisabled`), and netboot serves no agent configuration for it and no installer boot while an install is pending. Without a pending install, `grub.cfg` still chainloads the local disk, so the host keeps booting what it has installed |
-| machine-ops-controller | `--experimental-container-isolation` on `machine-ops-controller` (`MACHINE_OPS_EXPERIMENTAL_CONTAINER_ISOLATION=true` for `make machine-ops-manifests`) | A `HostReplace` of a Machine that declares `container` fails before the provider runs |
+| azure-machine-ops-controller | `--experimental-container-isolation` on `azure-machine-ops-controller` (`MACHINE_OPS_EXPERIMENTAL_CONTAINER_ISOLATION=true` for `make machine-ops-manifests`) | A `HostReplace` of a Machine that declares `container` fails before the provider runs |
 | kubectl | `--experimental-container-isolation` on `kubectl unbounded machine manual-bootstrap` | `--isolation container` is rejected before the cluster is contacted |
 
 The agent's setting is the one that decides. Machina, metalman and
-machine-ops-controller with the setting, and `kubectl` with the flag, write it
+azure-machine-ops-controller with the setting, and `kubectl` with the flag, write it
 into every agent configuration they produce, whatever mode the Machine
 declares, so a node can later be changed to `container` at a repave. Enable it
 on every provisioner that installs the node. The `IsolationDrift` condition is

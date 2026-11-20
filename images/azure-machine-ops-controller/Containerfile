@@ -19,7 +19,7 @@ RUN apt-get update && apt-get install -y \
     && apt-get clean
 
 # Set up Go environment.
-# CGO is disabled because cmd/machine-ops-controller has no cgo imports; this
+# CGO is disabled because cmd/azure-machine-ops-controller has no cgo imports; this
 # also keeps cross-compilation simple (no cross C toolchain required).
 ENV CGO_ENABLED=0
 ENV GOPATH=/go
@@ -50,7 +50,7 @@ ARG GIT_COMMIT=
 ARG BUILD_TIME=
 
 RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    make machine-ops-controller-build VERSION=${VERSION} ${GIT_COMMIT:+GIT_COMMIT=${GIT_COMMIT}} ${BUILD_TIME:+BUILD_TIME=${BUILD_TIME}}
+    make azure-machine-ops-controller-build VERSION=${VERSION} ${GIT_COMMIT:+GIT_COMMIT=${GIT_COMMIT}} ${BUILD_TIME:+BUILD_TIME=${BUILD_TIME}}
 
 # Runtime stage
 FROM ubuntu:noble
@@ -64,7 +64,7 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
 RUN mkdir -p /unbounded/bin
 
 # Copy the built binary from the builder stage
-COPY --from=builder /src/bin/machine-ops-controller /unbounded/bin/machine-ops-controller
+COPY --from=builder /src/bin/azure-machine-ops-controller /unbounded/bin/azure-machine-ops-controller
 COPY LICENSE NOTICE /unbounded/licenses/
 
 # Add unbounded bin to PATH
@@ -74,4 +74,4 @@ ENV PATH="/unbounded/bin:${PATH}"
 WORKDIR /unbounded
 
 # Default entrypoint
-ENTRYPOINT ["/unbounded/bin/machine-ops-controller"]
+ENTRYPOINT ["/unbounded/bin/azure-machine-ops-controller"]

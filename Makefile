@@ -90,9 +90,9 @@ TOKEN_REFRESHER_BIN=bin/token-refresher
 TOKEN_REFRESHER_CMD=./cmd/token-refresher
 TOKEN_REFRESHER_IMAGE ?= $(CONTAINER_REGISTRY)/token-refresher:$(VERSION_TAG)
 
-MACHINE_OPS_CONTROLLER_BIN=bin/machine-ops-controller
-MACHINE_OPS_CONTROLLER_CMD=./cmd/machine-ops-controller
-MACHINE_OPS_CONTROLLER_IMAGE ?= $(CONTAINER_REGISTRY)/machine-ops-controller:$(VERSION_TAG)
+MACHINE_OPS_CONTROLLER_BIN=bin/azure-machine-ops-controller
+MACHINE_OPS_CONTROLLER_CMD=./cmd/azure-machine-ops-controller
+MACHINE_OPS_CONTROLLER_IMAGE ?= $(CONTAINER_REGISTRY)/azure-machine-ops-controller:$(VERSION_TAG)
 
 # The Unbounded Karpenter plugin is a nested Go module (plugins/karpenter),
 # because upstream Karpenter pins older Kubernetes libraries than this module.
@@ -101,7 +101,7 @@ KARPENTER_IMAGE ?= $(CONTAINER_REGISTRY)/unbounded-karpenter:$(VERSION_TAG)
 KARPENTER_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
 KARPENTER_MAKE = $(MAKE) -C plugins/karpenter VERSION=$(VERSION) IMAGE=$(KARPENTER_IMAGE) \
 	NAMESPACE=$(KARPENTER_NAMESPACE) CONTAINER_ENGINE=$(CONTAINER_ENGINE)
-MACHINE_OPS_CONTROLLER_NAME ?= machine-ops-controller
+MACHINE_OPS_CONTROLLER_NAME ?= azure-machine-ops-controller
 MACHINE_OPS_PROVIDER ?=
 MACHINE_OPS_SITE ?=
 
@@ -247,15 +247,15 @@ NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
 # Frontend build toggle (dev builds produce unminified output with sourcemaps).
 REACT_DEV ?= false
 
-.PHONY: all help fmt lint lint-actions lint-layout test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc install-helm install-kind generate kubectl-unbounded forge relctl relctl-build agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests e2e-gantry e2e-racer gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build license-check notice notice-check gantry gantry-build gantry-manifests inventory-manifests
+.PHONY: all help fmt lint lint-actions lint-layout test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc install-helm install-kind generate kubectl-unbounded forge relctl relctl-build agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests azure-machine-ops-controller azure-machine-ops-controller-build azure-machine-ops-controller-oci azure-machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests e2e-gantry e2e-racer gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build license-check notice notice-check gantry gantry-build gantry-manifests inventory-manifests
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests gantry-chart-lint gantry-chart-package unbounded-operator-chart-lint unbounded-operator-chart-package release-bom release-manifests unbounded-operator-release-manifest
 .PHONY: karpenter karpenter-fmt karpenter-lint karpenter-test karpenter-test-ci karpenter-build karpenter-manifests image-karpenter-local
-.PHONY: image-machina-local image-token-refresher-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-unbounded-operator-push image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
+.PHONY: image-machina-local image-token-refresher-local image-azure-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-unbounded-operator-push image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
 
 ##@ General
 
-all: kubectl-unbounded forge relctl machina machine-ops-controller token-refresher unbounded-operator unbounded-net-controller unbounded-net-node unbounded-ipam unbounded-net-routeplan-debug unping unroute gantry ## Build all binaries (default)
+all: kubectl-unbounded forge relctl machina azure-machine-ops-controller token-refresher unbounded-operator unbounded-net-controller unbounded-net-node unbounded-ipam unbounded-net-routeplan-debug unping unroute gantry ## Build all binaries (default)
 
 help: ## Show this help
 	@echo ""
@@ -311,7 +311,7 @@ help: ## Show this help
 	@echo "  inventory-viewer-build           Build inventory-viewer without test"
 	@echo "  unbounded-agent                  Build unbounded-agent (linux)"
 	@echo "  machina | machina-build          Build machina controller (with/without lint/test)"
-	@echo "  machine-ops-controller           Build machine-ops-controller"
+	@echo "  azure-machine-ops-controller     Build azure-machine-ops-controller"
 	@echo "  metalman | metalman-build        Build metalman controller (with/without lint/test)"
 	@echo "  unbounded-operator | unbounded-operator-build  Build the top-level Site operator"
 	@echo "  unbounded-net-controller         Build net controller"
@@ -332,7 +332,7 @@ help: ## Show this help
 	@echo "  image-inventory-viewer-push      Build and push the inventory-viewer container image"
 	@echo "  image-machina-local              Build machina image with \$$(CONTAINER_ENGINE)"
 	@echo "  image-token-refresher-local      Build token-refresher image"
-	@echo "  image-machine-ops-controller-local Build machine-ops-controller image"
+	@echo "  image-azure-machine-ops-controller-local  Build azure-machine-ops-controller image"
 	@echo "  image-metalman-local             Build metalman image"
 	@echo "  image-unbounded-operator-local   Build unbounded-operator image"
 	@echo "  image-unbounded-operator-push    Build and push unbounded-operator image"
@@ -344,7 +344,7 @@ help: ## Show this help
 	@echo "  images-net-all-push              Build and push all unbounded-net images"
 	@echo "  images-local                     Build all local images"
 	@echo "  machina-oci-push                 Build machina image and push"
-	@echo "  machine-ops-controller-oci-push  Build machine-ops-controller image and push"
+	@echo "  azure-machine-ops-controller-oci-push    Build azure-machine-ops-controller image and push"
 	@echo "  metalman-oci-push                Build metalman image and push"
 	@echo "  image-orca-local                 Build orca image"
 	@echo "  orca-oci-push                    Build orca image and push"
@@ -962,10 +962,10 @@ token-refresher-build: ## Build the token-refresher binary (no lint/test)
 .PHONY: token-refresher
 token-refresher: test token-refresher-build ## Build token-refresher (implies test)
 
-machine-ops-controller-build: machine-ops-manifests ## Build the machine-ops-controller binary (no lint/test)
+azure-machine-ops-controller-build: machine-ops-manifests ## Build the azure-machine-ops-controller binary (no lint/test)
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(MACHINE_OPS_CONTROLLER_BIN) $(MACHINE_OPS_CONTROLLER_CMD)
 
-machine-ops-controller: test machine-ops-controller-build ## Build the machine-ops-controller (implies test)
+azure-machine-ops-controller: test azure-machine-ops-controller-build ## Build the azure-machine-ops-controller (implies test)
 
 metalman-build: ## Build the metalman binary (no lint/test)
 	$(GOBUILD) -ldflags '$(METALMAN_LDFLAGS)' -o $(METALMAN_BIN) $(METALMAN_CMD)/main.go
@@ -1230,18 +1230,18 @@ image-token-refresher-local: ## Build the token-refresher container image locall
 		-f ./images/token-refresher/Containerfile .
 	$(call trivy-maybe,$(TOKEN_REFRESHER_IMAGE))
 
-image-machine-ops-controller-local: ## Build the machine-ops-controller container image locally (single-arch)
+image-azure-machine-ops-controller-local: ## Build the azure-machine-ops-controller container image locally (single-arch)
 	$(CONTAINER_ENGINE) build \
 		--build-arg VERSION=$(VERSION) \
 		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
 		--build-arg BUILD_TIME=$(BUILD_TIME) \
-		-t machine-ops-controller:$(VERSION_TAG) -t $(MACHINE_OPS_CONTROLLER_IMAGE) \
-		-f ./images/machine-ops-controller/Containerfile .
+		-t azure-machine-ops-controller:$(VERSION_TAG) -t $(MACHINE_OPS_CONTROLLER_IMAGE) \
+		-f ./images/azure-machine-ops-controller/Containerfile .
 	$(call trivy-maybe,$(MACHINE_OPS_CONTROLLER_IMAGE))
 
-machine-ops-controller-oci: image-machine-ops-controller-local ## Alias for image-machine-ops-controller-local
+azure-machine-ops-controller-oci: image-azure-machine-ops-controller-local ## Alias for image-azure-machine-ops-controller-local
 
-machine-ops-controller-oci-push: machine-ops-controller-oci ## Build and push the machine-ops-controller image
+azure-machine-ops-controller-oci-push: azure-machine-ops-controller-oci ## Build and push the azure-machine-ops-controller image
 	$(CONTAINER_ENGINE) push $(MACHINE_OPS_CONTROLLER_IMAGE)
 
 MACHINA_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
@@ -1317,7 +1317,7 @@ unbounded-operator-chart-package: unbounded-operator-chart-lint ## Package the u
 		--app-version $(UNBOUNDED_OPERATOR_CHART_APP_VERSION) \
 		--destination $(GANTRY_CHART_PACKAGE_DIR)
 
-machine-ops-manifests: ## Render machine-ops-controller manifests into deploy/machine-ops/rendered
+machine-ops-manifests: ## Render azure-machine-ops-controller manifests into deploy/machine-ops/rendered
 	@mkdir -p $(MACHINE_OPS_MANIFEST_RENDERED_DIR)
 	@find $(MACHINE_OPS_MANIFEST_RENDERED_DIR) -mindepth 1 -not -name .gitignore -delete
 	$(GOCMD) run ./hack/cmd/render-manifests \
@@ -1519,7 +1519,7 @@ images-net-all: image-net-controller-local image-net-node-local ## Build all unb
 
 images-net-all-push: image-net-controller-push image-net-node-push ## Build and push all unbounded-net container images
 
-images-local: image-machina-local image-token-refresher-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-node-config-local ## Build all container images locally
+images-local: image-machina-local image-token-refresher-local image-azure-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-node-config-local ## Build all container images locally
 
 ##@ Net Frontend
 

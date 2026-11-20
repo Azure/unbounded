@@ -138,9 +138,9 @@ DRA, reservations, and specialized repair policies remain separate extensions.
 | Retirement fences the Machine and revokes bootstrap before checking release authorization. | `internal/capacity/allocation_release.go:158-212`, `:247-309` | Deletion, fencing, and safe release are distinct. |
 | Allocation-backed Machines reject HostReplace, HostPowerOff, and HostPowerOn even if the provider registers them. | `internal/machineops/allocation.go:64-96` | Provider capability and permission to operate on a particular Machine are separate; broader support needs lifecycle review. |
 | A recorded allocate operation cannot be silently replaced. | `internal/capacity/allocation_controller.go:247-262`; `internal/machineops/allocation.go:250-268` | Losing the recorded journal requires recovery, not another launch. |
-| Providers record actual attached resources, including results from failed allocation. | `internal/machineops/providers/azurevm/capacity.go:659-795`; `internal/machineops/providers/awsec2/capacity.go:883-963` | Cleanup cannot be derived from a naming convention alone. |
+| Providers record actual attached resources, including results from failed allocation. | `cmd/azure-machine-ops-controller/internal/azurevm/capacity_allocate.go:554-614, :678-755`; AWSEC2 proof of concept, not in this repository | Cleanup cannot be derived from a naming convention alone. |
 | Related-object indexes and selective class watches limit reconciliation fan-out. | `internal/capacity/indexes.go:16-101`; `internal/capacity/setup.go:187-249` | An offering refresh must not wake every healthy allocation. |
-| Provider/Site selection gives controllers separate leader leases; AWS is explicitly enabled. | `cmd/machine-ops-controller/main.go:180-230` | Providers can share code without sharing cloud credentials or a global leader. |
+| Provider/Site selection gives controllers separate leader leases; only the Azure VM provider is registered. | `cmd/azure-machine-ops-controller/main.go:216-224, :323-332` | Providers can share code without sharing cloud credentials or a global leader. |
 
 The earlier proposal used provider-specific CR references, illustrative
 `requests` and `offerings.items` fields, and a late-binding Machine model.
@@ -415,7 +415,7 @@ or every host lifecycle operation has been qualified.
 
 These are logical modules, not a requirement for a deployment per module.
 The POC hosts shared capacity reconciliation beside provider operations in
-`machine-ops-controller`. Each provider/Site scope has one elected writer.
+`azure-machine-ops-controller`. Each provider/Site scope has one elected writer.
 Adapters return normalized results; they do not race the shared controller to
 patch allocation status. The Karpenter plugin is packaged with a compatible
 self-hosted controller, not a remote plugin protocol or managed AKS NAP extension.
@@ -539,7 +539,7 @@ region, zone, subnet, and launch request, and targeted instance lookup. With a
 saved instance identity it refuses a missing or terminal instance rather than
 launching a replacement. Its ten-minute visibility bound limits observation of
 an accepted instance; it is not a claim about how long EC2 retains tokens
-(`internal/machineops/providers/awsec2/capacity.go:506-621`, `:815-880`).
+(AWSEC2 proof of concept, not in this repository).
 
 The [EC2 idempotency contract](https://docs.aws.amazon.com/ec2/latest/devguide/ec2-api-idempotency.html)
 is zonal for RunInstances with a subnet. Retrying in another zone or region is
@@ -547,9 +547,9 @@ not the same allocation attempt. Do not invent an undocumented token-retention
 window or use a new token to hide uncertain results.
 
 Tests assert identical replay parameters and one fake native instance, reject
-changed user data, and refuse replacement of recorded instances
-(`internal/machineops/providers/awsec2/capacity_test.go:517-670`). The live test
-proves restart recovery, not every ambiguous-submission interleaving.
+changed user data, and refuse replacement of recorded instances (AWSEC2 proof of
+concept, not in this repository). The live test proves restart recovery, not
+every ambiguous-submission interleaving.
 
 ### 10.2 Remaining recovery limits
 
@@ -598,8 +598,8 @@ remains required.
 
 Transport limits belong in adapters. The AWS adapter deterministically gzips
 the complete payload and checks EC2's 16-KiB decoded user-data limit before
-submission; errors report sizes, never the payload
-(`internal/machineops/providers/awsec2/capacity.go:663-684`).
+submission; errors report sizes, never the payload (AWSEC2 proof of concept,
+not in this repository).
 
 Connectivity must be tested end to end. Node Ready alone did not establish
 API-server-to-kubelet access or cross-cloud service routing. The POC used the
@@ -840,9 +840,11 @@ For immediate operations, use `WithImmediateOperation(kind, execute)`.
 `ReplaySafe()` is an explicit claim that repeating that immediate operation
 after interruption is safe; it must not be added simply to enable retries.
 `RequiresReplaceUserData()` requests shared bootstrap rendering for
-HostReplace. Providers using an existing provider-owned Machine CR can
+HostReplace; a long-running operation receives it in Begin and in every Poll,
+because a provider that deletes the old host first creates the new one from
+Poll. Providers using an existing provider-owned Machine CR can
 optionally declare its GroupKind with `WithProviderMachineKind`
-(`pkg/machineops/provider.go:47-68`, `:140-209`).
+(`pkg/machineops/provider.go:47-68`, `:140-220`).
 
 #### Requests and results across the boundary
 
@@ -932,10 +934,10 @@ and observations. A provider-specific host CR is an optional backend model,
 not a replacement for that shared ownership boundary.
 
 The AzureVM POC already combines existing-host operations and capacity in one
-registration (`internal/machineops/providers/azurevm/provider.go:39-96`;
-`internal/machineops/providers/azurevm/capacity.go:88-98`). The AWSEC2 POC
-registers capacity only; it does not implement host power or replacement
-operations (`internal/machineops/providers/awsec2/provider.go:18-39`).
+registration (`cmd/azure-machine-ops-controller/internal/azurevm/provider.go:64-89`;
+`cmd/azure-machine-ops-controller/internal/azurevm/capacity.go:88-100`). The AWSEC2
+POC registers capacity only; it does not implement host power or replacement
+operations (AWSEC2 proof of concept, not in this repository).
 The accepted dual-cloud proof qualifies the tested allocation/release paths,
 not every registered host operation or every provider.
 

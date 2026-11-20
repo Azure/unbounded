@@ -12,8 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	"github.com/Azure/unbounded/internal/machineops"
-	publicmachineops "github.com/Azure/unbounded/pkg/machineops"
+	"github.com/Azure/unbounded/pkg/machineops"
 )
 
 func TestRegistrationDeclaresCapacityAndHostOperations(t *testing.T) {
@@ -26,17 +25,25 @@ func TestRegistrationDeclaresCapacityAndHostOperations(t *testing.T) {
 	for _, kind := range []unboundedv1alpha3.OperationKind{
 		unboundedv1alpha3.OperationHostAllocate,
 		unboundedv1alpha3.OperationHostRelease,
+		unboundedv1alpha3.OperationHostHardReboot,
+		unboundedv1alpha3.OperationHostPowerOff,
+		unboundedv1alpha3.OperationHostPowerOn,
+		unboundedv1alpha3.OperationHostReplace,
 	} {
-		operation, ok := registration.Operation(kind)
-		require.True(t, ok, kind)
-		require.Equal(t, publicmachineops.OperationModeLongRunning, operation.Mode(), kind)
+		operation, registered := registration.Operation(kind)
+		require.True(t, registered, kind)
+		require.Equal(t, machineops.OperationModeLongRunning, operation.Mode(), kind)
 	}
 
-	for kind := range azureVMOperations {
-		operation, ok := registration.Operation(kind)
-		require.True(t, ok, kind)
-		require.Equal(t, publicmachineops.OperationModeImmediate, operation.Mode(), kind)
-	}
+	// Without this declaration the engine gives HostReplace no cloud-init for
+	// the replacement VM.
+	replace, ok := registration.Operation(unboundedv1alpha3.OperationHostReplace)
+	require.True(t, ok)
+	require.True(t, replace.RequiresReplaceUserData())
+
+	// Azure VMs have no provider machine object of their own.
+	_, ok = registration.ProviderMachineKind()
+	require.False(t, ok)
 }
 
 func TestVMNameUsesFullAllocationUID(t *testing.T) {
@@ -63,7 +70,7 @@ func allocatedVM(t *testing.T, client *fakeCapacityClient, provider *Provider) m
 
 	result, err := provider.PollAllocate(t.Context(), allocate, begin.Operation)
 	require.NoError(t, err)
-	require.Equal(t, publicmachineops.ProviderOperationStateSucceeded, result.State)
+	require.Equal(t, machineops.ProviderOperationStateSucceeded, result.State)
 
 	release := testOperationRequest(t, unboundedv1alpha3.OperationHostRelease, offering)
 	release.Allocation.OwnedResources = result.Result.Allocation.OwnedResources
@@ -71,10 +78,10 @@ func allocatedVM(t *testing.T, client *fakeCapacityClient, provider *Provider) m
 	return release
 }
 
-func pollRelease(t *testing.T, provider *Provider, request machineops.OperationRequest) publicmachineops.PollResult {
+func pollRelease(t *testing.T, provider *Provider, request machineops.OperationRequest) machineops.PollResult {
 	t.Helper()
 
-	result, err := provider.PollRelease(t.Context(), request, publicmachineops.ProviderOperation{
+	result, err := provider.PollRelease(t.Context(), request, machineops.ProviderOperation{
 		OperationID: testVMID(),
 	})
 	require.NoError(t, err)

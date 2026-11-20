@@ -20,8 +20,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	"github.com/Azure/unbounded/internal/machineops"
-	publicmachineops "github.com/Azure/unbounded/pkg/machineops"
+	"github.com/Azure/unbounded/pkg/machineops"
 )
 
 const testGalleryImage = "/subscriptions/" + testSubscription + "/resourceGroups/images/providers/Microsoft.Compute/galleries/workers/images/ubuntu"
@@ -364,7 +363,7 @@ func newTestProvider(client *fakeCapacityClient) *Provider {
 func resolveTestOffering(t *testing.T, provider *Provider) unboundedv1alpha3.MachineClassOffering {
 	t.Helper()
 
-	resolution, err := provider.ResolveClass(t.Context(), publicmachineops.ClassRequest{
+	resolution, err := provider.ResolveClass(t.Context(), machineops.ClassRequest{
 		ClassName:      "azure",
 		ProviderConfig: testProviderConfig(),
 	})
@@ -382,7 +381,7 @@ func testOperationRequest(t *testing.T, kind unboundedv1alpha3.OperationKind, of
 		ProviderID:  "azure:///subscriptions/" + testSubscription + "/resourceGroups/" + testResourceGroup + "/providers/Microsoft.Compute/virtualMachines/" + testVMName,
 		HostImage:   testImage,
 		Operation:   kind,
-		Allocation: &publicmachineops.AllocationRequest{
+		Allocation: &machineops.AllocationRequest{
 			Name:      "claim-a",
 			UID:       testAllocationUID,
 			ClassName: "azure",
@@ -413,14 +412,14 @@ func requireQuantity(t *testing.T, expected string, actual resource.Quantity) {
 	require.Zero(t, want.Cmp(actual), "expected %s, got %s", expected, actual.String())
 }
 
-func testProviderConfig() publicmachineops.ProviderConfig {
-	return publicmachineops.ProviderConfig{Data: testConfig()}
+func testProviderConfig() machineops.ProviderConfig {
+	return machineops.ProviderConfig{Data: testConfig()}
 }
 
 func requirePermanent(t *testing.T, err error, reason unboundedv1alpha3.MachineAllocationFailureReason) {
 	t.Helper()
 
-	var permanentErr *publicmachineops.PermanentError
+	var permanentErr *machineops.PermanentError
 	require.ErrorAs(t, err, &permanentErr)
 	require.Equal(t, string(reason), permanentErr.Reason)
 }
@@ -430,7 +429,7 @@ func requireTransient(t *testing.T, err error) {
 
 	require.Error(t, err)
 
-	var permanentErr *publicmachineops.PermanentError
+	var permanentErr *machineops.PermanentError
 	require.False(t, errors.As(err, &permanentErr), "error %v must be retryable", err)
 }
 
@@ -491,7 +490,7 @@ func pollRequestFor(t *testing.T, request machineops.OperationRequest) machineop
 	t.Helper()
 
 	poll := testOperationRequest(t, unboundedv1alpha3.OperationHostAllocate, request.Allocation.Offering)
-	poll.Allocation.ProviderConfig = publicmachineops.ProviderConfig{}
+	poll.Allocation.ProviderConfig = machineops.ProviderConfig{}
 	poll.Allocation.UserData = ""
 
 	return poll

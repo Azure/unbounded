@@ -1,5 +1,5 @@
 # Binds the reusable capacity roles in 04-machineclass-rbac.yaml.tmpl and
-# 05-machineallocation-rbac.yaml.tmpl to the machine-ops-controller
+# 05-machineallocation-rbac.yaml.tmpl to the azure-machine-ops-controller
 # ServiceAccount, which runs AddToManager and AddCapacityToManager in one
 # manager. Rendered only with EnableCapacity=true, the value that also passes
 # --enable-capacity to the Deployment in 03-deployment.yaml.tmpl. Without it
@@ -13,7 +13,7 @@
 # Each kind passed as AllocationConsumerKinds also needs get, list and watch
 # for this ServiceAccount. The deployer of that consumer grants those.
 {{- if eq (default "false" .EnableCapacity) "true" }}
-{{- $controllerName := default "machine-ops-controller" .ControllerName }}
+{{- $controllerName := default "azure-machine-ops-controller" .ControllerName }}
 {{- $namespace := default "unbounded-system" .Namespace }}
 {{- $providerConfigNamespace := default $namespace .ProviderConfigNamespace }}
 apiVersion: rbac.authorization.k8s.io/v1
