@@ -543,12 +543,13 @@ pub fn parse_list(xml: &[u8]) -> Result<Page, XmlError> {
     let mut in_blob = false;
     let mut capture = Capture::None;
     let mut name = String::new();
+    let mut name_encoded = false;
     let mut etag = String::new();
     let mut length = String::new();
     let mut content_type = String::new();
     while let Some(token) = scanner.next()? {
         match token {
-            Token::Start(tag) => {
+            Token::Start(tag, encoded) => {
                 if !root {
                     if tag != "EnumerationResults" {
                         return Err(XmlError);
@@ -560,10 +561,14 @@ pub fn parse_list(xml: &[u8]) -> Result<Page, XmlError> {
                     "Blob" => {
                         in_blob = true;
                         name.clear();
+                        name_encoded = false;
                         etag.clear();
                         length.clear();
                     }
-                    "Name" if in_blob => capture = Capture::Name,
+                    "Name" if in_blob => {
+                        name_encoded = encoded;
+                        capture = Capture::Name;
+                    }
                     "Etag" if in_blob => capture = Capture::Etag,
                     "Content-Length" if in_blob => capture = Capture::Length,
                     "Content-Type" if in_blob => capture = Capture::ContentType,
@@ -577,6 +582,9 @@ pub fn parse_list(xml: &[u8]) -> Result<Page, XmlError> {
                         return Err(XmlError);
                     }
                     let length = length.parse().map_err(|_| XmlError)?;
+                    if name_encoded {
+                        name = percent_decode(&name)?;
+                    }
                     page.blobs.push(ListedObject {
                         name: std::mem::take(&mut name),
                         etag: list_etag(&etag)?,
@@ -635,7 +643,7 @@ enum Capture {
 }
 
 enum Token<'a> {
-    Start(&'a str),
+    Start(&'a str, bool),
     End(&'a str),
     Text(String),
 }
@@ -676,7 +684,16 @@ impl<'a> Scanner<'a> {
                 self.rest = &self.rest[at..];
                 return Ok(Some(Token::Text(text)));
             }
-            let Some(end) = self.rest.find('>') else {
+            let mut quote = None;
+            let Some(end) = self.rest.char_indices().find_map(|(at, ch)| {
+                match (quote, ch) {
+                    (Some(q), ch) if q == ch => quote = None,
+                    (None, '\'' | '"') => quote = Some(ch),
+                    (None, '>') => return Some(at),
+                    _ => {}
+                }
+                None
+            }) else {
                 return Err(XmlError);
             };
             let tag = &self.rest[1..end];
@@ -699,9 +716,8 @@ impl<'a> Scanner<'a> {
                 }
                 return Ok(Some(Token::End(name)));
             }
-            let name = tag.trim_end_matches('/').trim();
-            let name = name.split_whitespace().next().ok_or(XmlError)?;
-            let name = name.split('/').next().ok_or(XmlError)?;
+            let element = tag.trim().trim_end_matches('/').trim_end();
+            let name = element.split_whitespace().next().ok_or(XmlError)?;
             if name.is_empty() {
                 return Err(XmlError);
             }
@@ -710,9 +726,66 @@ impl<'a> Scanner<'a> {
             } else {
                 self.open.push(name);
             }
-            return Ok(Some(Token::Start(name)));
+            let encoded = encoded_attribute(&element[name.len()..])?;
+            return Ok(Some(Token::Start(name, encoded)));
         }
     }
+}
+
+/// Read XML attributes without treating spaces or delimiters inside quotes as markup.
+fn encoded_attribute(mut attributes: &str) -> Result<bool, XmlError> {
+    let mut encoded = None;
+    while !attributes.trim().is_empty() {
+        attributes = attributes.trim_start();
+        let at = attributes.find('=').ok_or(XmlError)?;
+        let name = attributes[..at].trim_end();
+        if name.is_empty() || name.contains(char::is_whitespace) {
+            return Err(XmlError);
+        }
+        attributes = attributes[at + 1..].trim_start();
+        let quote = attributes.chars().next().ok_or(XmlError)?;
+        if !matches!(quote, '\'' | '"') {
+            return Err(XmlError);
+        }
+        attributes = &attributes[1..];
+        let end = attributes.find(quote).ok_or(XmlError)?;
+        let value = decode(&attributes[..end])?;
+        if name == "Encoded" {
+            if encoded.is_some() {
+                return Err(XmlError);
+            }
+            encoded = Some(match value.as_str() {
+                "true" => true,
+                "false" => false,
+                _ => return Err(XmlError),
+            });
+        }
+        attributes = &attributes[end + 1..];
+        if !attributes.is_empty() && !attributes.starts_with(char::is_whitespace) {
+            return Err(XmlError);
+        }
+    }
+    Ok(encoded.unwrap_or(false))
+}
+
+/// Azure encodes names, not form data: a literal plus is not a space.
+fn percent_decode(text: &str) -> Result<String, XmlError> {
+    let mut bytes = text.bytes();
+    let mut decoded = Vec::with_capacity(text.len());
+    while let Some(byte) = bytes.next() {
+        if byte == b'%' {
+            let high = char::from(bytes.next().ok_or(XmlError)?)
+                .to_digit(16)
+                .ok_or(XmlError)?;
+            let low = char::from(bytes.next().ok_or(XmlError)?)
+                .to_digit(16)
+                .ok_or(XmlError)?;
+            decoded.push((high * 16 + low) as u8);
+        } else {
+            decoded.push(byte);
+        }
+    }
+    String::from_utf8(decoded).map_err(|_| XmlError)
 }
 
 /// Decode the five XML entities plus numeric character references.
@@ -932,6 +1005,60 @@ mod tests {
                 &format!("<{field} />"),
             );
             assert_eq!(parse_list(xml.as_bytes()), Err(XmlError), "{field}");
+        }
+    }
+
+    #[test]
+    fn decodes_only_names_marked_encoded_once() {
+        // List Blobs percent-encodes XML-invalid names starting with 2021-02-12.
+        // https://learn.microsoft.com/rest/api/storageservices/list-blobs
+        let blob = |attributes: &str, name: &str| {
+            format!(
+                "<Blob><Name{attributes}>{name}</Name><Properties><Etag>0x12</Etag><Content-Length>1</Content-Length></Properties></Blob>"
+            )
+        };
+        let xml = format!(
+            "<EnumerationResults><Blobs>{}{}{}{}{}</Blobs><NextMarker>%2F</NextMarker></EnumerationResults>",
+            blob(" Encoded=\"true\"", "a%2fb%25EF+%EF%BF%BE&amp;%E9%9B%AA"),
+            blob("", "literal%2F+"),
+            blob(" Encoded='false'", "false%2F+"),
+            blob(" Other='space > value' Encoded = 'true'", "%252F"),
+            blob("", "reset%2F"),
+        );
+        let page = parse_list(xml.as_bytes()).unwrap();
+        assert_eq!(
+            page.blobs
+                .iter()
+                .map(|b| b.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "a/b%EF+\u{fffe}&雪",
+                "literal%2F+",
+                "false%2F+",
+                "%2F",
+                "reset%2F"
+            ]
+        );
+        assert_eq!(page.next_marker, "%2F");
+        for bad in ["%", "%2", "%GG", "%FF", "%C0%AF", "%ED%A0%80"] {
+            let xml = format!(
+                "<EnumerationResults><Blobs>{}{}</Blobs></EnumerationResults>",
+                blob("", "good"),
+                blob(" Encoded='true'", bad)
+            );
+            assert_eq!(parse_list(xml.as_bytes()), Err(XmlError), "{bad}");
+        }
+        for attributes in [
+            " Encoded='yes'",
+            " Encoded=true",
+            " Encoded='true' Encoded='false'",
+            " Encoded='true'Other='x'",
+        ] {
+            let xml = format!(
+                "<EnumerationResults><Blobs>{}</Blobs></EnumerationResults>",
+                blob(attributes, "x")
+            );
+            assert_eq!(parse_list(xml.as_bytes()), Err(XmlError), "{attributes}");
         }
     }
 
