@@ -7,15 +7,8 @@ Small generic helpers that two or more components share. Each helper is its own 
 
 A helper must meet all of these:
 
-- **Two or more components use it.** Count components, not packages, and only components whose own code imports the
-  helper. Code in `internal/` or `pkg/` counts as the component it belongs to. Tools in `hack/` don't count. To see
-  which packages import a helper:
-
-  ```sh
-  go list -f '{{range .Imports}}{{if eq . "github.com/Azure/unbounded/internal/helpers/<name>"}}{{$.ImportPath}}{{"\n"}}{{end}}{{end}}' ./...
-  ```
-
-  If only one component uses a helper, move it into that component.
+- **Two or more components import it directly.** Two packages from the same component count once. Count packages in
+  `internal/` and `pkg/` toward their owner. Ignore `hack/`. If only one component uses the helper, move it there.
 - **Generic.** It knows nothing about Machines, Sites or any component's types.
 - **Small.** Functions and constants only. No types with methods, goroutines, global variables or `init`. One
   exception: a function that registers something with a third-party library, if calling it twice is safe and its
@@ -26,6 +19,14 @@ A helper must meet all of these:
 
 If a helper stops meeting these rules, move it into the component that needs the change, or make it a convention
 (`internal/<name>`; ask first).
+
+### Find direct users
+
+Replace `<name>` with the helper's package name:
+
+```sh
+go list -f '{{range .Imports}}{{if eq . "github.com/Azure/unbounded/internal/helpers/<name>"}}{{$.ImportPath}}{{"\n"}}{{end}}{{end}}' ./...
+```
 
 ## Naming and API
 

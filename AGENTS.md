@@ -43,51 +43,21 @@ Some component code still lives in `internal/` and `pkg/`. For example, `interna
 
 ## Go
 
-### Building and testing
+Keep component code private by default. To share code, follow
+[Where new code goes](internal/AGENTS.md#where-new-code-goes).
 
-- `make` builds all binaries (kubectl-unbounded, forge, machina, and all net binaries).
-- To build `machina` use `make machina` which runs formatters, lint, tests, and go build.
-- To build `machina` without lint/test use `make machina-build` (used in Containerfiles).
-- To build `metalman` use `make metalman` which runs formatters, lint, tests, and builds the binary.
-- To build `metalman` without lint/test use `make metalman-build` (used in Containerfiles).
-- To build individual net binaries: `make unbounded-net-controller`, `make unbounded-net-node`, `make unbounded-net-routeplan-debug`, `make unping`, `make unroute`.
-- To build `gantry` use `make gantry` which runs tests and builds the binary.
-- To build `gantry` without lint/test use `make gantry-build` (used in Containerfiles).
-- The Karpenter plugin is a nested module, so the root `make fmt`, `make lint`, `make test` and `go build ./...` do not
-  cover it. Use `make karpenter` (lint, test, build), `make karpenter-fmt`, `make karpenter-test`,
-  `make karpenter-manifests` and `make image-karpenter-local`. Do not run `golangci-lint fmt` inside `plugins/`: it
-  resolves paths from the root config and reformats the whole repository.
-- Net-specific build tasks (container images, frontend, eBPF, render) are exposed via `net-` prefixed targets in the main `Makefile` (e.g., `make net-frontend`, `make net-ebpf-build`, `make net-ebpf-generate`, `make net-manifests`). Cluster deploy/undeploy targets live separately under `hack/net/` and are invoked via `make -C hack/net <target>` (e.g., `make -C hack/net deploy`). Run `make help` and `make -C hack/net help` for the full lists.
-- `make generate` runs `go generate ./...` to regenerate deepcopy, CRDs, and protobuf for all packages.
-- `make build` compiles all Go packages (`go build ./...`).
-- `make vulncheck` runs `govulncheck` and fails only on vulnerabilities that are both reachable from our code and have a final-release fix, since those are the ones a production module bump resolves. Reachable ones with no final fix are reported and allowed through; prerelease and Go pseudo-version fixes are also reported but do not block.
-- `make fmt` formats Go source (gofumpt + wsl_v5 blank-line rules); `make lint` runs golangci-lint; `make test` runs all tests.
-- `make test` runs through gotestsum: the output matches `go test -v`, and it ends with every skipped and failed test
-  and its reason. The JSON report is written to `tmp/go-test.json`, and CI turns it into the job summary. Other test
-  targets use `$(GOTEST)`, which also passes `-v`.
-- `make lint` runs the same checks locally and in CI and does NOT auto-fix. Always run `make fmt` before committing to satisfy the linter (gofumpt and wsl_v5 are enforced by `make lint`/CI); do not hand-format.
-- Locally `test` implies `lint`. In CI (`CI=1`), each runs independently.
-
-### Rules
-
-- Do not import another component's code. For example, `cmd/agent` must not import `cmd/machina`. The one exception
-  is code two components must agree on, which its owner exports (rule 3 in `internal/AGENTS.md`).
-- To share code between components, follow "Where new code goes" in `internal/AGENTS.md`.
+- Run `make fmt` before committing. `make test` runs lint and tests locally. `make build` compiles the root Go module.
+- Use `make help` for component targets and `make -C hack/net help` for network deployment commands.
+- Karpenter has its own Go module. Use `make karpenter-fmt` to format it and `make karpenter` to lint, test and build
+  it. Do not run `golangci-lint fmt` inside `plugins/`: it reformats the whole repository.
 
 ## Rust
 
-Rust code lives in:
-
-- `cmd/racer/` - the Racer dataplane, a Cargo workspace of several crates. Shared test fixtures are in
-  `cmd/racer/tests/support/`.
-- `cmd/racer-object/` - the racer-object sidecar.
-- `cmd/racer-loadgen/performance/` - a performance harness, run with its `run.sh`.
-
-To check your changes:
-
-- `cmd/racer/`: `make racer-fmt` formats, `make racer-lint` checks formatting and runs Clippy and the crate purity
-  checks, and `make racer-rust-test` runs the tests.
-- `cmd/racer-object/`: `make racer-object-test` checks formatting, runs Clippy and runs the tests.
+- `cmd/racer/` - the Racer dataplane. Use `make racer-fmt`, `make racer-lint` and `make racer-rust-test`.
+  Shared test fixtures live in `cmd/racer/tests/support/`.
+- `cmd/racer-object/` - the sidecar. `make racer-object-test` checks formatting, runs Clippy and runs the tests.
+- `cmd/racer-loadgen/performance/` - the performance harness. From that directory, use `bash run.sh build` and then
+  `bash run.sh run`.
 
 ## Coding Standards
 
@@ -134,14 +104,13 @@ To check your changes:
     - New dependencies with broad impact.
     - Destructive data or migration changes.
     - Removal of _test.go or Test* functions or subtests.
-    - Adding a package directly under `internal/`, such as `internal/systemns`.
+    - Adding a project-wide convention in `internal/<name>`.
     - Proceeding when a design doc or comment contradicts the code.
 - **Never**
     - Commit secrets, credentials, or tokens.
     - Edit generated files by hand when a generation workflow exists.
     - Use destructive git operations unless explicitly requested.
-    - Add a package deeper inside `internal/`, such as `internal/gantry/<new>`. The only exception is a helper,
-      `internal/helpers/<name>`.
+    - Add a package under `internal/` unless it is an approved convention or a helper in `internal/helpers/<name>`.
     - Go outside the project boundary, for example, DO NOT edit files in user's home directories, add or edit files 
       in /tmp or anywhere else on the host filesystem.
 

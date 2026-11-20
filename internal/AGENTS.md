@@ -8,7 +8,7 @@ Only two kinds of package:
 
 - **Conventions, `internal/<name>`:** something every component must do the same way, such as the build version
   (`version`) or the log format (`logger`). Ask before adding one.
-- **Helpers, `internal/helpers/<name>`:** small generic functions that two or more components use. Read
+- **Helpers, `internal/helpers/<name>`:** small generic functions or constants that two or more components use. Read
   `internal/helpers/AGENTS.md` first.
 
 ## Where new code goes
@@ -17,12 +17,12 @@ Use the first rule that fits:
 
 1. It is part of a CRD or other API type: `api/`.
 2. One component uses it: keep it in that component.
-3. Two components must agree on it, such as a message format, an annotation key or a validation rule: the component
-   that writes it owns it, and the other imports it. Do not copy it.
+3. If one component writes an annotation and another reads it, the writer defines the key. Both use that definition.
+   The same rule applies to message formats and shared validation rules: import the owner's definition, not a copy.
 4. Every component must agree on it and none owns it: `internal/<name>`.
-5. It is a small generic function that two or more components use: `internal/helpers/<name>`.
+5. It is a small generic function or constant that two or more components use: `internal/helpers/<name>`.
 
-If nothing fits, copy a short function into each component. Never copy something covered by rule 3.
+If nothing fits, each component may keep a short private copy.
 
 ## Rules for `internal/<name>`
 
@@ -33,10 +33,5 @@ If nothing fits, copy a short function into each component. Never copy something
 
 ## Until #1175
 
-Only `version`, `logger` and `helpers/` follow the rules above. Every other package here is component code that #1175
-moves into `cmd/`. Until then:
-
-- You may change those packages.
-- Do not add packages, not even inside an existing tree such as `internal/gantry/`. Add the code to an existing
-  package, or to a new package under `cmd/<component>/internal/`.
-- For rule 3, "the component that writes it" means one of that component's existing packages in `internal/`.
+You may edit existing component packages such as `internal/gantry`. Put new private packages in
+`cmd/<component>/internal/`. Export shared definitions from the owning component's existing package under `internal/`.
