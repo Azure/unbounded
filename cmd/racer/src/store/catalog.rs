@@ -3124,7 +3124,8 @@ mod tests {
     fn pagewise_pin_release_removes_only_its_member_and_disk_hold() {
         use super::super::pins::FillId;
         let env = racer_io::Env::host();
-        let segments = Rc::new(segments(1024, 8));
+        // Each unpublished pin reserves a segment, plus one free reserve.
+        let segments = Rc::new(segments(1024, 257));
         let index = Rc::new(index(&env, 512));
         index.set_page_capacity(512).unwrap();
         index.set_pin_capacity_percent(100).unwrap();
