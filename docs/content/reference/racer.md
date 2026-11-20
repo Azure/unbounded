@@ -320,10 +320,20 @@ The fill reports its place in the node cache in status:
   zero.
 
 Conditions are `Accepted` (the cache is supported and the reservation fits),
-`Listed` (the current generation has a manifest), `Progressing` (the first
-fill is under way), `Ready` (every replica copy is confirmed), and `Degraded`
-(the fill is short of confirmed copies after being `Ready`, a node refused
-pinned bytes, or `replicas` exceeds the cache pool's node count).
+`Listed` (the current generation has a current manifest and no listing error),
+`Progressing` (the initial fill for the current spec generation has not
+completed), `Ready` (every replica copy is confirmed), and `Degraded`
+(the current generation completed its initial fill and is now short of copies
+or pool members, or a node explicitly refused pinned bytes).
+Once a generation has been `Ready`, `Progressing` stays false during later
+refills. A new spec generation starts a new initial fill; completion from an
+earlier generation does not carry over.
+
+If `replicas` exceeds the cache pool's node count before initial completion,
+`Ready` is false and `Progressing` is true, with the shortage explained in the
+`Ready` message. That shortage becomes `Degraded` with `MemberLost` only after
+the generation has completed its initial fill. Explicit capacity refusal
+reports `Degraded` with `CapacityLost` even during the initial fill.
 A `Degraded` fill still serves reads from the pages it has and falls back to
 peers and the origin for the rest.
 

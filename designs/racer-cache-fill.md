@@ -212,7 +212,8 @@ node leaves one copy and a new owner to refill.
   pages it no longer owns when it adopts the new membership version. The new
   owners then pin the pages they now own. This is not a make-before-break
   handoff, so a page can be briefly unpinned during a membership change; status
-  shows the shortfall through `underReplicatedBytes` and `Degraded`.
+  shows the shortfall through `underReplicatedBytes`, with `Progressing`
+  during the initial fill or `Degraded` after completion.
 - **Fill deletion**: every node releases the fill's pins when the object is
   gone. Data leaves through normal eviction; it is not deleted outright.
 
@@ -246,11 +247,22 @@ Conditions:
 
 | Type | True when | Reasons |
 | --- | --- | --- |
-| `Accepted` | The cache exists, has a supported origin, is not passthrough, and the planned footprint is at most `maxFootprint` | `CacheNotFound`, `UnsupportedCache`, `UnsupportedOrigin`, `ExceedsMaxFootprint`, `TooManyObjects` |
-| `Listed` | The current generation has a manifest | `ListFailed`, `Forbidden` |
-| `Progressing` | The first fill has not completed | `Filling` |
+| `Accepted` | The cache exists, has a supported origin, is not passthrough, the planned footprint is at most `maxFootprint`, and every cache pool member has an available fill report slot | `CacheNotFound`, `UnsupportedCache`, `UnsupportedOrigin`, `ExceedsMaxFootprint`, `TooManyObjects`, `TooManyFills` |
+| `Listed` | The current generation has a current manifest and no listing error | `ListFailed`, `Forbidden`, `TooManyObjects` |
+| `Progressing` | The initial fill for the current spec generation has not completed | `Filling` |
 | `Ready` | Every page has its replica copies confirmed by the counted reports | `Complete` |
-| `Degraded` | The fill was Ready (or already Degraded) and is now short of copies, or `spec.replicas` exceeds the cache pool's node count | `MemberLost`, `Refilling`, `CapacityLost` |
+| `Degraded` | The current spec generation completed its initial fill and is now short of copies or pool members, or a node explicitly refused pinned bytes | `MemberLost`, `Refilling`, `CapacityLost` |
+
+Completion history is scoped to the spec generation. Once that generation has
+been `Ready`, `Progressing` stays false during later refills. A new generation
+starts a new initial fill; an earlier generation's `Ready` or `Degraded`
+condition does not count as completion.
+
+If `spec.replicas` exceeds the cache pool's node count before initial
+completion, `Ready` is false and `Progressing` is true. The `Ready` message
+explains the replica shortage; this is not reported as `MemberLost`. The same
+shortage after completion is `Degraded` with `MemberLost`. Explicit capacity
+refusal is `Degraded` with `CapacityLost` even during the initial fill.
 
 `footprintBytes` is the planned reservation. `residentBytes` is the summed
 page-rounded payload of confirmed pins. `underReplicatedBytes` is
