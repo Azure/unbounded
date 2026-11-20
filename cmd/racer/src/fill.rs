@@ -23,7 +23,7 @@ use crate::store::pins::{FillId, PinEpoch};
 use racer_authority::{FillObject, FillProgress, Manifest};
 use racer_core::prefetch::PageResult;
 use racer_wire::control::CacheId;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -44,13 +44,13 @@ const RETRY_MIN: Duration = Duration::from_secs(10);
 const RETRY_MAX: Duration = Duration::from_secs(5 * 60);
 /// Bound on one fill's page fetch.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(120);
-/// Manifest pages one fill may examine in one service turn.
+/// Scheduling work one worker may perform in one service turn, per phase.
 ///
 /// Pages this worker does not own count: a node outside the cache pool walks
 /// every page without fetching any, so the manifest object cap does not bound a
 /// turn. Keeping the walk small leaves the I/O reactor to foreground reads and
-/// control work. The cursor stays in [`LocalFill`], and a spent budget requests
-/// an immediate wakeup, so the scan continues on the next turn.
+/// control work. Fill visits, manifest pages, and object transitions share the
+/// launch budget. Completion polling has the same cap and rotates separately.
 const SCAN_BUDGET: usize = 256;
 
 /// One fill's progress as one worker sees it.
@@ -167,6 +167,7 @@ struct LocalFill {
     manifest: Arc<Manifest>,
     cache: CacheId,
     replicas: u8,
+    fetching: bool,
     object: usize,
     page: u64,
     pins: BTreeMap<PageId, PinEpoch>,
@@ -223,28 +224,28 @@ enum ScanStep {
     Owned(FillObject, u64),
 }
 
-/// Visit at most [`SCAN_BUDGET`] manifest pages from `state`'s cursor,
+/// Spend at most `budget` work units from `state`'s cursor,
 /// including pages `owned` rejects. Returns the first owned page without
 /// losing failed pages: launch and finish queue them separately for retry.
 fn scan_fill(
     cx: &mut Context<'_>,
     state: &mut LocalFill,
     page_size: u64,
+    budget: &mut usize,
     mut owned: impl FnMut(&FillObject, u64) -> Result<bool>,
 ) -> Result<ScanStep> {
-    let mut visited = 0;
     while let Some(object) = state.manifest.objects.get(state.object).cloned() {
+        if *budget == 0 {
+            cx.waker().wake_by_ref();
+            return Ok(ScanStep::Budget);
+        }
+        *budget -= 1;
         let pages = object.length.div_ceil(page_size);
         if state.page >= pages {
             state.object += 1;
             state.page = 0;
             continue;
         }
-        if visited == SCAN_BUDGET {
-            cx.waker().wake_by_ref();
-            return Ok(ScanStep::Budget);
-        }
-        visited += 1;
         let number = state.page;
         if owned(&object, number)? {
             state.page += 1;
@@ -265,7 +266,10 @@ pub struct FillController {
     coordinator: Rc<Coordinator>,
     clock: racer_io::Clock,
     local: BTreeMap<String, LocalFill>,
-    inflight: Vec<Inflight>,
+    inflight: VecDeque<Inflight>,
+    launch_after: Option<String>,
+    launch_remaining: usize,
+    finish_remaining: usize,
     next_refresh: Instant,
     next_report: Instant,
     next_renew: Instant,
@@ -290,7 +294,10 @@ impl FillController {
             coordinator,
             clock,
             local: BTreeMap::new(),
-            inflight: Vec::new(),
+            inflight: VecDeque::new(),
+            launch_after: None,
+            launch_remaining: 0,
+            finish_remaining: 0,
             next_refresh: now,
             next_report: now + REPORT,
             next_renew: now + RENEW,
@@ -375,6 +382,7 @@ impl FillController {
                         manifest,
                         cache: CacheId(view.cache_uid.clone()),
                         replicas: view.replicas.max(1),
+                        fetching: false,
                         object: 0,
                         page: 0,
                         pins: BTreeMap::new(),
@@ -410,8 +418,8 @@ impl FillController {
     }
 
     /// Start one page fetch per fill that is not already fetching. The scan is
-    /// bounded per fill so a turn stays short; [`scan_fill`] wakes when more
-    /// manifest remains.
+    /// bounded across all fills and rotates so a long scan cannot starve the
+    /// next fill. A sweep wakes until every fill gets a scheduling opportunity.
     fn launch(&mut self, cx: &mut Context<'_>, now: Instant) -> Result<()> {
         let Ok(page_size) = self.coordinator.page_size() else {
             return Ok(());
@@ -424,12 +432,37 @@ impl FillController {
         let coordinator = &self.coordinator;
         let worker = self.worker;
         let retry_seed = fill_id(&coordinator.local_node().0).0 ^ u64::from(worker.0);
-        let fills: Vec<String> = self.local.keys().cloned().collect();
+        use std::ops::Bound::{Excluded, Unbounded};
+        if self.launch_remaining == 0 {
+            self.launch_remaining = self.local.len();
+        }
+        let fills: Vec<String> = match &self.launch_after {
+            Some(after) => self
+                .local
+                .range((Excluded(after.clone()), Unbounded))
+                .chain(self.local.range(..=after.clone()))
+                .take(self.launch_remaining.min(SCAN_BUDGET))
+                .map(|(uid, _)| uid.clone())
+                .collect(),
+            None => self
+                .local
+                .keys()
+                .take(self.launch_remaining.min(SCAN_BUDGET))
+                .cloned()
+                .collect(),
+        };
+        let mut budget = SCAN_BUDGET;
         for uid in fills {
-            if self.inflight.iter().any(|work| work.fill == uid) {
+            if budget == 0 {
+                break;
+            }
+            budget -= 1;
+            self.launch_remaining = self.launch_remaining.saturating_sub(1);
+            self.launch_after = Some(uid.clone());
+            let state = self.local.get_mut(&uid).expect("listed locally");
+            if state.fetching {
                 continue;
             }
-            let state = self.local.get_mut(&uid).expect("listed locally");
             let cache = state.cache.clone();
             let replicas = state.replicas;
             let retry = state
@@ -440,7 +473,7 @@ impl FillController {
                 let attempt = state.retries.remove(&key).expect("listed retry");
                 (key.1, state.manifest.objects[key.1].clone(), key.2, attempt)
             } else {
-                let step = scan_fill(cx, state, page_size, |object, number| {
+                let step = scan_fill(cx, state, page_size, &mut budget, |object, number| {
                     let page = PageId {
                         version: ObjectVersion {
                             object: ObjectId {
@@ -489,8 +522,8 @@ impl FillController {
             ) {
                 Ok(epoch) => epoch,
                 Err(Error::Overloaded) => {
-                    // No pinned headroom. Count the bytes as refused and
-                    // retry after the next reservation frees room.
+                    // The reservation API signals capacity pressure with
+                    // Overloaded. Count it once per page while retrying.
                     if state.refused.insert(page.clone()) {
                         state.refused_bytes = state.refused_bytes.saturating_add(page_size);
                     }
@@ -508,8 +541,8 @@ impl FillController {
                     // This is background work. An unavailable page key or an
                     // index/configuration failure must not stop the worker's
                     // foreground service or lose this page from the plan.
-                    // Only an explicit capacity refusal contributes refused
-                    // bytes; another error clears an earlier refusal.
+                    // Only reservation Overloaded contributes refused bytes;
+                    // another error clears an earlier refusal.
                     if state.refused.remove(&page) {
                         state.refused_bytes = state.refused_bytes.saturating_sub(page_size);
                     }
@@ -555,7 +588,7 @@ impl FillController {
                     )
                     .await
             });
-            self.inflight.push(Inflight {
+            self.inflight.push_back(Inflight {
                 fill: uid,
                 generation: state.generation,
                 object: object_index,
@@ -566,6 +599,17 @@ impl FillController {
                 version,
                 future,
             });
+            state.fetching = true;
+            self.finish_remaining = self.inflight.len();
+            cx.waker().wake_by_ref();
+        }
+        if self.launch_remaining > 0 {
+            // A fill may have disappeared during a multi-turn sweep. Clamp to
+            // the current map size rather than retaining impossible work.
+            self.launch_remaining = self.launch_remaining.min(self.local.len());
+            if self.launch_remaining > 0 {
+                cx.waker().wake_by_ref();
+            }
         }
         Ok(())
     }
@@ -574,13 +618,19 @@ impl FillController {
     /// it for retry without moving the manifest cursor backward.
     fn finish(&mut self, cx: &mut Context<'_>) {
         let retry_seed = fill_id(&self.coordinator.local_node().0).0 ^ u64::from(self.worker.0);
-        let mut index = 0;
-        while index < self.inflight.len() {
-            let ready = Pin::new(&mut self.inflight[index].future).poll(cx);
+        if self.finish_remaining == 0 {
+            self.finish_remaining = self.inflight.len();
+        }
+        self.finish_remaining = self.finish_remaining.min(self.inflight.len());
+        let mut remaining = self.finish_remaining.min(SCAN_BUDGET);
+        while remaining > 0 && !self.inflight.is_empty() {
+            remaining -= 1;
+            self.finish_remaining -= 1;
+            let mut work = self.inflight.pop_front().expect("nonempty queue");
+            let ready = Pin::new(&mut work.future).poll(cx);
             match ready {
-                Poll::Pending => index += 1,
+                Poll::Pending => self.inflight.push_back(work),
                 Poll::Ready(result) => {
-                    let work = self.inflight.swap_remove(index);
                     let Some(state) = self.local.get_mut(&work.fill) else {
                         continue;
                     };
@@ -594,6 +644,7 @@ impl FillController {
                     if state.pins.get(&page) != Some(&work.epoch) {
                         continue;
                     }
+                    state.fetching = false;
                     match result {
                         Ok(PageResult::Resident | PageResult::Admitted) => {
                             let id = PageId {
@@ -645,6 +696,9 @@ impl FillController {
                 }
             }
         }
+        if self.finish_remaining > 0 {
+            cx.waker().wake_by_ref();
+        }
     }
 
     /// Extend every live pin. A pin whose page is no longer readable (its page
@@ -695,7 +749,7 @@ impl Drop for FillController {
 }
 
 /// Drop every in-flight fetch launched for `fill`.
-fn forget_inflight(inflight: &mut Vec<Inflight>, fill: &str) {
+fn forget_inflight(inflight: &mut VecDeque<Inflight>, fill: &str) {
     inflight.retain(|work| work.fill != fill);
 }
 
@@ -804,6 +858,7 @@ mod tests {
             }),
             cache: CacheId("cache".to_owned()),
             replicas: 1,
+            fetching: false,
             object: 0,
             page: 0,
             pins: BTreeMap::new(),
@@ -853,7 +908,10 @@ mod tests {
             coordinator,
             clock: env.ctx.clock.clone(),
             local: BTreeMap::from([("fill".into(), state)]),
-            inflight: Vec::new(),
+            inflight: VecDeque::new(),
+            launch_after: None,
+            launch_remaining: 0,
+            finish_remaining: 0,
             next_refresh: now + REFRESH,
             next_report: now + REPORT,
             next_renew: now + RENEW,
@@ -906,8 +964,49 @@ mod tests {
         assert_eq!(state.pinned_pages, 2);
         assert_eq!(state.pinned_bytes, 2 * crate::model::PAGE_BYTES);
         assert!(state.retries.is_empty());
+        assert_eq!(
+            (state.object, state.page),
+            (1, 0),
+            "retry completion cannot rewind an exhausted cursor"
+        );
         controller.forget("fill");
         assert!(!controller.index.is_pinned(&page));
+    }
+
+    #[test]
+    fn real_prefetch_failure_and_fill_cancellation_release_their_exact_reservations() {
+        let env = racer_io::Env::host();
+        let (mut controller, _graph) = controller(&env, 2);
+        let mut objects = controller.local["fill"].manifest.objects.clone();
+        objects[0].metadata = b"invalid\r\nmetadata".to_vec();
+        let cache = controller.local["fill"].cache.clone();
+        let mut state = local(objects);
+        state.cache = cache;
+        controller.local.insert("fill".into(), state);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        controller.poll(&mut cx).unwrap();
+        let first = PageId {
+            version: controller.inflight[0].version.clone(),
+            number: PageNumber(0),
+        };
+        assert!(controller.index.is_pinned(&first));
+        // Poll the actual future. Invalid metadata fails before dispatch, and
+        // the next manifest page launches without waiting for the failed one.
+        controller.poll(&mut cx).unwrap();
+        assert!(!controller.index.is_pinned(&first));
+        assert_eq!(controller.inflight[0].page, 1);
+        assert_eq!(controller.local["fill"].retries.len(), 1);
+        assert_eq!(controller.local["fill"].pinned_pages, 0);
+        let second = PageId {
+            number: PageNumber(1),
+            ..first
+        };
+        assert!(controller.index.is_pinned(&second));
+        controller.forget("fill");
+        assert!(controller.inflight.is_empty());
+        assert!(!controller.index.is_pinned(&second));
+        controller.finish(&mut cx);
+        assert!(controller.local.is_empty());
     }
 
     #[test]
@@ -1106,7 +1205,7 @@ mod tests {
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         let now = controller.clock.now();
         controller.launch(&mut cx, now).unwrap();
-        let mut stale = controller.inflight.pop().unwrap();
+        let mut stale = controller.inflight.pop_back().unwrap();
         let replacement = controller.local["fill"].manifest.objects.clone();
         let cache = controller.local["fill"].cache.clone();
         controller.forget("fill");
@@ -1121,13 +1220,109 @@ mod tests {
         assert_ne!(stale.epoch, controller.inflight[0].epoch);
         controller.inflight[0].future = Box::pin(std::future::pending());
         stale.future = Box::pin(std::future::ready(Ok(PageResult::Admitted)));
-        controller.inflight.push(stale);
+        controller.inflight.push_back(stale);
+        controller.finish_remaining = controller.inflight.len();
         controller.finish(&mut cx);
         assert_eq!(controller.local["fill"].pinned_pages, 0);
         assert!(controller.index.is_pinned(&page));
         assert_eq!(controller.inflight.len(), 1);
         complete(&mut controller, Ok(PageResult::Admitted));
         assert_eq!(controller.local["fill"].pinned_pages, 1);
+    }
+
+    #[test]
+    fn controller_scan_budget_is_shared_and_rotates_between_fills() {
+        let env = racer_io::Env::host();
+        let (mut controller, _graph) = controller(&env, (2 * SCAN_BUDGET) as u64);
+        // The real directory assigns every page to worker 0. A nonowning
+        // worker must still charge the manifest walk against its shared budget.
+        controller.worker = WorkerId(1);
+        let first = controller.local.remove("fill").unwrap();
+        let mut second = local(first.manifest.objects.clone());
+        second.cache = first.cache.clone();
+        controller.local.insert("a".into(), first);
+        controller.local.insert("b".into(), second);
+        let wake = Arc::new(CountWake(std::sync::atomic::AtomicBool::new(false)));
+        let waker = std::task::Waker::from(wake.clone());
+        let mut cx = Context::from_waker(&waker);
+        let now = controller.clock.now();
+        controller.launch(&mut cx, now).unwrap();
+        assert_eq!(controller.local["a"].page, (SCAN_BUDGET - 1) as u64);
+        assert_eq!(controller.local["b"].page, 0);
+        assert!(wake.0.load(std::sync::atomic::Ordering::SeqCst));
+        controller.launch(&mut cx, now).unwrap();
+        assert_eq!(controller.local["a"].page, (SCAN_BUDGET - 1) as u64);
+        assert_eq!(controller.local["b"].page, (SCAN_BUDGET - 1) as u64);
+        assert!(controller.inflight.is_empty());
+    }
+
+    #[test]
+    fn controller_fill_visits_are_bounded_without_an_endless_self_wake() {
+        let env = racer_io::Env::host();
+        let (mut controller, _graph) = controller(&env, 0);
+        controller.forget("fill");
+        for number in 0..2 * SCAN_BUDGET {
+            controller
+                .local
+                .insert(format!("{number:06}"), local(Vec::new()));
+        }
+        let wake = Arc::new(CountWake(std::sync::atomic::AtomicBool::new(false)));
+        let waker = std::task::Waker::from(wake.clone());
+        let mut cx = Context::from_waker(&waker);
+        let now = controller.clock.now();
+        controller.launch(&mut cx, now).unwrap();
+        assert_eq!(controller.launch_remaining, SCAN_BUDGET);
+        assert!(wake.0.swap(false, std::sync::atomic::Ordering::SeqCst));
+        controller.launch(&mut cx, now).unwrap();
+        assert_eq!(controller.launch_remaining, 0);
+        assert!(!wake.0.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn controller_completion_polling_is_bounded_and_fair() {
+        let env = racer_io::Env::host();
+        let (mut controller, _graph) = controller(&env, 1);
+        let calls = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let version = ObjectVersion {
+            object: ObjectId {
+                cache: controller.local["fill"].cache.clone(),
+                key: CacheKey([1; 32]),
+            },
+            etag: StrongEtag::test_value("v1"),
+        };
+        for number in 0..2 * SCAN_BUDGET + 3 {
+            let calls = calls.clone();
+            controller.inflight.push_back(Inflight {
+                fill: number.to_string(),
+                generation: 1,
+                object: 0,
+                page: 0,
+                attempt: 0,
+                epoch: PinEpoch::default(),
+                accounted: crate::model::PAGE_BYTES,
+                version: version.clone(),
+                future: Box::pin(futures::future::poll_fn(move |_| {
+                    calls.borrow_mut().push(number);
+                    Poll::Pending
+                })),
+            });
+        }
+        let wake = Arc::new(CountWake(std::sync::atomic::AtomicBool::new(false)));
+        let waker = std::task::Waker::from(wake.clone());
+        let mut cx = Context::from_waker(&waker);
+        for turn in 1..=3 {
+            let before = calls.borrow().len();
+            controller.finish(&mut cx);
+            assert!(calls.borrow().len() - before <= SCAN_BUDGET);
+            assert_eq!(
+                wake.0.swap(false, std::sync::atomic::Ordering::SeqCst),
+                turn < 3
+            );
+        }
+        assert_eq!(
+            *calls.borrow(),
+            (0..2 * SCAN_BUDGET + 3).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1138,7 +1333,8 @@ mod tests {
         let waker = std::task::Waker::from(wake.clone());
         let mut cx = Context::from_waker(&waker);
         let mut visits = 0;
-        let step = scan_fill(&mut cx, &mut state, 1, |_, _| {
+        let mut budget = SCAN_BUDGET;
+        let step = scan_fill(&mut cx, &mut state, 1, &mut budget, |_, _| {
             visits += 1;
             Ok(false)
         })
@@ -1161,7 +1357,8 @@ mod tests {
         let selected = loop {
             turns += 1;
             assert!(turns < 4, "scan did not converge");
-            let step = scan_fill(&mut cx, &mut state, 1, |object, number| {
+            let mut budget = SCAN_BUDGET;
+            let step = scan_fill(&mut cx, &mut state, 1, &mut budget, |object, number| {
                 Ok(object.key == CacheKey([2; 32]) && number == owned_page)
             })
             .unwrap();
@@ -1186,7 +1383,8 @@ mod tests {
         let wake = Arc::new(CountWake(std::sync::atomic::AtomicBool::new(false)));
         let waker = std::task::Waker::from(wake.clone());
         let mut cx = Context::from_waker(&waker);
-        let step = scan_fill(&mut cx, &mut state, 1, |_, _| Ok(false)).unwrap();
+        let mut budget = SCAN_BUDGET;
+        let step = scan_fill(&mut cx, &mut state, 1, &mut budget, |_, _| Ok(false)).unwrap();
         assert!(matches!(step, ScanStep::Exhausted));
         assert_eq!(state.object, 1);
         assert_eq!(state.page, 0);
@@ -1217,7 +1415,7 @@ mod tests {
             version: version.clone(),
             future: pending(),
         };
-        let mut inflight = vec![work("a", 0), work("b", 0), work("a", 1)];
+        let mut inflight = VecDeque::from([work("a", 0), work("b", 0), work("a", 1)]);
         forget_inflight(&mut inflight, "a");
         assert_eq!(inflight.len(), 1);
         assert_eq!(inflight[0].fill, "b");
