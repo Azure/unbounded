@@ -531,8 +531,7 @@ async fn list_fills(shared: Rc<Shared>) {
                 if !should_list(&shared, &cache_uid) {
                     continue;
                 }
-                let key = format!("{cache_uid}/{fill_uid}");
-                let result = client.list(&url, &credential, &key, &prefixes).await;
+                let result = client.list(&url, &credential, &cache_uid, &prefixes).await;
                 let now = rt::now();
                 let mut fills = shared.fills.borrow_mut();
                 let Some(view) = fills.get_mut(&fill_uid) else {

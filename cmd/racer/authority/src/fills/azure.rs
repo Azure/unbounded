@@ -41,6 +41,9 @@ const MAX_SMALL_BODY: usize = 64 * 1024;
 /// Refresh tokens this long before they expire.
 const REFRESH_LEAD: Duration = Duration::from_secs(300);
 
+/// Bound retained credentials even if caches churn faster than tokens expire.
+const MAX_CACHED_TOKENS: usize = 1024;
+
 /// IMDS address.
 const IMDS_ADDRESS: &str = "169.254.169.254";
 
@@ -82,12 +85,68 @@ struct CachedToken {
     refresh_at: Instant,
 }
 
+/// Credential configuration contains identifiers, not bearer tokens or assertions.
+/// Keep it in the key so an in-place cache edit cannot reuse another identity.
+#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
+struct TokenKey {
+    cache_uid: String,
+    identity: (u8, Option<String>, Option<String>),
+}
+
+impl TokenKey {
+    fn new(cache_uid: &str, credential: &AzureCredential) -> Self {
+        let identity = match credential {
+            AzureCredential::Anonymous => (0, None, None),
+            AzureCredential::ManagedIdentity { client_id } => (1, client_id.clone(), None),
+            AzureCredential::WorkloadIdentity {
+                client_id,
+                tenant_id,
+            } => (2, Some(client_id.clone()), tenant_id.clone()),
+        };
+        Self {
+            cache_uid: cache_uid.to_owned(),
+            identity,
+        }
+    }
+}
+
+#[derive(Default)]
+struct TokenCache(BTreeMap<TokenKey, CachedToken>);
+
+impl TokenCache {
+    fn get(&mut self, key: &TokenKey, now: Instant) -> Option<String> {
+        // Expired and replaced identities are discarded on every lookup,
+        // including anonymous access after a credential was removed.
+        self.0.retain(|stored, token| {
+            now < token.refresh_at && (stored.cache_uid != key.cache_uid || stored == key)
+        });
+        self.0.get(key).map(|cached| cached.token.clone())
+    }
+
+    fn insert(&mut self, key: TokenKey, token: String, refresh_at: Instant) {
+        if self.0.len() >= MAX_CACHED_TOKENS
+            && let Some(oldest) = self
+                .0
+                .iter()
+                .min_by_key(|(_, token)| token.refresh_at)
+                .map(|(key, _)| key.clone())
+        {
+            self.0.remove(&oldest);
+        }
+        self.0.insert(key, CachedToken { token, refresh_at });
+    }
+
+    fn invalidate(&mut self, key: &TokenKey) {
+        self.0.remove(key);
+    }
+}
+
 /// Per-process listing client and token cache. Only the fill listing task
 /// uses it, so it is not shared.
 pub struct Client {
     settings: Settings,
     trust: Option<Arc<rustls::ClientConfig>>,
-    tokens: RefCell<BTreeMap<String, CachedToken>>,
+    tokens: RefCell<TokenCache>,
 }
 
 impl Client {
@@ -100,7 +159,7 @@ impl Client {
         Self {
             settings,
             trust,
-            tokens: RefCell::new(BTreeMap::new()),
+            tokens: RefCell::new(TokenCache::default()),
         }
     }
 
@@ -110,10 +169,14 @@ impl Client {
         &self,
         url: &AzureContainerUrl,
         credential: &AzureCredential,
-        key: &str,
+        cache_uid: &str,
         prefixes: &[String],
     ) -> Result<Vec<ListedObject>, ListError> {
-        let bearer = self.token(credential, key).await?;
+        let key = TokenKey::new(cache_uid, credential);
+        let mut bearer = self.token(credential, &key).await?;
+        // One refresh per complete listing, not per page or prefix. A second
+        // 401 still evicts the rejected token, but cannot loop on bad credentials.
+        let mut refreshed = false;
         let mut objects = Vec::new();
         let mut seen = BTreeSet::new();
         for prefix in prefixes {
@@ -122,6 +185,14 @@ impl Client {
                 let (status, body) = self
                     .list_page(url, &marker, prefix, bearer.as_deref())
                     .await?;
+                if status == 401 && bearer.is_some() {
+                    self.tokens.borrow_mut().invalidate(&key);
+                    if !refreshed {
+                        refreshed = true;
+                        bearer = self.token(credential, &key).await?;
+                        continue;
+                    }
+                }
                 if status != 200 {
                     return Err(match status {
                         401 | 403 => ListError::Forbidden,
@@ -197,15 +268,14 @@ impl Client {
     async fn token(
         &self,
         credential: &AzureCredential,
-        key: &str,
+        key: &TokenKey,
     ) -> Result<Option<String>, ListError> {
+        let cached = self.tokens.borrow_mut().get(key, rt::now());
         if matches!(credential, AzureCredential::Anonymous) {
             return Ok(None);
         }
-        if let Some(cached) = self.tokens.borrow().get(key)
-            && rt::now() < cached.refresh_at
-        {
-            return Ok(Some(cached.token.clone()));
+        if let Some(cached) = cached {
+            return Ok(Some(cached));
         }
         let (token, lifetime) = match credential {
             AzureCredential::Anonymous => unreachable!("checked above"),
@@ -222,11 +292,9 @@ impl Client {
         };
         let lead = REFRESH_LEAD.min(lifetime / 2);
         self.tokens.borrow_mut().insert(
-            key.to_owned(),
-            CachedToken {
-                token: token.clone(),
-                refresh_at: rt::now() + lifetime.saturating_sub(lead),
-            },
+            key.clone(),
+            token.clone(),
+            rt::now() + lifetime.saturating_sub(lead),
         );
         Ok(Some(token))
     }
@@ -850,6 +918,194 @@ pub fn http_date(secs: u64) -> String {
 }
 
 #[cfg(test)]
+mod auth_tests {
+    use super::*;
+    use std::{collections::VecDeque, rc::Rc};
+
+    fn run(body: impl std::future::Future<Output = ()> + 'static) {
+        let mut executor = rt::Executor::new(32).unwrap();
+        let done = Rc::new(std::cell::Cell::new(false));
+        let completed = done.clone();
+        executor.enter(|| {
+            rt::spawn(async move {
+                body.await;
+                completed.set(true);
+            })
+            .unwrap()
+        });
+        executor.run(|| done.get());
+    }
+
+    fn credential(client: &str, tenant: &str) -> AzureCredential {
+        AzureCredential::WorkloadIdentity {
+            client_id: client.into(),
+            tenant_id: Some(tenant.into()),
+        }
+    }
+
+    #[test]
+    fn token_cache_reuses_identity_and_discards_replaced_and_expired_entries() {
+        let now = Instant::now();
+        let mut cache = TokenCache::default();
+        let key = TokenKey::new("cache", &credential("client", "tenant"));
+        cache.insert(key.clone(), "token".into(), now + REFRESH_LEAD);
+        assert_eq!(cache.get(&key, now).as_deref(), Some("token"));
+        assert_eq!(cache.get(&key, now).as_deref(), Some("token"));
+        for changed in [
+            credential("other", "tenant"),
+            credential("client", "other"),
+            AzureCredential::ManagedIdentity {
+                client_id: Some("client".into()),
+            },
+            AzureCredential::Anonymous,
+        ] {
+            cache.insert(key.clone(), "token".into(), now + REFRESH_LEAD);
+            assert!(cache.get(&TokenKey::new("cache", &changed), now).is_none());
+            assert!(cache.0.is_empty());
+        }
+        cache.insert(key.clone(), "token".into(), now);
+        assert!(cache.get(&key, now).is_none());
+        assert!(cache.0.is_empty());
+    }
+
+    #[test]
+    fn token_cache_is_bounded_under_cache_churn() {
+        let now = Instant::now();
+        let mut cache = TokenCache::default();
+        for i in 0..MAX_CACHED_TOKENS + 100 {
+            let key = TokenKey::new(&format!("cache-{i}"), &credential("client", "tenant"));
+            cache.get(&key, now);
+            cache.insert(key, "token".into(), now + Duration::from_secs(i as u64 + 1));
+            assert!(cache.0.len() <= MAX_CACHED_TOKENS);
+        }
+        assert!(
+            !cache
+                .0
+                .contains_key(&TokenKey::new("cache-0", &credential("client", "tenant")))
+        );
+        let key = TokenKey::new("unused", &AzureCredential::Anonymous);
+        cache.get(&key, now + Duration::from_secs(10_000));
+        assert!(cache.0.is_empty());
+    }
+
+    /// Loopback token and list endpoints. The manifest is empty so these tests
+    /// exercise authentication and requests, not XML parsing.
+    fn endpoint(statuses: &[u16]) -> (Client, AzureContainerUrl, Rc<RefCell<Vec<String>>>) {
+        let listener = rt::Listener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let recorded = requests.clone();
+        let mut statuses = VecDeque::from(statuses.to_vec());
+        let mut tokens = 0;
+        rt::spawn(async move {
+            loop {
+                let (mut tcp, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    assert_ne!(tcp.recv_into(&mut request).await.unwrap(), 0);
+                    if let Some(end) = find(&request, b"\r\n\r\n") {
+                        let head = std::str::from_utf8(&request[..end]).unwrap();
+                        let length = head.lines().find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        }).unwrap_or(0);
+                        if request.len() >= end + 4 + length { break; }
+                    }
+                }
+                let request = String::from_utf8(request).unwrap();
+                let (status, body) = if request.starts_with("POST ") {
+                    tokens += 1;
+                    (200, format!(r#"{{"access_token":"token-{tokens}","expires_in":3600}}"#))
+                } else {
+                    (statuses.pop_front().unwrap_or(200),
+                        "<EnumerationResults><Blobs></Blobs></EnumerationResults>".into())
+                };
+                recorded.borrow_mut().push(request);
+                tcp.send_all(format!("HTTP/1.1 {status} Response\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).into_bytes()).await.unwrap();
+            }
+        }).unwrap();
+        let client = Client {
+            settings: Settings {
+                trust_bundle: PathBuf::new(),
+                authority_host: format!("http://{address}"),
+                // A nonempty local fixture is enough for the fake token endpoint.
+                federated_token_file: Some(PathBuf::from(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/Cargo.toml"
+                ))),
+            },
+            trust: None,
+            tokens: RefCell::new(TokenCache::default()),
+        };
+        let url = AzureContainerUrl::parse(&format!("http://{address}/account/models")).unwrap();
+        (client, url, requests)
+    }
+
+    #[test]
+    fn fills_share_tokens_but_credential_edits_exchange_again() {
+        run(async {
+            let (client, url, requests) = endpoint(&[]);
+            for cred in [
+                credential("client", "tenant"),
+                credential("client", "tenant"),
+                credential("other", "tenant"),
+                credential("other", "other"),
+            ] {
+                assert!(
+                    client
+                        .list(&url, &cred, "cache", &["".into()])
+                        .await
+                        .is_ok()
+                );
+            }
+            let requests = requests.borrow();
+            assert_eq!(
+                requests.iter().filter(|r| r.starts_with("POST ")).count(),
+                3
+            );
+            assert_eq!(requests.iter().filter(|r| r.starts_with("GET ")).count(), 4);
+            assert_eq!(client.tokens.borrow().0.len(), 1);
+        });
+    }
+
+    #[test]
+    fn unauthorized_refreshes_once_and_forbidden_does_not_retry() {
+        for (statuses, expected, exchanges, retained) in [
+            (vec![401, 200], Ok(()), 2, true),
+            (vec![401, 401], Err(ListError::Forbidden), 2, false),
+            (vec![403], Err(ListError::Forbidden), 1, true),
+        ] {
+            run(async move {
+                let (client, url, requests) = endpoint(&statuses);
+                assert_eq!(
+                    client
+                        .list(&url, &credential("client", "tenant"), "cache", &["".into()])
+                        .await
+                        .map(|_| ()),
+                    expected
+                );
+                let requests = requests.borrow();
+                assert_eq!(
+                    requests.iter().filter(|r| r.starts_with("POST ")).count(),
+                    exchanges
+                );
+                assert_eq!(
+                    requests.iter().filter(|r| r.starts_with("GET ")).count(),
+                    statuses.len()
+                );
+                assert_eq!(!client.tokens.borrow().0.is_empty(), retained);
+                if statuses[0] == 401 {
+                    let gets: Vec<_> = requests.iter().filter(|r| r.starts_with("GET ")).collect();
+                    assert!(gets[0].contains("Bearer token-1"));
+                    assert!(gets[1].contains("Bearer token-2"));
+                }
+            });
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::{
@@ -915,7 +1171,7 @@ mod tests {
                 federated_token_file: None,
             },
             trust: None,
-            tokens: RefCell::new(BTreeMap::new()),
+            tokens: RefCell::new(TokenCache::default()),
         };
         // Spawn the operation as production does. The task waker notifies the
         // reactor when the DNS helper thread completes; block_on's test-only
