@@ -932,9 +932,10 @@ mod tests {
                 shared.fills.borrow_mut().insert(v.uid.clone(), v);
             }
 
-            // The fake has no status subresource, so both writes fail. The
-            // first fill stays dirty, but the cursor still moves past it.
+            // Both writes conflict. The first fill stays dirty, but the
+            // cursor still moves past it.
             let mut cursor = 0;
+            api.fail_next_write(409);
             let start = api.requests().len();
             reconcile(&shared, &mut cursor).await;
             let first: Vec<_> = api.requests()[start..]
@@ -947,6 +948,7 @@ mod tests {
             assert_eq!(cursor, 1);
 
             let start = api.requests().len();
+            api.fail_next_write(409);
             reconcile(&shared, &mut cursor).await;
             let second: Vec<_> = api.requests()[start..]
                 .iter()
@@ -1024,8 +1026,7 @@ mod tests {
             assert_eq!(cursor, 0);
 
             // The matching object is written, so the guard does not block the
-            // normal path. The fake has no status subresource, so the PUT
-            // itself fails with 404 after being sent.
+            // normal path, and the status PUT succeeds.
             api.put_object(
                 &path,
                 json!({
@@ -1047,6 +1048,16 @@ mod tests {
             assert_eq!(writes.len(), 1, "{writes:?}");
             assert!(writes[0].ends_with("/fill/status"), "{writes:?}");
             assert_eq!(cursor, 0);
+            let written = api.object(&path).unwrap();
+            assert_eq!(written["status"]["observedGeneration"], v.generation);
+            assert_eq!(written["spec"]["cacheName"], "models");
+            assert_eq!(written["metadata"]["uid"], v.uid);
+
+            // A successful write is stable: its transition timestamps are
+            // retained and the next pass makes no redundant status PUT.
+            let start = api.requests().len();
+            reconcile(&shared, &mut cursor).await;
+            assert!(api.requests()[start..].iter().all(|(m, _)| m == "GET"));
         });
     }
 }
