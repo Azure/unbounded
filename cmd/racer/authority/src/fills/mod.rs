@@ -804,6 +804,15 @@ mod tests {
                     assert_eq!(view.accepted, i < crate::limits::MAX_REPORT_FILLS);
                     if !view.accepted {
                         assert_eq!(view.message, "TooManyFills");
+                        let status = status::status(view, &BTreeMap::new(), None);
+                        let accepted = status["conditions"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .find(|condition| condition["type"] == "Accepted")
+                            .unwrap();
+                        assert_eq!(accepted["status"], "False");
+                        assert_eq!(accepted["reason"], "TooManyFills");
                     }
                 }
             };
