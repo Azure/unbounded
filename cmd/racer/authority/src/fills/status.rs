@@ -12,13 +12,15 @@ use crate::{
     rules::{
         election,
         members::{NodeInfo, Ownership, PodInfo, select_pod},
-        rails::FillProgress,
     },
     shared::Shared,
 };
 use racer_wire::control::Member;
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 /// How often the primary looks for a status update.
 const TICK: Duration = Duration::from_secs(10);
@@ -31,69 +33,90 @@ pub struct Progress {
     pub nodes: i32,
 }
 
-/// Sum the reports for `view` whose generation, digest, and membership match.
-pub fn aggregate(reports: &BTreeMap<String, String>, view: &FillView) -> Progress {
-    let Some(manifest) = &view.manifest else {
-        return Progress::default();
-    };
-    let Some(membership) = view.membership else {
-        return Progress::default();
-    };
-    let mut progress = Progress::default();
-    for report in reports.values() {
+/// Decode each selected Pod annotation once, then aggregate all matching fills.
+/// Work is proportional to the report entries, not fills times encoded reports.
+fn aggregate_all<'a, 'v>(
+    reports: impl IntoIterator<Item = &'a str>,
+    views: &'v [FillView],
+) -> BTreeMap<&'v str, Progress> {
+    let views: BTreeMap<_, _> = views.iter().map(|view| (view.uid.as_str(), view)).collect();
+    let mut progress: BTreeMap<&str, Progress> = BTreeMap::new();
+    for report in reports {
         let Ok(fills) = crate::rules::rails::parse_fills(report) else {
             continue;
         };
-        let entry: Option<&FillProgress> = fills.fills.iter().find(|f| f.fill == view.uid);
-        let Some(entry) = entry else {
-            continue;
-        };
-        if entry.generation != view.generation
-            || entry.digest != manifest.digest
-            || entry.membership != membership
-        {
-            continue;
-        }
-        progress.resident_bytes = progress.resident_bytes.saturating_add(entry.pinned_bytes);
-        progress.refused_bytes = progress.refused_bytes.saturating_add(entry.refused_bytes);
-        if entry.pinned_pages > 0 {
-            progress.nodes = progress.nodes.saturating_add(1);
+        let mut seen = BTreeSet::new();
+        for entry in &fills.fills {
+            // A Pod contributes at most once per fill, even if a malformed
+            // producer repeats an entry. Preserve the first-entry policy.
+            if !seen.insert(entry.fill.as_str()) {
+                continue;
+            }
+            let Some(view) = views.get(entry.fill.as_str()) else {
+                continue;
+            };
+            let Some(manifest) = &view.manifest else {
+                continue;
+            };
+            if entry.generation != view.generation
+                || entry.digest != manifest.digest
+                || Some(entry.membership) != view.membership
+            {
+                continue;
+            }
+            let progress = progress.entry(view.uid.as_str()).or_default();
+            progress.resident_bytes = progress.resident_bytes.saturating_add(entry.pinned_bytes);
+            progress.refused_bytes = progress.refused_bytes.saturating_add(entry.refused_bytes);
+            if entry.pinned_pages > 0 {
+                progress.nodes = progress.nodes.saturating_add(1);
+            }
         }
     }
     progress
 }
 
+#[cfg(test)]
+fn aggregate<K: Ord, V: AsRef<str>>(reports: &BTreeMap<K, V>, view: &FillView) -> Progress {
+    aggregate_all(
+        reports.values().map(AsRef::as_ref),
+        std::slice::from_ref(view),
+    )
+    .remove(view.uid.as_str())
+    .unwrap_or_default()
+}
+
 /// Fills annotations of the selected managed Pod for each current member Node.
 /// Keyed by Node UID so a Node contributes at most once, and Pods the
 /// dataplane DaemonSet does not own are ignored.
-fn member_reports(
-    pods: &BTreeMap<String, PodInfo>,
+fn member_reports<'a>(
+    pods: &'a BTreeMap<String, PodInfo>,
     nodes: &BTreeMap<String, NodeInfo>,
     ownership: &Ownership,
-    members: &[Member],
-) -> BTreeMap<String, String> {
-    let mut by_node: BTreeMap<&str, Vec<PodInfo>> = BTreeMap::new();
+    members: &'a [Member],
+) -> BTreeMap<&'a str, &'a str> {
+    let mut by_node: BTreeMap<&str, &PodInfo> = BTreeMap::new();
     for pod in pods.values() {
-        by_node
-            .entry(pod.node_name.as_str())
-            .or_default()
-            .push(pod.clone());
+        // Reuse the eligibility policy without cloning full Pod annotations.
+        if select_pod(std::slice::from_ref(pod), ownership, &pod.node_name).is_none() {
+            continue;
+        }
+        let selected = by_node.entry(pod.node_name.as_str()).or_insert(pod);
+        if (pod.creation.as_str(), pod.uid.as_str())
+            > (selected.creation.as_str(), selected.uid.as_str())
+        {
+            *selected = pod;
+        }
     }
     let mut reports = BTreeMap::new();
-    let empty = Vec::new();
     for member in members {
         let Some(node) = nodes.get(&member.node.0) else {
             continue;
         };
-        let Some((pod, _)) = select_pod(
-            by_node.get(node.name.as_str()).unwrap_or(&empty),
-            ownership,
-            &node.name,
-        ) else {
+        let Some(pod) = by_node.get(node.name.as_str()) else {
             continue;
         };
         if let Some(fills) = pod.annotations.get(annotations::FILLS) {
-            reports.insert(member.node.0.clone(), fills.clone());
+            reports.insert(member.node.0.as_str(), fills.as_str());
         }
     }
     reports
@@ -102,13 +125,14 @@ fn member_reports(
 /// Compute the `status` object for one fill. `previous` is the status read
 /// from the API, used only to keep `lastTransitionTime` and to detect a fill
 /// that was Ready and is now short.
-pub fn status(
-    view: &FillView,
-    reports: &BTreeMap<String, String>,
-    previous: Option<&Value>,
-) -> Value {
-    let now = election::now_micro(rt::wall_now());
+#[cfg(test)]
+fn status(view: &FillView, reports: &BTreeMap<String, String>, previous: Option<&Value>) -> Value {
     let progress = aggregate(reports, view);
+    status_with_progress(view, progress, previous)
+}
+
+fn status_with_progress(view: &FillView, progress: Progress, previous: Option<&Value>) -> Value {
+    let now = election::now_micro(rt::wall_now());
     let manifest_current = view.manifest.is_some()
         && view.listed_generation == Some(view.generation)
         && view.listed_cache_uid == view.cache_uid;
@@ -375,7 +399,7 @@ pub async fn reconcile(shared: &Shared, cursor: &mut usize) {
     if views.is_empty() {
         return;
     }
-    let reports = {
+    let progress = {
         let serving = shared.serving.borrow();
         let members: &[Member] = serving
             .image
@@ -384,7 +408,8 @@ pub async fn reconcile(shared: &Shared, cursor: &mut usize) {
         let pods = shared.pods.borrow();
         let nodes = shared.nodes.borrow();
         let ownership = shared.ownership.borrow();
-        member_reports(&pods, &nodes, &ownership, members)
+        let reports = member_reports(&pods, &nodes, &ownership, members);
+        aggregate_all(reports.into_values(), &views)
     };
     let len = views.len();
     let start = *cursor % len;
@@ -421,7 +446,11 @@ pub async fn reconcile(shared: &Shared, cursor: &mut usize) {
             continue;
         }
         let previous = current.get("status").filter(|s| s.is_object());
-        let next = status(view, &reports, previous);
+        let next = status_with_progress(
+            view,
+            progress.get(view.uid.as_str()).copied().unwrap_or_default(),
+            previous,
+        );
         if previous == Some(&next) {
             continue;
         }
@@ -468,6 +497,7 @@ pub async fn run(shared: std::rc::Rc<Shared>) {
 mod tests {
     use super::*;
     use crate::fills::manifest;
+    use crate::rules::rails::FillProgress;
     use racer_wire::control::NodeId;
     use std::{num::NonZeroU32, sync::Arc};
 
@@ -565,6 +595,16 @@ mod tests {
         let mut other = progress_for(&v);
         other.generation = 1;
         reports.insert("p2".into(), report(other));
+        let mut other = progress_for(&v);
+        other.digest = "0".repeat(64);
+        reports.insert("wrong-digest".into(), report(other));
+        let mut other = progress_for(&v);
+        other.membership += 1;
+        reports.insert("wrong-membership".into(), report(other));
+        let mut other = progress_for(&v);
+        other.fill = "99999999-9999-4999-8999-999999999999".into();
+        reports.insert("wrong-fill".into(), report(other));
+        reports.insert("malformed".into(), "not json".into());
         let p = aggregate(&reports, &v);
         assert_eq!(p.resident_bytes, 100);
         assert_eq!(p.nodes, 1);
@@ -596,6 +636,48 @@ mod tests {
         let missing = status(&v, &BTreeMap::new(), None);
         assert_eq!(missing["residentBytes"], 0);
         assert_eq!(missing["underReplicatedBytes"], 200);
+    }
+
+    #[test]
+    fn all_fills_are_aggregated_in_one_report_pass() {
+        let first = with_manifest(view());
+        let mut second = first.clone();
+        second.uid = "99999999-9999-4999-8999-999999999999".into();
+        let mut second_progress = progress_for(&second);
+        second_progress.pinned_bytes = 70;
+        let encoded = crate::rules::rails::encode_fills(&crate::rules::rails::Fills {
+            fills: vec![progress_for(&first), second_progress],
+            pinnable_bytes: None,
+        })
+        .unwrap();
+        let consumed = std::cell::Cell::new(0);
+        let reports = [encoded.as_str(), encoded.as_str()]
+            .into_iter()
+            .inspect(|_| consumed.set(consumed.get() + 1));
+        let views = [first.clone(), second.clone()];
+        let progress = aggregate_all(reports, &views);
+        assert_eq!(
+            consumed.get(),
+            2,
+            "reports are consumed once, not once per fill"
+        );
+        assert_eq!(progress[first.uid.as_str()].resident_bytes, 200);
+        assert_eq!(progress[second.uid.as_str()].resident_bytes, 140);
+        assert_eq!(progress[first.uid.as_str()].nodes, 2);
+        assert_eq!(progress[second.uid.as_str()].nodes, 2);
+        let duplicates = crate::rules::rails::encode_fills(&crate::rules::rails::Fills {
+            fills: vec![progress_for(&first), progress_for(&first)],
+            pinnable_bytes: None,
+        })
+        .unwrap();
+        let unique = aggregate_all([duplicates.as_str()], &views);
+        assert_eq!(unique[first.uid.as_str()].resident_bytes, 100);
+        assert_eq!(unique[first.uid.as_str()].nodes, 1);
+        let mut no_manifest = first.clone();
+        no_manifest.manifest = None;
+        let mut no_membership = second;
+        no_membership.membership = None;
+        assert!(aggregate_all([encoded.as_str()], &[no_manifest, no_membership]).is_empty());
     }
 
     #[test]
@@ -822,7 +904,8 @@ mod tests {
             managed_pod("real", "2024-01-01T00:00:00Z", &real, DS),
             managed_pod("spoof", "2025-01-01T00:00:00Z", &real, "other"),
         ]);
-        let reports = member_reports(&pods, &node_map(), &ownership(), &[member()]);
+        let members = [member()];
+        let reports = member_reports(&pods, &node_map(), &ownership(), &members);
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[NODE_UID], real);
         assert_eq!(aggregate(&reports, &v).nodes, 1);
@@ -842,7 +925,8 @@ mod tests {
             managed_pod("old", "2024-01-01T00:00:00Z", &old_report, DS),
             managed_pod("new", "2024-01-02T00:00:00Z", &new_report, DS),
         ]);
-        let reports = member_reports(&pods, &node_map(), &ownership(), &[member()]);
+        let members = [member()];
+        let reports = member_reports(&pods, &node_map(), &ownership(), &members);
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[NODE_UID], new_report);
         let progress = aggregate(&reports, &v);
@@ -861,7 +945,8 @@ mod tests {
             &reported,
             DS,
         )]);
-        let reports = member_reports(&pods, &node_map(), &ownership(), &[member()]);
+        let members = [member()];
+        let reports = member_reports(&pods, &node_map(), &ownership(), &members);
         assert_eq!(reports[NODE_UID], reported);
         let progress = aggregate(&reports, &v);
         assert_eq!(progress.nodes, 1);
