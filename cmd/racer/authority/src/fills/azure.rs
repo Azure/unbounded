@@ -13,6 +13,7 @@ use crate::{
     tls::TlsStream,
 };
 use racer_wire::control::{AzureContainerUrl, AzureCredential};
+use racer_wire::object::StrongEtag;
 use rustls::pki_types::ServerName;
 use serde_json::Value;
 use std::{
@@ -578,7 +579,7 @@ pub fn parse_list(xml: &[u8]) -> Result<Page, XmlError> {
                     let length = length.parse().map_err(|_| XmlError)?;
                     page.blobs.push(ListedObject {
                         name: std::mem::take(&mut name),
-                        etag: std::mem::take(&mut etag),
+                        etag: list_etag(&etag)?,
                         length,
                         content_type: (!content_type.is_empty())
                             .then(|| std::mem::take(&mut content_type)),
@@ -608,6 +609,20 @@ pub fn parse_list(xml: &[u8]) -> Result<Page, XmlError> {
         return Err(XmlError);
     }
     Ok(page)
+}
+
+/// List XML may omit the quotes that GET and HEAD use around Azure ETags.
+fn list_etag(value: &str) -> Result<String, XmlError> {
+    let quoted = if let Some(hex) = value.strip_prefix("0x") {
+        if hex.is_empty() || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(XmlError);
+        }
+        format!("\"{value}\"")
+    } else {
+        value.to_owned()
+    };
+    StrongEtag::parse(quoted.as_bytes()).map_err(|_| XmlError)?;
+    Ok(quoted)
 }
 
 enum Capture {
@@ -829,6 +844,40 @@ mod tests {
             .next_marker,
             "a&b"
         );
+    }
+
+    #[test]
+    fn normalizes_azure_list_etags_to_get_and_head_format() {
+        // Microsoft's Enumerating Blob Resources XML examples use this form:
+        // https://learn.microsoft.com/rest/api/storageservices/enumerating-blob-resources
+        let xml = br#"<EnumerationResults><Blobs><Blob>
+            <Name>blob1.txt</Name><Properties>
+            <Etag>0x8CBFF45D8A29A19</Etag><Content-Length>100</Content-Length>
+            <Content-Type>text/html</Content-Type></Properties>
+            </Blob></Blobs><NextMarker /></EnumerationResults>"#;
+        let page = parse_list(xml).unwrap();
+        assert_eq!(page.blobs[0].etag, "\"0x8CBFF45D8A29A19\"");
+        let manifest =
+            super::super::manifest::build("models", &page.blobs, &[String::new()], 0).unwrap();
+        assert_eq!(manifest.objects[0].etag.as_str(), page.blobs[0].etag);
+        assert_eq!(list_etag("\"0x8D1\"").unwrap(), "\"0x8D1\"");
+        assert_eq!(list_etag("\"literal,\\tag\"").unwrap(), "\"literal,\\tag\"");
+        for bad in [
+            "",
+            "0x",
+            "0xZZ",
+            "0x12\r\n",
+            "W/\"0x12\"",
+            "0x12\"",
+            "\"0x12",
+            "unquoted",
+        ] {
+            assert_eq!(list_etag(bad), Err(XmlError), "{bad:?}");
+            let xml = String::from_utf8(xml.to_vec())
+                .unwrap()
+                .replace("0x8CBFF45D8A29A19", bad);
+            assert_eq!(parse_list(xml.as_bytes()), Err(XmlError), "{bad:?}");
+        }
     }
 
     #[test]
