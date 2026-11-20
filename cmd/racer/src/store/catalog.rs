@@ -101,6 +101,12 @@ struct State {
 
     current: HashMap<ObjectId, CurrentVersion>,
 }
+
+enum PinAdmission {
+    Reserved(super::pins::PinEpoch),
+    /// Budgets fit, but ordinary cached entries must be reclaimed first.
+    IndexFull,
+}
 impl State {
     fn new(slots: u32) -> Self {
         Self {
@@ -472,22 +478,42 @@ impl Index {
     /// merges with earlier pins of the same fill and version; every call adds
     /// one reader holder to each requested page.
     pub fn reserve_pin_pages(
-        &self,
+        self: &Rc<Self>,
         fill: super::pins::FillId,
         version: &ObjectVersion,
         pages: &super::holds::HoldPages,
         until: std::time::SystemTime,
     ) -> Result<super::pins::PinEpoch> {
-        self.reserve_pin_inner(fill, version, pages, until)
+        match self.reserve_pin_admission(fill, version, pages, until)? {
+            PinAdmission::Reserved(epoch) => return Ok(epoch),
+            PinAdmission::IndexFull => {}
+        }
+        let segments = self
+            .pins
+            .borrow()
+            .segments
+            .clone()
+            .ok_or(Error::InvalidConfiguration)?;
+        let reserve = self.holds.borrow().free_reserve;
+        // Only index pressure reaches here: a pin-budget rejection must not
+        // evict ordinary pages. Reclaim is bounded like a normal cache write.
+        match SegmentClock::new(self.clone(), segments, reserve).reclaim_entries() {
+            Ok(()) | Err(Error::Overloaded) => {}
+            Err(error) => return Err(error),
+        }
+        match self.reserve_pin_admission(fill, version, pages, until)? {
+            PinAdmission::Reserved(epoch) => Ok(epoch),
+            PinAdmission::IndexFull => Err(Error::Overloaded),
+        }
     }
 
-    fn reserve_pin_inner(
+    fn reserve_pin_admission(
         &self,
         fill: super::pins::FillId,
         version: &ObjectVersion,
         pages: &super::holds::HoldPages,
         until: std::time::SystemTime,
-    ) -> Result<super::pins::PinEpoch> {
+    ) -> Result<PinAdmission> {
         let monotonic = super::pins::Pins::deadline(until, &self.clock)?;
         if !self.available(&version.object.cache) {
             return Err(Error::MissingKey);
@@ -514,7 +540,9 @@ impl Index {
             .chain(pages.iter())
             .collect();
         if members.is_empty() {
-            return Ok(super::pins::PinEpoch(state.pages.last_hold_id()));
+            return Ok(PinAdmission::Reserved(super::pins::PinEpoch(
+                state.pages.last_hold_id(),
+            )));
         }
         let mut page = PageId {
             version: version.clone(),
@@ -572,12 +600,6 @@ impl Index {
         {
             return Err(Error::Overloaded);
         }
-        // Hard page-slot and index-entry capacity, shared with spill holds.
-        if state.pages.len() + self.reserved.get() + state.pages.holds_unused() + joining_unused
-            > self.page_capacity.get()
-        {
-            return Err(Error::Overloaded);
-        }
         if let Some(old) = old
             && pages.iter().any(|number| {
                 old.holders
@@ -586,6 +608,12 @@ impl Index {
             })
         {
             return Err(Error::Overloaded);
+        }
+        // Keep index pressure distinct from pin-budget or holder overflow.
+        if state.pages.len() + self.reserved.get() + state.pages.holds_unused() + joining_unused
+            > self.page_capacity.get()
+        {
+            return Ok(PinAdmission::IndexFull);
         }
         let until = old.map_or(until, |pin| pin.until.max(until));
         let monotonic = old.map_or(monotonic, |pin| pin.monotonic.max(monotonic));
@@ -653,7 +681,7 @@ impl Index {
                 .pin_segment(segment)
                 .expect("validated resident pin must reference a live segment");
         }
-        Ok(epoch)
+        Ok(PinAdmission::Reserved(epoch))
     }
 
     /// Renew a live pin without adding holders. An unknown or expired pin is
@@ -2749,6 +2777,64 @@ mod tests {
             .reserve_pin_pages(FillId(1), &version, &page_set(&[0, 1]), until)
             .unwrap();
         assert_eq!(index.hold_unused(), 2);
+    }
+
+    #[test]
+    fn pin_reservation_reclaims_a_warm_full_index_without_evicting_holds() {
+        use super::super::pins::FillId;
+        let env = racer_io::Env::host();
+        let segments = Rc::new(segments(1024, 4));
+        let index = Rc::new(index(&env, 16));
+        index.set_page_capacity(2).unwrap();
+        let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
+        let (held, held_entry) = indexed(descriptor("held", 17), 0);
+        let (warm, warm_entry) = indexed(descriptor("warm", 17), 1);
+        drop(segments.append(1024).unwrap());
+        drop(segments.append(1024).unwrap());
+        index.publish(held.clone(), held_entry).unwrap();
+        index.publish(warm.clone(), warm_entry).unwrap();
+        let until = index.clock().wall_now() + std::time::Duration::from_secs(60);
+        index
+            .reserve_hold_pages(&held.version, &page_set(&[0]), until)
+            .unwrap();
+        let (page, entry) = indexed(descriptor("fill", 17), 0);
+        index
+            .reserve_pin_pages(FillId(1), &page.version, &page_set(&[0]), until)
+            .unwrap();
+        assert!(index.lookup(&held).unwrap().is_some());
+        assert!(index.lookup(&warm).unwrap().is_none());
+        let mut ticket = index.reserve_page_for(&page).unwrap();
+        let (lease, location) = ticket.append(&page, &segments, 1024).unwrap();
+        ticket
+            .publish(page.clone(), IndexedPage { location, ..entry })
+            .unwrap();
+        drop(lease);
+        assert!(index.lookup(&page).unwrap().is_some());
+        assert!(index.is_pinned(&page));
+        assert_eq!(index.state.borrow().pages.len(), 2);
+    }
+
+    #[test]
+    fn pin_budget_rejection_does_not_reclaim_a_full_index() {
+        use super::super::pins::FillId;
+        let env = racer_io::Env::host();
+        let segments = Rc::new(segments(1024, 4));
+        let index = Rc::new(index(&env, 16));
+        index.set_page_capacity(1).unwrap();
+        index.set_pin_capacity_percent(0).unwrap();
+        let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
+        let (warm, entry) = indexed(descriptor("warm", 17), 0);
+        drop(segments.append(1024).unwrap());
+        index.publish(warm.clone(), entry).unwrap();
+        let until = index.clock().wall_now() + std::time::Duration::from_secs(60);
+        let version = descriptor("refused", 17).version;
+        let before = segments.snapshot();
+        assert_eq!(
+            index.reserve_pin_pages(FillId(1), &version, &page_set(&[0]), until),
+            Err(Error::Overloaded)
+        );
+        assert_eq!(segments.snapshot(), before);
+        assert!(index.lookup(&warm).unwrap().is_some());
     }
 
     /// A page shared by several fills and versions stays pinned until the last
