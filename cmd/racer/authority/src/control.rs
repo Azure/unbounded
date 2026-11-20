@@ -920,7 +920,7 @@ mod tests {
             *outer.fill_context.lock().unwrap() = Some(fills::FillContext {
                 membership: 7,
                 page_size: 4096,
-                pool_sizes: [(cache.clone(), 2)].into(),
+                pool_members: [(cache.clone(), Arc::from([0, 1]))].into(),
                 local_caches: [cache.clone()].into(),
             });
             rt::spawn(publish_fills(shared.clone(), outer.clone())).unwrap();
@@ -928,7 +928,7 @@ mod tests {
             let adopted = shared.fill_context.borrow().clone().unwrap();
             assert_eq!(adopted.membership, 7);
             assert!(adopted.local_caches.contains(&cache));
-            assert_eq!(adopted.pool_sizes[&cache], 2);
+            assert_eq!(&*adopted.pool_members[&cache], &[0, 1]);
             // Losing the local publication closes listing eligibility again.
             *outer.fill_context.lock().unwrap() = None;
             rt::sleep(Duration::from_secs(3)).await;

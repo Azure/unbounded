@@ -56,7 +56,8 @@ pub(crate) struct ListingState {
 pub struct FillContext {
     pub membership: u64,
     pub page_size: u64,
-    pub pool_sizes: BTreeMap<racer_wire::control::CacheId, usize>,
+    /// Member indexes in the adopted publication, shared by overlapping pools.
+    pub pool_members: BTreeMap<racer_wire::control::CacheId, Arc<[u32]>>,
     pub local_caches: BTreeSet<racer_wire::control::CacheId>,
 }
 
@@ -601,7 +602,7 @@ fn listing_failed(shared: &Shared, view: &mut FillView, failure: ListingFailure,
     view.error = Some(
         match failure {
             ListingFailure::Invalid(ManifestError::TooManyObjects) => "TooManyObjects",
-            ListingFailure::Invalid(ManifestError::InvalidObject) => "ListFailed",
+            ListingFailure::Invalid(_) => "ListFailed",
             ListingFailure::Origin(error) => error.reason(),
         }
         .into(),
@@ -1239,7 +1240,7 @@ mod tests {
             shared.fill_context.replace(Some(FillContext {
                 membership: 7,
                 page_size: shared.config.page_size.get(),
-                pool_sizes: [(cache.clone(), 2)].into(),
+                pool_members: [(cache.clone(), Arc::from([0, 1]))].into(),
                 local_caches: BTreeSet::new(),
             }));
             assert!(!should_list(&shared, &cache.0));
@@ -1279,14 +1280,18 @@ mod tests {
             shared.fill_context.replace(Some(FillContext {
                 membership: 7,
                 page_size: 4096,
-                pool_sizes: [(cache, 1)].into(),
+                pool_members: [(cache, Arc::from([0]))].into(),
                 local_caches: BTreeSet::new(),
             }));
             let admission = Admission::read(&shared);
             assert_eq!(admission.membership, Some(7));
             assert_eq!(admission.page_size, 4096);
             assert_eq!(
-                admission.pool_sizes.values().copied().collect::<Vec<_>>(),
+                admission
+                    .pool_members
+                    .values()
+                    .map(|members| members.len())
+                    .collect::<Vec<_>>(),
                 vec![1]
             );
             // The primary must continue to plan against its authoritative image,

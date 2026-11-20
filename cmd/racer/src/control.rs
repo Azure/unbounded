@@ -175,13 +175,24 @@ pub struct Snapshot {
 impl Snapshot {
     /// Process-local fill inputs from the publication the dataplane adopted.
     pub(crate) fn fill_context(&self, node: &wire::NodeId) -> racer_authority::FillContext {
+        let all: Arc<[u32]> = (0..self.membership.members().len() as u32)
+            .collect::<Vec<_>>()
+            .into();
         racer_authority::FillContext {
             membership: self.membership.version.0,
             page_size: self.page_size.get(),
-            pool_sizes: self
+            pool_members: self
                 .caches
                 .iter()
-                .map(|cache| (cache.id.clone(), self.membership.pool_size(&cache.id)))
+                .map(|cache| {
+                    let members = self
+                        .pools
+                        .iter()
+                        .find(|pool| pool.caches.contains(&cache.id))
+                        .and_then(|pool| pool.members.as_ref())
+                        .map_or_else(|| all.clone(), |members| Arc::from(members.as_slice()));
+                    (cache.id.clone(), members)
+                })
                 .collect(),
             local_caches: self
                 .caches
@@ -3410,13 +3421,19 @@ mod caches_tests {
             definition("wide", 0),
             definition(NARROW, 0),
         ]));
+        snapshot.pools = vec![wire::Pool {
+            id: wire::PoolId("sel-0123456789abcdef0123456789abcdef".into()),
+            rank: 1 << 32,
+            members: Some(vec![1]),
+            caches: vec![CacheId(NARROW.into())],
+        }];
         let wide = CacheId("wide".into());
         let narrow = CacheId(NARROW.into());
         let outside = snapshot.fill_context(&membership.members()[0].node);
         assert_eq!(outside.membership, 7);
         assert_eq!(outside.page_size, snapshot.page_size.get());
-        assert_eq!(outside.pool_sizes[&wide], 3);
-        assert_eq!(outside.pool_sizes[&narrow], 1);
+        assert_eq!(&*outside.pool_members[&wide], &[0, 1, 2]);
+        assert_eq!(&*outside.pool_members[&narrow], &[1]);
         assert!(outside.local_caches.contains(&wide));
         assert!(!outside.local_caches.contains(&narrow));
         let inside = snapshot.fill_context(&membership.members()[1].node);
@@ -3424,9 +3441,10 @@ mod caches_tests {
         let absent = snapshot.fill_context(&wire::NodeId("not-a-member".into()));
         assert!(absent.local_caches.is_empty());
         snapshot.membership = Arc::new(pooled(8, 3, Vec::new(), Some(&membership)));
+        snapshot.pools[0].members = Some(Vec::new());
         let empty = snapshot.fill_context(&membership.members()[1].node);
         assert_eq!(empty.membership, 8);
-        assert_eq!(empty.pool_sizes[&narrow], 0);
+        assert!(empty.pool_members[&narrow].is_empty());
         assert!(!empty.local_caches.contains(&narrow));
     }
 
