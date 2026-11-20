@@ -974,7 +974,7 @@ const file_coord_proto_rawDesc = "" +
 	"\x12FAILURE_CLASS_AUTH\x10\x01\x12\x1b\n" +
 	"\x17FAILURE_CLASS_NOT_FOUND\x10\x02\x12\x1e\n" +
 	"\x1aFAILURE_CLASS_RATE_LIMITED\x10\x03\x12\x1b\n" +
-	"\x17FAILURE_CLASS_TRANSIENT\x10\x04BCZAgithub.com/Azure/unbounded/internal/gantry/proto/coord/v1;coordv1b\x06proto3"
+	"\x17FAILURE_CLASS_TRANSIENT\x10\x04BGZEgithub.com/Azure/unbounded/cmd/gantry/internal/proto/coord/v1;coordv1b\x06proto3"
 
 var (
 	file_coord_proto_rawDescOnce sync.Once

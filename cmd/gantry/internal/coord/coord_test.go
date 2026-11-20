@@ -15,7 +15,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/peerstore"
 
-	"github.com/Azure/unbounded/internal/gantry/coord"
+	"github.com/Azure/unbounded/cmd/gantry/internal/coord"
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/ifaces/fakes"
