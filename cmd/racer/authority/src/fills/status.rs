@@ -351,10 +351,10 @@ fn condition(
     })
 }
 
-/// Primary-only: write status for changed fills. At most one PUT per pass, so
-/// the primary Lease renewal stays on schedule. `cursor` is the first fill to
-/// try next; it advances after every write attempt, so a fill whose status
-/// stays dirty cannot starve the rest. A fill whose live object has a
+/// Primary-only: write status for changed fills. Drain successful updates in
+/// one pass; Lease renewal runs in its own task on a separate API client.
+/// On errors, retry next tick starting past the attempted fill, so a fill
+/// whose status stays dirty cannot starve the rest. A fill whose live object has a
 /// different UID or generation than the snapshot is skipped: the snapshot
 /// describes an older object, so its status must not be written.
 pub async fn reconcile(shared: &Shared, cursor: &mut usize) {
@@ -389,6 +389,9 @@ pub async fn reconcile(shared: &Shared, cursor: &mut usize) {
     let len = views.len();
     let start = *cursor % len;
     for offset in 0..len {
+        if shared.primary_term(rt::now()).as_ref() != Some(&term) || shared.stopping.get() {
+            return;
+        }
         let index = (start + offset) % len;
         let view = &views[index];
         let current = match shared.api.get(&paths::cluster_cache_fill(&view.name)).await {
@@ -444,7 +447,7 @@ pub async fn reconcile(shared: &Shared, cursor: &mut usize) {
         .await;
         *cursor = (index + 1) % len;
         match result {
-            Ok(Ok(_)) => return,
+            Ok(Ok(_)) => continue,
             // Conflict: re-read next turn. NotFound: deleted.
             Ok(Err(KubeError::Conflict | KubeError::NotFound)) => return,
             _ => return,
@@ -904,6 +907,52 @@ mod tests {
             let s = &written["status"];
             assert_eq!(statuses(s)["Accepted"], ("True".into(), "Accepted".into()));
             assert_eq!(s["cacheUID"], view().cache_uid);
+        });
+    }
+
+    #[test]
+    fn successful_status_writes_drain_in_one_pass() {
+        crate::kube::fake::run(|api, kube| async move {
+            let shared = crate::shared::tests::shared(kube);
+            shared.is_primary.set(true);
+            *shared.term.borrow_mut() = Some((
+                crate::rules::state::Term {
+                    lease_uid: "lease".into(),
+                    transitions: 1,
+                    holder: "p1/00".into(),
+                },
+                crate::rules::state::Freshness::confirmed(rt::now(), Duration::from_secs(3600)),
+            ));
+            shared.fills_synced.set(true);
+            shared.fills_caches_synced.set(true);
+            *shared.fill_status_term.borrow_mut() = shared.primary_term(rt::now());
+            for name in ["fill-a", "fill-b", "fill-c"] {
+                let mut v = view();
+                v.name = name.into();
+                v.uid = format!("{name}-uid");
+                api.put_object(
+                    &paths::cluster_cache_fill(name),
+                    json!({"metadata": {"name": name, "uid": v.uid, "generation": v.generation}}),
+                );
+                shared.fills.borrow_mut().insert(v.uid.clone(), v);
+            }
+            let mut cursor = 0;
+            let start = api.requests().len();
+            reconcile(&shared, &mut cursor).await;
+            assert_eq!(
+                api.requests()[start..]
+                    .iter()
+                    .filter(|(m, _)| m == "PUT")
+                    .count(),
+                3
+            );
+            for name in ["fill-a", "fill-b", "fill-c"] {
+                let written = api.object(&paths::cluster_cache_fill(name)).unwrap();
+                assert_eq!(written["status"]["observedGeneration"], 2);
+            }
+            let start = api.requests().len();
+            reconcile(&shared, &mut cursor).await;
+            assert!(api.requests()[start..].iter().all(|(m, _)| m == "GET"));
         });
     }
 
