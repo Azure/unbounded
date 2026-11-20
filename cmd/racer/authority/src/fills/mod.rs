@@ -650,14 +650,14 @@ struct Admission {
 impl Admission {
     /// Read the page size and publication admission is computed against.
     fn read(shared: &Shared) -> Self {
-        if !shared.is_primary.get() {
-            if let Some(context) = shared.fill_context.borrow().as_ref() {
-                return Self {
-                    page_size: context.page_size,
-                    membership: Some(context.membership),
-                    pool_members: context.pool_members.clone(),
-                };
-            }
+        if !shared.is_primary.get()
+            && let Some(context) = shared.fill_context.borrow().as_ref()
+        {
+            return Self {
+                page_size: context.page_size,
+                membership: Some(context.membership),
+                pool_members: context.pool_members.clone(),
+            };
         }
         let (page_size, membership, pool_members) = {
             let serving = shared.serving.borrow();
