@@ -58,7 +58,7 @@ func publicSoftOp() *v1alpha3.MachineOperation {
 func publicHandler(t *testing.T, c client.Client, reader client.Reader, host *fakeHostRebooter, flag *atomic.Bool) *HostSoftRebootHandler {
 	t.Helper()
 
-	h, err := NewHostSoftRebootHandler(c, reader, slog.New(slog.NewTextHandler(io.Discard, nil)), rebootTestTarget{}, host, flag)
+	h, err := NewHostSoftRebootHandler(c, reader, slog.New(slog.NewTextHandler(io.Discard, nil)), rebootTestTarget{}, host, flag, false)
 	require.NoError(t, err)
 
 	return h
@@ -311,7 +311,8 @@ func TestHostOperationUnfinishedOn(t *testing.T) {
 		},
 		{
 			name: "target for machine finished while others run",
-			op: withTargets(selectorOperation(siteSelector),
+			op: withTargets(
+				selectorOperation(siteSelector),
 				v1alpha3.MachineOperationTargetStatus{
 					MachineRef: "machine-1",
 					Phase:      v1alpha3.OperationPhaseComplete,
