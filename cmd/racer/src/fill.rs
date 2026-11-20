@@ -184,6 +184,9 @@ struct LocalFill {
     refused_bytes: u64,
     /// Failed pages ordered by deadline, independent of the manifest cursor.
     retries: BTreeMap<(Instant, usize, u64), u32>,
+    /// Alternate due retries with fresh scanning, including budgeted scans that
+    /// have not reached an owned page yet.
+    retry_turn: bool,
 }
 
 impl LocalFill {
@@ -440,6 +443,7 @@ impl FillController {
                         pinned_bytes: 0,
                         refused_bytes: 0,
                         retries: BTreeMap::new(),
+                        retry_turn: false,
                     },
                 );
                 if let Some(mut old) = old {
@@ -573,9 +577,8 @@ impl FillController {
                 .retries
                 .first_key_value()
                 .and_then(|(key, _)| (key.0 <= now).then_some(*key));
-            let (object_index, object, page_number, attempt) = if let Some(key) = retry {
-                let attempt = state.retries.remove(&key).expect("listed retry");
-                (key.1, state.manifest.objects[key.1].clone(), key.2, attempt)
+            let scan = if state.retry_turn && retry.is_some() {
+                None
             } else {
                 let resident = std::mem::take(&mut state.resident);
                 let step = scan_fill(cx, state, page_size, &mut budget, |object, number| {
@@ -598,11 +601,27 @@ impl FillController {
                     Ok(directory.page_owner(&page)? == worker)
                 });
                 state.resident = resident;
-                let step = step?;
-                let ScanStep::Owned(object, page_number) = step else {
+                Some(step?)
+            };
+            let (object_index, object, page_number, attempt) = match scan {
+                Some(ScanStep::Owned(object, page_number)) => {
+                    state.retry_turn = true;
+                    (state.object, object, page_number, 0)
+                }
+                Some(ScanStep::Budget) => {
+                    // A long nonowning walk must not monopolize scheduling
+                    // either. The next opportunity belongs to a due retry.
+                    state.retry_turn = true;
                     continue;
-                };
-                (state.object, object, page_number, 0)
+                }
+                Some(ScanStep::Exhausted) | None => {
+                    let Some(key) = retry else {
+                        continue;
+                    };
+                    state.retry_turn = false;
+                    let attempt = state.retries.remove(&key).expect("listed retry");
+                    (key.1, state.manifest.objects[key.1].clone(), key.2, attempt)
+                }
             };
             let id = fill_id(&uid);
             let version = ObjectVersion {
@@ -995,6 +1014,7 @@ mod tests {
             pinned_bytes: 0,
             refused_bytes: 0,
             retries: BTreeMap::new(),
+            retry_turn: false,
         }
     }
 
@@ -1319,6 +1339,73 @@ mod tests {
             "owner deferral is not a pin-capacity refusal"
         );
         assert!(controller.local["fill"].pins.is_empty());
+    }
+
+    #[test]
+    fn persistently_due_retry_backlog_cannot_starve_later_manifest_pages() {
+        let clock = racer_io::SimClock::new(1189);
+        let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
+        let (mut controller, _graph) = controller(&env, 8);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        // Build a real failed-page backlog before any retry is due.
+        for page in 0..3 {
+            controller.launch(&mut cx, controller.clock.now()).unwrap();
+            assert_eq!(controller.inflight[0].page, page);
+            complete(&mut controller, Err(Error::Io));
+        }
+        assert_eq!(controller.local["fill"].retries.len(), 3);
+        for fresh in 3..8 {
+            // A slow failed request outlasts the retry delays. Other retries
+            // stay due throughout, so retry-first scheduling would never
+            // advance beyond page 3.
+            clock.advance(FETCH_TIMEOUT);
+            let now = controller.clock.now();
+            assert!(
+                controller.local["fill"]
+                    .retries
+                    .keys()
+                    .filter(|key| key.0 <= now)
+                    .count()
+                    >= 2
+            );
+            controller.launch(&mut cx, now).unwrap();
+            assert!(
+                controller.inflight[0].page < fresh,
+                "due retries must also get service"
+            );
+            assert_eq!(controller.local["fill"].page, fresh);
+            complete(&mut controller, Err(Error::Io));
+
+            clock.advance(FETCH_TIMEOUT);
+            let now = controller.clock.now();
+            assert!(
+                controller.local["fill"]
+                    .retries
+                    .keys()
+                    .any(|key| key.0 <= now)
+            );
+            controller.launch(&mut cx, now).unwrap();
+            assert_eq!(
+                controller.inflight[0].page, fresh,
+                "a due retry backlog must yield to fresh pages"
+            );
+            assert_eq!(controller.local["fill"].page, fresh + 1);
+            complete(&mut controller, Err(Error::Io));
+        }
+        let state = &controller.local["fill"];
+        assert_eq!(state.owned_pages, 8);
+        assert_eq!(state.pinned_pages, 0);
+        assert_eq!(state.refused_bytes, 0);
+        assert_eq!(state.retries.len(), 8);
+        assert!(state.pins.is_empty());
+        // Once the scan is exhausted, both scheduling opportunities can retry
+        // immediately instead of wasting every other turn on the empty scan.
+        for _ in 0..2 {
+            clock.advance(FETCH_TIMEOUT);
+            controller.launch(&mut cx, controller.clock.now()).unwrap();
+            assert_eq!(controller.inflight.len(), 1);
+            complete(&mut controller, Err(Error::Io));
+        }
     }
 
     #[test]
