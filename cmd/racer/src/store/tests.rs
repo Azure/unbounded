@@ -5063,6 +5063,9 @@ mod checkpoint {
         assert_eq!(live[1].state, SegmentState::Open);
         assert!(live[1].pinned);
         cut.shards[0].segments = live.clone();
+        let location = &mut cut.shards[0].index.entries[0].1.location;
+        location.segment = SegmentId(1);
+        location.extent = Extent::new(geometry().segment_bytes, 4096).unwrap();
         let bytes = encode(&cut).unwrap();
         assert_eq!(&bytes[8..12], &4u32.to_le_bytes());
         let restored = decode(&bytes).unwrap();
@@ -5073,6 +5076,14 @@ mod checkpoint {
         assert_eq!(normalized[1].used_bytes, live[1].used_bytes);
         assert_eq!(normalized[1].generation, live[1].generation);
         assert_eq!(restored.shards[0].index.entries.len(), 1);
+        assert_eq!(
+            restored.shards[0].index.entries[0].1.location.segment,
+            SegmentId(1)
+        );
+        assert_eq!(
+            restored.shards[0].index.entries[0].1.location.extent,
+            cut.shards[0].index.entries[0].1.location.extent
+        );
         assert_eq!(encode(&restored).unwrap(), bytes);
         assert_eq!(segments.snapshot(), live);
         assert!(segments.pinned(SegmentId(1)).unwrap());
