@@ -39,8 +39,9 @@ const REPORT: Duration = Duration::from_secs(5);
 const RENEW: Duration = Duration::from_secs(5 * 60);
 /// Pin lifetime. Longer than [`RENEW`] so a late turn does not expire one.
 const PIN_TTL: Duration = Duration::from_secs(60 * 60);
-/// Backoff after a failed page fetch.
-const RETRY: Duration = Duration::from_secs(10);
+/// Initial retry ceiling, doubled per failed attempt up to [`RETRY_MAX`].
+const RETRY_MIN: Duration = Duration::from_secs(10);
+const RETRY_MAX: Duration = Duration::from_secs(5 * 60);
 /// Bound on one fill's page fetch.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(120);
 /// Manifest pages one fill may examine in one service turn.
@@ -183,6 +184,21 @@ struct LocalFill {
 }
 
 impl LocalFill {
+    fn retry(
+        &mut self,
+        seed: u64,
+        now: Instant,
+        object: usize,
+        page: u64,
+        attempt: u32,
+        retry_after: Option<Duration>,
+    ) {
+        let attempt = attempt.saturating_add(1);
+        let seed = seed ^ (object as u64).rotate_left(17) ^ page.rotate_left(31);
+        let delay = retry_delay(seed, attempt).max(retry_after.unwrap_or_default());
+        self.retries.insert((now + delay, object, page), attempt);
+    }
+
     fn progress(&self) -> WorkerProgress {
         WorkerProgress {
             generation: self.generation,
@@ -407,6 +423,7 @@ impl FillController {
         let directory = self.coordinator.prefetch_directory().clone();
         let coordinator = &self.coordinator;
         let worker = self.worker;
+        let retry_seed = fill_id(&coordinator.local_node().0).0 ^ u64::from(worker.0);
         let fills: Vec<String> = self.local.keys().cloned().collect();
         for uid in fills {
             if self.inflight.iter().any(|work| work.fill == uid) {
@@ -477,9 +494,14 @@ impl FillController {
                     if state.refused.insert(page.clone()) {
                         state.refused_bytes = state.refused_bytes.saturating_add(page_size);
                     }
-                    state
-                        .retries
-                        .insert((now + RETRY, object_index, page_number), attempt + 1);
+                    state.retry(
+                        fill_id(&uid).0 ^ retry_seed,
+                        now,
+                        object_index,
+                        page_number,
+                        attempt,
+                        None,
+                    );
                     continue;
                 }
                 Err(_) => {
@@ -491,9 +513,14 @@ impl FillController {
                     if state.refused.remove(&page) {
                         state.refused_bytes = state.refused_bytes.saturating_sub(page_size);
                     }
-                    state
-                        .retries
-                        .insert((now + RETRY, object_index, page_number), attempt + 1);
+                    state.retry(
+                        fill_id(&uid).0 ^ retry_seed,
+                        now,
+                        object_index,
+                        page_number,
+                        attempt,
+                        None,
+                    );
                     continue;
                 }
             };
@@ -546,6 +573,7 @@ impl FillController {
     /// Record finished fetches. Failure releases the page reservation and queues
     /// it for retry without moving the manifest cursor backward.
     fn finish(&mut self, cx: &mut Context<'_>) {
+        let retry_seed = fill_id(&self.coordinator.local_node().0).0 ^ u64::from(self.worker.0);
         let mut index = 0;
         while index < self.inflight.len() {
             let ready = Pin::new(&mut self.inflight[index].future).poll(cx);
@@ -578,7 +606,13 @@ impl FillController {
                                     state.pinned_bytes.saturating_add(work.accounted);
                             }
                         }
-                        Ok(PageResult::Deferred { .. }) | Ok(PageResult::Failed(_)) | Err(_) => {
+                        failure => {
+                            let retry_after = match failure {
+                                Ok(PageResult::Deferred { retry_after_ms }) => {
+                                    Some(Duration::from_millis(u64::from(retry_after_ms)))
+                                }
+                                _ => None,
+                            };
                             let id = PageId {
                                 version: work.version.clone(),
                                 number: PageNumber(work.page),
@@ -598,9 +632,13 @@ impl FillController {
                                     epoch,
                                 );
                             }
-                            state.retries.insert(
-                                (self.clock.now() + RETRY, work.object, work.page),
-                                work.attempt + 1,
+                            state.retry(
+                                fill_id(&work.fill).0 ^ retry_seed,
+                                self.clock.now(),
+                                work.object,
+                                work.page,
+                                work.attempt,
+                                retry_after,
                             );
                         }
                     }
@@ -686,6 +724,22 @@ fn fill_id(uid: &str) -> FillId {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     FillId(hash)
+}
+
+/// Equal jitter in [ceiling / 2, ceiling], with a bounded exponential ceiling.
+/// Mix node, worker, fill, page, and attempt identities so replicas and unrelated
+/// failures do not hammer an origin together. This jitter needs no secret or OS
+/// entropy, and remains reproducible under simulated time.
+fn retry_delay(seed: u64, attempt: u32) -> Duration {
+    let ceiling = RETRY_MIN
+        .saturating_mul(1u32 << attempt.saturating_sub(1).min(16))
+        .min(RETRY_MAX);
+    let mut random = seed.wrapping_add(u64::from(attempt).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+    random = (random ^ (random >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    random = (random ^ (random >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    random ^= random >> 31;
+    let half = ceiling / 2;
+    half + Duration::from_millis(random % (half.as_millis() as u64 + 1))
 }
 
 /// Request identity for one fill page. Deterministic so retries reuse it.
@@ -961,6 +1015,88 @@ mod tests {
         assert_eq!(controller.local["fill"].refused_bytes, 0);
         assert_eq!(controller.local["fill"].pinned_pages, 0);
         assert_eq!(controller.local["fill"].retries.len(), 1);
+    }
+
+    #[test]
+    fn repeated_page_failures_back_off_exponentially_with_a_cap_and_then_recover() {
+        let clock = racer_io::SimClock::new(1187);
+        let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
+        let (mut controller, _graph) = controller(&env, 1);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        controller.launch(&mut cx, controller.clock.now()).unwrap();
+        for attempt in 1..=12 {
+            let now = controller.clock.now();
+            let failure = if attempt % 2 == 0 {
+                Ok(PageResult::Failed(
+                    racer_core::prefetch::FailCode::OriginError,
+                ))
+            } else {
+                Err(Error::Io)
+            };
+            complete(&mut controller, failure);
+            let state = &controller.local["fill"];
+            let (key, failures) = state.retries.first_key_value().unwrap();
+            assert_eq!(*failures, attempt);
+            let delay = key.0.duration_since(now);
+            let ceiling = RETRY_MIN.saturating_mul(1 << (attempt - 1)).min(RETRY_MAX);
+            assert!(
+                (ceiling / 2..=ceiling).contains(&delay),
+                "attempt {attempt}: {delay:?}"
+            );
+            assert_eq!(state.pinned_pages, 0);
+            assert_eq!(state.refused_bytes, 0);
+            assert!(state.pins.is_empty());
+            controller.launch(&mut cx, now).unwrap();
+            assert!(controller.inflight.is_empty());
+            clock.advance(delay - Duration::from_millis(1));
+            controller.launch(&mut cx, controller.clock.now()).unwrap();
+            assert!(controller.inflight.is_empty());
+            clock.advance(Duration::from_millis(1));
+            controller.launch(&mut cx, controller.clock.now()).unwrap();
+            assert_eq!(controller.inflight.len(), 1);
+        }
+        complete(&mut controller, Ok(PageResult::Admitted));
+        assert_eq!(controller.local["fill"].owned_pages, 1);
+        assert_eq!(controller.local["fill"].pinned_pages, 1);
+        assert!(controller.local["fill"].retries.is_empty());
+    }
+
+    #[test]
+    fn deferred_owner_hint_is_honored_and_pages_have_distinct_retry_deadlines() {
+        let clock = racer_io::SimClock::new(1188);
+        let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
+        let (mut controller, _graph) = controller(&env, 3);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let now = controller.clock.now();
+        for _ in 0..2 {
+            controller.launch(&mut cx, now).unwrap();
+            complete(&mut controller, Err(Error::Io));
+        }
+        let deadlines: Vec<_> = controller.local["fill"]
+            .retries
+            .keys()
+            .map(|key| key.0)
+            .collect();
+        assert_eq!(deadlines.len(), 2);
+        assert_ne!(
+            deadlines[0], deadlines[1],
+            "page jitter must spread retries"
+        );
+        controller.launch(&mut cx, now).unwrap();
+        complete(
+            &mut controller,
+            Ok(PageResult::Deferred {
+                retry_after_ms: 600_000,
+            }),
+        );
+        let (key, _) = controller.local["fill"].retries.last_key_value().unwrap();
+        assert_eq!(key.0.duration_since(now), Duration::from_secs(600));
+        assert_eq!(key.2, 2);
+        assert_eq!(
+            controller.local["fill"].refused_bytes, 0,
+            "owner deferral is not a pin-capacity refusal"
+        );
+        assert!(controller.local["fill"].pins.is_empty());
     }
 
     #[test]
