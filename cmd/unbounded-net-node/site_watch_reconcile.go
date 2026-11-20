@@ -2200,9 +2200,14 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 		state.mu.Unlock()
 		syncMasqueradeRules(state, nonMasqCIDRs)
 
-		// Heartbeat reconciliations also follow changed native underlay routes.
-		var refreshErrors []error
+		// The desired state is unchanged, but the kernel state may not be:
+		// WireGuard roams peer endpoints on incoming handshakes, and anything
+		// else on the host can change the interfaces. Repair that here, since
+		// configureWireGuard does not run again until the desired state changes.
+		// An error marks the dataplane dirty so the next pass reconfigures all.
+		refreshErrors := []error{repairWireGuardDrift(state)}
 
+		// Heartbeat reconciliations also follow changed native underlay routes.
 		for _, tunnelMap := range []*ebpfpkg.TunnelMap{tunnelMap, assignmentMap} {
 			if tunnelMap != nil {
 				if err := tunnelMap.RefreshNativeNexthops(); err != nil {
