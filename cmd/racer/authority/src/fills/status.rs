@@ -367,6 +367,10 @@ pub async fn reconcile(shared: &Shared, cursor: &mut usize) {
     {
         return;
     }
+    // Watch insertion and admission run independently. Refresh admission
+    // synchronously before taking the snapshot, so a newly observed fill
+    // does not publish the parser's provisional CacheNotFound result.
+    super::recompute(shared);
     let views = snapshot(shared);
     if views.is_empty() {
         return;
@@ -859,6 +863,48 @@ mod tests {
         let progress = aggregate(&reports, &v);
         assert_eq!(progress.nodes, 1);
         assert_eq!(progress.resident_bytes, full.pinned_bytes);
+    }
+
+    #[test]
+    fn new_fill_is_admitted_before_its_first_status_write() {
+        crate::kube::fake::run(|api, kube| async move {
+            let shared = crate::shared::tests::shared(kube);
+            shared.is_primary.set(true);
+            *shared.term.borrow_mut() = Some((
+                crate::rules::state::Term {
+                    lease_uid: "lease".into(),
+                    transitions: 1,
+                    holder: "p1/00".into(),
+                },
+                crate::rules::state::Freshness::confirmed(rt::now(), Duration::from_secs(3600)),
+            ));
+            shared.fills_synced.set(true);
+            shared.fills_caches_synced.set(true);
+            *shared.fill_status_term.borrow_mut() = shared.primary_term(rt::now());
+            let cache = crate::rules::catalog::CacheInfo::from_json(&json!({
+                "metadata": {"name": "models", "uid": view().cache_uid},
+                "spec": {"origin": {"azure": {"containerURL": "https://acct.blob.core.windows.net/models"}}},
+            }));
+            shared
+                .fills_caches
+                .borrow_mut()
+                .insert(cache.uid.clone(), cache);
+            let object = json!({
+                "metadata": {"name": "fill", "uid": view().uid, "generation": 2},
+                "spec": {"cacheName": "models", "maxFootprint": 1024},
+            });
+            let v = FillView::from_json(&object).unwrap();
+            assert!(!v.accepted);
+            assert_eq!(v.message, "CacheNotFound");
+            shared.fills.borrow_mut().insert(v.uid.clone(), v);
+            let path = paths::cluster_cache_fill("fill");
+            api.put_object(&path, object);
+            reconcile(&shared, &mut 0).await;
+            let written = api.object(&path).unwrap();
+            let s = &written["status"];
+            assert_eq!(statuses(s)["Accepted"], ("True".into(), "Accepted".into()));
+            assert_eq!(s["cacheUID"], view().cache_uid);
+        });
     }
 
     #[test]
