@@ -212,6 +212,10 @@ fn status_with_progress(view: &FillView, progress: Progress, previous: Option<&V
             "origin selection exceeds the {} object manifest limit",
             super::MAX_FILL_OBJECTS
         ),
+        "TooManyFills" => format!(
+            "a cache pool member has exhausted its {} fill report slots; remove another fill or select a cache with available report slots",
+            limits::MAX_REPORT_FILLS
+        ),
         _ => "fill admission has not succeeded".to_owned(),
     };
     let accepted = condition(
@@ -818,6 +822,7 @@ mod tests {
             "UnsupportedOrigin",
             "ExceedsMaxFootprint",
             "TooManyObjects",
+            "TooManyFills",
         ] {
             let mut v = view();
             v.accepted = false;
@@ -825,8 +830,17 @@ mod tests {
             let s = status(&v, &BTreeMap::new(), None);
             let c = previous_condition(Some(&s), "Accepted").unwrap();
             assert_eq!(c["reason"], reason);
+            assert_eq!(c["status"], "False");
             assert_ne!(c["message"], reason);
             assert!(c["message"].as_str().unwrap().contains(' '));
+            if reason == "TooManyFills" {
+                let message = c["message"].as_str().unwrap();
+                assert!(message.contains("cache pool member"));
+                assert!(
+                    message.contains(&format!("{} fill report slots", limits::MAX_REPORT_FILLS))
+                );
+                assert!(message.contains("remove another fill"));
+            }
         }
         for reason in ["Forbidden", "ListFailed", "TooManyObjects"] {
             let mut v = view();
