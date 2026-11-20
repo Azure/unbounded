@@ -121,13 +121,18 @@ pub fn status(
         && !missing_members
         && progress.resident_bytes >= footprint
         && under_replicated_bytes == 0;
-    let was_ready = previous
+    // Completion history belongs to this spec generation, not the object
+    // name: a changed spec starts a new initial fill.
+    let history = previous.filter(|p| {
+        p.get("observedGeneration").and_then(Value::as_u64) == Some(view.generation)
+    });
+    let was_ready = history
         .map(|p| condition_status(p, "Ready") == Some("True"))
         .unwrap_or(false);
-    let was_degraded = previous
+    let was_degraded = history
         .map(|p| condition_status(p, "Degraded") == Some("True"))
         .unwrap_or(false);
-    let previous_nodes = previous
+    let previous_nodes = history
         .and_then(|p| p.get("nodes"))
         .and_then(Value::as_i64)
         .unwrap_or(0);
@@ -589,6 +594,24 @@ mod tests {
             .unwrap();
         assert!(message.contains("2 replicas"), "{message}");
         assert!(message.contains("1 nodes"), "{message}");
+    }
+
+    #[test]
+    fn previous_generation_completion_does_not_degrade_a_new_spec() {
+        let mut v = with_manifest(view());
+        v.planned_footprint_bytes = Some(100);
+        let reports = BTreeMap::from([("p1".into(), report(progress_for(&v)))]);
+        let ready = status(&v, &reports, None);
+        assert_eq!(statuses(&ready)["Ready"].0, "True");
+        let degraded = status(&v, &BTreeMap::new(), Some(&ready));
+        assert_eq!(statuses(&degraded)["Degraded"].0, "True");
+        v.generation += 1;
+        v.listed_generation = Some(v.generation);
+        for previous in [&ready, &degraded] {
+            let next = status(&v, &BTreeMap::new(), Some(previous));
+            assert_eq!(statuses(&next)["Degraded"].0, "False");
+            assert_eq!(statuses(&next)["Progressing"].0, "True");
+        }
     }
 
     #[test]
