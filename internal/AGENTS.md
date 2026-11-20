@@ -8,7 +8,7 @@ Only two kinds of package:
 
 - **Conventions, `internal/<name>`:** something every component must do the same way, such as the build version
   (`version`) or the log format (`logger`). Ask before adding one.
-- **Helpers, `internal/helpers/<name>`:** small generic functions or constants that two or more components use. Read
+- **Helpers, `internal/helpers/<name>`:** small functions or constants that two or more components use. Read
   `internal/helpers/AGENTS.md` first.
 
 ## Where new code goes
@@ -20,7 +20,7 @@ Use the first rule that fits:
 3. If one component writes an annotation and another reads it, the writer defines the key. Both use that definition.
    The same rule applies to message formats and shared validation rules: import the owner's definition, not a copy.
 4. Every component must agree on it and none owns it: `internal/<name>`.
-5. It is a small generic function or constant that two or more components use: `internal/helpers/<name>`.
+5. It is a small function or constant that two or more components use and none owns: `internal/helpers/<name>`.
 
 If nothing fits, each component may keep a short private copy.
 

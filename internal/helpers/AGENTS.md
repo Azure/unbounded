@@ -1,6 +1,6 @@
 # internal/helpers/
 
-Small generic helpers that two or more components share. Each helper is its own package, such as
+Small helpers that two or more components share. Each helper is its own package, such as
 `internal/helpers/statusmsg`.
 
 ## What belongs here
@@ -9,11 +9,10 @@ A helper must meet all of these:
 
 - **Two or more components import it directly.** Two packages from the same component count once. Count packages in
   `internal/` and `pkg/` toward their owner. Ignore `hack/`. If only one component uses the helper, move it there.
-- **Generic.** It knows nothing about Machines, Sites or any component's types.
+- Helpers may use public types from `api/`. Keep component-specific decisions in the component that owns them.
 - **Small.** Functions and constants only. No types with methods, goroutines, global variables or `init`. One
   exception: a function that registers something with a third-party library, if calling it twice is safe and its
   comment says so, such as `dockermedia.RegisterParsers`.
-- **Imports nothing from this repository.** Only the standard library and third-party modules.
 - **Not an agreement between components.** If one component writes a value and another checks it, the writer owns that
   code (rule 3 in `internal/AGENTS.md`). Do not put it here.
 
