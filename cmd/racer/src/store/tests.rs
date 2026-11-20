@@ -5064,7 +5064,7 @@ mod checkpoint {
         assert!(live[1].pinned);
         cut.shards[0].segments = live.clone();
         let location = &mut cut.shards[0].index.entries[0].1.location;
-        location.segment = SegmentId(1);
+        location.segment = page_alloc::SegmentId(1);
         location.extent = Extent::new(geometry().segment_bytes, 4096).unwrap();
         let bytes = encode(&cut).unwrap();
         assert_eq!(&bytes[8..12], &4u32.to_le_bytes());
@@ -5078,7 +5078,7 @@ mod checkpoint {
         assert_eq!(restored.shards[0].index.entries.len(), 1);
         assert_eq!(
             restored.shards[0].index.entries[0].1.location.segment,
-            SegmentId(1)
+            page_alloc::SegmentId(1)
         );
         assert_eq!(
             restored.shards[0].index.entries[0].1.location.extent,
@@ -5086,7 +5086,7 @@ mod checkpoint {
         );
         assert_eq!(encode(&restored).unwrap(), bytes);
         assert_eq!(segments.snapshot(), live);
-        assert!(segments.pinned(SegmentId(1)).unwrap());
+        assert!(segments.pinned(page_alloc::SegmentId(1)).unwrap());
     }
 
     #[test]
