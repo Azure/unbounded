@@ -8,9 +8,10 @@ import (
 )
 
 // ClusterCacheFill pre-fetches a set of objects into a ClusterCache and keeps
-// them resident on disk. Unlike a prefetch request, which is best effort, a
-// fill is an admission-controlled reservation: while a fill is Ready, its
-// pages are not evicted to make room for other data. Fills cover caches that
+// them resident on disk. Admission checks the planned footprint against the
+// fill's own limit, not available cluster capacity. Nodes pin pages on a best
+// effort basis within their local budgets; pinned pages are not evicted to
+// make room for other data. Fills cover caches that
 // read directly from object storage (spec.origin); caches served by a
 // self-deployed origin, and passthrough caches, are rejected.
 //
@@ -24,7 +25,9 @@ import (
 // +kubebuilder:printcolumn:name="Replicas",type=integer,JSONPath=`.spec.replicas`
 // +kubebuilder:printcolumn:name="Footprint",type=integer,JSONPath=`.status.footprintBytes`
 // +kubebuilder:printcolumn:name="Resident",type=integer,JSONPath=`.status.residentBytes`
+// +kubebuilder:printcolumn:name="Accepted",type=string,JSONPath=`.status.conditions[?(@.type=="Accepted")].status`
 // +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
+// +kubebuilder:printcolumn:name="Degraded",type=string,JSONPath=`.status.conditions[?(@.type=="Degraded")].status`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 type ClusterCacheFill struct {
 	metav1.TypeMeta   `json:",inline"`
@@ -61,13 +64,14 @@ type ClusterCacheFillSpec struct {
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=16
 	// +kubebuilder:validation:items:MaxLength=1024
+	// +listType=set
 	Prefixes []string `json:"prefixes"`
 
 	// Replicas is the number of pinned copies of each page, across distinct
 	// Racer nodes. A fill with more replicas survives the loss of up to
-	// replicas-1 nodes without going to the origin. Values above 3 have no
-	// effect, because Racer keeps at most three owners per page. When unset,
-	// 2.
+	// replicas-1 nodes without going to the origin. Only values from 1 to 3
+	// are accepted because Racer keeps at most three owners per page. When
+	// unset, 2.
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=3
 	// +kubebuilder:default=2
@@ -80,7 +84,8 @@ type ClusterCacheFillSpec struct {
 	// reservation rather than the object size. Actual disk use can be higher
 	// because a pinned segment keeps its unused tail; the per-worker pin
 	// budget bounds that overhead. A larger selection fails admission with
-	// ExceedsMaxFootprint; it is never truncated.
+	// ExceedsMaxFootprint; it is never truncated. This limit does not reserve
+	// cluster capacity.
 	// +kubebuilder:validation:Minimum=1
 	MaxFootprint int64 `json:"maxFootprint"`
 
@@ -165,9 +170,8 @@ type ClusterCacheFillStatus struct {
 	// +optional
 	ResidentBytes int64 `json:"residentBytes,omitempty"`
 
-	// UnderReplicatedBytes is the payload size, in bytes, of copies that are
-	// still missing: the summed shortfall between the pages each node should
-	// pin and the copies it has confirmed.
+	// UnderReplicatedBytes is max(0, FootprintBytes - ResidentBytes), including
+	// copies missing because their owners no longer report progress.
 	// +optional
 	UnderReplicatedBytes int64 `json:"underReplicatedBytes,omitempty"`
 
@@ -208,7 +212,8 @@ type FillManifestStatus struct {
 // Condition types written to ClusterCacheFill status.
 const (
 	// FillConditionAccepted is True when the fill is a supported cache and its
-	// reservation fits.
+	// planned footprint fits spec.maxFootprint. It does not promise that nodes
+	// have enough capacity to pin the plan.
 	FillConditionAccepted = "Accepted"
 	// FillConditionListed is True when the current spec generation has a
 	// complete manifest.

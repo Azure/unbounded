@@ -6,6 +6,7 @@ package v1alpha1
 import (
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -50,11 +51,13 @@ func TestEnvtestClusterCacheFillValidation(t *testing.T) {
 	}
 
 	valid := map[string]map[string]any{
-		"one prefix":      {"cacheName": "models", "prefixes": []any{"llama/"}, "maxFootprint": int64(1)},
-		"whole container": {"cacheName": "models", "prefixes": []any{""}, "maxFootprint": int64(1 << 30)},
-		"two replicas":    {"cacheName": "models", "prefixes": []any{"a/", "b/"}, "replicas": int64(2), "maxFootprint": int64(1 << 30)},
-		"three replicas":  {"cacheName": "models", "prefixes": []any{"a/"}, "replicas": int64(3), "maxFootprint": int64(1 << 30)},
-		"resync":          {"cacheName": "models", "prefixes": []any{"a/"}, "resyncInterval": "30m", "maxFootprint": int64(1 << 30)},
+		"one prefix":              {"cacheName": "models", "prefixes": []any{"llama/"}, "maxFootprint": int64(1)},
+		"whole container":         {"cacheName": "models", "prefixes": []any{""}, "maxFootprint": int64(1 << 30)},
+		"two replicas":            {"cacheName": "models", "prefixes": []any{"a/", "b/"}, "replicas": int64(2), "maxFootprint": int64(1 << 30)},
+		"three replicas":          {"cacheName": "models", "prefixes": []any{"a/"}, "replicas": int64(3), "maxFootprint": int64(1 << 30)},
+		"resync":                  {"cacheName": "models", "prefixes": []any{"a/"}, "resyncInterval": "30m", "maxFootprint": int64(1 << 30)},
+		"unicode prefix boundary": {"cacheName": "models", "prefixes": []any{strings.Repeat("界", 1024)}, "maxFootprint": int64(1)},
+		"overlapping prefixes":    {"cacheName": "models", "prefixes": []any{"a/", "a/b/"}, "maxFootprint": int64(1)},
 		"sixteen prefixes": {"cacheName": "models", "prefixes": []any{
 			"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p",
 		}, "maxFootprint": int64(1 << 30)},
@@ -70,10 +73,12 @@ func TestEnvtestClusterCacheFillValidation(t *testing.T) {
 		spec    map[string]any
 		message string
 	}{
-		"no spec":        {nil, "spec"},
-		"no cache":       {map[string]any{"prefixes": []any{"a/"}, "maxFootprint": int64(1)}, "cacheName"},
-		"no prefixes":    {map[string]any{"cacheName": "models", "maxFootprint": int64(1)}, "prefixes"},
-		"empty prefixes": {map[string]any{"cacheName": "models", "prefixes": []any{}, "maxFootprint": int64(1)}, "prefixes"},
+		"no spec":             {nil, "spec"},
+		"no cache":            {map[string]any{"prefixes": []any{"a/"}, "maxFootprint": int64(1)}, "cacheName"},
+		"no prefixes":         {map[string]any{"cacheName": "models", "maxFootprint": int64(1)}, "prefixes"},
+		"empty prefixes":      {map[string]any{"cacheName": "models", "prefixes": []any{}, "maxFootprint": int64(1)}, "prefixes"},
+		"duplicate prefixes":  {map[string]any{"cacheName": "models", "prefixes": []any{"a/", "a/"}, "maxFootprint": int64(1)}, "prefixes"},
+		"long unicode prefix": {map[string]any{"cacheName": "models", "prefixes": []any{strings.Repeat("界", 1025)}, "maxFootprint": int64(1)}, "prefixes"},
 		"too many prefixes": {map[string]any{"cacheName": "models", "prefixes": []any{
 			"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q",
 		}, "maxFootprint": int64(1)}, "prefixes"},

@@ -31,8 +31,14 @@ spec:
     - jsonPath: .status.residentBytes
       name: Resident
       type: integer
+    - jsonPath: .status.conditions[?(@.type=="Accepted")].status
+      name: Accepted
+      type: string
     - jsonPath: .status.conditions[?(@.type=="Ready")].status
       name: Ready
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="Degraded")].status
+      name: Degraded
       type: string
     - jsonPath: .metadata.creationTimestamp
       name: Age
@@ -42,9 +48,10 @@ spec:
       openAPIV3Schema:
         description: |-
           ClusterCacheFill pre-fetches a set of objects into a ClusterCache and keeps
-          them resident on disk. Unlike a prefetch request, which is best effort, a
-          fill is an admission-controlled reservation: while a fill is Ready, its
-          pages are not evicted to make room for other data. Fills cover caches that
+          them resident on disk. Admission checks the planned footprint against the
+          fill's own limit, not available cluster capacity. Nodes pin pages on a best
+          effort basis within their local budgets; pinned pages are not evicted to
+          make room for other data. Fills cover caches that
           read directly from object storage (spec.origin); caches served by a
           self-deployed origin, and passthrough caches, are rejected.
 
@@ -94,7 +101,8 @@ spec:
                   reservation rather than the object size. Actual disk use can be higher
                   because a pinned segment keeps its unused tail; the per-worker pin
                   budget bounds that overhead. A larger selection fails admission with
-                  ExceedsMaxFootprint; it is never truncated.
+                  ExceedsMaxFootprint; it is never truncated. This limit does not reserve
+                  cluster capacity.
                 format: int64
                 minimum: 1
                 type: integer
@@ -112,14 +120,15 @@ spec:
                 maxItems: 16
                 minItems: 1
                 type: array
+                x-kubernetes-list-type: set
               replicas:
                 default: 2
                 description: |-
                   Replicas is the number of pinned copies of each page, across distinct
                   Racer nodes. A fill with more replicas survives the loss of up to
-                  replicas-1 nodes without going to the origin. Values above 3 have no
-                  effect, because Racer keeps at most three owners per page. When unset,
-                  2.
+                  replicas-1 nodes without going to the origin. Only values from 1 to 3
+                  are accepted because Racer keeps at most three owners per page. When
+                  unset, 2.
                 format: int32
                 maximum: 3
                 minimum: 1
@@ -261,9 +270,8 @@ spec:
                 type: integer
               underReplicatedBytes:
                 description: |-
-                  UnderReplicatedBytes is the payload size, in bytes, of copies that are
-                  still missing: the summed shortfall between the pages each node should
-                  pin and the copies it has confirmed.
+                  UnderReplicatedBytes is max(0, FootprintBytes - ResidentBytes), including
+                  copies missing because their owners no longer report progress.
                 format: int64
                 type: integer
             type: object
