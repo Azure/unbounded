@@ -472,7 +472,12 @@ func systemdDecodeEscape(s string) ([]byte, int, bool) {
 		}
 
 		v, err := strconv.ParseUint(hex, 16, 32)
-		if err != nil {
+		if err != nil || v > 0x10FFFF {
+			return nil, 0, false
+		}
+
+		// Surrogates (U+D800..U+DFFF) are not valid code points.
+		if v >= 0xD800 && v <= 0xDFFF {
 			return nil, 0, false
 		}
 
