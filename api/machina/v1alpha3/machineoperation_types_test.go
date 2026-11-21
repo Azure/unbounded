@@ -8,8 +8,10 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation/field"
@@ -29,6 +31,16 @@ const (
 	msgAllocationRefAdded        = "allocationRef cannot be added after creation"
 	msgAllocationResultImmutable = "allocation is immutable once set"
 	msgAllocationResultKind      = "allocation is allowed only for HostAllocate"
+)
+
+// Messages of the MachineOperation selector and rollout rules.
+const (
+	msgExactlyOneTarget         = "exactly one of machineRef and machineSelector must be set"
+	msgMachineSelectorEmpty     = "machineSelector must have at least one matchLabels or matchExpressions entry"
+	msgRolloutWithoutSelector   = "rollout is allowed only with machineSelector"
+	msgMachineSelectorImmutable = "machineSelector cannot be changed, added or removed after creation"
+	msgSelectorSpecImmutable    = "spec is immutable for a selector operation"
+	msgMaxConcurrentInvalid     = "maxConcurrent must be an integer of at least 1 or a percentage from 1% to 100%"
 )
 
 func TestOperationKindHostRebootValues(t *testing.T) {
@@ -122,6 +134,33 @@ func TestOperationKindIsAllocationOperation(t *testing.T) {
 	}
 }
 
+func TestMachineOperationSpecIsSelectorOperation(t *testing.T) {
+	t.Parallel()
+
+	selector := &metav1.LabelSelector{MatchLabels: map[string]string{"pool": "a"}}
+
+	tests := []struct {
+		name string
+		spec MachineOperationSpec
+		want bool
+	}{
+		{name: "machineRef only", spec: MachineOperationSpec{MachineRef: "worker-01"}, want: false},
+		{name: "selector only", spec: MachineOperationSpec{MachineSelector: selector}, want: true},
+		{name: "machineRef and selector", spec: MachineOperationSpec{MachineRef: "worker-01", MachineSelector: selector}, want: false},
+		{name: "empty spec", spec: MachineOperationSpec{}, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := tt.spec.IsSelectorOperation(); got != tt.want {
+				t.Errorf("IsSelectorOperation() = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestMachineOperationCRD(t *testing.T) {
 	t.Parallel()
 
@@ -155,6 +194,66 @@ func TestMachineOperationCRD(t *testing.T) {
 
 	if !slices.Equal(ownedResources.XListMapKeys, []string{"id"}) {
 		t.Errorf("status.allocation.ownedResources list map keys = %v, want [id]", ownedResources.XListMapKeys)
+	}
+
+	rollout := root.Properties["spec"].Properties["rollout"]
+	if got := sortedKeys(rollout.Properties); !slices.Equal(got, []string{"childRetention", "maxConcurrent", "onFailure"}) {
+		t.Errorf("spec.rollout properties = %v, want [childRetention maxConcurrent onFailure]", got)
+	}
+
+	if !rollout.Properties["maxConcurrent"].XIntOrString {
+		t.Error("spec.rollout.maxConcurrent is not x-kubernetes-int-or-string")
+	}
+
+	var policies []string
+
+	for _, value := range rollout.Properties["onFailure"].Enum {
+		var policy string
+		if err := yaml.Unmarshal(value.Raw, &policy); err != nil {
+			t.Fatalf("parse onFailure enum value %s: %v", value.Raw, err)
+		}
+
+		policies = append(policies, policy)
+	}
+
+	wantPolicies := []string{string(RolloutFailurePolicyStop), string(RolloutFailurePolicyContinue)}
+	if !slices.Equal(policies, wantPolicies) {
+		t.Errorf("spec.rollout.onFailure enum = %v, want %v", policies, wantPolicies)
+	}
+
+	targets := root.Properties["status"].Properties["targets"]
+	if targets.Items == nil || targets.Items.Schema == nil {
+		t.Fatal("status.targets items are missing")
+	}
+
+	if _, ok := targets.Items.Schema.Properties["operationRef"]; ok {
+		t.Error("status.targets.operationRef exists: the children are the per-machine record")
+	}
+
+	summary := root.Properties["status"].Properties["summary"]
+
+	wantSummary := []string{"active", "complete", "failed", "failedMachines", "held", "total"}
+	if got := sortedKeys(summary.Properties); !slices.Equal(got, wantSummary) {
+		t.Errorf("status.summary properties = %v, want %v", got, wantSummary)
+	}
+
+	if max := summary.Properties["failedMachines"].MaxItems; max == nil || *max != 10 {
+		t.Errorf("status.summary.failedMachines maxItems = %v, want 10", max)
+	}
+
+	if _, ok := root.Properties["spec"].Properties["suspend"]; !ok {
+		t.Error("spec.suspend is missing")
+	}
+
+	// spec.machineRef is how an agent watches only its own operations.
+	// status.phase lets an operator list the failed children of a rollout.
+	var selectable []string
+	for _, field := range crd.Spec.Versions[0].SelectableFields {
+		selectable = append(selectable, field.JSONPath)
+	}
+
+	if want := []string{".spec.machineRef", ".status.phase"}; !slices.Equal(selectable, want) {
+		t.Errorf("selectable fields = %v, want %v", selectable, want)
 	}
 }
 
@@ -202,6 +301,22 @@ spec:
 	setField(t, obj, string(kind), "spec", "operationKind")
 
 	return obj
+}
+
+func newSelectorOperationObject(t *testing.T) map[string]any {
+	t.Helper()
+
+	return parseObject(t, `
+apiVersion: unbounded-cloud.io/v1alpha3
+kind: MachineOperation
+metadata:
+  name: op-1
+spec:
+  operationKind: NodeReboot
+  machineSelector:
+    matchLabels:
+      pool: a
+`)
 }
 
 func newAllocationResult() map[string]any {
@@ -331,7 +446,7 @@ func TestMachineOperationAllocationCreate(t *testing.T) {
 			name:   "HostRelease with machineRef and machineSelector",
 			base:   allocation(OperationHostRelease),
 			mutate: set(selector, "spec", "machineSelector"),
-			want:   []string{msgAllocationMachineSelector},
+			want:   []string{msgAllocationMachineSelector, msgExactlyOneTarget},
 		},
 		{
 			name:   "HostAllocate with ttlSecondsAfterFinished 0",
@@ -380,6 +495,300 @@ func TestMachineOperationAllocationCreate(t *testing.T) {
 			assertNoEvaluationErrors(t, errs)
 		})
 	}
+}
+
+func TestMachineOperationSelectorCreate(t *testing.T) {
+	t.Parallel()
+
+	v := newCRDValidator(t, machineOperationCRD)
+
+	machineRef := func(t *testing.T) map[string]any {
+		return newHostOperationObject(t, OperationNodeReboot)
+	}
+	selector := func(t *testing.T) map[string]any {
+		return newSelectorOperationObject(t)
+	}
+	set := func(value any, path ...string) func(*testing.T, map[string]any) {
+		return func(t *testing.T, obj map[string]any) {
+			setField(t, obj, value, path...)
+		}
+	}
+	remove := func(path ...string) func(*testing.T, map[string]any) {
+		return func(_ *testing.T, obj map[string]any) {
+			unstructured.RemoveNestedField(obj, path...)
+		}
+	}
+	matchExpressions := []any{map[string]any{
+		"key":      "pool",
+		"operator": "In",
+		"values":   []any{"a", "b"},
+	}}
+	rollout := func(value any) map[string]any {
+		return map[string]any{"maxConcurrent": value}
+	}
+
+	tests := []struct {
+		name   string
+		base   func(*testing.T) map[string]any
+		mutate func(*testing.T, map[string]any)
+		want   []string
+	}{
+		{name: "machineRef only", base: machineRef},
+		{name: "selector with matchLabels", base: selector},
+		{
+			name: "selector with matchExpressions",
+			base: selector,
+			mutate: func(t *testing.T, obj map[string]any) {
+				unstructured.RemoveNestedField(obj, "spec", "machineSelector", "matchLabels")
+				setField(t, obj, matchExpressions, "spec", "machineSelector", "matchExpressions")
+			},
+		},
+		{
+			name:   "selector with maxConcurrent 1",
+			base:   selector,
+			mutate: set(rollout(int64(1)), "spec", "rollout"),
+		},
+		{
+			name:   "selector with maxConcurrent 5",
+			base:   selector,
+			mutate: set(rollout(int64(5)), "spec", "rollout"),
+		},
+		{
+			name:   "selector with maxConcurrent 100%",
+			base:   selector,
+			mutate: set(rollout("100%"), "spec", "rollout"),
+		},
+		{
+			name:   "selector with maxConcurrent 25%",
+			base:   selector,
+			mutate: set(rollout("25%"), "spec", "rollout"),
+		},
+		{
+			name:   "selector with onFailure Continue",
+			base:   selector,
+			mutate: set(map[string]any{"onFailure": "Continue"}, "spec", "rollout"),
+		},
+
+		{
+			name:   "machineRef and machineSelector",
+			base:   machineRef,
+			mutate: set(map[string]any{"matchLabels": map[string]any{"pool": "a"}}, "spec", "machineSelector"),
+			want:   []string{msgExactlyOneTarget},
+		},
+		{
+			name:   "neither machineRef nor machineSelector",
+			base:   machineRef,
+			mutate: remove("spec", "machineRef"),
+			want:   []string{msgExactlyOneTarget},
+		},
+		{
+			name: "empty machineSelector",
+			base: machineRef,
+			mutate: func(t *testing.T, obj map[string]any) {
+				unstructured.RemoveNestedField(obj, "spec", "machineRef")
+				setField(t, obj, map[string]any{}, "spec", "machineSelector")
+			},
+			want: []string{msgMachineSelectorEmpty},
+		},
+		{
+			name:   "rollout with machineRef",
+			base:   machineRef,
+			mutate: set(rollout(int64(1)), "spec", "rollout"),
+			want:   []string{msgRolloutWithoutSelector},
+		},
+		{
+			name:   "maxConcurrent 0",
+			base:   selector,
+			mutate: set(rollout(int64(0)), "spec", "rollout"),
+			want:   []string{msgMaxConcurrentInvalid},
+		},
+		{
+			name:   "maxConcurrent -1",
+			base:   selector,
+			mutate: set(rollout(int64(-1)), "spec", "rollout"),
+			want:   []string{msgMaxConcurrentInvalid},
+		},
+		{
+			// The largest number the field can decode into is accepted, and
+			// one more is not: stored, it would break every typed read.
+			name:   "maxConcurrent 2147483647",
+			base:   selector,
+			mutate: set(rollout(int64(2147483647)), "spec", "rollout"),
+		},
+		{
+			name:   "maxConcurrent 2147483648",
+			base:   selector,
+			mutate: set(rollout(int64(2147483648)), "spec", "rollout"),
+			want:   []string{msgMaxConcurrentInvalid},
+		},
+		{
+			name:   "maxConcurrent 0%",
+			base:   selector,
+			mutate: set(rollout("0%"), "spec", "rollout"),
+			want:   []string{msgMaxConcurrentInvalid},
+		},
+		{
+			name:   "maxConcurrent 101%",
+			base:   selector,
+			mutate: set(rollout("101%"), "spec", "rollout"),
+			want:   []string{msgMaxConcurrentInvalid},
+		},
+		{
+			name:   "maxConcurrent abc",
+			base:   selector,
+			mutate: set(rollout("abc"), "spec", "rollout"),
+			want:   []string{msgMaxConcurrentInvalid},
+		},
+		{
+			name:   "onFailure Pause",
+			base:   selector,
+			mutate: set(map[string]any{"onFailure": "Pause"}, "spec", "rollout"),
+			want:   []string{"spec.rollout.onFailure: Unsupported value"},
+		},
+		{
+			name:   "childRetention All",
+			base:   selector,
+			mutate: set(map[string]any{"childRetention": "All"}, "spec", "rollout"),
+		},
+		{
+			name:   "childRetention Unsuccessful",
+			base:   selector,
+			mutate: set(map[string]any{"childRetention": "Unsuccessful"}, "spec", "rollout"),
+		},
+		{
+			name:   "childRetention Some",
+			base:   selector,
+			mutate: set(map[string]any{"childRetention": "Some"}, "spec", "rollout"),
+			want:   []string{"spec.rollout.childRetention: Unsupported value"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			obj := tt.base(t)
+			if tt.mutate != nil {
+				tt.mutate(t, obj)
+			}
+
+			errs := v.validateCreate(obj)
+			assertErrors(t, errs, tt.want)
+			assertNoEvaluationErrors(t, errs)
+		})
+	}
+}
+
+func TestMachineOperationSelectorSpecImmutable(t *testing.T) {
+	t.Parallel()
+
+	selector := func(t *testing.T) map[string]any {
+		return newSelectorOperationObject(t)
+	}
+	selectorWithRollout := func(t *testing.T) map[string]any {
+		obj := newSelectorOperationObject(t)
+		setField(t, obj, map[string]any{"maxConcurrent": int64(5)}, "spec", "rollout")
+
+		return obj
+	}
+	machineRef := func(t *testing.T) map[string]any {
+		return newHostOperationObject(t, OperationHostHardReboot)
+	}
+	set := func(value any, path ...string) func(*testing.T, map[string]any) {
+		return func(t *testing.T, obj map[string]any) {
+			setField(t, obj, value, path...)
+		}
+	}
+
+	runOperationUpdateCases(t, []operationUpdateCase{
+		{
+			name:   "machineSelector matchLabels changed",
+			stored: selector,
+			mutate: set(map[string]any{"pool": "b"}, "spec", "machineSelector", "matchLabels"),
+			want:   []string{"spec.machineSelector: Invalid value", msgMachineSelectorImmutable},
+		},
+		{
+			name:   "machineSelector added",
+			stored: machineRef,
+			mutate: func(t *testing.T, obj map[string]any) {
+				unstructured.RemoveNestedField(obj, "spec", "machineRef")
+				setField(t, obj, map[string]any{"matchLabels": map[string]any{"pool": "a"}}, "spec", "machineSelector")
+			},
+			want: []string{"spec.machineSelector: Invalid value", msgMachineSelectorImmutable},
+		},
+		{
+			name:   "machineSelector removed",
+			stored: selector,
+			mutate: func(_ *testing.T, obj map[string]any) {
+				unstructured.RemoveNestedField(obj, "spec", "machineSelector")
+			},
+			want: []string{"spec.machineSelector: Invalid value", msgMachineSelectorImmutable, msgExactlyOneTarget},
+		},
+		{
+			name:   "rollout maxConcurrent changed",
+			stored: selectorWithRollout,
+			mutate: set(map[string]any{"maxConcurrent": int64(6)}, "spec", "rollout"),
+			want:   []string{"spec: Invalid value", msgSelectorSpecImmutable},
+		},
+		{
+			name:   "rollout added",
+			stored: selector,
+			mutate: set(map[string]any{"maxConcurrent": int64(5)}, "spec", "rollout"),
+			want:   []string{"spec: Invalid value", msgSelectorSpecImmutable},
+		},
+		{
+			name:   "rollout removed",
+			stored: selectorWithRollout,
+			mutate: func(_ *testing.T, obj map[string]any) {
+				unstructured.RemoveNestedField(obj, "spec", "rollout")
+			},
+			want: []string{"spec: Invalid value", msgSelectorSpecImmutable},
+		},
+		{
+			// Every machine of a group must get the same operation, so the
+			// kind and the parameters cannot change while children are
+			// being created.
+			name:   "selector operation kind changed",
+			stored: selector,
+			mutate: set(string(OperationAgentReset), "spec", "operationKind"),
+			want:   []string{"spec: Invalid value", msgSelectorSpecImmutable},
+		},
+		{
+			name:   "selector operation parameters changed",
+			stored: selector,
+			mutate: set(map[string]any{"reason": "b"}, "spec", "parameters"),
+			want:   []string{"spec: Invalid value", msgSelectorSpecImmutable},
+		},
+		{
+			name:   "selector operation ttlSecondsAfterFinished changed",
+			stored: selector,
+			mutate: set(int64(60), "spec", "ttlSecondsAfterFinished"),
+			want:   []string{"spec: Invalid value", msgSelectorSpecImmutable},
+		},
+		{
+			name:   "selector operation label and finalizer added",
+			stored: selector,
+			mutate: func(t *testing.T, obj map[string]any) {
+				setField(t, obj, "x", "metadata", "labels", "team")
+				setField(t, obj, []any{"example.com/hold"}, "metadata", "finalizers")
+			},
+		},
+		{
+			name:   "selector operation status updated",
+			stored: selector,
+			mutate: func(t *testing.T, obj map[string]any) {
+				setField(t, obj, "InProgress", "status", "phase")
+			},
+		},
+		{
+			name:   "machineRef operation still updated",
+			stored: machineRef,
+			mutate: func(t *testing.T, obj map[string]any) {
+				setField(t, obj, map[string]any{"reason": "b"}, "spec", "parameters")
+				setField(t, obj, int64(60), "spec", "ttlSecondsAfterFinished")
+			},
+		},
+	})
 }
 
 // operationUpdateCase applies one update to a stored MachineOperation.
@@ -654,4 +1063,179 @@ func TestMachineOperationAllocationStatus(t *testing.T) {
 			want: []string{"status.allocation.ownedResources[0].nativeID: Invalid value", "at least 1 chars long"},
 		},
 	})
+}
+
+// suspend holds a machineRef operation. A selector operation is paced by its
+// rollout, not suspended, and an allocation operation is never held.
+func TestMachineOperationSuspend(t *testing.T) {
+	t.Parallel()
+
+	const msgSuspend = "suspend is allowed only on a machineRef operation that is not HostAllocate or HostRelease"
+
+	v := newCRDValidator(t, machineOperationCRD)
+
+	tests := []struct {
+		name   string
+		object func(*testing.T) map[string]any
+		want   []string
+	}{
+		{
+			name: "machineRef operation suspended",
+			object: func(t *testing.T) map[string]any {
+				obj := newHostOperationObject(t, OperationHostHardReboot)
+				setField(t, obj, true, "spec", "suspend")
+
+				return obj
+			},
+		},
+		{
+			name: "suspend false on a selector operation",
+			object: func(t *testing.T) map[string]any {
+				obj := newHostOperationObject(t, OperationHostHardReboot)
+				unstructured.RemoveNestedField(obj, "spec", "machineRef")
+				setField(t, obj, map[string]any{"matchLabels": map[string]any{"pool": "a"}}, "spec", "machineSelector")
+				setField(t, obj, false, "spec", "suspend")
+
+				return obj
+			},
+		},
+		{
+			name: "selector operation suspended",
+			object: func(t *testing.T) map[string]any {
+				obj := newHostOperationObject(t, OperationHostHardReboot)
+				unstructured.RemoveNestedField(obj, "spec", "machineRef")
+				setField(t, obj, map[string]any{"matchLabels": map[string]any{"pool": "a"}}, "spec", "machineSelector")
+				setField(t, obj, true, "spec", "suspend")
+
+				return obj
+			},
+			want: []string{msgSuspend},
+		},
+		{
+			name: "HostAllocate suspended",
+			object: func(t *testing.T) map[string]any {
+				obj := newAllocationOperationObject(t, OperationHostAllocate)
+				setField(t, obj, true, "spec", "suspend")
+
+				return obj
+			},
+			want: []string{msgSuspend},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			assertErrors(t, v.validateCreate(tt.object(t)), tt.want)
+		})
+	}
+
+	suspended := func(t *testing.T) map[string]any {
+		obj := newHostOperationObject(t, OperationHostHardReboot)
+		setField(t, obj, true, "spec", "suspend")
+
+		return obj
+	}
+	running := func(t *testing.T) map[string]any {
+		return newHostOperationObject(t, OperationHostHardReboot)
+	}
+
+	// A held operation is released by clearing spec.suspend. It can never be
+	// suspended again, and one created running can never be suspended, so a
+	// held operation is one that has never started.
+	runOperationUpdateCases(t, []operationUpdateCase{
+		{
+			name:   "released by clearing suspend",
+			stored: suspended,
+			mutate: func(t *testing.T, obj map[string]any) { setField(t, obj, false, "spec", "suspend") },
+		},
+		{
+			name:   "released by removing suspend",
+			stored: suspended,
+			mutate: func(_ *testing.T, obj map[string]any) { unstructured.RemoveNestedField(obj, "spec", "suspend") },
+		},
+		{
+			name:   "status of a held operation updated",
+			stored: suspended,
+			mutate: func(t *testing.T, obj map[string]any) { setField(t, obj, "Failed", "status", "phase") },
+		},
+		{
+			name:   "suspended after creation",
+			stored: running,
+			mutate: func(t *testing.T, obj map[string]any) { setField(t, obj, true, "spec", "suspend") },
+			want:   []string{"spec.suspend: Invalid value", "suspend can be set only when the operation is created"},
+		},
+		{
+			name:   "machineRef changed",
+			stored: running,
+			mutate: func(t *testing.T, obj map[string]any) { setField(t, obj, "another-machine", "spec", "machineRef") },
+			want:   []string{"spec.machineRef: Invalid value", "machineRef cannot be changed"},
+		},
+		{
+			name:   "machineRef changed on a held operation",
+			stored: suspended,
+			mutate: func(t *testing.T, obj map[string]any) { setField(t, obj, "another-machine", "spec", "machineRef") },
+			want:   []string{"spec.machineRef: Invalid value", "machineRef cannot be changed"},
+		},
+	})
+}
+
+func TestMachineOperationIsHeld(t *testing.T) {
+	t.Parallel()
+
+	selector := &metav1.LabelSelector{MatchLabels: map[string]string{"pool": "a"}}
+	now := metav1.Now()
+
+	tests := []struct {
+		name string
+		op   MachineOperation
+		want bool
+	}{
+		{name: "suspended", op: MachineOperation{Spec: MachineOperationSpec{MachineRef: "m", Suspend: true}}, want: true},
+		{name: "not suspended", op: MachineOperation{Spec: MachineOperationSpec{MachineRef: "m"}}},
+		{name: "selector operation", op: MachineOperation{Spec: MachineOperationSpec{MachineSelector: selector, Suspend: true}}},
+		// Every agent may write the status of any operation. None of it
+		// releases a held one.
+		{name: "suspended with a forged start time", op: MachineOperation{Spec: MachineOperationSpec{MachineRef: "m", Suspend: true}, Status: MachineOperationStatus{StartedAt: &now}}, want: true},
+		{name: "suspended with a forged phase", op: MachineOperation{Spec: MachineOperationSpec{MachineRef: "m", Suspend: true}, Status: MachineOperationStatus{Phase: OperationPhaseInProgress}}, want: true},
+	}
+
+	for _, tt := range tests {
+		if got := tt.op.IsHeld(); got != tt.want {
+			t.Errorf("%s: IsHeld() = %v, want %v", tt.name, got, tt.want)
+		}
+	}
+}
+
+// An operation that was held joins the queue of its machine when it is
+// released, not when it was created.
+func TestMachineOperationQueueTime(t *testing.T) {
+	t.Parallel()
+
+	created := metav1.NewTime(time.Date(2026, 11, 20, 10, 0, 0, 0, time.UTC))
+	released := created.Add(time.Hour)
+
+	plain := MachineOperation{ObjectMeta: metav1.ObjectMeta{CreationTimestamp: created}}
+	if got := plain.QueueTime(); !got.Equal(&created) {
+		t.Errorf("no annotation: QueueTime() = %v, want the creation time", got)
+	}
+
+	held := MachineOperation{ObjectMeta: metav1.ObjectMeta{
+		CreationTimestamp: created,
+		Annotations:       map[string]string{MachineOperationReleasedAtAnnotation: released.Format(time.RFC3339)},
+	}}
+	if got := held.QueueTime(); !got.Time.Equal(released) {
+		t.Errorf("released later: QueueTime() = %v, want %v", got, released)
+	}
+
+	for name, value := range map[string]string{"not a time": "soon", "before creation": created.Add(-time.Hour).Format(time.RFC3339)} {
+		op := MachineOperation{ObjectMeta: metav1.ObjectMeta{
+			CreationTimestamp: created,
+			Annotations:       map[string]string{MachineOperationReleasedAtAnnotation: value},
+		}}
+		if got := op.QueueTime(); !got.Equal(&created) {
+			t.Errorf("%s: QueueTime() = %v, want the creation time", name, got)
+		}
+	}
 }
