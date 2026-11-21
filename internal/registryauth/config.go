@@ -171,6 +171,11 @@ func validHostname(host string) bool {
 }
 
 // ProviderConfig configures upstream's identity-binding mode, not its IMDS mode.
+// AzureConfigPath is the fixed location of the azure.json the credential
+// provider reads; it is referenced from the generated credential-provider
+// config, so the path that generates the content defines the contract.
+const AzureConfigPath = "/opt/unbounded/registry-auth/azure.json"
+
 func (c Config) ProviderConfig() ([]byte, error) {
 	return json.MarshalIndent(map[string]any{
 		"apiVersion": "kubelet.config.k8s.io/v1", "kind": "CredentialProviderConfig",
@@ -178,7 +183,7 @@ func (c Config) ProviderConfig() ([]byte, error) {
 			"name": ProviderName, "matchImages": []string{c.Registry}, "defaultCacheDuration": "5m",
 			"apiVersion": "credentialprovider.kubelet.k8s.io/v1",
 			"args": []string{
-				azureConfigPath, "--ib-sni-name=" + c.SNIName,
+				AzureConfigPath, "--ib-sni-name=" + c.SNIName,
 				"--ib-default-client-id=" + c.ClientID, "--ib-default-tenant-id=" + c.TenantID,
 				"--ib-apiserver-ip=" + c.ProxyAddress,
 			},

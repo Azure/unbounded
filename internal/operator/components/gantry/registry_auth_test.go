@@ -7,7 +7,6 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/x509"
-	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"math/big"
@@ -19,7 +18,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/yaml"
 
@@ -66,15 +64,41 @@ func authSource(policy string) *corev1.ConfigMap {
 	return &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: configName, Namespace: component.DefaultNamespace}, Data: map[string]string{"config.yaml": acrUpstream, registryauth.ConfigKey: policy}}
 }
 
-func TestLateACRAdditionPlansAuthenticationWithoutChangingSource(t *testing.T) {
+// registryAuthFlexNodeMachine seeds an eligible Linux AKS Flex node and its
+// Machine, so planRegistryAuth has an agent-backed node to deliver the policy
+// to. The Machine's reported condition can be set to model agent readiness.
+func registryAuthFlexNodeMachine(name string) *corev1.Node {
+	return &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name, Labels: map[string]string{
+		"kubernetes.io/os": "linux", registryauth.FlexNodeLabel: registryauth.FlexNodeValue,
+	}}}
+}
+
+func registryAuthMachine(name string, spec *unboundedv1alpha3.RegistryAuthPolicy, cond *metav1.Condition) *unboundedv1alpha3.Machine {
+	m := &unboundedv1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: name}}
+	m.Spec.RegistryAuth = spec
+	if cond != nil {
+		m.Status.Conditions = []metav1.Condition{*cond}
+	}
+
+	return m
+}
+
+func registryAuthHealthyCondition() *metav1.Condition {
+	return &metav1.Condition{Type: unboundedv1alpha3.MachineConditionRegistryAuth, Status: metav1.ConditionTrue, Reason: "Configured"}
+}
+
+func TestRegistryAuthDeliversPolicyToAgentBackedNodes(t *testing.T) {
 	source := authSource("")
-	env := testEnv(t, source)
+	node := registryAuthFlexNodeMachine("flex-a")
+	machine := registryAuthMachine("flex-a", nil, nil)
+	env := testEnv(t, source, node, machine)
+
 	operations, result, err := planRegistryAuth(t.Context(), env)
 	require.NoError(t, err)
 	require.NotNil(t, result)
+	// The node has not reported its state yet, so the operator is installing.
 	require.False(t, result.Ready)
 	require.Equal(t, "RegistryAuthInstalling", result.Reason)
-	require.Zero(t, result.RequeueAfter)
 
 	plan := component.NewPlan()
 	plan.Add(operations...)
@@ -83,154 +107,97 @@ func TestLateACRAdditionPlansAuthenticationWithoutChangingSource(t *testing.T) {
 	require.Empty(t, executed.Failed())
 	require.Empty(t, executed.Deferred)
 
-	var ds appsv1.DaemonSet
-	require.NoError(t, env.Client.Get(t.Context(), componentKey(registryAuthName), &ds))
-
-	var cfg registryauth.Config
-	require.NoError(t, json.Unmarshal([]byte(ds.Spec.Template.Spec.Containers[0].Env[0].Value), &cfg))
-
-	expected, err := registryauth.Derive(source.Data["config.yaml"], source.Data[registryauth.ConfigKey])
-	require.NoError(t, err)
-	require.Equal(t, expected, cfg)
-
-	var got corev1.ConfigMap
-	require.NoError(t, env.Client.Get(t.Context(), componentKey(configName), &got))
-	require.Equal(t, source.Data, got.Data)
+	// The policy is now on the Machine spec, where the agent reads it.
+	var got unboundedv1alpha3.Machine
+	require.NoError(t, env.Client.Get(t.Context(), client.ObjectKey{Name: "flex-a"}, &got))
+	require.NotNil(t, got.Spec.RegistryAuth)
+	require.Equal(t, registryauth.IdentityBindingMode, got.Spec.RegistryAuth.Mode)
+	require.Equal(t, "example.azurecr.io", got.Spec.RegistryAuth.Registry)
 }
 
-func componentKey(name string) struct{ Namespace, Name string } {
-	return struct{ Namespace, Name string }{Namespace: component.DefaultNamespace, Name: name}
-}
-
-func TestNodeAuthInlinePolicyDoesNotExpandServiceEnvironmentReferences(t *testing.T) {
+func TestRegistryAuthReadyWhenNodesReportHealthy(t *testing.T) {
 	source := authSource("")
-	cfg, err := registryauth.Derive(source.Data["config.yaml"], source.Data[registryauth.ConfigKey])
+	node := registryAuthFlexNodeMachine("flex-a")
+	machine := registryAuthMachine("flex-a", nil, registryAuthHealthyCondition())
+	env := testEnv(t, source, node, machine)
+
+	_, result, err := planRegistryAuth(t.Context(), env)
 	require.NoError(t, err)
-
-	cfg.Audience = "api://$(KUBERNETES_SERVICE_HOST)"
-	policy, err := yaml.Marshal(cfg)
-	require.NoError(t, err)
-
-	source.Data[registryauth.ConfigKey] = string(policy)
-	operations, _, err := planRegistryAuth(t.Context(), testEnv(t, source))
-	require.NoError(t, err)
-
-	var ds appsv1.DaemonSet
-	require.NoError(t, runtime.DefaultUnstructuredConverter.FromUnstructured(operations[1].Object.Object, &ds))
-	value := ds.Spec.Template.Spec.Containers[0].Env[0].Value
-	require.Contains(t, value, "api://$$(KUBERNETES_SERVICE_HOST)", "a service environment variable must not replace the configured audience")
-
-	var received registryauth.Config
-	require.NoError(t, json.Unmarshal([]byte(strings.ReplaceAll(value, "$$", "$")), &received))
-	require.Equal(t, cfg, received)
+	require.True(t, result.Ready)
+	require.Equal(t, component.ReasonReconciled, result.Reason)
+	require.Contains(t, result.Message, "verified")
 }
 
-func TestNodeAuthInstallationModes(t *testing.T) {
-	for _, tc := range []struct {
-		name, policy, upstream string
-		install                bool
-	}{
-		{name: "external", policy: "mode: external", upstream: acrUpstream},
-		{name: "shared", policy: "mode: external", upstream: acrUpstream + "    credentials_path: /etc/gantry/registry/shared\n"},
-		{name: "non-ACR", policy: "mode: external", upstream: strings.ReplaceAll(acrUpstream, "example.azurecr.io", "registry.example.com")},
-		{name: "no policy", policy: "mode: external", upstream: acrUpstream},
-		{name: "racer", upstream: acrUpstream + "storage_mode: racer\n", install: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			source := authSource(tc.policy)
-			if tc.name == "no policy" {
-				delete(source.Data, registryauth.ConfigKey)
-			}
+func TestRegistryAuthFailedWhenANodeReportsFailure(t *testing.T) {
+	source := authSource("")
+	node := registryAuthFlexNodeMachine("flex-a")
+	cond := &metav1.Condition{Type: unboundedv1alpha3.MachineConditionRegistryAuth, Status: metav1.ConditionFalse, Reason: "RestartBudgetExhausted", Message: "budget exhausted"}
+	machine := registryAuthMachine("flex-a", nil, cond)
+	env := testEnv(t, source, node, machine)
 
-			source.Data["config.yaml"] = tc.upstream
-			operations, result, err := planRegistryAuth(t.Context(), testEnv(t, source))
-			require.NoError(t, err)
-
-			if tc.install {
-				require.Len(t, operations, 2, "kubelet authentication must survive a Gantry storage-backend change")
-				require.NotNil(t, result)
-			} else {
-				require.Empty(t, operations)
-				require.Nil(t, result)
-			}
-		})
-	}
-}
-
-func TestNodeAuthReadinessDistinguishesUnverifiedPermissions(t *testing.T) {
-	for _, scheduled := range []int32{0, 3} {
-		t.Run(fmt.Sprint(scheduled), func(t *testing.T) {
-			source := authSource("")
-			env := testEnv(t, source)
-			operations, _, err := planRegistryAuth(t.Context(), env)
-			require.NoError(t, err)
-
-			var existing appsv1.DaemonSet
-
-			for _, op := range operations {
-				if op.Object.GetKind() == "DaemonSet" {
-					require.NoError(t, runtime.DefaultUnstructuredConverter.FromUnstructured(op.Object.Object, &existing))
-				}
-			}
-
-			existing.Generation = 2
-			existing.UID = "owned-installer"
-			existing.Status = appsv1.DaemonSetStatus{ObservedGeneration: 2, DesiredNumberScheduled: scheduled, UpdatedNumberScheduled: scheduled, NumberAvailable: scheduled}
-			require.NoError(t, env.Client.Create(t.Context(), &existing))
-			_, result, err := planRegistryAuth(t.Context(), env)
-			require.NoError(t, err)
-			require.True(t, result.Ready)
-			require.Zero(t, result.RequeueAfter)
-
-			require.Contains(t, result.Message, "unverified")
-
-			existing.Spec.Template.Spec.Containers[0].Env[0].Value = `{"mode":"external"}`
-			require.NoError(t, env.Client.Update(t.Context(), &existing))
-			_, result, err = planRegistryAuth(t.Context(), env)
-			require.NoError(t, err)
-			require.False(t, result.Ready, "a matching hash must not conceal actual template drift")
-
-			existing.Spec.Template.Annotations[registryAuthHash] = "old-config"
-			require.NoError(t, env.Client.Update(t.Context(), &existing))
-			_, result, err = planRegistryAuth(t.Context(), env)
-			require.NoError(t, err)
-			require.False(t, result.Ready, "old available pods must not prove the new config is active")
-		})
-	}
-}
-
-func TestNodeAuthExternalModeKeepsReconcilerForOwnedFileCleanup(t *testing.T) {
-	source := authSource("mode: external")
-	existing := &appsv1.DaemonSet{ObjectMeta: ownedAuthMetadata()}
-	env := testEnv(t, source, existing)
-	require.NoError(t, rbacv1.AddToScheme(env.Client.Scheme()))
-	operations, result, err := planRegistryAuth(t.Context(), env)
+	_, result, err := planRegistryAuth(t.Context(), env)
 	require.NoError(t, err)
 	require.False(t, result.Ready)
-	require.Len(t, operations, 2)
+	require.Equal(t, "RegistryAuthFailed", result.Reason)
+	require.Contains(t, result.Message, "flex-a")
+}
 
+func TestRegistryAuthExternalClearsManagedPolicy(t *testing.T) {
+	source := authSource("mode: external")
+	activePolicy := &unboundedv1alpha3.RegistryAuthPolicy{Mode: registryauth.IdentityBindingMode, Registry: "example.azurecr.io"}
+	node := registryAuthFlexNodeMachine("flex-a")
+	machine := registryAuthMachine("flex-a", activePolicy, registryAuthHealthyCondition())
+	env := testEnv(t, source, node, machine)
+
+	operations, _, err := planRegistryAuth(t.Context(), env)
+	require.NoError(t, err)
+	require.NotEmpty(t, operations, "external mode must clear the active policy on the Machine")
+
+	plan := component.NewPlan()
+	plan.Add(operations...)
+	_, err = env.Execute(t.Context(), plan)
+	require.NoError(t, err)
+
+	var got unboundedv1alpha3.Machine
+	require.NoError(t, env.Client.Get(t.Context(), client.ObjectKey{Name: "flex-a"}, &got))
+	require.Nil(t, got.Spec.RegistryAuth, "external mode leaves the kubelet's authentication untouched")
+}
+
+func TestRegistryAuthRetiresLegacyInstaller(t *testing.T) {
+	source := authSource("mode: external")
+	node := registryAuthFlexNodeMachine("flex-a")
+	machine := registryAuthMachine("flex-a", nil, registryAuthHealthyCondition())
+	legacyDaemonSet := &appsv1.DaemonSet{ObjectMeta: ownedAuthMetadata()}
+	legacyAccount := &corev1.ServiceAccount{ObjectMeta: ownedAuthMetadata()}
+	legacyMarker := &corev1.ConfigMap{ObjectMeta: ownedAuthMetadata()}
+	env := testEnv(t, source, node, machine, legacyDaemonSet, legacyAccount, legacyMarker)
+
+	operations, result, err := planRegistryAuth(t.Context(), env)
+	require.NoError(t, err)
+	require.True(t, result.Ready)
+
+	// The owned legacy objects are retired (deleted).
+	kinds := map[string]bool{}
 	for _, op := range operations {
-		if op.Object.GetKind() == "DaemonSet" {
-			var ds appsv1.DaemonSet
-			require.NoError(t, runtime.DefaultUnstructuredConverter.FromUnstructured(op.Object.Object, &ds))
-
-			var cfg registryauth.Config
-			require.NoError(t, json.Unmarshal([]byte(ds.Spec.Template.Spec.Containers[0].Env[0].Value), &cfg))
-			require.Equal(t, "external", cfg.Mode)
+		if op.Kind == component.OpDelete {
+			kinds[op.Object.GetKind()] = true
 		}
 	}
+
+	require.True(t, kinds["DaemonSet"], "the legacy installer DaemonSet is retired")
+	require.True(t, kinds["ServiceAccount"], "the legacy ServiceAccount is retired")
+	require.True(t, kinds["ConfigMap"], "the legacy ConfigMap marker is retired")
 }
 
-func TestAuthCleanupRecreatesDeletedHelper(t *testing.T) {
-	source := authSource("mode: external")
-	retained := &corev1.ConfigMap{ObjectMeta: ownedAuthMetadata()}
-	env := testEnv(t, source, retained)
-	require.NoError(t, rbacv1.AddToScheme(env.Client.Scheme()))
+func TestRegistryAuthNoFlexNodesIsReady(t *testing.T) {
+	source := authSource("")
+	env := testEnv(t, source)
+
 	operations, result, err := planRegistryAuth(t.Context(), env)
 	require.NoError(t, err)
-	require.Len(t, operations, 2)
-	require.NotNil(t, result)
-	require.False(t, result.Ready)
+	require.Empty(t, operations)
+	require.True(t, result.Ready)
+	require.Contains(t, result.Message, "no agent-backed Flex nodes")
 }
 
 func TestExternalCleanupRevokesOnlyOwnedIdentityUseBinding(t *testing.T) {

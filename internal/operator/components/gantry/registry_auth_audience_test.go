@@ -11,17 +11,16 @@ import (
 
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
-	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 
+	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/operator/component"
 	"github.com/Azure/unbounded/internal/registryauth"
 )
@@ -414,79 +413,24 @@ func TestRegistryAuthEventsCoalesceWithoutIdlePolling(t *testing.T) {
 	require.Zero(t, q.Len(), "no timer should requeue a converged controller")
 }
 
-func TestRegistryAuthReadinessEventsIgnoreIntermediateRolloutProgress(t *testing.T) {
-	env := testEnv(t)
-	p := registryAuthWorkloadEvents(env, env.InNamespaceNamed(registryAuthName, daemonSetName))
-	old := &appsv1.DaemonSet{ObjectMeta: ownedAuthMetadata()}
-	old.Generation = 2
-	old.Status = appsv1.DaemonSetStatus{ObservedGeneration: 2, DesiredNumberScheduled: 10000, UpdatedNumberScheduled: 9000, NumberAvailable: 9000}
+func TestRegistryAuthMachinePredicateReactsToPolicyAndState(t *testing.T) {
+	p := registryAuthMachinePredicate()
+
+	// A change to the reported condition enqueues.
+	old := &unboundedv1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "m"}}
 	newer := old.DeepCopy()
-	newer.Status.UpdatedNumberScheduled, newer.Status.NumberAvailable = 9999, 9999
-	require.False(t, p.Update(event.UpdateEvent{ObjectOld: old, ObjectNew: newer}))
-	old = newer.DeepCopy()
-	newer.Status.UpdatedNumberScheduled, newer.Status.NumberAvailable = 10000, 10000
+	newer.Status.Conditions = []metav1.Condition{{Type: unboundedv1alpha3.MachineConditionRegistryAuth, Status: metav1.ConditionFalse, Reason: "Configuring"}}
 	require.True(t, p.Update(event.UpdateEvent{ObjectOld: old, ObjectNew: newer}))
-	old = newer.DeepCopy()
-	newer.Status.NumberAvailable--
-	require.True(t, p.Update(event.UpdateEvent{ObjectOld: old, ObjectNew: newer}))
-}
 
-func TestRegistryAuthMigratesLegacyHelperResourcesOnlyAfterRollout(t *testing.T) {
-	env := testEnv(t, authSource(""))
-	operations, _, err := planRegistryAuth(t.Context(), env)
-	require.NoError(t, err)
+	// An unrelated Machine change (no registry-auth policy or condition) does not.
+	plain := &unboundedv1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "m"}}
+	plainNew := plain.DeepCopy()
+	plainNew.Spec.Isolation = "none"
+	require.False(t, p.Update(event.UpdateEvent{ObjectOld: plain, ObjectNew: plainNew}))
 
-	var ds appsv1.DaemonSet
-	require.NoError(t, runtime.DefaultUnstructuredConverter.FromUnstructured(operations[1].Object.Object, &ds))
-	ds.Generation = 2
-	ds.Status = appsv1.DaemonSetStatus{ObservedGeneration: 1}
-	require.NoError(t, env.Client.Create(t.Context(), &ds))
-
-	marker := &corev1.ConfigMap{ObjectMeta: ownedAuthMetadata()}
-	require.NoError(t, env.Client.Create(t.Context(), marker))
-
-	role := &rbacv1.Role{ObjectMeta: ownedAuthMetadata()}
-	binding := &rbacv1.RoleBinding{ObjectMeta: ownedAuthMetadata()}
-	lease := &coordinationv1.Lease{ObjectMeta: ownedAuthMetadata()}
-
-	lease.Name = "gantry-acr-auth-restart"
-	for _, object := range []client.Object{role, binding, lease} {
-		require.NoError(t, env.Client.Create(t.Context(), object))
-	}
-
-	operations, _, err = planRegistryAuth(t.Context(), env)
-	require.NoError(t, err)
-
-	for _, op := range operations {
-		require.NotEqual(t, component.OpDelete, op.Kind)
-	}
-
-	ds.Status.ObservedGeneration = 2
-	require.NoError(t, env.Client.Status().Update(t.Context(), &ds))
-	operations, result, err := planRegistryAuth(t.Context(), env)
-	require.NoError(t, err)
-	require.True(t, result.Ready)
-
-	var cleanup []component.Operation
-
-	for _, op := range operations {
-		if op.Kind == component.OpDelete {
-			cleanup = append(cleanup, op)
-		}
-	}
-
-	require.Len(t, cleanup, 4)
-
-	for _, op := range cleanup {
-		require.Contains(t, []string{"RoleBinding", "Role", "Lease", "ConfigMap"}, op.Object.GetKind())
-	}
-
-	require.Equal(t, "ConfigMap", cleanup[3].Object.GetKind())
-	require.Len(t, cleanup[3].DependsOn, 3)
-
-	plan := component.NewPlan()
-	plan.Add(operations...)
-	resultExecuted, err := env.Execute(t.Context(), plan)
-	require.NoError(t, err)
-	require.Empty(t, resultExecuted.Failed())
+	// A change to the desired policy enqueues.
+	withPolicy := &unboundedv1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "m"}, Spec: unboundedv1alpha3.MachineSpec{RegistryAuth: &unboundedv1alpha3.RegistryAuthPolicy{Mode: registryauth.IdentityBindingMode}}}
+	withoutPolicy := withPolicy.DeepCopy()
+	withoutPolicy.Spec.RegistryAuth = nil
+	require.True(t, p.Update(event.UpdateEvent{ObjectOld: withPolicy, ObjectNew: withoutPolicy}))
 }
