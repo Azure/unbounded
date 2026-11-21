@@ -51,11 +51,13 @@ alongside `machinectl`, systemd, and the nspawn rootfs.
 ## Creating an Operation
 
 Operations are created by applying a `MachineOperation` resource. Target a
-single machine with `spec.machineRef` or, for agent-handled operations
-(`NodeReboot`, `AgentUpgrade`, `AgentReset`) and metalman bare-metal host
-operations, a group of machines with `spec.machineSelector`. Bare-metal host
-selectors must be scoped to one metalman site with
-`unbounded-cloud.io/site=<site>`.
+single machine with `spec.machineRef` or a group of machines with
+`spec.machineSelector`. Every operation kind works with a selector except
+`HostAllocate` and `HostRelease`. The selector matches Machine labels;
+machina-controller creates one child operation per
+matched Machine and releases them at the pace in `spec.rollout`. The parent's
+status has counts; each child has its machine's result. Agents and provider
+controllers execute only the child operations.
 
 ```yaml
 apiVersion: unbounded-cloud.io/v1alpha3

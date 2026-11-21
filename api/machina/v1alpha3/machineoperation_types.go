@@ -30,6 +30,7 @@ func init() {
 // +kubebuilder:printcolumn:name="Machine",type="string",JSONPath=".spec.machineRef"
 // +kubebuilder:printcolumn:name="Operation",type="string",JSONPath=".spec.operationKind"
 // +kubebuilder:printcolumn:name="Phase",type="string",JSONPath=".status.phase"
+// +kubebuilder:printcolumn:name="Message",type="string",JSONPath=".status.message",priority=1
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 // The allocation transition and status rules sit on the root, not on spec or
 // status, because a rule on a child node is skipped when an update drops that

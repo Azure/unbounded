@@ -10,9 +10,17 @@ Node operations change the `systemd-nspawn` container that runs kubelet,
 containerd, CNI plugins, and pod containers while leaving the host running.
 
 Operations are requested with `MachineOperation` and target a `Machine` by
-`spec.machineRef` or `spec.machineSelector`. Each operation is handled by the
-component that owns the relevant boundary. Controllers that do not own an
-operation ignore it.
+`spec.machineRef` or a group of Machines by `spec.machineSelector`. Every
+operation kind works by selector except `HostAllocate` and `HostRelease`.
+Each operation is handled by the component that owns the relevant boundary.
+Controllers that do not own an operation ignore it.
+
+A selector operation is a parent: machina-controller creates one child
+operation with `spec.machineRef` for every matching Machine and releases them
+at the pace set by `spec.rollout`. Agents and provider controllers execute
+only `machineRef` operations that are not held (`spec.suspend`); they never
+act on a selector operation. See
+[MachineOperation Selectors](machine-operation-selectors.md).
 
 ## Proposed operations
 
