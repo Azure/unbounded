@@ -22,6 +22,19 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/phases/rootfs"
 )
 
+// executableFile reports whether path exists, is a regular file, and has any
+// execute bit set. It is the "provider binary already in place" check that
+// lets the steady-state and external-policy paths skip the offline-bundle
+// fetch/verify entirely.
+func executableFile(path string) bool {
+	s, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+
+	return !s.IsDir() && s.Mode()&0o111 != 0
+}
+
 // writeFileIfChanged atomically writes content to path and reports whether the
 // on-disk bytes differed, so the caller knows whether the kubelet must be
 // restarted to pick the change up.
@@ -47,6 +60,12 @@ func writeFileIfChanged(path string, content []byte, perm os.FileMode) (bool, er
 		}
 
 		if err := tmp.Chmod(perm); err != nil {
+			tmp.Close()
+
+			return false, err
+		}
+
+		if err := fsyncPath(tmp, name); err != nil {
 			tmp.Close()
 
 			return false, err
@@ -91,18 +110,16 @@ func bytesEqual(a, b []byte) bool {
 //   - nspawn: the machine directory (the default goal-state root).
 //
 // The preflight resolver is used so the placement does not require device
-// readiness, and no disruptive Prepare is invoked just to discover a root. The
-// applied config's offline-artifact download override is resolved and wired
-// into the goal state so the provider-binary download honors an offline mirror
-// (finding: air-gapped nspawn nodes are the motivating environment, and the
-// provider is no longer supplied by an installer image).
-func registryAuthNodeStart(ctx context.Context, log *slog.Logger, active *ActiveMachine) (*goalstates.MachineGoalState, error) {
-	downloads, _, err := goalstates.ResolveDownloadOverridesWithOfflineArtifacts(ctx, active.Config, nil)
-	if err != nil {
-		return nil, fmt.Errorf("resolve download overrides for %s: %w", active.Name, err)
-	}
-
-	gs, err := goalstates.ResolveMachineForPreflight(log, active.Config, active.Name, downloads)
+// readiness, and no disruptive Prepare is invoked just to discover a root.
+//
+// The offline-artifact bundle is intentionally NOT resolved here: resolution
+// fetches and verifies the entire bundle, which would force a bootstrap source
+// to remain available for every reconcile pass, including pure verification and
+// teardown of an external policy that never downloads the provider. The
+// provider download (ensureACRProviderBinary) resolves the bundle lazily, only
+// when the binary actually needs to be fetched.
+func registryAuthNodeStart(log *slog.Logger, active *ActiveMachine) (*goalstates.MachineGoalState, error) {
+	gs, err := goalstates.ResolveMachineForPreflight(log, active.Config, active.Name, nil)
 	if err != nil {
 		return nil, fmt.Errorf("resolve node stack root for %s: %w", active.Name, err)
 	}
@@ -129,10 +146,32 @@ func registryAuthNodeStart(ctx context.Context, log *slog.Logger, active *Active
 // offline mirror) rather than always the default upstream URL, because the
 // provider is no longer supplied by an installer image and air-gapped nodes are
 // the motivating environment.
+//
+// The offline bundle is resolved only when a download is actually needed. A node
+// that already carries the provider binary (the common steady state) or one
+// converging to an external policy does not need the bootstrap source to remain
+// available, so verification and teardown do not couple to it.
 func ensureACRProviderBinary(ctx context.Context, log *slog.Logger, active *ActiveMachine, gs *goalstates.MachineGoalState) error {
 	// The download task writes through the node stack root. Point it at the
 	// resolved root so it places the binary where the running stack expects it.
 	gs.RootFS.RootOverride = gs.NodeStart.Root()
+
+	// A download is only needed when the provider binary is not already in
+	// place. Checking first lets the steady-state and external-policy paths skip
+	// the offline-bundle fetch/verify entirely.
+	target := gs.RootFS.Root().Path(filepath.Join(goalstates.RegistryAuthProviderBinDir, goalstates.RegistryAuthProviderName))
+	if executableFile(target) {
+		return nil
+	}
+
+	downloads, _, err := goalstates.ResolveDownloadOverridesWithOfflineArtifacts(ctx, active.Config, nil)
+	if err != nil {
+		return fmt.Errorf("resolve download overrides for %s: %w", active.Name, err)
+	}
+
+	if downloads != nil {
+		gs.RootFS.Downloads = downloads
+	}
 
 	return rootfs.DownloadACRProvider(log, gs.RootFS).Do(ctx)
 }
@@ -208,7 +247,10 @@ func applyProviderToNodeConfig(root isolation.NodeRoot, mode isolation.Mode, pol
 			return false, nil
 		}
 
-		return writeFileIfChanged(path, []byte(nodeConfigArgsRendered(envValue, args)), 0o644)
+		// Re-render the complete original drop-in so only the provider tokens
+		// change; the header comment, [Service] stanza, and any other
+		// Environment= directives are preserved byte for byte.
+		return writeFileIfChanged(path, []byte(nodeConfigArgsRendered(string(data), args)), 0o644)
 	}
 
 	added, err := args.addManaged()
@@ -220,26 +262,48 @@ func applyProviderToNodeConfig(root isolation.NodeRoot, mode isolation.Mode, pol
 		return false, nil
 	}
 
-	return writeFileIfChanged(path, []byte(nodeConfigArgsRendered(envValue, args)), 0o644)
+	return writeFileIfChanged(path, []byte(nodeConfigArgsRendered(string(data), args)), 0o644)
+}
+
+// nodeConfigArgsLine reports whether line is the systemd Environment=
+// assignment that carries KUBELET_NODE_CONFIG_ARGS. The generated drop-in
+// quotes the whole assignment, so the value after Environment= is
+// "KUBELET_NODE_CONFIG_ARGS=<args>"; a bare (unquoted) assignment is also
+// accepted so a hand-written drop-in does not break the reconciler.
+func nodeConfigArgsLine(line string) bool {
+	rest := strings.TrimPrefix(line, "Environment=")
+	if rest == line {
+		return false
+	}
+
+	rest = strings.TrimRight(rest, "\r")
+	rest = strings.TrimPrefix(rest, `"`)
+
+	return strings.HasPrefix(rest, "KUBELET_NODE_CONFIG_ARGS=")
 }
 
 // nodeConfigArgsValue extracts the value of the KUBELET_NODE_CONFIG_ARGS
-// Environment entry from the node-config drop-in.
+// Environment entry from the node-config drop-in, handling both the generated
+// quoted form Environment="KUBELET_NODE_CONFIG_ARGS=..." and a bare
+// assignment. It returns the raw args string (the value after the
+// KUBELET_NODE_CONFIG_ARGS= prefix, with the assignment quotes removed).
 func nodeConfigArgsValue(data string) (string, error) {
 	for _, line := range strings.Split(data, "\n") {
-		line = strings.TrimPrefix(line, "Environment=")
-		if !strings.HasPrefix(line, "KUBELET_NODE_CONFIG_ARGS=") {
+		if !nodeConfigArgsLine(line) {
 			continue
 		}
 
-		value := strings.TrimPrefix(line, "KUBELET_NODE_CONFIG_ARGS=")
-
-		// The value is a systemd Environment= assignment, quoted.
-		if len(value) >= 2 && strings.HasPrefix(value, `"`) && strings.HasSuffix(value, `"`) {
-			value = value[1 : len(value)-1]
+		rest := strings.TrimPrefix(line, "Environment=")
+		rest = strings.TrimRight(rest, "\r")
+		if strings.HasPrefix(rest, `"`) {
+			// The generated form wraps the whole assignment in quotes; the
+			// args value carries no quotes, so stripping the closing quote is
+			// safe.
+			rest = strings.TrimPrefix(rest, `"`)
+			rest = strings.TrimSuffix(rest, `"`)
 		}
 
-		return value, nil
+		return strings.TrimPrefix(rest, "KUBELET_NODE_CONFIG_ARGS="), nil
 	}
 
 	return "", fmt.Errorf("no KUBELET_NODE_CONFIG_ARGS in kubelet node-config drop-in")
@@ -267,27 +331,53 @@ func registryAuthProviderArgs(value string) nodeConfigArgs {
 	return a
 }
 
+// providerFlagName is the prefix of a provider flag token up to and including
+// the '=' sign, or "" when the token is not a provider flag. It is what tells
+// one provider flag apart from another: two tokens with the same name are the
+// same flag, possibly carrying different values.
+func providerFlagName(token string) string {
+	idx := strings.IndexByte(token, '=')
+	if idx <= 0 {
+		return ""
+	}
+
+	name := token[:idx+1]
+	if strings.HasPrefix(name, "--image-credential-provider-") {
+		return name
+	}
+
+	return ""
+}
+
 // addManaged adds the two managed provider flags if any are missing. It refuses
-// to add a flag whose path differs from the managed value (so an existing
-// provider configured elsewhere is not silently overridden).
+// to add a flag whose name is already set to a different value (so an existing
+// provider configured elsewhere is not silently overridden), while still
+// completing a partial managed pair (a config flag without its bin-dir, or
+// vice versa) so an interrupted write is repaired rather than refused.
 func (a *nodeConfigArgs) addManaged() (bool, error) {
 	flags := registryAuthProviderFlags()
 
 	for _, flag := range flags {
+		wantName := providerFlagName(flag)
 		present := false
-		seenOther := false
 
 		for i, tok := range a.tokens {
 			if tok == flag {
 				present = true
 				a.managed[i] = true
-			} else if strings.HasPrefix(tok, "--image-credential-provider-") {
-				seenOther = true
 			}
 		}
 
-		if seenOther && !present {
-			return false, fmt.Errorf("kubelet node config already sets a different %q; the managed provider cannot be added", flag)
+		// A conflict is a token that sets the same flag name to a different
+		// value while the managed token itself is absent. The config and
+		// bin-dir flags are distinct names, so the presence of one is not a
+		// conflict for the other.
+		if !present {
+			for _, tok := range a.tokens {
+				if providerFlagName(tok) == wantName {
+					return false, fmt.Errorf("kubelet node config already sets a different %q; the managed provider cannot be added", wantName)
+				}
+			}
 		}
 	}
 
@@ -311,34 +401,45 @@ func (a *nodeConfigArgs) addManaged() (bool, error) {
 	return changed, nil
 }
 
-// removeManaged drops any managed provider flag. It returns false when there was
-// nothing managed to remove (a non-managed provider is left untouched).
+// removeManaged drops every managed provider flag. It returns false when there
+// was nothing managed to remove (a non-managed provider is left untouched). It
+// rebuilds the token list rather than deleting in place, so the removal cannot
+// index past the end of a shrinking slice.
 func (a *nodeConfigArgs) removeManaged() bool {
 	changed := false
 
-	for i := range a.tokens {
-		if a.managed[i] {
-			a.tokens = append(a.tokens[:i], a.tokens[i+1:]...)
-			a.managed = append(a.managed[:i], a.managed[i+1:]...)
-			changed = true
+	keptTokens := make([]string, 0, len(a.tokens))
+	keptManaged := make([]bool, 0, len(a.tokens))
 
-			i--
+	for i, tok := range a.tokens {
+		if a.managed[i] {
+			changed = true
+			continue
 		}
+
+		keptTokens = append(keptTokens, tok)
+		keptManaged = append(keptManaged, false)
 	}
+
+	a.tokens = keptTokens
+	a.managed = keptManaged
 
 	return changed
 }
 
-// nodeConfigArgsRendered rewrites only the KUBELET_NODE_CONFIG_ARGS Environment
-// entry, preserving every other byte of the drop-in (including the trailing
-// newline) so the node-config args stay the only thing that changes.
+// nodeConfigArgsRendered rewrites only the KUBELET_NODE_CONFIG_ARGS
+// Environment entry of the original drop-in, preserving every other byte
+// (the header comment, the [Service] stanza, any other Environment=
+// directives, and the trailing newline) so the provider tokens are the only
+// thing that changes. The value is re-quoted in the generated form
+// Environment="KUBELET_NODE_CONFIG_ARGS=<args>".
 func nodeConfigArgsRendered(data string, a nodeConfigArgs) string {
 	joined := strings.Join(a.tokens, " ")
-	replacement := "Environment=\"KUBELET_NODE_CONFIG_ARGS=" + joined + "\""
+	replacement := `Environment="KUBELET_NODE_CONFIG_ARGS=` + joined + `"`
 
 	lines := strings.Split(data, "\n")
 	for i, line := range lines {
-		if strings.HasPrefix(strings.TrimPrefix(line, "Environment="), "KUBELET_NODE_CONFIG_ARGS=") {
+		if nodeConfigArgsLine(line) {
 			lines[i] = replacement
 		}
 	}
@@ -489,6 +590,12 @@ func saveRegistryAuthBudget(slot string, budget *registryAuthBudget) error {
 		tmp.Close()
 
 		return fmt.Errorf("chmod registry-auth budget for %s: %w", slot, err)
+	}
+
+	if err := fsyncPath(tmp, name); err != nil {
+		tmp.Close()
+
+		return fmt.Errorf("fsync registry-auth budget for %s: %w", slot, err)
 	}
 
 	if err := tmp.Close(); err != nil {

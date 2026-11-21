@@ -85,7 +85,26 @@ func registryAuthMachine(name string, spec *unboundedv1alpha3.RegistryAuthPolicy
 }
 
 func registryAuthHealthyCondition() *metav1.Condition {
-	return &metav1.Condition{Type: unboundedv1alpha3.MachineConditionRegistryAuth, Status: metav1.ConditionTrue, Reason: "Configured"}
+	return &metav1.Condition{Type: unboundedv1alpha3.MachineConditionRegistryAuth, Status: metav1.ConditionTrue, Reason: "Configured", ObservedGeneration: 1}
+}
+
+// registryAuthExternalCondition models a node that reports the external policy
+// converged (no managed provider on the kubelet).
+func registryAuthExternalCondition() *metav1.Condition {
+	return &metav1.Condition{Type: unboundedv1alpha3.MachineConditionRegistryAuth, Status: metav1.ConditionTrue, Reason: "External", ObservedGeneration: 1}
+}
+
+// managedRegistryAuthPolicy derives the Machine.spec.registryAuth the operator
+// delivers for a given source, so a test can model a node whose delivered spec
+// matches the desired policy (the readiness contract requires the spec to
+// match, not merely the condition to be True).
+func managedRegistryAuthPolicy(t *testing.T, source *corev1.ConfigMap) *unboundedv1alpha3.RegistryAuthPolicy {
+	t.Helper()
+
+	cfg, err := registryauth.Derive(source.Data["config.yaml"], source.Data[registryauth.ConfigKey])
+	require.NoError(t, err)
+
+	return registryAuthPolicyFromConfig(cfg)
 }
 
 func TestRegistryAuthDeliversPolicyToAgentBackedNodes(t *testing.T) {
@@ -119,7 +138,9 @@ func TestRegistryAuthDeliversPolicyToAgentBackedNodes(t *testing.T) {
 func TestRegistryAuthReadyWhenNodesReportHealthy(t *testing.T) {
 	source := authSource("")
 	node := registryAuthFlexNodeMachine("flex-a")
-	machine := registryAuthMachine("flex-a", nil, registryAuthHealthyCondition())
+	// The node reports healthy AND the delivered spec matches the desired
+	// policy, so readiness is satisfied (not merely a True condition).
+	machine := registryAuthMachine("flex-a", managedRegistryAuthPolicy(t, source), registryAuthHealthyCondition())
 	env := testEnv(t, source, node, machine)
 
 	_, result, err := planRegistryAuth(t.Context(), env)
@@ -167,7 +188,9 @@ func TestRegistryAuthExternalClearsManagedPolicy(t *testing.T) {
 func TestRegistryAuthRetiresLegacyInstaller(t *testing.T) {
 	source := authSource("mode: external")
 	node := registryAuthFlexNodeMachine("flex-a")
-	machine := registryAuthMachine("flex-a", nil, registryAuthHealthyCondition())
+	// External mode: the desired policy is nil, the machine's spec is nil (a
+	// match), and the node reports the external condition, so readiness holds.
+	machine := registryAuthMachine("flex-a", nil, registryAuthExternalCondition())
 	legacyDaemonSet := &appsv1.DaemonSet{ObjectMeta: ownedAuthMetadata()}
 	legacyAccount := &corev1.ServiceAccount{ObjectMeta: ownedAuthMetadata()}
 	legacyMarker := &corev1.ConfigMap{ObjectMeta: ownedAuthMetadata()}

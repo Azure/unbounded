@@ -32,26 +32,32 @@ import (
 	"k8s.io/client-go/rest"
 	k8stesting "k8s.io/client-go/testing"
 
+	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/registryauth"
 )
 
 // fakeMachineStatus stands in for machineStatusClient in attach-acr tests,
 // returning a fixed per-node registry-auth readiness map instead of reading
-// real Machines.
+// real Machines. healthy maps node name to ready.
 type fakeMachineStatus struct {
 	healthy map[string]bool
 }
 
-func (f fakeMachineStatus) flexMachines(context.Context) (map[string]bool, error) {
-	return f.healthy, nil
+func (f fakeMachineStatus) flexMachines(_ context.Context, _ *v1alpha3.RegistryAuthPolicy) (map[string]flexNodeStatus, error) {
+	statuses := make(map[string]flexNodeStatus, len(f.healthy))
+	for name, ok := range f.healthy {
+		statuses[name] = flexNodeStatus{name: name, hasMachine: true, ready: ok}
+	}
+
+	return statuses, nil
 }
 
 // machineStatusReaderFunc adapts a function to machineStatusReader for tests
 // that want to observe or vary the readiness polling.
-type machineStatusReaderFunc func(context.Context) (map[string]bool, error)
+type machineStatusReaderFunc func(context.Context, *v1alpha3.RegistryAuthPolicy) (map[string]flexNodeStatus, error)
 
-func (f machineStatusReaderFunc) flexMachines(ctx context.Context) (map[string]bool, error) {
-	return f(ctx)
+func (f machineStatusReaderFunc) flexMachines(ctx context.Context, policy *v1alpha3.RegistryAuthPolicy) (map[string]flexNodeStatus, error) {
+	return f(ctx, policy)
 }
 
 const (
@@ -751,9 +757,10 @@ func TestGantryAttachACRWaitsOnNodeReportedState(t *testing.T) {
 	h, client, _ := managedAttachFixture(t)
 
 	polls := 0
-	h.machineClient = machineStatusReaderFunc(func(context.Context) (map[string]bool, error) {
+	h.machineClient = machineStatusReaderFunc(func(context.Context, *v1alpha3.RegistryAuthPolicy) (map[string]flexNodeStatus, error) {
 		polls++
-		return map[string]bool{"off-azure": true}, nil
+
+		return map[string]flexNodeStatus{"off-azure": {name: "off-azure", hasMachine: true, ready: true}}, nil
 	})
 
 	require.NoError(t, h.execute(t.Context()))
@@ -769,11 +776,11 @@ func TestGantryAttachACRWaitsForHealthyNodeReport(t *testing.T) {
 	h.timeout = 3 * time.Second
 
 	polls := 0
-	h.machineClient = machineStatusReaderFunc(func(context.Context) (map[string]bool, error) {
+	h.machineClient = machineStatusReaderFunc(func(context.Context, *v1alpha3.RegistryAuthPolicy) (map[string]flexNodeStatus, error) {
 		polls++
-		// The node is not yet verified: keep it unhealthy so the wait retries
+		// The node is not yet verified: keep it not-ready so the wait retries
 		// until the timeout rather than acknowledging a stale state.
-		return map[string]bool{"off-azure": false}, nil
+		return map[string]flexNodeStatus{"off-azure": {name: "off-azure", hasMachine: true, ready: false, detail: "still converging"}}, nil
 	})
 
 	// An unhealthy node report must not be acknowledged; the wait must run to
@@ -790,15 +797,119 @@ func TestGantryAttachACRDoesNotReachInstallationWhenPolicySaveFails(t *testing.T
 	})
 
 	polls := 0
-	h.machineClient = machineStatusReaderFunc(func(context.Context) (map[string]bool, error) {
+	h.machineClient = machineStatusReaderFunc(func(context.Context, *v1alpha3.RegistryAuthPolicy) (map[string]flexNodeStatus, error) {
 		polls++
 
-		return map[string]bool{"off-azure": true}, nil
+		return map[string]flexNodeStatus{"off-azure": {name: "off-azure", hasMachine: true, ready: true}}, nil
 	})
 
 	require.ErrorContains(t, h.execute(t.Context()), "policy write failed")
 	require.Zero(t, polls, "a failed opt-in must not proceed to wait for node-reported installation")
 	_ = client
+}
+
+// TestFlexMachineStatusCountercases verifies the structured, per-node status
+// the CLI waits on is mode-aware: a True condition is not enough. A managed
+// attach must not count a node as ready when the node reports the external
+// policy (reason mismatch), a stale condition (observed generation behind the
+// machine generation), or a delivered spec that does not match the desired
+// policy. This is the fix for the review finding that a mode-blind bool let a
+// managed attach succeed on External, a stale Configured, or a missing Machine.
+func TestFlexMachineStatusCountercases(t *testing.T) {
+	t.Parallel()
+
+	managed := &v1alpha3.RegistryAuthPolicy{
+		Mode:     registryauth.IdentityBindingMode,
+		Registry: "example.azurecr.io",
+		ClientID: "11111111-2222-3333-4444-555555555555",
+		TenantID: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+	}
+
+	// A node reporting the external reason is not ready for a managed attach.
+	externalCond := &metav1.Condition{
+		Type: v1alpha3.MachineConditionRegistryAuth, Status: metav1.ConditionTrue,
+		Reason: "External", ObservedGeneration: 1,
+	}
+
+	externalMachine := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "n", Generation: 1},
+		Spec:       v1alpha3.MachineSpec{RegistryAuth: managed},
+		Status:     v1alpha3.MachineStatus{Conditions: []metav1.Condition{*externalCond}},
+	}
+
+	st := flexMachineStatus(externalMachine, managed, "Configured")
+	require.False(t, st.ready, "an External condition must not count as a managed attach")
+	require.Contains(t, st.detail, "External")
+
+	// A stale Configured (observed generation behind the machine generation) is
+	// not ready.
+	staleCond := &metav1.Condition{
+		Type: v1alpha3.MachineConditionRegistryAuth, Status: metav1.ConditionTrue,
+		Reason: "Configured", ObservedGeneration: 0,
+	}
+	staleMachine := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "n", Generation: 1},
+		Spec:       v1alpha3.MachineSpec{RegistryAuth: managed},
+		Status:     v1alpha3.MachineStatus{Conditions: []metav1.Condition{*staleCond}},
+	}
+
+	st = flexMachineStatus(staleMachine, managed, "Configured")
+	require.False(t, st.ready, "a stale condition must not count as ready")
+	require.Contains(t, st.detail, "lags machine generation")
+
+	// A delivered spec that does not match the desired policy is not ready, even
+	// with a current-generation Configured condition.
+	otherPolicy := &v1alpha3.RegistryAuthPolicy{
+		Mode:     registryauth.IdentityBindingMode,
+		Registry: "other.azurecr.io",
+		ClientID: "11111111-2222-3333-4444-555555555555",
+		TenantID: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+	}
+	mismatchCond := &metav1.Condition{
+		Type: v1alpha3.MachineConditionRegistryAuth, Status: metav1.ConditionTrue,
+		Reason: "Configured", ObservedGeneration: 1,
+	}
+	mismatchMachine := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "n", Generation: 1},
+		Spec:       v1alpha3.MachineSpec{RegistryAuth: otherPolicy},
+		Status:     v1alpha3.MachineStatus{Conditions: []metav1.Condition{*mismatchCond}},
+	}
+
+	st = flexMachineStatus(mismatchMachine, managed, "Configured")
+	require.False(t, st.ready, "a delivered spec that does not match the desired policy must not count as ready")
+
+	// The matching case: current-generation Configured and a matching spec is
+	// ready.
+	matchCond := &metav1.Condition{
+		Type: v1alpha3.MachineConditionRegistryAuth, Status: metav1.ConditionTrue,
+		Reason: "Configured", ObservedGeneration: 1,
+	}
+	matchMachine := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "n", Generation: 1},
+		Spec:       v1alpha3.MachineSpec{RegistryAuth: managed},
+		Status:     v1alpha3.MachineStatus{Conditions: []metav1.Condition{*matchCond}},
+	}
+
+	st = flexMachineStatus(matchMachine, managed, "Configured")
+	require.True(t, st.ready, "a current-generation Configured with a matching spec must be ready")
+	require.True(t, st.hasMachine)
+}
+
+// TestGantryAttachACRManagedDoesNotSucceedOnExternalReport verifies the managed
+// attach wait does not complete when a node reports the external policy (reason
+// mismatch), even if the condition is True and at the current generation: the
+// structured status rejects it, so the wait retries until the timeout.
+func TestGantryAttachACRManagedDoesNotSucceedOnExternalReport(t *testing.T) {
+	h, _, _ := managedAttachFixture(t)
+	h.timeout = 2 * time.Second
+
+	h.machineClient = machineStatusReaderFunc(func(context.Context, *v1alpha3.RegistryAuthPolicy) (map[string]flexNodeStatus, error) {
+		// The node reports the external reason (not Configured): a mode-blind
+		// reader would have counted this as healthy.
+		return map[string]flexNodeStatus{"off-azure": {name: "off-azure", hasMachine: true, ready: false, detail: "condition reports External, expected Configured for this policy"}}, nil
+	})
+
+	require.ErrorContains(t, h.execute(t.Context()), "timed out waiting for Flex nodes")
 }
 
 func TestGantryAttachACRRejectsConcurrentInvalidEndpoint(t *testing.T) {

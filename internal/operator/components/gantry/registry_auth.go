@@ -45,12 +45,19 @@ func registryAuthMachinePredicate() predicate.Predicate {
 		GenericFunc: func(ev event.GenericEvent) bool { return false },
 		UpdateFunc: func(ev event.UpdateEvent) bool {
 			oldMachine, okOld := ev.ObjectOld.(*v1alpha3.Machine)
+
 			newMachine, okNew := ev.ObjectNew.(*v1alpha3.Machine)
+
 			if !okOld || !okNew {
 				return false
 			}
 
+			// The delivery plan indexes Machines by NodeName(), so a change to
+			// spec.kubernetes.nodeRef.name (the association it reads) re-plans
+			// which node a Machine is delivered to. Include it without
+			// broadening to unrelated spec/status traffic.
 			return !sameRegistryAuthPolicy(oldMachine.Spec.RegistryAuth, newMachine.Spec.RegistryAuth) ||
+				oldMachine.NodeName() != newMachine.NodeName() ||
 				registryAuthConditionChanged(oldMachine, newMachine)
 		},
 	}
@@ -86,10 +93,16 @@ const (
 	registryAuthAudienceName = "gantry-acr-kubelet-token-audience"
 )
 
-// registryAuthNodePredicate enqueues a gantry re-reconcile when a Linux AKS Flex
-// node is created, updated, or deleted, so the registry-auth plan reflects
-// membership changes even for a node that has not registered its Machine yet.
-// The singleton request maps every event to one reconcile pass; the eligibility
+// registryAuthNodePredicate enqueues a gantry re-reconcile on Node membership
+// changes for the Linux AKS Flex nodes, so the registry-auth plan reflects a
+// node joining or leaving the fleet even before its Machine registers.
+//
+// The UpdateFunc fires only when eligibility CHANGES (a node becomes or stops
+// being a Linux AKS Flex node), matching registryAuthNodeEvents. A status-only
+// update (NodeReady flaps, heartbeats, unrelated label churn) on an already
+// eligible node therefore does not enqueue the singleton fleet planner, which at
+// 10k nodes would otherwise turn every heartbeat into a whole-fleet pass. The
+// singleton request maps every event to one reconcile pass; the eligibility
 // check bounds it to the nodes the policy applies to.
 func registryAuthNodePredicate() predicate.Predicate {
 	eligible := func(obj client.Object) bool {
@@ -103,9 +116,9 @@ func registryAuthNodePredicate() predicate.Predicate {
 		DeleteFunc:  func(ev event.DeleteEvent) bool { return eligible(ev.Object) },
 		GenericFunc: func(ev event.GenericEvent) bool { return eligible(ev.Object) },
 		UpdateFunc: func(ev event.UpdateEvent) bool {
-			// Reconcile when eligibility changes (a node becomes or stops being
-			// a Linux AKS Flex node) or when either side is eligible.
-			return eligible(ev.ObjectOld) || eligible(ev.ObjectNew)
+			// Reconcile only when eligibility changes, so a status-only update
+			// on an already-eligible node is not amplified into a fleet pass.
+			return eligible(ev.ObjectOld) != eligible(ev.ObjectNew)
 		},
 	}
 }
@@ -173,7 +186,7 @@ func planRegistryAuth(ctx context.Context, env *component.Env) ([]component.Oper
 
 	operations = append(operations, cleanup...)
 
-	return operations, registryAuthResult(machines, active), nil
+	return operations, registryAuthResult(machines, policy, active), nil
 }
 
 // planRegistryAuthMachines writes the policy to every eligible Flex node's
@@ -291,13 +304,17 @@ func sameRegistryAuthPolicy(a, b *v1alpha3.RegistryAuthPolicy) bool {
 }
 
 // registryAuthResult reads back the node-reported RegistryAuth conditions on the
-// Machines and folds them into a component Result. Ready means every Machine
-// reports the expected healthy condition for the current policy. A single
-// failing node is reported as NotReady with RegistryAuthFailed; a node still
-// installing (no condition yet) is reported as NotReady with
-// RegistryAuthInstalling. The aggregation is bounded to the node count: it does
-// not fan out per-node events on the control plane.
-func registryAuthResult(machines []v1alpha3.Machine, active bool) *component.Result {
+// Machines and folds them into a component Result. Ready means, for every
+// Machine, that (a) the desired policy has actually been delivered to
+// Machine.spec.registryAuth (not merely planned as a patch), and (b) the agent
+// reports the expected healthy condition for the current policy: Configured for
+// a managed provider, External when authentication is left untouched, observed
+// at or after the current generation. A single failing node is reported as
+// NotReady with RegistryAuthFailed; a node still installing (no condition yet,
+// an unacknowledged generation, or an undelivered policy) is reported as NotReady
+// with RegistryAuthInstalling. The aggregation is bounded to the node count: it
+// does not fan out per-node events on the control plane.
+func registryAuthResult(machines []v1alpha3.Machine, policy *v1alpha3.RegistryAuthPolicy, active bool) *component.Result {
 	if len(machines) == 0 {
 		message := "no Linux AKS Flex nodes currently require registry-auth reconciliation; private pulls are unverified"
 		if active {
@@ -305,6 +322,14 @@ func registryAuthResult(machines []v1alpha3.Machine, active bool) *component.Res
 		}
 
 		return &component.Result{Ready: true, Reason: component.ReasonReconciled, Message: message}
+	}
+
+	// The healthy reason the agent reports for each mode. A True condition with
+	// a different reason means the node is verified for a different policy than
+	// the one being delivered, which is not readiness for this intent.
+	wantReason := "External"
+	if active {
+		wantReason = "Configured"
 	}
 
 	installing := 0
@@ -320,12 +345,17 @@ func registryAuthResult(machines []v1alpha3.Machine, active bool) *component.Res
 		case cond == nil:
 			// No condition reported yet: the node is still installing.
 			installing++
-		case cond.Status == metav1.ConditionTrue && cond.ObservedGeneration >= m.Generation:
-			// Healthy, verified by the agent, and observed the current generation
-			// (a True on a stale generation is not readiness for this policy).
+		case cond.Status == metav1.ConditionTrue &&
+			cond.Reason == wantReason &&
+			cond.ObservedGeneration >= m.Generation &&
+			sameRegistryAuthPolicy(m.Spec.RegistryAuth, policy):
+			// Healthy, verified by the agent, observed the current generation,
+			// for the exact policy being delivered, with the policy present on
+			// the spec (not merely planned as a patch).
 		case cond.Status == metav1.ConditionTrue:
-			// The condition is healthy but was observed before the current
-			// generation; the node has not acknowledged this policy yet.
+			// The condition is healthy but either observed before the current
+			// generation, reports a different reason, or the desired policy is
+			// not yet on the spec; the node has not acknowledged this policy yet.
 			installing++
 		default:
 			failures = append(failures, fmt.Sprintf("%s: %s (%s)", m.Name, cond.Reason, cond.Message))

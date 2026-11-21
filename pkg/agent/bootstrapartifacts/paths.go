@@ -38,6 +38,27 @@ func CoreDNSArtifactPath(version, arch string) string {
 	return fmt.Sprintf("coredns/v%s/bin/linux/%s/coredns", StripLeadingV(version), arch)
 }
 
+// ACRProviderArtifactURLTemplate is the bundle-relative path of the stock ACR
+// credential provider binary with a %s placeholder for the architecture, for
+// use as a DownloadSource.URL. The version is the upstream release tag (with
+// the leading "v", matching the asset path the agent pins); the manifest stores
+// it without the leading "v", so it is restored here. The version defaults to
+// the upstream release the agent pins when the bundle manifest records none.
+func ACRProviderArtifactURLTemplate(version string) string {
+	version = StripLeadingV(version)
+	if version == "" {
+		version = "1.36.0"
+	}
+
+	return "acr-provider/v" + version + "/azure-acr-credential-provider-linux-%s"
+}
+
+// ACRProviderArtifactPath is the concrete bundle path of the stock ACR
+// credential provider binary for an architecture.
+func ACRProviderArtifactPath(version, arch string) string {
+	return fmt.Sprintf(ACRProviderArtifactURLTemplate(version), arch)
+}
+
 func ContainerImageArchivePath(arch, imageTag string) string {
 	imageTag = strings.TrimSpace(imageTag)
 	name := strings.NewReplacer(
@@ -69,6 +90,14 @@ func RequiredPaths(manifest Manifest, hostOS, arch string) []string {
 
 	if manifest.Versions.CoreDNS != "" {
 		path := CoreDNSArtifactPath(manifest.Versions.CoreDNS, arch)
+		paths = append(paths, path, path+".sha256")
+	}
+
+	// The ACR credential provider is optional in a bundle; it is required only
+	// when the manifest records a version for it, so bundles that do not
+	// support managed ACR authentication offline (the common case) keep working.
+	if manifest.Versions.ACRProvider != "" {
+		path := ACRProviderArtifactPath(manifest.Versions.ACRProvider, arch)
 		paths = append(paths, path, path+".sha256")
 	}
 

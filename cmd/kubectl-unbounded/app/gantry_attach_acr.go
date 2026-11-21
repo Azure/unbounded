@@ -65,20 +65,46 @@ type attachACRHandler struct {
 	out                                               io.Writer
 }
 
+// flexNodeStatus is the structured, per-node registry-auth convergence state the
+// CLI waits on. It carries enough for a caller to tell a verified node apart
+// from one that is still converging or reporting a different policy, instead of
+// a mode-blind bool.
+type flexNodeStatus struct {
+	// name is the node name.
+	name string
+	// hasMachine is false when the node has no agent-backed Machine yet; the
+	// operator delivers the policy to the Machine as it appears.
+	hasMachine bool
+	// ready is true when the Machine reports the expected healthy condition for
+	// the desired policy: the reason matches the mode (Configured for managed,
+	// External for external), the condition observed at or after the current
+	// generation, and the delivered Machine.spec.registryAuth matches the desired
+	// policy.
+	ready bool
+	// detail is a human-readable explanation when not ready.
+	detail string
+}
+
 // machineStatusReader reports whether the registry-auth credential provider has
 // converged on the cluster's Flex nodes by reading the node-reported
 // Machine.Status conditions the agent writes. It is injected in tests; the
 // default reads Machines through a controller-runtime client.
 type machineStatusReader interface {
-	// flexMachines returns, for each eligible Linux AKS Flex node that has an
-	// agent-backed Machine, the node name and whether that Machine reports the
-	// RegistryAuth condition True with the expected reason.
-	flexMachines(ctx context.Context) (map[string]bool, error)
+	// flexMachines returns, for each eligible Linux AKS Flex node, a structured
+	// status against the desired policy: whether it has an agent-backed Machine,
+	// and whether that Machine reports the expected healthy condition for the
+	// policy being delivered.
+	flexMachines(ctx context.Context, policy *v1alpha3.RegistryAuthPolicy) (map[string]flexNodeStatus, error)
 }
 
 type machineStatusClient struct{ client client.Client }
 
-func (m machineStatusClient) flexMachines(ctx context.Context) (map[string]bool, error) {
+// flexMachines reads the node-reported convergence state for the desired policy.
+// It associates each eligible Flex node to its Machine via Machine.NodeName()
+// (the field the operator's delivery plan indexes on, not the Machine name) and
+// batches the observation: one bounded List of Machines plus an in-memory map,
+// not a direct GET per node on every poll.
+func (m machineStatusClient) flexMachines(ctx context.Context, policy *v1alpha3.RegistryAuthPolicy) (map[string]flexNodeStatus, error) {
 	nodes := &corev1.NodeList{}
 	if err := m.client.List(ctx, nodes, client.MatchingLabels{
 		"kubernetes.io/os": "linux", registryauth.FlexNodeLabel: registryauth.FlexNodeValue,
@@ -86,31 +112,119 @@ func (m machineStatusClient) flexMachines(ctx context.Context) (map[string]bool,
 		return nil, err
 	}
 
-	healthy := map[string]bool{}
+	machines := &v1alpha3.MachineList{}
+	if err := m.client.List(ctx, machines); err != nil {
+		return nil, err
+	}
 
+	byNode := make(map[string]*v1alpha3.Machine, len(machines.Items))
+	for i := range machines.Items {
+		byNode[machines.Items[i].NodeName()] = &machines.Items[i]
+	}
+
+	wantReason := "External"
+	if policy != nil {
+		wantReason = "Configured"
+	}
+
+	statuses := make(map[string]flexNodeStatus, len(nodes.Items))
 	for i := range nodes.Items {
 		name := nodes.Items[i].Name
 
-		var machine v1alpha3.Machine
-		if err := m.client.Get(ctx, client.ObjectKey{Name: name}, &machine); err != nil {
-			if apierrors.IsNotFound(err) {
-				// A node without a Machine is not yet agent-backed; the operator
-				// will deliver the policy once its Machine exists. Skip it so an
-				// agent-less node does not block the wait.
-				continue
-			}
+		machine, ok := byNode[name]
 
-			return nil, err
+		if !ok {
+			// No agent-backed Machine yet: the operator delivers the policy to
+			// the Machine as it appears. The node is not yet verifiable.
+			statuses[name] = flexNodeStatus{name: name, hasMachine: false, detail: "no agent-backed Machine registered yet"}
+
+			continue
 		}
 
-		cond := apimeta.FindStatusCondition(machine.Status.Conditions, v1alpha3.MachineConditionRegistryAuth)
-		// A True condition means the agent verified the policy it was given:
-		// Configured for a managed provider, External when authentication was
-		// left untouched. Both are converged for the operator's intent.
-		healthy[name] = cond != nil && cond.Status == metav1.ConditionTrue
+		statuses[name] = flexMachineStatus(machine, policy, wantReason)
 	}
 
-	return healthy, nil
+	return statuses, nil
+}
+
+// flexMachineStatus evaluates one Machine's node-reported RegistryAuth condition
+// against the desired policy, returning a structured status. The expected
+// healthy state requires the reason to match the mode, the condition to have
+// observed at or after the current generation, and the delivered
+// Machine.spec.registryAuth to equal the desired policy (a True from a prior
+// policy, or a condition observed before the current policy was written, is not
+// readiness).
+func flexMachineStatus(machine *v1alpha3.Machine, policy *v1alpha3.RegistryAuthPolicy, wantReason string) flexNodeStatus {
+	status := flexNodeStatus{name: machine.Name, hasMachine: true}
+
+	cond := apimeta.FindStatusCondition(machine.Status.Conditions, v1alpha3.MachineConditionRegistryAuth)
+	if cond == nil {
+		status.detail = "no registry-auth condition reported yet"
+
+		return status
+	}
+
+	if cond.Status != metav1.ConditionTrue {
+		status.detail = fmt.Sprintf("condition %s: %s (%s)", cond.Status, cond.Reason, cond.Message)
+
+		return status
+	}
+
+	if cond.ObservedGeneration < machine.Generation {
+		status.detail = fmt.Sprintf("condition observed generation %d lags machine generation %d", cond.ObservedGeneration, machine.Generation)
+
+		return status
+	}
+
+	if cond.Reason != wantReason {
+		status.detail = fmt.Sprintf("condition reports %s, expected %s for this policy", cond.Reason, wantReason)
+
+		return status
+	}
+
+	if !registryAuthSpecEquals(machine.Spec.RegistryAuth, policy) {
+		status.detail = "delivered policy does not match the desired policy"
+
+		return status
+	}
+
+	status.ready = true
+
+	return status
+}
+
+// registryAuthSpecEquals reports whether two Machine registry-auth policies are
+// equal (both nil counts as a match).
+func registryAuthSpecEquals(a, b *v1alpha3.RegistryAuthPolicy) bool {
+	if a == nil && b == nil {
+		return true
+	}
+
+	if a == nil || b == nil {
+		return false
+	}
+
+	return *a == *b
+}
+
+// registryAuthPolicyFromConfig maps a Gantry node-auth config to the
+// Machine.spec.registryAuth field the operator delivers. A non-managed mode maps
+// to nil: the agent then leaves the kubelet's authentication untouched.
+func registryAuthPolicyFromConfig(cfg registryauth.Config) *v1alpha3.RegistryAuthPolicy {
+	if cfg.Mode != registryauth.IdentityBindingMode {
+		return nil
+	}
+
+	return &v1alpha3.RegistryAuthPolicy{
+		Mode:         cfg.Mode,
+		Registry:     cfg.Registry,
+		ClientID:     cfg.ClientID,
+		TenantID:     cfg.TenantID,
+		SNIName:      cfg.SNIName,
+		ProxyAddress: cfg.ProxyAddress,
+		Audience:     cfg.Audience,
+		CACert:       cfg.CACert,
+	}
 }
 
 func gantryCommandGroup() *cobra.Command {
@@ -349,7 +463,7 @@ func (h *attachACRHandler) execute(ctx context.Context) error {
 			return fmt.Errorf("policy saved, but the identity-use grant was not acknowledged: %w", err)
 		}
 
-		if err := h.waitForACRInstallation(ctx); err != nil {
+		if err := h.waitForACRInstallation(ctx, &cfg); err != nil {
 			return fmt.Errorf("policy saved, but stock provider installation is not ready: %w", err)
 		}
 	}
@@ -564,31 +678,41 @@ func (h *attachACRHandler) discoverACRProxy(ctx context.Context, cfg *registryau
 // waitForACRInstallation blocks until every agent-backed Flex node reports the
 // managed credential provider configured and verified on its kubelet, as
 // reflected in the node-reported Machine.Status registry-auth condition the
-// operator delivers policy to. A node still converging (no condition yet, or
-// not yet Configured) is retried until the timeout; a node reporting a terminal
-// failure surfaces that condition's message.
-func (h *attachACRHandler) waitForACRInstallation(ctx context.Context) error {
+// operator delivers policy to. A node still converging (no Machine yet, no
+// condition yet, a stale or mismatched reason, or an undelivered policy) is
+// retried until the timeout; a node reporting a terminal failure surfaces that
+// condition's message. A node reporting the external policy (or a stale
+// Configured from a prior revision) is not counted as converged for this
+// managed attach.
+func (h *attachACRHandler) waitForACRInstallation(ctx context.Context, cfg *registryauth.Config) error {
 	if h.machineClient == nil {
 		return errors.New("machine status reader is not configured")
 	}
 
+	policy := registryAuthPolicyFromConfig(*cfg)
+
 	var lastError error
 
 	err := wait.PollUntilContextCancel(ctx, 2*time.Second, true, func(ctx context.Context) (bool, error) {
-		healthy, err := h.machineClient.flexMachines(ctx)
+		statuses, err := h.machineClient.flexMachines(ctx, policy)
 		if err != nil {
 			return false, err
 		}
 
-		if len(healthy) == 0 {
-			// No agent-backed Flex nodes yet: the policy is delivered to Machines
-			// as they appear, so there is nothing to wait on.
+		if len(statuses) == 0 {
+			// No eligible Flex nodes: the policy is delivered to Machines as they
+			// appear, so there is nothing to wait on.
 			return true, nil
 		}
 
-		for name, ok := range healthy {
-			if !ok {
-				lastError = fmt.Errorf("flex node %s has not yet reported the managed credential provider as verified", name)
+		// A node with no Machine yet is still installing; it is retried like any
+		// not-ready node. A node with a Machine that has not reported the
+		// expected managed condition (no condition, a stale or mismatched
+		// reason, an undelivered policy, or a terminal False) is not converged
+		// and is retried until the timeout.
+		for name, st := range statuses {
+			if st.hasMachine && !st.ready {
+				lastError = fmt.Errorf("flex node %s has not converged to the managed credential provider: %s", name, st.detail)
 
 				return false, nil
 			}

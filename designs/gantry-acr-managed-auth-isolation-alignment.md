@@ -9,8 +9,7 @@ is now implemented: the policy is delivered to the agent as
 `Machine.spec.registryAuth`, the kubelet configuration and bounded restart live in
 the agent's isolation backend, and readiness is read back from
 `Machine.Status` conditions. Section 7 records the relationship to the working
-patch (PR #1201), which is still a valid standalone improvement to the pre-change
-architecture.
+patch (PR #1201), which the implemented design supersedes.
 North star: managed ACR authentication (`attach-acr --auth-mode aks-identity-binding`) must work on every isolation mode the agent supports, and the failure modes observed on air-gapped nspawn nodes must be diagnosed and bounded rather than flapping forever.
 
 ## 1. What is implemented today on main
@@ -109,9 +108,10 @@ backend in one composition table (`cmd/agent/internal/cmd/modes.go`).
   uncertain rather than certain, and both are named here instead of asserted:
 
   1. the installer pod runs with `HostPID: true` and a host `/` bind mount; the `/proc` it
-     actually sees is the namespace that namespace shares with the runtime, which on the
-     reported nodes was the nspawn runtime's view, not the agent host's, so which PIDs the
-     scan enumerates depends on that namespace, not on the host; and
+     actually sees is whichever PID namespace it shares with the runtime that scheduled it.
+     On an nspawn node that namespace may be the nspawn runtime's view rather than the
+     physical agent host's, so which PIDs the scan enumerates depends on that namespace
+     (a hypothesis to confirm per node, not a fact established by the report); and
   2. even when the in-machine kubelet's `/proc` entry is visible, the installer matches on
      `comm == kubelet` and reads a `cmdline` that is the machine's, but it restarts through
      the host unit, so a visible process does not prove the restart reached the right
@@ -272,7 +272,11 @@ isolation backend, and shrink the operator's role to policy and state.
     binaries; it is a large upstream artifact, so it is not embedded in the agent). The
     download honors the node's configured source, including an offline artifact mirror
     (`DownloadOverrides.ACRProvider`), because the provider is no longer supplied by an
-    installer image and air-gapped nspawn nodes are the motivating environment;
+    installer image and air-gapped nspawn nodes are the motivating environment. The
+    offline bundle is resolved **lazily**, only when the provider binary is actually
+    missing and a download is needed: a node in steady state (provider already in place)
+    or converging to an external policy does not require the bootstrap source to remain
+    available, so verification and teardown do not couple to it;
   - writes the credential-provider and azure config generated from the policy into the
     node stack through the mode-aware node root (so the path is correct per mode: machine
     rootfs for nspawn, the host for none, container rootfs for container),
@@ -379,13 +383,16 @@ constraint and is explicitly out of scope.
 
 ## 7. Relationship to the working patch
 
-The working patch (PR #1201) is still worth merging as a bounded, safe improvement to the
-*current* architecture: it stops the unbounded restart loop (ask 2), adds the supported
-disable (ask 3), and makes the installer fail closed and diagnosable rather than flap. It is
-not the north star, and its probe's "nspawn" claim should be corrected to match section 4.
-The target design in section 6 is the follow-up that actually makes managed ACR
-authentication work on every isolation mode and removes the DaemonSet-does-node-work
-anti-pattern.
+The working patch (PR #1201) was a bounded, safe improvement to the *previous*
+DaemonSet-installer architecture: it stopped the unbounded restart loop (ask 2), added the
+supported disable (ask 3), and made the installer fail closed and diagnosable rather than
+flap. That patch is now superseded: the target design in section 6 (delivered to the agent
+as `Machine.spec.registryAuth`, applied through the agent's isolation backend, and read back
+from `Machine.Status`) is the architecture that is implemented, and it removes the
+DaemonSet-does-node-work anti-pattern entirely. PR #1201's probe "nspawn" claim is
+corrected in section 4, and its fixes (bounded restart, fail-closed verification,
+detach) are re-expressed in the agent-backed reconciler rather than carried in the
+installer.
 
 ## 8. Constraints and open questions
 
@@ -405,8 +412,17 @@ Open questions (resolved in the implementation):
   folded into the serialized repave/machine-op setup path. It re-resolves the **mode-aware**
   node-stack root for the active slot (host for `none`, container rootfs for `container`,
   the machine directory for `nspawn`) so the provider files and the node-config drop-in land
-  on the correct filesystem in every mode, and it resolves the applied config's offline
-  artifact download override so the provider binary honors an offline mirror.
+  on the correct filesystem in every mode. The offline-artifact download override is
+  resolved **lazily, only when the provider binary is actually missing** (so a steady-state
+  or external-policy pass does not require the bootstrap source to remain available), and
+  when resolved it wires `DownloadOverrides.ACRProvider` so the provider binary downloads
+  from the offline mirror instead of the public upstream release.
+- **Operator triggers:** the operator enqueues a registry-auth reconcile on Machine
+  create/delete and on a change to the policy, the association (`spec.kubernetes.nodeRef.name`,
+  which the delivery plan indexes via `Machine.NodeName()`), or the reported condition; and
+  on Node membership changes only (a node becoming or stopping being an eligible Linux AKS
+  Flex node), not on status-only Node updates. At 10k nodes a NodeReady heartbeat or
+  unrelated label churn therefore does not fan out into a whole-fleet pass.
 - **Aggregation shape:** `GantryReady` reports `RegistryAuthFailed` when any eligible node
   reports a terminal failure (the message carries the count and the first failing node), and
   `RegistryAuthInstalling` while nodes have not yet reported. It is computed on the operator's

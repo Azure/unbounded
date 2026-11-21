@@ -143,8 +143,9 @@ func (r *registryAuthReconciler) ReconcileRegistryAuth(ctx context.Context) (rec
 	// Resolve the mode-aware node-stack goal state for the active slot. This
 	// re-probes the host for the machine's layout, which is cheap and
 	// idempotent, and points at the same root the running node uses in every
-	// isolation mode.
-	gs, err := registryAuthNodeStart(ctx, r.log, active)
+	// isolation mode. The offline bundle is not resolved here; the provider
+	// download resolves it lazily only when a download is actually needed.
+	gs, err := registryAuthNodeStart(r.log, active)
 	if err != nil {
 		return reconcile.Result{}, err
 	}
@@ -210,10 +211,11 @@ func (r *registryAuthReconciler) ReconcileRegistryAuth(ctx context.Context) (rec
 		return reconcile.Result{RequeueAfter: registryAuthRequeue}, nil
 	}
 
-	// The policy is verified healthy. Clear the durable pending-restart work and
-	// reset the bounded-restart budget so a healthy node does not carry a stale
-	// attempt count or a stale "restart pending" flag into a future change.
-	if err := r.clearPendingWork(active.Name); err != nil {
+	// The policy is verified healthy. Record the verified revision in the
+	// durable ledger and reset the bounded-restart budget so a healthy node does
+	// not carry a stale attempt count or a stale "restart pending" flag into a
+	// future change.
+	if err := r.clearPendingWork(active.Name, desired.policyHash); err != nil {
 		r.log.Warn("clear registry-auth pending work failed", "error", err)
 	}
 
@@ -265,16 +267,42 @@ func registryAuthPendingPath(slot string) string {
 
 // pendingWork brings the provider binary, the credential-provider and azure
 // config, and the kubelet node-config drop-in to the desired state, daemon-
-// reloads the mode's systemd manager so the (changed) drop-in is picked up, and
-// persists whether a restart is still owed. It reports the durable work state so
-// the caller can decide whether to charge a bounded restart.
+// reloads the mode's systemd manager so the drop-in is picked up, and persists
+// whether a restart is still owed. It reports the durable work state so the
+// caller can decide whether to charge a bounded restart.
+//
+// The durable intent is persisted BEFORE the on-disk mutations it protects: a
+// crash that lands anywhere after the intent is written but before the kubelet
+// is verified running the expected flags still finds work owed on the next
+// pass, so the original failure window (bytes changed, ledger still false) is
+// closed. A policy revision change marks the new revision as owed up front. The
+// manager reload is retried whenever work is owed, even when this pass made no
+// on-disk change, so a reload that failed or was skipped by a crash is not
+// lost.
 func (r *registryAuthReconciler) pendingWork(ctx context.Context, active *ActiveMachine, gs *goalstates.MachineGoalState, desired registryAuthActivePolicy) (*pendingWorkResult, error) {
 	root := gs.NodeStart.Root()
 	slot := active.Name
 
-	// A policy change clears any stale pending work from a previous revision.
-	if err := r.loadPending(slot, desired.policyHash); err != nil {
+	// Establish the durable intent for this policy revision BEFORE any on-disk
+	// mutation. Work is owed whenever a new revision arrived, a prior pass left
+	// work owed (a failed reload or restart, a backoff), or this pass is about
+	// to change files. The intent is persisted as work=true up front (not as
+	// the as-yet-unknown result) so that a crash landing anywhere after the
+	// write but before the kubelet is verified running the expected flags still
+	// finds work owed on the next pass: the original failure window, where the
+	// bytes changed but the ledger still read false, is closed. The record is
+	// cleared to work=false only once this pass determines nothing is owed.
+	pending, err := r.readPending(slot)
+	if err != nil {
 		return nil, err
+	}
+
+	owesWork := pending.Work || pending.PolicyHash != desired.policyHash
+	if err := r.savePending(slot, desired.policyHash, true); err != nil {
+		// Do not proceed with mutations if the intent cannot be durably
+		// recorded: a pass that writes files but cannot persist that a restart
+		// is owed reintroduces the lost-recovery window.
+		return nil, fmt.Errorf("persist registry-auth pending work for %s: %w", slot, err)
 	}
 
 	changed := false
@@ -325,50 +353,34 @@ func (r *registryAuthReconciler) pendingWork(ctx context.Context, active *Active
 		}
 	}
 
-	// If a restart was already owed (from a prior failed pass) it stays owed even
-	// if this pass made no on-disk change.
-	pending, err := r.readPending(slot)
-	if err != nil {
-		return nil, err
+	// A change on this pass means the kubelet must pick it up, so work is owed
+	// even when the revision did not change and no prior pass owed it.
+	owesWork = owesWork || changed
+
+	if !owesWork {
+		// Nothing is owed for this revision: clear the up-front intent so the
+		// ledger reflects the verified steady state rather than a stale "restart
+		// owed" flag. (A crash after this clear still retries harmlessly: the
+		// next pass re-reads a fresh ledger and re-derives that nothing is owed
+		// because the bytes already match.)
+		if err := r.savePending(slot, desired.policyHash, false); err != nil {
+			return nil, fmt.Errorf("clear registry-auth pending work for %s: %w", slot, err)
+		}
 	}
 
-	work := changed || pending.Work
-
-	// Persist the durable work state before the disruptive restart so a crash in
-	// between still retries on the next pass.
-	if err := r.savePending(slot, desired.policyHash, work); err != nil {
-		return nil, err
-	}
-
-	if changed {
-		// The node-config drop-in (or provider files) changed. Reload the
-		// mode's systemd manager so the new unit state is used before the
-		// restart; verify the reload succeeded before the disruptive restart.
+	if owesWork {
+		// Reload the mode's systemd manager so the drop-in is used before the
+		// restart. This runs whenever work is owed (a fresh change or a retry
+		// after a failed reload), not only when this pass wrote bytes, so a
+		// reload that failed or was skipped by a crash is retried.
 		if err := r.reloadKubeletUnit(ctx, active); err != nil {
-			// The reload failed; the work is still owed (already persisted) so
-			// the caller retries. Report the reload failure.
+			// The reload failed; the work is still owed (persisted true) so the
+			// caller retries on the next pass. Report the reload failure.
 			return &pendingWorkResult{restart: true}, err
 		}
 	}
 
-	return &pendingWorkResult{restart: work}, nil
-}
-
-// loadPending clears the durable pending work when the policy revision changed,
-// so a new policy starts with a clean work state.
-func (r *registryAuthReconciler) loadPending(slot, policyHash string) error {
-	pending, err := r.readPending(slot)
-	if err != nil {
-		return err
-	}
-
-	if pending.PolicyHash != policyHash {
-		if err := r.savePending(slot, policyHash, false); err != nil {
-			return err
-		}
-	}
-
-	return nil
+	return &pendingWorkResult{restart: owesWork}, nil
 }
 
 func (r *registryAuthReconciler) readPending(slot string) (*registryAuthPending, error) {
@@ -397,15 +409,14 @@ func (r *registryAuthReconciler) savePending(slot, policyHash string, work bool)
 	return writeJSONFile(registryAuthPendingPath(slot), &registryAuthPending{PolicyHash: policyHash, Work: work})
 }
 
-// clearPendingWork clears the durable pending work for a slot (called when the
-// policy is verified healthy).
-func (r *registryAuthReconciler) clearPendingWork(slot string) error {
-	err := os.Remove(registryAuthPendingPath(slot))
-	if err != nil && !os.IsNotExist(err) {
-		return err
-	}
-
-	return nil
+// clearPendingWork records that the policy revision was applied and verified,
+// so the durable ledger stops owing a restart for it. It persists
+// {PolicyHash, Work: false} rather than removing the file, so the next pass can
+// tell that the current revision is already verified and does not re-derive work
+// (which a fresh record, PolicyHash="" Work=false, would do for a managed policy
+// by treating the hash as a revision change).
+func (r *registryAuthReconciler) clearPendingWork(slot, policyHash string) error {
+	return r.savePending(slot, policyHash, false)
 }
 
 // reloadKubeletUnit runs systemctl daemon-reload in the active node stack so a
@@ -428,8 +439,28 @@ func (r *registryAuthReconciler) reloadKubeletUnit(ctx context.Context, active *
 	return nil
 }
 
+// fsyncPath syncs the contents of an open file and the directory entry for
+// path, so an interrupted atomic write (temp + rename) survives a power loss
+// with the rename in place rather than the old file. The directory sync is what
+// makes the rename durable; the file sync makes the content durable.
+func fsyncPath(f *os.File, path string) error {
+	if err := f.Sync(); err != nil {
+		return err
+	}
+
+	d, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+
+	defer d.Close() //nolint:errcheck // the close error is not the one to report
+
+	return d.Sync()
+}
+
 // writeJSONFile atomically writes a JSON value to path (temp file in the same
-// directory, then rename), so an interrupted write cannot leave a corrupt file.
+// directory, synced, then renamed into place), so an interrupted write cannot
+// leave a corrupt file and a durable record survives a crash.
 func writeJSONFile(path string, value any) error {
 	data, err := json.Marshal(value)
 	if err != nil {
@@ -455,6 +486,12 @@ func writeJSONFile(path string, value any) error {
 	}
 
 	if err := tmp.Chmod(0o644); err != nil {
+		tmp.Close()
+
+		return err
+	}
+
+	if err := fsyncPath(tmp, name); err != nil {
 		tmp.Close()
 
 		return err
@@ -597,32 +634,51 @@ func (r *registryAuthReconciler) verifyKubelet(ctx context.Context, active *Acti
 		return false, fmt.Errorf("read kubelet argv: %w", err)
 	}
 
-	hasManaged := registryAuthArgvHasManagedFlags(argv)
-
+	// External: a running kubelet must not carry any of the managed provider
+	// flags. Proven external is a running kubelet with no managed tokens.
 	if !desired.active {
-		// External: a running kubelet must not carry the managed provider flags.
-		// Proven external is a running kubelet with no managed tokens.
-		return !hasManaged, nil
+		return !registryAuthArgvHasManagedFlags(argv), nil
 	}
 
-	// Managed: the running kubelet must carry exactly the managed provider
-	// tokens (config path and bin-dir), checked as exact argv tokens (not
-	// substrings, so a sibling path like ...bin-dir.old cannot match).
-	managedPresent := true
-	for _, flag := range registryAuthProviderFlags() {
+	// Managed: the running kubelet's EFFECTIVE provider flags must be the
+	// managed ones. The generated kubelet unit expands KUBELET_EXTRA_ARGS after
+	// KUBELET_NODE_CONFIG_ARGS, and kubelet resolves a repeated flag by the last
+	// occurrence, so mere presence of the managed tokens is not proof that they
+	// are in effect: a later --image-credential-provider-config=... from another
+	// drop-in or environment source would override the managed value. The check
+	// therefore takes the last occurrence of each managed flag name and requires
+	// it to equal the managed value (and that the flag name is present at all).
+	return registryAuthEffectiveManagedFlags(argv), nil
+}
+
+// registryAuthEffectiveManagedFlags reports whether the argv's effective image
+// credential provider configuration is the managed one: for each managed flag
+// (config path and bin-dir), the flag name is present and its last occurrence
+// (the value kubelet actually uses) equals the managed value. A flag name
+// present only as a different value, or absent entirely, is not effective.
+func registryAuthEffectiveManagedFlags(argv []string) bool {
+	for _, managed := range registryAuthProviderFlags() {
+		name := providerFlagName(managed)
+		if name == "" {
+			return false
+		}
+
+		last := ""
 		found := false
+
 		for _, tok := range argv {
-			if tok == flag {
+			if providerFlagName(tok) == name {
+				last = tok
 				found = true
 			}
 		}
 
-		if !found {
-			managedPresent = false
+		if !found || last != managed {
+			return false
 		}
 	}
 
-	return managedPresent, nil
+	return true
 }
 
 // registryAuthMainPID reads the unit's MainPID through the node's systemd

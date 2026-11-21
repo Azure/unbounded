@@ -13,6 +13,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/Azure/unbounded/pkg/agent/bootstrapartifacts"
 	"github.com/Azure/unbounded/pkg/agent/config"
 )
 
@@ -70,6 +71,82 @@ func assertOfflineArtifactDownloads(t *testing.T, downloads *DownloadOverrides) 
 	require.Contains(t, downloads.CoreDNS.URL, "coredns/v%s/bin/linux/%s/coredns")
 	require.Contains(t, downloads.Runc.URL, "file://")
 	require.NotContains(t, downloads.Runc.URL, "ignored")
+}
+
+// TestResolveDownloadOverridesACRProvider verifies the offline resolver wires
+// the ACR credential provider into the download overrides when the bundle
+// manifest records a version for it, and leaves it nil (falling back to the
+// public upstream) when the bundle does not carry the provider. This is the
+// air-gapped managed-auth path: the provider must download from the mirror, not
+// from public GitHub, when the bundle supports it.
+func TestResolveDownloadOverridesACRProvider(t *testing.T) {
+	t.Parallel()
+
+	base := func(acrProvider string) *DownloadOverrides {
+		root := writeGoalStateOfflineBundle(t, OfflineArtifactManifest{
+			Versions: OfflineArtifactVersions{
+				Kubernetes:  "v1.34.2",
+				Containerd:  "2.1.8",
+				Runc:        "1.5.0",
+				CNI:         "1.5.1",
+				Crictl:      "1.34.0",
+				ACRProvider: acrProvider,
+			},
+		})
+
+		cfg := &config.AgentConfig{
+			Cluster:          config.AgentClusterConfig{Version: "1.34.2"},
+			OfflineArtifacts: &config.AgentOfflineArtifacts{Source: root},
+		}
+
+		downloads, _, err := ResolveDownloadOverridesWithOfflineArtifacts(context.Background(), cfg, nil)
+		require.NoError(t, err)
+
+		return downloads
+	}
+
+	// A bundle that records the provider version wires it into the overrides
+	// with a mirror (file://) URL and the pinned version.
+	with := base("v1.36.0")
+	require.NotNil(t, with.ACRProvider, "bundle with an acrProvider version must set the ACRProvider override")
+	require.Equal(t, "1.36.0", with.ACRProvider.Version)
+	require.Contains(t, with.ACRProvider.URL, "file://")
+	require.Contains(t, with.ACRProvider.URL, "acr-provider/v1.36.0/azure-acr-credential-provider-linux-")
+
+	// A bundle without the provider leaves the override nil so the download
+	// falls back to the public upstream release.
+	without := base("")
+	require.Nil(t, without.ACRProvider, "bundle without an acrProvider version must not set the override")
+}
+
+// TestBootstrapArtifactsACRProviderPath verifies the bundle path helpers: the
+// concrete path fills in the architecture, the URL template leaves a %s for it,
+// and RequiredPaths includes the provider only when the manifest records a
+// version for it (so existing bundles that omit it keep working).
+func TestBootstrapArtifactsACRProviderPath(t *testing.T) {
+	t.Parallel()
+
+	const version = "v1.36.0"
+
+	tmpl := bootstrapartifacts.ACRProviderArtifactURLTemplate(version)
+	require.Equal(t, "acr-provider/v1.36.0/azure-acr-credential-provider-linux-%s", tmpl)
+
+	require.Equal(t, "acr-provider/v1.36.0/azure-acr-credential-provider-linux-arm64", bootstrapartifacts.ACRProviderArtifactPath(version, "arm64"))
+
+	// RequiredPaths includes the provider (and its sha256) only when the
+	// manifest version is set.
+	withProvider := bootstrapartifacts.RequiredPaths(bootstrapartifacts.Manifest{
+		Versions: bootstrapartifacts.Versions{Kubernetes: "v1.34.2", Containerd: "2.1.8", Runc: "1.5.0", CNI: "1.5.1", Crictl: "1.34.0", ACRProvider: "v1.36.0"},
+	}, "linux", "arm64")
+	require.Contains(t, withProvider, "acr-provider/v1.36.0/azure-acr-credential-provider-linux-arm64")
+	require.Contains(t, withProvider, "acr-provider/v1.36.0/azure-acr-credential-provider-linux-arm64.sha256")
+
+	withoutProvider := bootstrapartifacts.RequiredPaths(bootstrapartifacts.Manifest{
+		Versions: bootstrapartifacts.Versions{Kubernetes: "v1.34.2", Containerd: "2.1.8", Runc: "1.5.0", CNI: "1.5.1", Crictl: "1.34.0"},
+	}, "linux", "arm64")
+	for _, p := range withoutProvider {
+		require.NotContains(t, p, "acr-provider", "bundles without an acrProvider version must not require the provider")
+	}
 }
 
 func TestResolveDownloadOverridesWithOfflineArtifactsNoopWithoutOfflineConfig(t *testing.T) {

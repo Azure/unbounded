@@ -114,6 +114,45 @@ func TestLoadSaveRegistryAuthBudget(t *testing.T) {
 	require.Equal(t, "abc", reloaded.PolicyHash)
 }
 
+func TestPendingWorkRecordRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	orig := registryAuthBudgetDir
+	registryAuthBudgetDir = t.TempDir()
+	defer func() { registryAuthBudgetDir = orig }()
+
+	r := &registryAuthReconciler{}
+	slot := "kube1"
+
+	// A fresh slot has no record: work is not owed, no revision tied.
+	pending, err := r.readPending(slot)
+	require.NoError(t, err)
+	require.Equal(t, "", pending.PolicyHash)
+	require.False(t, pending.Work)
+
+	// Persisting the intent (work owed) for a revision reads back as owed.
+	require.NoError(t, r.savePending(slot, "abc", true))
+	pending, err = r.readPending(slot)
+	require.NoError(t, err)
+	require.Equal(t, "abc", pending.PolicyHash)
+	require.True(t, pending.Work, "a persisted intent must read back as work owed")
+
+	// clearPendingWork records the revision as verified (work not owed) without
+	// removing the file, so the next pass can tell the revision is verified
+	// rather than treating the empty hash as a fresh revision change.
+	require.NoError(t, r.clearPendingWork(slot, "abc"))
+	pending, err = r.readPending(slot)
+	require.NoError(t, err)
+	require.Equal(t, "abc", pending.PolicyHash, "clearPendingWork must retain the verified revision")
+	require.False(t, pending.Work, "a verified revision owes no restart")
+
+	// A corrupt pending file surfaces as an error, not a free restart.
+	path := registryAuthPendingPath(slot)
+	require.NoError(t, os.WriteFile(path, []byte("{not json"), 0o644))
+	_, err = r.readPending(slot)
+	require.Error(t, err, "a corrupt pending record must not grant a free restart")
+}
+
 func TestRegistryAuthFailureOutcome(t *testing.T) {
 	t.Parallel()
 
@@ -159,68 +198,217 @@ func TestWriteFileIfChanged(t *testing.T) {
 	require.Equal(t, []byte("two"), data)
 }
 
-func TestApplyProviderToNodeConfig(t *testing.T) {
+// managedFlags returns the two managed provider tokens, matching
+// registryAuthProviderFlags, used to build and check drop-in contents.
+func managedFlags() []string {
+	return registryAuthProviderFlags()
+}
+
+// applyDropIn points the drop-in path override at a fresh temp file with the
+// given contents and returns the path. The subtests are NOT parallel because
+// the path override is a package global; concurrent subtests would race on it.
+func applyDropIn(t *testing.T, content string) string {
+	t.Helper()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "kubelet.service.d", "20-node-config.conf")
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+	orig := registryAuthNodeConfigDropInPath
+	registryAuthNodeConfigDropInPath = func(_ isolation.NodeRoot, _ isolation.Mode) string { return path }
+	t.Cleanup(func() { registryAuthNodeConfigDropInPath = orig })
+
+	return path
+}
+
+// generatedDropIn is the exact format the nodestart phase renders for a node
+// with hostname-override and node-ip and no provider flags yet.
+const generatedDropIn = "# Managed by unbounded-agent. Do not edit directly.\n" +
+	"[Service]\n" +
+	"Environment=\"KUBELET_NODE_CONFIG_ARGS=--hostname-override=node1 --node-ip=10.0.0.5\"\n"
+
+func TestNodeConfigArgsValue(t *testing.T) {
 	t.Parallel()
 
-	// A node-config drop-in the nodestart phase would write: it carries the
-	// effective node config args, including hostname-override, and no provider
-	// flags yet.
-	base := "# Managed by unbounded-agent. Do not edit directly.\n" +
-		"[Service]\n" +
-		"Environment=\"KUBELET_NODE_CONFIG_ARGS=--hostname-override=node1 --node-ip=10.0.0.5\"\n"
-
 	tt := []struct {
-		name       string
-		policy     *registryauth.Config
-		wantChange bool
+		name    string
+		data    string
+		want    string
+		wantErr bool
 	}{
 		{
-			name: "adds managed flags and preserves other args",
-			policy: &registryauth.Config{
-				Mode: registryauth.IdentityBindingMode,
-			},
-			wantChange: true,
+			name: "generated quoted form",
+			data: "Environment=\"KUBELET_NODE_CONFIG_ARGS=--hostname-override=node1 --node-ip=10.0.0.5\"\n",
+			want: "--hostname-override=node1 --node-ip=10.0.0.5",
 		},
 		{
-			name:       "no managed flags and no policy is unchanged",
-			policy:     nil,
-			wantChange: false,
+			name: "generated quoted form with provider flags",
+			data: "Environment=\"KUBELET_NODE_CONFIG_ARGS=--hostname-override=node1 --image-credential-provider-config=/x --image-credential-provider-bin-dir=/y\"\n",
+			want: "--hostname-override=node1 --image-credential-provider-config=/x --image-credential-provider-bin-dir=/y",
+		},
+		{
+			name: "bare unquoted form",
+			data: "Environment=KUBELET_NODE_CONFIG_ARGS=--hostname-override=node1\n",
+			want: "--hostname-override=node1",
+		},
+		{
+			name:    "no matching line",
+			data:    "[Service]\nEnvironment=FOO=bar\n",
+			wantErr: true,
 		},
 	}
 
 	for _, tc := range tt {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
+			value, err := nodeConfigArgsValue(tc.data)
+			if tc.wantErr {
+				require.Error(t, err)
 
-			dir := t.TempDir()
-			path := filepath.Join(dir, "kubelet.service.d", "20-node-config.conf")
-			require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
-			require.NoError(t, os.WriteFile(path, []byte(base), 0o644))
+				return
+			}
 
-			orig := registryAuthNodeConfigDropInPath
-			registryAuthNodeConfigDropInPath = func(_ isolation.NodeRoot, _ isolation.Mode) string { return path }
-			t.Cleanup(func() { registryAuthNodeConfigDropInPath = orig })
+			require.NoError(t, err)
+			require.Equal(t, tc.want, value)
+		})
+	}
+}
+
+func TestApplyProviderToNodeConfig(t *testing.T) {
+	// Sequential on purpose: the drop-in path override is a package global and
+	// concurrent subtests would race on it (the -race reproducer from review).
+	tt := []struct {
+		name       string
+		base       string
+		policy     *registryauth.Config
+		wantChange bool
+		wantValue  string
+	}{
+		{
+			name:       "adds managed flags and preserves other args",
+			base:       generatedDropIn,
+			policy:     &registryauth.Config{Mode: registryauth.IdentityBindingMode},
+			wantChange: true,
+			wantValue:  "--hostname-override=node1 --node-ip=10.0.0.5 " + managedFlags()[0] + " " + managedFlags()[1],
+		},
+		{
+			name:       "no managed flags and no policy is unchanged",
+			base:       generatedDropIn,
+			policy:     nil,
+			wantChange: false,
+			wantValue:  "--hostname-override=node1 --node-ip=10.0.0.5",
+		},
+		{
+			name: "detach removes managed flags preserving other args",
+			base: generatedDropIn +
+				"Environment=\"KUBELET_NODE_CONFIG_ARGS=--hostname-override=node1 " + managedFlags()[0] + " " + managedFlags()[1] + "\"\n",
+			policy:     nil,
+			wantChange: true,
+			wantValue:  "--hostname-override=node1",
+		},
+		{
+			name: "partial pair config only is completed with bin-dir",
+			base: generatedDropIn +
+				"Environment=\"KUBELET_NODE_CONFIG_ARGS=--hostname-override=node1 " + managedFlags()[0] + "\"\n",
+			policy:     &registryauth.Config{Mode: registryauth.IdentityBindingMode},
+			wantChange: true,
+			wantValue:  "--hostname-override=node1 " + managedFlags()[0] + " " + managedFlags()[1],
+		},
+		{
+			name: "partial pair bin-dir only is completed with config",
+			base: generatedDropIn +
+				"Environment=\"KUBELET_NODE_CONFIG_ARGS=--hostname-override=node1 " + managedFlags()[1] + "\"\n",
+			policy:     &registryauth.Config{Mode: registryauth.IdentityBindingMode},
+			wantChange: true,
+			wantValue:  "--hostname-override=node1 " + managedFlags()[0] + " " + managedFlags()[1],
+		},
+		{
+			name: "conflicting external provider is refused",
+			base: generatedDropIn +
+				"Environment=\"KUBELET_NODE_CONFIG_ARGS=--hostname-override=node1 --image-credential-provider-config=/customer/cfg.json --image-credential-provider-bin-dir=/customer/bin\"\n",
+			policy:     &registryauth.Config{Mode: registryauth.IdentityBindingMode},
+			wantChange: false,
+			wantValue:  "--hostname-override=node1 --image-credential-provider-config=/customer/cfg.json --image-credential-provider-bin-dir=/customer/bin",
+		},
+		{
+			name: "single conflicting flag is refused",
+			base: generatedDropIn +
+				"Environment=\"KUBELET_NODE_CONFIG_ARGS=--hostname-override=node1 --image-credential-provider-config=/customer/cfg.json\"\n",
+			policy:     &registryauth.Config{Mode: registryauth.IdentityBindingMode},
+			wantChange: false,
+			wantValue:  "--hostname-override=node1 --image-credential-provider-config=/customer/cfg.json",
+		},
+	}
+
+	for _, tc := range tt {
+		t.Run(tc.name, func(t *testing.T) {
+			path := applyDropIn(t, tc.base)
 
 			changed, err := applyProviderToNodeConfig(nil, isolation.ModeNone, tc.policy)
 			require.NoError(t, err)
 			require.Equal(t, tc.wantChange, changed)
 
-			// After adding the managed flags, a second pass with the same policy
-			// makes no further change (idempotent).
-			if tc.policy != nil {
-				changed2, err := applyProviderToNodeConfig(nil, isolation.ModeNone, tc.policy)
-				require.NoError(t, err)
-				require.False(t, changed2)
-			}
+			data, err := os.ReadFile(path)
+			require.NoError(t, err)
+
+			value, err := nodeConfigArgsValue(string(data))
+			require.NoError(t, err)
+			require.Equal(t, tc.wantValue, value)
+
+			// The writer must preserve every unrelated byte: the header comment
+			// and the [Service] stanza survive, and only the provider tokens in
+			// the KUBELET_NODE_CONFIG_ARGS line change.
+			require.Contains(t, string(data), "# Managed by unbounded-agent. Do not edit directly.")
+			require.Contains(t, string(data), "[Service]")
+
+			// Idempotence: a second pass with the same policy makes no change.
+			changed2, err := applyProviderToNodeConfig(nil, isolation.ModeNone, tc.policy)
+			require.NoError(t, err)
+			require.False(t, changed2, "second pass must be a no-op for %s", tc.name)
 		})
 	}
 }
 
-func TestNodeConfigArgsValue(t *testing.T) {
+func TestEffectiveManagedFlags(t *testing.T) {
 	t.Parallel()
 
-	data := "Environment=\"KUBELET_NODE_CONFIG_ARGS=--hostname-override=node1 --node-ip=10.0.0.5\"\n"
-	value, err := nodeConfigArgsValue(data)
-	require.NoError(t, err)
-	require.Equal(t, "--hostname-override=node1 --node-ip=10.0.0.5", value)
+	m0, m1 := managedFlags()[0], managedFlags()[1]
+
+	tt := []struct {
+		name string
+		argv []string
+		want bool
+	}{
+		{
+			name: "managed flags effective",
+			argv: []string{"kubelet", "--hostname-override=n1", m0, m1},
+			want: true,
+		},
+		{
+			name: "managed flags present but a later value overrides them",
+			argv: []string{"kubelet", m0, m1, "--image-credential-provider-config=/other", "--image-credential-provider-bin-dir=/other"},
+			want: false,
+		},
+		{
+			name: "only config flag present",
+			argv: []string{"kubelet", m0},
+			want: false,
+		},
+		{
+			name: "no provider flags",
+			argv: []string{"kubelet", "--hostname-override=n1"},
+			want: false,
+		},
+		{
+			name: "managed flags with unrelated flags after them",
+			argv: []string{"kubelet", m0, m1, "--hostname-override=n1"},
+			want: true,
+		},
+	}
+
+	for _, tc := range tt {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, registryAuthEffectiveManagedFlags(tc.argv))
+		})
+	}
 }
