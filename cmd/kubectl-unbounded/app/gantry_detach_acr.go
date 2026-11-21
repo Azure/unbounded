@@ -403,7 +403,9 @@ func (h *detachACRHandler) findACRRoleAssignments(ctx context.Context, acrID *ar
 		// and is preserved.
 		entry := acrRoleAssignment{ID: a.ID, Scope: a.Scope, Condition: a.Condition, RoleID: a.RoleDefinitionID}
 
-		for _, grant := range ownedRoleGrantNames(h.clusterID, h.acrID, principalID) {
+		// Use the canonical parsed resource ID (not the raw command-line
+		// spelling) so the receipt matches what attach created.
+		for _, grant := range ownedRoleGrantNames(h.clusterID, acrID.String(), principalID) {
 			if strings.EqualFold(a.Name, grant) {
 				entry.Owned = true
 

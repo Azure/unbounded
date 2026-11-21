@@ -408,6 +408,110 @@ func TestNodeConfigArgsRenderedRoundTrip(t *testing.T) {
 	}
 }
 
+// TestIndentedEnvironmentDirectiveIsRewritten verifies that an indented
+// Environment= directive (inside a [Service] stanza) is recognized by both the
+// getter and the renderer: attach adds the provider flags to the indented line,
+// and detach removes them. The indentation is preserved.
+func TestIndentedEnvironmentDirectiveIsRewritten(t *testing.T) {
+	// A drop-in with an indented Environment= directive.
+	indentedBase := "# Managed by unbounded-agent. Do not edit directly.\n" +
+		"[Service]\n" +
+		"  Environment=\"KUBELET_NODE_CONFIG_ARGS=--hostname-override=node1\"\n"
+
+	path := applyDropIn(t, indentedBase)
+
+	// Attach: the managed flags must be added to the indented line.
+	changed, err := applyProviderToNodeConfig(nil, isolation.ModeNone, &registryauth.Config{Mode: registryauth.IdentityBindingMode})
+	require.NoError(t, err)
+	require.True(t, changed, "attach must modify the indented directive")
+
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	value, err := nodeConfigArgsValue(string(data))
+	require.NoError(t, err)
+	require.Contains(t, value, managedFlags()[0], "the managed config flag must be present after attach")
+	require.Contains(t, value, managedFlags()[1], "the managed bin-dir flag must be present after attach")
+	// The indentation must be preserved.
+	require.Contains(t, string(data), "\n  Environment=")
+
+	// Detach: the managed flags must be removed from the indented line.
+	changed, err = applyProviderToNodeConfig(nil, isolation.ModeNone, nil)
+	require.NoError(t, err)
+	require.True(t, changed, "detach must modify the indented directive")
+
+	data, err = os.ReadFile(path)
+	require.NoError(t, err)
+	value, err = nodeConfigArgsValue(string(data))
+	require.NoError(t, err)
+	require.NotContains(t, value, managedFlags()[0], "the managed config flag must be absent after detach")
+	require.NotContains(t, value, managedFlags()[1], "the managed bin-dir flag must be absent after detach")
+}
+
+// TestBareAndSingleQuotedEscapesDecode verifies that C-style escape sequences
+// are decoded in bare (unquoted) and single-quoted items, not only in
+// double-quoted items, matching systemd's extract_first_word behavior.
+func TestBareAndSingleQuotedEscapesDecode(t *testing.T) {
+	tt := []struct {
+		name string
+		data string
+		want string
+	}{
+		{
+			name: "bare item hex escape decodes",
+			data: "Environment=KUBELET_NODE_CONFIG_ARGS=--hostname-override=node\\x31\n",
+			want: "--hostname-override=node1",
+		},
+		{
+			name: "single-quoted item hex escape decodes",
+			data: "Environment=KUBELET_NODE_CONFIG_ARGS='--hostname-override=node\\x31'\n",
+			want: "--hostname-override=node1",
+		},
+	}
+
+	for _, tc := range tt {
+		t.Run(tc.name, func(t *testing.T) {
+			value, err := nodeConfigArgsValue(tc.data)
+			require.NoError(t, err)
+			require.Equal(t, tc.want, value)
+		})
+	}
+}
+
+// TestHexOctalByteEscapesProducesBytes verifies that hex and octal escapes
+// produce raw bytes (not code points), so \xc3\xa9 produces the two bytes
+// 0xC3 0xA9 (é in UTF-8), not U+00C3 + U+00A9.
+func TestHexOctalByteEscapesProducesBytes(t *testing.T) {
+	tt := []struct {
+		name string
+		data string
+		want string
+	}{
+		{
+			name: "hex byte escape produces UTF-8 bytes for e-acute",
+			data: "Environment=KUBELET_NODE_CONFIG_ARGS=\"--root-dir=/data/\\xc3\\xa9\"\n",
+			want: "--root-dir=/data/é",
+		},
+		{
+			name: "octal byte escape produces UTF-8 bytes for e-acute",
+			data: "Environment=KUBELET_NODE_CONFIG_ARGS=\"--root-dir=/data/\\303\\251\"\n",
+			want: "--root-dir=/data/é",
+		},
+		{
+			name: "unicode code point escape produces e-acute",
+			data: "Environment=KUBELET_NODE_CONFIG_ARGS=\"--root-dir=/data/\\u00e9\"\n",
+			want: "--root-dir=/data/é",
+		},
+	}
+
+	for _, tc := range tt {
+		t.Run(tc.name, func(t *testing.T) {
+			value, err := nodeConfigArgsValue(tc.data)
+			require.NoError(t, err)
+			require.Equal(t, tc.want, value)
+		})
+	}
+}
+
 func TestApplyProviderToNodeConfig(t *testing.T) {
 	// Sequential on purpose: the drop-in path override is a package global and
 	// concurrent subtests would race on it (the -race reproducer from review).

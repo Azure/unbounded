@@ -405,6 +405,15 @@ func TestGantryAttachACRRejectsUpstreamAliasCollisionsBeforeWrites(t *testing.T)
 		t.Run(mode, func(t *testing.T) {
 			h, client, calls := attachFixture(t)
 			h.authMode = mode
+			// In managed mode, the Machine reader is initialized before the
+			// ns_alias validation. Inject a fake so the test is hermetic and
+			// does not depend on a developer's real kubeconfig.
+			if mode == registryauth.IdentityBindingMode {
+				h.machineClient = machineStatusReaderFunc(func(context.Context, *v1alpha3.RegistryAuthPolicy) (map[string]flexNodeStatus, error) {
+					return map[string]flexNodeStatus{}, nil
+				})
+			}
+
 			source, err := client.CoreV1().ConfigMaps(h.namespace).Get(t.Context(), "gantry-config", metav1.GetOptions{})
 			require.NoError(t, err)
 

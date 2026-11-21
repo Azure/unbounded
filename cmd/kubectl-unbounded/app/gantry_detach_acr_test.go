@@ -408,6 +408,57 @@ func TestGantryDetachACRRemovesOwnedACRRoleAssignment(t *testing.T) {
 	require.True(t, deleted, "the owned ACR pull role assignment must be deleted, not left behind or faked")
 }
 
+// TestGantryDetachACRTrailingSlashACRIDStillMatchesGrant verifies that a
+// detach invoked with a trailing-slash ACR resource ID (which the Azure SDK
+// accepts and resolves to the same registry) still matches the grant created
+// with the canonical (no-trailing-slash) ID. The receipt is computed from the
+// canonical parsed resource ID, not the raw command-line spelling.
+func TestGantryDetachACRTrailingSlashACRIDStillMatchesGrant(t *testing.T) {
+	h := detachAzureBase(t)
+	// The ACR ID is given with a trailing slash. The Azure SDK accepts this and
+	// resolves it to the same registry. The receipt must match the grant
+	// created with the canonical (no-trailing-slash) ID.
+	h.acrID = attachACRID + "/"
+
+	const acrPullRole = "/subscriptions/11111111-2222-3333-4444-555555555555/providers/Microsoft.Authorization/roleDefinitions/7f951dda-4ed3-4680-a7ca-43fe172d538d"
+
+	var deleteCalls []string
+
+	h.runAzure = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		key := detachAzureCmd(args)
+		if key == "role assignment delete" {
+			deleteCalls = append(deleteCalls, strings.Join(args, " "))
+		}
+
+		switch key {
+		case "aks show":
+			return json.Marshal(map[string]any{"id": attachClusterID, "location": "eastus", "fqdn": "cluster.example.com", "provisioningState": "Succeeded"})
+		case "identity show":
+			return json.Marshal(map[string]any{"principalId": "principal-1", "tags": map[string]string{"unbounded-cluster-id": attachClusterID}})
+		case "role assignment list":
+			// The grant was created with the canonical ID (no trailing slash).
+			// The receipt must match even though the detach handler's raw h.acrID
+			// has a trailing slash.
+			return json.Marshal([]map[string]any{{
+				"name":             acrPullGrantName(attachClusterID, attachACRID, "principal-1", "7f951dda-4ed3-4680-a7ca-43fe172d538d"),
+				"principalId":      "principal-1",
+				"roleDefinitionId": acrPullRole,
+				"scope":            attachACRID,
+				"id":               "/subscriptions/11111111-2222-3333-4444-555555555555/providers/Microsoft.Authorization/roleAssignments/aaaa",
+				"condition":        "",
+			}})
+		case "rest --method":
+			return []byte(`{"value":[]}`), nil
+		}
+
+		return []byte("{}"), nil
+	}
+
+	require.NoError(t, h.execute(t.Context()))
+	// The owned grant must be deleted, not classified as shared.
+	require.NotEmpty(t, deleteCalls, "the owned grant must be deleted even when the ACR ID has a trailing slash")
+}
+
 // TestGantryDetachACRConditionalGrantIsPreserved verifies a conditional role
 // assignment on the owned principal (one the attach path did not create) is
 // preserved, not deleted: it is a shared/inherited grant, and the detach

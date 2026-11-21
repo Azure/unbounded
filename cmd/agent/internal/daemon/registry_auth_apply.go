@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Azure/unbounded/internal/registryauth"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
@@ -276,8 +277,9 @@ func applyProviderToNodeConfig(root isolation.NodeRoot, mode isolation.Mode, pol
 // The systemd Environment= value grammar is a list of whitespace-separated
 // items, where each item is an unquoted run of non-whitespace or a quoted
 // string that may itself contain whitespace. Quoted items may be double-quoted
-// (C-style backslash escapes: \\, \", \n, \t, and octal; a literal backslash is
-// doubled) or single-quoted (everything literal except the closing quote). A
+// or single-quoted; C-style backslash escapes (\\, \", \n, \t, \xHH, \NNN,
+// \uNNNN, etc.) are processed in ALL item forms (bare, single-quoted, and
+// double-quoted), per systemd's extract_first_word with EXTRACT_CUNESCAPE. A
 // single Environment= directive can carry several items, so one line can hold
 // multiple assignments.
 //
@@ -287,9 +289,9 @@ func applyProviderToNodeConfig(root isolation.NodeRoot, mode isolation.Mode, pol
 
 // systemdEnvItems tokenizes the value of one Environment= directive into its
 // decoded items. A quoted item (single or double) is returned with its quotes
-// removed and, for double quotes, its C-style backslash escapes unescaped; an
-// unquoted item is returned verbatim. Whitespace between items is a separator;
-// whitespace inside a quoted item is preserved.
+// removed and its C-style backslash escapes unescaped; an unquoted item is
+// returned with its C-style escapes unescaped as well. Whitespace between
+// items is a separator; whitespace inside a quoted item is preserved.
 func systemdEnvItems(value string) []string {
 	var (
 		items []string
@@ -304,10 +306,12 @@ func systemdEnvItems(value string) []string {
 
 		switch {
 		case inQuote != 0:
-			if inQuote == '"' && c == '\\' && i+1 < len(value) {
+			// Escape sequences are processed in ALL quoted forms (systemd
+			// applies cunescape inside both single and double quotes).
+			if c == '\\' && i+1 < len(value) {
 				decoded, consumed, ok := systemdDecodeEscape(value[i:])
 				if ok {
-					cur.WriteRune(decoded)
+					cur.Write(decoded)
 
 					i += consumed - 1
 
@@ -331,6 +335,22 @@ func systemdEnvItems(value string) []string {
 			inQuote = c
 			quoted = true
 
+		case c == '\\' && inQuote == 0:
+			// Bare (unquoted) items also process C escapes (systemd's
+			// extract_first_word applies cunescape outside quotes too).
+			if i+1 < len(value) {
+				decoded, consumed, ok := systemdDecodeEscape(value[i:])
+				if ok {
+					cur.Write(decoded)
+
+					i += consumed - 1
+
+					continue
+				}
+			}
+
+			cur.WriteByte(c)
+
 		case c == ' ' || c == '\t' || c == '\r' || c == '\n':
 			if cur.Len() > 0 || quoted {
 				items = append(items, cur.String())
@@ -351,109 +371,123 @@ func systemdEnvItems(value string) []string {
 	return items
 }
 
-// systemdDecodeEscape resolves a C-style escape sequence that follows a backslash
-// inside a double-quoted systemd item. It returns the decoded rune and the number
-// of bytes consumed after the backslash (including the backslash itself). It
-// reports ok=false when the sequence is not recognized; the caller then decides
-// whether to treat it as a literal backslash or an error.
+// systemdDecodeEscape resolves a C-style escape sequence that begins with a
+// backslash at s[0]. It returns the decoded bytes and the total number of bytes
+// consumed from s (including the backslash). It reports ok=false when the
+// sequence is malformed or unrecognized; the caller then decides whether to
+// treat it as a literal backslash or an error.
 //
-// Supported forms (per systemd.syntax man page, "Quoting" section):
+// The grammar follows systemd's src/basic/escape.c (cunescape_one) and
+// src/basic/extract-word.c (extract_first_word with EXTRACT_CUNESCAPE):
+// escape sequences are processed in ALL item forms (bare, single-quoted, and
+// double-quoted), not only inside double quotes.
+//
+// Supported forms:
 //   - \n, \t, \r, \b, \f, \v, \\, \", \'  (single-char C escapes)
-//   - \xHH  (hex, 1-2 hex digits)
-//   - \NNN  (octal, 1-3 octal digits)
-//   - \uNNNN (Unicode BMP, 4 hex digits)
-//   - \UNNNNNNNN (Unicode full, 8 hex digits)
-//   - \s  (space; systemd also allows \s for a literal space)
-func systemdDecodeEscape(s string) (rune, int, bool) {
+//   - \s  (space)
+//   - \xHH  (exactly 2 hex digits; produces a single raw byte)
+//   - \NNN  (exactly 3 octal digits; produces a single raw byte)
+//   - \uNNNN (Unicode BMP code point, 4 hex digits; UTF-8 encoded)
+//   - \UNNNNNNNN (Unicode full code point, 8 hex digits; UTF-8 encoded)
+//
+// Hex and octal escapes produce raw bytes (eight_bit=true in systemd), not
+// code points. This means \xc3\xa9 produces the two bytes 0xC3 0xA9 (which is
+// é in UTF-8), not U+00C3 followed by U+00A9.
+func systemdDecodeEscape(s string) ([]byte, int, bool) {
 	if len(s) < 2 {
-		return 0, 0, false
+		return nil, 0, false
 	}
 
 	c := s[1]
 
 	switch c {
 	case '\\', '"', '\'':
-		return rune(c), 2, true
+		return []byte{c}, 2, true
 	case 'n':
-		return '\n', 2, true
+		return []byte{'\n'}, 2, true
 	case 't':
-		return '\t', 2, true
+		return []byte{'\t'}, 2, true
 	case 'r':
-		return '\r', 2, true
+		return []byte{'\r'}, 2, true
 	case 'b':
-		return '\b', 2, true
+		return []byte{'\b'}, 2, true
 	case 'f':
-		return '\f', 2, true
+		return []byte{'\f'}, 2, true
 	case 'v':
-		return '\v', 2, true
+		return []byte{'\v'}, 2, true
 	case 's':
-		return ' ', 2, true
+		return []byte{' '}, 2, true
 	case 'x':
-		// Hex: \xHH (1-2 hex digits).
-		hex := s[2:]
-
-		n := 0
-		for n < len(hex) && n < 2 && isHexDigit(hex[n]) {
-			n++
+		// Hex: \xHH (exactly 2 hex digits). Produces a raw byte.
+		if len(s) < 4 {
+			return nil, 0, false
 		}
 
-		if n == 0 {
-			return 0, 0, false
+		if !isHexDigit(s[2]) || !isHexDigit(s[3]) {
+			return nil, 0, false
 		}
 
-		v, err := strconv.ParseUint(hex[:n], 16, 32)
-		if err != nil {
-			return 0, 0, false
+		v, err := strconv.ParseUint(s[2:4], 16, 8)
+		if err != nil || v == 0 {
+			return nil, 0, false
 		}
 
-		return rune(v), 2 + n, true
+		return []byte{byte(v)}, 4, true
 	}
 
-	// Octal: \NNN (1-3 octal digits).
+	// Octal: \NNN (exactly 3 octal digits). Produces a raw byte.
 	if c >= '0' && c <= '7' {
-		oct := s[1:]
-
-		n := 0
-		for n < len(oct) && n < 3 && oct[n] >= '0' && oct[n] <= '7' {
-			n++
+		if len(s) < 4 {
+			return nil, 0, false
 		}
 
-		v, err := strconv.ParseUint(oct[:n], 8, 32)
-		if err != nil {
-			return 0, 0, false
+		if s[2] < '0' || s[2] > '7' || s[3] < '0' || s[3] > '7' {
+			return nil, 0, false
 		}
 
-		return rune(v), 1 + n, true
+		v, err := strconv.ParseUint(s[1:4], 8, 8)
+		if err != nil || v == 0 {
+			return nil, 0, false
+		}
+
+		return []byte{byte(v)}, 4, true
 	}
 
-	// Unicode: \uNNNN (4 hex) or \UNNNNNNNN (8 hex).
+	// Unicode: \uNNNN (4 hex) or \UNNNNNNNN (8 hex). Produces UTF-8 bytes.
 	if c == 'u' || c == 'U' {
-		// Count the hex digits.
 		hexLen := 4
 		if c == 'U' {
 			hexLen = 8
 		}
 
 		if len(s) < 2+hexLen {
-			return 0, 0, false
+			return nil, 0, false
 		}
 
 		hex := s[2 : 2+hexLen]
 		for i := range hex {
 			if !isHexDigit(hex[i]) {
-				return 0, 0, false
+				return nil, 0, false
 			}
 		}
 
 		v, err := strconv.ParseUint(hex, 16, 32)
 		if err != nil {
-			return 0, 0, false
+			return nil, 0, false
 		}
 
-		return rune(v), 2 + hexLen, true
+		r := rune(v)
+		if r == 0 {
+			return nil, 0, false
+		}
+
+		buf := make([]byte, 4)
+		n := utf8.EncodeRune(buf, r)
+
+		return buf[:n], 2 + hexLen, true
 	}
 
-	return 0, 0, false
+	return nil, 0, false
 }
 
 // isHexDigit reports whether b is an ASCII hex digit.
@@ -521,10 +555,14 @@ func nodeConfigArgsItem(value string) (string, bool) {
 // quoting, so the generated whole-assignment-quoted form
 // Environment="KUBELET_NODE_CONFIG_ARGS=...", a value-quoted form
 // Environment=KUBELET_NODE_CONFIG_ARGS="...", a bare assignment, and a directive
-// that also carries other items are all recognized.
+// that also carries other items are all recognized. Leading whitespace
+// (indentation) is tolerated: the directive may be indented inside a [Service]
+// stanza, and the getter and renderer must agree on recognition.
 func nodeConfigArgsLine(line string) bool {
-	rest := strings.TrimPrefix(line, "Environment=")
-	if rest == line {
+	trimmed := strings.TrimLeft(line, " \t")
+
+	rest := strings.TrimPrefix(trimmed, "Environment=")
+	if rest == trimmed {
 		return false
 	}
 
@@ -902,6 +940,8 @@ func decodedItemStartsWithKey(raw string) bool {
 
 // decodeOneItem decodes a single raw item span (which may be a quoted or
 // unquoted run, or a key followed by a quoted value) into its decoded text.
+// Escape sequences are processed in all forms (bare, single-quoted, and
+// double-quoted), matching systemd's extract_first_word behavior.
 func decodeOneItem(raw string) string {
 	var b strings.Builder
 
@@ -912,10 +952,11 @@ func decodeOneItem(raw string) string {
 
 		switch {
 		case inQuote != 0:
-			if inQuote == '"' && c == '\\' && i+1 < len(raw) {
+			// Escapes are processed in ALL quoted forms.
+			if c == '\\' && i+1 < len(raw) {
 				decoded, consumed, ok := systemdDecodeEscape(raw[i:])
 				if ok {
-					b.WriteRune(decoded)
+					b.Write(decoded)
 
 					i += consumed - 1
 
@@ -938,6 +979,21 @@ func decodeOneItem(raw string) string {
 		case c == '"' || c == '\'':
 			inQuote = c
 
+		case c == '\\' && inQuote == 0:
+			// Bare (unquoted) items also process C escapes.
+			if i+1 < len(raw) {
+				decoded, consumed, ok := systemdDecodeEscape(raw[i:])
+				if ok {
+					b.Write(decoded)
+
+					i += consumed - 1
+
+					continue
+				}
+			}
+
+			b.WriteByte(c)
+
 		default:
 			b.WriteByte(c)
 		}
@@ -954,7 +1010,21 @@ func decodeOneItem(raw string) string {
 // example one containing a backslash) is written back as the value systemd
 // reads it as.
 func rewriteKubeletItem(line, args string) string {
-	rest := strings.TrimPrefix(line, "Environment=")
+	// Preserve leading indentation: the directive may be indented inside a
+	// [Service] stanza, and the rewrite must not strip it.
+	indent := ""
+	trimmed := line
+
+	for len(trimmed) > 0 && (trimmed[0] == ' ' || trimmed[0] == '\t') {
+		indent += trimmed[:1]
+		trimmed = trimmed[1:]
+	}
+
+	rest := strings.TrimPrefix(trimmed, "Environment=")
+	if rest == trimmed {
+		return line
+	}
+
 	carriage := strings.HasSuffix(rest, "\r")
 
 	if carriage {
@@ -969,6 +1039,8 @@ func rewriteKubeletItem(line, args string) string {
 	replacement := nodeConfigArgsKey + "=" + systemdQuote(args)
 
 	var b strings.Builder
+	b.WriteString(indent)
+	b.WriteString("Environment=")
 	b.WriteString(rest[:start])
 	b.WriteString(replacement)
 	b.WriteString(rest[end:])
@@ -979,7 +1051,7 @@ func rewriteKubeletItem(line, args string) string {
 		suffix = "\r"
 	}
 
-	return "Environment=" + b.String() + suffix
+	return b.String() + suffix
 }
 
 // registryAuthBackoff returns the delay to wait before the next restart attempt

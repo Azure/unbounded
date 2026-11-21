@@ -307,7 +307,10 @@ func (h *attachACRHandler) ensureACRPullGrant(ctx context.Context, acrID *arm.Re
 		return err
 	}
 
-	grantName := acrPullGrantName(h.clusterID, h.acrID, principal, role)
+	// Use the canonical parsed resource ID (not the raw command-line spelling)
+	// so that equivalent accepted forms (trailing slash, case differences)
+	// produce the same receipt.
+	grantName := acrPullGrantName(h.clusterID, acrID.String(), principal, role)
 
 	conditional := false
 
