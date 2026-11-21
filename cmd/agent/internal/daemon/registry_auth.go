@@ -214,13 +214,26 @@ func (r *registryAuthReconciler) ReconcileRegistryAuth(ctx context.Context) (rec
 	// The policy is verified healthy. Record the verified revision in the
 	// durable ledger and reset the bounded-restart budget so a healthy node does
 	// not carry a stale attempt count or a stale "restart pending" flag into a
-	// future change.
+	// future change. These durability transitions are load-bearing: if the
+	// verified-revision record or the budget reset is not durably written (the
+	// rename + directory sync fails), a later crash would re-derive work or
+	// leave a stale attempt count, and the node could restart unboundedly. A
+	// failed durability transition therefore must not produce a healthy
+	// success; it is reported as a failure and retried.
 	if err := r.clearPendingWork(active.Name, desired.policyHash); err != nil {
-		r.log.Warn("clear registry-auth pending work failed", "error", err)
+		if werr := r.writeCondition(ctx, machine, false, "LedgerWriteFailed", "verified registry-auth ledger could not be durably recorded"); werr != nil {
+			r.log.Warn("write registry-auth condition failed", "error", werr)
+		}
+
+		return reconcile.Result{RequeueAfter: registryAuthRequeue}, fmt.Errorf("clear registry-auth pending work: %w", err)
 	}
 
 	if err := r.resetBudget(active.Name, desired.policyHash); err != nil {
-		r.log.Warn("reset registry-auth budget failed", "error", err)
+		if werr := r.writeCondition(ctx, machine, false, "BudgetResetFailed", "registry-auth restart budget could not be durably reset"); werr != nil {
+			r.log.Warn("write registry-auth condition failed", "error", werr)
+		}
+
+		return reconcile.Result{RequeueAfter: registryAuthRequeue}, fmt.Errorf("reset registry-auth budget: %w", err)
 	}
 
 	// The healthy condition reasons match the API contract: "Configured" for an
@@ -439,15 +452,18 @@ func (r *registryAuthReconciler) reloadKubeletUnit(ctx context.Context, active *
 	return nil
 }
 
-// fsyncPath syncs the contents of an open file and the directory entry for
-// path, so an interrupted atomic write (temp + rename) survives a power loss
-// with the rename in place rather than the old file. The directory sync is what
-// makes the rename durable; the file sync makes the content durable.
-func fsyncPath(f *os.File, path string) error {
-	if err := f.Sync(); err != nil {
-		return err
-	}
+// fsyncFile syncs the contents of an open file to durable storage. It is the
+// content-durability half of an atomic write; the caller must separately sync
+// the destination directory AFTER the rename to make the rename itself durable.
+func fsyncFile(f *os.File) error {
+	return f.Sync()
+}
 
+// fsyncDir syncs the directory entry for path, so a rename (or create/delete)
+// of a path inside it is durable across a power loss. The directory sync is
+// what makes the rename durable; it must be performed AFTER the rename, not on
+// the temporary name before it.
+func fsyncDir(path string) error {
 	d, err := os.Open(filepath.Dir(path))
 	if err != nil {
 		return err
@@ -459,8 +475,11 @@ func fsyncPath(f *os.File, path string) error {
 }
 
 // writeJSONFile atomically writes a JSON value to path (temp file in the same
-// directory, synced, then renamed into place), so an interrupted write cannot
-// leave a corrupt file and a durable record survives a crash.
+// directory, content synced, renamed into place, then the destination
+// directory synced), so an interrupted write cannot leave a corrupt file and
+// the final record (its content and its name) survives a power loss. The
+// directory sync happens after the rename so the durable transition is the
+// final entry, not the temporary one.
 func writeJSONFile(path string, value any) error {
 	data, err := json.Marshal(value)
 	if err != nil {
@@ -491,7 +510,8 @@ func writeJSONFile(path string, value any) error {
 		return err
 	}
 
-	if err := fsyncPath(tmp, name); err != nil {
+	// Sync the content before the rename so the file data is durable.
+	if err := fsyncFile(tmp); err != nil {
 		tmp.Close()
 
 		return err
@@ -501,7 +521,13 @@ func writeJSONFile(path string, value any) error {
 		return err
 	}
 
-	return os.Rename(name, path)
+	if err := os.Rename(name, path); err != nil {
+		return err
+	}
+
+	// Sync the destination directory after the rename so the final entry is
+	// durable, not just the temporary name.
+	return fsyncDir(path)
 }
 
 // boundedRestartKubelet charges the bounded-restart budget and restarts only
@@ -654,8 +680,9 @@ func (r *registryAuthReconciler) verifyKubelet(ctx context.Context, active *Acti
 // registryAuthEffectiveManagedFlags reports whether the argv's effective image
 // credential provider configuration is the managed one: for each managed flag
 // (config path and bin-dir), the flag name is present and its last occurrence
-// (the value kubelet actually uses) equals the managed value. A flag name
-// present only as a different value, or absent entirely, is not effective.
+// (the value kubelet actually uses) equals the managed value. Both the inline
+// --flag=value and the split --flag value forms are honored, and a flag present
+// only as a different value, or absent entirely, is not effective.
 func registryAuthEffectiveManagedFlags(argv []string) bool {
 	for _, managed := range registryAuthProviderFlags() {
 		name := providerFlagName(managed)
@@ -663,17 +690,10 @@ func registryAuthEffectiveManagedFlags(argv []string) bool {
 			return false
 		}
 
-		last := ""
-		found := false
+		wantValue := providerFlagValue(managed)
+		got, found := providerFlagEffectiveValue(argv, name)
 
-		for _, tok := range argv {
-			if providerFlagName(tok) == name {
-				last = tok
-				found = true
-			}
-		}
-
-		if !found || last != managed {
+		if !found || got != wantValue {
 			return false
 		}
 	}

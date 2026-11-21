@@ -28,15 +28,30 @@ import (
 	"github.com/Azure/unbounded/internal/registryauth"
 )
 
+// The built-in Azure role definition GUIDs the attach path can grant on an ACR.
+// RoleDefinitionIDs end in these GUIDs (not in names), so the detach reversal
+// must compare against them.
+const (
+	// acrPullRoleID is the AcrPull built-in role
+	// (7f951dda-4ed3-4680-a7ca-43fe172d538d).
+	acrPullRoleID = "7f951dda-4ed3-4680-a7ca-43fe172d538d"
+
+	// repositoryReaderRoleID is the Container Registry Repository Reader
+	// built-in role (b93aa761-3e63-49ed-ac28-beffa264f7ac), as published by
+	// Microsoft:
+	// https://learn.microsoft.com/en-us/azure/role-based-access-control/built-in-roles/containers#container-registry-repository-reader
+	repositoryReaderRoleID = "b93aa761-3e63-49ed-ac28-beffa264f7ac"
+)
+
 type detachACRHandler struct {
-	clusterID, namespace, kubeconfig string
-	timeout                          time.Duration
-	removeAzure                      bool
-	client                           kubernetes.Interface
-	restConfig                       *rest.Config
-	machineClient                    machineStatusReader
-	runAzure                         func(context.Context, string, ...string) ([]byte, error)
-	out                              io.Writer
+	acrID, clusterID, namespace, kubeconfig string
+	timeout                                 time.Duration
+	removeAzure                             bool
+	client                                  kubernetes.Interface
+	restConfig                              *rest.Config
+	machineClient                           machineStatusReader
+	runAzure                                func(context.Context, string, ...string) ([]byte, error)
+	out                                     io.Writer
 }
 
 // execute reverts managed ACR authentication to external mode: it sets the
@@ -138,10 +153,11 @@ func (h *detachACRHandler) execute(ctx context.Context) error {
 // waitForExternalConvergence blocks until every agent-backed Flex node reports
 // the external policy converged (RegistryAuth condition True with reason
 // External, observed at the current generation, with the delivered spec
-// matching the external policy). A node that still reports a managed
-// (Configured) condition, a stale generation, or a terminal failure is not
-// converged and is retried until the timeout; a node with no Machine yet is
-// still installing and is retried.
+// matching the external policy). Every eligible not-ready node is checked,
+// including a node with no Machine yet (still installing) and a node that still
+// reports a managed (Configured) condition, stale generation, or undelivered
+// policy: all are retried until the timeout. A node reporting a terminal
+// failure is surfaced immediately, not polled to the timeout.
 func (h *detachACRHandler) waitForExternalConvergence(ctx context.Context) error {
 	// The desired policy for detach is external (nil spec.registryAuth).
 	var lastError error
@@ -153,7 +169,17 @@ func (h *detachACRHandler) waitForExternalConvergence(ctx context.Context) error
 		}
 
 		for name, st := range statuses {
-			if st.hasMachine && !st.ready {
+			if st.terminal {
+				// A terminal failure is surfaced immediately, not polled to the
+				// timeout: the node reported the external policy will not
+				// converge.
+				return false, fmt.Errorf("flex node %s reports a terminal failure: %s", name, st.detail)
+			}
+
+			if !st.ready {
+				// Not converged: a node with no Machine is still installing, and
+				// a node that still reports a managed or stale condition is still
+				// converging. Both are retried until the timeout.
 				lastError = fmt.Errorf("flex node %s has not converged to external authentication: %s", name, st.detail)
 
 				return false, nil
@@ -198,21 +224,55 @@ func (h *detachACRHandler) removePullGrant(ctx context.Context) error {
 		return err
 	}
 
+	// The ACR resource ID identifies the registry whose pull grant is being
+	// reversed. The grant is scoped to the ACR and lives in the ACR's
+	// subscription, which may differ from the AKS cluster's, so the ACR
+	// authority (not the cluster authority) is what finds and reverses it.
+	acrID, err := azureResourceID(h.acrID, "Microsoft.ContainerRegistry/registries")
+	if err != nil {
+		return fmt.Errorf("--acr-resource-id is required with --remove-azure: %w", err)
+	}
+
 	// The deterministic UAMI name the attach path derives from the cluster ID.
 	digest := sha256.Sum256([]byte(strings.ToLower(h.clusterID)))
 	name := "gantry-pull-" + hex.EncodeToString(digest[:6])
 
-	// The owned principal the role assignment was granted on; "" when there is
-	// no owned identity to reverse.
+	// --- Phase 1: validate ALL ownership that can refuse the operation, before
+	// any deletion. A foreign resource at the same name, or a foreign
+	// Kubernetes grant, must abort the whole operation before anything is
+	// deleted, so the detach never deletes some resources and then refuse on
+	// the rest.
+	if err := h.checkClusterRoleBindingOwned(ctx); err != nil {
+		return err
+	}
+
 	principal, err := h.ownedIdentityPrincipalID(ctx, clusterID, name)
 	if err != nil {
 		return err
 	}
 
-	if principal != "" {
-		if err := h.removeACRRoleAssignment(ctx, clusterID.SubscriptionID, principal); err != nil {
-			return err
+	// The role assignments to reverse and the ones to preserve. Owned grants
+	// carry the unbounded ownership receipt tag; shared/inherited/reused grants
+	// do not and are left in place, reported for manual cleanup.
+	owned, preserved, err := h.findACRRoleAssignments(ctx, acrID, principal)
+	if err != nil {
+		return err
+	}
+
+	if len(preserved) > 0 {
+		if h.out != nil {
+			for _, p := range preserved {
+				if _, werr := fmt.Fprintln(h.out, "Preserving ACR role assignment not created by this installation (manual cleanup required): "+p.ID); werr != nil {
+					return fmt.Errorf("report preserved role assignment %s: %w", p.ID, werr)
+				}
+			}
 		}
+	}
+
+	// --- Phase 2: all ownership checks passed; perform the deletions in the
+	// safe order (grant, binding, identity, then the K8s RBAC grant).
+	if err := h.deleteACRRoleAssignments(ctx, acrID, owned); err != nil {
+		return err
 	}
 
 	if err := h.removeACRIdentityBinding(ctx, clusterID, name); err != nil {
@@ -225,6 +285,141 @@ func (h *detachACRHandler) removePullGrant(ctx context.Context) error {
 
 	if err := h.removeClusterRoleBinding(ctx); err != nil {
 		return err
+	}
+
+	return nil
+}
+
+// checkClusterRoleBindingOwned verifies, read-only, that the Kubernetes
+// identity-use grant (if present) is owned by this installation for this
+// namespace, so the ownership gate runs before any Azure deletion rather than
+// as the last step. Absence is allowed; a foreign grant is refused.
+func (h *detachACRHandler) checkClusterRoleBindingOwned(ctx context.Context) error {
+	binding, err := h.client.RbacV1().ClusterRoleBindings().Get(ctx, registryauth.IdentityRoleName, metav1.GetOptions{})
+	if err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	if err == nil &&
+		(binding.Labels["unbounded-cloud.io/namespace"] != h.namespace || binding.Labels["app.kubernetes.io/managed-by"] != acrAttachManager) {
+		return errors.New("refusing to remove pull grant: the identity-use ClusterRoleBinding is not owned by this installation for this namespace")
+	}
+
+	return nil
+}
+
+// acrRoleAssignment is a role assignment on the pull principal that scopes an
+// ACR role to a registry.
+type acrRoleAssignment struct {
+	ID        string
+	Scope     string
+	Condition string
+	Owned     bool
+	RoleID    string
+}
+
+// findACRRoleAssignments lists the role assignments on the pull principal in the
+// ACR's subscription and partitions them into owned (carrying the unbounded
+// ownership receipt tag for this cluster) and preserved (shared/inherited/
+// reused, no receipt). Only the owned grants are reversed; the preserved ones
+// are left in place and reported. A conditional grant is never reversed.
+func (h *detachACRHandler) findACRRoleAssignments(ctx context.Context, acrID *arm.ResourceID, principalID string) (owned, preserved []acrRoleAssignment, err error) {
+	if principalID == "" {
+		// No owned identity, so no role assignment to reverse.
+		return nil, nil, nil
+	}
+
+	var raw []struct {
+		PrincipalID      string
+		RoleDefinitionID string
+		Scope            string
+		ID               string
+		Condition        string
+		Tags             map[string]string
+	}
+
+	// The grant is scoped to the ACR and lives in the ACR's subscription, which
+	// may differ from the AKS cluster's. List at the ACR's subscription scope.
+	if err := h.azureJSON(ctx, acrID.SubscriptionID, &raw, "role", "assignment", "list",
+		"--assignee", principalID, "--include-inherited", "--scope", "/subscriptions/"+acrID.SubscriptionID); err != nil {
+		return nil, nil, fmt.Errorf("list role assignments for principal %s: %w", principalID, err)
+	}
+
+	for _, a := range raw {
+		if !strings.EqualFold(a.PrincipalID, principalID) {
+			continue
+		}
+
+		// The scope must be this ACR (the attach path scopes the grant to the
+		// ACR, not the subscription or a resource group).
+		scopeID, perr := azureResourceID(a.Scope, "Microsoft.ContainerRegistry/registries")
+		if perr != nil {
+			continue
+		}
+
+		if !strings.EqualFold(scopeID.SubscriptionID, acrID.SubscriptionID) ||
+			!strings.EqualFold(scopeID.ResourceGroupName, acrID.ResourceGroupName) ||
+			!strings.EqualFold(scopeID.Name, acrID.Name) {
+			continue
+		}
+
+		// The role must be one the attach path granted: AcrPull or the Container
+		// Registry Repository Reader built-in role, matched by their published
+		// built-in role definition GUIDs (RoleDefinitionIDs end in GUIDs, not
+		// names).
+		if !isACRPullRole(a.RoleDefinitionID) && !isRepositoryReaderRole(a.RoleDefinitionID) {
+			continue
+		}
+
+		// A conditional grant is never the unconditional one the attach path
+		// created; it is shared/inherited and is left in place, never reversed.
+		if a.Condition != "" {
+			preserved = append(preserved, acrRoleAssignment{ID: a.ID, Scope: a.Scope, Condition: a.Condition, RoleID: a.RoleDefinitionID})
+
+			continue
+		}
+
+		// Ownership proof is the receipt tag the attach path stamps on grants it
+		// creates. A grant on the same principal+ACR without the tag (for
+		// example, one attach merely reused) is not owned and is preserved.
+		ownedTag := strings.EqualFold(a.Tags["unbounded-cluster-id"], h.clusterID)
+
+		entry := acrRoleAssignment{ID: a.ID, Scope: a.Scope, Condition: a.Condition, RoleID: a.RoleDefinitionID, Owned: ownedTag}
+		if ownedTag {
+			owned = append(owned, entry)
+		} else {
+			preserved = append(preserved, entry)
+		}
+	}
+
+	return owned, preserved, nil
+}
+
+// isACRPullRole reports whether a role definition ID is the AcrPull built-in
+// role (7f951dda-4ed3-4680-a7ca-43fe172d538d).
+func isACRPullRole(roleDefinitionID string) bool {
+	return strings.HasSuffix(strings.ToLower(roleDefinitionID), "/"+acrPullRoleID)
+}
+
+// isRepositoryReaderRole reports whether a role definition ID is the Container
+// Registry Repository Reader built-in role
+// (b93aa761-3e63-49ed-ac28-beffa264f7ac), as published by Microsoft.
+func isRepositoryReaderRole(roleDefinitionID string) bool {
+	return strings.HasSuffix(strings.ToLower(roleDefinitionID), "/"+repositoryReaderRoleID)
+}
+
+// deleteACRRoleAssignments deletes the owned (receipt-tagged) ACR role
+// assignments by their full resource ID, in the ACR's subscription. Absence of
+// an assignment is success (it may have been removed already).
+func (h *detachACRHandler) deleteACRRoleAssignments(ctx context.Context, acrID *arm.ResourceID, owned []acrRoleAssignment) error {
+	for _, a := range owned {
+		if _, err := h.runAzure(ctx, acrID.SubscriptionID, "role", "assignment", "delete", "--id", a.ID); err != nil {
+			if isAzureNotFound(err) {
+				continue
+			}
+
+			return fmt.Errorf("delete ACR role assignment %s: %w", a.ID, err)
+		}
 	}
 
 	return nil
@@ -290,86 +485,6 @@ func (h *detachACRHandler) ownedIdentityPrincipalID(ctx context.Context, cluster
 	}
 
 	return identity.PrincipalID, nil
-}
-
-// removeACRRoleAssignment deletes the ACR role assignment (AcrPull or
-// Repository Reader) that the attach path granted on the owned principal,
-// scoped to an ACR. It lists the assignments for the principal at the
-// subscription scope and deletes only the ones whose role definition is one of
-// the two ACR roles the attach path uses and whose scope is an ACR resource. A
-// shared, inherited, or reused grant (a role assignment on the same principal
-// that this installation did not create) is left in place and reported as
-// uncertain rather than deleted or faked as success.
-func (h *detachACRHandler) removeACRRoleAssignment(ctx context.Context, subscriptionID, principalID string) error {
-	var assignments []struct {
-		PrincipalID      string
-		RoleDefinitionID string
-		Scope            string
-		ID               string
-		Condition        string
-	}
-
-	if err := h.azureJSON(ctx, subscriptionID, &assignments, "role", "assignment", "list",
-		"--assignee", principalID, "--include-inherited", "--scope", "/subscriptions/"+subscriptionID); err != nil {
-		return fmt.Errorf("list role assignments for principal %s: %w", principalID, err)
-	}
-
-	acrPull := "7f951dda-4ed3-4680-a7ca-43fe172d538d" // AcrPull built-in role ID.
-
-	removed := 0
-
-	for _, a := range assignments {
-		if !strings.EqualFold(a.PrincipalID, principalID) {
-			continue
-		}
-
-		// The scope must be an ACR resource (the attach path scopes the grant to
-		// the ACR, not the subscription or a resource group).
-		scopeID, err := azureResourceID(a.Scope, "Microsoft.ContainerRegistry/registries")
-		if err != nil {
-			continue
-		}
-
-		// The role must be one the attach path granted: AcrPull, or the
-		// Repository Reader role (whose definition ID is not a fixed well-known
-		// ID, so it is matched by name suffix).
-		role := strings.ToLower(a.RoleDefinitionID)
-
-		isAcrPull := strings.HasSuffix(role, "/"+acrPull)
-
-		if !isAcrPull && !strings.HasSuffix(role, "repository-reader") {
-			continue
-		}
-
-		if a.Condition != "" {
-			// A conditional grant is not the unconditional one the attach path
-			// created; it is shared/inherited and is left in place. Surface the
-			// uncertainty rather than deleting it.
-			return fmt.Errorf("refusing to remove role assignment %s: it is conditional and not the unbounded pull grant", a.ID)
-		}
-
-		// Delete by the full resource ID: the attach path used role add, which
-		// auto-names the assignment, so the ID is the unambiguous handle.
-		if _, err := h.runAzure(ctx, subscriptionID, "role", "assignment", "delete", "--id", a.ID); err != nil {
-			if isAzureNotFound(err) {
-				continue
-			}
-
-			return fmt.Errorf("delete ACR role assignment %s: %w", scopeID.Name, err)
-		}
-
-		removed++
-	}
-
-	if removed == 0 {
-		// No grant the attach path created was found on the owned principal.
-		// This is not an error: the attach path may have been interrupted before
-		// creating the role assignment, or the grant may have been removed
-		// manually. Absence of the grant this installation owns is success.
-		return nil
-	}
-
-	return nil
 }
 
 // removeClusterRoleBinding deletes the K8s RBAC grant (the identity-use

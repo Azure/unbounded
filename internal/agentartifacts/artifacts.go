@@ -172,6 +172,15 @@ func CoreDNSArchive(override *goalstates.DownloadSource, version, arch string) s
 // upstream release (ACRProviderVersion) rather than a versioned node binary, so
 // the version does not follow the cluster Kubernetes version.
 func ACRProviderBinary(override *goalstates.DownloadSource, arch string) string {
+	return ACRProviderBinaryForVersion(override, ACRProviderVersion, arch)
+}
+
+// ACRProviderBinaryForVersion resolves the download URL for the stock ACR
+// credential provider binary at an explicit version (with or without a leading
+// "v"), honoring the optional override. The offline bundle producer uses this
+// to materialize the provider at the version the bundle manifest records, rather
+// than the agent's default pinned release.
+func ACRProviderBinaryForVersion(override *goalstates.DownloadSource, version, arch string) string {
 	if override != nil && override.URL != "" {
 		return fmt.Sprintf(override.URL, arch)
 	}
@@ -181,7 +190,9 @@ func ACRProviderBinary(override *goalstates.DownloadSource, arch string) string 
 		base = strings.TrimRight(override.BaseURL, "/")
 	}
 
-	return fmt.Sprintf("%s/%s/azure-acr-credential-provider-linux-%s", base, ACRProviderVersion, arch)
+	version = "v" + bootstrapartifacts.StripLeadingV(version)
+
+	return fmt.Sprintf("%s/%s/azure-acr-credential-provider-linux-%s", base, version, arch)
 }
 
 // ACRProviderSHA256For returns the pinned SHA256 of the ACR credential provider

@@ -488,8 +488,13 @@ func TestGantryAttachACRABACRoleSelection(t *testing.T) {
 				require.NoError(t, err)
 				_, err := registryauth.Derive(source.Data["config.yaml"], source.Data[registryauth.ConfigKey])
 				require.NoError(t, err)
+				// The created grant is stamped with the unbounded ownership
+				// receipt tag so detach can reverse exactly the grant this
+				// installation created, and leave a shared/reused grant in
+				// place.
 				require.Contains(t, *calls, "role assignment create --assignee-object-id "+attachPrincipalID+
-					" --assignee-principal-type ServicePrincipal --role "+readerRole+" --scope "+h.acrID)
+					" --assignee-principal-type ServicePrincipal --role "+readerRole+" --scope "+h.acrID+
+					" --tags unbounded-cluster-id="+h.clusterID)
 			}
 		})
 	}
@@ -609,6 +614,64 @@ func TestGantryAttachACRMergesConcurrentConfiguration(t *testing.T) {
 	require.Equal(t, "concurrent edit", got.Data["other.yaml"])
 }
 
+// TestGantryAttachACRReattachUpdatesOwnedDiscoveryServiceAccount verifies the
+// reattach-with-a-fresh-identity path: when a prior attach created the owned
+// gantry-acr-discovery ServiceAccount annotated with an old (stale) client-id,
+// and a re-attach mints a new identity, the attach updates the owned account's
+// identity annotations in place rather than refusing. A truly foreign account
+// (wrong managed-by label) is still refused.
+func TestGantryAttachACRReattachUpdatesOwnedDiscoveryServiceAccount(t *testing.T) {
+	h, client, _ := managedAttachFixture(t)
+
+	staleClientID := "11111111-0000-0000-0000-000000000000"
+	staleTenantID := "44444444-0000-0000-0000-000000000000"
+
+	// An owned discovery ServiceAccount from a prior attach, carrying a stale
+	// (old) identity. The re-attach must update it to the fresh identity the
+	// Azure fixture returns (attachClientID/attachTenantID).
+	_, err := client.CoreV1().ServiceAccounts(h.namespace).Create(t.Context(), &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "gantry-acr-discovery", Namespace: h.namespace,
+			Labels:      map[string]string{"app.kubernetes.io/managed-by": acrAttachManager},
+			Annotations: map[string]string{"azure.workload.identity/client-id": staleClientID, "azure.workload.identity/tenant-id": staleTenantID},
+		},
+	}, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	require.NoError(t, h.execute(t.Context()))
+
+	got, err := client.CoreV1().ServiceAccounts(h.namespace).Get(t.Context(), "gantry-acr-discovery", metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Equal(t, attachClientID, got.Annotations["azure.workload.identity/client-id"],
+		"the owned discovery account must be updated to the fresh client-id, not refused")
+	require.Equal(t, attachTenantID, got.Annotations["azure.workload.identity/tenant-id"],
+		"the owned discovery account must be updated to the fresh tenant-id")
+}
+
+// TestGantryAttachACRReattachRefusesForeignDiscoveryServiceAccount verifies a
+// foreign (unowned) discovery ServiceAccount is still refused, even when the
+// attach would update an owned one: the managed-by label must match.
+func TestGantryAttachACRReattachRefusesForeignDiscoveryServiceAccount(t *testing.T) {
+	h, client, _ := managedAttachFixture(t)
+
+	// A foreign discovery ServiceAccount: wrong managed-by label.
+	_, err := client.CoreV1().ServiceAccounts(h.namespace).Create(t.Context(), &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "gantry-acr-discovery", Namespace: h.namespace,
+			Labels:      map[string]string{"app.kubernetes.io/managed-by": "customer"},
+			Annotations: map[string]string{"azure.workload.identity/client-id": "99999999-9999-9999-9999-999999999999"},
+		},
+	}, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	require.ErrorContains(t, h.execute(t.Context()), "unowned")
+
+	// The foreign account is untouched.
+	got, err := client.CoreV1().ServiceAccounts(h.namespace).Get(t.Context(), "gantry-acr-discovery", metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Equal(t, "customer", got.Labels["app.kubernetes.io/managed-by"], "a foreign account must not be changed")
+}
+
 func TestGantryAttachACRManagedUsesStockProviderWithoutComputeAssignment(t *testing.T) {
 	h, client, calls := managedAttachFixture(t)
 	require.NoError(t, h.execute(t.Context()))
@@ -705,8 +768,13 @@ func TestGantryAttachACRManagedCrossSubscription(t *testing.T) {
 					require.NotContains(t, call, "role assignment create")
 				}
 			} else {
+				// The created grant is stamped with the unbounded ownership
+				// receipt tag so detach can reverse exactly the grant this
+				// installation created, and leave a shared/reused grant in
+				// place.
 				require.Contains(t, *calls, "role assignment create --assignee-object-id "+attachPrincipalID+
-					" --assignee-principal-type ServicePrincipal --role 7f951dda-4ed3-4680-a7ca-43fe172d538d --scope "+h.acrID)
+					" --assignee-principal-type ServicePrincipal --role 7f951dda-4ed3-4680-a7ca-43fe172d538d --scope "+h.acrID+
+					" --tags unbounded-cluster-id="+h.clusterID)
 			}
 		})
 	}
@@ -787,6 +855,7 @@ func TestGantryAttachACRWaitsForHealthyNodeReport(t *testing.T) {
 	// the timeout.
 	require.ErrorContains(t, h.execute(t.Context()), "timed out waiting for Flex nodes")
 	require.GreaterOrEqual(t, polls, 2, "an unhealthy node report must be retried, not acknowledged")
+
 	_ = client
 }
 
@@ -805,6 +874,7 @@ func TestGantryAttachACRDoesNotReachInstallationWhenPolicySaveFails(t *testing.T
 
 	require.ErrorContains(t, h.execute(t.Context()), "policy write failed")
 	require.Zero(t, polls, "a failed opt-in must not proceed to wait for node-reported installation")
+
 	_ = client
 }
 
@@ -910,6 +980,70 @@ func TestGantryAttachACRManagedDoesNotSucceedOnExternalReport(t *testing.T) {
 	})
 
 	require.ErrorContains(t, h.execute(t.Context()), "timed out waiting for Flex nodes")
+}
+
+// TestGantryAttachACRDoesNotSucceedOnMissingMachine verifies the managed attach
+// wait does not complete when an eligible node has no agent-backed Machine yet:
+// a hasMachine=false, ready=false status is an eligible unverified node, not a
+// converged one, so it is retried until the timeout (the reader deliberately
+// retains it, and the wait must not skip it).
+func TestGantryAttachACRDoesNotSucceedOnMissingMachine(t *testing.T) {
+	h, _, _ := managedAttachFixture(t)
+	h.timeout = 2 * time.Second
+
+	h.machineClient = machineStatusReaderFunc(func(context.Context, *v1alpha3.RegistryAuthPolicy) (map[string]flexNodeStatus, error) {
+		// A node with no Machine yet: the reader retains it as eligible but
+		// unverified. A wait that only checked hasMachine && !ready would skip
+		// it and declare success immediately.
+		return map[string]flexNodeStatus{"off-azure": {name: "off-azure", hasMachine: false, ready: false, detail: "no agent-backed Machine registered yet"}}, nil
+	})
+
+	require.ErrorContains(t, h.execute(t.Context()), "timed out waiting for Flex nodes")
+}
+
+// TestGantryAttachACRTerminalFailureSurfacesImmediately verifies a node that
+// reports a terminal (False) condition is surfaced immediately rather than
+// polled to the timeout: the wait must stop at the first terminal report.
+func TestGantryAttachACRTerminalFailureSurfacesImmediately(t *testing.T) {
+	h, _, _ := managedAttachFixture(t)
+	h.timeout = 30 * time.Second
+
+	start := time.Now()
+
+	h.machineClient = machineStatusReaderFunc(func(context.Context, *v1alpha3.RegistryAuthPolicy) (map[string]flexNodeStatus, error) {
+		// A terminal False condition: the node reports the policy will not
+		// converge.
+		return map[string]flexNodeStatus{"off-azure": {name: "off-azure", hasMachine: true, ready: false, terminal: true, detail: "condition False: RestartBudgetExhausted (budget spent)"}}, nil
+	})
+
+	require.ErrorContains(t, h.execute(t.Context()), "terminal failure")
+	// A terminal failure is surfaced immediately, well before the timeout.
+	require.WithinDuration(t, time.Now(), start, 3*time.Second, "a terminal failure must not be polled to the timeout")
+}
+
+// TestFlexMachineStatusTerminal reports the terminal flag on a False condition
+// and leaves it clear for a not-ready-but-converging status.
+func TestFlexMachineStatusTerminal(t *testing.T) {
+	t.Parallel()
+
+	falseCond := &metav1.Condition{
+		Type: v1alpha3.MachineConditionRegistryAuth, Status: metav1.ConditionFalse,
+		Reason: "RestartBudgetExhausted", ObservedGeneration: 1,
+	}
+	machine := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "n", Generation: 1},
+		Status:     v1alpha3.MachineStatus{Conditions: []metav1.Condition{*falseCond}},
+	}
+
+	st := flexMachineStatus(machine, nil, "External")
+	require.True(t, st.terminal, "a False condition is a terminal failure")
+	require.False(t, st.ready)
+
+	// A not-ready-but-converging status (no condition) is not terminal.
+	empty := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "n", Generation: 1}}
+	st = flexMachineStatus(empty, nil, "External")
+	require.False(t, st.terminal, "a not-yet-reported node is not terminal")
+	require.False(t, st.ready)
 }
 
 func TestGantryAttachACRRejectsConcurrentInvalidEndpoint(t *testing.T) {

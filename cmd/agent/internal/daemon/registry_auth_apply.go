@@ -65,7 +65,8 @@ func writeFileIfChanged(path string, content []byte, perm os.FileMode) (bool, er
 			return false, err
 		}
 
-		if err := fsyncPath(tmp, name); err != nil {
+		// Sync the content before the rename so the file data is durable.
+		if err := fsyncFile(tmp); err != nil {
 			tmp.Close()
 
 			return false, err
@@ -76,6 +77,12 @@ func writeFileIfChanged(path string, content []byte, perm os.FileMode) (bool, er
 		}
 
 		if err := os.Rename(name, path); err != nil {
+			return false, err
+		}
+
+		// Sync the destination directory after the rename so the final entry is
+		// durable, not just the temporary name.
+		if err := fsyncDir(path); err != nil {
 			return false, err
 		}
 
@@ -268,8 +275,10 @@ func applyProviderToNodeConfig(root isolation.NodeRoot, mode isolation.Mode, pol
 // nodeConfigArgsLine reports whether line is the systemd Environment=
 // assignment that carries KUBELET_NODE_CONFIG_ARGS. The generated drop-in
 // quotes the whole assignment, so the value after Environment= is
-// "KUBELET_NODE_CONFIG_ARGS=<args>"; a bare (unquoted) assignment is also
-// accepted so a hand-written drop-in does not break the reconciler.
+// "KUBELET_NODE_CONFIG_ARGS=<args>"; a value-quoted form
+// Environment=KUBELET_NODE_CONFIG_ARGS="<args>" and a bare (unquoted)
+// assignment are also accepted so a hand-written drop-in does not break the
+// reconciler.
 func nodeConfigArgsLine(line string) bool {
 	rest := strings.TrimPrefix(line, "Environment=")
 	if rest == line {
@@ -282,31 +291,102 @@ func nodeConfigArgsLine(line string) bool {
 	return strings.HasPrefix(rest, "KUBELET_NODE_CONFIG_ARGS=")
 }
 
-// nodeConfigArgsValue extracts the value of the KUBELET_NODE_CONFIG_ARGS
-// Environment entry from the node-config drop-in, handling both the generated
-// quoted form Environment="KUBELET_NODE_CONFIG_ARGS=..." and a bare
-// assignment. It returns the raw args string (the value after the
-// KUBELET_NODE_CONFIG_ARGS= prefix, with the assignment quotes removed).
+// nodeConfigArgsValue extracts the value of the EFFECTIVE KUBELET_NODE_CONFIG_ARGS
+// Environment entry from the node-config drop-in. In systemd a later assignment
+// of the same variable is the effective one, so when the drop-in assigns
+// KUBELET_NODE_CONFIG_ARGS more than once the LAST assignment is returned, not
+// the first. It handles the generated whole-assignment-quoted form
+// Environment="KUBELET_NODE_CONFIG_ARGS=...", a value-quoted form
+// Environment=KUBELET_NODE_CONFIG_ARGS="...", and a bare assignment. It returns
+// the raw args string (the value after the KUBELET_NODE_CONFIG_ARGS= prefix,
+// with the assignment quotes removed).
 func nodeConfigArgsValue(data string) (string, error) {
+	value, found := "", false
+
 	for _, line := range strings.Split(data, "\n") {
 		if !nodeConfigArgsLine(line) {
 			continue
 		}
 
-		rest := strings.TrimPrefix(line, "Environment=")
-		rest = strings.TrimRight(rest, "\r")
-		if strings.HasPrefix(rest, `"`) {
-			// The generated form wraps the whole assignment in quotes; the
-			// args value carries no quotes, so stripping the closing quote is
-			// safe.
-			rest = strings.TrimPrefix(rest, `"`)
+		v := nodeConfigArgsLineValue(line)
+		value, found = v, true
+	}
+
+	if !found {
+		return "", fmt.Errorf("no KUBELET_NODE_CONFIG_ARGS in kubelet node-config drop-in")
+	}
+
+	return value, nil
+}
+
+// nodeConfigArgsLineValue extracts the args value from a single KUBELET_NODE_CONFIG_ARGS
+// Environment line, respecting systemd quoting/escaping. It handles the
+// whole-assignment-quoted form Environment="KUBELET_NODE_CONFIG_ARGS=<args>", a
+// value-quoted form Environment=KUBELET_NODE_CONFIG_ARGS="<args>", and a bare
+// Environment=KUBELET_NODE_CONFIG_ARGS=<args> assignment. The returned value is
+// the unquoted args string (systemd double-quote escaping is unescaped).
+func nodeConfigArgsLineValue(line string) string {
+	rest := strings.TrimPrefix(line, "Environment=")
+	rest = strings.TrimRight(rest, "\r")
+
+	// Whole-assignment-quoted form: the value after Environment= is
+	// "KUBELET_NODE_CONFIG_ARGS=...". The opening quote is part of the value
+	// (before the variable name), so the value is the quoted string itself.
+	if strings.HasPrefix(rest, `"`) {
+		rest = strings.TrimPrefix(rest, `"`)
+
+		// The generated form closes the quote at the end of the line; the args
+		// value carries no quotes, so stripping the closing quote is safe.
+		if strings.HasSuffix(rest, `"`) {
+			rest = strings.TrimSuffix(rest, `"`)
+		}
+	}
+
+	rest = strings.TrimPrefix(rest, "KUBELET_NODE_CONFIG_ARGS=")
+
+	// Value-quoted form: Environment=KUBELET_NODE_CONFIG_ARGS="<args>". The
+	// value after the = is a quoted string; strip its quotes and unescape
+	// systemd's backslash-escaped characters (\" and \\).
+	if strings.HasPrefix(rest, `"`) {
+		rest = strings.TrimPrefix(rest, `"`)
+		if strings.HasSuffix(rest, `"`) {
 			rest = strings.TrimSuffix(rest, `"`)
 		}
 
-		return strings.TrimPrefix(rest, "KUBELET_NODE_CONFIG_ARGS="), nil
+		rest = systemdUnquote(rest)
 	}
 
-	return "", fmt.Errorf("no KUBELET_NODE_CONFIG_ARGS in kubelet node-config drop-in")
+	return rest
+}
+
+// systemdUnquote unescapes the systemd double-quote escape sequences (\\" and
+// \\\\\\\\) that may appear inside a quoted Environment value. systemd does not
+// support the other common escape forms (\\n, \\t) in Environment=, so only the
+// quote and backslash escapes are handled.
+func systemdUnquote(s string) string {
+	if !strings.ContainsAny(s, `"\`) {
+		return s
+	}
+
+	var b strings.Builder
+
+	b.Grow(len(s))
+
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) {
+			switch s[i+1] {
+			case '"', '\\':
+				b.WriteByte(s[i+1])
+				i++
+
+				continue
+			}
+		}
+
+		b.WriteByte(s[i])
+	}
+
+	return b.String()
 }
 
 // nodeConfigArgs is the parsed token list of the node-config args value plus
@@ -317,88 +397,191 @@ type nodeConfigArgs struct {
 }
 
 func registryAuthProviderArgs(value string) nodeConfigArgs {
-	managedSet := map[string]bool{}
-	for _, f := range registryAuthProviderFlags() {
-		managedSet[f] = true
-	}
-
 	a := nodeConfigArgs{}
+
 	for _, tok := range strings.Fields(value) {
 		a.tokens = append(a.tokens, tok)
-		a.managed = append(a.managed, managedSet[tok])
+		a.managed = append(a.managed, false)
+	}
+
+	// Mark the tokens that establish the managed flags, in both the inline
+	// --flag=value and the split --flag value forms, so removeManaged can target
+	// them on detach.
+	for _, flag := range registryAuthProviderFlags() {
+		a.markManagedEffective(providerFlagName(flag), providerFlagValue(flag))
 	}
 
 	return a
 }
 
-// providerFlagName is the prefix of a provider flag token up to and including
-// the '=' sign, or "" when the token is not a provider flag. It is what tells
-// one provider flag apart from another: two tokens with the same name are the
-// same flag, possibly carrying different values.
-func providerFlagName(token string) string {
-	idx := strings.IndexByte(token, '=')
-	if idx <= 0 {
-		return ""
+// providerFlagNames are the known kubelet image credential provider flag names
+// (without values), in the exact spelling kubelet accepts. The managed provider
+// is set with these two flags; any other provider is configured with one or
+// both of them pointing elsewhere.
+var providerFlagNames = []string{
+	"--image-credential-provider-config",
+	"--image-credential-provider-bin-dir",
+}
+
+// isProviderFlagName reports whether name is a known image credential provider
+// flag name (the two the kubelet accepts).
+func isProviderFlagName(name string) bool {
+	for _, n := range providerFlagNames {
+		if name == n {
+			return true
+		}
 	}
 
-	name := token[:idx+1]
-	if strings.HasPrefix(name, "--image-credential-provider-") {
+	return false
+}
+
+// providerFlagName is the flag-name part of a provider flag token, or "" when
+// the token is not a provider flag. It recognizes both the inline form
+// --flag=value and the split form --flag (the value is the following token).
+// It is what tells one provider flag apart from another: two tokens with the
+// same name are the same flag, possibly carrying different values.
+func providerFlagName(token string) string {
+	if strings.HasPrefix(token, "--image-credential-provider-") {
+		// Split form: --flag with the value as the next token.
+		if !strings.Contains(token, "=") {
+			if isProviderFlagName(token) {
+				return token
+			}
+
+			return ""
+		}
+
+		// Inline form: --flag=value.
+		name := token[:strings.IndexByte(token, '=')]
+
 		return name
 	}
 
 	return ""
 }
 
+// providerFlagValue is the value part of a provider flag token, or "" when the
+// token is a split-form flag (whose value is the following token). For the
+// inline form --flag=value it returns everything after the first '='.
+func providerFlagValue(token string) string {
+	name := providerFlagName(token)
+	if name == "" || !strings.Contains(token, "=") {
+		return ""
+	}
+
+	return token[strings.IndexByte(token, '=')+1:]
+}
+
+// providerFlagEffectiveValue scans a token list and returns the effective (last
+// occurrence) value of the named provider flag, handling both the inline
+// --flag=value form and the split --flag value form, and whether the flag was
+// present at all. The last occurrence is the effective one because kubelet
+// resolves a repeated flag by the last occurrence. In the split form the value
+// is the following token, which is consumed (not itself a flag).
+func providerFlagEffectiveValue(tokens []string, name string) (string, bool) {
+	last, found := "", false
+
+	for i, tok := range tokens {
+		if providerFlagName(tok) != name {
+			continue
+		}
+
+		found = true
+
+		if strings.Contains(tok, "=") {
+			last = providerFlagValue(tok)
+		} else if i+1 < len(tokens) {
+			last = tokens[i+1]
+		}
+	}
+
+	return last, found
+}
+
 // addManaged adds the two managed provider flags if any are missing. It refuses
-// to add a flag whose name is already set to a different value (so an existing
-// provider configured elsewhere is not silently overridden), while still
-// completing a partial managed pair (a config flag without its bin-dir, or
-// vice versa) so an interrupted write is repaired rather than refused.
+// to add a flag whose name is already set (inline or split) to a different
+// value (so an existing provider configured elsewhere is not silently
+// overridden), while still completing a partial managed pair (a config flag
+// without its bin-dir, or vice versa) so an interrupted write is repaired rather
+// than refused. The effective value of each flag (its last occurrence, both
+// forms honored) is what decides: equal to the managed value means the managed
+// provider is already in effect for that flag; present but different means a
+// conflict; absent means it must be added.
 func (a *nodeConfigArgs) addManaged() (bool, error) {
 	flags := registryAuthProviderFlags()
 
+	// Mark the tokens that carry the managed flags so removeManaged can find
+	// them later. A managed flag is present when its effective value equals the
+	// managed value; the tokens that establish it (inline, or the split flag
+	// and its value) are marked managed.
+	a.managed = make([]bool, len(a.tokens))
+
 	for _, flag := range flags {
 		wantName := providerFlagName(flag)
-		present := false
+		wantValue := providerFlagValue(flag)
+		got, present := providerFlagEffectiveValue(a.tokens, wantName)
 
-		for i, tok := range a.tokens {
-			if tok == flag {
-				present = true
-				a.managed[i] = true
-			}
-		}
-
-		// A conflict is a token that sets the same flag name to a different
-		// value while the managed token itself is absent. The config and
-		// bin-dir flags are distinct names, so the presence of one is not a
-		// conflict for the other.
-		if !present {
-			for _, tok := range a.tokens {
-				if providerFlagName(tok) == wantName {
-					return false, fmt.Errorf("kubelet node config already sets a different %q; the managed provider cannot be added", wantName)
-				}
-			}
+		switch {
+		case !present:
+			// Absent: must be added (below).
+		case got == wantValue:
+			// The managed value is already effective for this flag; mark the
+			// token(s) that establish it so removal can target them.
+			a.markManagedEffective(wantName, wantValue)
+		default:
+			// Present but a different value: an existing provider is in effect,
+			// so the managed provider cannot be added without overriding it.
+			return false, fmt.Errorf("kubelet node config already sets %q to a different value (%q); the managed provider cannot be added", wantName, got)
 		}
 	}
 
 	changed := false
 
 	for _, flag := range flags {
-		found := false
-		for _, tok := range a.tokens {
-			if tok == flag {
-				found = true
-			}
+		wantName := providerFlagName(flag)
+		wantValue := providerFlagValue(flag)
+		_, present := providerFlagEffectiveValue(a.tokens, wantName)
+		if present && providerFlagEffectiveValueEquals(a.tokens, wantName, wantValue) {
+			continue
 		}
 
-		if !found {
-			a.tokens = append(a.tokens, flag)
-			a.managed = append(a.managed, true)
-			changed = true
-		}
+		// Absent (or not the managed value): append the managed token.
+		a.tokens = append(a.tokens, flag)
+		a.managed = append(a.managed, true)
+		changed = true
 	}
 
 	return changed, nil
+}
+
+// providerFlagEffectiveValueEquals reports whether the effective (last) value
+// of a provider flag in a token list equals wantValue.
+func providerFlagEffectiveValueEquals(tokens []string, name, wantValue string) bool {
+	got, found := providerFlagEffectiveValue(tokens, name)
+
+	return found && got == wantValue
+}
+
+// markManagedEffective marks the tokens that establish a provider flag whose
+// value equals wantValue, so removeManaged can target them on detach. It marks
+// every occurrence of the flag whose value equals wantValue (inline: the flag
+// token; split: the flag token and its following value token), not just the
+// last, so a duplicate managed token is also removed cleanly.
+func (a *nodeConfigArgs) markManagedEffective(name, wantValue string) {
+	for i, tok := range a.tokens {
+		if providerFlagName(tok) != name {
+			continue
+		}
+
+		if strings.Contains(tok, "=") {
+			if providerFlagValue(tok) == wantValue {
+				a.managed[i] = true
+			}
+		} else if i+1 < len(a.tokens) && a.tokens[i+1] == wantValue {
+			a.managed[i] = true
+			a.managed[i+1] = true
+		}
+	}
 }
 
 // removeManaged drops every managed provider flag. It returns false when there
@@ -432,16 +615,26 @@ func (a *nodeConfigArgs) removeManaged() bool {
 // (the header comment, the [Service] stanza, any other Environment=
 // directives, and the trailing newline) so the provider tokens are the only
 // thing that changes. The value is re-quoted in the generated form
-// Environment="KUBELET_NODE_CONFIG_ARGS=<args>".
+// Environment="KUBELET_NODE_CONFIG_ARGS=<args>". When the drop-in assigns
+// KUBELET_NODE_CONFIG_ARGS more than once, only the LAST (effective) assignment
+// is rewritten; earlier (overridden) assignments are preserved untouched, so
+// the rendered file has exactly one effective assignment and no duplicate.
 func nodeConfigArgsRendered(data string, a nodeConfigArgs) string {
 	joined := strings.Join(a.tokens, " ")
 	replacement := `Environment="KUBELET_NODE_CONFIG_ARGS=` + joined + `"`
 
 	lines := strings.Split(data, "\n")
+
+	lastEffective := -1
+
 	for i, line := range lines {
 		if nodeConfigArgsLine(line) {
-			lines[i] = replacement
+			lastEffective = i
 		}
+	}
+
+	if lastEffective >= 0 {
+		lines[lastEffective] = replacement
 	}
 
 	return strings.Join(lines, "\n")
@@ -592,7 +785,8 @@ func saveRegistryAuthBudget(slot string, budget *registryAuthBudget) error {
 		return fmt.Errorf("chmod registry-auth budget for %s: %w", slot, err)
 	}
 
-	if err := fsyncPath(tmp, name); err != nil {
+	// Sync the content before the rename so the budget data is durable.
+	if err := fsyncFile(tmp); err != nil {
 		tmp.Close()
 
 		return fmt.Errorf("fsync registry-auth budget for %s: %w", slot, err)
@@ -606,5 +800,7 @@ func saveRegistryAuthBudget(slot string, budget *registryAuthBudget) error {
 		return fmt.Errorf("persist registry-auth budget for %s: %w", slot, err)
 	}
 
-	return nil
+	// Sync the destination directory after the rename so the final entry is
+	// durable, not just the temporary name.
+	return fsyncDir(path)
 }

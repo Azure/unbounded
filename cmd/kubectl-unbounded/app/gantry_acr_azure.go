@@ -285,6 +285,10 @@ func (h *attachACRHandler) ensureACRPullGrant(ctx context.Context, acrID *arm.Re
 		}
 
 		if assignment.Condition == "" {
+			// A pre-existing unconditional grant already grants this principal
+			// the pull role on this ACR. Reuse it; it is NOT created by this
+			// installation and carries no unbounded ownership receipt, so detach
+			// will preserve it (and report it) rather than delete it.
 			return nil
 		}
 
@@ -295,8 +299,14 @@ func (h *attachACRHandler) ensureACRPullGrant(ctx context.Context, acrID *arm.Re
 		return errors.New("existing pull grant is conditional; refusing to broaden it with an unconditional grant")
 	}
 
+	// Create the grant and stamp it with the unbounded ownership receipt tag so
+	// detach can reverse exactly the grant this installation created, and leave
+	// a shared/inherited/reused grant (one without the tag) in place. The tag
+	// travels with the assignment, so it works for an ACR in another
+	// subscription.
 	_, err := h.runAzure(ctx, acrID.SubscriptionID, "role", "assignment", "create", "--assignee-object-id", principal,
-		"--assignee-principal-type", "ServicePrincipal", "--role", role, "--scope", h.acrID)
+		"--assignee-principal-type", "ServicePrincipal", "--role", role, "--scope", h.acrID,
+		"--tags", "unbounded-cluster-id="+h.clusterID)
 
 	return err
 }

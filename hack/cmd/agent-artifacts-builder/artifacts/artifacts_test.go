@@ -103,6 +103,93 @@ func TestNewPlan(t *testing.T) {
 	)
 }
 
+// TestNewPlanACRProvider verifies the bundle producer materializes the stock ACR
+// credential provider when the manifest records a version for it, and omits it
+// when the manifest does not (so existing non-managed bundles keep working). The
+// producer must download the provider at the manifest's version for the
+// requested architecture and materialize it at the bundle path the agent's
+// offline resolver reads, with a generated checksum.
+func TestNewPlanACRProvider(t *testing.T) {
+	// A manifest that records the ACR provider version must plan the provider
+	// binary (and its checksum) at the bundle path for the requested arch.
+	with, err := NewPlan(Options{
+		OutputDir: t.TempDir(),
+		Manifest: bootstrapartifacts.Manifest{
+			Versions: bootstrapartifacts.Versions{
+				Kubernetes:  "1.34.2",
+				Containerd:  "2.1.8",
+				Runc:        "1.5.0",
+				CNI:         "1.5.1",
+				Crictl:      "1.34.0",
+				ACRProvider: "v1.36.0",
+			},
+		},
+		Architectures: []string{"amd64"},
+	})
+	require.NoError(t, err)
+	require.Equal(t, "1.36.0", with.Manifest.Versions.ACRProvider)
+
+	providerPath := bootstrapartifacts.ACRProviderArtifactPath("1.36.0", "amd64")
+	provider := findArtifactByPath(t, with.Artifacts, providerPath)
+	require.True(t, provider.GenerateChecksum, "the ACR provider must be checksummed like the other node binaries")
+	require.Equal(t,
+		"https://github.com/kubernetes-sigs/cloud-provider-azure/releases/download/v1.36.0/azure-acr-credential-provider-linux-amd64",
+		provider.URL,
+	)
+	// The provider is a plain binary (not an archive): it is downloaded as a
+	// file and its checksum is generated at materialization, like runc.
+	require.Empty(t, provider.ExtractFile)
+
+	// A manifest that does not record the ACR provider must NOT plan the
+	// provider or its checksum: existing non-managed bundles stay compatible.
+	without, err := NewPlan(Options{
+		OutputDir: t.TempDir(),
+		Manifest: bootstrapartifacts.Manifest{
+			Versions: bootstrapartifacts.Versions{
+				Kubernetes: "1.34.2",
+				Containerd: "2.1.8",
+				Runc:       "1.5.0",
+				CNI:        "1.5.1",
+				Crictl:     "1.34.0",
+			},
+		},
+		Architectures: []string{"amd64"},
+	})
+	require.NoError(t, err)
+	require.Empty(t, without.Manifest.Versions.ACRProvider)
+
+	for _, p := range artifactPaths(without.Artifacts) {
+		require.NotContains(t, p, "acr-provider", "bundles without an ACR provider version must not plan the provider")
+	}
+}
+
+// findArtifactByPath returns the artifact with the given path, failing the test
+// if it is absent.
+func findArtifactByPath(t *testing.T, artifacts []Artifact, path string) Artifact {
+	t.Helper()
+
+	for _, a := range artifacts {
+		if a.Path == path {
+			return a
+		}
+	}
+
+	require.FailNow(t, "artifact not found", "path", path)
+
+	return Artifact{}
+}
+
+// artifactPaths returns the set of artifact paths in a plan.
+func artifactPaths(artifacts []Artifact) []string {
+	out := make([]string, 0, len(artifacts))
+
+	for _, a := range artifacts {
+		out = append(out, a.Path)
+	}
+
+	return out
+}
+
 func TestNewPlanUsesDefaultManifestFromKubernetesVersion(t *testing.T) {
 	plan, err := NewPlan(Options{
 		OutputDir:         t.TempDir(),

@@ -13,6 +13,7 @@ import (
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/registryauth"
+	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/isolation"
 )
 
@@ -257,6 +258,28 @@ func TestNodeConfigArgsValue(t *testing.T) {
 			data:    "[Service]\nEnvironment=FOO=bar\n",
 			wantErr: true,
 		},
+		{
+			name: "value-quoted form unquotes the value",
+			data: "Environment=KUBELET_NODE_CONFIG_ARGS=\"--hostname-override=node --node-ip=10.0.0.5\"\n",
+			want: "--hostname-override=node --node-ip=10.0.0.5",
+		},
+		{
+			name: "last of several assignments is the effective value",
+			data: "Environment=\"KUBELET_NODE_CONFIG_ARGS=--hostname-override=base\"\n" +
+				"Environment=\"KUBELET_NODE_CONFIG_ARGS=--hostname-override=base --node-ip=10.0.0.5\"\n",
+			want: "--hostname-override=base --node-ip=10.0.0.5",
+		},
+		{
+			name: "customer provider after base is the effective value",
+			data: "Environment=\"KUBELET_NODE_CONFIG_ARGS=--hostname-override=base\"\n" +
+				"Environment=\"KUBELET_NODE_CONFIG_ARGS=--hostname-override=base --image-credential-provider-config=/customer/cfg.json --image-credential-provider-bin-dir=/customer/bin\"\n",
+			want: "--hostname-override=base --image-credential-provider-config=/customer/cfg.json --image-credential-provider-bin-dir=/customer/bin",
+		},
+		{
+			name: "split-form provider is parsed as name and value",
+			data: "Environment=KUBELET_NODE_CONFIG_ARGS=\"--hostname-override=base --image-credential-provider-config /customer/cfg.json --image-credential-provider-bin-dir /customer/bin\"\n",
+			want: "--hostname-override=base --image-credential-provider-config /customer/cfg.json --image-credential-provider-bin-dir /customer/bin",
+		},
 	}
 
 	for _, tc := range tt {
@@ -338,6 +361,28 @@ func TestApplyProviderToNodeConfig(t *testing.T) {
 			wantChange: false,
 			wantValue:  "--hostname-override=node1 --image-credential-provider-config=/customer/cfg.json",
 		},
+		{
+			// Finding 3: a SPLIT-FORM external provider (flag and value as
+			// separate tokens) in the effective assignment is a conflict, not
+			// "absent": the managed provider must not silently override it.
+			name: "split-form external provider in effective assignment is refused",
+			base: generatedDropIn +
+				"Environment=\"KUBELET_NODE_CONFIG_ARGS=--hostname-override=node1 --image-credential-provider-config /customer/cfg.json --image-credential-provider-bin-dir /customer/bin\"\n",
+			policy:     &registryauth.Config{Mode: registryauth.IdentityBindingMode},
+			wantChange: false,
+			wantValue:  "--hostname-override=node1 --image-credential-provider-config /customer/cfg.json --image-credential-provider-bin-dir /customer/bin",
+		},
+		{
+			// Finding 3: a split-form external provider set via a LATER (effective)
+			// assignment after a base assignment is still a conflict; the base
+			// assignment alone must not be read.
+			name: "split-form external provider in a later assignment is refused",
+			base: generatedDropIn +
+				"Environment=\"KUBELET_NODE_CONFIG_ARGS=--hostname-override=node1 --image-credential-provider-config /customer/cfg.json\"\n",
+			policy:     &registryauth.Config{Mode: registryauth.IdentityBindingMode},
+			wantChange: false,
+			wantValue:  "--hostname-override=node1 --image-credential-provider-config /customer/cfg.json",
+		},
 	}
 
 	for _, tc := range tt {
@@ -402,6 +447,28 @@ func TestEffectiveManagedFlags(t *testing.T) {
 		{
 			name: "managed flags with unrelated flags after them",
 			argv: []string{"kubelet", m0, m1, "--hostname-override=n1"},
+			want: true,
+		},
+		{
+			// Finding 3: a later SPLIT-FORM config flag overrides the managed
+			// inline one; the effective value is the split-form value, so the
+			// managed provider is not in effect.
+			name: "later split-form config flag overrides managed inline",
+			argv: []string{"kubelet", m0, m1, "--image-credential-provider-config", "/customer/config"},
+			want: false,
+		},
+		{
+			// Finding 3: a later SPLIT-FORM bin-dir flag overrides the managed
+			// inline one.
+			name: "later split-form bin-dir flag overrides managed inline",
+			argv: []string{"kubelet", m0, m1, "--image-credential-provider-bin-dir", "/customer/bin"},
+			want: false,
+		},
+		{
+			// The split-form managed flags (flag and value as separate tokens)
+			// are effective when their values match the managed values.
+			name: "split-form managed flags are effective",
+			argv: []string{"kubelet", "--image-credential-provider-config", goalstates.RegistryAuthCredentialConfigPath, "--image-credential-provider-bin-dir", goalstates.RegistryAuthProviderBinDir},
 			want: true,
 		},
 	}

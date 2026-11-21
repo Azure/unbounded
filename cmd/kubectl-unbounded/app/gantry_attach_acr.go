@@ -81,6 +81,12 @@ type flexNodeStatus struct {
 	// generation, and the delivered Machine.spec.registryAuth matches the desired
 	// policy.
 	ready bool
+	// terminal is true when the Machine reports a condition that will not resolve
+	// by re-converging (a False condition): the wait surfaces it immediately
+	// instead of polling to the timeout. A not-ready node that is still
+	// converging (no Machine yet, no condition yet, a stale or mismatched
+	// reason, an undelivered policy) is not terminal and is retried.
+	terminal bool
 	// detail is a human-readable explanation when not ready.
 	detail string
 }
@@ -165,6 +171,10 @@ func flexMachineStatus(machine *v1alpha3.Machine, policy *v1alpha3.RegistryAuthP
 	}
 
 	if cond.Status != metav1.ConditionTrue {
+		// A False condition is a terminal failure: the node reported that the
+		// policy will not converge (for example, a budget-exhausted restart).
+		// The wait surfaces it immediately instead of polling to the timeout.
+		status.terminal = true
 		status.detail = fmt.Sprintf("condition %s: %s (%s)", cond.Status, cond.Reason, cond.Message)
 
 		return status
@@ -272,6 +282,7 @@ func gantryDetachACRCommand() *cobra.Command {
 	cmd.Flags().StringVar(&h.namespace, "namespace", unbounded.SystemNamespace(), "Operator and Gantry namespace")
 	cmd.Flags().StringVar(&h.kubeconfig, "kubeconfig", "", "Kubeconfig path")
 	cmd.Flags().StringVar(&h.clusterID, "cluster-resource-id", "", "AKS resource ID (required with --remove-azure)")
+	cmd.Flags().StringVar(&h.acrID, "acr-resource-id", "", "ACR Azure resource ID whose pull grant to reverse (required with --remove-azure); the grant may live in a different subscription than the AKS cluster")
 	cmd.Flags().DurationVar(&h.timeout, "timeout", 10*time.Minute, "Convergence timeout")
 	cmd.Flags().BoolVar(&h.removeAzure, "remove-azure", false, "Delete the operator-owned cluster pull grant and Azure identity")
 
@@ -538,10 +549,27 @@ func (h *attachACRHandler) discoverACRProxy(ctx context.Context, cfg *registryau
 		}
 	} else if err != nil {
 		return err
-	} else if account.Labels["app.kubernetes.io/managed-by"] != acrAttachManager ||
-		account.Annotations["azure.workload.identity/client-id"] != cfg.ClientID ||
+	} else if account.Labels["app.kubernetes.io/managed-by"] != acrAttachManager {
+		// A foreign (unowned) discovery ServiceAccount is refused, never
+		// changed.
+		return errors.New("refusing to change an unowned ACR discovery ServiceAccount")
+	} else if account.Annotations["azure.workload.identity/client-id"] != cfg.ClientID ||
 		account.Annotations["azure.workload.identity/tenant-id"] != cfg.TenantID {
-		return errors.New("refusing to change an unowned or conflicting ACR discovery ServiceAccount")
+		// An owned discovery ServiceAccount carrying a different identity is
+		// the reattach-with-a-fresh-identity case: --remove-azure deleted the
+		// old UAMI, so a re-attach mints a new client ID. Safely update the
+		// owned account's identity annotations in place rather than requiring
+		// the user to delete it first. A truly foreign account is refused above.
+		if account.Annotations == nil {
+			account.Annotations = map[string]string{}
+		}
+
+		account.Annotations["azure.workload.identity/client-id"] = cfg.ClientID
+		account.Annotations["azure.workload.identity/tenant-id"] = cfg.TenantID
+
+		if _, err := accounts.Update(ctx, account, metav1.UpdateOptions{}); err != nil {
+			return fmt.Errorf("update owned ACR discovery ServiceAccount to the new identity: %w", err)
+		}
 	}
 
 	pod, err := h.client.CoreV1().Pods(h.namespace).Create(ctx, &corev1.Pod{
@@ -699,19 +727,24 @@ func (h *attachACRHandler) waitForACRInstallation(ctx context.Context, cfg *regi
 			return false, err
 		}
 
-		if len(statuses) == 0 {
-			// No eligible Flex nodes: the policy is delivered to Machines as they
-			// appear, so there is nothing to wait on.
-			return true, nil
-		}
-
-		// A node with no Machine yet is still installing; it is retried like any
-		// not-ready node. A node with a Machine that has not reported the
-		// expected managed condition (no condition, a stale or mismatched
-		// reason, an undelivered policy, or a terminal False) is not converged
-		// and is retried until the timeout.
+		// A genuinely empty eligible fleet is the only no-node case: the policy
+		// is delivered to Machines as they appear, so there is nothing to wait
+		// on. Every eligible node that is present but not converged is checked,
+		// including a node with no Machine yet (the reader deliberately retains
+		// it as an eligible unverified node) and a node reporting a terminal
+		// failure.
 		for name, st := range statuses {
-			if st.hasMachine && !st.ready {
+			if st.terminal {
+				// A terminal failure is surfaced immediately, not polled to the
+				// timeout: the node reported the policy will not converge.
+				return false, fmt.Errorf("flex node %s reports a terminal failure: %s", name, st.detail)
+			}
+
+			if !st.ready {
+				// Not converged: a node with no Machine is still installing, and
+				// a node with a Machine that reports a stale or mismatched
+				// condition is still converging. Both are retried until the
+				// timeout.
 				lastError = fmt.Errorf("flex node %s has not converged to the managed credential provider: %s", name, st.detail)
 
 				return false, nil
