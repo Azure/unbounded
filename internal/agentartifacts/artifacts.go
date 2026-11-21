@@ -38,7 +38,25 @@ const (
 
 	// CoreDNSDefaultBaseURL is the upstream base URL for CoreDNS releases.
 	CoreDNSDefaultBaseURL = "https://github.com/coredns/coredns/releases/download"
+
+	// ACRProviderDefaultBaseURL is the upstream base URL for the AKS
+	// acr-credential-provider releases. Mirrors must preserve the
+	// <base>/v<ver>/azure-acr-credential-provider-linux-<arch> layout used by
+	// cloud-provider-azure GitHub releases.
+	ACRProviderDefaultBaseURL = "https://github.com/kubernetes-sigs/cloud-provider-azure/releases/download"
+
+	// ACRProviderVersion is the cloud-provider-azure release that ships the
+	// stock acr-credential-provider the managed ACR authentication installs.
+	ACRProviderVersion = "v1.36.0"
 )
+
+// ACRProviderSHA256 maps each architecture to the SHA256 of that
+// architecture's acr-credential-provider binary, pinned to ACRProviderVersion.
+// The hashes match the ones the unbounded-operator image verifies against.
+var ACRProviderSHA256 = map[string]string{
+	"amd64": "b8f9a8137640685ab06cf5ffc4d37f0525534654c057973630f73485442ea21b",
+	"arm64": "8097badaccae6cd9e3f90ea5520a2a2343e2484c0dc6aa7835f5d33f8a6b2d5d",
+}
 
 func DefaultContainerImages(kubernetesVersion string) []string {
 	return bootstrapartifacts.NormalizeContainerImages([]string{
@@ -147,6 +165,34 @@ func CoreDNSArchive(override *goalstates.DownloadSource, version, arch string) s
 	}
 
 	return fmt.Sprintf("%s/v%s/coredns_%s_linux_%s.tgz", base, version, version, arch)
+}
+
+// ACRProviderBinary resolves the download URL for the stock ACR credential
+// provider binary, honoring the optional override. The asset is a single
+// upstream release (ACRProviderVersion) rather than a versioned node binary, so
+// the version does not follow the cluster Kubernetes version.
+func ACRProviderBinary(override *goalstates.DownloadSource, arch string) string {
+	if override != nil && override.URL != "" {
+		return fmt.Sprintf(override.URL, arch)
+	}
+
+	base := ACRProviderDefaultBaseURL
+	if override != nil && override.BaseURL != "" {
+		base = strings.TrimRight(override.BaseURL, "/")
+	}
+
+	return fmt.Sprintf("%s/%s/azure-acr-credential-provider-linux-%s", base, ACRProviderVersion, arch)
+}
+
+// ACRProviderSHA256For returns the pinned SHA256 of the ACR credential provider
+// binary for the architecture, or an error for an unsupported architecture.
+func ACRProviderSHA256For(arch string) (string, error) {
+	hash, ok := ACRProviderSHA256[arch]
+	if !ok {
+		return "", fmt.Errorf("no ACR credential provider binary hash for architecture %q", arch)
+	}
+
+	return hash, nil
 }
 
 // CrictlVersionForKubernetesVersion returns the cri-tools version for the

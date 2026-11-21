@@ -20,6 +20,9 @@ type DownloadOverrides struct {
 	Crictl *DownloadSource
 	// CoreDNS overrides the source for the CoreDNS release tarball.
 	CoreDNS *DownloadSource
+	// ACRProvider overrides the source for the stock ACR credential provider
+	// binary used by managed ACR authentication.
+	ACRProvider *DownloadSource
 }
 
 // DownloadSource configures the override for a single binary download.

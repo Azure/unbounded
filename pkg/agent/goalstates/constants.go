@@ -203,6 +203,29 @@ const (
 	ContainerdDefaultHostsDir  = ContainerdCertsDir + "/_default"
 	ContainerdDefaultHostsPath = ContainerdDefaultHostsDir + "/hosts.toml"
 
+	// RegistryAuthProviderDir is where the managed ACR credential provider and
+	// its configuration live in the node stack. The agent owns the directory;
+	// it is co-located with the kubelet's image-credential-provider-bin-dir so
+	// the provider is self-contained.
+	RegistryAuthProviderDir = "/opt/unbounded/registry-auth"
+
+	// RegistryAuthProviderBinDir is the directory the kubelet's
+	// --image-credential-provider-bin-dir points at; it contains the provider
+	// binary.
+	RegistryAuthProviderBinDir = RegistryAuthProviderDir + "/bin"
+
+	// RegistryAuthProviderName is the provider binary name the kubelet looks up
+	// inside RegistryAuthProviderBinDir.
+	RegistryAuthProviderName = "acr-credential-provider"
+
+	// RegistryAuthCredentialConfigPath is the credential-provider config the
+	// kubelet's --image-credential-provider-config points at.
+	RegistryAuthCredentialConfigPath = RegistryAuthProviderDir + "/credential-provider.json"
+
+	// RegistryAuthAzureConfigPath is the azure.json the credential provider
+	// reads for the identity binding exchange.
+	RegistryAuthAzureConfigPath = RegistryAuthProviderDir + "/azure.json"
+
 	SystemdUnitKubelet             = "kubelet.service"
 	KubeletConfigurationPath       = "/var/lib/kubelet/config.yaml"
 	KubeletKubeconfigPath          = "/var/lib/kubelet/kubeconfig"
