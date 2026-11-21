@@ -21,7 +21,6 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-	appsv1 "k8s.io/api/apps/v1"
 	certificatesv1beta1 "k8s.io/api/certificates/v1beta1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -35,6 +34,25 @@ import (
 
 	"github.com/Azure/unbounded/internal/registryauth"
 )
+
+// fakeMachineStatus stands in for machineStatusClient in attach-acr tests,
+// returning a fixed per-node registry-auth readiness map instead of reading
+// real Machines.
+type fakeMachineStatus struct {
+	healthy map[string]bool
+}
+
+func (f fakeMachineStatus) flexMachines(context.Context) (map[string]bool, error) {
+	return f.healthy, nil
+}
+
+// machineStatusReaderFunc adapts a function to machineStatusReader for tests
+// that want to observe or vary the readiness polling.
+type machineStatusReaderFunc func(context.Context) (map[string]bool, error)
+
+func (f machineStatusReaderFunc) flexMachines(ctx context.Context) (map[string]bool, error) {
+	return f(ctx)
+}
 
 const (
 	attachSubscription      = "11111111-2222-3333-4444-555555555555"
@@ -186,47 +204,31 @@ func managedAttachFixture(t *testing.T, bundles ...corev1.ClusterTrustBundleProj
 		return true, pod, nil
 	})
 
-	cfg := registryauth.Config{
-		Mode: h.authMode, Registry: "central.azurecr.io", ClientID: attachClientID,
-		TenantID: attachTenantID, SNIName: "proxy.example.com", ProxyAddress: "10.0.0.1", Audience: "api://binding", CACert: ca,
-	}
-	data, err := json.Marshal(cfg)
-	require.NoError(t, err)
+	// Model the node-reported registry-auth readiness: a single agent-backed
+	// Flex node whose Machine reports the managed credential provider verified.
+	// waitForACRInstallation polls this through machineStatusReader, not the
+	// retired per-node installer DaemonSet.
+	h.machineClient = fakeMachineStatus{healthy: map[string]bool{"off-azure": true}}
 
-	hash := sha256.Sum256(data)
-
-	client.PrependReactor("get", "daemonsets", func(k8stesting.Action) (bool, runtime.Object, error) {
-		// Model the policy controller acknowledging its grant after installation.
-		_, err := client.Tracker().Get(rbacv1.SchemeGroupVersion.WithResource("clusterrolebindings"), "", registryauth.IdentityRoleName)
-		if apierrors.IsNotFound(err) {
-			err = client.Tracker().Create(rbacv1.SchemeGroupVersion.WithResource("clusterrolebindings"), &rbacv1.ClusterRoleBinding{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:        registryauth.IdentityRoleName,
-					Labels:      map[string]string{"app.kubernetes.io/managed-by": acrAttachManager, "unbounded-cloud.io/namespace": h.namespace},
-					Annotations: map[string]string{"unbounded-cloud.io/registry-auth-config-hash": hex.EncodeToString(hash[:])},
-				},
-				RoleRef:  rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: registryauth.IdentityRoleName},
-				Subjects: []rbacv1.Subject{{Kind: rbacv1.GroupKind, APIGroup: rbacv1.GroupName, Name: "system:serviceaccounts"}},
-			}, "")
-		}
-
-		require.NoError(t, err)
-
-		return false, nil, nil
-	})
-	_, err = client.AppsV1().DaemonSets(h.namespace).Create(t.Context(), &appsv1.DaemonSet{
-		ObjectMeta: metav1.ObjectMeta{Name: "gantry-acr-auth", Namespace: h.namespace, Generation: 1},
-		Spec: appsv1.DaemonSetSpec{Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{
-			Annotations: map[string]string{"unbounded-cloud.io/registry-auth-config-hash": hex.EncodeToString(hash[:])},
-		}}},
-		Status: appsv1.DaemonSetStatus{ObservedGeneration: 1, DesiredNumberScheduled: 1, UpdatedNumberScheduled: 1, NumberAvailable: 1},
-	}, metav1.CreateOptions{})
-	require.NoError(t, err)
 	_, err = client.CoreV1().Nodes().Create(t.Context(), &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{Name: "off-azure", Labels: map[string]string{registryauth.FlexNodeLabel: registryauth.FlexNodeValue, "kubernetes.io/os": "linux"}},
 		Status:     corev1.NodeStatus{NodeInfo: corev1.NodeSystemInfo{KubeletVersion: "v1.34.0"}},
 	}, metav1.CreateOptions{})
 	require.NoError(t, err)
+
+	// The operator's audience reconciler publishes the identity-use grant once
+	// the policy is in place; the attach-acr CLI no longer creates or waits on a
+	// per-node installer DaemonSet, so the fixture publishes the grant directly.
+	_, err = client.RbacV1().ClusterRoleBindings().Create(t.Context(), &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   registryauth.IdentityRoleName,
+			Labels: map[string]string{"app.kubernetes.io/managed-by": acrAttachManager, "unbounded-cloud.io/namespace": h.namespace},
+		},
+		RoleRef:  rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: registryauth.IdentityRoleName},
+		Subjects: []rbacv1.Subject{{Kind: rbacv1.GroupKind, APIGroup: rbacv1.GroupName, Name: "system:serviceaccounts"}},
+	}, metav1.CreateOptions{})
+	require.NoError(t, err)
+
 	client.ClearActions()
 
 	return h, client, calls
@@ -715,70 +717,61 @@ func TestGantryAttachACRRejectsIdentityOutsideClusterSubscription(t *testing.T) 
 	}
 }
 
-func TestGantryAttachACRPublishesIdentityGrantAfterManagedInstallation(t *testing.T) {
+// TestGantryAttachACRWaitsOnNodeReportedState verifies the CLI waits on the
+// node-reported Machine.Status registry-auth readiness (via machineClient), not
+// on the retired per-node installer DaemonSet, and never polls the DaemonSet.
+func TestGantryAttachACRWaitsOnNodeReportedState(t *testing.T) {
 	h, client, _ := managedAttachFixture(t)
-	client.PrependReactor("update", "configmaps", func(k8stesting.Action) (bool, runtime.Object, error) {
-		// A queued external-policy reconciliation can revoke a staged grant.
-		err := client.Tracker().Delete(rbacv1.SchemeGroupVersion.WithResource("clusterrolebindings"), "", registryauth.IdentityRoleName)
-		require.True(t, err == nil || apierrors.IsNotFound(err))
 
-		return false, nil, nil
+	polls := 0
+	h.machineClient = machineStatusReaderFunc(func(context.Context) (map[string]bool, error) {
+		polls++
+		return map[string]bool{"off-azure": true}, nil
 	})
+
 	require.NoError(t, h.execute(t.Context()))
+	require.GreaterOrEqual(t, polls, 1, "attach must confirm the node-reported registry-auth state")
 
-	actions := client.Actions()
-	_, err := client.RbacV1().ClusterRoleBindings().Get(t.Context(), registryauth.IdentityRoleName, metav1.GetOptions{})
-	require.NoError(t, err, "the identity-use grant must survive the transition from external policy")
-
-	installerRead, grantRead := -1, -1
-
-	for index, action := range actions {
-		if action.Matches("get", "daemonsets") {
-			installerRead = index
-		}
-
-		if action.Matches("get", "clusterrolebindings") {
-			grantRead = index
-		}
+	for _, action := range client.Actions() {
+		require.False(t, action.Matches("get", "daemonsets"), "attach-acr must not poll the retired installer DaemonSet")
 	}
-
-	require.NotEqual(t, -1, installerRead)
-	require.Greater(t, grantRead, installerRead, "wait for the policy controller acknowledgement after installation")
 }
 
-func TestGantryAttachACRWaitsForCurrentPolicyAcknowledgement(t *testing.T) {
+func TestGantryAttachACRWaitsForHealthyNodeReport(t *testing.T) {
 	h, client, _ := managedAttachFixture(t)
-	reads := 0
+	h.timeout = 3 * time.Second
 
-	client.PrependReactor("get", "clusterrolebindings", func(k8stesting.Action) (bool, runtime.Object, error) {
-		reads++
-		if reads != 1 {
-			return false, nil, nil
-		}
-
-		object, err := client.Tracker().Get(rbacv1.SchemeGroupVersion.WithResource("clusterrolebindings"), "", registryauth.IdentityRoleName)
-		require.NoError(t, err)
-
-		binding, ok := object.(*rbacv1.ClusterRoleBinding)
-		require.True(t, ok)
-
-		binding = binding.DeepCopy()
-		binding.Annotations["unbounded-cloud.io/registry-auth-config-hash"] = "previous-policy"
-
-		return true, binding, nil
+	polls := 0
+	h.machineClient = machineStatusReaderFunc(func(context.Context) (map[string]bool, error) {
+		polls++
+		// The node is not yet verified: keep it unhealthy so the wait retries
+		// until the timeout rather than acknowledging a stale state.
+		return map[string]bool{"off-azure": false}, nil
 	})
-	require.NoError(t, h.execute(t.Context()))
-	require.GreaterOrEqual(t, reads, 2, "helper readiness alone must not acknowledge the policy controller")
+
+	// An unhealthy node report must not be acknowledged; the wait must run to
+	// the timeout.
+	require.ErrorContains(t, h.execute(t.Context()), "timed out waiting for Flex nodes")
+	require.GreaterOrEqual(t, polls, 2, "an unhealthy node report must be retried, not acknowledged")
+	_ = client
 }
 
-func TestGantryAttachACRDoesNotStageIdentityGrantWhenPolicySaveFails(t *testing.T) {
+func TestGantryAttachACRDoesNotReachInstallationWhenPolicySaveFails(t *testing.T) {
 	h, client, _ := managedAttachFixture(t)
 	client.PrependReactor("update", "configmaps", func(k8stesting.Action) (bool, runtime.Object, error) {
 		return true, nil, errors.New("policy write failed")
 	})
+
+	polls := 0
+	h.machineClient = machineStatusReaderFunc(func(context.Context) (map[string]bool, error) {
+		polls++
+
+		return map[string]bool{"off-azure": true}, nil
+	})
+
 	require.ErrorContains(t, h.execute(t.Context()), "policy write failed")
-	_, err := client.RbacV1().ClusterRoleBindings().Get(t.Context(), registryauth.IdentityRoleName, metav1.GetOptions{})
-	require.True(t, apierrors.IsNotFound(err), "a failed opt-in must not publish collective identity-use permission")
+	require.Zero(t, polls, "a failed opt-in must not proceed to wait for node-reported installation")
+	_ = client
 }
 
 func TestGantryAttachACRRejectsConcurrentInvalidEndpoint(t *testing.T) {

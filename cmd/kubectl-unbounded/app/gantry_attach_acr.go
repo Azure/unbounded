@@ -6,9 +6,7 @@ package app
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,17 +19,19 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
 	"github.com/google/uuid"
 	"github.com/spf13/cobra"
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/version"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/util/retry"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/yaml"
 
+	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/kube"
 	"github.com/Azure/unbounded/internal/registryauth"
 	"github.com/Azure/unbounded/internal/unbounded"
@@ -46,8 +46,57 @@ type attachACRHandler struct {
 	timeout                                           time.Duration
 	client                                            kubernetes.Interface
 	restConfig                                        *rest.Config
+	machineClient                                     machineStatusReader
 	runAzure                                          func(context.Context, string, ...string) ([]byte, error)
 	out                                               io.Writer
+}
+
+// machineStatusReader reports whether the registry-auth credential provider has
+// converged on the cluster's Flex nodes by reading the node-reported
+// Machine.Status conditions the agent writes. It is injected in tests; the
+// default reads Machines through a controller-runtime client.
+type machineStatusReader interface {
+	// flexMachines returns, for each eligible Linux AKS Flex node that has an
+	// agent-backed Machine, the node name and whether that Machine reports the
+	// RegistryAuth condition True with the expected reason.
+	flexMachines(ctx context.Context) (map[string]bool, error)
+}
+
+type machineStatusClient struct{ client client.Client }
+
+func (m machineStatusClient) flexMachines(ctx context.Context) (map[string]bool, error) {
+	nodes := &corev1.NodeList{}
+	if err := m.client.List(ctx, nodes, client.MatchingLabels{
+		"kubernetes.io/os": "linux", registryauth.FlexNodeLabel: registryauth.FlexNodeValue,
+	}); err != nil {
+		return nil, err
+	}
+
+	healthy := map[string]bool{}
+
+	for i := range nodes.Items {
+		name := nodes.Items[i].Name
+
+		var machine v1alpha3.Machine
+		if err := m.client.Get(ctx, client.ObjectKey{Name: name}, &machine); err != nil {
+			if apierrors.IsNotFound(err) {
+				// A node without a Machine is not yet agent-backed; the operator
+				// will deliver the policy once its Machine exists. Skip it so an
+				// agent-less node does not block the wait.
+				continue
+			}
+
+			return nil, err
+		}
+
+		cond := apimeta.FindStatusCondition(machine.Status.Conditions, v1alpha3.MachineConditionRegistryAuth)
+		// A True condition means the agent verified the policy it was given:
+		// Configured for a managed provider, External when authentication was
+		// left untouched. Both are converged for the operator's intent.
+		healthy[name] = cond != nil && cond.Status == metav1.ConditionTrue
+	}
+
+	return healthy, nil
 }
 
 func gantryCommandGroup() *cobra.Command {
@@ -71,8 +120,34 @@ func gantryCommandGroup() *cobra.Command {
 	}
 
 	group.AddCommand(cmd)
+	group.AddCommand(gantryDetachACRCommand())
 
 	return group
+}
+
+// gantryDetachACRCommand reverts managed ACR authentication to external mode.
+// It flips the node-auth policy to mode: external so the operator clears
+// Machine.spec.registryAuth and the agent removes the managed credential
+// provider from each node's kubelet, then waits for the fleet to report
+// convergence. Azure-side identities and grants are retained by default;
+// --remove-azure deletes the operator-owned pull grant for the cluster.
+func gantryDetachACRCommand() *cobra.Command {
+	h := &detachACRHandler{}
+
+	cmd := &cobra.Command{
+		Use:   "detach-acr",
+		Short: "Turn off managed ACR authentication and let nodes converge to external",
+		Long:  "Revert managed ACR authentication (attach-acr --auth-mode aks-identity-binding) to external. The node-auth policy is set to mode: external, the operator clears Machine.spec.registryAuth on the affected Flex nodes, and each node's agent removes the managed credential provider and reports convergence. Azure identities and the cluster pull grant are retained by default; use --remove-azure to delete the operator-owned pull grant for --cluster-resource-id.",
+		Args:  cobra.NoArgs,
+		RunE:  func(cmd *cobra.Command, _ []string) error { h.out = cmd.OutOrStdout(); return h.execute(cmd.Context()) },
+	}
+	cmd.Flags().StringVar(&h.namespace, "namespace", unbounded.SystemNamespace(), "Operator and Gantry namespace")
+	cmd.Flags().StringVar(&h.kubeconfig, "kubeconfig", "", "Kubeconfig path")
+	cmd.Flags().StringVar(&h.clusterID, "cluster-resource-id", "", "AKS resource ID (required with --remove-azure)")
+	cmd.Flags().DurationVar(&h.timeout, "timeout", 10*time.Minute, "Convergence timeout")
+	cmd.Flags().BoolVar(&h.removeAzure, "remove-azure", false, "Delete the operator-owned cluster pull grant and Azure identity")
+
+	return cmd
 }
 
 func azureResourceID(id, resourceType string) (*arm.ResourceID, error) {
@@ -126,6 +201,15 @@ func (h *attachACRHandler) execute(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+	}
+
+	if h.machineClient == nil {
+		c, err := newMachineClientWithKubeconfig(h.kubeconfig)
+		if err != nil {
+			return fmt.Errorf("create Machine client: %w", err)
+		}
+
+		h.machineClient = machineStatusClient{client: c}
 	}
 
 	if h.runAzure == nil {
@@ -231,7 +315,7 @@ func (h *attachACRHandler) execute(ctx context.Context) error {
 	}
 
 	if h.authMode == registryauth.IdentityBindingMode {
-		if err := h.waitForACRInstallation(ctx, cfg); err != nil {
+		if err := h.waitForACRInstallation(ctx); err != nil {
 			return fmt.Errorf("policy saved, but stock provider installation is not ready: %w", err)
 		}
 	}
@@ -443,46 +527,50 @@ func (h *attachACRHandler) discoverACRProxy(ctx context.Context, cfg *registryau
 	return nil
 }
 
-func (h *attachACRHandler) waitForACRInstallation(ctx context.Context, cfg registryauth.Config) error {
-	data, err := json.Marshal(cfg)
+// waitForACRInstallation blocks until every agent-backed Flex node reports the
+// managed credential provider configured and verified on its kubelet, as
+// reflected in the node-reported Machine.Status registry-auth condition the
+// operator delivers policy to. A node still converging (no condition yet, or
+// not yet Configured) is retried until the timeout; a node reporting a terminal
+// failure surfaces that condition's message.
+func (h *attachACRHandler) waitForACRInstallation(ctx context.Context) error {
+	if h.machineClient == nil {
+		return errors.New("machine status reader is not configured")
+	}
+
+	var lastError error
+
+	err := wait.PollUntilContextCancel(ctx, 2*time.Second, true, func(ctx context.Context) (bool, error) {
+		healthy, err := h.machineClient.flexMachines(ctx)
+		if err != nil {
+			return false, err
+		}
+
+		if len(healthy) == 0 {
+			// No agent-backed Flex nodes yet: the policy is delivered to Machines
+			// as they appear, so there is nothing to wait on.
+			return true, nil
+		}
+
+		for name, ok := range healthy {
+			if !ok {
+				lastError = fmt.Errorf("flex node %s has not yet reported the managed credential provider as verified", name)
+
+				return false, nil
+			}
+		}
+
+		return true, nil
+	})
 	if err != nil {
-		return err
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("timed out waiting for Flex nodes to verify the managed credential provider; last: %v", lastError)
+		}
+
+		return errors.Join(err, lastError)
 	}
 
-	hash := sha256.Sum256(data)
-	expected := hex.EncodeToString(hash[:])
-
-	for {
-		ds, err := h.client.AppsV1().DaemonSets(h.namespace).Get(ctx, "gantry-acr-auth", metav1.GetOptions{})
-		if err != nil && !apierrors.IsNotFound(err) {
-			return err
-		}
-
-		if err == nil && ds.Spec.Template.Annotations["unbounded-cloud.io/registry-auth-config-hash"] == expected && acrInstallerReady(ds) {
-			binding, err := h.client.RbacV1().ClusterRoleBindings().Get(ctx, registryauth.IdentityRoleName, metav1.GetOptions{})
-			if err != nil && !apierrors.IsNotFound(err) {
-				return err
-			}
-
-			if err == nil && binding.Annotations["unbounded-cloud.io/registry-auth-config-hash"] == expected &&
-				binding.Labels["app.kubernetes.io/managed-by"] == acrAttachManager &&
-				binding.Labels["unbounded-cloud.io/namespace"] == h.namespace {
-				return nil
-			}
-		}
-
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(2 * time.Second):
-		}
-	}
-}
-
-func acrInstallerReady(ds *appsv1.DaemonSet) bool {
-	return ds.Status.ObservedGeneration >= ds.Generation &&
-		ds.Status.UpdatedNumberScheduled == ds.Status.DesiredNumberScheduled &&
-		ds.Status.NumberAvailable == ds.Status.DesiredNumberScheduled
+	return nil
 }
 
 func (h *attachACRHandler) checkFlexVersions(ctx context.Context) error {
