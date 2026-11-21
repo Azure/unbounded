@@ -269,12 +269,38 @@ func (h *attachACRHandler) azureSubscriptionTenant(ctx context.Context, subscrip
 	return tenantID.String(), nil
 }
 
+// acrPullGrantName is the deterministic role-assignment name (a GUID) the attach
+// path uses for the grant it creates on an ACR. The role-assignment API has no
+// tags property, so the ownership receipt is the assignment's own name: a
+// GUID derived from the cluster ID and the role. Detach lists the principal's
+// assignments on the ACR and reverses only the one carrying this exact name,
+// leaving a shared/inherited/reused grant (a different name) in place. The same
+// cluster+role always yields the same name, so a re-attach reuses the grant it
+// would have created rather than stacking a duplicate.
+func acrPullGrantName(clusterID, role string) string {
+	digest := sha256.Sum256([]byte(strings.ToLower(clusterID) + "|" + strings.ToLower(role)))
+
+	// Render the first 16 bytes as a lowercase GUID (the form the API accepts
+	// for the role-assignment name).
+	b := digest[:16]
+
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
 func (h *attachACRHandler) ensureACRPullGrant(ctx context.Context, acrID *arm.ResourceID, principal, role string) error {
-	var assignments []struct{ PrincipalID, RoleDefinitionID, Scope, Condition string }
+	var assignments []struct {
+		Name             string
+		PrincipalID      string
+		RoleDefinitionID string
+		Scope            string
+		Condition        string
+	}
 	if err := h.azureJSON(ctx, acrID.SubscriptionID, &assignments, "role", "assignment", "list", "--scope", h.acrID, "--include-inherited",
 		"--fill-principal-name", "false", "--fill-role-definition-name", "false"); err != nil {
 		return err
 	}
+
+	grantName := acrPullGrantName(h.clusterID, role)
 
 	conditional := false
 
@@ -284,11 +310,16 @@ func (h *attachACRHandler) ensureACRPullGrant(ctx context.Context, acrID *arm.Re
 			continue
 		}
 
+		if strings.EqualFold(assignment.Name, grantName) {
+			// The grant this installation created already exists (same
+			// deterministic name). Reuse it; nothing to do.
+			return nil
+		}
+
 		if assignment.Condition == "" {
 			// A pre-existing unconditional grant already grants this principal
-			// the pull role on this ACR. Reuse it; it is NOT created by this
-			// installation and carries no unbounded ownership receipt, so detach
-			// will preserve it (and report it) rather than delete it.
+			// the pull role on this ACR under a different name. Reuse it; it is
+			// NOT created by this installation and detach will preserve it.
 			return nil
 		}
 
@@ -299,14 +330,14 @@ func (h *attachACRHandler) ensureACRPullGrant(ctx context.Context, acrID *arm.Re
 		return errors.New("existing pull grant is conditional; refusing to broaden it with an unconditional grant")
 	}
 
-	// Create the grant and stamp it with the unbounded ownership receipt tag so
-	// detach can reverse exactly the grant this installation created, and leave
-	// a shared/inherited/reused grant (one without the tag) in place. The tag
-	// travels with the assignment, so it works for an ACR in another
-	// subscription.
+	// Create the grant under its deterministic ownership-receipt name so detach
+	// can reverse exactly the grant this installation created, and leave a
+	// shared/inherited/reused grant (a different name) in place. The name works
+	// for an ACR in another subscription because it is carried by the assignment
+	// itself, not by the cluster's subscription.
 	_, err := h.runAzure(ctx, acrID.SubscriptionID, "role", "assignment", "create", "--assignee-object-id", principal,
 		"--assignee-principal-type", "ServicePrincipal", "--role", role, "--scope", h.acrID,
-		"--tags", "unbounded-cluster-id="+h.clusterID)
+		"--name", grantName)
 
 	return err
 }

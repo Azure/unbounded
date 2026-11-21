@@ -488,13 +488,14 @@ func TestGantryAttachACRABACRoleSelection(t *testing.T) {
 				require.NoError(t, err)
 				_, err := registryauth.Derive(source.Data["config.yaml"], source.Data[registryauth.ConfigKey])
 				require.NoError(t, err)
-				// The created grant is stamped with the unbounded ownership
-				// receipt tag so detach can reverse exactly the grant this
+				// The created grant is stamped with the deterministic
+				// ownership-receipt name (the role-assignment API has no tags
+				// property) so detach can reverse exactly the grant this
 				// installation created, and leave a shared/reused grant in
 				// place.
 				require.Contains(t, *calls, "role assignment create --assignee-object-id "+attachPrincipalID+
 					" --assignee-principal-type ServicePrincipal --role "+readerRole+" --scope "+h.acrID+
-					" --tags unbounded-cluster-id="+h.clusterID)
+					" --name "+acrPullGrantName(h.clusterID, readerRole))
 			}
 		})
 	}
@@ -768,13 +769,14 @@ func TestGantryAttachACRManagedCrossSubscription(t *testing.T) {
 					require.NotContains(t, call, "role assignment create")
 				}
 			} else {
-				// The created grant is stamped with the unbounded ownership
-				// receipt tag so detach can reverse exactly the grant this
+				// The created grant is stamped with the deterministic
+				// ownership-receipt name (the role-assignment API has no tags
+				// property) so detach can reverse exactly the grant this
 				// installation created, and leave a shared/reused grant in
 				// place.
 				require.Contains(t, *calls, "role assignment create --assignee-object-id "+attachPrincipalID+
 					" --assignee-principal-type ServicePrincipal --role 7f951dda-4ed3-4680-a7ca-43fe172d538d --scope "+h.acrID+
-					" --tags unbounded-cluster-id="+h.clusterID)
+					" --name "+acrPullGrantName(h.clusterID, "7f951dda-4ed3-4680-a7ca-43fe172d538d"))
 			}
 		})
 	}
@@ -1021,27 +1023,45 @@ func TestGantryAttachACRTerminalFailureSurfacesImmediately(t *testing.T) {
 	require.WithinDuration(t, time.Now(), start, 3*time.Second, "a terminal failure must not be polled to the timeout")
 }
 
-// TestFlexMachineStatusTerminal reports the terminal flag on a False condition
-// and leaves it clear for a not-ready-but-converging status.
+// TestFlexMachineStatusTerminal distinguishes a genuinely terminal failure from
+// a retryable one. Only a current-generation RestartBudgetExhausted is terminal:
+// the agent reports other False reasons while it is scheduling a bounded retry,
+// and a stale failure from a prior generation is not terminal because a new
+// policy resets the restart budget.
 func TestFlexMachineStatusTerminal(t *testing.T) {
-	t.Parallel()
-
-	falseCond := &metav1.Condition{
-		Type: v1alpha3.MachineConditionRegistryAuth, Status: metav1.ConditionFalse,
-		Reason: "RestartBudgetExhausted", ObservedGeneration: 1,
+	tt := []struct {
+		name         string
+		reason       string
+		observedGen  int64
+		machineGen   int64
+		wantTerminal bool
+	}{
+		{name: "current-generation budget exhaustion is terminal", reason: "RestartBudgetExhausted", observedGen: 1, machineGen: 1, wantTerminal: true},
+		{name: "retryable backoff is not terminal", reason: "RestartBackoff", observedGen: 1, machineGen: 1, wantTerminal: false},
+		{name: "retryable apply failure is not terminal", reason: "ApplyFailed", observedGen: 1, machineGen: 1, wantTerminal: false},
+		{name: "stale-generation budget exhaustion is not terminal", reason: "RestartBudgetExhausted", observedGen: 1, machineGen: 2, wantTerminal: false},
 	}
-	machine := &v1alpha3.Machine{
-		ObjectMeta: metav1.ObjectMeta{Name: "n", Generation: 1},
-		Status:     v1alpha3.MachineStatus{Conditions: []metav1.Condition{*falseCond}},
-	}
 
-	st := flexMachineStatus(machine, nil, "External")
-	require.True(t, st.terminal, "a False condition is a terminal failure")
-	require.False(t, st.ready)
+	for _, tc := range tt {
+		t.Run(tc.name, func(t *testing.T) {
+			cond := &metav1.Condition{
+				Type: v1alpha3.MachineConditionRegistryAuth, Status: metav1.ConditionFalse,
+				Reason: tc.reason, ObservedGeneration: tc.observedGen,
+			}
+			machine := &v1alpha3.Machine{
+				ObjectMeta: metav1.ObjectMeta{Name: "n", Generation: tc.machineGen},
+				Status:     v1alpha3.MachineStatus{Conditions: []metav1.Condition{*cond}},
+			}
+
+			st := flexMachineStatus(machine, nil, "External")
+			require.Equal(t, tc.wantTerminal, st.terminal, "terminal flag")
+			require.False(t, st.ready, "a False condition is never ready")
+		})
+	}
 
 	// A not-ready-but-converging status (no condition) is not terminal.
 	empty := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "n", Generation: 1}}
-	st = flexMachineStatus(empty, nil, "External")
+	st := flexMachineStatus(empty, nil, "External")
 	require.False(t, st.terminal, "a not-yet-reported node is not terminal")
 	require.False(t, st.ready)
 }

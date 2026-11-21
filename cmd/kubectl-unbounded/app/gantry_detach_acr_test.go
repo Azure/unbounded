@@ -6,6 +6,8 @@ package app
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -132,6 +134,27 @@ func TestGantryDetachACRRemoveGrantRequiresClusterID(t *testing.T) {
 	require.ErrorContains(t, h.execute(t.Context()), "--cluster-resource-id is required with --remove-azure")
 }
 
+// TestGantryDetachACRRemoveGrantRequiresACRID verifies a missing
+// --acr-resource-id is refused BEFORE any policy mutation: the node-auth
+// ConfigMap must still carry the managed policy (not have been rewritten to
+// external) when the flag error is returned.
+func TestGantryDetachACRRemoveGrantRequiresACRID(t *testing.T) {
+	h, client := detachFixture(t)
+	h.machineClient = fakeMachineStatus{healthy: map[string]bool{}}
+	h.removeAzure = true
+	h.clusterID = attachClusterID
+	// ACR ID intentionally left empty.
+
+	require.ErrorContains(t, h.execute(t.Context()), "--acr-resource-id is required with --remove-azure")
+
+	// The policy must not have been rewritten to external before the refusal:
+	// the node-auth policy key must still carry the managed mode, not external.
+	source, err := client.CoreV1().ConfigMaps(h.namespace).Get(t.Context(), "gantry-config", metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Contains(t, source.Data[registryauth.ConfigKey], registryauth.IdentityBindingMode, "a missing ACR ID must be refused before the policy is rewritten")
+	require.NotContains(t, source.Data[registryauth.ConfigKey], "\nmode: external", "the policy must not be rewritten to external before the refusal")
+}
+
 func TestGantryDetachACRRemoveGrantIsOwnershipGated(t *testing.T) {
 	h, client := detachFixture(t)
 	h.machineClient = fakeMachineStatus{healthy: map[string]bool{}}
@@ -175,6 +198,79 @@ func TestGantryDetachACRRemoveGrantIsOwnershipGated(t *testing.T) {
 	require.Equal(t, "customer", binding.Labels["app.kubernetes.io/managed-by"], "an unowned grant must survive detach")
 }
 
+// TestGantryDetachACRForeignBindingIsPreflighted verifies the AKS identity
+// binding's target is validated read-only BEFORE any deletion: a same-name
+// binding that references a foreign identity is refused before the owned role
+// assignment is deleted, so the detach never deletes some resources and then
+// refuse on the rest.
+func TestGantryDetachACRForeignBindingIsPreflighted(t *testing.T) {
+	h := detachAzureBase(t)
+
+	const acrPullRole = "/subscriptions/11111111-2222-3333-4444-555555555555/providers/Microsoft.Authorization/roleDefinitions/7f951dda-4ed3-4680-a7ca-43fe172d538d"
+
+	const foreignIdentityID = "/subscriptions/99999999-2222-3333-4444-555555555555/resourceGroups/other-rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/other"
+
+	// The deterministic UAMI name the attach path derives from the cluster ID.
+	digest := sha256.Sum256([]byte(strings.ToLower(attachClusterID)))
+	uamiName := "gantry-pull-" + hex.EncodeToString(digest[:6])
+
+	var deleteCalls []string
+
+	h.runAzure = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		key := detachAzureCmd(args)
+		if key == "role assignment delete" {
+			deleteCalls = append(deleteCalls, strings.Join(args, " "))
+		}
+
+		switch key {
+		case "aks show":
+			return json.Marshal(map[string]any{"id": attachClusterID, "location": "eastus", "fqdn": "cluster.example.com", "provisioningState": "Succeeded"})
+		case "identity show":
+			// The owned UAMI exists with the matching tag, a principal, and a
+			// resource ID.
+			return json.Marshal(map[string]any{
+				"id":          attachIdentityID,
+				"principalId": "principal-1",
+				"tags":        map[string]string{"unbounded-cluster-id": attachClusterID},
+			})
+		case "role assignment list":
+			// An owned ACR pull assignment exists, so a naive implementation would
+			// delete it before noticing the foreign binding.
+			return json.Marshal([]map[string]any{{
+				"name":             acrPullGrantName(attachClusterID, "7f951dda-4ed3-4680-a7ca-43fe172d538d"),
+				"principalId":      "principal-1",
+				"roleDefinitionId": acrPullRole,
+				"scope":            attachACRID,
+				"id":               "/subscriptions/11111111-2222-3333-4444-555555555555/providers/Microsoft.Authorization/roleAssignments/aaaa",
+				"condition":        "",
+			}})
+		case "rest --method":
+			// A same-name identity binding that references a FOREIGN identity
+			// (not the owned UAMI): this must be refused by preflight. The
+			// GET lists the bindings; a DELETE (also "rest --method") is never
+			// reached because preflight refuses first.
+			if len(args) >= 3 && args[2] == "delete" {
+				deleteCalls = append(deleteCalls, strings.Join(args, " "))
+
+				return []byte("{}"), nil
+			}
+
+			return json.Marshal(map[string]any{"value": []map[string]any{{
+				"name": uamiName, "properties": map[string]any{
+					"managedIdentity": map[string]any{"resourceId": foreignIdentityID},
+				},
+			}}})
+		}
+
+		return []byte("{}"), nil
+	}
+
+	require.ErrorContains(t, h.execute(t.Context()), "references another identity")
+	// The foreign binding refusal must happen before any role assignment is
+	// deleted.
+	require.Empty(t, deleteCalls, "the foreign binding must be refused before a role assignment is deleted")
+}
+
 // detachAzureFixture builds a remove-azure detach handler whose Azure fake
 // reports a successfully provisioned cluster matching the kubeconfig, so the
 // preflight passes and the test can exercise the Azure reverse steps. It returns
@@ -209,14 +305,15 @@ func detachAzureFixture(t *testing.T) (*detachACRHandler, *[]string) {
 			return json.Marshal(map[string]any{"principalId": "principal-1", "tags": map[string]string{"unbounded-cluster-id": attachClusterID}})
 		case "role assignment list":
 			// One owned ACR pull assignment on the owned principal, carrying the
-			// unbounded ownership receipt tag.
+			// deterministic ownership-receipt name (the role-assignment API has
+			// no tags property, so the receipt is the assignment's name).
 			return json.Marshal([]map[string]any{{
+				"name":             acrPullGrantName(attachClusterID, "7f951dda-4ed3-4680-a7ca-43fe172d538d"),
 				"principalId":      "principal-1",
 				"roleDefinitionId": acrPullRole,
 				"scope":            acrScope,
 				"id":               "/subscriptions/11111111-2222-3333-4444-555555555555/providers/Microsoft.Authorization/roleAssignments/aaaa",
 				"condition":        "",
-				"tags":             map[string]string{"unbounded-cluster-id": attachClusterID},
 			}})
 		case "rest":
 			return []byte(`{"value":[]}`), nil
@@ -264,6 +361,7 @@ func TestGantryDetachACRPreflightRejectsMismatchedKubeconfig(t *testing.T) {
 	h.machineClient = fakeMachineStatus{healthy: map[string]bool{}}
 	h.removeAzure = true
 	h.clusterID = attachClusterID
+	h.acrID = attachACRID
 	// A kubeconfig pointing at a different host than the cluster's FQDN.
 	h.restConfig = &rest.Config{Host: "https://different.example.com"}
 
@@ -354,13 +452,13 @@ func TestGantryDetachACRConditionalGrantIsPreserved(t *testing.T) {
 	require.Empty(t, deleteCalls, "a conditional (shared) grant must not be deleted")
 }
 
-// TestGantryDetachACRPreservesUntaggedGrant verifies that a role assignment on
-// the owned principal that scopes the ACR role but carries NO unbounded
-// ownership receipt tag (a customer grant the attach path merely reused, or a
-// shared/inherited grant) is preserved, not deleted: matching principal + ACR
-// scope + unconditional AcrPull is not ownership proof, so only tagged grants
-// are reversed.
-func TestGantryDetachACRPreservesUntaggedGrant(t *testing.T) {
+// TestGantryDetachACRPreservesForeignGrant verifies that a role assignment on
+// the owned principal that scopes the ACR role but carries a name this
+// installation did NOT create (a customer grant the attach path merely reused,
+// or a shared/inherited grant) is preserved, not deleted: matching principal +
+// ACR scope + unconditional AcrPull is not ownership proof, so only the
+// deterministic receipt name is reversed.
+func TestGantryDetachACRPreservesForeignGrant(t *testing.T) {
 	h := detachAzureBase(t)
 
 	const acrPullRole = "/subscriptions/11111111-2222-3333-4444-555555555555/providers/Microsoft.Authorization/roleDefinitions/7f951dda-4ed3-4680-a7ca-43fe172d538d"
@@ -380,14 +478,15 @@ func TestGantryDetachACRPreservesUntaggedGrant(t *testing.T) {
 			return json.Marshal(map[string]any{"principalId": "principal-1", "tags": map[string]string{"unbounded-cluster-id": attachClusterID}})
 		case "role assignment list":
 			// A customer grant: principal + ACR scope + unconditional AcrPull,
-			// but NO unbounded receipt tag. The attach path may have reused it.
+			// but a name this installation did not create. The attach path may
+			// have reused it.
 			return json.Marshal([]map[string]any{{
+				"name":             "customer-owned-assignment",
 				"principalId":      "principal-1",
 				"roleDefinitionId": acrPullRole,
 				"scope":            attachACRID,
 				"id":               "/subscriptions/11111111-2222-3333-4444-555555555555/providers/Microsoft.Authorization/roleAssignments/customer",
 				"condition":        "",
-				"tags":             map[string]string{},
 			}})
 		case "rest":
 			return []byte(`{"value":[]}`), nil
@@ -396,10 +495,10 @@ func TestGantryDetachACRPreservesUntaggedGrant(t *testing.T) {
 		return []byte("{}"), nil
 	}
 
-	// The untagged (customer) grant is preserved: the detach succeeds but does
-	// NOT delete it.
+	// The foreign-named (customer) grant is preserved: the detach succeeds but
+	// does NOT delete it.
 	require.NoError(t, h.execute(t.Context()))
-	require.Empty(t, deleteCalls, "an untagged (customer/shared) grant must not be deleted")
+	require.Empty(t, deleteCalls, "a foreign-named (customer/shared) grant must not be deleted")
 }
 
 // TestGantryDetachACRRemovesRepositoryReaderGrant verifies the Repository Reader
@@ -425,14 +524,15 @@ func TestGantryDetachACRRemovesRepositoryReaderGrant(t *testing.T) {
 		case "identity show":
 			return json.Marshal(map[string]any{"principalId": "principal-1", "tags": map[string]string{"unbounded-cluster-id": attachClusterID}})
 		case "role assignment list":
-			// An owned Repository Reader grant, matched by its built-in GUID.
+			// An owned Repository Reader grant, matched by its built-in GUID and
+			// the deterministic ownership-receipt name.
 			return json.Marshal([]map[string]any{{
+				"name":             acrPullGrantName(attachClusterID, "b93aa761-3e63-49ed-ac28-beffa264f7ac"),
 				"principalId":      "principal-1",
 				"roleDefinitionId": repoReaderRole,
 				"scope":            attachACRID,
 				"id":               "/subscriptions/11111111-2222-3333-4444-555555555555/providers/Microsoft.Authorization/roleAssignments/reader",
 				"condition":        "",
-				"tags":             map[string]string{"unbounded-cluster-id": attachClusterID},
 			}})
 		case "rest":
 			return []byte(`{"value":[]}`), nil

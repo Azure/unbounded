@@ -135,6 +135,7 @@ func (r *registryAuthReconciler) ReconcileRegistryAuth(ctx context.Context) (rec
 	}
 
 	desired := desiredRegistryAuth(machine)
+
 	active, err := r.active(r.log)
 	if err != nil {
 		return reconcile.Result{}, fmt.Errorf("find active machine: %w", err)
@@ -239,9 +240,9 @@ func (r *registryAuthReconciler) ReconcileRegistryAuth(ctx context.Context) (rec
 	// The healthy condition reasons match the API contract: "Configured" for an
 	// active, verified managed provider, and "External" when the policy leaves
 	// the kubelet's authentication untouched.
-	reason := "External"
+	reason := registryauth.ConditionReasonExternal
 	if desired.active {
-		reason = "Configured"
+		reason = registryauth.ConditionReasonConfigured
 	}
 
 	if err := r.writeCondition(ctx, machine, true, reason, registryAuthHealthMessage(desired)); err != nil {
@@ -496,23 +497,23 @@ func writeJSONFile(path string, value any) error {
 	}
 
 	name := tmp.Name()
-	defer os.Remove(name)
+	defer os.Remove(name) //nolint:errcheck // best-effort cleanup of the temp file
 
 	if _, err := tmp.Write(append(data, '\n')); err != nil {
-		tmp.Close()
+		tmp.Close() //nolint:errcheck // best-effort cleanup; the write error is the one to report
 
 		return err
 	}
 
 	if err := tmp.Chmod(0o644); err != nil {
-		tmp.Close()
+		tmp.Close() //nolint:errcheck // best-effort cleanup; the chmod error is the one to report
 
 		return err
 	}
 
 	// Sync the content before the rename so the file data is durable.
 	if err := fsyncFile(tmp); err != nil {
-		tmp.Close()
+		tmp.Close() //nolint:errcheck // best-effort cleanup; the sync error is the one to report
 
 		return err
 	}
@@ -555,7 +556,7 @@ func (r *registryAuthReconciler) boundedRestartKubelet(ctx context.Context, acti
 	}
 
 	backoff := registryAuthBackoff(budget.Attempts)
-	if wait := budget.LastAttempt.Add(backoff).Sub(time.Now()); wait > 0 {
+	if wait := time.Until(budget.LastAttempt.Add(backoff)); wait > 0 {
 		// The backoff has not elapsed. Do not charge or restart yet; report a
 		// retryable backoff so the caller schedules the next attempt.
 		return &registryAuthBackoffPending{wait: wait}
@@ -603,6 +604,7 @@ func (r *registryAuthReconciler) restartKubelet(ctx context.Context, active *Act
 // time, so the caller treats the restart as failed.
 func (r *registryAuthReconciler) waitKubeletRestart(ctx context.Context, active *ActiveMachine) error {
 	deadline := time.Now().Add(60 * time.Second)
+
 	backend, err := r.backendFor(active)
 	if err != nil {
 		return err

@@ -51,23 +51,23 @@ func writeFileIfChanged(path string, content []byte, perm os.FileMode) (bool, er
 		}
 
 		name := tmp.Name()
-		defer os.Remove(name)
+		defer os.Remove(name) //nolint:errcheck // best-effort cleanup of the temp file
 
 		if _, err := tmp.Write(content); err != nil {
-			tmp.Close()
+			tmp.Close() //nolint:errcheck // best-effort cleanup; the write error is the one to report
 
 			return false, err
 		}
 
 		if err := tmp.Chmod(perm); err != nil {
-			tmp.Close()
+			tmp.Close() //nolint:errcheck // best-effort cleanup; the chmod error is the one to report
 
 			return false, err
 		}
 
 		// Sync the content before the rename so the file data is durable.
 		if err := fsyncFile(tmp); err != nil {
-			tmp.Close()
+			tmp.Close() //nolint:errcheck // best-effort cleanup; the sync error is the one to report
 
 			return false, err
 		}
@@ -272,34 +272,172 @@ func applyProviderToNodeConfig(root isolation.NodeRoot, mode isolation.Mode, pol
 	return writeFileIfChanged(path, []byte(nodeConfigArgsRendered(string(data), args)), 0o644)
 }
 
+// The systemd Environment= value grammar is a list of whitespace-separated
+// items, where each item is an unquoted run of non-whitespace or a quoted
+// string that may itself contain whitespace. Quoted items may be double-quoted
+// (C-style backslash escapes: \\, \", \n, \t, and octal; a literal backslash is
+// doubled) or single-quoted (everything literal except the closing quote). A
+// single Environment= directive can carry several items, so one line can hold
+// multiple assignments.
+//
+// These helpers implement that grammar so the reconciler parses and re-renders
+// the KUBELET_NODE_CONFIG_ARGS entry correctly regardless of how the drop-in
+// quotes it, and preserves every unrelated item byte for byte.
+
+// systemdEnvItems tokenizes the value of one Environment= directive into its
+// decoded items. A quoted item (single or double) is returned with its quotes
+// removed and, for double quotes, its C-style backslash escapes unescaped; an
+// unquoted item is returned verbatim. Whitespace between items is a separator;
+// whitespace inside a quoted item is preserved.
+func systemdEnvItems(value string) []string {
+	var (
+		items []string
+		cur   strings.Builder
+	)
+
+	inQuote := byte(0)
+	quoted := false
+
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+
+		switch {
+		case inQuote != 0:
+			if inQuote == '"' && c == '\\' && i+1 < len(value) {
+				decoded, ok := systemdDecodeEscape(value[i+1])
+				if ok {
+					cur.WriteByte(decoded)
+
+					i++
+
+					continue
+				}
+				// An unrecognized escape: keep the backslash literally.
+				cur.WriteByte(c)
+
+				continue
+			}
+
+			if c == inQuote {
+				inQuote = 0
+
+				continue
+			}
+
+			cur.WriteByte(c)
+
+		case c == '"' || c == '\'':
+			inQuote = c
+			quoted = true
+
+		case c == ' ' || c == '\t' || c == '\r' || c == '\n':
+			if cur.Len() > 0 || quoted {
+				items = append(items, cur.String())
+				cur.Reset()
+			}
+
+			quoted = false
+
+		default:
+			cur.WriteByte(c)
+		}
+	}
+
+	if cur.Len() > 0 || quoted {
+		items = append(items, cur.String())
+	}
+
+	return items
+}
+
+// systemdDecodeEscape resolves a single C-style escape character that follows a
+// backslash inside a double-quoted systemd item. It reports ok=false when the
+// character is not a recognized escape (a literal backslash is then preserved).
+func systemdDecodeEscape(c byte) (byte, bool) {
+	switch c {
+	case '\\', '"', '\'':
+		return c, true
+	case 'n':
+		return '\n', true
+	case 't':
+		return '\t', true
+	case 'r':
+		return '\r', true
+	}
+
+	return 0, false
+}
+
+// systemdQuote encodes s as a double-quoted systemd item, escaping backslashes
+// and double quotes (the two characters that are meaningful inside double
+// quotes). Whitespace is left as-is because it is inside the quotes; the quotes
+// are what protect it from being treated as an item separator.
+func systemdQuote(s string) string {
+	var b strings.Builder
+	b.Grow(len(s) + 2)
+	b.WriteByte('"')
+
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '\\', '"':
+			b.WriteByte('\\')
+			b.WriteByte(s[i])
+		default:
+			b.WriteByte(s[i])
+		}
+	}
+
+	b.WriteByte('"')
+
+	return b.String()
+}
+
+// nodeConfigArgsKey is the Environment item key the kubelet node-config drop-in
+// uses for the node-level kubelet arguments.
+const nodeConfigArgsKey = "KUBELET_NODE_CONFIG_ARGS"
+
+// nodeConfigArgsItem returns the value of the KUBELET_NODE_CONFIG_ARGS item in a
+// single Environment= directive, or "" when the item is absent. It decodes the
+// item's quoting/escaping, so a whole-assignment-quoted item
+// ("KUBELET_NODE_CONFIG_ARGS=<args>"), a value-quoted item
+// (KUBELET_NODE_CONFIG_ARGS="<args>"), and a bare item all yield the same args
+// string. When the item's value is quoted only partially
+// (KUBELET_NODE_CONFIG_ARGS="<a>" UNRELATED=keep), only the KUBELET item's value
+// is returned and the unrelated item is ignored.
+func nodeConfigArgsItem(value string) (string, bool) {
+	for _, item := range systemdEnvItems(value) {
+		if strings.HasPrefix(item, nodeConfigArgsKey+"=") {
+			return item[len(nodeConfigArgsKey)+1:], true
+		}
+	}
+
+	return "", false
+}
+
 // nodeConfigArgsLine reports whether line is the systemd Environment=
-// assignment that carries KUBELET_NODE_CONFIG_ARGS. The generated drop-in
-// quotes the whole assignment, so the value after Environment= is
-// "KUBELET_NODE_CONFIG_ARGS=<args>"; a value-quoted form
-// Environment=KUBELET_NODE_CONFIG_ARGS="<args>" and a bare (unquoted)
-// assignment are also accepted so a hand-written drop-in does not break the
-// reconciler.
+// directive that carries KUBELET_NODE_CONFIG_ARGS. It decodes the item's
+// quoting, so the generated whole-assignment-quoted form
+// Environment="KUBELET_NODE_CONFIG_ARGS=...", a value-quoted form
+// Environment=KUBELET_NODE_CONFIG_ARGS="...", a bare assignment, and a directive
+// that also carries other items are all recognized.
 func nodeConfigArgsLine(line string) bool {
 	rest := strings.TrimPrefix(line, "Environment=")
 	if rest == line {
 		return false
 	}
 
-	rest = strings.TrimRight(rest, "\r")
-	rest = strings.TrimPrefix(rest, `"`)
+	_, ok := nodeConfigArgsItem(rest)
 
-	return strings.HasPrefix(rest, "KUBELET_NODE_CONFIG_ARGS=")
+	return ok
 }
 
 // nodeConfigArgsValue extracts the value of the EFFECTIVE KUBELET_NODE_CONFIG_ARGS
 // Environment entry from the node-config drop-in. In systemd a later assignment
 // of the same variable is the effective one, so when the drop-in assigns
 // KUBELET_NODE_CONFIG_ARGS more than once the LAST assignment is returned, not
-// the first. It handles the generated whole-assignment-quoted form
-// Environment="KUBELET_NODE_CONFIG_ARGS=...", a value-quoted form
-// Environment=KUBELET_NODE_CONFIG_ARGS="...", and a bare assignment. It returns
-// the raw args string (the value after the KUBELET_NODE_CONFIG_ARGS= prefix,
-// with the assignment quotes removed).
+// the first. It returns the decoded args string (the value after the
+// KUBELET_NODE_CONFIG_ARGS= prefix, with the item's quotes and escapes
+// resolved).
 func nodeConfigArgsValue(data string) (string, error) {
 	value, found := "", false
 
@@ -308,7 +446,13 @@ func nodeConfigArgsValue(data string) (string, error) {
 			continue
 		}
 
-		v := nodeConfigArgsLineValue(line)
+		rest := strings.TrimPrefix(line, "Environment=")
+
+		v, ok := nodeConfigArgsItem(rest)
+		if !ok {
+			continue
+		}
+
 		value, found = v, true
 	}
 
@@ -317,76 +461,6 @@ func nodeConfigArgsValue(data string) (string, error) {
 	}
 
 	return value, nil
-}
-
-// nodeConfigArgsLineValue extracts the args value from a single KUBELET_NODE_CONFIG_ARGS
-// Environment line, respecting systemd quoting/escaping. It handles the
-// whole-assignment-quoted form Environment="KUBELET_NODE_CONFIG_ARGS=<args>", a
-// value-quoted form Environment=KUBELET_NODE_CONFIG_ARGS="<args>", and a bare
-// Environment=KUBELET_NODE_CONFIG_ARGS=<args> assignment. The returned value is
-// the unquoted args string (systemd double-quote escaping is unescaped).
-func nodeConfigArgsLineValue(line string) string {
-	rest := strings.TrimPrefix(line, "Environment=")
-	rest = strings.TrimRight(rest, "\r")
-
-	// Whole-assignment-quoted form: the value after Environment= is
-	// "KUBELET_NODE_CONFIG_ARGS=...". The opening quote is part of the value
-	// (before the variable name), so the value is the quoted string itself.
-	if strings.HasPrefix(rest, `"`) {
-		rest = strings.TrimPrefix(rest, `"`)
-
-		// The generated form closes the quote at the end of the line; the args
-		// value carries no quotes, so stripping the closing quote is safe.
-		if strings.HasSuffix(rest, `"`) {
-			rest = strings.TrimSuffix(rest, `"`)
-		}
-	}
-
-	rest = strings.TrimPrefix(rest, "KUBELET_NODE_CONFIG_ARGS=")
-
-	// Value-quoted form: Environment=KUBELET_NODE_CONFIG_ARGS="<args>". The
-	// value after the = is a quoted string; strip its quotes and unescape
-	// systemd's backslash-escaped characters (\" and \\).
-	if strings.HasPrefix(rest, `"`) {
-		rest = strings.TrimPrefix(rest, `"`)
-		if strings.HasSuffix(rest, `"`) {
-			rest = strings.TrimSuffix(rest, `"`)
-		}
-
-		rest = systemdUnquote(rest)
-	}
-
-	return rest
-}
-
-// systemdUnquote unescapes the systemd double-quote escape sequences (\\" and
-// \\\\\\\\) that may appear inside a quoted Environment value. systemd does not
-// support the other common escape forms (\\n, \\t) in Environment=, so only the
-// quote and backslash escapes are handled.
-func systemdUnquote(s string) string {
-	if !strings.ContainsAny(s, `"\`) {
-		return s
-	}
-
-	var b strings.Builder
-
-	b.Grow(len(s))
-
-	for i := 0; i < len(s); i++ {
-		if s[i] == '\\' && i+1 < len(s) {
-			switch s[i+1] {
-			case '"', '\\':
-				b.WriteByte(s[i+1])
-				i++
-
-				continue
-			}
-		}
-
-		b.WriteByte(s[i])
-	}
-
-	return b.String()
 }
 
 // nodeConfigArgs is the parsed token list of the node-config args value plus
@@ -540,6 +614,7 @@ func (a *nodeConfigArgs) addManaged() (bool, error) {
 	for _, flag := range flags {
 		wantName := providerFlagName(flag)
 		wantValue := providerFlagValue(flag)
+
 		_, present := providerFlagEffectiveValue(a.tokens, wantName)
 		if present && providerFlagEffectiveValueEquals(a.tokens, wantName, wantValue) {
 			continue
@@ -610,18 +685,19 @@ func (a *nodeConfigArgs) removeManaged() bool {
 	return changed
 }
 
-// nodeConfigArgsRendered rewrites only the KUBELET_NODE_CONFIG_ARGS
-// Environment entry of the original drop-in, preserving every other byte
-// (the header comment, the [Service] stanza, any other Environment=
-// directives, and the trailing newline) so the provider tokens are the only
-// thing that changes. The value is re-quoted in the generated form
-// Environment="KUBELET_NODE_CONFIG_ARGS=<args>". When the drop-in assigns
-// KUBELET_NODE_CONFIG_ARGS more than once, only the LAST (effective) assignment
-// is rewritten; earlier (overridden) assignments are preserved untouched, so
-// the rendered file has exactly one effective assignment and no duplicate.
+// nodeConfigArgsRendered rewrites only the KUBELET_NODE_CONFIG_ARGS item of the
+// LAST effective Environment= directive in the original drop-in, preserving
+// every other byte (the header comment, the [Service] stanza, any other
+// Environment= directives, and the trailing newline) so the provider tokens are
+// the only thing that changes. The item is re-encoded with systemd double-quote
+// escaping (systemdQuote), so a value that round-tripped through a quoted drop-in
+// (for example one containing a backslash) is written back in the form systemd
+// will read as the same value. When the drop-in assigns KUBELET_NODE_CONFIG_ARGS
+// more than once, only the LAST (effective) assignment is rewritten; earlier
+// (overridden) assignments are preserved untouched. Any sibling items on the
+// effective line (for example an unrelated Environment item) are preserved.
 func nodeConfigArgsRendered(data string, a nodeConfigArgs) string {
 	joined := strings.Join(a.tokens, " ")
-	replacement := `Environment="KUBELET_NODE_CONFIG_ARGS=` + joined + `"`
 
 	lines := strings.Split(data, "\n")
 
@@ -633,11 +709,162 @@ func nodeConfigArgsRendered(data string, a nodeConfigArgs) string {
 		}
 	}
 
-	if lastEffective >= 0 {
-		lines[lastEffective] = replacement
+	if lastEffective < 0 {
+		return data
 	}
 
+	lines[lastEffective] = rewriteKubeletItem(lines[lastEffective], joined)
+
 	return strings.Join(lines, "\n")
+}
+
+// kubeletItemSpan finds the byte span [start, end) of the KUBELET_NODE_CONFIG_ARGS
+// item within the value of an Environment= directive (the part after
+// "Environment="). It returns the span that covers exactly that item, so the
+// caller can replace it while leaving every sibling item byte untouched. A
+// directive without the item returns ok=false.
+func kubeletItemSpan(value string) (start, end int, ok bool) {
+	itemStart := -1
+	inQuote := byte(0)
+
+	flush := func(i int) {
+		if itemStart < 0 {
+			return
+		}
+
+		if decodedItemStartsWithKey(value[itemStart:i]) {
+			start, end = itemStart, i
+			ok = true
+		}
+
+		itemStart = -1
+	}
+
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+
+		switch {
+		case inQuote != 0:
+			if inQuote == '"' && c == '\\' && i+1 < len(value) {
+				i++
+
+				continue
+			}
+
+			if c == inQuote {
+				inQuote = 0
+			}
+
+		case c == '"' || c == '\'':
+			inQuote = c
+
+			if itemStart < 0 {
+				itemStart = i
+			}
+
+		case c == ' ' || c == '\t' || c == '\r' || c == '\n':
+			flush(i)
+
+			inQuote = 0
+
+		default:
+			if itemStart < 0 {
+				itemStart = i
+			}
+		}
+	}
+
+	flush(len(value))
+
+	return start, end, ok
+}
+
+// decodedItemStartsWithKey reports whether a raw item span decodes to text that
+// begins with the KUBELET_NODE_CONFIG_ARGS key.
+func decodedItemStartsWithKey(raw string) bool {
+	return strings.HasPrefix(decodeOneItem(raw), nodeConfigArgsKey+"=")
+}
+
+// decodeOneItem decodes a single raw item span (which may be a quoted or
+// unquoted run, or a key followed by a quoted value) into its decoded text.
+func decodeOneItem(raw string) string {
+	var b strings.Builder
+
+	inQuote := byte(0)
+
+	for i := 0; i < len(raw); i++ {
+		c := raw[i]
+
+		switch {
+		case inQuote != 0:
+			if inQuote == '"' && c == '\\' && i+1 < len(raw) {
+				decoded, ok := systemdDecodeEscape(raw[i+1])
+				if ok {
+					b.WriteByte(decoded)
+
+					i++
+
+					continue
+				}
+
+				b.WriteByte(c)
+
+				continue
+			}
+
+			if c == inQuote {
+				inQuote = 0
+
+				continue
+			}
+
+			b.WriteByte(c)
+
+		case c == '"' || c == '\'':
+			inQuote = c
+
+		default:
+			b.WriteByte(c)
+		}
+	}
+
+	return b.String()
+}
+
+// rewriteKubeletItem re-encodes the KUBELET_NODE_CONFIG_ARGS item of a single
+// Environment= directive, replacing only that item's span with
+// KUBELET_NODE_CONFIG_ARGS=<quoted args> and leaving every sibling item's bytes
+// untouched. The args are re-encoded with systemd double-quote escaping
+// (systemdQuote), so a value that round-tripped through a quoted drop-in (for
+// example one containing a backslash) is written back as the value systemd
+// reads it as.
+func rewriteKubeletItem(line, args string) string {
+	rest := strings.TrimPrefix(line, "Environment=")
+	carriage := strings.HasSuffix(rest, "\r")
+
+	if carriage {
+		rest = strings.TrimSuffix(rest, "\r")
+	}
+
+	start, end, ok := kubeletItemSpan(rest)
+	if !ok {
+		return line
+	}
+
+	replacement := nodeConfigArgsKey + "=" + systemdQuote(args)
+
+	var b strings.Builder
+	b.WriteString(rest[:start])
+	b.WriteString(replacement)
+	b.WriteString(rest[end:])
+
+	suffix := ""
+
+	if carriage {
+		suffix = "\r"
+	}
+
+	return "Environment=" + b.String() + suffix
 }
 
 // registryAuthBackoff returns the delay to wait before the next restart attempt
@@ -659,7 +886,13 @@ func registryAuthBackoff(attempts int) time.Duration {
 // registryAuthPolicyHash is a stable digest of the active policy, used to tell
 // whether the bounded-restart budget applies to the same policy as last time.
 func registryAuthPolicyHash(policy registryauth.Config) string {
-	data, _ := json.Marshal(policy)
+	data, err := json.Marshal(policy)
+	if err != nil {
+		// The policy is a struct of plain strings; marshaling cannot fail in
+		// practice. A failure would be a programming error, but the hash is
+		// only used to key the restart budget, so an empty digest is safe.
+		return ""
+	}
 
 	return fmt.Sprintf("%x", sha256.Sum256(data))
 }
@@ -692,7 +925,7 @@ func registryAuthFailureOutcome(_ string, err error) (reason, message string, af
 	case isBackoffPending(err):
 		return "RestartBackoff", "waiting out the bounded-restart backoff after a failed kubelet restart", backoffWait(err)
 	case isBudgetExhausted(err):
-		return "RestartBudgetExhausted", err.Error(), 0
+		return registryauth.ConditionReasonRestartBudgetExhausted, err.Error(), 0
 	default:
 		return "RestartFailed", err.Error(), registryAuthRequeue
 	}
@@ -771,23 +1004,23 @@ func saveRegistryAuthBudget(slot string, budget *registryAuthBudget) error {
 	}
 
 	name := tmp.Name()
-	defer os.Remove(name)
+	defer os.Remove(name) //nolint:errcheck // best-effort cleanup of the temp file
 
 	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
+		tmp.Close() //nolint:errcheck // best-effort cleanup; the write error is the one to report
 
 		return fmt.Errorf("write registry-auth budget for %s: %w", slot, err)
 	}
 
 	if err := tmp.Chmod(0o644); err != nil {
-		tmp.Close()
+		tmp.Close() //nolint:errcheck // best-effort cleanup; the chmod error is the one to report
 
 		return fmt.Errorf("chmod registry-auth budget for %s: %w", slot, err)
 	}
 
 	// Sync the content before the rename so the budget data is durable.
 	if err := fsyncFile(tmp); err != nil {
-		tmp.Close()
+		tmp.Close() //nolint:errcheck // best-effort cleanup; the sync error is the one to report
 
 		return fmt.Errorf("fsync registry-auth budget for %s: %w", slot, err)
 	}

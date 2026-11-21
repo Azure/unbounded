@@ -64,8 +64,18 @@ func (h *detachACRHandler) execute(ctx context.Context) error {
 	}
 
 	if h.removeAzure {
+		// Validate ALL required remove-azure inputs before any policy mutation.
+		// The ACR resource ID identifies the registry whose pull grant is being
+		// reversed (and is required because the grant may live in a different
+		// subscription than the AKS cluster); a missing or malformed value must
+		// be refused up front, before the node-auth policy is rewritten to
+		// external, not after the fleet has been told to converge.
 		if _, err := azureResourceID(h.clusterID, "Microsoft.ContainerService/managedClusters"); err != nil {
 			return fmt.Errorf("--cluster-resource-id is required with --remove-azure: %w", err)
+		}
+
+		if _, err := azureResourceID(h.acrID, "Microsoft.ContainerRegistry/registries"); err != nil {
+			return fmt.Errorf("--acr-resource-id is required with --remove-azure: %w", err)
 		}
 
 		if h.runAzure == nil {
@@ -238,10 +248,10 @@ func (h *detachACRHandler) removePullGrant(ctx context.Context) error {
 	name := "gantry-pull-" + hex.EncodeToString(digest[:6])
 
 	// --- Phase 1: validate ALL ownership that can refuse the operation, before
-	// any deletion. A foreign resource at the same name, or a foreign
-	// Kubernetes grant, must abort the whole operation before anything is
-	// deleted, so the detach never deletes some resources and then refuse on
-	// the rest.
+	// any deletion. A foreign resource at the same name, a foreign AKS identity
+	// binding, or a foreign Kubernetes grant must abort the whole operation
+	// before anything is deleted, so the detach never deletes some resources and
+	// then refuse on the rest.
 	if err := h.checkClusterRoleBindingOwned(ctx); err != nil {
 		return err
 	}
@@ -251,9 +261,16 @@ func (h *detachACRHandler) removePullGrant(ctx context.Context) error {
 		return err
 	}
 
+	// The AKS identity binding that references the owned UAMI must be owned
+	// (or absent) before any deletion: a same-name binding that points at a
+	// foreign identity is refused here, before a role assignment is deleted.
+	if err := h.checkACRIdentityBindingOwned(ctx, clusterID, name); err != nil {
+		return err
+	}
+
 	// The role assignments to reverse and the ones to preserve. Owned grants
-	// carry the unbounded ownership receipt tag; shared/inherited/reused grants
-	// do not and are left in place, reported for manual cleanup.
+	// carry the deterministic ownership-receipt name; shared/inherited/reused
+	// grants do not and are left in place, reported for manual cleanup.
 	owned, preserved, err := h.findACRRoleAssignments(ctx, acrID, principal)
 	if err != nil {
 		return err
@@ -319,10 +336,10 @@ type acrRoleAssignment struct {
 }
 
 // findACRRoleAssignments lists the role assignments on the pull principal in the
-// ACR's subscription and partitions them into owned (carrying the unbounded
-// ownership receipt tag for this cluster) and preserved (shared/inherited/
-// reused, no receipt). Only the owned grants are reversed; the preserved ones
-// are left in place and reported. A conditional grant is never reversed.
+// ACR's subscription and partitions them into owned (carrying the deterministic
+// ownership-receipt name for this cluster) and preserved (shared/inherited/
+// reused, a different name). Only the owned grants are reversed; the preserved
+// ones are left in place and reported. A conditional grant is never reversed.
 func (h *detachACRHandler) findACRRoleAssignments(ctx context.Context, acrID *arm.ResourceID, principalID string) (owned, preserved []acrRoleAssignment, err error) {
 	if principalID == "" {
 		// No owned identity, so no role assignment to reverse.
@@ -330,12 +347,12 @@ func (h *detachACRHandler) findACRRoleAssignments(ctx context.Context, acrID *ar
 	}
 
 	var raw []struct {
+		Name             string
 		PrincipalID      string
 		RoleDefinitionID string
 		Scope            string
 		ID               string
 		Condition        string
-		Tags             map[string]string
 	}
 
 	// The grant is scoped to the ACR and lives in the ACR's subscription, which
@@ -379,13 +396,22 @@ func (h *detachACRHandler) findACRRoleAssignments(ctx context.Context, acrID *ar
 			continue
 		}
 
-		// Ownership proof is the receipt tag the attach path stamps on grants it
-		// creates. A grant on the same principal+ACR without the tag (for
-		// example, one attach merely reused) is not owned and is preserved.
-		ownedTag := strings.EqualFold(a.Tags["unbounded-cluster-id"], h.clusterID)
+		// Ownership proof is the deterministic name the attach path creates the
+		// grant under (the role-assignment API has no tags property, so the
+		// receipt is the name). A grant on the same principal+ACR under a
+		// different name (for example, one attach merely reused) is not owned
+		// and is preserved.
+		entry := acrRoleAssignment{ID: a.ID, Scope: a.Scope, Condition: a.Condition, RoleID: a.RoleDefinitionID}
 
-		entry := acrRoleAssignment{ID: a.ID, Scope: a.Scope, Condition: a.Condition, RoleID: a.RoleDefinitionID, Owned: ownedTag}
-		if ownedTag {
+		for _, grant := range ownedRoleGrantNames(h.clusterID) {
+			if strings.EqualFold(a.Name, grant) {
+				entry.Owned = true
+
+				break
+			}
+		}
+
+		if entry.Owned {
 			owned = append(owned, entry)
 		} else {
 			preserved = append(preserved, entry)
@@ -393,6 +419,21 @@ func (h *detachACRHandler) findACRRoleAssignments(ctx context.Context, acrID *ar
 	}
 
 	return owned, preserved, nil
+}
+
+// ownedRoleGrantNames returns the deterministic role-assignment names the attach
+// path would create for this cluster, one per ACR role it can grant (AcrPull and
+// the Repository Reader role). Detach matches a listed assignment's name against
+// this set to tell its own grant from a shared one.
+func ownedRoleGrantNames(clusterID string) []string {
+	// The attach path names the grant from the cluster ID and the resolved role
+	// GUID (the built-in role's definition name), so the receipt for each role is
+	// deterministic. Detach reconstructs both candidate receipts and matches a
+	// listed assignment against whichever it carries.
+	return []string{
+		acrPullGrantName(clusterID, acrPullRoleID),
+		acrPullGrantName(clusterID, repositoryReaderRoleID),
+	}
 }
 
 // isACRPullRole reports whether a role definition ID is the AcrPull built-in
@@ -541,21 +582,52 @@ func (h *detachACRHandler) removeUserAssignedIdentity(ctx context.Context, clust
 	return nil
 }
 
-// removeACRIdentityBinding lists the cluster's identity bindings and deletes the
-// one named by the install only when it references the owned user-assigned
-// identity. This deletes the binding, not the underlying ACR role assignment,
-// which the operator separately manages; the binding is refused when it points
-// at a different identity so a shared or foreign binding is never touched.
-func (h *detachACRHandler) removeACRIdentityBinding(ctx context.Context, clusterID *arm.ResourceID, name string) error {
+// aksIdentityBinding is one of the cluster's AKS identity bindings.
+type aksIdentityBinding struct {
+	Name       string
+	Properties struct {
+		ManagedIdentity struct{ ResourceID string }
+	}
+}
+
+// aksIdentityBindingsList returns every identity binding on the cluster,
+// following the API's pagination.
+func (h *detachACRHandler) aksIdentityBindingsList(ctx context.Context, clusterID *arm.ResourceID) ([]aksIdentityBinding, error) {
 	bindingsURL := "https://management.azure.com" + h.clusterID + "/identityBindings?api-version=2026-08-02-preview"
 
-	type identityBinding struct {
-		Name       string
-		Properties struct {
-			ManagedIdentity struct{ ResourceID string }
-		}
-	}
+	var all []aksIdentityBinding
 
+	for {
+		var page struct {
+			Value    []aksIdentityBinding
+			NextLink string
+		}
+		if err := h.azureJSON(ctx, clusterID.SubscriptionID, &page, "rest", "--method", "get", "--url", bindingsURL); err != nil {
+			return nil, fmt.Errorf("list AKS identity bindings: %w", err)
+		}
+
+		all = append(all, page.Value...)
+
+		if page.NextLink == "" {
+			return all, nil
+		}
+
+		next, err := url.Parse(page.NextLink)
+		if err != nil || next.Scheme != "https" || next.Host != "management.azure.com" {
+			return nil, errors.New("AKS returned an invalid identity-binding pagination URL")
+		}
+
+		bindingsURL = page.NextLink
+	}
+}
+
+// checkACRIdentityBindingOwned verifies, read-only, that the AKS identity
+// binding named by the install (if present) references the owned user-assigned
+// identity, so the ownership gate runs before any Azure deletion. It is the
+// read-only counterpart of removeACRIdentityBinding. Absence of the binding is
+// allowed; a binding at the same name that references a different identity is
+// refused, because deleting it would drop a foreign binding.
+func (h *detachACRHandler) checkACRIdentityBindingOwned(ctx context.Context, clusterID *arm.ResourceID, name string) error {
 	ownedID, err := h.ownedIdentityResourceID(ctx, clusterID, name)
 	if err != nil {
 		return err
@@ -566,45 +638,68 @@ func (h *detachACRHandler) removeACRIdentityBinding(ctx context.Context, cluster
 		return nil
 	}
 
-	for {
-		var page struct {
-			Value    []identityBinding
-			NextLink string
-		}
-		if err := h.azureJSON(ctx, clusterID.SubscriptionID, &page, "rest", "--method", "get", "--url", bindingsURL); err != nil {
-			return fmt.Errorf("list AKS identity bindings: %w", err)
-		}
-
-		for _, binding := range page.Value {
-			if binding.Name != name {
-				continue
-			}
-
-			if !strings.EqualFold(binding.Properties.ManagedIdentity.ResourceID, ownedID) {
-				return fmt.Errorf("refusing to remove identity binding %q: it references another identity", name)
-			}
-
-			bindingURL := "https://management.azure.com" + h.clusterID + "/identityBindings/" + name + "?api-version=2026-08-02-preview"
-
-			if _, err := h.runAzure(ctx, clusterID.SubscriptionID, "rest", "--method", "delete", "--url", bindingURL); err != nil {
-				return fmt.Errorf("delete AKS identity binding %q: %w", name, err)
-			}
-
-			return nil
-		}
-
-		if page.NextLink == "" {
-			// No binding of this name: nothing to remove.
-			return nil
-		}
-
-		next, err := url.Parse(page.NextLink)
-		if err != nil || next.Scheme != "https" || next.Host != "management.azure.com" {
-			return errors.New("AKS returned an invalid identity-binding pagination URL")
-		}
-
-		bindingsURL = page.NextLink
+	bindings, err := h.aksIdentityBindingsList(ctx, clusterID)
+	if err != nil {
+		return err
 	}
+
+	for _, binding := range bindings {
+		if binding.Name != name {
+			continue
+		}
+
+		if !strings.EqualFold(binding.Properties.ManagedIdentity.ResourceID, ownedID) {
+			return fmt.Errorf("refusing to remove identity binding %q: it references another identity", name)
+		}
+	}
+
+	return nil
+}
+
+// removeACRIdentityBinding deletes the AKS identity binding named by the install
+// only when it references the owned user-assigned identity. This deletes the
+// binding, not the underlying ACR role assignment, which the operator separately
+// manages; the binding is refused when it points at a different identity so a
+// shared or foreign binding is never touched. The ownership check runs in
+// checkACRIdentityBindingOwned before any deletion; this performs the deletion.
+func (h *detachACRHandler) removeACRIdentityBinding(ctx context.Context, clusterID *arm.ResourceID, name string) error {
+	ownedID, err := h.ownedIdentityResourceID(ctx, clusterID, name)
+	if err != nil {
+		return err
+	}
+
+	// No owned identity: there is no binding the install created to remove.
+	if ownedID == "" {
+		return nil
+	}
+
+	bindings, err := h.aksIdentityBindingsList(ctx, clusterID)
+	if err != nil {
+		return err
+	}
+
+	for _, binding := range bindings {
+		if binding.Name != name {
+			continue
+		}
+
+		// Guard the deletion against a foreign binding in case the read-only
+		// preflight and this deletion observe different state.
+		if !strings.EqualFold(binding.Properties.ManagedIdentity.ResourceID, ownedID) {
+			return fmt.Errorf("refusing to remove identity binding %q: it references another identity", name)
+		}
+
+		bindingURL := "https://management.azure.com" + h.clusterID + "/identityBindings/" + name + "?api-version=2026-08-02-preview"
+
+		if _, err := h.runAzure(ctx, clusterID.SubscriptionID, "rest", "--method", "delete", "--url", bindingURL); err != nil {
+			return fmt.Errorf("delete AKS identity binding %q: %w", name, err)
+		}
+
+		return nil
+	}
+
+	// No binding of this name: nothing to remove.
+	return nil
 }
 
 // ownedIdentityResourceID returns the resource ID of the pull UAMI for this

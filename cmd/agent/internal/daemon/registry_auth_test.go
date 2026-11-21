@@ -59,6 +59,7 @@ func TestDesiredRegistryAuth(t *testing.T) {
 
 			got := desiredRegistryAuth(&v1alpha3.Machine{Spec: v1alpha3.MachineSpec{RegistryAuth: tc.spec}})
 			require.Equal(t, tc.wantActive, got.active)
+
 			if tc.wantActive {
 				require.Equal(t, tc.wantRegistry, got.policy.Registry)
 				require.NotEmpty(t, got.policyHash)
@@ -93,6 +94,7 @@ func TestRegistryAuthBackoff(t *testing.T) {
 
 func TestLoadSaveRegistryAuthBudget(t *testing.T) {
 	orig := registryAuthBudgetDir
+
 	registryAuthBudgetDir = t.TempDir()
 	defer func() { registryAuthBudgetDir = orig }()
 
@@ -119,6 +121,7 @@ func TestPendingWorkRecordRoundTrip(t *testing.T) {
 	t.Parallel()
 
 	orig := registryAuthBudgetDir
+
 	registryAuthBudgetDir = t.TempDir()
 	defer func() { registryAuthBudgetDir = orig }()
 
@@ -150,6 +153,7 @@ func TestPendingWorkRecordRoundTrip(t *testing.T) {
 	// A corrupt pending file surfaces as an error, not a free restart.
 	path := registryAuthPendingPath(slot)
 	require.NoError(t, os.WriteFile(path, []byte("{not json"), 0o644))
+
 	_, err = r.readPending(slot)
 	require.Error(t, err, "a corrupt pending record must not grant a free restart")
 }
@@ -218,6 +222,7 @@ func applyDropIn(t *testing.T, content string) string {
 
 	orig := registryAuthNodeConfigDropInPath
 	registryAuthNodeConfigDropInPath = func(_ isolation.NodeRoot, _ isolation.Mode) string { return path }
+
 	t.Cleanup(func() { registryAuthNodeConfigDropInPath = orig })
 
 	return path
@@ -280,6 +285,22 @@ func TestNodeConfigArgsValue(t *testing.T) {
 			data: "Environment=KUBELET_NODE_CONFIG_ARGS=\"--hostname-override=base --image-credential-provider-config /customer/cfg.json --image-credential-provider-bin-dir /customer/bin\"\n",
 			want: "--hostname-override=base --image-credential-provider-config /customer/cfg.json --image-credential-provider-bin-dir /customer/bin",
 		},
+		{
+			// The whole-assignment-quoted form must unescape the value's
+			// backslashes, not return them doubled: systemd double-quoted values
+			// use C-style escapes, so \\\\ is a literal \\.
+			name: "whole-assignment-quoted backslash is unescaped",
+			data: "Environment=\"KUBELET_NODE_CONFIG_ARGS=--foo=/tmp/a\\\\b\"\n",
+			want: "--foo=/tmp/a\\b",
+		},
+		{
+			// A single Environment= directive may carry several separately
+			// quoted items; only the KUBELET item's value is returned, the
+			// sibling item is not folded into the kubelet args.
+			name: "sibling item is not folded into the kubelet args",
+			data: "Environment=\"KUBELET_NODE_CONFIG_ARGS=--hostname-override=node\" \"UNRELATED=keep\"\n",
+			want: "--hostname-override=node",
+		},
 	}
 
 	for _, tc := range tt {
@@ -297,6 +318,55 @@ func TestNodeConfigArgsValue(t *testing.T) {
 	}
 }
 
+// TestNodeConfigArgsRenderedRoundTrip verifies the Environment codec is
+// systemd-correct in both directions: decoding a quoted value and re-rendering
+// it must write back a value systemd reads as the same string (a backslash is
+// doubled on the way out), and a sibling item on the same Environment= directive
+// must be preserved byte for byte.
+func TestNodeConfigArgsRenderedRoundTrip(t *testing.T) {
+	tt := []struct {
+		name string
+		line string
+		args string
+		want string
+		keep string // a substring of a sibling item that must survive the rewrite
+	}{
+		{
+			// A backslash decoded from a value-quoted form must be re-escaped
+			// (doubled) so the round trip is stable.
+			name: "backslash round-trips doubled",
+			line: `Environment=KUBELET_NODE_CONFIG_ARGS="--foo=/tmp/a\\b"`,
+			args: "--foo=/tmp/a\\b",
+			want: `Environment=KUBELET_NODE_CONFIG_ARGS="--foo=/tmp/a\\b"`,
+		},
+		{
+			// A sibling item on the same directive is preserved; only the
+			// KUBELET item is re-encoded.
+			name: "sibling item preserved",
+			line: `Environment="KUBELET_NODE_CONFIG_ARGS=--hostname-override=node" "UNRELATED=keep"`,
+			args: "--hostname-override=node --extra=1",
+			want: `Environment="KUBELET_NODE_CONFIG_ARGS=--hostname-override=node --extra=1" "UNRELATED=keep"`,
+			keep: "UNRELATED=keep",
+		},
+	}
+
+	for _, tc := range tt {
+		t.Run(tc.name, func(t *testing.T) {
+			rendered := rewriteKubeletItem(tc.line, tc.args)
+			require.Equal(t, tc.want, rendered)
+
+			// The re-rendered line must decode back to the same args.
+			got, err := nodeConfigArgsValue(rendered + "\n")
+			require.NoError(t, err)
+			require.Equal(t, tc.args, got)
+
+			if tc.keep != "" {
+				require.Contains(t, rendered, tc.keep)
+			}
+		})
+	}
+}
+
 func TestApplyProviderToNodeConfig(t *testing.T) {
 	// Sequential on purpose: the drop-in path override is a package global and
 	// concurrent subtests would race on it (the -race reproducer from review).
@@ -305,6 +375,7 @@ func TestApplyProviderToNodeConfig(t *testing.T) {
 		base       string
 		policy     *registryauth.Config
 		wantChange bool
+		wantErr    bool
 		wantValue  string
 	}{
 		{
@@ -338,19 +409,27 @@ func TestApplyProviderToNodeConfig(t *testing.T) {
 			wantValue:  "--hostname-override=node1 " + managedFlags()[0] + " " + managedFlags()[1],
 		},
 		{
+			// The existing bin-dir token stays in place; the missing config
+			// flag is appended after it, so the completed order is bin-dir then
+			// config (the ordering of the two managed flags is semantically
+			// irrelevant, but the existing token is not moved).
 			name: "partial pair bin-dir only is completed with config",
 			base: generatedDropIn +
 				"Environment=\"KUBELET_NODE_CONFIG_ARGS=--hostname-override=node1 " + managedFlags()[1] + "\"\n",
 			policy:     &registryauth.Config{Mode: registryauth.IdentityBindingMode},
 			wantChange: true,
-			wantValue:  "--hostname-override=node1 " + managedFlags()[0] + " " + managedFlags()[1],
+			wantValue:  "--hostname-override=node1 " + managedFlags()[1] + " " + managedFlags()[0],
 		},
 		{
+			// A managed policy cannot be applied over an existing external
+			// provider: addManaged refuses, so applyProviderToNodeConfig returns
+			// an error and leaves the drop-in unchanged.
 			name: "conflicting external provider is refused",
 			base: generatedDropIn +
 				"Environment=\"KUBELET_NODE_CONFIG_ARGS=--hostname-override=node1 --image-credential-provider-config=/customer/cfg.json --image-credential-provider-bin-dir=/customer/bin\"\n",
 			policy:     &registryauth.Config{Mode: registryauth.IdentityBindingMode},
 			wantChange: false,
+			wantErr:    true,
 			wantValue:  "--hostname-override=node1 --image-credential-provider-config=/customer/cfg.json --image-credential-provider-bin-dir=/customer/bin",
 		},
 		{
@@ -359,6 +438,7 @@ func TestApplyProviderToNodeConfig(t *testing.T) {
 				"Environment=\"KUBELET_NODE_CONFIG_ARGS=--hostname-override=node1 --image-credential-provider-config=/customer/cfg.json\"\n",
 			policy:     &registryauth.Config{Mode: registryauth.IdentityBindingMode},
 			wantChange: false,
+			wantErr:    true,
 			wantValue:  "--hostname-override=node1 --image-credential-provider-config=/customer/cfg.json",
 		},
 		{
@@ -370,6 +450,7 @@ func TestApplyProviderToNodeConfig(t *testing.T) {
 				"Environment=\"KUBELET_NODE_CONFIG_ARGS=--hostname-override=node1 --image-credential-provider-config /customer/cfg.json --image-credential-provider-bin-dir /customer/bin\"\n",
 			policy:     &registryauth.Config{Mode: registryauth.IdentityBindingMode},
 			wantChange: false,
+			wantErr:    true,
 			wantValue:  "--hostname-override=node1 --image-credential-provider-config /customer/cfg.json --image-credential-provider-bin-dir /customer/bin",
 		},
 		{
@@ -381,6 +462,7 @@ func TestApplyProviderToNodeConfig(t *testing.T) {
 				"Environment=\"KUBELET_NODE_CONFIG_ARGS=--hostname-override=node1 --image-credential-provider-config /customer/cfg.json\"\n",
 			policy:     &registryauth.Config{Mode: registryauth.IdentityBindingMode},
 			wantChange: false,
+			wantErr:    true,
 			wantValue:  "--hostname-override=node1 --image-credential-provider-config /customer/cfg.json",
 		},
 	}
@@ -390,8 +472,15 @@ func TestApplyProviderToNodeConfig(t *testing.T) {
 			path := applyDropIn(t, tc.base)
 
 			changed, err := applyProviderToNodeConfig(nil, isolation.ModeNone, tc.policy)
-			require.NoError(t, err)
-			require.Equal(t, tc.wantChange, changed)
+			if tc.wantErr {
+				// A conflict is refused: the apply returns an error and leaves
+				// the drop-in unchanged.
+				require.Error(t, err)
+				require.False(t, changed)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, tc.wantChange, changed)
+			}
 
 			data, err := os.ReadFile(path)
 			require.NoError(t, err)
@@ -405,6 +494,14 @@ func TestApplyProviderToNodeConfig(t *testing.T) {
 			// the KUBELET_NODE_CONFIG_ARGS line change.
 			require.Contains(t, string(data), "# Managed by unbounded-agent. Do not edit directly.")
 			require.Contains(t, string(data), "[Service]")
+
+			if tc.wantErr {
+				// A refused apply must not have written anything; there is no
+				// idempotence pass to check because no change was made.
+				require.Equal(t, tc.base, string(data), "a refused apply must not modify the drop-in")
+
+				return
+			}
 
 			// Idempotence: a second pass with the same policy makes no change.
 			changed2, err := applyProviderToNodeConfig(nil, isolation.ModeNone, tc.policy)

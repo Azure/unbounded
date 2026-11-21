@@ -29,6 +29,29 @@ const (
 	IdentityRoleName    = "gantry-acr-pull"
 )
 
+// The node-reported Machine RegistryAuth condition (MachineConditionRegistryAuth)
+// reasons the agent writes. The agent is the writer and defines them; the CLI
+// waits and the operator aggregate read them, so they are shared here rather
+// than copied.
+const (
+	// ConditionReasonConfigured reports a managed provider is active and
+	// verified (Status True).
+	ConditionReasonConfigured = "Configured"
+
+	// ConditionReasonExternal reports authentication is left untouched
+	// (Status True, external policy).
+	ConditionReasonExternal = "External"
+
+	// ConditionReasonRestartBudgetExhausted reports the bounded kubelet-restart
+	// budget is spent and no further retry is scheduled for the current policy
+	// generation (Status False). It is the only genuinely terminal registry-auth
+	// failure reason: the other False reasons are reported while the agent is
+	// scheduling a retry (backoff, apply, verify, ledger, budget-reset) and are
+	// retryable. A new policy generation resets the budget, so only a verdict
+	// observed at the current generation is terminal.
+	ConditionReasonRestartBudgetExhausted = "RestartBudgetExhausted"
+)
+
 var acrHost = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)?(?:\.[a-z0-9]+\.geo)?\.azurecr\.io$`)
 
 // Config contains installation policy, never access tokens or client secrets.

@@ -327,9 +327,9 @@ func registryAuthResult(machines []v1alpha3.Machine, policy *v1alpha3.RegistryAu
 	// The healthy reason the agent reports for each mode. A True condition with
 	// a different reason means the node is verified for a different policy than
 	// the one being delivered, which is not readiness for this intent.
-	wantReason := "External"
+	wantReason := registryauth.ConditionReasonExternal
 	if active {
-		wantReason = "Configured"
+		wantReason = registryauth.ConditionReasonConfigured
 	}
 
 	installing := 0
@@ -357,8 +357,16 @@ func registryAuthResult(machines []v1alpha3.Machine, policy *v1alpha3.RegistryAu
 			// generation, reports a different reason, or the desired policy is
 			// not yet on the spec; the node has not acknowledged this policy yet.
 			installing++
-		default:
+		case cond.Reason == registryauth.ConditionReasonRestartBudgetExhausted && cond.ObservedGeneration >= m.Generation:
+			// A current-generation budget exhaustion is a genuine failure: no
+			// retry is left for the policy being delivered.
 			failures = append(failures, fmt.Sprintf("%s: %s (%s)", m.Name, cond.Reason, cond.Message))
+		default:
+			// A False condition that is not a current-generation budget
+			// exhaustion is the agent scheduling a bounded retry (backoff,
+			// apply, verify, ledger, budget-reset) or a stale verdict from a
+			// prior generation; the node is still converging, not failed.
+			installing++
 		}
 	}
 

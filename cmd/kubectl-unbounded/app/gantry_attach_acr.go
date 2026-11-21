@@ -171,10 +171,19 @@ func flexMachineStatus(machine *v1alpha3.Machine, policy *v1alpha3.RegistryAuthP
 	}
 
 	if cond.Status != metav1.ConditionTrue {
-		// A False condition is a terminal failure: the node reported that the
-		// policy will not converge (for example, a budget-exhausted restart).
-		// The wait surfaces it immediately instead of polling to the timeout.
-		status.terminal = true
+		// A False condition is not automatically terminal. The agent reports a
+		// False reason while it is scheduling a bounded retry (RestartBackoff,
+		// RestartFailed, ApplyFailed, VerifyFailed, VerificationFailed,
+		// LedgerWriteFailed, BudgetResetFailed); the wait must keep polling for
+		// that to converge. Only RestartBudgetExhausted means no retry is left
+		// for the CURRENT policy generation, and only a verdict observed at or
+		// after the current generation applies: a stale failure from a prior
+		// generation is not terminal, because a new policy or detach resets the
+		// restart budget. Surface a current terminal exhaustion immediately.
+		if cond.Reason == registryauth.ConditionReasonRestartBudgetExhausted && cond.ObservedGeneration >= machine.Generation {
+			status.terminal = true
+		}
+
 		status.detail = fmt.Sprintf("condition %s: %s (%s)", cond.Status, cond.Reason, cond.Message)
 
 		return status
@@ -275,7 +284,7 @@ func gantryDetachACRCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "detach-acr",
 		Short: "Turn off managed ACR authentication and let nodes converge to external",
-		Long:  "Revert managed ACR authentication (attach-acr --auth-mode aks-identity-binding) to external. The node-auth policy is set to mode: external, the operator clears Machine.spec.registryAuth on the affected Flex nodes, and each node's agent removes the managed credential provider and reports convergence. Azure identities and the cluster pull grant are retained by default; use --remove-azure to delete the operator-owned pull grant for --cluster-resource-id.",
+		Long:  "Revert managed ACR authentication (attach-acr --auth-mode aks-identity-binding) to external. The node-auth policy is set to mode: external, the operator clears Machine.spec.registryAuth on the affected Flex nodes, and each node's agent removes the managed credential provider and reports convergence. Azure identities and the cluster pull grant are retained by default; use --remove-azure to delete the operator-owned pull grant. With --remove-azure, both --cluster-resource-id and --acr-resource-id are required (the ACR grant may live in a different subscription than the AKS cluster) and are validated before the policy is changed.",
 		Args:  cobra.NoArgs,
 		RunE:  func(cmd *cobra.Command, _ []string) error { h.out = cmd.OutOrStdout(); return h.execute(cmd.Context()) },
 	}
