@@ -5,17 +5,22 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
+	"strings"
 	"time"
 
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/util/retry"
-
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/yaml"
 
 	"github.com/Azure/unbounded/internal/kube"
@@ -28,6 +33,7 @@ type detachACRHandler struct {
 	removeAzure                      bool
 	client                           kubernetes.Interface
 	machineClient                    machineStatusReader
+	runAzure                         func(context.Context, string, ...string) ([]byte, error)
 	out                              io.Writer
 }
 
@@ -43,6 +49,10 @@ func (h *detachACRHandler) execute(ctx context.Context) error {
 	if h.removeAzure {
 		if _, err := azureResourceID(h.clusterID, "Microsoft.ContainerService/managedClusters"); err != nil {
 			return fmt.Errorf("--cluster-resource-id is required with --remove-azure: %w", err)
+		}
+
+		if h.runAzure == nil {
+			h.runAzure = defaultAzureCLI
 		}
 	}
 
@@ -145,9 +155,51 @@ func (h *detachACRHandler) waitForExternalConvergence(ctx context.Context) error
 	return nil
 }
 
-// removePullGrant deletes the operator-owned cluster pull grant. It is
-// ownership-gated: a grant not labeled as operator-owned is left in place.
+// removePullGrant reverses the Azure-side resources the attach path created, in
+// the order that is safe to delete, each ownership-gated so a resource not
+// owned by this installation is left in place:
+//
+//  1. the ACR role assignment (AcrPull or Repository Reader) on the owned
+//     principal,
+//  2. the AKS identity binding that references the owned user-assigned identity,
+//  3. the user-assigned identity itself,
+//  4. the Kubernetes RBAC grant (ClusterRoleBinding) the nodes use to reach the
+//     ACR proxy.
+//
+// The UAMI and binding are identified by the deterministic name derived from
+// the cluster resource ID plus the unbounded-cluster-id ownership tag, so a
+// resource at the same name owned by another installation is refused, not
+// deleted. This distinguishes the Azure grants (steps 1-3) from the K8s RBAC
+// grant (step 4); neither is faked on failure.
 func (h *detachACRHandler) removePullGrant(ctx context.Context) error {
+	clusterID, err := azureResourceID(h.clusterID, "Microsoft.ContainerService/managedClusters")
+	if err != nil {
+		return err
+	}
+
+	// The deterministic UAMI name the attach path derives from the cluster ID.
+	digest := sha256.Sum256([]byte(strings.ToLower(h.clusterID)))
+	name := "gantry-pull-" + hex.EncodeToString(digest[:6])
+
+	if err := h.removeACRIdentityBinding(ctx, clusterID, name); err != nil {
+		return err
+	}
+
+	if err := h.removeUserAssignedIdentity(ctx, clusterID, name); err != nil {
+		return err
+	}
+
+	if err := h.removeClusterRoleBinding(ctx); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// removeClusterRoleBinding deletes the operator-owned K8s RBAC grant the nodes
+// use. A binding not labeled as operator-owned for this namespace is left in
+// place.
+func (h *detachACRHandler) removeClusterRoleBinding(ctx context.Context) error {
 	binding, err := h.client.RbacV1().ClusterRoleBindings().Get(ctx, registryauth.IdentityRoleName, metav1.GetOptions{})
 	if err != nil && !apierrors.IsNotFound(err) {
 		return err
@@ -164,4 +216,143 @@ func (h *detachACRHandler) removePullGrant(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// removeUserAssignedIdentity deletes the pull UAMI the attach path created for
+// this cluster, only when it carries the unbounded-cluster-id ownership tag
+// matching this cluster. Absence is success.
+func (h *detachACRHandler) removeUserAssignedIdentity(ctx context.Context, clusterID *arm.ResourceID, name string) error {
+	var identity struct {
+		ID   string
+		Tags map[string]string
+	}
+
+	err := h.azureJSON(ctx, clusterID.SubscriptionID, &identity, "identity", "show", "--name", name, "--resource-group", clusterID.ResourceGroupName)
+	if err != nil && isAzureNotFound(err) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+
+	if !strings.EqualFold(identity.Tags["unbounded-cluster-id"], h.clusterID) {
+		return fmt.Errorf("refusing to remove pull identity %q: it is not owned by this cluster", name)
+	}
+
+	if _, err := h.runAzure(ctx, clusterID.SubscriptionID, "identity", "delete", "--name", name, "--resource-group", clusterID.ResourceGroupName, "--yes"); err != nil {
+		return fmt.Errorf("delete pull identity %q: %w", name, err)
+	}
+
+	return nil
+}
+
+// removeACRIdentityBinding lists the cluster's identity bindings and deletes the
+// one named by the install only when it references the owned user-assigned
+// identity. This deletes the binding, not the underlying ACR role assignment,
+// which the operator separately manages; the binding is refused when it points
+// at a different identity so a shared or foreign binding is never touched.
+func (h *detachACRHandler) removeACRIdentityBinding(ctx context.Context, clusterID *arm.ResourceID, name string) error {
+	bindingsURL := "https://management.azure.com" + h.clusterID + "/identityBindings?api-version=2026-08-02-preview"
+
+	type identityBinding struct {
+		Name       string
+		Properties struct {
+			ManagedIdentity struct{ ResourceID string }
+		}
+	}
+
+	ownedID, err := h.ownedIdentityResourceID(ctx, clusterID, name)
+	if err != nil {
+		return err
+	}
+
+	// No owned identity: there is no binding the install created to remove.
+	if ownedID == "" {
+		return nil
+	}
+
+	for {
+		var page struct {
+			Value    []identityBinding
+			NextLink string
+		}
+		if err := h.azureJSON(ctx, clusterID.SubscriptionID, &page, "rest", "--method", "get", "--url", bindingsURL); err != nil {
+			return fmt.Errorf("list AKS identity bindings: %w", err)
+		}
+
+		for _, binding := range page.Value {
+			if binding.Name != name {
+				continue
+			}
+
+			if !strings.EqualFold(binding.Properties.ManagedIdentity.ResourceID, ownedID) {
+				return fmt.Errorf("refusing to remove identity binding %q: it references another identity", name)
+			}
+
+			bindingURL := "https://management.azure.com" + h.clusterID + "/identityBindings/" + name + "?api-version=2026-08-02-preview"
+
+			if _, err := h.runAzure(ctx, clusterID.SubscriptionID, "rest", "--method", "delete", "--url", bindingURL); err != nil {
+				return fmt.Errorf("delete AKS identity binding %q: %w", name, err)
+			}
+
+			return nil
+		}
+
+		if page.NextLink == "" {
+			// No binding of this name: nothing to remove.
+			return nil
+		}
+
+		next, err := url.Parse(page.NextLink)
+		if err != nil || next.Scheme != "https" || next.Host != "management.azure.com" {
+			return errors.New("AKS returned an invalid identity-binding pagination URL")
+		}
+
+		bindingsURL = page.NextLink
+	}
+}
+
+// ownedIdentityResourceID returns the resource ID of the pull UAMI for this
+// cluster when it is owned (by tag), or "" when it does not exist.
+func (h *detachACRHandler) ownedIdentityResourceID(ctx context.Context, clusterID *arm.ResourceID, name string) (string, error) {
+	var identity struct {
+		ID   string
+		Tags map[string]string
+	}
+
+	err := h.azureJSON(ctx, clusterID.SubscriptionID, &identity, "identity", "show", "--name", name, "--resource-group", clusterID.ResourceGroupName)
+	if err != nil && isAzureNotFound(err) {
+		return "", nil
+	} else if err != nil {
+		return "", err
+	}
+
+	if !strings.EqualFold(identity.Tags["unbounded-cluster-id"], h.clusterID) {
+		return "", fmt.Errorf("refusing to remove identity binding %q: identity %q is not owned by this cluster", name, name)
+	}
+
+	return identity.ID, nil
+}
+
+// azureJSON runs an Azure CLI command for a subscription and decodes the JSON
+// output into out. It is the detach handler's counterpart to the attach
+// handler's azureJSON.
+func (h *detachACRHandler) azureJSON(ctx context.Context, subscriptionID string, out any, args ...string) error {
+	data, err := h.runAzure(ctx, subscriptionID, args...)
+	if err != nil {
+		return err
+	}
+
+	if err := json.Unmarshal(data, out); err != nil {
+		return fmt.Errorf("invalid Azure response for %s: %w", strings.Join(args[:min(2, len(args))], " "), err)
+	}
+
+	return nil
+}
+
+// isAzureNotFound reports whether an Azure CLI error means the resource does not
+// exist, so removal treats absence as success.
+func isAzureNotFound(err error) bool {
+	return strings.Contains(strings.ToLower(err.Error()), "not found") ||
+		strings.Contains(strings.ToLower(err.Error()), "could not be found") ||
+		strings.Contains(err.Error(), "ResourceNotFound")
 }

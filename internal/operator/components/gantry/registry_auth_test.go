@@ -4,6 +4,7 @@
 package gantry
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/x509"
@@ -233,6 +234,73 @@ func ownedAuthMetadata() metav1.ObjectMeta {
 		Name: registryAuthName, Namespace: component.DefaultNamespace, UID: "owned-installer",
 		Labels: map[string]string{"app.kubernetes.io/name": registryAuthName, "app.kubernetes.io/managed-by": installationManagerOperator},
 	}
+}
+
+// countingClient wraps a client.Client and counts Get and List calls, so a
+// 10k-node test can assert the registry-auth plan is bounded (a single List of
+// the watched kind, not a live Get per node).
+type countingClient struct {
+	client.Client
+	gets  int
+	lists int
+}
+
+func (c *countingClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	c.gets++
+
+	return c.Client.Get(ctx, key, obj, opts...)
+}
+
+func (c *countingClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	c.lists++
+
+	return c.Client.List(ctx, list, opts...)
+}
+
+// TestRegistryAuthBoundedAt10kNodes asserts the registry-auth plan observes the
+// fleet with a single bounded List of Machines plus the node membership List,
+// and does no per-node live read. This is the 10k-node contract: an unchanged
+// fleet must not fan out N apiserver calls as the node count grows.
+func TestRegistryAuthBoundedAt10kNodes(t *testing.T) {
+	const nodes = 10_000
+
+	source := authSource("")
+
+	objs := make([]client.Object, 0, nodes*2)
+
+	for i := 0; i < nodes; i++ {
+		name := fmt.Sprintf("flex-%05d", i)
+		objs = append(objs,
+			registryAuthFlexNodeMachine(name),
+			registryAuthMachine(name, nil, registryAuthHealthyCondition()),
+		)
+	}
+
+	env := testEnv(t, source)
+	for _, obj := range objs {
+		require.NoError(t, env.Client.Create(t.Context(), obj))
+	}
+
+	client_ := env.Client
+	reader := &countingClient{Client: client_}
+	env.Client = reader
+	// The registry-auth plan reads only through the cached client; a nil
+	// APIReader makes LiveReader fall back to the cached client, but the plan
+	// no longer calls it at all.
+
+	policy := &unboundedv1alpha3.RegistryAuthPolicy{Mode: registryauth.IdentityBindingMode}
+	operations, machines, err := planRegistryAuthMachines(t.Context(), env, policy, true)
+	require.NoError(t, err)
+	require.Len(t, machines, nodes)
+
+	// Bounded observation: the node membership List plus the single Machine
+	// List. No per-node Get, so the cost is O(1) reads, not O(nodes).
+	require.LessOrEqual(t, reader.gets, 1, "no per-node live Get at 10k scale")
+	require.LessOrEqual(t, reader.lists, 2, "one node membership List and one Machine List at most")
+
+	// An undelivered fleet plans one patch per Machine (the policy is not yet on
+	// the spec); the bound is on the observation above, not the patch count.
+	require.Len(t, operations, nodes)
 }
 
 func TestInvalidAuthPolicyStopsPlanning(t *testing.T) {

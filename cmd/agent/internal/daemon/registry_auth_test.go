@@ -13,7 +13,7 @@ import (
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/registryauth"
-	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/isolation"
 )
 
 func TestDesiredRegistryAuth(t *testing.T) {
@@ -159,13 +159,68 @@ func TestWriteFileIfChanged(t *testing.T) {
 	require.Equal(t, []byte("two"), data)
 }
 
-func TestRegistryAuthDropInContent(t *testing.T) {
+func TestApplyProviderToNodeConfig(t *testing.T) {
 	t.Parallel()
 
-	execStart := "/usr/local/bin/kubelet --config=/var/lib/kubelet/config.yaml $KUBELET_NODE_CONFIG_ARGS"
-	data := registryAuthDropInContent(execStart)
+	// A node-config drop-in the nodestart phase would write: it carries the
+	// effective node config args, including hostname-override, and no provider
+	// flags yet.
+	base := "# Managed by unbounded-agent. Do not edit directly.\n" +
+		"[Service]\n" +
+		"Environment=\"KUBELET_NODE_CONFIG_ARGS=--hostname-override=node1 --node-ip=10.0.0.5\"\n"
 
-	require.Contains(t, data, registryAuthManagedMarker)
-	require.Contains(t, data, "ExecStart="+execStart+" --image-credential-provider-config="+goalstates.RegistryAuthCredentialConfigPath)
-	require.Contains(t, data, "--image-credential-provider-bin-dir="+goalstates.RegistryAuthProviderBinDir)
+	tt := []struct {
+		name       string
+		policy     *registryauth.Config
+		wantChange bool
+	}{
+		{
+			name: "adds managed flags and preserves other args",
+			policy: &registryauth.Config{
+				Mode: registryauth.IdentityBindingMode,
+			},
+			wantChange: true,
+		},
+		{
+			name:       "no managed flags and no policy is unchanged",
+			policy:     nil,
+			wantChange: false,
+		},
+	}
+
+	for _, tc := range tt {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			dir := t.TempDir()
+			path := filepath.Join(dir, "kubelet.service.d", "20-node-config.conf")
+			require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+			require.NoError(t, os.WriteFile(path, []byte(base), 0o644))
+
+			orig := registryAuthNodeConfigDropInPath
+			registryAuthNodeConfigDropInPath = func(_ isolation.NodeRoot, _ isolation.Mode) string { return path }
+			t.Cleanup(func() { registryAuthNodeConfigDropInPath = orig })
+
+			changed, err := applyProviderToNodeConfig(nil, isolation.ModeNone, tc.policy)
+			require.NoError(t, err)
+			require.Equal(t, tc.wantChange, changed)
+
+			// After adding the managed flags, a second pass with the same policy
+			// makes no further change (idempotent).
+			if tc.policy != nil {
+				changed2, err := applyProviderToNodeConfig(nil, isolation.ModeNone, tc.policy)
+				require.NoError(t, err)
+				require.False(t, changed2)
+			}
+		})
+	}
+}
+
+func TestNodeConfigArgsValue(t *testing.T) {
+	t.Parallel()
+
+	data := "Environment=\"KUBELET_NODE_CONFIG_ARGS=--hostname-override=node1 --node-ip=10.0.0.5\"\n"
+	value, err := nodeConfigArgsValue(data)
+	require.NoError(t, err)
+	require.Equal(t, "--hostname-override=node1 --node-ip=10.0.0.5", value)
 }

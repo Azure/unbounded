@@ -64,5 +64,7 @@ func TestRegistryAuthExternalDoesNotTouchUnownedMachinePolicy(t *testing.T) {
 	require.Empty(t, operations, "an already-external Machine must not be patched")
 }
 
-var _ = corev1.ServiceAccount{}
-var _ = registryauth.IdentityRoleName
+var (
+	_ = corev1.ServiceAccount{}
+	_ = registryauth.IdentityRoleName
+)

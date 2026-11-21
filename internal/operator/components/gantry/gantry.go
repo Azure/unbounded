@@ -338,6 +338,13 @@ func (Component) SetupWatches(b *builder.Builder, env *component.Env) {
 	// singleton request, so it does not fan out per Site or per node.
 	b.Watches(&unboundedv1alpha3.Machine{}, env.RequestSingleton(),
 		builder.WithPredicates(registryAuthMachinePredicate()))
+	// A Linux AKS Flex node joining or leaving the cluster changes the set of
+	// nodes the registry-auth policy must be delivered to. A newly joined node
+	// may not have its Machine yet, so the Machine watch alone would miss the
+	// initial delivery; this watch ensures membership changes reliably
+	// re-reconcile the registry-auth plan.
+	b.Watches(&corev1.Node{}, env.RequestSingleton(),
+		builder.WithPredicates(registryAuthNodePredicate()))
 	b.Watches(&coordinationv1.Lease{}, env.RequestSingleton(),
 		builder.WithPredicates(chairLeaseDeletePredicate(env.Namespace)))
 	b.Watches(&racerv1.ClusterCache{}, env.RequestSingleton(), builder.WithPredicates(racerCachePredicate()))

@@ -6,7 +6,9 @@ package app
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -39,7 +41,19 @@ import (
 
 const acrAttachManager = "unbounded-acr-attach"
 
-var errACRProxyNotReady = errors.New("AKS admission did not expose a supported identity-binding token proxy; verify feature availability")
+// registryAuthConfigHashKey is the annotation the operator stamps on the
+// identity-use grant with the hash of the policy it was published for, so the
+// CLI can confirm the grant backs the current policy before acknowledging it.
+// It must match the operator's registryAuthHash key.
+const registryAuthConfigHashKey = "unbounded-cloud.io/registry-auth-config-hash"
+
+var (
+	errACRProxyNotReady = errors.New("AKS admission did not expose a supported identity-binding token proxy; verify feature availability")
+	// errUnownedGrant marks a terminal acknowledgment failure: the identity-use
+	// grant exists but is not owned by this installation, so it will not become
+	// owned by a re-publish and the caller must not keep polling.
+	errUnownedGrant = errors.New("identity-use grant is not owned by this installation")
+)
 
 type attachACRHandler struct {
 	acrID, clusterID, authMode, namespace, kubeconfig string
@@ -150,6 +164,24 @@ func gantryDetachACRCommand() *cobra.Command {
 	return cmd
 }
 
+// defaultAzureCLI runs the Azure CLI for a subscription, returning the JSON
+// output. Both the attach and detach handlers use it; tests inject a fake.
+func defaultAzureCLI(ctx context.Context, subscriptionID string, args ...string) ([]byte, error) {
+	args = append(args, "--subscription", subscriptionID, "--only-show-errors", "--output", "json")
+	cmd := exec.CommandContext(ctx, "az", args...)
+
+	var stderr bytes.Buffer
+
+	cmd.Stderr = &stderr
+
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("az %s: %w: %s", strings.Join(args[:min(2, len(args))], " "), err, strings.TrimSpace(stderr.String()))
+	}
+
+	return output, nil
+}
+
 func azureResourceID(id, resourceType string) (*arm.ResourceID, error) {
 	parsed, err := arm.ParseResourceID(id)
 	if err != nil {
@@ -213,21 +245,7 @@ func (h *attachACRHandler) execute(ctx context.Context) error {
 	}
 
 	if h.runAzure == nil {
-		h.runAzure = func(ctx context.Context, subscriptionID string, args ...string) ([]byte, error) {
-			args = append(args, "--subscription", subscriptionID, "--only-show-errors", "--output", "json")
-			cmd := exec.CommandContext(ctx, "az", args...)
-
-			var stderr bytes.Buffer
-
-			cmd.Stderr = &stderr
-
-			output, err := cmd.Output()
-			if err != nil {
-				return nil, fmt.Errorf("az %s: %w: %s", strings.Join(args[:min(2, len(args))], " "), err, strings.TrimSpace(stderr.String()))
-			}
-
-			return output, nil
-		}
+		h.runAzure = defaultAzureCLI
 	}
 
 	source, err := h.client.CoreV1().ConfigMaps(h.namespace).Get(ctx, "gantry-config", metav1.GetOptions{})
@@ -264,11 +282,23 @@ func (h *attachACRHandler) execute(ctx context.Context) error {
 				return fmt.Errorf("existing authentication policy must be resolved explicitly: %w", err)
 			}
 
-			if current.Mode != registryauth.IdentityBindingMode || current.Registry != cfg.Registry {
+			// Managed opt-in is permitted from a known external policy (one the
+			// attach/detach flow wrote, i.e. mode: external with no managed
+			// identity) so attach -> detach -> attach works, and from the same
+			// managed policy. A conflicting or customer-owned policy of any
+			// other shape is refused rather than silently replaced.
+			switch current.Mode {
+			case registryauth.ExternalMode:
+				// Known external: no managed identity to preserve.
+			case registryauth.IdentityBindingMode:
+				if current.Registry != cfg.Registry {
+					return errors.New("refusing to replace an existing authentication policy for another registry; resolve it explicitly before opting in")
+				}
+
+				cfg.ClientID, cfg.TenantID = current.ClientID, current.TenantID
+			default:
 				return errors.New("refusing to replace an existing authentication policy; resolve it explicitly before opting in")
 			}
-
-			cfg.ClientID, cfg.TenantID = current.ClientID, current.TenantID
 		}
 
 		if err := h.configureIdentityBinding(ctx, acrID, registry.RoleAssignmentMode, &cfg); err != nil {
@@ -315,6 +345,10 @@ func (h *attachACRHandler) execute(ctx context.Context) error {
 	}
 
 	if h.authMode == registryauth.IdentityBindingMode {
+		if err := h.acknowledgeIdentityUseGrant(ctx, &cfg); err != nil {
+			return fmt.Errorf("policy saved, but the identity-use grant was not acknowledged: %w", err)
+		}
+
 		if err := h.waitForACRInstallation(ctx); err != nil {
 			return fmt.Errorf("policy saved, but stock provider installation is not ready: %w", err)
 		}
@@ -565,6 +599,79 @@ func (h *attachACRHandler) waitForACRInstallation(ctx context.Context) error {
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
 			return fmt.Errorf("timed out waiting for Flex nodes to verify the managed credential provider; last: %v", lastError)
+		}
+
+		return errors.Join(err, lastError)
+	}
+
+	return nil
+}
+
+// acknowledgeIdentityUseGrant waits for the operator's audience reconciler to
+// publish the identity-use grant (ClusterRole and ClusterRoleBinding the nodes
+// use to use the managed identity) for the current policy, and confirms it is
+// owned by this installation and matches the current policy hash. This
+// restores the managed-attach acknowledgment that the grant actually backs the
+// policy that was just written: a grant that is unowned or stamped with a
+// different policy hash is a race or a customer-owned grant and is not
+// acknowledged as ready. Absence is retried (the operator publishes it); a
+// present-but-mismatched grant is an error, not a silent success.
+func (h *attachACRHandler) acknowledgeIdentityUseGrant(ctx context.Context, cfg *registryauth.Config) error {
+	payload, err := json.Marshal(cfg)
+	if err != nil {
+		return err
+	}
+
+	sum := sha256.Sum256(payload)
+	hash := hex.EncodeToString(sum[:])
+
+	var lastError error
+
+	err = wait.PollUntilContextCancel(ctx, 2*time.Second, true, func(ctx context.Context) (bool, error) {
+		binding, err := h.client.RbacV1().ClusterRoleBindings().Get(ctx, registryauth.IdentityRoleName, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			lastError = fmt.Errorf("the identity-use grant %q is not yet published", registryauth.IdentityRoleName)
+
+			return false, nil
+		}
+
+		if err != nil {
+			return false, err
+		}
+
+		if binding.Labels["app.kubernetes.io/managed-by"] != acrAttachManager || binding.Labels["unbounded-cloud.io/namespace"] != h.namespace {
+			lastError = fmt.Errorf("%w: %q", errUnownedGrant, registryauth.IdentityRoleName)
+
+			// An unowned grant will not become owned by a re-publish; report it
+			// as a terminal failure rather than polling until the deadline.
+			return false, lastError
+		}
+
+		// The grant is owned and present. The policy hash is acknowledged when
+		// it matches; a mismatch is reported (a stale grant from a prior
+		// policy, e.g. during attach -> detach -> attach) and retried, while a
+		// missing hash is accepted because the operator stamps it on re-publish.
+		switch binding.Annotations[registryAuthConfigHashKey] {
+		case "":
+			// Not yet stamped; the operator will (re)publish it.
+			lastError = fmt.Errorf("the identity-use grant %q is not yet stamped with the policy hash", registryauth.IdentityRoleName)
+
+			return false, nil
+		case hash:
+			return true, nil
+		default:
+			lastError = fmt.Errorf("the identity-use grant %q carries a stale policy hash; waiting for the operator to reconcile the current policy", registryauth.IdentityRoleName)
+
+			return false, nil
+		}
+	})
+	if err != nil {
+		if errors.Is(lastError, errUnownedGrant) {
+			return lastError
+		}
+
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("timed out waiting for the operator to acknowledge the identity-use grant; last: %v", lastError)
 		}
 
 		return errors.Join(err, lastError)

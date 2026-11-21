@@ -17,6 +17,8 @@ import (
 	"github.com/Azure/unbounded/internal/registryauth"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/isolation"
+	"github.com/Azure/unbounded/pkg/agent/isolation/container"
+	"github.com/Azure/unbounded/pkg/agent/isolation/none"
 	"github.com/Azure/unbounded/pkg/agent/phases/rootfs"
 )
 
@@ -78,176 +80,279 @@ func bytesEqual(a, b []byte) bool {
 	return true
 }
 
-// registryAuthManagedMarker prefixes the agent's registry-auth drop-in so the
-// agent (and a future detach) can recognize and remove only the files it owns.
-const registryAuthManagedMarker = "# Managed by unbounded-agent registry authentication.\n"
+// registryAuthNodeStart re-resolves the node-stack goal state for the active
+// machine's slot, applying the mode-aware root the running node uses. It is the
+// same root the repave/machine-op path places files through, so placement and
+// teardown target the correct filesystem in every isolation mode:
+//   - none: the host (identity root, bin/libexec/cni redirected into the
+//
+// version directory),
+//   - container: the container's rootfs,
+//   - nspawn: the machine directory (the default goal-state root).
+//
+// The preflight resolver is used so the placement does not require device
+// readiness, and no disruptive Prepare is invoked just to discover a root. The
+// applied config's offline-artifact download override is resolved and wired
+// into the goal state so the provider-binary download honors an offline mirror
+// (finding: air-gapped nspawn nodes are the motivating environment, and the
+// provider is no longer supplied by an installer image).
+func registryAuthNodeStart(ctx context.Context, log *slog.Logger, active *ActiveMachine) (*goalstates.MachineGoalState, error) {
+	downloads, _, err := goalstates.ResolveDownloadOverridesWithOfflineArtifacts(ctx, active.Config, nil)
+	if err != nil {
+		return nil, fmt.Errorf("resolve download overrides for %s: %w", active.Name, err)
+	}
 
-// registryAuthDropInName is the drop-in file name the agent writes into the
-// kubelet unit's drop-in directory.
-const registryAuthDropInName = "90-unbounded-registry-auth.conf"
-
-// registryAuthRoot re-resolves the node-stack root for the active machine's
-// slot so the reconciler can place provider files by in-node path. It resolves
-// the goal state for the applied configuration because the registry-auth files
-// are placed next to the running stack, not as part of a repave. The preflight
-// resolver is used so the placement does not require device readiness. The
-// provider binary is a fixed upstream release, so no download override is
-// needed here; the default source is used.
-func registryAuthRoot(log *slog.Logger, active *ActiveMachine) (isolation.NodeRoot, error) {
-	gs, err := goalstates.ResolveMachineForPreflight(log, active.Config, active.Name, nil)
+	gs, err := goalstates.ResolveMachineForPreflight(log, active.Config, active.Name, downloads)
 	if err != nil {
 		return nil, fmt.Errorf("resolve node stack root for %s: %w", active.Name, err)
 	}
 
-	return gs.NodeStart.Root(), nil
+	switch activeModeOf(active) {
+	case isolation.ModeNone:
+		gs.NodeStart.RootOverride = none.Root{}
+	case isolation.ModeContainer:
+		root, err := container.NewDefault(log).NodeRoot(active.Name)
+		if err != nil {
+			return nil, fmt.Errorf("resolve container root for %s: %w", active.Name, err)
+		}
+
+		gs.NodeStart.RootOverride = root
+	}
+
+	return gs, nil
 }
 
 // ensureACRProviderBinary downloads the stock ACR credential provider into the
 // node stack if it is not already present. It reuses the rootfs download task so
-// the binary lands and is verified exactly as it would during provisioning.
-func ensureACRProviderBinary(ctx context.Context, log *slog.Logger, active *ActiveMachine, root isolation.NodeRoot) error {
-	gs, err := goalstates.ResolveMachineForPreflight(log, active.Config, active.Name, nil)
-	if err != nil {
-		return fmt.Errorf("resolve node stack for ACR provider: %w", err)
-	}
-
+// the binary lands and is verified exactly as it would during provisioning, and
+// it drives the download through the node's configured source (including an
+// offline mirror) rather than always the default upstream URL, because the
+// provider is no longer supplied by an installer image and air-gapped nodes are
+// the motivating environment.
+func ensureACRProviderBinary(ctx context.Context, log *slog.Logger, active *ActiveMachine, gs *goalstates.MachineGoalState) error {
 	// The download task writes through the node stack root. Point it at the
 	// resolved root so it places the binary where the running stack expects it.
-	gs.RootFS.RootOverride = root
+	gs.RootFS.RootOverride = gs.NodeStart.Root()
 
 	return rootfs.DownloadACRProvider(log, gs.RootFS).Do(ctx)
 }
 
-// registryAuthKubeletUnitFile is the kubelet unit file for the mode, as seen
-// through the node-stack root.
-func registryAuthKubeletUnitFile(mode isolation.Mode) string {
+// registryAuthKubeletUnitName is the kubelet systemd unit name for the mode.
+func registryAuthKubeletUnitName(mode isolation.Mode) string {
 	switch mode {
 	case isolation.ModeNone:
-		return filepath.Join(goalstates.SystemdSystemDir, "unbounded-kubelet.service")
+		return "unbounded-kubelet.service"
 	default:
-		return filepath.Join(goalstates.SystemdSystemDir, goalstates.SystemdUnitKubelet)
+		return goalstates.SystemdUnitKubelet
 	}
 }
 
-// registryAuthDropInPath is the path (through the node-stack root) of the
-// registry-auth drop-in for the mode.
-func registryAuthDropInPath(root isolation.NodeRoot, mode isolation.Mode) string {
-	unitDir := filepath.Dir(registryAuthKubeletUnitFile(mode)) + ".d"
-
-	return root.Path(filepath.Join(unitDir, registryAuthDropInName))
+// registryAuthNodeConfigDropIn is the path (through the node-stack root) of the
+// kubelet node-config drop-in that renders $KUBELET_NODE_CONFIG_ARGS, where the
+// managed image credential provider flags live. The kubelet unit's ExecStart
+// references $KUBELET_NODE_CONFIG_ARGS, so this is the effective, mode-correct
+// place to enable or disable the provider without restating ExecStart.
+func registryAuthNodeConfigDropIn(root isolation.NodeRoot, mode isolation.Mode) string {
+	return root.Path(filepath.Join(goalstates.SystemdSystemDir, registryAuthKubeletUnitName(mode)+".d", "20-node-config.conf"))
 }
 
-// kubeletExecStartFromUnit reads the kubelet unit's ExecStart line through the
-// node-stack root. The registry-auth drop-in must restate this line (systemd
-// replaces the unit's ExecStart with the drop-in's) and append the managed
-// flags.
-func kubeletExecStartFromUnit(root isolation.NodeRoot, mode isolation.Mode) (string, error) {
-	path := root.Path(registryAuthKubeletUnitFile(mode))
+// registryAuthProviderFlags are the kubelet image credential provider flags the
+// agent toggles in $KUBELET_NODE_CONFIG_ARGS.
+func registryAuthProviderFlags() []string {
+	return []string{
+		"--image-credential-provider-config=" + goalstates.RegistryAuthCredentialConfigPath,
+		"--image-credential-provider-bin-dir=" + goalstates.RegistryAuthProviderBinDir,
+	}
+}
+
+// registryAuthNodeConfigDropInPath resolves the node-config drop-in path. It is
+// a variable so tests can point it at a temporary path instead of the node
+// stack root.
+var registryAuthNodeConfigDropInPath = func(root isolation.NodeRoot, mode isolation.Mode) string {
+	return registryAuthNodeConfigDropIn(root, mode)
+}
+
+// applyProviderToNodeConfig adds the managed provider flags to the kubelet
+// node-config drop-in's $KUBELET_NODE_CONFIG_ARGS if they are absent, or removes
+// them when policy is nil. It edits only the provider tokens, preserving the
+// other effective node config args (hostname-override, node-ip, labels) and any
+// other existing drop-ins. It reports whether the on-disk content changed, which
+// is what triggers a kubelet restart.
+func applyProviderToNodeConfig(root isolation.NodeRoot, mode isolation.Mode, policy *registryauth.Config) (bool, error) {
+	path := registryAuthNodeConfigDropInPath(root, mode)
 
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return "", fmt.Errorf("read kubelet unit %s: %w", path, err)
-	}
+		if os.IsNotExist(err) {
+			if policy == nil {
+				// No node-config drop-in and nothing to remove: the kubelet's
+				// authentication is already external.
+				return false, nil
+			}
 
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "ExecStart=") {
-			return strings.TrimPrefix(line, "ExecStart="), nil
-		}
-	}
-
-	return "", fmt.Errorf("no ExecStart line in kubelet unit %s", path)
-}
-
-// writeRegistryAuthDropInFor writes the drop-in that sets the image credential
-// provider flags for the mode, or removes it when policy is nil. It reports
-// whether the on-disk content changed.
-func writeRegistryAuthDropInFor(root isolation.NodeRoot, mode isolation.Mode, policy *registryauth.Config) (bool, error) {
-	path := registryAuthDropInPath(root, mode)
-
-	if policy == nil {
-		err := os.Remove(path)
-		if err != nil && !os.IsNotExist(err) {
-			return false, err
+			return false, fmt.Errorf("kubelet node-config drop-in %s not found; the node stack has not written it yet", path)
 		}
 
-		return false, nil
+		return false, fmt.Errorf("read kubelet node-config drop-in %s: %w", path, err)
 	}
 
-	execStart, err := kubeletExecStartFromUnit(root, mode)
+	envValue, err := nodeConfigArgsValue(string(data))
 	if err != nil {
 		return false, err
 	}
 
-	if !strings.Contains(execStart, "$KUBELET_NODE_CONFIG_ARGS") {
-		return false, fmt.Errorf("kubelet ExecStart %q does not reference the node config args; refusing to override it", execStart)
-	}
-	if strings.Contains(execStart, "--image-credential-provider-") {
-		return false, fmt.Errorf("kubelet ExecStart already sets image credential provider flags; the managed provider cannot be added")
-	}
-
-	data := registryAuthDropInContent(execStart)
-
-	return writeFileIfChanged(path, []byte(data), 0o644)
-}
-
-// registryAuthDropInContent renders the [Service] drop-in restating the kubelet
-// ExecStart with the managed image credential provider flags appended.
-func registryAuthDropInContent(execStart string) string {
-	return registryAuthManagedMarker +
-		"[Service]\n" +
-		"ExecStart=\n" +
-		"ExecStart=" + execStart +
-		" --image-credential-provider-config=" + goalstates.RegistryAuthCredentialConfigPath +
-		" --image-credential-provider-bin-dir=" + goalstates.RegistryAuthProviderBinDir + "\n"
-}
-
-// removeRegistryAuthDropIn removes the managed drop-in from both the nspawn and
-// none kubelet unit locations, leaving the kubelet's authentication untouched.
-// It reports whether the content it removed was the agent's own (so the caller
-// knows a restart is needed).
-func removeRegistryAuthDropIn(root isolation.NodeRoot) (bool, error) {
-	changed := false
-
-	for _, unitDir := range []string{
-		filepath.Join(goalstates.SystemdSystemDir, "kubelet.service.d"),
-		filepath.Join(goalstates.SystemdSystemDir, "unbounded-kubelet.service.d"),
-	} {
-		path := root.Path(filepath.Join(unitDir, registryAuthDropInName))
-		if _, err := os.Stat(path); err != nil {
-			if os.IsNotExist(err) {
-				continue
-			}
-
-			return changed, err
+	args := registryAuthProviderArgs(envValue)
+	if policy == nil {
+		removed := args.removeManaged()
+		if !removed {
+			return false, nil
 		}
 
-		// Only remove a drop-in the agent owns, so an unrelated drop-in at the
-		// same name is never touched.
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return changed, err
-		}
+		return writeFileIfChanged(path, []byte(nodeConfigArgsRendered(envValue, args)), 0o644)
+	}
 
-		if !strings.HasPrefix(string(data), registryAuthManagedMarker) {
+	added, err := args.addManaged()
+	if err != nil {
+		return false, err
+	}
+
+	if !added {
+		return false, nil
+	}
+
+	return writeFileIfChanged(path, []byte(nodeConfigArgsRendered(envValue, args)), 0o644)
+}
+
+// nodeConfigArgsValue extracts the value of the KUBELET_NODE_CONFIG_ARGS
+// Environment entry from the node-config drop-in.
+func nodeConfigArgsValue(data string) (string, error) {
+	for _, line := range strings.Split(data, "\n") {
+		line = strings.TrimPrefix(line, "Environment=")
+		if !strings.HasPrefix(line, "KUBELET_NODE_CONFIG_ARGS=") {
 			continue
 		}
 
-		if err := os.Remove(path); err != nil {
-			return changed, err
+		value := strings.TrimPrefix(line, "KUBELET_NODE_CONFIG_ARGS=")
+
+		// The value is a systemd Environment= assignment, quoted.
+		if len(value) >= 2 && strings.HasPrefix(value, `"`) && strings.HasSuffix(value, `"`) {
+			value = value[1 : len(value)-1]
 		}
 
-		changed = true
+		return value, nil
+	}
+
+	return "", fmt.Errorf("no KUBELET_NODE_CONFIG_ARGS in kubelet node-config drop-in")
+}
+
+// nodeConfigArgs is the parsed token list of the node-config args value plus
+// which tokens are the managed provider flags.
+type nodeConfigArgs struct {
+	tokens  []string
+	managed []bool // parallel to tokens: true for a managed provider flag
+}
+
+func registryAuthProviderArgs(value string) nodeConfigArgs {
+	managedSet := map[string]bool{}
+	for _, f := range registryAuthProviderFlags() {
+		managedSet[f] = true
+	}
+
+	a := nodeConfigArgs{}
+	for _, tok := range strings.Fields(value) {
+		a.tokens = append(a.tokens, tok)
+		a.managed = append(a.managed, managedSet[tok])
+	}
+
+	return a
+}
+
+// addManaged adds the two managed provider flags if any are missing. It refuses
+// to add a flag whose path differs from the managed value (so an existing
+// provider configured elsewhere is not silently overridden).
+func (a *nodeConfigArgs) addManaged() (bool, error) {
+	flags := registryAuthProviderFlags()
+
+	for _, flag := range flags {
+		present := false
+		seenOther := false
+
+		for i, tok := range a.tokens {
+			if tok == flag {
+				present = true
+				a.managed[i] = true
+			} else if strings.HasPrefix(tok, "--image-credential-provider-") {
+				seenOther = true
+			}
+		}
+
+		if seenOther && !present {
+			return false, fmt.Errorf("kubelet node config already sets a different %q; the managed provider cannot be added", flag)
+		}
+	}
+
+	changed := false
+
+	for _, flag := range flags {
+		found := false
+		for _, tok := range a.tokens {
+			if tok == flag {
+				found = true
+			}
+		}
+
+		if !found {
+			a.tokens = append(a.tokens, flag)
+			a.managed = append(a.managed, true)
+			changed = true
+		}
 	}
 
 	return changed, nil
 }
 
-// registryAuthBackoff returns the backoff delay after the given number of
-// charged attempts.
+// removeManaged drops any managed provider flag. It returns false when there was
+// nothing managed to remove (a non-managed provider is left untouched).
+func (a *nodeConfigArgs) removeManaged() bool {
+	changed := false
+
+	for i := range a.tokens {
+		if a.managed[i] {
+			a.tokens = append(a.tokens[:i], a.tokens[i+1:]...)
+			a.managed = append(a.managed[:i], a.managed[i+1:]...)
+			changed = true
+
+			i--
+		}
+	}
+
+	return changed
+}
+
+// nodeConfigArgsRendered rewrites only the KUBELET_NODE_CONFIG_ARGS Environment
+// entry, preserving every other byte of the drop-in (including the trailing
+// newline) so the node-config args stay the only thing that changes.
+func nodeConfigArgsRendered(data string, a nodeConfigArgs) string {
+	joined := strings.Join(a.tokens, " ")
+	replacement := "Environment=\"KUBELET_NODE_CONFIG_ARGS=" + joined + "\""
+
+	lines := strings.Split(data, "\n")
+	for i, line := range lines {
+		if strings.HasPrefix(strings.TrimPrefix(line, "Environment="), "KUBELET_NODE_CONFIG_ARGS=") {
+			lines[i] = replacement
+		}
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+// registryAuthBackoff returns the delay to wait before the next restart attempt
+// given the number of attempts already charged. It is the documented schedule:
+// base for the first attempt, doubling thereafter, capped at the maximum.
 func registryAuthBackoff(attempts int) time.Duration {
 	backoff := registryAuthBaseBackoff
-	for i := 1; i < attempts; i++ {
+
+	for i := 0; i < attempts; i++ {
 		backoff *= registryAuthBackoffFactor
 		if backoff > registryAuthMaxBackoff {
 			backoff = registryAuthMaxBackoff
@@ -319,8 +424,10 @@ func backoffWait(err error) time.Duration {
 	return 0
 }
 
-// loadRegistryAuthBudget reads the persisted budget for a slot. A missing or
-// unreadable file yields a fresh budget.
+// loadRegistryAuthBudget reads the persisted budget for a slot. A missing file
+// yields a fresh budget. A malformed file is an error, not a fresh budget: an
+// interrupted write must not restore all restart attempts and contradict the
+// persistence-across-restarts guarantee (finding #7).
 func loadRegistryAuthBudget(slot string) (*registryAuthBudget, error) {
 	path := registryAuthBudgetPath(slot)
 
@@ -335,8 +442,7 @@ func loadRegistryAuthBudget(slot string) (*registryAuthBudget, error) {
 
 	var budget registryAuthBudget
 	if err := json.Unmarshal(data, &budget); err != nil {
-		// A corrupt budget is treated as fresh rather than blocking the node.
-		return &registryAuthBudget{}, nil
+		return nil, fmt.Errorf("corrupt registry-auth budget for %s: %w", slot, err)
 	}
 
 	return &budget, nil
@@ -350,7 +456,10 @@ func (r *registryAuthReconciler) resetBudget(slot, policyHash string) error {
 	return saveRegistryAuthBudget(slot, &registryAuthBudget{PolicyHash: policyHash})
 }
 
-// saveRegistryAuthBudget persists the budget for a slot.
+// saveRegistryAuthBudget persists the budget for a slot atomically (write a
+// temp file in the same directory and rename it into place), so an interrupted
+// write cannot leave a corrupt budget that loadRegistryAuthBudget would then
+// treat as an error or, worse, silently reset.
 func saveRegistryAuthBudget(slot string, budget *registryAuthBudget) error {
 	path := registryAuthBudgetPath(slot)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -362,8 +471,32 @@ func saveRegistryAuthBudget(slot string, budget *registryAuthBudget) error {
 		return err
 	}
 
-	if err := os.WriteFile(path, data, 0o644); err != nil {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".registry-auth-budget-*")
+	if err != nil {
+		return fmt.Errorf("create temp budget for %s: %w", slot, err)
+	}
+
+	name := tmp.Name()
+	defer os.Remove(name)
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+
 		return fmt.Errorf("write registry-auth budget for %s: %w", slot, err)
+	}
+
+	if err := tmp.Chmod(0o644); err != nil {
+		tmp.Close()
+
+		return fmt.Errorf("chmod registry-auth budget for %s: %w", slot, err)
+	}
+
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close registry-auth budget for %s: %w", slot, err)
+	}
+
+	if err := os.Rename(name, path); err != nil {
+		return fmt.Errorf("persist registry-auth budget for %s: %w", slot, err)
 	}
 
 	return nil

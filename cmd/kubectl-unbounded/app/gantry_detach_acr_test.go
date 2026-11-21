@@ -6,6 +6,8 @@ package app
 import (
 	"bytes"
 	"context"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -79,6 +81,20 @@ func TestGantryDetachACRRemoveGrantIsOwnershipGated(t *testing.T) {
 	h.machineClient = fakeMachineStatus{healthy: map[string]bool{}}
 	h.removeAzure = true
 	h.clusterID = attachClusterID
+
+	// Model Azure as having no pull identity or binding for this cluster (the
+	// UAMI and binding were already removed or never created), so the Azure
+	// reverse is a no-op and the test focuses on the K8s RBAC ownership gate.
+	h.runAzure = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		switch strings.Join(args[:min(2, len(args))], " ") {
+		case "identity show":
+			return nil, errors.New("the provided identity does not exist or could not be found")
+		case "rest":
+			return []byte(`{"value":[]}`), nil
+		}
+
+		return []byte("{}"), nil
+	}
 
 	// An unowned grant must be left in place.
 	_, err := client.RbacV1().ClusterRoleBindings().Create(t.Context(), &rbacv1.ClusterRoleBinding{

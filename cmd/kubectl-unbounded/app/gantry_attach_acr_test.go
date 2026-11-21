@@ -218,11 +218,14 @@ func managedAttachFixture(t *testing.T, bundles ...corev1.ClusterTrustBundleProj
 
 	// The operator's audience reconciler publishes the identity-use grant once
 	// the policy is in place; the attach-acr CLI no longer creates or waits on a
-	// per-node installer DaemonSet, so the fixture publishes the grant directly.
+	// per-node installer DaemonSet, so the fixture publishes the grant directly,
+	// stamped with the policy hash the attach path will compute, so the
+	// managed-attach acknowledgment (ownership + hash) succeeds.
 	_, err = client.RbacV1().ClusterRoleBindings().Create(t.Context(), &rbacv1.ClusterRoleBinding{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:   registryauth.IdentityRoleName,
-			Labels: map[string]string{"app.kubernetes.io/managed-by": acrAttachManager, "unbounded-cloud.io/namespace": h.namespace},
+			Name:        registryauth.IdentityRoleName,
+			Labels:      map[string]string{"app.kubernetes.io/managed-by": acrAttachManager, "unbounded-cloud.io/namespace": h.namespace},
+			Annotations: map[string]string{registryAuthConfigHashKey: attachTestGrantHash(t, ca)},
 		},
 		RoleRef:  rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: registryauth.IdentityRoleName},
 		Subjects: []rbacv1.Subject{{Kind: rbacv1.GroupKind, APIGroup: rbacv1.GroupName, Name: "system:serviceaccounts"}},
@@ -232,6 +235,30 @@ func managedAttachFixture(t *testing.T, bundles ...corev1.ClusterTrustBundleProj
 	client.ClearActions()
 
 	return h, client, calls
+}
+
+// attachTestGrantHash computes the identity-use grant hash the way the attach
+// path does, from the test's fixed policy values, so the fixture can stamp the
+// grant the way the operator would. The values match the fixture's ACR
+// (central.azurecr.io), identity (attachClientID/attachTenantID), and the
+// discovery pod's proxy env as execute() parses it: ProxyAddress is the proxy
+// hostname (10.0.0.1, not the URL), and CACert is the generated CA the fixture
+// injects through the proxy-ca ConfigMap.
+func attachTestGrantHash(t *testing.T, ca string) string {
+	t.Helper()
+
+	cfg := registryauth.Config{
+		Mode: registryauth.IdentityBindingMode, Registry: "central.azurecr.io",
+		ClientID: attachClientID, TenantID: attachTenantID,
+		SNIName: "proxy.example.com", ProxyAddress: "10.0.0.1", Audience: "api://binding", CACert: ca,
+	}
+
+	payload, err := json.Marshal(cfg)
+	require.NoError(t, err)
+
+	sum := sha256.Sum256(payload)
+
+	return hex.EncodeToString(sum[:])
 }
 
 func TestGantryAttachACRWaitsForAdmissionReadiness(t *testing.T) {

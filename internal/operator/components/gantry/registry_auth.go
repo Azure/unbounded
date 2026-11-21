@@ -32,11 +32,16 @@ import (
 // unrelated updates.
 func registryAuthMachinePredicate() predicate.Predicate {
 	return predicate.Funcs{
+		// Every Machine create is relevant: an external (nil-policy) Machine is
+		// still agent-backed and reports its registry-auth readiness, so dropping
+		// it here would lose the initial delivery and readiness for external
+		// nodes.
 		CreateFunc: func(ev event.CreateEvent) bool {
-			m, ok := ev.Object.(*v1alpha3.Machine)
-			return ok && m.Spec.RegistryAuth != nil
+			_, ok := ev.Object.(*v1alpha3.Machine)
+
+			return ok
 		},
-		DeleteFunc:  func(event.DeleteEvent) bool { return false },
+		DeleteFunc:  func(event.DeleteEvent) bool { return true },
 		GenericFunc: func(ev event.GenericEvent) bool { return false },
 		UpdateFunc: func(ev event.UpdateEvent) bool {
 			oldMachine, okOld := ev.ObjectOld.(*v1alpha3.Machine)
@@ -65,7 +70,14 @@ func registryAuthConditionChanged(oldMachine, newMachine *v1alpha3.Machine) bool
 		return false
 	}
 
-	return oldCond.Status != newCond.Status || oldCond.Reason != newCond.Reason
+	// A change that only updates ObservedGeneration still reconciles: the node
+	// re-acknowledged the current generation, which the readiness aggregation
+	// depends on. The message is part of the contract too (terminal vs
+	// transient reasons are carried there).
+	return oldCond.Status != newCond.Status ||
+		oldCond.Reason != newCond.Reason ||
+		oldCond.ObservedGeneration != newCond.ObservedGeneration ||
+		oldCond.Message != newCond.Message
 }
 
 const (
@@ -73,6 +85,30 @@ const (
 	registryAuthHash         = "unbounded-cloud.io/registry-auth-config-hash"
 	registryAuthAudienceName = "gantry-acr-kubelet-token-audience"
 )
+
+// registryAuthNodePredicate enqueues a gantry re-reconcile when a Linux AKS Flex
+// node is created, updated, or deleted, so the registry-auth plan reflects
+// membership changes even for a node that has not registered its Machine yet.
+// The singleton request maps every event to one reconcile pass; the eligibility
+// check bounds it to the nodes the policy applies to.
+func registryAuthNodePredicate() predicate.Predicate {
+	eligible := func(obj client.Object) bool {
+		node, ok := obj.(*corev1.Node)
+
+		return ok && registryAuthEligibleNode(node)
+	}
+
+	return predicate.Funcs{
+		CreateFunc:  func(ev event.CreateEvent) bool { return eligible(ev.Object) },
+		DeleteFunc:  func(ev event.DeleteEvent) bool { return eligible(ev.Object) },
+		GenericFunc: func(ev event.GenericEvent) bool { return eligible(ev.Object) },
+		UpdateFunc: func(ev event.UpdateEvent) bool {
+			// Reconcile when eligibility changes (a node becomes or stops being
+			// a Linux AKS Flex node) or when either side is eligible.
+			return eligible(ev.ObjectOld) || eligible(ev.ObjectNew)
+		},
+	}
+}
 
 // registryAuthPolicyFromConfig maps the operator's node-auth policy to the
 // Machine.spec.registryAuth field the agent applies. An external (or absent)
@@ -149,22 +185,39 @@ func planRegistryAuthMachines(ctx context.Context, env *component.Env, policy *v
 		return nil, nil, err
 	}
 
+	// Read the Machines once through the cached client (a single bounded List,
+	// not a live read per node) and associate each node with its Machine by
+	// NodeName. This is the 10k-node contract: observation is a single List of
+	// the watched kind plus an in-memory map, not N apiserver calls.
+	machinesList := &v1alpha3.MachineList{}
+	if err := env.Client.List(ctx, machinesList); err != nil {
+		return nil, nil, fmt.Errorf("list Machines for registry-auth: %w", err)
+	}
+
+	byNode := make(map[string]*v1alpha3.Machine, len(machinesList.Items))
+	for i := range machinesList.Items {
+		m := &machinesList.Items[i]
+		byNode[m.NodeName()] = m
+	}
+
 	var (
-		operations []component.Operation
-		machines   []v1alpha3.Machine
+		operations   []component.Operation
+		machines     []v1alpha3.Machine
+		pendingNodes []string
 	)
 
+	gvk := v1alpha3.GroupVersion.WithKind("Machine")
+
 	for _, name := range nodes {
-		var machine v1alpha3.Machine
-		err := env.LiveReader().Get(ctx, client.ObjectKey{Name: name}, &machine)
-		if apierrors.IsNotFound(err) {
-			// A node without a Machine is not yet agent-backed; skip it. The
-			// agent registers its Machine at bootstrap, so it will reconcile on
-			// the next pass once the Machine exists.
+		machine, ok := byNode[name]
+		if !ok {
+			// A node without a Machine is not yet agent-backed. It is kept as
+			// pending (reported by the readiness aggregation) rather than
+			// silently skipped, so initial delivery and membership changes are
+			// not lost.
+			pendingNodes = append(pendingNodes, name)
+
 			continue
-		}
-		if err != nil {
-			return nil, nil, fmt.Errorf("read Machine %s: %w", name, err)
 		}
 
 		machines = append(machines, *machine.DeepCopy())
@@ -180,9 +233,9 @@ func planRegistryAuthMachines(ctx context.Context, env *component.Env, policy *v
 		// A typed read from the client drops TypeMeta, so restore the known
 		// Machine GVK before the executor can tell the object apart from any
 		// other cluster-scoped one.
-		gvk := v1alpha3.GroupVersion.WithKind("Machine")
-		base := component.ToUnstructured(&machine)
+		base := component.ToUnstructured(machine)
 		base.SetGroupVersionKind(gvk)
+
 		object := component.ToUnstructured(desired)
 		object.SetGroupVersionKind(gvk)
 
@@ -192,6 +245,12 @@ func planRegistryAuthMachines(ctx context.Context, env *component.Env, policy *v
 			Base:      base,
 			Object:    object,
 		})
+	}
+
+	// Pending nodes are reported through a synthetic Machine so the readiness
+	// aggregation sees them as installing rather than ignoring them.
+	for _, name := range pendingNodes {
+		machines = append(machines, v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: name}})
 	}
 
 	return operations, machines, nil
@@ -249,17 +308,27 @@ func registryAuthResult(machines []v1alpha3.Machine, active bool) *component.Res
 	}
 
 	installing := 0
+
 	var failures []string
 
 	for i := range machines {
-		cond := registryAuthCondition(&machines[i])
+		m := &machines[i]
+
+		cond := registryAuthCondition(m)
+
 		switch {
 		case cond == nil:
+			// No condition reported yet: the node is still installing.
 			installing++
+		case cond.Status == metav1.ConditionTrue && cond.ObservedGeneration >= m.Generation:
+			// Healthy, verified by the agent, and observed the current generation
+			// (a True on a stale generation is not readiness for this policy).
 		case cond.Status == metav1.ConditionTrue:
-			// Healthy and verified by the agent.
+			// The condition is healthy but was observed before the current
+			// generation; the node has not acknowledged this policy yet.
+			installing++
 		default:
-			failures = append(failures, fmt.Sprintf("%s: %s (%s)", machines[i].Name, cond.Reason, cond.Message))
+			failures = append(failures, fmt.Sprintf("%s: %s (%s)", m.Name, cond.Reason, cond.Message))
 		}
 	}
 
