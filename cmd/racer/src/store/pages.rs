@@ -193,6 +193,53 @@ impl Pages {
         self.stored
     }
 
+    /// Segment commitments of current and proposed pin members.
+    pub fn pin_charge(&mut self, segments: &Segments, pages: &[PageId]) -> Result<usize> {
+        let inner = self.inner_mut()?;
+        let mut slots = Vec::new();
+        let mut missing = 0;
+        for page in pages {
+            match inner.slots.get(page) {
+                Some(slot) => slots.push(slot),
+                None => missing += 1,
+            }
+        }
+        Ok(inner.disk.borrow_mut().pin_charge(segments, &slots)? + missing)
+    }
+
+    pub fn set_pin_limit(&mut self, limit: usize) -> Result<()> {
+        let inner = self.inner_mut()?;
+        let mut disk = inner.disk.borrow_mut();
+        disk.set_pin_limit(limit);
+        Ok(())
+    }
+
+    pub fn set_protection_limit(&mut self, limit: usize) -> Result<()> {
+        self.inner_mut()?
+            .disk
+            .borrow_mut()
+            .set_protection_limit(limit);
+        Ok(())
+    }
+
+    /// Joint commitments of spill holds, pins, and proposed members.
+    pub fn protection_charge(&mut self, segments: &Segments, pages: &[PageId]) -> Result<usize> {
+        let inner = self.inner_mut()?;
+        let mut slots = Vec::new();
+        let mut missing = 0;
+        for page in pages {
+            match inner.slots.get(page) {
+                Some(slot) => slots.push(slot),
+                None => missing += 1,
+            }
+        }
+        Ok(inner
+            .disk
+            .borrow_mut()
+            .protection_charge(segments, &slots)?
+            + missing)
+    }
+
     /// Interned page capacity.
     #[cfg(test)]
     pub fn slots(&self) -> u32 {
@@ -346,12 +393,13 @@ impl Pages {
         Ok((slot, cache))
     }
 
-    /// Reserve a publication of `page`. `Overloaded` when the slot arena or
-    /// cache table is full, `Busy` when `page` is already being written.
-    pub fn reserve(&mut self, page: &PageId) -> Result<Reservation> {
+    /// Reserve a publication of `page`, appending into the pinned segment
+    /// class when `pinned` is set. `Overloaded` when the slot arena or cache
+    /// table is full, `Busy` when `page` is already being written.
+    pub fn reserve(&mut self, page: &PageId, pinned: bool) -> Result<Reservation> {
         let (slot, cache) = self.intern(page)?;
         let inner = self.inner.as_mut().expect("initialized page table");
-        match PendingWrite::reserve(&inner.disk, slot, cache) {
+        match PendingWrite::reserve(&inner.disk, slot, cache, pinned) {
             Ok(write) => Ok(Reservation {
                 write,
                 disk: inner.disk.clone(),
@@ -578,6 +626,25 @@ impl Pages {
         until: Monotonic,
         now: Monotonic,
     ) -> Result<(HoldId, Vec<PageSlot>)> {
+        self.hold_in(pages, until, now, false)
+    }
+
+    pub fn hold_pinned(
+        &mut self,
+        pages: &[PageId],
+        until: Monotonic,
+        now: Monotonic,
+    ) -> Result<(HoldId, Vec<PageSlot>)> {
+        self.hold_in(pages, until, now, true)
+    }
+
+    fn hold_in(
+        &mut self,
+        pages: &[PageId],
+        until: Monotonic,
+        now: Monotonic,
+        pinned: bool,
+    ) -> Result<(HoldId, Vec<PageSlot>)> {
         let inner = self.inner_mut()?;
         let mut slots = Vec::with_capacity(pages.len());
         for page in pages {
@@ -589,7 +656,11 @@ impl Pages {
                 }
             }
         }
-        let held = inner.disk.borrow_mut().hold(&slots, until, now);
+        let held = if pinned {
+            inner.disk.borrow_mut().hold_pinned(&slots, until, now)
+        } else {
+            inner.disk.borrow_mut().hold(&slots, until, now)
+        };
         match held {
             Ok(id) => Ok((id, slots)),
             Err(error) => {

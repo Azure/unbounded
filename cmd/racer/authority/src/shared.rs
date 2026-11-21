@@ -7,6 +7,7 @@ use crate::{
     pki::{DynamicClientVerifier, SeatIssuer, ServingIdentity},
     rt::Signal,
     rules::{
+        members::{NodeInfo, Ownership, PodInfo},
         publication::Image,
         state::{Freshness, StateRecord},
     },
@@ -124,6 +125,25 @@ pub struct Shared {
     pub authz: RefCell<crate::rules::authz::AuthCache<crate::auth::Caller>>,
     /// API call budget for bearer authorization.
     pub auth_budget: RefCell<crate::rules::authz::ApiBudget>,
+    /// Process-wide ClusterCacheFills by UID.
+    pub fills: RefCell<BTreeMap<String, crate::fills::FillView>>,
+    /// Publication adopted by the local dataplane, including its cache pools.
+    pub fill_context: RefCell<Option<crate::fills::FillContext>>,
+    /// ClusterCacheFills listed at least once, or the CRD is absent.
+    pub fills_synced: Cell<bool>,
+    /// Process-wide ClusterCaches by UID, for fill cache resolution.
+    pub fills_caches: RefCell<BTreeMap<String, crate::rules::catalog::CacheInfo>>,
+    /// ClusterCaches listed at least once, or the CRD is absent.
+    pub fills_caches_synced: Cell<bool>,
+    /// Live Nodes by UID, mirrored for fill status member selection.
+    pub nodes: RefCell<BTreeMap<String, NodeInfo>>,
+    /// Live Pods by UID, mirrored for fill status member selection.
+    pub pods: RefCell<BTreeMap<String, PodInfo>>,
+    /// Live DaemonSet ownership, mirrored for fill status member selection.
+    pub ownership: RefCell<Ownership>,
+    /// Primary term whose Pod/Node lists and DaemonSet ownership have all
+    /// been read. Mirrors from an earlier term must not drive fill status.
+    pub fill_status_term: RefCell<Option<crate::rules::state::Term>>,
 }
 
 impl Shared {
@@ -242,6 +262,9 @@ pub(crate) mod tests {
             peer_port: 8082,
             page_size: racer_wire::object::PageSize::DEFAULT,
             rotation: Default::default(),
+            trust_bundle: "/etc/ssl/certs/ca-certificates.crt".into(),
+            azure_authority_host: "https://login.microsoftonline.com/".into(),
+            azure_federated_token_file: None,
         };
         Rc::new(Shared {
             identity: "p1/00".into(),
@@ -266,6 +289,15 @@ pub(crate) mod tests {
             rng: RefCell::new(Box::new(racer_core::rng::SplitMix64::new(1))),
             authz: Default::default(),
             auth_budget: Default::default(),
+            fills: RefCell::new(BTreeMap::new()),
+            fill_context: RefCell::new(None),
+            fills_synced: Cell::new(false),
+            fills_caches: RefCell::new(BTreeMap::new()),
+            fills_caches_synced: Cell::new(false),
+            nodes: RefCell::new(BTreeMap::new()),
+            pods: RefCell::new(BTreeMap::new()),
+            ownership: RefCell::new(Ownership::default()),
+            fill_status_term: RefCell::new(None),
         })
     }
 }

@@ -62,16 +62,23 @@ spec:
       message: A Racer Pod may not change other metadata
       reason: Forbidden
     - expression: >-
-        variables.annotations.all(k, k == 'racer.unbounded-cloud.io/report' ||
+        variables.annotations.all(k,
+          k in ['racer.unbounded-cloud.io/report', 'racer.unbounded-cloud.io/fills'] ||
           (k in variables.oldAnnotations && variables.annotations[k] == variables.oldAnnotations[k])) &&
-        variables.oldAnnotations.all(k, k == 'racer.unbounded-cloud.io/report' ||
+        variables.oldAnnotations.all(k,
+          k in ['racer.unbounded-cloud.io/report', 'racer.unbounded-cloud.io/fills'] ||
           (k in variables.annotations && variables.oldAnnotations[k] == variables.annotations[k]))
-      message: A Racer Pod may only change its racer.unbounded-cloud.io/report annotation
+      message: A Racer Pod may only change its racer.unbounded-cloud.io/report or racer.unbounded-cloud.io/fills annotations
       reason: Forbidden
     - expression: >-
         !('racer.unbounded-cloud.io/report' in variables.annotations) ||
         size(bytes(variables.annotations['racer.unbounded-cloud.io/report'])) <= 32768
       message: The Racer report annotation is limited to 32768 UTF-8 bytes
+      reason: Forbidden
+    - expression: >-
+        !('racer.unbounded-cloud.io/fills' in variables.annotations) ||
+        size(bytes(variables.annotations['racer.unbounded-cloud.io/fills'])) <= 65536
+      message: The Racer fills annotation is limited to 65536 UTF-8 bytes
       reason: Forbidden
 ---
 apiVersion: admissionregistration.k8s.io/v1

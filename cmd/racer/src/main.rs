@@ -53,6 +53,27 @@ impl ClusterControl for Embedded {
             eprintln!("racer: stage=cluster-report error={error}");
         }
     }
+
+    fn report_fill_progress(
+        &self,
+        fills: Vec<racer_authority::FillProgress>,
+        pinnable_bytes: Option<u64>,
+    ) {
+        if let Err(error) = self.0.report_fill_progress(fills, pinnable_bytes) {
+            eprintln!("racer: stage=cluster-fill-report error={error}");
+        }
+    }
+
+    fn fills(&self) -> Vec<racer_authority::FillView> {
+        self.0.fills()
+    }
+
+    fn fills_for(
+        &self,
+        context: Option<racer_authority::FillContext>,
+    ) -> Vec<racer_authority::FillView> {
+        self.0.fills_for(context)
+    }
 }
 
 fn run() -> std::result::Result<(), (&'static str, Error)> {

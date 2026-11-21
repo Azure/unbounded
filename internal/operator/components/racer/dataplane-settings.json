@@ -30,6 +30,7 @@
   {"name": "RACER_DISK_PAGE_ENTRIES", "owner": "dataplane", "scope": "node", "kind": "unsigned", "min": "1", "max": "1048576", "step": "1", "default": "65536", "empty_unset": false},
   {"name": "RACER_CHECKPOINT_BYTES", "owner": "dataplane", "scope": "node", "kind": "unsigned", "min": "1", "max": "536870912", "step": "1", "default": "67108864", "empty_unset": false},
   {"name": "RACER_RETAINED_SEGMENT_PERCENT", "owner": "dataplane", "scope": "per-worker", "kind": "unsigned", "min": "1", "max": "100", "step": "1", "default": "50", "empty_unset": false},
+  {"name": "RACER_PINNED_SEGMENT_PERCENT", "owner": "dataplane", "scope": "per-worker", "kind": "unsigned", "min": "0", "max": "100", "step": "1", "default": "50", "empty_unset": false},
   {"name": "RACER_RANGE_SPILL_PAGES", "owner": "dataplane", "scope": "node", "kind": "unsigned", "min": "0", "max": "1024", "step": "1", "default": "0", "empty_unset": false},
   {"name": "RACER_ADMISSION_MODE", "owner": "dataplane", "scope": "node", "kind": "enum", "values": ["disabled", "second-sight"], "default": "second-sight", "empty_unset": false},
   {"name": "RACER_ADMISSION_HISTORY_BYTES", "owner": "dataplane", "scope": "node", "kind": "unsigned", "min": "32", "max": "536870912", "step": "1", "default": "4194304", "empty_unset": false},

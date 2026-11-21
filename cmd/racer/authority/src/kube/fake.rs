@@ -549,6 +549,10 @@ impl Store {
                 )
             }
             "PUT" => {
+                // Status uses the parent object's CAS and changes only its
+                // status, just like Kubernetes' status subresource.
+                let status_parent = path.strip_suffix("/status");
+                let path = status_parent.unwrap_or(path);
                 let Some(current) = self.object(path) else {
                     return (404, json!({}));
                 };
@@ -556,7 +560,13 @@ impl Store {
                 if rv != str_at(current, &["metadata", "resourceVersion"]) {
                     return (409, json!({"code":409}));
                 }
-                let mut next = request.clone();
+                let mut next = if status_parent.is_some() {
+                    let mut next = current.clone();
+                    next["status"] = request["status"].clone();
+                    next
+                } else {
+                    request.clone()
+                };
                 next["metadata"]["uid"] = current["metadata"]["uid"].clone();
                 (200, self.put_object(path, next))
             }
@@ -723,6 +733,34 @@ mod store_tests {
         assert_eq!(s.handle("PUT", &format!("{LEASES}/x"), b"{}").0, 404);
         assert_eq!(s.handle("GET", &format!("{LEASES}/x"), b"").0, 404);
         assert_eq!(s.handle("GET", "/x/y", b"{").0, 400);
+    }
+
+    #[test]
+    fn status_put_preserves_parent_and_checks_its_resource_version() {
+        let mut s = Store::new();
+        let path = "/apis/racer.unbounded-cloud.io/v1alpha1/clustercachefills/a";
+        let current = s.put_object(
+            path,
+            json!({"metadata": {"name": "a", "generation": 3}, "spec": {"cacheName": "models"}}),
+        );
+        let body = serde_json::to_vec(&json!({
+            "metadata": {"name": "a", "resourceVersion": current["metadata"]["resourceVersion"]},
+            "spec": {"cacheName": "must-not-change"},
+            "status": {"observedGeneration": 3},
+        }))
+        .unwrap();
+        let target = format!("{path}/status");
+        assert_eq!(s.handle("PUT", &target, &body).0, 200);
+        let stored = s.object(path).unwrap();
+        assert_eq!(stored["metadata"]["uid"], current["metadata"]["uid"]);
+        assert_eq!(stored["metadata"]["generation"], 3);
+        assert_eq!(stored["spec"], current["spec"]);
+        assert_eq!(stored["status"]["observedGeneration"], 3);
+        assert_eq!(s.handle("PUT", &target, &body).0, 409);
+        assert_eq!(
+            s.handle("PUT", &format!("{path}-missing/status"), &body).0,
+            404
+        );
     }
 
     #[test]

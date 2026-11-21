@@ -64,8 +64,41 @@ func TestRacerBootstrapUsesClusterScopedClusterCache(t *testing.T) {
 		}
 	}
 
+	fill := desired["clustercachefills.racer.unbounded-cloud.io"]
+	if fill == nil {
+		t.Fatal("ClusterCacheFill CRD is not bootstrapped")
+	}
+
+	for _, field := range []struct {
+		path []string
+		want string
+	}{
+		{path: []string{"spec", "scope"}, want: "Cluster"},
+		{path: []string{"spec", "names", "kind"}, want: "ClusterCacheFill"},
+		{path: []string{"spec", "group"}, want: "racer.unbounded-cloud.io"},
+	} {
+		got, _, err := unstructured.NestedString(fill.Object, field.path...)
+		if err != nil || got != field.want {
+			t.Fatalf("%v = %q, %v; want %q", field.path, got, err, field.want)
+		}
+	}
+
+	versions, found, err := unstructured.NestedSlice(fill.Object, "spec", "versions")
+	if err != nil || !found || len(versions) != 1 {
+		t.Fatalf("ClusterCacheFill CRD versions = %v, %v", versions, err)
+	}
+
+	version := versions[0].(map[string]any)
+
+	status, _ := version["subresources"].(map[string]any)
+	if _, ok := status["status"]; !ok {
+		t.Fatalf("ClusterCacheFill CRD has no status subresource: %v", version["subresources"])
+	}
+
 	for name := range desired {
-		if strings.HasSuffix(name, ".racer.unbounded-cloud.io") && name != "clustercaches.racer.unbounded-cloud.io" {
+		if strings.HasSuffix(name, ".racer.unbounded-cloud.io") &&
+			name != "clustercaches.racer.unbounded-cloud.io" &&
+			name != "clustercachefills.racer.unbounded-cloud.io" {
 			t.Fatalf("unexpected Racer CRD %q is bootstrapped", name)
 		}
 	}
