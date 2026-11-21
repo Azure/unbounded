@@ -16,6 +16,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -32,7 +33,7 @@ import (
 func TestReconcilerAddsMachineOperationNameToHandlerLogs(t *testing.T) {
 	s := testScheme(t)
 	op := testOperation("op-logged", v1alpha3.OperationHostPowerOff)
-	op.Spec.MachineSelector = &metav1.LabelSelector{MatchLabels: map[string]string{"missing": "true"}}
+	op.Spec.MachineRef = "missing"
 
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(op).WithStatusSubresource(op).Build()
 	reconciler := testReconciler(c, &recordingPowerClient{}, "rack-a")
@@ -568,53 +569,280 @@ func TestRedfishPowerClientFactoryDefaultsEmptySecretKey(t *testing.T) {
 	require.ErrorContains(t, err, `redfish password secret unbounded-system/redfish missing key "password"`)
 }
 
-func TestReconcilerSnapshotsSiteScopedSelectorTargets(t *testing.T) {
+func TestShouldReconcileIgnoresSelectorOnlyOperation(t *testing.T) {
 	t.Parallel()
 
-	s := testScheme(t)
-	machineA := testBareMetalMachine("machine-a", "rack-a")
-	machineA.Spec.Host = &v1alpha3.HostSpec{Netboot: machineA.Spec.PXE}
-	machineA.Spec.PXE = nil
-	machineB := testBareMetalMachine("machine-b", "rack-a")
-	machineOtherSite := testBareMetalMachine("machine-c", "rack-b")
-	external := testBareMetalMachine("machine-d", "rack-a")
-	external.Spec.PXE = nil
-	external.Spec.Host = &v1alpha3.HostSpec{Azure: &v1alpha3.AzureHostSpec{
-		ResourceID: "azure:///subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/machine-d",
-	}}
-	op := testOperation("op-selector", v1alpha3.OperationHostPowerOff)
-	op.Spec.MachineSelector = &metav1.LabelSelector{MatchLabels: map[string]string{siteLabel: "rack-a"}}
+	ttl := int32(0)
+	completedAt := fixedNow()
 
-	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machineA, machineB, machineOtherSite, external, op, testRedfishSecret()).WithStatusSubresource(op).Build()
-	reconciler := testReconciler(c, &recordingPowerClient{states: map[string]redfish.PowerState{}}, "rack-a")
+	tests := []struct {
+		name string
+		op   *v1alpha3.MachineOperation
+	}{
+		{
+			name: "pending host operation",
+			op:   testOperation("op-selector", v1alpha3.OperationHostPowerOff),
+		},
+		{
+			name: "terminal operation with TTL",
+			op: func() *v1alpha3.MachineOperation {
+				op := testOperation("op-selector-ttl", v1alpha3.OperationHostPowerOff)
+				op.Spec.TTLSecondsAfterFinished = &ttl
+				op.Status.Phase = v1alpha3.OperationPhaseComplete
+				op.Status.CompletedAt = &completedAt
 
-	_, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
-	require.NoError(t, err)
+				return op
+			}(),
+		},
+	}
 
-	var updated v1alpha3.MachineOperation
-	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &updated))
-	require.Equal(t, v1alpha3.OperationPhaseInProgress, updated.Status.Phase)
-	require.Equal(t, []string{"machine-a", "machine-b"}, targetNames(updated.Status.Targets))
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			tt.op.Spec.MachineSelector = &metav1.LabelSelector{MatchLabels: map[string]string{siteLabel: "rack-a"}}
+			require.False(t, shouldReconcile(tt.op), "selector-only operation")
+
+			tt.op.Spec.MachineRef = "machine-1"
+			require.True(t, shouldReconcile(tt.op), "machineRef operation")
+		})
+	}
 }
 
-func TestReconcilerFailsUnscopedSelector(t *testing.T) {
+func TestReconcilerIgnoresSelectorOnlyOperation(t *testing.T) {
+	t.Parallel()
+
+	ttl := int32(0)
+	completedAt := fixedNow()
+
+	tests := []struct {
+		name string
+		site string
+		spec func(*v1alpha3.MachineOperation)
+	}{
+		{
+			name: "selector on the owning site",
+			site: "rack-a",
+			spec: func(op *v1alpha3.MachineOperation) {
+				op.Spec.MachineSelector = &metav1.LabelSelector{MatchLabels: map[string]string{siteLabel: "rack-a"}}
+			},
+		},
+		{
+			name: "selector on another site",
+			site: "rack-b",
+			spec: func(op *v1alpha3.MachineOperation) {
+				op.Spec.MachineSelector = &metav1.LabelSelector{MatchLabels: map[string]string{siteLabel: "rack-a"}}
+			},
+		},
+		{
+			name: "selector naming no site",
+			site: "rack-a",
+			spec: func(op *v1alpha3.MachineOperation) {
+				op.Spec.MachineSelector = &metav1.LabelSelector{MatchLabels: map[string]string{"rack": "a"}}
+			},
+		},
+		{
+			name: "default metalman",
+			site: "",
+			spec: func(op *v1alpha3.MachineOperation) {
+				op.Spec.MachineSelector = &metav1.LabelSelector{MatchLabels: map[string]string{siteLabel: "rack-a"}}
+			},
+		},
+		{
+			name: "terminal operation with expired TTL",
+			site: "rack-a",
+			spec: func(op *v1alpha3.MachineOperation) {
+				op.Spec.MachineSelector = &metav1.LabelSelector{MatchLabels: map[string]string{siteLabel: "rack-a"}}
+				op.Spec.TTLSecondsAfterFinished = &ttl
+				op.Status.Phase = v1alpha3.OperationPhaseComplete
+				op.Status.CompletedAt = &completedAt
+				op.Finalizers = []string{mediaFinalizer}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			s := testScheme(t)
+			machine := testBareMetalMachine("machine-1", "rack-a")
+			op := testOperation("op-selector", v1alpha3.OperationHostPowerOff)
+			tt.spec(op)
+
+			c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, testRedfishSecret()).WithStatusSubresource(op).Build()
+			before := getOperation(t, c, op.Name)
+			power := &recordingPowerClient{}
+			reconciler := testReconciler(c, power, tt.site)
+
+			result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+			require.NoError(t, err)
+			require.Equal(t, ctrl.Result{}, result)
+
+			after := getOperation(t, c, op.Name)
+			require.Equal(t, before.ResourceVersion, after.ResourceVersion)
+			require.Equal(t, before.Status, after.Status)
+			require.Equal(t, before.Finalizers, after.Finalizers)
+			require.Empty(t, after.Status.Targets)
+			require.Empty(t, power.calls)
+		})
+	}
+}
+
+// A held machineRef operation is not started: while spec.suspend is set
+// metalman writes no status, adds no finalizer, installs no boot media and
+// makes no power call. An operation that has already started, or that is
+// terminal, is not held.
+func TestReconcilerIgnoresHeldOperation(t *testing.T) {
+	t.Parallel()
+
+	startedAt := fixedNow()
+	ttl := int32(0)
+	completedAt := metav1.NewTime(fixedNow().Add(-time.Hour))
+
+	tests := []struct {
+		name        string
+		mutate      func(*v1alpha3.MachineOperation)
+		wantGone    bool
+		wantStarted bool
+	}{
+		{
+			name:   "not started",
+			mutate: func(*v1alpha3.MachineOperation) {},
+		},
+		{
+			name: "pending",
+			mutate: func(op *v1alpha3.MachineOperation) {
+				op.Status.Phase = v1alpha3.OperationPhasePending
+			},
+		},
+		{
+			// Every agent may write any operation's status. A status that
+			// claims the operation started does not release it.
+			name: "forged in-progress status is still held",
+			mutate: func(op *v1alpha3.MachineOperation) {
+				op.Status.Phase = v1alpha3.OperationPhaseInProgress
+				op.Status.StartedAt = &startedAt
+			},
+		},
+		{
+			name: "forged terminal status is still held",
+			mutate: func(op *v1alpha3.MachineOperation) {
+				op.Spec.TTLSecondsAfterFinished = &ttl
+				op.Status.Phase = v1alpha3.OperationPhaseComplete
+				op.Status.CompletedAt = &completedAt
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			s := testScheme(t)
+			machine := testBareMetalMachine("machine-1", "rack-a")
+			op := testOperation("op-held", v1alpha3.OperationHostPowerOff)
+			op.Spec.MachineRef = machine.Name
+			op.Spec.Suspend = true
+			tt.mutate(op)
+
+			c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, testRedfishSecret()).WithStatusSubresource(op).Build()
+			before := getOperation(t, c, op.Name)
+			power := &recordingPowerClient{}
+			reconciler := testReconciler(c, power, "rack-a")
+
+			result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+			require.NoError(t, err)
+
+			if tt.wantStarted {
+				// The started operation keeps running as usual.
+				require.Equal(t, []string{"machine-1:ForceOff"}, power.calls)
+
+				after := getOperation(t, c, op.Name)
+				require.Equal(t, v1alpha3.OperationPhaseInProgress, after.Status.Phase)
+				require.Len(t, after.Status.Targets, 1)
+
+				return
+			}
+
+			require.Equal(t, ctrl.Result{}, result)
+
+			var after v1alpha3.MachineOperation
+
+			err = c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &after)
+
+			if tt.wantGone {
+				require.True(t, apierrors.IsNotFound(err))
+
+				return
+			}
+
+			require.NoError(t, err)
+			require.Equal(t, before.ResourceVersion, after.ResourceVersion)
+			require.Equal(t, before.Status, after.Status)
+			require.Equal(t, before.Finalizers, after.Finalizers)
+			require.Empty(t, after.Status.Targets)
+			require.Empty(t, power.calls)
+		})
+	}
+}
+
+// A held machineRef operation is not started. The release clears
+// spec.suspend, which bumps the generation; the watch predicate then
+// re-enqueues the operation and metalman runs it as usual.
+func TestReconcilerExecutesHeldOperationOnceReleased(t *testing.T) {
 	t.Parallel()
 
 	s := testScheme(t)
 	machine := testBareMetalMachine("machine-1", "rack-a")
-	op := testOperation("op-selector", v1alpha3.OperationHostPowerOff)
-	op.Spec.MachineSelector = &metav1.LabelSelector{MatchLabels: map[string]string{"rack": "a"}}
+	op := testOperation("op-held", v1alpha3.OperationHostPowerOff)
+	op.Spec.MachineRef = machine.Name
+	op.Spec.Suspend = true
 
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, testRedfishSecret()).WithStatusSubresource(op).Build()
-	reconciler := testReconciler(c, &recordingPowerClient{}, "rack-a")
+	power := &recordingPowerClient{}
+	reconciler := testReconciler(c, power, "rack-a")
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}}
 
-	_, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+	// Held: no status write, no power call.
+	result, err := reconciler.Reconcile(context.Background(), req)
 	require.NoError(t, err)
+	require.Equal(t, ctrl.Result{}, result)
+	require.Empty(t, power.calls)
+	require.Equal(t, v1alpha3.MachineOperationStatus{}, getOperation(t, c, op.Name).Status)
+
+	// Release.
+	released := getOperation(t, c, op.Name)
+	released.Spec.Suspend = false
+	require.NoError(t, c.Update(context.Background(), &released))
+
+	// The operation runs and completes as usual.
+	for range 2 {
+		_, err := reconciler.Reconcile(context.Background(), req)
+		require.NoError(t, err)
+	}
 
 	var updated v1alpha3.MachineOperation
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &updated))
-	require.Equal(t, v1alpha3.OperationPhaseFailed, updated.Status.Phase)
-	require.Contains(t, updated.Status.Message, "machineSelector must include unbounded-cloud.io/site=rack-a")
+	require.Equal(t, v1alpha3.OperationPhaseComplete, updated.Status.Phase, updated.Status.Message)
+	require.Equal(t, []string{machine.Name}, targetNames(updated.Status.Targets))
+	require.Equal(t, []string{"machine-1:ForceOff"}, power.calls)
+}
+
+// The watch predicate keys on the new object: a held machineRef operation is
+// enqueued, and the release that clears spec.suspend is enqueued too, so
+// metalman reconciles the operation once it is no longer held.
+func TestShouldReconcileReconcilesHeldOperationRelease(t *testing.T) {
+	t.Parallel()
+
+	held := testOperation("op-held", v1alpha3.OperationHostPowerOff)
+	held.Spec.MachineRef = "machine-1"
+	held.Spec.Suspend = true
+	require.True(t, shouldReconcile(held), "the held operation is enqueued; Reconcile skips it while it is held")
+
+	released := held.DeepCopy()
+	released.Spec.Suspend = false
+	require.True(t, shouldReconcile(released), "the release is reconciled")
 }
 
 func TestReconcilerIgnoresMachineRefOutsideSite(t *testing.T) {
@@ -1859,7 +2087,7 @@ func TestReconcilerCompletesAllHostReplaceTargetsWhenOperationMilestonesComplete
 	machineA := testBareMetalMachine("machine-a", "rack-a")
 	machineB := testBareMetalMachine("machine-b", "rack-a")
 	op := testOperation("op-replace-multi", v1alpha3.OperationHostReplace)
-	op.Spec.MachineSelector = &metav1.LabelSelector{MatchLabels: map[string]string{siteLabel: "rack-a"}}
+	op.Spec.MachineRef = machineA.Name
 	op.Status.Phase = v1alpha3.OperationPhaseInProgress
 	op.Status.Conditions = []metav1.Condition{
 		{Type: v1alpha3.MachineOperationConditionBootLoaderDownloaded, Status: metav1.ConditionUnknown, Reason: "Pending"},
@@ -1929,6 +2157,90 @@ func TestReconcilerWaitsForOlderOperation(t *testing.T) {
 	require.Contains(t, updated.Status.Message, "waiting for older host operation op-a")
 }
 
+// op-a was created first but released last, so it joined the queue after op-b
+// started: it waits for op-b, and op-b does not wait for it.
+func TestReconcilerWaitsForOlderOperationByQueueTime(t *testing.T) {
+	t.Parallel()
+
+	s := testScheme(t)
+	machine := testBareMetalMachine("machine-1", "rack-a")
+	releasedLate := testOperation("op-a", v1alpha3.OperationHostPowerOn)
+	releasedLate.CreationTimestamp = metav1.NewTime(fixedNow().Add(-2 * time.Minute))
+	releasedLate.Spec.MachineRef = machine.Name
+	releasedLate.Annotations = map[string]string{v1alpha3.MachineOperationReleasedAtAnnotation: fixedNow().Format(time.RFC3339)}
+	createdInBetween := testOperation("op-b", v1alpha3.OperationHostPowerOff)
+	createdInBetween.CreationTimestamp = metav1.NewTime(fixedNow().Add(-time.Minute))
+	createdInBetween.Spec.MachineRef = machine.Name
+	createdInBetween.Status.Phase = v1alpha3.OperationPhaseInProgress
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, releasedLate, createdInBetween, testRedfishSecret()).WithStatusSubresource(releasedLate, createdInBetween).Build()
+	power := &recordingPowerClient{}
+	reconciler := testReconciler(c, power, "rack-a")
+
+	// The operation released last waits for the one that started in the meantime.
+	_, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: releasedLate.Name}})
+	require.NoError(t, err)
+
+	var waiting v1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: releasedLate.Name}, &waiting))
+	require.Equal(t, v1alpha3.OperationPhasePending, waiting.Status.Phase)
+	require.Contains(t, waiting.Status.Message, "waiting for older host operation op-b")
+	require.Empty(t, waiting.Status.Targets)
+	require.Empty(t, power.calls)
+
+	// The operation that started in the meantime does not wait for it.
+	_, err = reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: createdInBetween.Name}})
+	require.NoError(t, err)
+
+	var updated v1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: createdInBetween.Name}, &updated))
+	require.NotEqual(t, v1alpha3.OperationPhasePending, updated.Status.Phase)
+	require.NotContains(t, updated.Status.Message, "waiting for older host operation")
+	require.Equal(t, []string{machine.Name}, targetNames(updated.Status.Targets))
+	require.Equal(t, v1alpha3.OperationStageWaitingOff, updated.Status.Targets[0].Stage)
+	require.Equal(t, int32(1), updated.Status.Targets[0].Attempts)
+	require.Equal(t, []string{"machine-1:ForceOff"}, power.calls)
+}
+
+// operationBefore orders a machine's queue by queue time, not creation time:
+// an operation created early and released late waits for one created in the
+// meantime, the same queue time is broken by name, and without the released-at
+// annotation the creation time decides.
+func TestOperationBeforeUsesQueueTime(t *testing.T) {
+	t.Parallel()
+
+	createdEarly := testOperation("op-early", v1alpha3.OperationHostPowerOff)
+	createdEarly.CreationTimestamp = metav1.NewTime(fixedNow().Add(-2 * time.Minute))
+	createdEarly.Annotations = map[string]string{v1alpha3.MachineOperationReleasedAtAnnotation: fixedNow().Format(time.RFC3339)}
+	createdInBetween := testOperation("op-between", v1alpha3.OperationHostPowerOn)
+	createdInBetween.CreationTimestamp = metav1.NewTime(fixedNow().Add(-time.Minute))
+
+	require.True(t, operationBefore(createdInBetween, createdEarly), "the operation released later is behind the one created in the meantime")
+	require.False(t, operationBefore(createdEarly, createdInBetween))
+
+	tieA := testOperation("op-tie-a", v1alpha3.OperationHostPowerOff)
+	tieA.CreationTimestamp = createdInBetween.CreationTimestamp
+	tieB := testOperation("op-tie-b", v1alpha3.OperationHostPowerOn)
+	tieB.CreationTimestamp = createdInBetween.CreationTimestamp
+
+	require.True(t, operationBefore(tieA, tieB), "operations with the same queue time are ordered by name")
+	require.False(t, operationBefore(tieB, tieA))
+
+	withoutA := testOperation("op-without-a", v1alpha3.OperationHostPowerOff)
+	withoutA.CreationTimestamp = createdInBetween.CreationTimestamp
+	withoutB := testOperation("op-without-b", v1alpha3.OperationHostPowerOn)
+	withoutB.CreationTimestamp = fixedNow()
+
+	require.True(t, operationBefore(withoutA, withoutB), "without the annotation the creation time decides")
+	require.False(t, operationBefore(withoutB, withoutA))
+
+	malformed := testOperation("op-malformed", v1alpha3.OperationHostPowerOff)
+	malformed.CreationTimestamp = createdInBetween.CreationTimestamp
+	malformed.Annotations = map[string]string{v1alpha3.MachineOperationReleasedAtAnnotation: "not-a-time"}
+
+	require.True(t, operationBefore(malformed, withoutB), "an unreadable released-at annotation falls back to the creation time")
+}
+
 func TestReconcilerStartsDisjointHostReplaceWhileOlderReplaceInProgress(t *testing.T) {
 	t.Parallel()
 
@@ -1967,7 +2279,7 @@ func TestReconcilerStartsDisjointHostReplaceWhileOlderReplaceInProgress(t *testi
 	require.Equal(t, int32(1), updated.Status.Targets[0].Attempts)
 }
 
-func TestReconcilerWaitsForOlderHostReplaceSelectorOverlap(t *testing.T) {
+func TestReconcilerSelectorOperationDoesNotDelayMachineRefOperation(t *testing.T) {
 	t.Parallel()
 
 	s := testScheme(t)
@@ -1983,43 +2295,13 @@ func TestReconcilerWaitsForOlderHostReplaceSelectorOverlap(t *testing.T) {
 	newer.CreationTimestamp = fixedNow()
 	newer.Spec.MachineRef = machineB.Name
 
-	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machineA, machineB, older, newer, testRedfishSecret()).WithStatusSubresource(older, newer).Build()
-	reconciler := testReconciler(c, &recordingPowerClient{}, "rack-a")
-
-	_, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: newer.Name}})
-	require.NoError(t, err)
-
-	var updated v1alpha3.MachineOperation
-	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: newer.Name}, &updated))
-	require.Equal(t, v1alpha3.OperationPhasePending, updated.Status.Phase)
-	require.Contains(t, updated.Status.Message, "waiting for older host operation op-a")
-}
-
-func TestReconcilerStartsDisjointHostReplaceSelector(t *testing.T) {
-	t.Parallel()
-
-	s := testScheme(t)
-	machineA := testBareMetalMachine("machine-a", "rack-a")
-	machineA.Labels["pool"] = "a"
-	machineA.Spec.PXE.Redfish.URL = "https://bmc-a.example.com"
-	machineB := testBareMetalMachine("machine-b", "rack-a")
-	machineB.Labels["pool"] = "b"
-	machineB.Spec.PXE.Redfish.URL = "https://bmc-b.example.com"
-	older := testOperation("op-a", v1alpha3.OperationHostReplace)
-	older.CreationTimestamp = metav1.NewTime(fixedNow().Add(-time.Minute))
-	older.Spec.MachineSelector = &metav1.LabelSelector{MatchLabels: map[string]string{siteLabel: "rack-a", "pool": "a"}}
-	older.Status.Phase = v1alpha3.OperationPhaseInProgress
-	newer := testOperation("op-b", v1alpha3.OperationHostReplace)
-	newer.CreationTimestamp = fixedNow()
-	newer.Spec.MachineSelector = &metav1.LabelSelector{MatchLabels: map[string]string{siteLabel: "rack-a", "pool": "b"}}
-
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machineA, machineB, older, newer, testRedfishSecret()).WithStatusSubresource(older, newer, machineB).Build()
 	reconciler := testReconciler(c, &recordingPowerClient{}, "rack-a")
 
-	_, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: newer.Name}})
-	require.NoError(t, err)
-	_, err = reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: newer.Name}})
-	require.NoError(t, err)
+	for range 2 {
+		_, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: newer.Name}})
+		require.NoError(t, err)
+	}
 
 	var updated v1alpha3.MachineOperation
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: newer.Name}, &updated))
@@ -2028,6 +2310,77 @@ func TestReconcilerStartsDisjointHostReplaceSelector(t *testing.T) {
 	require.Equal(t, []string{machineB.Name}, targetNames(updated.Status.Targets))
 	require.Equal(t, v1alpha3.OperationStageWaitingRepave, updated.Status.Targets[0].Stage)
 	require.Equal(t, int32(1), updated.Status.Targets[0].Attempts)
+
+	unchanged := getOperation(t, c, older.Name)
+	require.Equal(t, v1alpha3.OperationPhaseInProgress, unchanged.Status.Phase)
+	require.Empty(t, unchanged.Status.Targets)
+}
+
+// A held operation is not started, so it never makes a newer operation on
+// the same Machine wait for it, and it is not started itself while it waits.
+func TestReconcilerHeldOperationDoesNotDelayMachineRefOperation(t *testing.T) {
+	t.Parallel()
+
+	s := testScheme(t)
+	machine := testBareMetalMachine("machine-1", "rack-a")
+	older := testOperation("op-a", v1alpha3.OperationHostPowerOn)
+	older.CreationTimestamp = metav1.NewTime(fixedNow().Add(-time.Minute))
+	older.Spec.MachineRef = machine.Name
+	older.Spec.Suspend = true
+	newer := testOperation("op-b", v1alpha3.OperationHostPowerOff)
+	newer.CreationTimestamp = fixedNow()
+	newer.Spec.MachineRef = machine.Name
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, older, newer, testRedfishSecret()).WithStatusSubresource(older, newer).Build()
+	power := &recordingPowerClient{}
+	reconciler := testReconciler(c, power, "rack-a")
+
+	// The newer operation does not wait for the held one.
+	_, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: newer.Name}})
+	require.NoError(t, err)
+
+	var updated v1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: newer.Name}, &updated))
+	require.NotEqual(t, v1alpha3.OperationPhasePending, updated.Status.Phase)
+	require.NotContains(t, updated.Status.Message, "waiting for older host operation")
+	require.Equal(t, []string{machine.Name}, targetNames(updated.Status.Targets))
+	require.Equal(t, v1alpha3.OperationStageWaitingOff, updated.Status.Targets[0].Stage)
+	require.Equal(t, int32(1), updated.Status.Targets[0].Attempts)
+
+	// The held operation is not started either.
+	_, err = reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: older.Name}})
+	require.NoError(t, err)
+
+	held := getOperation(t, c, older.Name)
+	require.Equal(t, v1alpha3.MachineOperationStatus{}, held.Status)
+	require.Equal(t, []string{"machine-1:ForceOff"}, power.calls)
+}
+
+// A held operation contributes no conflict keys: it is not started, so it
+// never blocks a newer operation on the same Machine.
+func TestOperationConflictKeysIgnoreHeldOperation(t *testing.T) {
+	t.Parallel()
+
+	s := testScheme(t)
+	machine := testBareMetalMachine("machine-1", "rack-a")
+
+	held := testOperation("op-held", v1alpha3.OperationHostPowerOff)
+	held.Spec.MachineRef = machine.Name
+	held.Spec.Suspend = true
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, held).WithStatusSubresource(held).Build()
+	r := testReconciler(c, &recordingPowerClient{}, "rack-a")
+
+	keys, err := r.operationConflictKeys(t.Context(), held)
+	require.NoError(t, err)
+	require.Empty(t, keys)
+
+	released := held.DeepCopy()
+	released.Spec.Suspend = false
+	keys, err = r.operationConflictKeys(t.Context(), released)
+	require.NoError(t, err)
+	require.Contains(t, keys, "machine:"+machine.Name)
+	require.Contains(t, keys, "redfish:https://bmc.example.com")
 }
 
 func TestReconcilerWaitsForOlderHostReplaceSharedRedfishEndpoint(t *testing.T) {

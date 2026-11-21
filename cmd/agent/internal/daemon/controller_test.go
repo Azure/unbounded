@@ -405,7 +405,7 @@ func TestReconcileAgentUpgrade_NothingMoreOnceRestartRequested(t *testing.T) {
 
 	var second v1alpha3.MachineOperation
 	require.NoError(t, c.Get(t.Context(), client.ObjectKey{Name: "op-2"}, &second))
-	assert.Empty(t, second.Status.Phase, "op-2 stays Pending, so the restarted daemon enqueues it")
+	assert.Equal(t, v1alpha3.OperationPhasePending, second.Status.Phase, "op-2 stays Pending, so the restarted daemon enqueues it")
 
 	data, err := os.ReadFile(signalPath)
 	require.NoError(t, err)
@@ -443,7 +443,7 @@ func TestReconcileAgentUpgrade_WaitsForActivationLock(t *testing.T) {
 
 	var updated v1alpha3.MachineOperation
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
-	assert.Empty(t, updated.Status.Phase)
+	assert.Equal(t, v1alpha3.OperationPhasePending, updated.Status.Phase, "acknowledged, not started")
 }
 
 func TestReconcileAgentUpgrade_MissingDownloadURL(t *testing.T) {
@@ -576,33 +576,76 @@ func TestPublishAndClearAgentUpgradeSignals_Failure(t *testing.T) {
 
 	const rollbackMessage = "rolled back to last good"
 
-	machineOp := &v1alpha3.MachineOperation{
-		ObjectMeta: metav1.ObjectMeta{Name: "op-1"},
-		Spec: v1alpha3.MachineOperationSpec{
-			MachineRef:    "test-machine",
-			OperationKind: v1alpha3.OperationAgentUpgrade,
+	tests := []struct {
+		name          string
+		initialStatus v1alpha3.MachineOperationStatus
+		wantPhase     v1alpha3.OperationPhase
+		wantMessage   string
+	}{
+		{
+			name: "in-progress operation is marked failed",
+			initialStatus: v1alpha3.MachineOperationStatus{
+				Phase:   v1alpha3.OperationPhaseInProgress,
+				Message: "staging upgraded host agent binary",
+			},
+			wantPhase:   v1alpha3.OperationPhaseFailed,
+			wantMessage: rollbackMessage,
 		},
-		Status: v1alpha3.MachineOperationStatus{
-			Phase:   v1alpha3.OperationPhaseComplete,
-			Message: "AgentUpgrade completed",
+		{
+			// The upgraded daemon reported the operation complete and was
+			// then rolled back. The failure replaces the completion.
+			name: "completed operation is marked failed",
+			initialStatus: v1alpha3.MachineOperationStatus{
+				Phase:   v1alpha3.OperationPhaseComplete,
+				Message: "AgentUpgrade completed",
+			},
+			wantPhase:   v1alpha3.OperationPhaseFailed,
+			wantMessage: rollbackMessage,
+		},
+		{
+			// A failure is never replaced.
+			name: "failed operation is left unchanged",
+			initialStatus: v1alpha3.MachineOperationStatus{
+				Phase:   v1alpha3.OperationPhaseFailed,
+				Message: "not picked up",
+			},
+			wantPhase:   v1alpha3.OperationPhaseFailed,
+			wantMessage: "not picked up",
 		},
 	}
-	c := fakeStatusClient(machineOp)
-	signals := newAgentUpgradeSignalOperatorForPath(signalPath)
-	require.NoError(t, signals.RecordPending("op-1", 7))
-	require.NoError(t, RecordAgentUpgradeFailureSignal(rollbackMessage))
 
-	require.NoError(t, publishAndClearAgentUpgradeSignals(context.Background(), discardLogger(), c))
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			machineOp := &v1alpha3.MachineOperation{
+				ObjectMeta: metav1.ObjectMeta{Name: "op-1"},
+				Spec: v1alpha3.MachineOperationSpec{
+					MachineRef:    "test-machine",
+					OperationKind: v1alpha3.OperationAgentUpgrade,
+				},
+				Status: tt.initialStatus,
+			}
+			c := fakeStatusClient(machineOp)
+			signals := newAgentUpgradeSignalOperatorForPath(signalPath)
+			require.NoError(t, signals.RecordPending("op-1", 7))
+			require.NoError(t, RecordAgentUpgradeFailureSignal(rollbackMessage))
 
-	var updated v1alpha3.MachineOperation
-	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
-	assert.Equal(t, v1alpha3.OperationPhaseFailed, updated.Status.Phase)
-	assert.Equal(t, rollbackMessage, updated.Status.Message)
-	condition := apimeta.FindStatusCondition(updated.Status.Conditions, "Completed")
-	require.NotNil(t, condition)
-	assert.Equal(t, metav1.ConditionFalse, condition.Status)
-	assert.Equal(t, "DaemonFailed", condition.Reason)
-	assert.NoFileExists(t, signalPath)
+			require.NoError(t, publishAndClearAgentUpgradeSignals(context.Background(), discardLogger(), c))
+
+			var updated v1alpha3.MachineOperation
+			require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
+			assert.Equal(t, tt.wantPhase, updated.Status.Phase)
+			assert.Equal(t, tt.wantMessage, updated.Status.Message)
+
+			if tt.wantMessage == rollbackMessage {
+				condition := apimeta.FindStatusCondition(updated.Status.Conditions, "Completed")
+				require.NotNil(t, condition)
+				assert.Equal(t, metav1.ConditionFalse, condition.Status)
+				assert.Equal(t, "DaemonFailed", condition.Reason)
+			}
+
+			assert.NoFileExists(t, signalPath)
+		})
+	}
 }
 
 func TestReconcileAgentReset_Complete(t *testing.T) {

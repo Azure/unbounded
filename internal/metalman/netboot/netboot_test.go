@@ -4385,3 +4385,100 @@ func TestTemplates_OlderControllerWithoutDHCPHoldLease(t *testing.T) {
 	require.NotContains(t, network, "dhcp4-overrides")
 	require.NotContains(t, network, "dhcp-identifier")
 }
+
+// A selector HostReplace lists every machine it will replace from the start,
+// long before each one's turn. A machine that boots while it waits must not
+// be handed the installer: only its own machineRef operation asks for that.
+func TestInstallRequestedIgnoresASelectorOperation(t *testing.T) {
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-waiting", Namespace: "default"},
+	}
+	parent := &v1alpha3.MachineOperation{
+		ObjectMeta: metav1.ObjectMeta{Name: "replace-rack", Namespace: "default"},
+		Spec: v1alpha3.MachineOperationSpec{
+			OperationKind:   v1alpha3.OperationHostReplace,
+			MachineSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"topology.unbounded-cloud.io/rack": "dc-a.rack-01"}},
+		},
+		Status: v1alpha3.MachineOperationStatus{
+			Phase: v1alpha3.OperationPhaseInProgress,
+			Targets: []v1alpha3.MachineOperationTargetStatus{{
+				MachineRef: node.Name,
+				Phase:      v1alpha3.OperationPhasePending,
+			}},
+		},
+	}
+
+	fc := fake.NewClientBuilder().
+		WithScheme(newScheme(t)).
+		WithObjects(node, parent).
+		Build()
+
+	resolver := FileResolver{Reader: fc}
+	installRequested, err := resolver.installRequested(t.Context(), node)
+	require.NoError(t, err)
+	require.False(t, installRequested)
+
+	// Its turn comes: the machineRef operation created for it asks for the
+	// install.
+	child := &v1alpha3.MachineOperation{
+		ObjectMeta: metav1.ObjectMeta{Name: "replace-rack-node-waiting", Namespace: "default"},
+		Spec: v1alpha3.MachineOperationSpec{
+			OperationKind: v1alpha3.OperationHostReplace,
+			MachineRef:    node.Name,
+		},
+		Status: v1alpha3.MachineOperationStatus{
+			Phase: v1alpha3.OperationPhaseInProgress,
+			Targets: []v1alpha3.MachineOperationTargetStatus{{
+				MachineRef: node.Name,
+				Phase:      v1alpha3.OperationPhaseInProgress,
+				Stage:      v1alpha3.OperationStageWaitingRepave,
+			}},
+		},
+	}
+	require.NoError(t, fc.Create(t.Context(), child))
+
+	installRequested, err = resolver.installRequested(t.Context(), node)
+	require.NoError(t, err)
+	require.True(t, installRequested)
+}
+
+// A held HostReplace is not started, so a machine that boots while it waits
+// must not be handed the installer. The same machineRef operation asks for
+// the install once it is released.
+func TestInstallRequestedIgnoresAHeldOperation(t *testing.T) {
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-waiting"},
+	}
+	held := &v1alpha3.MachineOperation{
+		ObjectMeta: metav1.ObjectMeta{Name: "replace-node-waiting"},
+		Spec: v1alpha3.MachineOperationSpec{
+			OperationKind: v1alpha3.OperationHostReplace,
+			MachineRef:    node.Name,
+			Suspend:       true,
+		},
+	}
+
+	fc := fake.NewClientBuilder().
+		WithScheme(newScheme(t)).
+		WithObjects(node, held).
+		Build()
+
+	resolver := FileResolver{Reader: fc}
+	installRequested, err := resolver.installRequested(t.Context(), node)
+	require.NoError(t, err)
+	require.False(t, installRequested)
+
+	// Released: the same operation asks for the install.
+	held.Spec.Suspend = false
+	held.Status.Phase = v1alpha3.OperationPhaseInProgress
+	held.Status.Targets = []v1alpha3.MachineOperationTargetStatus{{
+		MachineRef: node.Name,
+		Phase:      v1alpha3.OperationPhaseInProgress,
+		Stage:      v1alpha3.OperationStageWaitingRepave,
+	}}
+	require.NoError(t, fc.Update(t.Context(), held))
+
+	installRequested, err = resolver.installRequested(t.Context(), node)
+	require.NoError(t, err)
+	require.True(t, installRequested)
+}

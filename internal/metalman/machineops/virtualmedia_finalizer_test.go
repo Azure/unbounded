@@ -10,7 +10,6 @@ import (
 
 	"github.com/stretchr/testify/require"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -24,8 +23,6 @@ func TestMediaFinalizerCleanupOwnership(t *testing.T) {
 		site       string
 		media      bool
 		active     bool
-		selector   bool
-		expression bool
 		targetOnly bool
 		missing    bool
 		wantRemove bool
@@ -38,9 +35,6 @@ func TestMediaFinalizerCleanupOwnership(t *testing.T) {
 		{name: "deleting owner before ownership saved", site: "rack-a", wantRemove: true},
 		{name: "deleting owner with target only", site: "rack-a", targetOnly: true, wantRemove: true},
 		{name: "deleting other site with target only", site: "rack-b", targetOnly: true},
-		{name: "deleting owner with selector", site: "rack-a", selector: true, missing: true, wantRemove: true},
-		{name: "deleting other site with selector", site: "rack-b", selector: true, missing: true},
-		{name: "deleting owner with expression", site: "rack-a", expression: true, missing: true, wantRemove: true},
 		{name: "deleting unknown owner", site: "rack-a", missing: true},
 		{name: "deleting owner with saved site and missing Machine", site: "rack-a", media: true, missing: true, wantRemove: true},
 	}
@@ -58,18 +52,8 @@ func TestMediaFinalizerCleanupOwnership(t *testing.T) {
 
 			require.NoError(t, r.Status().Update(t.Context(), op))
 
-			if tt.selector || tt.expression || tt.targetOnly {
+			if tt.targetOnly {
 				op.Spec.MachineRef = ""
-				if tt.selector {
-					op.Spec.MachineSelector = &metav1.LabelSelector{MatchLabels: map[string]string{siteLabel: "rack-a"}}
-				}
-
-				if tt.expression {
-					op.Spec.MachineSelector = &metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{{
-						Key: siteLabel, Operator: metav1.LabelSelectorOpIn, Values: []string{"rack-a"},
-					}}}
-				}
-
 				require.NoError(t, r.Update(t.Context(), op))
 			}
 

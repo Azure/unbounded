@@ -229,7 +229,11 @@ func (q *StatusQueue) activeOperationForMachine(ctx context.Context, machineName
 	candidates := make([]*v1alpha3.MachineOperation, 0, len(list.Items))
 	for i := range list.Items {
 		op := &list.Items[i]
-		if operationHasForeignMediaForMachine(op, machineName, q.Site) {
+		// A selector operation lists the machine as a target, but metalman
+		// runs, and records boot milestones on, the machineRef operation
+		// created for the machine. A held operation is not started, so it
+		// records no milestones either.
+		if op.Spec.IsSelectorOperation() || op.IsHeld() || operationHasForeignMediaForMachine(op, machineName, q.Site) {
 			continue
 		}
 

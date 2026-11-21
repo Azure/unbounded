@@ -5,13 +5,11 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
-	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -26,7 +24,8 @@ import (
 type MachineOperationHandlers map[machinav1alpha3.OperationKind]MachineOperationHandler[int64]
 
 // MachinaMachineOperationReconciler fetches MachineOperation objects, skips terminal
-// operations, and dispatches non-terminal operations to kind-specific targets.
+// operations, and dispatches the non-terminal operations whose machineRef names this
+// machine to kind-specific targets.
 type MachinaMachineOperationReconciler struct {
 	client      client.Client
 	reader      client.Reader
@@ -92,7 +91,9 @@ func (r *MachinaMachineOperationReconciler) SetupController(b *builder.TypedBuil
 	)
 }
 
-// ReconcileMachineOperation handles a queued MachineOperation request.
+// ReconcileMachineOperation handles a queued MachineOperation request, ignoring
+// terminal operations, allocation operations, and operations that do not name
+// this machine.
 func (r *MachinaMachineOperationReconciler) ReconcileMachineOperation(
 	ctx context.Context,
 	name string,
@@ -113,32 +114,80 @@ func (r *MachinaMachineOperationReconciler) ReconcileMachineOperation(
 		return ctrl.Result{}, nil
 	}
 
-	operation := MachineOperation{
-		Name: op.Name,
-		Kind: op.Spec.OperationKind,
-	}
-
 	handler, ok := r.handlers[op.Spec.OperationKind]
 	if !ok {
 		log.FromContext(ctx).V(1).Info("ignoring MachineOperation with no local handler", "operation", op.Name, "operationKind", op.Spec.OperationKind)
 		return ctrl.Result{}, nil
 	}
 
+	if !r.matchesMachine(&op) {
+		log.FromContext(ctx).V(1).Info("ignoring MachineOperation for another machine", "operation", op.Name, "machineRef", op.Spec.MachineRef)
+		return ctrl.Result{}, nil
+	}
+
+	// Say that an agent has the operation before the handler can decide to
+	// wait, for a lock or for this daemon to be restarted. Whoever created
+	// the operation can then tell a busy agent from a machine nothing serves.
+	if err := r.acknowledge(ctx, &op); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	operation := MachineOperation{
+		Name: op.Name,
+		Kind: op.Spec.OperationKind,
+	}
+
 	operation.Parameters = op.Spec.Parameters
 
-	return handler(ctx, r, operation)
+	result, err := handler(ctx, r, operation)
+	if errors.Is(err, ErrMachineOperationFinished) {
+		log.FromContext(ctx).Info("not running MachineOperation: it finished before this agent started it", "operation", op.Name)
+		return ctrl.Result{}, nil
+	}
+
+	return result, err
 }
 
-func (r *MachinaMachineOperationReconciler) mapMachineOperation(ctx context.Context, obj client.Object) []Request {
+// ErrMachineOperationFinished is returned by MarkInProgress when the
+// operation reached a terminal phase before the agent started it, for
+// example because its creator gave up waiting. The handler must not run it.
+var ErrMachineOperationFinished = errors.New("machine operation is already finished")
+
+const acknowledgedMessage = "accepted by the agent; waiting to start"
+
+// acknowledge marks an operation with no phase as Pending.
+func (r *MachinaMachineOperationReconciler) acknowledge(ctx context.Context, op *machinav1alpha3.MachineOperation) error {
+	if op.Status.Phase != "" {
+		return nil
+	}
+
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var latest machinav1alpha3.MachineOperation
+		if err := r.client.Get(ctx, client.ObjectKey{Name: op.Name}, &latest); err != nil {
+			return client.IgnoreNotFound(err)
+		}
+
+		if latest.Status.Phase != "" {
+			return nil
+		}
+
+		latest.Status.Phase = machinav1alpha3.OperationPhasePending
+		latest.Status.Message = acknowledgedMessage
+
+		return r.client.Status().Update(ctx, &latest)
+	})
+}
+
+func (r *MachinaMachineOperationReconciler) mapMachineOperation(_ context.Context, obj client.Object) []Request {
 	op, ok := obj.(*machinav1alpha3.MachineOperation)
-	if !ok || !r.shouldEnqueue(ctx, op) {
+	if !ok || !r.shouldEnqueue(op) {
 		return nil
 	}
 
 	return []Request{NewMachineOperationRequest(op.Name)}
 }
 
-func (r *MachinaMachineOperationReconciler) shouldEnqueue(ctx context.Context, op *machinav1alpha3.MachineOperation) bool {
+func (r *MachinaMachineOperationReconciler) shouldEnqueue(op *machinav1alpha3.MachineOperation) bool {
 	if op.Status.Phase != "" && op.Status.Phase != machinav1alpha3.OperationPhasePending {
 		return false
 	}
@@ -151,41 +200,16 @@ func (r *MachinaMachineOperationReconciler) shouldEnqueue(ctx context.Context, o
 		return false
 	}
 
-	matches, err := r.matchesMachine(ctx, op)
-	if err != nil {
-		log.FromContext(ctx).Error(err, "invalid MachineOperation target selector", "operation", op.Name)
-		return false
-	}
-
-	return matches
+	return r.matchesMachine(op)
 }
 
-func (r *MachinaMachineOperationReconciler) matchesMachine(ctx context.Context, op *machinav1alpha3.MachineOperation) (bool, error) {
-	if op.Spec.MachineRef != "" {
-		return op.Spec.MachineRef == r.machineName, nil
-	}
-
-	if op.Spec.MachineSelector == nil {
-		return false, nil
-	}
-
-	var node corev1.Node
-	if err := r.client.Get(ctx, client.ObjectKey{Name: r.nodeName}, &node); err == nil {
-		return selectorMatches(op.Spec.MachineSelector, node.Labels)
-	} else if !apierrors.IsNotFound(err) {
-		return false, fmt.Errorf("get Node %s for selector match: %w", r.nodeName, err)
-	}
-
-	var machine machinav1alpha3.Machine
-	if err := r.client.Get(ctx, client.ObjectKey{Name: r.machineName}, &machine); err != nil {
-		if apierrors.IsNotFound(err) {
-			return false, nil
-		}
-
-		return false, fmt.Errorf("get Machine %s for selector match: %w", r.machineName, err)
-	}
-
-	return selectorMatches(op.Spec.MachineSelector, machine.Labels)
+// matchesMachine reports whether op is for this agent to run now: it names
+// this machine and is not held. An operation without a machineRef is never a
+// match, whatever its selector says: a central controller resolves selectors
+// into one machineRef operation per machine, and releases a held one by
+// clearing spec.suspend, which is an update the agent sees.
+func (r *MachinaMachineOperationReconciler) matchesMachine(op *machinav1alpha3.MachineOperation) bool {
+	return op.Spec.MachineRef == r.machineName && !op.IsHeld()
 }
 
 func (r *MachinaMachineOperationReconciler) MarkInProgress(ctx context.Context, op MachineOperation, message string) error {
@@ -196,7 +220,7 @@ func (r *MachinaMachineOperationReconciler) MarkInProgress(ctx context.Context, 
 		}
 
 		if latest.Status.IsTerminal() {
-			return nil
+			return ErrMachineOperationFinished
 		}
 
 		now := metav1.Now()
@@ -224,12 +248,23 @@ func (r *MachinaMachineOperationReconciler) Finish(ctx context.Context, op Machi
 	return FinishMachineOperation(ctx, r.client, op, result)
 }
 
-// FinishMachineOperation records the final status for a MachineOperation.
+// FinishMachineOperation records the final status for a MachineOperation. A
+// Failed operation is left unchanged. A Complete one is changed only to
+// Failed: an agent upgrade that was reported complete and then rolled back
+// reports its failure that way.
 func FinishMachineOperation(ctx context.Context, c client.Client, op MachineOperation, result MachineOperationResult[int64]) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var latest machinav1alpha3.MachineOperation
 		if err := c.Get(ctx, client.ObjectKey{Name: op.Name}, &latest); err != nil {
 			return client.IgnoreNotFound(err)
+		}
+
+		if latest.Status.Phase == machinav1alpha3.OperationPhaseFailed {
+			return nil
+		}
+
+		if latest.Status.Phase == machinav1alpha3.OperationPhaseComplete && result.Phase != machinav1alpha3.OperationPhaseFailed {
+			return nil
 		}
 
 		SetMachineOperationResult(&latest, result, metav1.Now())
@@ -268,14 +303,5 @@ func SetMachineOperationResult(op *machinav1alpha3.MachineOperation, result Mach
 }
 
 var _ MachineOperationStore[int64] = (*MachinaMachineOperationReconciler)(nil)
-
-func selectorMatches(selector *metav1.LabelSelector, targetLabels map[string]string) (bool, error) {
-	compiled, err := metav1.LabelSelectorAsSelector(selector)
-	if err != nil {
-		return false, err
-	}
-
-	return compiled.Matches(labels.Set(targetLabels)), nil
-}
 
 var _ MachineOperationRequestReconciler = (*MachinaMachineOperationReconciler)(nil)
