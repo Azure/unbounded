@@ -29,6 +29,29 @@ const (
 	IdentityRoleName    = "gantry-acr-pull"
 )
 
+// The node-reported Machine RegistryAuth condition (MachineConditionRegistryAuth)
+// reasons the agent writes. The agent is the writer and defines them; the CLI
+// waits and the operator aggregate read them, so they are shared here rather
+// than copied.
+const (
+	// ConditionReasonConfigured reports a managed provider is active and
+	// verified (Status True).
+	ConditionReasonConfigured = "Configured"
+
+	// ConditionReasonExternal reports authentication is left untouched
+	// (Status True, external policy).
+	ConditionReasonExternal = "External"
+
+	// ConditionReasonRestartBudgetExhausted reports the bounded kubelet-restart
+	// budget is spent and no further retry is scheduled for the current policy
+	// generation (Status False). It is the only genuinely terminal registry-auth
+	// failure reason: the other False reasons are reported while the agent is
+	// scheduling a retry (backoff, apply, verify, ledger, budget-reset) and are
+	// retryable. A new policy generation resets the budget, so only a verdict
+	// observed at the current generation is terminal.
+	ConditionReasonRestartBudgetExhausted = "RestartBudgetExhausted"
+)
+
 var acrHost = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)?(?:\.[a-z0-9]+\.geo)?\.azurecr\.io$`)
 
 // Config contains installation policy, never access tokens or client secrets.
@@ -171,6 +194,11 @@ func validHostname(host string) bool {
 }
 
 // ProviderConfig configures upstream's identity-binding mode, not its IMDS mode.
+// AzureConfigPath is the fixed location of the azure.json the credential
+// provider reads; it is referenced from the generated credential-provider
+// config, so the path that generates the content defines the contract.
+const AzureConfigPath = "/opt/unbounded/registry-auth/azure.json"
+
 func (c Config) ProviderConfig() ([]byte, error) {
 	return json.MarshalIndent(map[string]any{
 		"apiVersion": "kubelet.config.k8s.io/v1", "kind": "CredentialProviderConfig",
@@ -178,7 +206,7 @@ func (c Config) ProviderConfig() ([]byte, error) {
 			"name": ProviderName, "matchImages": []string{c.Registry}, "defaultCacheDuration": "5m",
 			"apiVersion": "credentialprovider.kubelet.k8s.io/v1",
 			"args": []string{
-				azureConfigPath, "--ib-sni-name=" + c.SNIName,
+				AzureConfigPath, "--ib-sni-name=" + c.SNIName,
 				"--ib-default-client-id=" + c.ClientID, "--ib-default-tenant-id=" + c.TenantID,
 				"--ib-apiserver-ip=" + c.ProxyAddress,
 			},

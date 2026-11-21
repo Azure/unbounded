@@ -243,6 +243,17 @@ func downloadOverridesFromOfflineArtifacts(offlineArtifacts *ResolvedOfflineArti
 		},
 	}
 
+	// The ACR credential provider is an optional bundle entry: it is wired into
+	// the download overrides only when the bundle records a version for it, so
+	// air-gapped nodes with a managed-auth-capable bundle download the provider
+	// from the mirror instead of falling back to the public upstream release.
+	if manifest.Versions.ACRProvider != "" {
+		overrides.ACRProvider = &DownloadSource{
+			URL:     offlineArtifacts.bundle.ArtifactURL(bootstrapartifacts.ACRProviderArtifactURLTemplate(manifest.Versions.ACRProvider)),
+			Version: manifest.Versions.ACRProvider,
+		}
+	}
+
 	return overrides
 }
 

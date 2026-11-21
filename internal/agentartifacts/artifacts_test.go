@@ -77,6 +77,69 @@ func TestKubernetesBinary(t *testing.T) {
 	}
 }
 
+func TestACRProviderBinary(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		override *goalstates.DownloadSource
+		arch     string
+		want     string
+	}{
+		{
+			name: "default amd64",
+			arch: "amd64",
+			want: "https://github.com/kubernetes-sigs/cloud-provider-azure/releases/download/v1.36.0/azure-acr-credential-provider-linux-amd64",
+		},
+		{
+			name: "default arm64",
+			arch: "arm64",
+			want: "https://github.com/kubernetes-sigs/cloud-provider-azure/releases/download/v1.36.0/azure-acr-credential-provider-linux-arm64",
+		},
+		{
+			name:     "base url override",
+			override: &goalstates.DownloadSource{BaseURL: "https://mirror.example.com/acr"},
+			arch:     "amd64",
+			want:     "https://mirror.example.com/acr/v1.36.0/azure-acr-credential-provider-linux-amd64",
+		},
+		{
+			name:     "base url override strips trailing slash",
+			override: &goalstates.DownloadSource{BaseURL: "https://mirror.example.com/acr/"},
+			arch:     "arm64",
+			want:     "https://mirror.example.com/acr/v1.36.0/azure-acr-credential-provider-linux-arm64",
+		},
+		{
+			name:     "url override",
+			override: &goalstates.DownloadSource{URL: "https://mirror.example.com/provider-%s"},
+			arch:     "amd64",
+			want:     "https://mirror.example.com/provider-amd64",
+		},
+	}
+
+	for i := range tests {
+		testCase := tests[i]
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := ACRProviderBinary(testCase.override, testCase.arch)
+			require.Equal(t, testCase.want, got)
+		})
+	}
+}
+
+func TestACRProviderSHA256For(t *testing.T) {
+	t.Parallel()
+
+	for _, arch := range []string{"amd64", "arm64"} {
+		hash, err := ACRProviderSHA256For(arch)
+		require.NoError(t, err)
+		require.Len(t, hash, 64)
+	}
+
+	_, err := ACRProviderSHA256For("riscv64")
+	require.Error(t, err)
+}
+
 func TestContainerdArchive(t *testing.T) {
 	t.Parallel()
 

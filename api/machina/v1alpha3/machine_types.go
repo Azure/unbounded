@@ -108,6 +108,16 @@ const (
 	// For OnDelete updates this remains True until the operator deletes
 	// the Node and the agent repaves with the desired version.
 	MachineConditionRepavePending = "RepavePending"
+
+	// MachineConditionRegistryAuth indicates whether the agent has configured
+	// the kubelet's image credential provider per spec.registryAuth and
+	// verified it. Status is True with Reason "Configured" when the managed
+	// provider is active and verified, or True with Reason "External" when the
+	// policy is external (nothing to configure). Status is False with a
+	// failure reason (for example "UnsupportedLayout" or
+	// "RestartBudgetExhausted") when the agent cannot configure or verify the
+	// provider. Only the agent writes this condition.
+	MachineConditionRegistryAuth = "RegistryAuth"
 )
 
 // Annotation keys.
@@ -208,6 +218,59 @@ type MachineSpec struct {
 	// can only change from false to true, and requires AllocationRef.
 	// +optional
 	Fenced bool `json:"fenced,omitempty"`
+
+	// RegistryAuth is the operator-managed policy for the kubelet's image
+	// credential provider. The unbounded-operator writes it from the
+	// gantry-config node-auth policy; the agent applies it to the kubelet and
+	// reports the outcome in status.conditions (RegistryAuth). It is not part
+	// of the MachineConfiguration versioning: it is a live, operator-managed
+	// node setting, not a provisioned configuration profile. An absent or
+	// external policy leaves the kubelet's authentication untouched.
+	// +optional
+	RegistryAuth *RegistryAuthPolicy `json:"registryAuth,omitempty"`
+}
+
+// RegistryAuthPolicy is the operator-managed kubelet image credential provider
+// policy for one Machine. It carries installation policy, never access tokens
+// or client secrets. Mode is "external" (no managed provider, leave
+// authentication alone) or "aks-identity-binding" (configure the stock ACR
+// credential provider using the AKS identity binding).
+type RegistryAuthPolicy struct {
+	// Mode selects the authentication mode. Empty or "external" leaves the
+	// kubelet's authentication untouched; "aks-identity-binding" enables the
+	// managed provider.
+	// +kubebuilder:validation:Enum=external;aks-identity-binding
+	// +optional
+	Mode string `json:"mode,omitempty"`
+
+	// Registry is the ACR host the credential provider authenticates to.
+	// +optional
+	Registry string `json:"registry,omitempty"`
+
+	// ClientID is the UAMI client ID the AKS identity binding authorizes.
+	// +optional
+	ClientID string `json:"clientID,omitempty"`
+
+	// TenantID is the Entra tenant the identity binding belongs to.
+	// +optional
+	TenantID string `json:"tenantID,omitempty"`
+
+	// SNIName is the SNI name the provider uses for the identity exchange.
+	// +optional
+	SNIName string `json:"sniName,omitempty"`
+
+	// ProxyAddress is the apiserver address the provider reaches for the
+	// identity binding exchange.
+	// +optional
+	ProxyAddress string `json:"proxyAddress,omitempty"`
+
+	// Audience is the ServiceAccount token audience the provider requests.
+	// +optional
+	Audience string `json:"audience,omitempty"`
+
+	// CACert is the PEM CA bundle the provider trusts for the exchange.
+	// +optional
+	CACert string `json:"caCert,omitempty"`
 }
 
 // ProviderMachineReference identifies a cluster-scoped provider-owned Machine

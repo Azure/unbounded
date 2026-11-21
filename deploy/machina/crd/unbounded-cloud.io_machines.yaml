@@ -1542,6 +1542,55 @@ spec:
                   message: network does not support dhcpLeases[0].holdLease
                   rule: '!has(self.network) || !has(self.dhcpLeases) || size(self.dhcpLeases)
                     == 0 || !has(self.dhcpLeases[0].holdLease) || !self.dhcpLeases[0].holdLease'
+              registryAuth:
+                description: |-
+                  RegistryAuth is the operator-managed policy for the kubelet's image
+                  credential provider. The unbounded-operator writes it from the
+                  gantry-config node-auth policy; the agent applies it to the kubelet and
+                  reports the outcome in status.conditions (RegistryAuth). It is not part
+                  of the MachineConfiguration versioning: it is a live, operator-managed
+                  node setting, not a provisioned configuration profile. An absent or
+                  external policy leaves the kubelet's authentication untouched.
+                properties:
+                  audience:
+                    description: Audience is the ServiceAccount token audience the
+                      provider requests.
+                    type: string
+                  caCert:
+                    description: CACert is the PEM CA bundle the provider trusts for
+                      the exchange.
+                    type: string
+                  clientID:
+                    description: ClientID is the UAMI client ID the AKS identity binding
+                      authorizes.
+                    type: string
+                  mode:
+                    description: |-
+                      Mode selects the authentication mode. Empty or "external" leaves the
+                      kubelet's authentication untouched; "aks-identity-binding" enables the
+                      managed provider.
+                    enum:
+                    - external
+                    - aks-identity-binding
+                    type: string
+                  proxyAddress:
+                    description: |-
+                      ProxyAddress is the apiserver address the provider reaches for the
+                      identity binding exchange.
+                    type: string
+                  registry:
+                    description: Registry is the ACR host the credential provider
+                      authenticates to.
+                    type: string
+                  sniName:
+                    description: SNIName is the SNI name the provider uses for the
+                      identity exchange.
+                    type: string
+                  tenantID:
+                    description: TenantID is the Entra tenant the identity binding
+                      belongs to.
+                    type: string
+                type: object
               ssh:
                 description: |-
                   SSH contains the SSH connection and credential details for the

@@ -45,6 +45,14 @@ func crictlDownloadSource(rootFS *goalstates.RootFS) *goalstates.DownloadSource 
 	return rootFS.Downloads.Crictl
 }
 
+func acrProviderDownloadSource(rootFS *goalstates.RootFS) *goalstates.DownloadSource {
+	if rootFS.Downloads == nil {
+		return nil
+	}
+
+	return rootFS.Downloads.ACRProvider
+}
+
 func downloadSourceVersion(defaultVersion string, source *goalstates.DownloadSource) string {
 	if source != nil && source.Version != "" {
 		return source.Version
