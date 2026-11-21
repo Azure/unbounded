@@ -77,6 +77,7 @@ func registryAuthFlexNodeMachine(name string) *corev1.Node {
 func registryAuthMachine(name string, spec *unboundedv1alpha3.RegistryAuthPolicy, cond *metav1.Condition) *unboundedv1alpha3.Machine {
 	m := &unboundedv1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: name}}
 	m.Spec.RegistryAuth = spec
+
 	if cond != nil {
 		m.Status.Conditions = []metav1.Condition{*cond}
 	}
@@ -154,7 +155,10 @@ func TestRegistryAuthFailedWhenANodeReportsFailure(t *testing.T) {
 	source := authSource("")
 	node := registryAuthFlexNodeMachine("flex-a")
 	cond := &metav1.Condition{Type: unboundedv1alpha3.MachineConditionRegistryAuth, Status: metav1.ConditionFalse, Reason: "RestartBudgetExhausted", Message: "budget exhausted"}
-	machine := registryAuthMachine("flex-a", nil, cond)
+	// The spec must match the desired policy for the failure to be terminal:
+	// a budget exhaustion for a policy that has actually been delivered is a
+	// genuine failure; one for an undelivered (nil) spec is still installing.
+	machine := registryAuthMachine("flex-a", managedRegistryAuthPolicy(t, source), cond)
 	env := testEnv(t, source, node, machine)
 
 	_, result, err := planRegistryAuth(t.Context(), env)
@@ -162,6 +166,25 @@ func TestRegistryAuthFailedWhenANodeReportsFailure(t *testing.T) {
 	require.False(t, result.Ready)
 	require.Equal(t, "RegistryAuthFailed", result.Reason)
 	require.Contains(t, result.Message, "flex-a")
+}
+
+// TestRegistryAuthStaleSpecFailureIsInstalling verifies that a
+// RestartBudgetExhausted condition for a policy NOT delivered on the spec
+// (the spec is nil, meaning the operator has not yet patched the new policy)
+// is reported as installing, not failed: the failure is for the old (absent)
+// policy, not the one being planned.
+func TestRegistryAuthStaleSpecFailureIsInstalling(t *testing.T) {
+	source := authSource("")
+	node := registryAuthFlexNodeMachine("flex-a")
+	cond := &metav1.Condition{Type: unboundedv1alpha3.MachineConditionRegistryAuth, Status: metav1.ConditionFalse, Reason: "RestartBudgetExhausted", Message: "budget exhausted for old policy"}
+	// The spec is nil: the desired policy has not been delivered yet.
+	machine := registryAuthMachine("flex-a", nil, cond)
+	env := testEnv(t, source, node, machine)
+
+	_, result, err := planRegistryAuth(t.Context(), env)
+	require.NoError(t, err)
+	require.False(t, result.Ready)
+	require.Equal(t, "RegistryAuthInstalling", result.Reason)
 }
 
 func TestRegistryAuthExternalClearsManagedPolicy(t *testing.T) {
@@ -202,6 +225,7 @@ func TestRegistryAuthRetiresLegacyInstaller(t *testing.T) {
 
 	// The owned legacy objects are retired (deleted).
 	kinds := map[string]bool{}
+
 	for _, op := range operations {
 		if op.Kind == component.OpDelete {
 			kinds[op.Object.GetKind()] = true

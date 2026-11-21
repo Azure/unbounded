@@ -237,7 +237,7 @@ func TestGantryDetachACRForeignBindingIsPreflighted(t *testing.T) {
 			// An owned ACR pull assignment exists, so a naive implementation would
 			// delete it before noticing the foreign binding.
 			return json.Marshal([]map[string]any{{
-				"name":             acrPullGrantName(attachClusterID, "7f951dda-4ed3-4680-a7ca-43fe172d538d"),
+				"name":             acrPullGrantName(attachClusterID, attachACRID, "principal-1", "7f951dda-4ed3-4680-a7ca-43fe172d538d"),
 				"principalId":      "principal-1",
 				"roleDefinitionId": acrPullRole,
 				"scope":            attachACRID,
@@ -306,9 +306,10 @@ func detachAzureFixture(t *testing.T) (*detachACRHandler, *[]string) {
 		case "role assignment list":
 			// One owned ACR pull assignment on the owned principal, carrying the
 			// deterministic ownership-receipt name (the role-assignment API has
-			// no tags property, so the receipt is the assignment's name).
+			// no tags property, so the receipt is the assignment's name). The
+			// principal must match the identity show response ("principal-1").
 			return json.Marshal([]map[string]any{{
-				"name":             acrPullGrantName(attachClusterID, "7f951dda-4ed3-4680-a7ca-43fe172d538d"),
+				"name":             acrPullGrantName(attachClusterID, attachACRID, "principal-1", "7f951dda-4ed3-4680-a7ca-43fe172d538d"),
 				"principalId":      "principal-1",
 				"roleDefinitionId": acrPullRole,
 				"scope":            acrScope,
@@ -525,9 +526,10 @@ func TestGantryDetachACRRemovesRepositoryReaderGrant(t *testing.T) {
 			return json.Marshal(map[string]any{"principalId": "principal-1", "tags": map[string]string{"unbounded-cluster-id": attachClusterID}})
 		case "role assignment list":
 			// An owned Repository Reader grant, matched by its built-in GUID and
-			// the deterministic ownership-receipt name.
+			// the deterministic ownership-receipt name. The principal must match
+			// the identity show response ("principal-1").
 			return json.Marshal([]map[string]any{{
-				"name":             acrPullGrantName(attachClusterID, "b93aa761-3e63-49ed-ac28-beffa264f7ac"),
+				"name":             acrPullGrantName(attachClusterID, attachACRID, "principal-1", "b93aa761-3e63-49ed-ac28-beffa264f7ac"),
 				"principalId":      "principal-1",
 				"roleDefinitionId": repoReaderRole,
 				"scope":            attachACRID,

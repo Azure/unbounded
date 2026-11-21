@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -304,11 +305,11 @@ func systemdEnvItems(value string) []string {
 		switch {
 		case inQuote != 0:
 			if inQuote == '"' && c == '\\' && i+1 < len(value) {
-				decoded, ok := systemdDecodeEscape(value[i+1])
+				decoded, consumed, ok := systemdDecodeEscape(value[i:])
 				if ok {
-					cur.WriteByte(decoded)
+					cur.WriteRune(decoded)
 
-					i++
+					i += consumed - 1
 
 					continue
 				}
@@ -350,22 +351,114 @@ func systemdEnvItems(value string) []string {
 	return items
 }
 
-// systemdDecodeEscape resolves a single C-style escape character that follows a
-// backslash inside a double-quoted systemd item. It reports ok=false when the
-// character is not a recognized escape (a literal backslash is then preserved).
-func systemdDecodeEscape(c byte) (byte, bool) {
-	switch c {
-	case '\\', '"', '\'':
-		return c, true
-	case 'n':
-		return '\n', true
-	case 't':
-		return '\t', true
-	case 'r':
-		return '\r', true
+// systemdDecodeEscape resolves a C-style escape sequence that follows a backslash
+// inside a double-quoted systemd item. It returns the decoded rune and the number
+// of bytes consumed after the backslash (including the backslash itself). It
+// reports ok=false when the sequence is not recognized; the caller then decides
+// whether to treat it as a literal backslash or an error.
+//
+// Supported forms (per systemd.syntax man page, "Quoting" section):
+//   - \n, \t, \r, \b, \f, \v, \\, \", \'  (single-char C escapes)
+//   - \xHH  (hex, 1-2 hex digits)
+//   - \NNN  (octal, 1-3 octal digits)
+//   - \uNNNN (Unicode BMP, 4 hex digits)
+//   - \UNNNNNNNN (Unicode full, 8 hex digits)
+//   - \s  (space; systemd also allows \s for a literal space)
+func systemdDecodeEscape(s string) (rune, int, bool) {
+	if len(s) < 2 {
+		return 0, 0, false
 	}
 
-	return 0, false
+	c := s[1]
+
+	switch c {
+	case '\\', '"', '\'':
+		return rune(c), 2, true
+	case 'n':
+		return '\n', 2, true
+	case 't':
+		return '\t', 2, true
+	case 'r':
+		return '\r', 2, true
+	case 'b':
+		return '\b', 2, true
+	case 'f':
+		return '\f', 2, true
+	case 'v':
+		return '\v', 2, true
+	case 's':
+		return ' ', 2, true
+	case 'x':
+		// Hex: \xHH (1-2 hex digits).
+		hex := s[2:]
+
+		n := 0
+		for n < len(hex) && n < 2 && isHexDigit(hex[n]) {
+			n++
+		}
+
+		if n == 0 {
+			return 0, 0, false
+		}
+
+		v, err := strconv.ParseUint(hex[:n], 16, 32)
+		if err != nil {
+			return 0, 0, false
+		}
+
+		return rune(v), 2 + n, true
+	}
+
+	// Octal: \NNN (1-3 octal digits).
+	if c >= '0' && c <= '7' {
+		oct := s[1:]
+
+		n := 0
+		for n < len(oct) && n < 3 && oct[n] >= '0' && oct[n] <= '7' {
+			n++
+		}
+
+		v, err := strconv.ParseUint(oct[:n], 8, 32)
+		if err != nil {
+			return 0, 0, false
+		}
+
+		return rune(v), 1 + n, true
+	}
+
+	// Unicode: \uNNNN (4 hex) or \UNNNNNNNN (8 hex).
+	if c == 'u' || c == 'U' {
+		// Count the hex digits.
+		hexLen := 4
+		if c == 'U' {
+			hexLen = 8
+		}
+
+		if len(s) < 2+hexLen {
+			return 0, 0, false
+		}
+
+		hex := s[2 : 2+hexLen]
+		for i := range hex {
+			if !isHexDigit(hex[i]) {
+				return 0, 0, false
+			}
+		}
+
+		v, err := strconv.ParseUint(hex, 16, 32)
+		if err != nil {
+			return 0, 0, false
+		}
+
+		return rune(v), 2 + hexLen, true
+	}
+
+	return 0, 0, false
+}
+
+// isHexDigit reports whether b is an ASCII hex digit.
+func isHexDigit(b byte) bool {
+	return (b >= '0' && b <= '9') || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F')
 }
 
 // systemdQuote encodes s as a double-quoted systemd item, escaping backslashes
@@ -396,8 +489,10 @@ func systemdQuote(s string) string {
 // uses for the node-level kubelet arguments.
 const nodeConfigArgsKey = "KUBELET_NODE_CONFIG_ARGS"
 
-// nodeConfigArgsItem returns the value of the KUBELET_NODE_CONFIG_ARGS item in a
-// single Environment= directive, or "" when the item is absent. It decodes the
+// nodeConfigArgsItem returns the value of the EFFECTIVE KUBELET_NODE_CONFIG_ARGS
+// item in a single Environment= directive, or "" when the item is absent. In
+// systemd, a repeated assignment to the same variable in the same directive
+// uses the LAST value, so this returns the last matching item. It decodes the
 // item's quoting/escaping, so a whole-assignment-quoted item
 // ("KUBELET_NODE_CONFIG_ARGS=<args>"), a value-quoted item
 // (KUBELET_NODE_CONFIG_ARGS="<args>"), and a bare item all yield the same args
@@ -405,13 +500,20 @@ const nodeConfigArgsKey = "KUBELET_NODE_CONFIG_ARGS"
 // (KUBELET_NODE_CONFIG_ARGS="<a>" UNRELATED=keep), only the KUBELET item's value
 // is returned and the unrelated item is ignored.
 func nodeConfigArgsItem(value string) (string, bool) {
+	// Walk all items; the last KUBELET_NODE_CONFIG_ARGS assignment is effective.
+	var (
+		effective string
+		found     bool
+	)
+
 	for _, item := range systemdEnvItems(value) {
 		if strings.HasPrefix(item, nodeConfigArgsKey+"=") {
-			return item[len(nodeConfigArgsKey)+1:], true
+			effective = item[len(nodeConfigArgsKey)+1:]
+			found = true
 		}
 	}
 
-	return "", false
+	return effective, found
 }
 
 // nodeConfigArgsLine reports whether line is the systemd Environment=
@@ -432,21 +534,34 @@ func nodeConfigArgsLine(line string) bool {
 }
 
 // nodeConfigArgsValue extracts the value of the EFFECTIVE KUBELET_NODE_CONFIG_ARGS
-// Environment entry from the node-config drop-in. In systemd a later assignment
-// of the same variable is the effective one, so when the drop-in assigns
-// KUBELET_NODE_CONFIG_ARGS more than once the LAST assignment is returned, not
-// the first. It returns the decoded args string (the value after the
-// KUBELET_NODE_CONFIG_ARGS= prefix, with the item's quotes and escapes
-// resolved).
+// Environment entry from the node-config drop-in. In systemd, Environment=
+// accumulates entries: a later assignment of the same variable is the effective
+// one, and a bare Environment= (with no items) RESETS the entire environment,
+// clearing all previously-set variables. So when the drop-in assigns
+// KUBELET_NODE_CONFIG_ARGS more than once the LAST assignment is returned, and
+// if a reset appears after the last assignment the variable is no longer defined
+// (the function returns an error). It returns the decoded args string (the value
+// after the KUBELET_NODE_CONFIG_ARGS= prefix, with the item's quotes and
+// escapes resolved).
 func nodeConfigArgsValue(data string) (string, error) {
+	// Walk lines in order; track whether a reset has occurred.
 	value, found := "", false
 
 	for _, line := range strings.Split(data, "\n") {
-		if !nodeConfigArgsLine(line) {
+		line = strings.TrimSpace(line)
+
+		if !strings.HasPrefix(line, "Environment=") {
 			continue
 		}
 
 		rest := strings.TrimPrefix(line, "Environment=")
+
+		// A bare Environment= (empty value) resets the environment.
+		if strings.TrimSpace(rest) == "" {
+			value, found = "", false
+
+			continue
+		}
 
 		v, ok := nodeConfigArgsItem(rest)
 		if !ok {
@@ -798,11 +913,11 @@ func decodeOneItem(raw string) string {
 		switch {
 		case inQuote != 0:
 			if inQuote == '"' && c == '\\' && i+1 < len(raw) {
-				decoded, ok := systemdDecodeEscape(raw[i+1])
+				decoded, consumed, ok := systemdDecodeEscape(raw[i:])
 				if ok {
-					b.WriteByte(decoded)
+					b.WriteRune(decoded)
 
-					i++
+					i += consumed - 1
 
 					continue
 				}

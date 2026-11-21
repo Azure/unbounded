@@ -179,8 +179,15 @@ func flexMachineStatus(machine *v1alpha3.Machine, policy *v1alpha3.RegistryAuthP
 		// for the CURRENT policy generation, and only a verdict observed at or
 		// after the current generation applies: a stale failure from a prior
 		// generation is not terminal, because a new policy or detach resets the
-		// restart budget. Surface a current terminal exhaustion immediately.
-		if cond.Reason == registryauth.ConditionReasonRestartBudgetExhausted && cond.ObservedGeneration >= machine.Generation {
+		// restart budget. Additionally, the verdict must be for the policy
+		// actually being delivered: a failure current for the Machine's OLD
+		// spec is not authority for a different requested policy that has not
+		// yet been patched onto the spec. Surface a current terminal
+		// exhaustion immediately only when the delivered spec matches the
+		// desired policy.
+		if cond.Reason == registryauth.ConditionReasonRestartBudgetExhausted &&
+			cond.ObservedGeneration >= machine.Generation &&
+			registryAuthSpecEquals(machine.Spec.RegistryAuth, policy) {
 			status.terminal = true
 		}
 
@@ -369,7 +376,11 @@ func (h *attachACRHandler) execute(ctx context.Context) error {
 		}
 	}
 
-	if h.machineClient == nil {
+	// The Machine client is only needed in managed mode, where waitForACRInstallation
+	// polls node-reported readiness. In external/default mode it is unused;
+	// initializing it unconditionally would require a valid kubeconfig even for
+	// the external path, which should not depend on Machine CRD access.
+	if h.authMode == registryauth.IdentityBindingMode && h.machineClient == nil {
 		c, err := newMachineClientWithKubeconfig(h.kubeconfig)
 		if err != nil {
 			return fmt.Errorf("create Machine client: %w", err)

@@ -37,10 +37,12 @@ func (d *downloadACRProvider) Name() string { return "download-acr-provider" }
 
 func (d *downloadACRProvider) Do(ctx context.Context) error {
 	destDir := d.goalState.Root().Path(goalstates.RegistryAuthProviderBinDir)
-	target := filepath.Join(destDir, goalstates.RegistryAuthProviderName)
+
 	if err := os.MkdirAll(destDir, 0o755); err != nil {
 		return fmt.Errorf("create %s: %w", destDir, err)
 	}
+
+	target := filepath.Join(destDir, goalstates.RegistryAuthProviderName)
 
 	if utilio.IsExecutable(target) {
 		return nil

@@ -41,6 +41,7 @@ func TestRegistryAuthRetiresOnlyOwnedLegacyObjects(t *testing.T) {
 // kindsOfDeletions returns the set of object kinds that a plan deletes.
 func kindsOfDeletions(operations []component.Operation) map[string]bool {
 	kinds := map[string]bool{}
+
 	for _, op := range operations {
 		if op.Kind == component.OpDelete {
 			kinds[op.Object.GetKind()] = true

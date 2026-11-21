@@ -301,6 +301,45 @@ func TestNodeConfigArgsValue(t *testing.T) {
 			data: "Environment=\"KUBELET_NODE_CONFIG_ARGS=--hostname-override=node\" \"UNRELATED=keep\"\n",
 			want: "--hostname-override=node",
 		},
+		{
+			// A repeated assignment to the same variable within ONE Environment=
+			// directive: systemd uses the LAST value.
+			name: "repeated assignment in one directive uses last value",
+			data: "Environment=\"KUBELET_NODE_CONFIG_ARGS=--first\" \"KUBELET_NODE_CONFIG_ARGS=--last\"\n",
+			want: "--last",
+		},
+		{
+			// A bare Environment= (empty value) resets the environment: a
+			// KUBELET_NODE_CONFIG_ARGS assigned before the reset is no longer
+			// defined.
+			name:    "empty Environment= reset clears prior assignment",
+			data:    "Environment=\"KUBELET_NODE_CONFIG_ARGS=--base\"\nEnvironment=\n",
+			wantErr: true,
+		},
+		{
+			// A hex escape \x31 decodes to '1': node\x31 becomes node1.
+			name: "hex escape is decoded",
+			data: "Environment=KUBELET_NODE_CONFIG_ARGS=\"--hostname-override=node\\x31\"\n",
+			want: "--hostname-override=node1",
+		},
+		{
+			// An octal escape \061 decodes to '1'.
+			name: "octal escape is decoded",
+			data: "Environment=KUBELET_NODE_CONFIG_ARGS=\"--hostname-override=node\\061\"\n",
+			want: "--hostname-override=node1",
+		},
+		{
+			// A unicode escape \u0031 decodes to '1'.
+			name: "unicode BMP escape is decoded",
+			data: "Environment=KUBELET_NODE_CONFIG_ARGS=\"--hostname-override=node\\u0031\"\n",
+			want: "--hostname-override=node1",
+		},
+		{
+			// The \s escape decodes to a space.
+			name: "space escape is decoded",
+			data: "Environment=KUBELET_NODE_CONFIG_ARGS=\"--foo=a\\sb\"\n",
+			want: "--foo=a b",
+		},
 	}
 
 	for _, tc := range tt {
@@ -341,11 +380,13 @@ func TestNodeConfigArgsRenderedRoundTrip(t *testing.T) {
 		},
 		{
 			// A sibling item on the same directive is preserved; only the
-			// KUBELET item is re-encoded.
+			// KUBELET item is re-encoded. The re-encode uses value-quote form
+			// (KUBELET_NODE_CONFIG_ARGS="..."), so the expected output has the
+			// value quoted, not the whole assignment.
 			name: "sibling item preserved",
 			line: `Environment="KUBELET_NODE_CONFIG_ARGS=--hostname-override=node" "UNRELATED=keep"`,
 			args: "--hostname-override=node --extra=1",
-			want: `Environment="KUBELET_NODE_CONFIG_ARGS=--hostname-override=node --extra=1" "UNRELATED=keep"`,
+			want: `Environment=KUBELET_NODE_CONFIG_ARGS="--hostname-override=node --extra=1" "UNRELATED=keep"`,
 			keep: "UNRELATED=keep",
 		},
 	}

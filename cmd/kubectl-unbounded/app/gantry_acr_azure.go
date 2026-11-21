@@ -271,14 +271,21 @@ func (h *attachACRHandler) azureSubscriptionTenant(ctx context.Context, subscrip
 
 // acrPullGrantName is the deterministic role-assignment name (a GUID) the attach
 // path uses for the grant it creates on an ACR. The role-assignment API has no
-// tags property, so the ownership receipt is the assignment's own name: a
-// GUID derived from the cluster ID and the role. Detach lists the principal's
-// assignments on the ACR and reverses only the one carrying this exact name,
-// leaving a shared/inherited/reused grant (a different name) in place. The same
-// cluster+role always yields the same name, so a re-attach reuses the grant it
-// would have created rather than stacking a duplicate.
-func acrPullGrantName(clusterID, role string) string {
-	digest := sha256.Sum256([]byte(strings.ToLower(clusterID) + "|" + strings.ToLower(role)))
+// tags property, so the ownership receipt is the assignment's own name: a GUID
+// derived from the cluster ID, the ACR scope, the principal, and the role.
+// Azure role-assignment names must be unique across the ENTIRE Microsoft Entra
+// tenant (not just within a scope), so the name includes the scope and principal
+// to avoid collisions when the same cluster is attached to multiple ACRs or
+// multiple roles. Detach reconstructs the same receipt from the same inputs and
+// reverses only the one carrying this exact name, leaving a shared/inherited/
+// reused grant (a different name) in place.
+func acrPullGrantName(clusterID, acrScope, principal, role string) string {
+	digest := sha256.Sum256([]byte(
+		strings.ToLower(clusterID) + "|" +
+			strings.ToLower(acrScope) + "|" +
+			strings.ToLower(principal) + "|" +
+			strings.ToLower(role),
+	))
 
 	// Render the first 16 bytes as a lowercase GUID (the form the API accepts
 	// for the role-assignment name).
@@ -300,7 +307,7 @@ func (h *attachACRHandler) ensureACRPullGrant(ctx context.Context, acrID *arm.Re
 		return err
 	}
 
-	grantName := acrPullGrantName(h.clusterID, role)
+	grantName := acrPullGrantName(h.clusterID, h.acrID, principal, role)
 
 	conditional := false
 

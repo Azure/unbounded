@@ -357,9 +357,14 @@ func registryAuthResult(machines []v1alpha3.Machine, policy *v1alpha3.RegistryAu
 			// generation, reports a different reason, or the desired policy is
 			// not yet on the spec; the node has not acknowledged this policy yet.
 			installing++
-		case cond.Reason == registryauth.ConditionReasonRestartBudgetExhausted && cond.ObservedGeneration >= m.Generation:
-			// A current-generation budget exhaustion is a genuine failure: no
-			// retry is left for the policy being delivered.
+		case cond.Reason == registryauth.ConditionReasonRestartBudgetExhausted &&
+			cond.ObservedGeneration >= m.Generation &&
+			sameRegistryAuthPolicy(m.Spec.RegistryAuth, policy):
+			// A current-generation budget exhaustion for the policy actually
+			// delivered on the spec is a genuine failure: no retry is left for
+			// this policy. A failure current for a different (stale) spec is
+			// not authority for the policy being planned; it is still
+			// installing until the operator patches the new policy.
 			failures = append(failures, fmt.Sprintf("%s: %s (%s)", m.Name, cond.Reason, cond.Message))
 		default:
 			// A False condition that is not a current-generation budget

@@ -495,10 +495,35 @@ func TestGantryAttachACRABACRoleSelection(t *testing.T) {
 				// place.
 				require.Contains(t, *calls, "role assignment create --assignee-object-id "+attachPrincipalID+
 					" --assignee-principal-type ServicePrincipal --role "+readerRole+" --scope "+h.acrID+
-					" --name "+acrPullGrantName(h.clusterID, readerRole))
+					" --name "+acrPullGrantName(h.clusterID, h.acrID, attachPrincipalID, readerRole))
 			}
 		})
 	}
+}
+
+// TestGantryAttachACRTwoScopesUseDistinctGrantNames verifies that attaching the
+// same cluster to two different ACRs produces two role-assignment names that do
+// not collide: Azure role-assignment names are tenant-wide unique, so the
+// deterministic receipt must include the ACR scope. The sequence is attach
+// registry A, detach without Azure cleanup (the default), then attach registry
+// B. The surviving grant on A and the new grant on B must have different names.
+func TestGantryAttachACRTwoScopesUseDistinctGrantNames(t *testing.T) {
+	// Two ACRs in different resource groups (and potentially subscriptions).
+	acrA := "/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/registry-rg/providers/Microsoft.ContainerRegistry/registries/central"
+	acrB := "/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/other-rg/providers/Microsoft.ContainerRegistry/registries/other"
+
+	const acrPullRole = "7f951dda-4ed3-4680-a7ca-43fe172d538d"
+
+	nameA := acrPullGrantName(attachClusterID, acrA, attachPrincipalID, acrPullRole)
+	nameB := acrPullGrantName(attachClusterID, acrB, attachPrincipalID, acrPullRole)
+
+	// The names must differ: a collision would cause the second create to fail
+	// with RoleAssignmentUpdateNotPermitted.
+	require.NotEqual(t, nameA, nameB, "two ACRs must produce distinct grant names")
+
+	// The names must be deterministic: calling again yields the same name.
+	require.Equal(t, nameA, acrPullGrantName(attachClusterID, acrA, attachPrincipalID, acrPullRole))
+	require.Equal(t, nameB, acrPullGrantName(attachClusterID, acrB, attachPrincipalID, acrPullRole))
 }
 
 func TestGantryAttachACRClusterTrustBundleSelection(t *testing.T) {
@@ -776,7 +801,7 @@ func TestGantryAttachACRManagedCrossSubscription(t *testing.T) {
 				// place.
 				require.Contains(t, *calls, "role assignment create --assignee-object-id "+attachPrincipalID+
 					" --assignee-principal-type ServicePrincipal --role 7f951dda-4ed3-4680-a7ca-43fe172d538d --scope "+h.acrID+
-					" --name "+acrPullGrantName(h.clusterID, "7f951dda-4ed3-4680-a7ca-43fe172d538d"))
+					" --name "+acrPullGrantName(h.clusterID, h.acrID, attachPrincipalID, "7f951dda-4ed3-4680-a7ca-43fe172d538d"))
 			}
 		})
 	}
@@ -1024,22 +1049,39 @@ func TestGantryAttachACRTerminalFailureSurfacesImmediately(t *testing.T) {
 }
 
 // TestFlexMachineStatusTerminal distinguishes a genuinely terminal failure from
-// a retryable one. Only a current-generation RestartBudgetExhausted is terminal:
-// the agent reports other False reasons while it is scheduling a bounded retry,
-// and a stale failure from a prior generation is not terminal because a new
-// policy resets the restart budget.
+// a retryable one. Only a current-generation RestartBudgetExhausted for the
+// DELIVERED policy is terminal: the agent reports other False reasons while it
+// is scheduling a bounded retry, a stale failure from a prior generation is not
+// terminal, and a failure for a different (undelivered) requested policy is not
+// terminal because the operator has not yet patched the new policy onto the spec.
 func TestFlexMachineStatusTerminal(t *testing.T) {
+	// A managed policy the machine may or may not carry on its spec.
+	managedPolicy := &v1alpha3.RegistryAuthPolicy{Mode: "aks-identity-binding", Registry: "central.azurecr.io"}
+
 	tt := []struct {
 		name         string
 		reason       string
 		observedGen  int64
 		machineGen   int64
+		spec         *v1alpha3.RegistryAuthPolicy // the delivered spec on the machine
+		requested    *v1alpha3.RegistryAuthPolicy // the requested policy (nil = external/detach)
 		wantTerminal bool
 	}{
-		{name: "current-generation budget exhaustion is terminal", reason: "RestartBudgetExhausted", observedGen: 1, machineGen: 1, wantTerminal: true},
-		{name: "retryable backoff is not terminal", reason: "RestartBackoff", observedGen: 1, machineGen: 1, wantTerminal: false},
-		{name: "retryable apply failure is not terminal", reason: "ApplyFailed", observedGen: 1, machineGen: 1, wantTerminal: false},
-		{name: "stale-generation budget exhaustion is not terminal", reason: "RestartBudgetExhausted", observedGen: 1, machineGen: 2, wantTerminal: false},
+		// Current-gen exhaustion for the delivered policy: terminal.
+		{name: "current-gen budget exhaustion for delivered policy is terminal", reason: "RestartBudgetExhausted", observedGen: 1, machineGen: 1, spec: managedPolicy, requested: managedPolicy, wantTerminal: true},
+		// Retryable reasons are never terminal.
+		{name: "retryable backoff is not terminal", reason: "RestartBackoff", observedGen: 1, machineGen: 1, spec: managedPolicy, requested: managedPolicy, wantTerminal: false},
+		{name: "retryable apply failure is not terminal", reason: "ApplyFailed", observedGen: 1, machineGen: 1, spec: managedPolicy, requested: managedPolicy, wantTerminal: false},
+		// Stale-generation exhaustion is not terminal.
+		{name: "stale-generation budget exhaustion is not terminal", reason: "RestartBudgetExhausted", observedGen: 1, machineGen: 2, spec: managedPolicy, requested: managedPolicy, wantTerminal: false},
+		// Exhaustion for a DIFFERENT requested policy (spec does not match): not terminal.
+		{name: "budget exhaustion for undelivered requested policy is not terminal", reason: "RestartBudgetExhausted", observedGen: 1, machineGen: 1, spec: managedPolicy, requested: nil, wantTerminal: false},
+		// Detach (nil requested) while the machine carries an old exhausted managed
+		// policy: not terminal because the spec does not match the requested (nil).
+		{name: "detach with old exhausted managed spec is not terminal", reason: "RestartBudgetExhausted", observedGen: 1, machineGen: 1, spec: managedPolicy, requested: nil, wantTerminal: false},
+		// New managed policy requested while the machine carries an old exhausted
+		// managed policy (different registry): not terminal.
+		{name: "new managed policy with old exhausted spec is not terminal", reason: "RestartBudgetExhausted", observedGen: 1, machineGen: 1, spec: managedPolicy, requested: &v1alpha3.RegistryAuthPolicy{Mode: "aks-identity-binding", Registry: "other.azurecr.io"}, wantTerminal: false},
 	}
 
 	for _, tc := range tt {
@@ -1050,10 +1092,16 @@ func TestFlexMachineStatusTerminal(t *testing.T) {
 			}
 			machine := &v1alpha3.Machine{
 				ObjectMeta: metav1.ObjectMeta{Name: "n", Generation: tc.machineGen},
+				Spec:       v1alpha3.MachineSpec{RegistryAuth: tc.spec},
 				Status:     v1alpha3.MachineStatus{Conditions: []metav1.Condition{*cond}},
 			}
 
-			st := flexMachineStatus(machine, nil, "External")
+			wantReason := "External"
+			if tc.requested != nil {
+				wantReason = "Configured"
+			}
+
+			st := flexMachineStatus(machine, tc.requested, wantReason)
 			require.Equal(t, tc.wantTerminal, st.terminal, "terminal flag")
 			require.False(t, st.ready, "a False condition is never ready")
 		})

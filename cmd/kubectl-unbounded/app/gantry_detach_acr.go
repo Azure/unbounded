@@ -403,7 +403,7 @@ func (h *detachACRHandler) findACRRoleAssignments(ctx context.Context, acrID *ar
 		// and is preserved.
 		entry := acrRoleAssignment{ID: a.ID, Scope: a.Scope, Condition: a.Condition, RoleID: a.RoleDefinitionID}
 
-		for _, grant := range ownedRoleGrantNames(h.clusterID) {
+		for _, grant := range ownedRoleGrantNames(h.clusterID, h.acrID, principalID) {
 			if strings.EqualFold(a.Name, grant) {
 				entry.Owned = true
 
@@ -422,17 +422,16 @@ func (h *detachACRHandler) findACRRoleAssignments(ctx context.Context, acrID *ar
 }
 
 // ownedRoleGrantNames returns the deterministic role-assignment names the attach
-// path would create for this cluster, one per ACR role it can grant (AcrPull and
-// the Repository Reader role). Detach matches a listed assignment's name against
-// this set to tell its own grant from a shared one.
-func ownedRoleGrantNames(clusterID string) []string {
-	// The attach path names the grant from the cluster ID and the resolved role
-	// GUID (the built-in role's definition name), so the receipt for each role is
-	// deterministic. Detach reconstructs both candidate receipts and matches a
-	// listed assignment against whichever it carries.
+// path would create for this cluster on the given ACR, one per ACR role it can
+// grant (AcrPull and the Repository Reader role). Detach matches a listed
+// assignment's name against this set to tell its own grant from a shared one.
+// The name includes the ACR scope and principal so that two grants on different
+// ACRs (or different principals) never collide, since Azure role-assignment
+// names are tenant-wide unique.
+func ownedRoleGrantNames(clusterID, acrScope, principal string) []string {
 	return []string{
-		acrPullGrantName(clusterID, acrPullRoleID),
-		acrPullGrantName(clusterID, repositoryReaderRoleID),
+		acrPullGrantName(clusterID, acrScope, principal, acrPullRoleID),
+		acrPullGrantName(clusterID, acrScope, principal, repositoryReaderRoleID),
 	}
 }
 
