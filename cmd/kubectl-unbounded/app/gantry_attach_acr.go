@@ -233,26 +233,6 @@ func registryAuthSpecEquals(a, b *v1alpha3.RegistryAuthPolicy) bool {
 	return *a == *b
 }
 
-// registryAuthPolicyFromConfig maps a Gantry node-auth config to the
-// Machine.spec.registryAuth field the operator delivers. A non-managed mode maps
-// to nil: the agent then leaves the kubelet's authentication untouched.
-func registryAuthPolicyFromConfig(cfg registryauth.Config) *v1alpha3.RegistryAuthPolicy {
-	if cfg.Mode != registryauth.IdentityBindingMode {
-		return nil
-	}
-
-	return &v1alpha3.RegistryAuthPolicy{
-		Mode:         cfg.Mode,
-		Registry:     cfg.Registry,
-		ClientID:     cfg.ClientID,
-		TenantID:     cfg.TenantID,
-		SNIName:      cfg.SNIName,
-		ProxyAddress: cfg.ProxyAddress,
-		Audience:     cfg.Audience,
-		CACert:       cfg.CACert,
-	}
-}
-
 func gantryCommandGroup() *cobra.Command {
 	group := &cobra.Command{Use: "gantry", Short: "Configure Gantry image acceleration"}
 	h := &attachACRHandler{}
@@ -737,7 +717,7 @@ func (h *attachACRHandler) waitForACRInstallation(ctx context.Context, cfg *regi
 		return errors.New("machine status reader is not configured")
 	}
 
-	policy := registryAuthPolicyFromConfig(*cfg)
+	policy := registryauth.PolicyFromConfig(*cfg)
 
 	var lastError error
 

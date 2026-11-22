@@ -105,7 +105,7 @@ func managedRegistryAuthPolicy(t *testing.T, source *corev1.ConfigMap) *unbounde
 	cfg, err := registryauth.Derive(source.Data["config.yaml"], source.Data[registryauth.ConfigKey])
 	require.NoError(t, err)
 
-	return registryAuthPolicyFromConfig(cfg)
+	return registryauth.PolicyFromConfig(cfg)
 }
 
 func TestRegistryAuthDeliversPolicyToAgentBackedNodes(t *testing.T) {

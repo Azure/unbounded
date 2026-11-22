@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"sigs.k8s.io/yaml"
 )
 
@@ -68,6 +69,28 @@ type Config struct {
 }
 
 func IsACR(host string) bool { return len(host) <= 253 && acrHost.MatchString(host) }
+
+// PolicyFromConfig maps a node-auth config to the Machine.spec.registryAuth
+// field the operator delivers to the agent. A non-managed mode maps to nil:
+// the agent then leaves the kubelet's authentication untouched. The operator
+// writes the field and the CLI reads it back, so both use this definition
+// rather than a copy.
+func PolicyFromConfig(cfg Config) *v1alpha3.RegistryAuthPolicy {
+	if cfg.Mode != IdentityBindingMode {
+		return nil
+	}
+
+	return &v1alpha3.RegistryAuthPolicy{
+		Mode:         cfg.Mode,
+		Registry:     cfg.Registry,
+		ClientID:     cfg.ClientID,
+		TenantID:     cfg.TenantID,
+		SNIName:      cfg.SNIName,
+		ProxyAddress: cfg.ProxyAddress,
+		Audience:     cfg.Audience,
+		CACert:       cfg.CACert,
+	}
+}
 
 // Derive validates the explicitly selected policy against Gantry's actual upstream.
 func Derive(gantry, policy string) (Config, error) {

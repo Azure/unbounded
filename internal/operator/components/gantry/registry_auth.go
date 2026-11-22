@@ -123,27 +123,6 @@ func registryAuthNodePredicate() predicate.Predicate {
 	}
 }
 
-// registryAuthPolicyFromConfig maps the operator's node-auth policy to the
-// Machine.spec.registryAuth field the agent applies. An external (or absent)
-// policy maps to nil: the agent then leaves the kubelet's authentication
-// untouched and removes any managed provider it had installed.
-func registryAuthPolicyFromConfig(cfg registryauth.Config) *v1alpha3.RegistryAuthPolicy {
-	if cfg.Mode != registryauth.IdentityBindingMode {
-		return nil
-	}
-
-	return &v1alpha3.RegistryAuthPolicy{
-		Mode:         cfg.Mode,
-		Registry:     cfg.Registry,
-		ClientID:     cfg.ClientID,
-		TenantID:     cfg.TenantID,
-		SNIName:      cfg.SNIName,
-		ProxyAddress: cfg.ProxyAddress,
-		Audience:     cfg.Audience,
-		CACert:       cfg.CACert,
-	}
-}
-
 // planRegistryAuth delivers the node-auth policy to the agent on every eligible
 // Flex node by writing Machine.spec.registryAuth, and reads back the node-
 // reported Machine.Status.registryAuth condition to determine readiness. The
@@ -169,7 +148,7 @@ func planRegistryAuth(ctx context.Context, env *component.Env) ([]component.Oper
 	}
 
 	active := cfg.Mode == registryauth.IdentityBindingMode
-	policy := registryAuthPolicyFromConfig(cfg)
+	policy := registryauth.PolicyFromConfig(cfg)
 
 	operations, machines, err := planRegistryAuthMachines(ctx, env, policy, active)
 	if err != nil {
