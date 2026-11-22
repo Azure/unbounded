@@ -95,7 +95,12 @@ type aksIdentityBinding struct {
 // listAKSIdentityBindings returns every identity binding on the cluster,
 // following the API's pagination. The pagination URL is validated to stay on
 // the management plane and within the cluster's identity-bindings collection.
-func listAKSIdentityBindings(ctx context.Context, runAzure func(context.Context, string, ...string) ([]byte, error), clusterID string, subscriptionID string) ([]aksIdentityBinding, error) {
+func listAKSIdentityBindings(
+	ctx context.Context,
+	runAzure func(context.Context, string, ...string) ([]byte, error),
+	clusterID string,
+	subscriptionID string,
+) ([]aksIdentityBinding, error) {
 	bindingsURL := "https://management.azure.com" + clusterID + "/identityBindings?api-version=2026-08-02-preview"
 
 	var all []aksIdentityBinding
@@ -140,7 +145,12 @@ func aksIdentityBindingByName(bindings []aksIdentityBinding, name string) *aksId
 // when it references identityResourceID. A binding that points at a different
 // identity is refused, so a shared or foreign binding is never touched. Absence
 // of the binding is success.
-func deleteAKSIdentityBinding(ctx context.Context, runAzure func(context.Context, string, ...string) ([]byte, error), clusterID string, subscriptionID, name, identityResourceID string) error {
+func deleteAKSIdentityBinding(
+	ctx context.Context,
+	runAzure func(context.Context, string, ...string) ([]byte, error),
+	clusterID string,
+	subscriptionID, name, identityResourceID string,
+) error {
 	bindings, err := listAKSIdentityBindings(ctx, runAzure, clusterID, subscriptionID)
 	if err != nil {
 		return err

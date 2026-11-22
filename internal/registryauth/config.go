@@ -15,8 +15,9 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
-	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"sigs.k8s.io/yaml"
+
+	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
 
 const (

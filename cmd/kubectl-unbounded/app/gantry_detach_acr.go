@@ -562,12 +562,6 @@ func (h *detachACRHandler) removeUserAssignedIdentity(ctx context.Context, clust
 	return nil
 }
 
-// aksIdentityBindingsList returns every identity binding on the cluster,
-// following the API's pagination.
-func (h *detachACRHandler) aksIdentityBindingsList(ctx context.Context, clusterID *arm.ResourceID) ([]aksIdentityBinding, error) {
-	return listAKSIdentityBindings(ctx, h.runAzure, h.clusterID, clusterID.SubscriptionID)
-}
-
 // checkACRIdentityBindingOwned verifies, read-only, that the AKS identity
 // binding named by the install (if present) references the owned user-assigned
 // identity, so the ownership gate runs before any Azure deletion. Absence of

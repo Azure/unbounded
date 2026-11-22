@@ -4,16 +4,21 @@
 package daemon
 
 import (
+	"context"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/internal/registryauth"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/isolation"
 )
 
 func TestDesiredRegistryAuth(t *testing.T) {
@@ -185,99 +190,185 @@ func TestWriteFileIfChanged(t *testing.T) {
 	require.Equal(t, []byte("two"), data)
 }
 
+// TestApplyProviderToNodeConfig exercises the REAL apply path end to end:
+// applyProviderToNodeConfig -> nodestart.RenderNodeConfigDropIn -> the file on
+// disk under an isolation root. It uses isolation.NewDirRoot so the drop-in is
+// written to a real temp directory, and it asserts on the rendered content (not
+// a fake string callback) so a regression that writes an empty file, clobbers a
+// customer provider, or fails to detect a change is caught.
 func TestApplyProviderToNodeConfig(t *testing.T) {
-	// The drop-in path is derived from the root, so we use a temp dir as the
-	// root and check the file it writes.
+	customerProvider := &goalstates.ImageCredentialProvider{
+		ConfigPath: "/etc/customer/provider.json",
+		BinDir:     "/opt/customer/providers",
+	}
+
 	tt := []struct {
 		name       string
 		policy     *registryauth.Config
+		customer   *goalstates.ImageCredentialProvider
 		wantChange bool
+		wantErr    bool
 		wantFlags  bool
+		// wantCustomer asserts the rendered drop-in still carries the customer
+		// provider (external mode with a customer config) and NOT the managed pair.
+		wantCustomer bool
 	}{
 		{
-			name:       "attach adds managed flags",
+			name:       "attach with no customer provider adds managed flags",
 			policy:     &registryauth.Config{Mode: registryauth.IdentityBindingMode},
+			customer:   nil,
 			wantChange: true,
 			wantFlags:  true,
 		},
 		{
-			name:       "detach removes managed flags",
+			name:       "attach rejects a different customer provider",
+			policy:     &registryauth.Config{Mode: registryauth.IdentityBindingMode},
+			customer:   customerProvider,
+			wantChange: false,
+			wantErr:    true,
+		},
+		{
+			name:       "external with no customer provider leaves none",
 			policy:     nil,
+			customer:   nil,
 			wantChange: true,
 			wantFlags:  false,
+		},
+		{
+			name:         "external preserves a customer provider",
+			policy:       nil,
+			customer:     customerProvider,
+			wantChange:   true,
+			wantFlags:    false,
+			wantCustomer: true,
 		},
 	}
 
 	for _, tc := range tt {
 		t.Run(tc.name, func(t *testing.T) {
-			// Build a minimal goal state with a temp dir as the root.
 			rootDir := t.TempDir()
+			root, err := isolation.NewDirRoot("slot1", rootDir)
+			require.NoError(t, err)
 
 			gs := &goalstates.MachineGoalState{
 				NodeStart: &goalstates.NodeStart{
 					NodeName: "node1",
 					Kubelet: goalstates.Kubelet{
-						NodeIP: "10.0.0.5",
+						NodeIP:                  "10.0.0.5",
+						ImageCredentialProvider: tc.customer,
 					},
 				},
 			}
 
-			// Create the drop-in path.
-			dropInDir := filepath.Join(rootDir, goalstates.SystemdSystemDir, "kubelet.service.d")
-			require.NoError(t, os.MkdirAll(dropInDir, 0o755))
+			// The drop-in is written under the node-stack root at the mode-correct
+			// path (nspawn -> kubelet.service.d/20-node-config.conf).
+			path := filepath.Join(rootDir, goalstates.SystemdSystemDir, "kubelet.service.d", "20-node-config.conf")
 
-			// Use a fake root that returns paths under rootDir.
-			fakeRoot := func(rel string) string { return filepath.Join(rootDir, rel) }
+			changed, err := applyProviderToNodeConfig(root, isolation.ModeNSpawn, nil, gs, tc.policy)
+			if tc.wantErr {
+				require.Error(t, err)
+				require.False(t, changed)
 
-			// Render and write the drop-in with the given policy.
-			gs.NodeStart.Kubelet.ImageCredentialProvider = nil
-			if tc.policy != nil {
-				gs.NodeStart.Kubelet.ImageCredentialProvider = &goalstates.ImageCredentialProvider{
-					ConfigPath: goalstates.RegistryAuthCredentialConfigPath,
-					BinDir:     goalstates.RegistryAuthProviderBinDir,
-				}
+				return
 			}
 
-			// We test the render function directly since applyProviderToNodeConfig
-			// uses a root abstraction that's hard to fake here.
-			rendered, err := renderNodeConfigDropInForTest(&gs.NodeStart.Kubelet, gs.NodeStart.NodeName, gs.NodeStart.Kubelet.NodeIP)
-			require.NoError(t, err)
-
-			path := filepath.Join(dropInDir, "20-node-config.conf")
-			changed, err := writeFileIfChanged(path, rendered, 0o644)
 			require.NoError(t, err)
 			require.Equal(t, tc.wantChange, changed)
 
-			data, err := os.ReadFile(path)
-			require.NoError(t, err)
+			data, readErr := os.ReadFile(path)
+			if !tc.wantChange {
+				// No write happened when nothing changed; the file need not exist yet.
+				require.True(t, os.IsNotExist(readErr) || readErr != nil, "no change expected but file may or may not exist")
+
+				return
+			}
+
+			require.NoError(t, readErr)
 
 			if tc.wantFlags {
 				require.Contains(t, string(data), "--image-credential-provider-config="+goalstates.RegistryAuthCredentialConfigPath)
 				require.Contains(t, string(data), "--image-credential-provider-bin-dir="+goalstates.RegistryAuthProviderBinDir)
 			} else {
-				require.NotContains(t, string(data), "--image-credential-provider-config=")
-				require.NotContains(t, string(data), "--image-credential-provider-bin-dir=")
+				require.NotContains(t, string(data), "--image-credential-provider-config="+goalstates.RegistryAuthCredentialConfigPath)
+				require.NotContains(t, string(data), "--image-credential-provider-bin-dir="+goalstates.RegistryAuthProviderBinDir)
 			}
 
-			// Verify the other args are preserved.
+			if tc.wantCustomer {
+				// The customer provider must survive; the managed pair must not appear.
+				require.Contains(t, string(data), "--image-credential-provider-config="+customerProvider.ConfigPath)
+				require.Contains(t, string(data), "--image-credential-provider-bin-dir="+customerProvider.BinDir)
+			}
+
+			// The non-provider node args are always preserved by the template.
 			require.Contains(t, string(data), "--hostname-override=node1")
 			require.Contains(t, string(data), "--node-ip=10.0.0.5")
-
-			_ = fakeRoot
 		})
 	}
 }
 
-// renderNodeConfigDropInForTest is a test helper that renders the drop-in.
-// It exists because the nodestart package's RenderNodeConfigDropIn is not
-// directly accessible from the daemon package tests without importing the
-// full package (which would create a cycle).
-func renderNodeConfigDropInForTest(spec *goalstates.Kubelet, nodeName, nodeIP string) ([]byte, error) {
-	// This is a simplified version for testing. In production, the
-	// nodestart.RenderNodeConfigDropIn function is used.
-	// For now, we just check that the applyProviderToNodeConfig function
-	// works correctly by testing it directly.
-	return nil, nil
+// TestApplyProviderToNodeConfigRoundtrip drives the real apply path through a
+// full attach -> detach round trip on one root, asserting the on-disk content at
+// each step and that detach removes only the managed pair (leaving a customer
+// provider, if present, intact).
+func TestApplyProviderToNodeConfigRoundtrip(t *testing.T) {
+	rootDir := t.TempDir()
+	root, err := isolation.NewDirRoot("slot1", rootDir)
+	require.NoError(t, err)
+
+	gs := &goalstates.MachineGoalState{
+		NodeStart: &goalstates.NodeStart{
+			NodeName: "node1",
+			Kubelet: goalstates.Kubelet{
+				NodeIP: "10.0.0.5",
+			},
+		},
+	}
+	path := filepath.Join(rootDir, goalstates.SystemdSystemDir, "kubelet.service.d", "20-node-config.conf")
+
+	// Step 1: attach. The managed pair appears.
+	changed, err := applyProviderToNodeConfig(root, isolation.ModeNSpawn, nil, gs, &registryauth.Config{Mode: registryauth.IdentityBindingMode})
+	require.NoError(t, err)
+	require.True(t, changed)
+
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Contains(t, string(data), "--image-credential-provider-config="+goalstates.RegistryAuthCredentialConfigPath)
+	require.Contains(t, string(data), "--image-credential-provider-bin-dir="+goalstates.RegistryAuthProviderBinDir)
+
+	// Step 2: detach with no customer provider. The managed pair is removed.
+	changed, err = applyProviderToNodeConfig(root, isolation.ModeNSpawn, nil, gs, nil)
+	require.NoError(t, err)
+	require.True(t, changed)
+
+	data, err = os.ReadFile(path)
+	require.NoError(t, err)
+	require.NotContains(t, string(data), "--image-credential-provider-config="+goalstates.RegistryAuthCredentialConfigPath)
+	require.NotContains(t, string(data), "--image-credential-provider-bin-dir="+goalstates.RegistryAuthProviderBinDir)
+
+	// Step 3: attach again on a fresh goal state that carries a customer
+	// provider -> must be rejected, and the on-disk content must be untouched.
+	gs2 := &goalstates.MachineGoalState{
+		NodeStart: &goalstates.NodeStart{
+			NodeName: "node1",
+			Kubelet: goalstates.Kubelet{
+				NodeIP: "10.0.0.5",
+				ImageCredentialProvider: &goalstates.ImageCredentialProvider{
+					ConfigPath: "/etc/customer/provider.json",
+					BinDir:     "/opt/customer/providers",
+				},
+			},
+		},
+	}
+	before, err := os.ReadFile(path)
+	require.NoError(t, err)
+
+	changed, err = applyProviderToNodeConfig(root, isolation.ModeNSpawn, nil, gs2, &registryauth.Config{Mode: registryauth.IdentityBindingMode})
+	require.Error(t, err)
+	require.False(t, changed)
+
+	after, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, before, after, "rejected attach must not modify the drop-in")
 }
 
 func TestEffectiveManagedFlags(t *testing.T) {
@@ -307,4 +398,132 @@ func TestEffectiveManagedFlags(t *testing.T) {
 			require.Equal(t, tc.want, registryAuthEffectiveManagedFlags(tc.argv))
 		})
 	}
+}
+
+// TestVerifyKubeletExternalSplitFormManagedFlags is the regression the review
+// called out: the external-mode verifyKubelet check must NOT acknowledge a
+// running kubelet whose argv carries the managed provider in SPLIT form
+// (--flag value, two tokens), as produced by KUBELET_EXTRA_ARGS or an
+// environment-sourced drop-in. A bare exact-inline-token match would miss the
+// split form and falsely conclude the managed provider was removed. The check
+// must detect the managed provider in effect from the split-form argv, whether
+// both flags or a single remaining managed flag are present.
+func TestVerifyKubeletExternalSplitFormManagedFlags(t *testing.T) {
+	t.Parallel()
+
+	cfg := goalstates.RegistryAuthCredentialConfigPath
+	bin := goalstates.RegistryAuthProviderBinDir
+
+	tt := []struct {
+		name string
+		argv []string
+		// wantHasManaged is what registryAuthArgvHasManagedFlags (the external
+		// check) must return. true == managed provider still in effect, so the
+		// external acknowledgment must be rejected.
+		wantHasManaged bool
+	}{
+		{
+			name:           "split-form both managed flags in effect",
+			argv:           []string{"kubelet", "--image-credential-provider-config", cfg, "--image-credential-provider-bin-dir", bin},
+			wantHasManaged: true,
+		},
+		{
+			name:           "split-form single remaining managed config flag",
+			argv:           []string{"kubelet", "--image-credential-provider-config", cfg},
+			wantHasManaged: true,
+		},
+		{
+			name:           "split-form single remaining managed bin-dir flag",
+			argv:           []string{"kubelet", "--image-credential-provider-bin-dir", bin},
+			wantHasManaged: true,
+		},
+		{
+			name:           "inline-form managed flags in effect",
+			argv:           []string{"kubelet", "--image-credential-provider-config=" + cfg, "--image-credential-provider-bin-dir=" + bin},
+			wantHasManaged: true,
+		},
+		{
+			name:           "customer split-form provider is not the managed one",
+			argv:           []string{"kubelet", "--image-credential-provider-config", "/etc/customer/provider.json", "--image-credential-provider-bin-dir", "/opt/customer/providers"},
+			wantHasManaged: false,
+		},
+		{
+			name:           "no provider flags at all",
+			argv:           []string{"kubelet", "--hostname-override=n1", "--node-ip=10.0.0.5"},
+			wantHasManaged: false,
+		},
+		{
+			name:           "split-form repeated flag overridden to customer value",
+			argv:           []string{"kubelet", "--image-credential-provider-config", cfg, "--image-credential-provider-config", "/etc/customer/provider.json"},
+			wantHasManaged: false,
+		},
+	}
+
+	for _, tc := range tt {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.wantHasManaged, registryAuthArgvHasManagedFlags(tc.argv),
+				"external-mode verifyKubelet must recognize the managed provider in this argv form")
+		})
+	}
+}
+
+// TestVerifyKubeletExternalSplitFormIsRegression exercises the full
+// verifyKubelet method with a FakeBackend whose Exec returns a MainPID and a
+// NUL-separated /proc/<pid>/cmdline carrying the managed provider flags in
+// split form. This is the exact counterexample from the review: a kubelet
+// running with KUBELET_EXTRA_ARGS supplying the managed provider in split form
+// must NOT be acknowledged as external.
+func TestVerifyKubeletExternalSplitFormIsRegression(t *testing.T) {
+	t.Parallel()
+
+	cfg := goalstates.RegistryAuthCredentialConfigPath
+	bin := goalstates.RegistryAuthProviderBinDir
+	argv := []string{
+		"kubelet",
+		"--image-credential-provider-config", cfg,
+		"--image-credential-provider-bin-dir", bin,
+	}
+
+	// FakeBackend: first Exec call is systemctl show MainPID, second is
+	// cat /proc/<pid>/cmdline.
+	callCount := 0
+	backend := &isolation.FakeBackend{
+		FakeMode: isolation.ModeNSpawn,
+		Dir:      t.TempDir(),
+		ExecFunc: func(spec isolation.ExecSpec) (isolation.ExecResult, error) {
+			callCount++
+			switch {
+			case len(spec.Args) > 0 && spec.Args[0] == "systemctl":
+				return isolation.ExecResult{Stdout: "4242\n"}, nil
+			case len(spec.Args) > 0 && spec.Args[0] == "cat":
+				return isolation.ExecResult{Stdout: strings.Join(argv, "\x00")}, nil
+			default:
+				t.Fatalf("unexpected Exec: %v", spec.Args)
+			}
+
+			return isolation.ExecResult{}, nil
+		},
+	}
+
+	r := &registryAuthReconciler{
+		log:         slog.New(slog.NewTextHandler(os.Stderr, nil)),
+		machineName: "test-machine",
+		backends: ModeBackends{
+			isolation.ModeNSpawn: func(log *slog.Logger, cfg *provision.AgentConfig) isolation.Backend {
+				return backend
+			},
+		},
+	}
+
+	active := &ActiveMachine{
+		Name: "test-machine",
+		Mode: isolation.ModeNSpawn,
+	}
+
+	// External policy: active=false means we want to confirm no managed flags.
+	desired := registryAuthActivePolicy{active: false}
+
+	ready, err := r.verifyKubelet(context.Background(), active, desired)
+	require.NoError(t, err)
+	require.False(t, ready, "verifyKubelet must reject external acknowledgment when split-form managed flags are in the running kubelet argv")
 }

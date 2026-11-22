@@ -130,12 +130,35 @@ func registryAuthProviderFlags() []string {
 func applyProviderToNodeConfig(root isolation.NodeRoot, mode isolation.Mode, active *ActiveMachine, gs *goalstates.MachineGoalState, policy *registryauth.Config) (bool, error) {
 	path := registryAuthNodeConfigDropIn(root, mode)
 
-	// Set the provider on the goal state if we're attaching, clear it if detaching.
-	gs.NodeStart.Kubelet.ImageCredentialProvider = nil
-	if policy != nil {
-		gs.NodeStart.Kubelet.ImageCredentialProvider = &goalstates.ImageCredentialProvider{
-			ConfigPath: goalstates.RegistryAuthCredentialConfigPath,
-			BinDir:     goalstates.RegistryAuthProviderBinDir,
+	// Reconcile the provider flags on the goal state with the desired policy,
+	// WITHOUT clobbering a customer-configured provider that the applied
+	// AgentConfig declared. The goal state's ImageCredentialProvider (projected
+	// from the applied config) is the authoritative customer value.
+	//
+	//   - External/detach (policy nil): leave the customer provider as-is (it
+	//     may be nil). Do NOT clear it: a customer provider declared via the
+	//     supported config must survive registry-auth detach.
+	//   - Managed/attach (policy non-nil): if the customer configured a DIFFERENT
+	//     provider, reject the conflict before writing anything. If none (or the
+	//     managed pair itself), set the managed pair.
+	switch {
+	case policy == nil:
+		// Customer provider (or none) stays as projected from the applied config.
+		// No mutation: gs.NodeStart.Kubelet.ImageCredentialProvider is already
+		// whatever the customer configured (nil or their paths).
+	case gs.NodeStart.Kubelet.ImageCredentialProvider == nil:
+		// No customer provider: apply the managed pair.
+		gs.NodeStart.Kubelet.ImageCredentialProvider = managedRegistryAuthProvider()
+	default:
+		// Customer configured a provider. Reject if it is not the managed pair,
+		// so we never silently overwrite a customer's registry auth.
+		cust := gs.NodeStart.Kubelet.ImageCredentialProvider
+		if cust.ConfigPath != goalstates.RegistryAuthCredentialConfigPath || cust.BinDir != goalstates.RegistryAuthProviderBinDir {
+			return false, fmt.Errorf(
+				"registry-auth: node config already declares image-credential-provider "+
+					"(config=%s bin-dir=%s); cannot attach the managed provider without first removing the customer provider "+
+					"from the agent config; refusing to overwrite customer registry auth",
+				cust.ConfigPath, cust.BinDir)
 		}
 	}
 
@@ -145,6 +168,15 @@ func applyProviderToNodeConfig(root isolation.NodeRoot, mode isolation.Mode, act
 	}
 
 	return writeFileIfChanged(path, rendered, 0o644)
+}
+
+// managedRegistryAuthProvider returns the managed provider pair (the credential
+// config path and bin dir the agent writes for registry-auth).
+func managedRegistryAuthProvider() *goalstates.ImageCredentialProvider {
+	return &goalstates.ImageCredentialProvider{
+		ConfigPath: goalstates.RegistryAuthCredentialConfigPath,
+		BinDir:     goalstates.RegistryAuthProviderBinDir,
+	}
 }
 
 // executableFile reports whether path exists, is a regular file, and has any
@@ -444,14 +476,29 @@ func saveRegistryAuthBudget(slot string, budget *registryAuthBudget) error {
 	return fsyncDir(path)
 }
 
-// registryAuthArgvHasManagedFlags reports whether the argv carries any of the
-// managed provider tokens.
+// registryAuthArgvHasManagedFlags reports whether the argv carries the managed
+// provider in effect. It recognizes BOTH the inline form (--flag=value) and the
+// split form (--flag value), because kubelet's argv may be assembled from
+// KUBELET_EXTRA_ARGS or other sources that split the flag and its value into
+// separate tokens. A bare exact-token match would miss the split form and
+// falsely conclude the managed provider was removed.
+//
+// The managed provider is "in effect" when at least one managed flag name is
+// present and its effective (last-occurrence) value equals the managed value, so
+// a single remaining managed flag (config or bin-dir) is detected even when the
+// other was already cleared, and repeated-flag semantics are honored.
 func registryAuthArgvHasManagedFlags(argv []string) bool {
-	for _, f := range registryAuthProviderFlags() {
-		for _, tok := range argv {
-			if tok == f {
-				return true
-			}
+	for _, managed := range registryAuthProviderFlags() {
+		name := providerFlagName(managed)
+		if name == "" {
+			continue
+		}
+
+		wantValue := providerFlagValue(managed)
+		got, found := providerFlagEffectiveValue(argv, name)
+
+		if found && got == wantValue {
+			return true
 		}
 	}
 
