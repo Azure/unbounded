@@ -292,7 +292,7 @@ func applyProviderToNodeConfig(root isolation.NodeRoot, mode isolation.Mode, pol
 // removed and its C-style backslash escapes unescaped; an unquoted item is
 // returned with its C-style escapes unescaped as well. Whitespace between
 // items is a separator; whitespace inside a quoted item is preserved.
-func systemdEnvItems(value string) []string {
+func systemdEnvItems(value string) ([]string, error) {
 	var (
 		items []string
 		cur   strings.Builder
@@ -317,10 +317,10 @@ func systemdEnvItems(value string) []string {
 
 					continue
 				}
-				// An unrecognized escape: keep the backslash literally.
-				cur.WriteByte(c)
-
-				continue
+				// A malformed escape (invalid hex, NUL byte, surrogate, etc.):
+				// systemd logs a warning and does NOT apply the assignment.
+				// Return an error so the caller can refuse the mutation.
+				return nil, fmt.Errorf("malformed escape sequence in Environment item at byte %d", i)
 			}
 
 			if c == inQuote {
@@ -347,6 +347,9 @@ func systemdEnvItems(value string) []string {
 
 					continue
 				}
+				// A malformed escape in a bare item: systemd would not apply
+				// the assignment.
+				return nil, fmt.Errorf("malformed escape sequence in Environment item at byte %d", i)
 			}
 
 			cur.WriteByte(c)
@@ -368,7 +371,7 @@ func systemdEnvItems(value string) []string {
 		items = append(items, cur.String())
 	}
 
-	return items
+	return items, nil
 }
 
 // systemdDecodeEscape resolves a C-style escape sequence that begins with a
@@ -538,21 +541,26 @@ const nodeConfigArgsKey = "KUBELET_NODE_CONFIG_ARGS"
 // string. When the item's value is quoted only partially
 // (KUBELET_NODE_CONFIG_ARGS="<a>" UNRELATED=keep), only the KUBELET item's value
 // is returned and the unrelated item is ignored.
-func nodeConfigArgsItem(value string) (string, bool) {
+func nodeConfigArgsItem(value string) (string, bool, error) {
 	// Walk all items; the last KUBELET_NODE_CONFIG_ARGS assignment is effective.
 	var (
 		effective string
 		found     bool
 	)
 
-	for _, item := range systemdEnvItems(value) {
+	items, err := systemdEnvItems(value)
+	if err != nil {
+		return "", false, err
+	}
+
+	for _, item := range items {
 		if strings.HasPrefix(item, nodeConfigArgsKey+"=") {
 			effective = item[len(nodeConfigArgsKey)+1:]
 			found = true
 		}
 	}
 
-	return effective, found
+	return effective, found, nil
 }
 
 // nodeConfigArgsLine reports whether line is the systemd Environment=
@@ -571,7 +579,14 @@ func nodeConfigArgsLine(line string) bool {
 		return false
 	}
 
-	_, ok := nodeConfigArgsItem(rest)
+	_, ok, err := nodeConfigArgsItem(rest)
+	if err != nil {
+		// A malformed escape in this line: systemd would not apply the
+		// assignment. nodeConfigArgsLine only tests presence for the renderer;
+		// the getter (nodeConfigArgsValue) reports the error and the apply path
+		// refuses before rewriting, so treat the line as not matching here.
+		return false
+	}
 
 	return ok
 }
@@ -606,7 +621,15 @@ func nodeConfigArgsValue(data string) (string, error) {
 			continue
 		}
 
-		v, ok := nodeConfigArgsItem(rest)
+		v, ok, err := nodeConfigArgsItem(rest)
+		if err != nil {
+			// A malformed escape in a later directive: systemd would not apply
+			// that assignment and would retain the prior effective value.
+			// Refuse the mutation rather than silently overriding a customer
+			// provider with a decoded-literal value.
+			return "", err
+		}
+
 		if !ok {
 			continue
 		}
@@ -903,7 +926,21 @@ func kubeletItemSpan(value string) (start, end int, ok bool) {
 
 		switch {
 		case inQuote != 0:
-			if inQuote == '"' && c == '\\' && i+1 < len(value) {
+			// Escape sequences are processed in ALL quoted forms (matching
+			// systemdEnvItems). The backslash escapes the next byte, so an
+			// escaped quote is not a quote boundary.
+			if c == '\\' && i+1 < len(value) {
+				// Skip the escaped byte. For multi-byte escapes (hex, octal,
+				// unicode), consume the full sequence so we don't misinterpret
+				// a quote inside the escape digits.
+				_, consumed, valid := systemdDecodeEscape(value[i:])
+				if valid {
+					i += consumed - 1
+
+					continue
+				}
+				// Unrecognized escape: the backslash is literal; the next
+				// byte is processed normally (it may be a quote boundary).
 				i++
 
 				continue
@@ -915,6 +952,26 @@ func kubeletItemSpan(value string) (start, end int, ok bool) {
 
 		case c == '"' || c == '\'':
 			inQuote = c
+
+			if itemStart < 0 {
+				itemStart = i
+			}
+
+		case c == '\\' && inQuote == 0:
+			// Bare (unquoted) items also process C escapes. Skip the escaped
+			// byte so a quote inside the escape is not treated as a boundary.
+			if i+1 < len(value) {
+				_, consumed, valid := systemdDecodeEscape(value[i:])
+				if valid {
+					i += consumed - 1
+
+					continue
+				}
+
+				i++
+
+				continue
+			}
 
 			if itemStart < 0 {
 				itemStart = i

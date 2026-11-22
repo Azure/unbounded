@@ -447,6 +447,46 @@ func TestIndentedEnvironmentDirectiveIsRewritten(t *testing.T) {
 	require.NotContains(t, value, managedFlags()[1], "the managed bin-dir flag must be absent after detach")
 }
 
+// TestEscapedQuoteSiblingPreserved verifies that an escaped apostrophe inside
+// a single-quoted KUBELET item does not terminate the item early, so a sibling
+// variable on the same Environment= directive is preserved byte for byte after
+// an attach (managed flag added) and after a detach (managed flag removed).
+// The span finder must obey the same escape/quote rules as the decoder.
+func TestEscapedQuoteSiblingPreserved(t *testing.T) {
+	// Single-quoted item with an escaped apostrophe in the value, plus a
+	// sibling item. The 'b' after the backslash is an escaped quote, not a
+	// quote boundary.
+	base := "# Managed by unbounded-agent. Do not edit directly.\n" +
+		"[Service]\n" +
+		"Environment='KUBELET_NODE_CONFIG_ARGS=--root-dir=\"/var/lib/a\\'b\"' \"UNRELATED=keep\"\n"
+
+	path := applyDropIn(t, base)
+
+	// Attach: the managed flags must be added without deleting the sibling.
+	changed, err := applyProviderToNodeConfig(nil, isolation.ModeNone, &registryauth.Config{Mode: registryauth.IdentityBindingMode})
+	require.NoError(t, err)
+	require.True(t, changed, "attach must modify the directive")
+
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Contains(t, string(data), "UNRELATED=keep", "the sibling item must survive attach")
+	require.Contains(t, string(data), managedFlags()[0], "the managed config flag must be present")
+	require.Contains(t, string(data), managedFlags()[1], "the managed bin-dir flag must be present")
+	// The escaped apostrophe value must be preserved (decoded to a literal ').
+	value, err := nodeConfigArgsValue(string(data))
+	require.NoError(t, err)
+	require.Contains(t, value, "--root-dir=\"/var/lib/a'b\"", "the escaped quote must decode to a literal apostrophe")
+
+	// Detach: the managed flags must be removed without deleting the sibling.
+	changed, err = applyProviderToNodeConfig(nil, isolation.ModeNone, nil)
+	require.NoError(t, err)
+	require.True(t, changed, "detach must modify the directive")
+
+	data, err = os.ReadFile(path)
+	require.NoError(t, err)
+	require.Contains(t, string(data), "UNRELATED=keep", "the sibling item must survive detach")
+}
+
 // TestBareAndSingleQuotedEscapesDecode verifies that C-style escape sequences
 // are decoded in bare (unquoted) and single-quoted items, not only in
 // double-quoted items, matching systemd's extract_first_word behavior.
@@ -508,6 +548,64 @@ func TestHexOctalByteEscapesProducesBytes(t *testing.T) {
 			value, err := nodeConfigArgsValue(tc.data)
 			require.NoError(t, err)
 			require.Equal(t, tc.want, value)
+		})
+	}
+}
+
+// TestMalformedLateOverridePreservesCustomerProvider verifies that a malformed
+// escape in a LATER KUBELET_NODE_CONFIG_ARGS directive does not supersede the
+// earlier effective customer provider. systemd would log a warning and not
+// apply the malformed assignment, so the apply path must refuse the mutation
+// (return an error) rather than rewrite the drop-in with a decoded-literal
+// value that would override the customer provider.
+func TestMalformedLateOverridePreservesCustomerProvider(t *testing.T) {
+	// Each case has an earlier valid customer provider assignment and a later
+	// malformed one. The apply must fail (not rewrite), leaving the file
+	// untouched so the customer provider remains effective.
+	tt := []struct {
+		name          string
+		malformedTail string
+	}{
+		{
+			name:          "surrogate unicode code point",
+			malformedTail: "Environment=\"KUBELET_NODE_CONFIG_ARGS=--hostname-override=node\\uD800\"\n",
+		},
+		{
+			name:          "NUL hex escape",
+			malformedTail: "Environment=\"KUBELET_NODE_CONFIG_ARGS=--hostname-override=node\\x00\"\n",
+		},
+		{
+			name:          "single hex digit (malformed)",
+			malformedTail: "Environment=\"KUBELET_NODE_CONFIG_ARGS=--hostname-override=node\\x1\"\n",
+		},
+	}
+
+	customerProvider := "--image-credential-provider-config=/customer/config.json --image-credential-provider-bin-dir=/customer/bin"
+
+	for _, tc := range tt {
+		t.Run(tc.name, func(t *testing.T) {
+			// The earlier (effective) directive carries the customer provider.
+			base := "# Managed by unbounded-agent. Do not edit directly.\n" +
+				"[Service]\n" +
+				"Environment=\"KUBELET_NODE_CONFIG_ARGS=--hostname-override=node " + customerProvider + "\"\n" +
+				tc.malformedTail
+
+			path := applyDropIn(t, base)
+
+			// A managed attach must be refused: the later malformed directive
+			// would be the effective one, but systemd would not apply it. The
+			// apply must fail before changing the file.
+			changed, err := applyProviderToNodeConfig(nil, isolation.ModeNone, &registryauth.Config{Mode: registryauth.IdentityBindingMode})
+			require.Error(t, err, "a malformed later override must be refused, not applied")
+			require.False(t, changed, "the drop-in must not be modified on refusal")
+
+			// The on-disk file must be untouched: the customer provider is
+			// still the effective value, and no managed flags were added.
+			data, rerr := os.ReadFile(path)
+			require.NoError(t, rerr)
+			require.Equal(t, base, string(data), "the drop-in must be byte-identical after a refused apply")
+			require.NotContains(t, string(data), managedFlags()[0], "no managed flag must be added")
+			require.NotContains(t, string(data), managedFlags()[1], "no managed bin-dir flag must be added")
 		})
 	}
 }
