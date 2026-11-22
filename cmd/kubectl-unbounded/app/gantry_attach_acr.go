@@ -492,16 +492,7 @@ func (h *attachACRHandler) execute(ctx context.Context) error {
 }
 
 func (h *attachACRHandler) azureJSON(ctx context.Context, subscriptionID string, output any, args ...string) error {
-	data, err := h.runAzure(ctx, subscriptionID, args...)
-	if err != nil {
-		return err
-	}
-
-	if err := json.Unmarshal(data, output); err != nil {
-		return fmt.Errorf("invalid Azure response for %s: %w", strings.Join(args[:min(2, len(args))], " "), err)
-	}
-
-	return nil
+	return azureJSONWith(ctx, h.runAzure, subscriptionID, output, args...)
 }
 
 func (h *attachACRHandler) waitForACRProxy(ctx context.Context, cfg *registryauth.Config) error {

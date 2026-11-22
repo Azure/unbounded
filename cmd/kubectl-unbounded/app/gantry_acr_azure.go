@@ -5,8 +5,6 @@ package app
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -100,8 +98,7 @@ func (h *attachACRHandler) configureIdentityBinding(ctx context.Context, acrID *
 		}
 	}
 
-	digest := sha256.Sum256([]byte(strings.ToLower(h.clusterID)))
-	name := "gantry-pull-" + hex.EncodeToString(digest[:6])
+	name := acrPullIdentityName(h.clusterID)
 
 	type identity struct {
 		ID, PrincipalID, ClientID, TenantID, Name string
@@ -155,53 +152,17 @@ func (h *attachACRHandler) configureIdentityBinding(ctx context.Context, acrID *
 
 	cfg.ClientID, cfg.TenantID = selected.ClientID, selected.TenantID
 
-	type identityBinding struct {
-		Name       string
-		Properties struct {
-			ManagedIdentity   struct{ ResourceID string }
-			ProvisioningState string
-		}
+	bindings, err := listAKSIdentityBindings(ctx, h.runAzure, h.clusterID, clusterID.SubscriptionID)
+	if err != nil {
+		return fmt.Errorf("AKS identity bindings are unavailable: %w", err)
 	}
 
-	var bindings struct {
-		Value    []identityBinding
-		NextLink string
-	}
+	binding := aksIdentityBindingByName(bindings, name)
 
-	bindingsURL := "https://management.azure.com" + h.clusterID + "/identityBindings?api-version=2026-08-02-preview"
+	found := binding != nil
 
-	var found bool
-
-	for {
-		if err := h.azureJSON(ctx, clusterID.SubscriptionID, &bindings, "rest", "--method", "get", "--url", bindingsURL); err != nil {
-			return fmt.Errorf("AKS identity bindings are unavailable: %w", err)
-		}
-
-		for _, binding := range bindings.Value {
-			if binding.Name == name {
-				if !strings.EqualFold(binding.Properties.ManagedIdentity.ResourceID, selected.ID) {
-					return errors.New("existing AKS identity binding refers to another identity")
-				}
-
-				found = true
-			}
-		}
-
-		if bindings.NextLink == "" {
-			break
-		}
-
-		next, err := url.Parse(bindings.NextLink)
-		if err != nil || next.Scheme != "https" || next.Host != "management.azure.com" ||
-			!strings.HasPrefix(strings.ToLower(next.Path), strings.ToLower(h.clusterID)+"/identitybindings") {
-			return errors.New("AKS returned an invalid identity-binding pagination URL")
-		}
-
-		bindingsURL = bindings.NextLink
-		bindings = struct {
-			Value    []identityBinding
-			NextLink string
-		}{}
+	if binding != nil && !strings.EqualFold(binding.Properties.ManagedIdentity.ResourceID, selected.ID) {
+		return errors.New("existing AKS identity binding refers to another identity")
 	}
 
 	bindingURL := "https://management.azure.com" + h.clusterID + "/identityBindings/" + name + "?api-version=2026-08-02-preview"
@@ -218,7 +179,7 @@ func (h *attachACRHandler) configureIdentityBinding(ctx context.Context, acrID *
 	}
 
 	for {
-		var binding identityBinding
+		var binding aksIdentityBinding
 		if err := h.azureJSON(ctx, clusterID.SubscriptionID, &binding, "rest", "--method", "get", "--url", bindingURL); err != nil {
 			return err
 		}
@@ -267,31 +228,6 @@ func (h *attachACRHandler) azureSubscriptionTenant(ctx context.Context, subscrip
 	}
 
 	return tenantID.String(), nil
-}
-
-// acrPullGrantName is the deterministic role-assignment name (a GUID) the attach
-// path uses for the grant it creates on an ACR. The role-assignment API has no
-// tags property, so the ownership receipt is the assignment's own name: a GUID
-// derived from the cluster ID, the ACR scope, the principal, and the role.
-// Azure role-assignment names must be unique across the ENTIRE Microsoft Entra
-// tenant (not just within a scope), so the name includes the scope and principal
-// to avoid collisions when the same cluster is attached to multiple ACRs or
-// multiple roles. Detach reconstructs the same receipt from the same inputs and
-// reverses only the one carrying this exact name, leaving a shared/inherited/
-// reused grant (a different name) in place.
-func acrPullGrantName(clusterID, acrScope, principal, role string) string {
-	digest := sha256.Sum256([]byte(
-		strings.ToLower(clusterID) + "|" +
-			strings.ToLower(acrScope) + "|" +
-			strings.ToLower(principal) + "|" +
-			strings.ToLower(role),
-	))
-
-	// Render the first 16 bytes as a lowercase GUID (the form the API accepts
-	// for the role-assignment name).
-	b := digest[:16]
-
-	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
 func (h *attachACRHandler) ensureACRPullGrant(ctx context.Context, acrID *arm.ResourceID, principal, role string) error {
