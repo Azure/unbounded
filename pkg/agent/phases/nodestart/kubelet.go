@@ -245,6 +245,29 @@ func (c *configureKubelet) ensureKubeletServiceUnit() error {
 	return c.write(dest, buf.Bytes(), 0o644)
 }
 
+// RenderNodeConfigDropIn renders the 20-node-config.conf drop-in from the
+// template and returns the rendered bytes. It is the single source of truth
+// for the drop-in content, used by both the nodestart phase (at provisioning)
+// and the registry-auth reconciler (at steady-state toggle). The caller is
+// responsible for writing the bytes to the correct path through the node-stack
+// root and for tracking whether the content changed.
+func RenderNodeConfigDropIn(spec *goalstates.Kubelet, nodeName, nodeIP string) ([]byte, error) {
+	buf := &bytes.Buffer{}
+
+	err := assetsTemplate.ExecuteTemplate(buf, "20-node-config.conf", map[string]any{
+		"NodeName":                nodeName,
+		"NodeIP":                  nodeIP,
+		"NodeLabels":              formatNodeLabels(spec.NodeLabels),
+		"RegisterWithTaints":      formatRegisterWithTaints(spec.RegisterWithTaints),
+		"ImageCredentialProvider": spec.ImageCredentialProvider,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("render 20-node-config.conf: %w", err)
+	}
+
+	return buf.Bytes(), nil
+}
+
 // ensureKubeletDropIns renders and writes all kubelet systemd drop-in files
 // into the machine rootfs.
 func (c *configureKubelet) ensureKubeletDropIns() error {

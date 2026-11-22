@@ -10,8 +10,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strconv"
-	"strings"
 	"time"
 
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
@@ -348,19 +346,17 @@ func (r *registryAuthReconciler) pendingWork(ctx context.Context, active *Active
 			changed = changed || c
 		}
 
-		// Toggle the managed provider flags in the kubelet node-config drop-in's
-		// $KUBELET_NODE_CONFIG_ARGS, preserving the other effective node config
-		// args. This is the mode-correct, mode-aware path the kubelet actually
-		// reads.
-		if c, err := applyProviderToNodeConfig(root, activeModeOf(active), &desired.policy); err != nil {
+		// Toggle the managed provider flags in the kubelet node-config drop-in
+		// by re-rendering from the template with the provider on.
+		if c, err := applyProviderToNodeConfig(root, activeModeOf(active), active, gs, &desired.policy); err != nil {
 			return nil, fmt.Errorf("apply provider to node-config drop-in: %w", err)
 		} else {
 			changed = changed || c
 		}
 	} else {
-		// No managed provider: remove the provider flags from the node-config
-		// drop-in, leaving the kubelet's other authentication untouched.
-		if c, err := applyProviderToNodeConfig(root, activeModeOf(active), nil); err != nil {
+		// No managed provider: re-render the drop-in from the template with the
+		// provider off, leaving the kubelet's other authentication untouched.
+		if c, err := applyProviderToNodeConfig(root, activeModeOf(active), active, gs, nil); err != nil {
 			return nil, fmt.Errorf("remove provider from node-config drop-in: %w", err)
 		} else {
 			changed = changed || c
@@ -451,84 +447,6 @@ func (r *registryAuthReconciler) reloadKubeletUnit(ctx context.Context, active *
 	}
 
 	return nil
-}
-
-// fsyncFile syncs the contents of an open file to durable storage. It is the
-// content-durability half of an atomic write; the caller must separately sync
-// the destination directory AFTER the rename to make the rename itself durable.
-func fsyncFile(f *os.File) error {
-	return f.Sync()
-}
-
-// fsyncDir syncs the directory entry for path, so a rename (or create/delete)
-// of a path inside it is durable across a power loss. The directory sync is
-// what makes the rename durable; it must be performed AFTER the rename, not on
-// the temporary name before it.
-func fsyncDir(path string) error {
-	d, err := os.Open(filepath.Dir(path))
-	if err != nil {
-		return err
-	}
-
-	defer d.Close() //nolint:errcheck // the close error is not the one to report
-
-	return d.Sync()
-}
-
-// writeJSONFile atomically writes a JSON value to path (temp file in the same
-// directory, content synced, renamed into place, then the destination
-// directory synced), so an interrupted write cannot leave a corrupt file and
-// the final record (its content and its name) survives a power loss. The
-// directory sync happens after the rename so the durable transition is the
-// final entry, not the temporary one.
-func writeJSONFile(path string, value any) error {
-	data, err := json.Marshal(value)
-	if err != nil {
-		return err
-	}
-
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".registry-auth-*")
-	if err != nil {
-		return err
-	}
-
-	name := tmp.Name()
-	defer os.Remove(name) //nolint:errcheck // best-effort cleanup of the temp file
-
-	if _, err := tmp.Write(append(data, '\n')); err != nil {
-		tmp.Close() //nolint:errcheck // best-effort cleanup; the write error is the one to report
-
-		return err
-	}
-
-	if err := tmp.Chmod(0o644); err != nil {
-		tmp.Close() //nolint:errcheck // best-effort cleanup; the chmod error is the one to report
-
-		return err
-	}
-
-	// Sync the content before the rename so the file data is durable.
-	if err := fsyncFile(tmp); err != nil {
-		tmp.Close() //nolint:errcheck // best-effort cleanup; the sync error is the one to report
-
-		return err
-	}
-
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-
-	if err := os.Rename(name, path); err != nil {
-		return err
-	}
-
-	// Sync the destination directory after the rename so the final entry is
-	// durable, not just the temporary name.
-	return fsyncDir(path)
 }
 
 // boundedRestartKubelet charges the bounded-restart budget and restarts only
@@ -677,83 +595,6 @@ func (r *registryAuthReconciler) verifyKubelet(ctx context.Context, active *Acti
 	// therefore takes the last occurrence of each managed flag name and requires
 	// it to equal the managed value (and that the flag name is present at all).
 	return registryAuthEffectiveManagedFlags(argv), nil
-}
-
-// registryAuthEffectiveManagedFlags reports whether the argv's effective image
-// credential provider configuration is the managed one: for each managed flag
-// (config path and bin-dir), the flag name is present and its last occurrence
-// (the value kubelet actually uses) equals the managed value. Both the inline
-// --flag=value and the split --flag value forms are honored, and a flag present
-// only as a different value, or absent entirely, is not effective.
-func registryAuthEffectiveManagedFlags(argv []string) bool {
-	for _, managed := range registryAuthProviderFlags() {
-		name := providerFlagName(managed)
-		if name == "" {
-			return false
-		}
-
-		wantValue := providerFlagValue(managed)
-		got, found := providerFlagEffectiveValue(argv, name)
-
-		if !found || got != wantValue {
-			return false
-		}
-	}
-
-	return true
-}
-
-// registryAuthMainPID reads the unit's MainPID through the node's systemd
-// manager (in-machine for nspawn/container, on the host for none).
-func registryAuthMainPID(ctx context.Context, backend isolation.Backend, active *ActiveMachine, unit string) (int, error) {
-	res, err := backend.Exec(ctx, isolation.SlotName(active.Name), isolation.ExecSpec{
-		Args: []string{"systemctl", "show", "-p", "MainPID", "--value", unit},
-	})
-	if err != nil {
-		return 0, err
-	}
-
-	pid, err := strconv.Atoi(strings.TrimSpace(res.Stdout))
-	if err != nil {
-		return 0, fmt.Errorf("parse MainPID %q: %w", strings.TrimSpace(res.Stdout), err)
-	}
-
-	return pid, nil
-}
-
-// registryAuthProcessArgv reads /proc/<pid>/cmdline in the node's namespace and
-// returns the argv tokens (NUL-separated, trailing NUL stripped).
-func registryAuthProcessArgv(ctx context.Context, backend isolation.Backend, active *ActiveMachine, pid int) ([]string, error) {
-	res, err := backend.Exec(ctx, isolation.SlotName(active.Name), isolation.ExecSpec{
-		Args: []string{"cat", fmt.Sprintf("/proc/%d/cmdline", pid)},
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	raw := res.Stdout
-
-	if raw == "" {
-		return nil, fmt.Errorf("no argv for kubelet pid %d", pid)
-	}
-
-	fields := strings.Split(strings.TrimRight(raw, "\x00"), "\x00")
-
-	return fields, nil
-}
-
-// registryAuthArgvHasManagedFlags reports whether the argv carries any of the
-// managed provider tokens.
-func registryAuthArgvHasManagedFlags(argv []string) bool {
-	for _, f := range registryAuthProviderFlags() {
-		for _, tok := range argv {
-			if tok == f {
-				return true
-			}
-		}
-	}
-
-	return false
 }
 
 // writeCondition publishes the RegistryAuth condition on the Machine status.
