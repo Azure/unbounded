@@ -204,6 +204,21 @@ func NewPlan(opts Options) (Plan, error) {
 			})
 		}
 
+		// The stock ACR credential provider is an optional bundle entry (like
+		// CoreDNS): it is materialized only when the manifest records a version
+		// for it, so existing non-managed bundles that omit it keep working. The
+		// binary is a single upstream release per architecture, pinned per-arch
+		// with a generated checksum, and materialized at the bundle path the
+		// agent's offline resolver reads.
+		if manifest.Versions.ACRProvider != "" {
+			artifacts = append(artifacts, Artifact{
+				Name:             "acr-provider",
+				URL:              agentartifacts.ACRProviderBinaryForVersion(nil, manifest.Versions.ACRProvider, arch),
+				Path:             bootstrapartifacts.ACRProviderArtifactPath(manifest.Versions.ACRProvider, arch),
+				GenerateChecksum: true,
+			})
+		}
+
 		artifacts = append(artifacts,
 			Artifact{
 				Name:             "containerd",

@@ -16,6 +16,8 @@ import (
 
 	"github.com/google/uuid"
 	"sigs.k8s.io/yaml"
+
+	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
 
 const (
@@ -27,6 +29,29 @@ const (
 	FlexNodeLabel       = "kubernetes.azure.com/nodepool-type"
 	FlexNodeValue       = "FlexNodes"
 	IdentityRoleName    = "gantry-acr-pull"
+)
+
+// The node-reported Machine RegistryAuth condition (MachineConditionRegistryAuth)
+// reasons the agent writes. The agent is the writer and defines them; the CLI
+// waits and the operator aggregate read them, so they are shared here rather
+// than copied.
+const (
+	// ConditionReasonConfigured reports a managed provider is active and
+	// verified (Status True).
+	ConditionReasonConfigured = "Configured"
+
+	// ConditionReasonExternal reports authentication is left untouched
+	// (Status True, external policy).
+	ConditionReasonExternal = "External"
+
+	// ConditionReasonRestartBudgetExhausted reports the bounded kubelet-restart
+	// budget is spent and no further retry is scheduled for the current policy
+	// generation (Status False). It is the only genuinely terminal registry-auth
+	// failure reason: the other False reasons are reported while the agent is
+	// scheduling a retry (backoff, apply, verify, ledger, budget-reset) and are
+	// retryable. A new policy generation resets the budget, so only a verdict
+	// observed at the current generation is terminal.
+	ConditionReasonRestartBudgetExhausted = "RestartBudgetExhausted"
 )
 
 var acrHost = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)?(?:\.[a-z0-9]+\.geo)?\.azurecr\.io$`)
@@ -45,6 +70,28 @@ type Config struct {
 }
 
 func IsACR(host string) bool { return len(host) <= 253 && acrHost.MatchString(host) }
+
+// PolicyFromConfig maps a node-auth config to the Machine.spec.registryAuth
+// field the operator delivers to the agent. A non-managed mode maps to nil:
+// the agent then leaves the kubelet's authentication untouched. The operator
+// writes the field and the CLI reads it back, so both use this definition
+// rather than a copy.
+func PolicyFromConfig(cfg Config) *v1alpha3.RegistryAuthPolicy {
+	if cfg.Mode != IdentityBindingMode {
+		return nil
+	}
+
+	return &v1alpha3.RegistryAuthPolicy{
+		Mode:         cfg.Mode,
+		Registry:     cfg.Registry,
+		ClientID:     cfg.ClientID,
+		TenantID:     cfg.TenantID,
+		SNIName:      cfg.SNIName,
+		ProxyAddress: cfg.ProxyAddress,
+		Audience:     cfg.Audience,
+		CACert:       cfg.CACert,
+	}
+}
 
 // Derive validates the explicitly selected policy against Gantry's actual upstream.
 func Derive(gantry, policy string) (Config, error) {
@@ -171,6 +218,11 @@ func validHostname(host string) bool {
 }
 
 // ProviderConfig configures upstream's identity-binding mode, not its IMDS mode.
+// AzureConfigPath is the fixed location of the azure.json the credential
+// provider reads; it is referenced from the generated credential-provider
+// config, so the path that generates the content defines the contract.
+const AzureConfigPath = "/opt/unbounded/registry-auth/azure.json"
+
 func (c Config) ProviderConfig() ([]byte, error) {
 	return json.MarshalIndent(map[string]any{
 		"apiVersion": "kubelet.config.k8s.io/v1", "kind": "CredentialProviderConfig",
@@ -178,7 +230,7 @@ func (c Config) ProviderConfig() ([]byte, error) {
 			"name": ProviderName, "matchImages": []string{c.Registry}, "defaultCacheDuration": "5m",
 			"apiVersion": "credentialprovider.kubelet.k8s.io/v1",
 			"args": []string{
-				azureConfigPath, "--ib-sni-name=" + c.SNIName,
+				AzureConfigPath, "--ib-sni-name=" + c.SNIName,
 				"--ib-default-client-id=" + c.ClientID, "--ib-default-tenant-id=" + c.TenantID,
 				"--ib-apiserver-ip=" + c.ProxyAddress,
 			},

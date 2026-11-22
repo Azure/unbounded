@@ -99,6 +99,7 @@ func runController(
 	nodeOperator nodeOperator,
 	installation *installstate.Store,
 	handoff *handoffState,
+	backends ModeBackends,
 ) error {
 	mgr, err := ctrl.NewManager(restCfg, manager.Options{
 		Scheme: newScheme(),
@@ -174,6 +175,25 @@ func runController(
 		repaveReconciler,
 	); err != nil {
 		return fmt.Errorf("setup daemon controller: %w", err)
+	}
+
+	// The registry-auth reconciler is a separate controller: it owns its own
+	// Machine watch and periodic requeue, and writes only the RegistryAuth
+	// condition. It is not part of the serialized repave/machine-operation
+	// controller because it does not repave or restart the whole stack; it
+	// configures and verifies the kubelet's credential provider in place.
+	registryAuth := &registryAuthReconciler{
+		log:         log,
+		machineName: machineName,
+		active:      func(l *slog.Logger) (*ActiveMachine, error) { return nodeOperator.FindActiveMachine(l) },
+		backends:    backends,
+		client:      c,
+	}
+	if err := ctrl.NewControllerManagedBy(mgr).
+		Named("unbounded-agent-registry-auth").
+		For(&v1alpha3.Machine{}, builder.WithPredicates(registryAuthPredicate(machineName))).
+		Complete(&registryAuthControllerAdapter{r: registryAuth}); err != nil {
+		return fmt.Errorf("setup registry-auth controller: %w", err)
 	}
 
 	err = mgr.Start(mgrCtx)

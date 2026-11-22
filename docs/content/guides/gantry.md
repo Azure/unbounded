@@ -384,7 +384,14 @@ subscriptions within the same Microsoft Entra tenant. The command creates or
 reuses the Gantry-owned pull identity and identity binding in the AKS subscription,
 and uses the caller's Azure CLI permissions to create the pull-role assignment at
 the ACR scope in the registry's subscription. Existing sufficient grants are
-reused; conditional grants are not broadened.
+reused; conditional grants are not broadened. A grant the command creates is named
+with a deterministic identifier derived from the cluster, the canonical ACR
+resource ID, the pull principal, and the role (Azure role-assignment names are
+tenant-wide unique, so the scope and principal are included to avoid collisions
+across registries). The matching
+`detach-acr --remove-azure --cluster-resource-id ... --acr-resource-id ...`
+reverses exactly that grant and leaves any shared or reused grant (a different
+name) in place.
 
 Use `--kubeconfig /path/to/kubeconfig` to select a cluster; otherwise the current
 context is used. This requires a compatible plugin/operator release, not the

@@ -8,10 +8,15 @@ import (
 
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/Azure/unbounded/internal/operator/component"
 )
 
+// TestRegistryAuthPolicyDoesNotModifyGantryConfiguration verifies that the
+// registry-auth policy does not rewrite the gantry-config ConfigMap: planConfig
+// leaves the source data untouched, and planRegistryAuth only errors (not
+// rewrites) when a managed policy is missing its upstream registry.
 func TestRegistryAuthPolicyDoesNotModifyGantryConfiguration(t *testing.T) {
 	for _, mode := range []string{"managed", "external", "registry-only"} {
 		t.Run(mode, func(t *testing.T) {
@@ -33,18 +38,18 @@ func TestRegistryAuthPolicyDoesNotModifyGantryConfiguration(t *testing.T) {
 			require.Nil(t, op)
 			require.Equal(t, component.ConfigMapPayloadHash(source), hash)
 
-			operations, result, err := planRegistryAuth(t.Context(), env)
+			operations, _, err := planRegistryAuth(t.Context(), env)
 			if mode == "managed" {
 				require.ErrorContains(t, err, "requires its registry in Gantry upstream_registries")
 			} else {
 				require.NoError(t, err)
 			}
 
+			// With no eligible Flex nodes, the operator plans no node work.
 			require.Empty(t, operations)
-			require.Nil(t, result)
 
 			var got corev1.ConfigMap
-			require.NoError(t, env.Client.Get(t.Context(), componentKey(configName), &got))
+			require.NoError(t, env.Client.Get(t.Context(), client.ObjectKey{Namespace: component.DefaultNamespace, Name: configName}, &got))
 			require.Equal(t, source.Data, got.Data)
 			require.Equal(t, source.BinaryData, got.BinaryData)
 		})

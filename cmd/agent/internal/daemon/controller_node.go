@@ -21,6 +21,8 @@ import (
 	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
 	"github.com/Azure/unbounded/internal/machineconfigs"
 	"github.com/Azure/unbounded/internal/provision"
+	"github.com/Azure/unbounded/internal/registryauth"
+	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/isolation"
 	"github.com/Azure/unbounded/pkg/agent/isolation/migrate"
 )
@@ -158,6 +160,17 @@ func resolveDesiredRepaveConfig(
 	// a host that can only reach the mirrors the Machine names.
 	if machine.Spec.Agent != nil {
 		desired.Downloads = provision.AgentDownloadsFromSpec(machine.Spec.Agent.Downloads)
+	}
+
+	// spec.registryAuth declares whether the node uses the managed ACR
+	// credential provider. Fold it into the desired config so a repave builds
+	// the new machine with the correct drop-in flags, matching what the
+	// registry-auth reconciler would apply in steady state.
+	if machine.Spec.RegistryAuth != nil && machine.Spec.RegistryAuth.Mode == registryauth.IdentityBindingMode {
+		desired.Kubelet.ImageCredentialProvider = &provision.ImageCredentialProvider{
+			ConfigPath: goalstates.RegistryAuthCredentialConfigPath,
+			BinDir:     goalstates.RegistryAuthProviderBinDir,
+		}
 	}
 
 	var appliedRef *v1alpha3.MachineConfigurationRefStatus

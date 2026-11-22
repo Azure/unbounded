@@ -5,8 +5,6 @@ package app
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -100,8 +98,7 @@ func (h *attachACRHandler) configureIdentityBinding(ctx context.Context, acrID *
 		}
 	}
 
-	digest := sha256.Sum256([]byte(strings.ToLower(h.clusterID)))
-	name := "gantry-pull-" + hex.EncodeToString(digest[:6])
+	name := acrPullIdentityName(h.clusterID)
 
 	type identity struct {
 		ID, PrincipalID, ClientID, TenantID, Name string
@@ -155,53 +152,17 @@ func (h *attachACRHandler) configureIdentityBinding(ctx context.Context, acrID *
 
 	cfg.ClientID, cfg.TenantID = selected.ClientID, selected.TenantID
 
-	type identityBinding struct {
-		Name       string
-		Properties struct {
-			ManagedIdentity   struct{ ResourceID string }
-			ProvisioningState string
-		}
+	bindings, err := listAKSIdentityBindings(ctx, h.runAzure, h.clusterID, clusterID.SubscriptionID)
+	if err != nil {
+		return fmt.Errorf("AKS identity bindings are unavailable: %w", err)
 	}
 
-	var bindings struct {
-		Value    []identityBinding
-		NextLink string
-	}
+	binding := aksIdentityBindingByName(bindings, name)
 
-	bindingsURL := "https://management.azure.com" + h.clusterID + "/identityBindings?api-version=2026-08-02-preview"
+	found := binding != nil
 
-	var found bool
-
-	for {
-		if err := h.azureJSON(ctx, clusterID.SubscriptionID, &bindings, "rest", "--method", "get", "--url", bindingsURL); err != nil {
-			return fmt.Errorf("AKS identity bindings are unavailable: %w", err)
-		}
-
-		for _, binding := range bindings.Value {
-			if binding.Name == name {
-				if !strings.EqualFold(binding.Properties.ManagedIdentity.ResourceID, selected.ID) {
-					return errors.New("existing AKS identity binding refers to another identity")
-				}
-
-				found = true
-			}
-		}
-
-		if bindings.NextLink == "" {
-			break
-		}
-
-		next, err := url.Parse(bindings.NextLink)
-		if err != nil || next.Scheme != "https" || next.Host != "management.azure.com" ||
-			!strings.HasPrefix(strings.ToLower(next.Path), strings.ToLower(h.clusterID)+"/identitybindings") {
-			return errors.New("AKS returned an invalid identity-binding pagination URL")
-		}
-
-		bindingsURL = bindings.NextLink
-		bindings = struct {
-			Value    []identityBinding
-			NextLink string
-		}{}
+	if binding != nil && !strings.EqualFold(binding.Properties.ManagedIdentity.ResourceID, selected.ID) {
+		return errors.New("existing AKS identity binding refers to another identity")
 	}
 
 	bindingURL := "https://management.azure.com" + h.clusterID + "/identityBindings/" + name + "?api-version=2026-08-02-preview"
@@ -218,7 +179,7 @@ func (h *attachACRHandler) configureIdentityBinding(ctx context.Context, acrID *
 	}
 
 	for {
-		var binding identityBinding
+		var binding aksIdentityBinding
 		if err := h.azureJSON(ctx, clusterID.SubscriptionID, &binding, "rest", "--method", "get", "--url", bindingURL); err != nil {
 			return err
 		}
@@ -270,11 +231,22 @@ func (h *attachACRHandler) azureSubscriptionTenant(ctx context.Context, subscrip
 }
 
 func (h *attachACRHandler) ensureACRPullGrant(ctx context.Context, acrID *arm.ResourceID, principal, role string) error {
-	var assignments []struct{ PrincipalID, RoleDefinitionID, Scope, Condition string }
+	var assignments []struct {
+		Name             string
+		PrincipalID      string
+		RoleDefinitionID string
+		Scope            string
+		Condition        string
+	}
 	if err := h.azureJSON(ctx, acrID.SubscriptionID, &assignments, "role", "assignment", "list", "--scope", h.acrID, "--include-inherited",
 		"--fill-principal-name", "false", "--fill-role-definition-name", "false"); err != nil {
 		return err
 	}
+
+	// Use the canonical parsed resource ID (not the raw command-line spelling)
+	// so that equivalent accepted forms (trailing slash, case differences)
+	// produce the same receipt.
+	grantName := acrPullGrantName(h.clusterID, acrID.String(), principal, role)
 
 	conditional := false
 
@@ -284,7 +256,16 @@ func (h *attachACRHandler) ensureACRPullGrant(ctx context.Context, acrID *arm.Re
 			continue
 		}
 
+		if strings.EqualFold(assignment.Name, grantName) {
+			// The grant this installation created already exists (same
+			// deterministic name). Reuse it; nothing to do.
+			return nil
+		}
+
 		if assignment.Condition == "" {
+			// A pre-existing unconditional grant already grants this principal
+			// the pull role on this ACR under a different name. Reuse it; it is
+			// NOT created by this installation and detach will preserve it.
 			return nil
 		}
 
@@ -295,8 +276,14 @@ func (h *attachACRHandler) ensureACRPullGrant(ctx context.Context, acrID *arm.Re
 		return errors.New("existing pull grant is conditional; refusing to broaden it with an unconditional grant")
 	}
 
+	// Create the grant under its deterministic ownership-receipt name so detach
+	// can reverse exactly the grant this installation created, and leave a
+	// shared/inherited/reused grant (a different name) in place. The name works
+	// for an ACR in another subscription because it is carried by the assignment
+	// itself, not by the cluster's subscription.
 	_, err := h.runAzure(ctx, acrID.SubscriptionID, "role", "assignment", "create", "--assignee-object-id", principal,
-		"--assignee-principal-type", "ServicePrincipal", "--role", role, "--scope", h.acrID)
+		"--assignee-principal-type", "ServicePrincipal", "--role", role, "--scope", h.acrID,
+		"--name", grantName)
 
 	return err
 }

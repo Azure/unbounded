@@ -21,6 +21,11 @@ type Versions struct {
 	CNI        string `json:"cni"`
 	Crictl     string `json:"crictl"`
 	CoreDNS    string `json:"coredns,omitempty"`
+	// ACRProvider is the cloud-provider-azure release that ships the stock ACR
+	// credential provider binary, present in bundles that support managed ACR
+	// authentication offline. Empty (the default) means the bundle does not
+	// carry the provider and the provider is not required.
+	ACRProvider string `json:"acrProvider,omitempty"`
 }
 
 // Manifest describes a complete bootstrap artifact bundle.
@@ -46,6 +51,7 @@ func NormalizeManifest(manifest Manifest) (Manifest, error) {
 	manifest.Versions.CNI = StripLeadingV(manifest.Versions.CNI)
 	manifest.Versions.Crictl = StripLeadingV(manifest.Versions.Crictl)
 	manifest.Versions.CoreDNS = StripLeadingV(manifest.Versions.CoreDNS)
+	manifest.Versions.ACRProvider = StripLeadingV(manifest.Versions.ACRProvider)
 	manifest.ContainerImages = NormalizeContainerImages(manifest.ContainerImages)
 
 	missing := make([]string, 0, 5)

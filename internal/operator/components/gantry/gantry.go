@@ -327,9 +327,24 @@ func (Component) SetupWatches(b *builder.Builder, env *component.Env) {
 	// ConfigMap edit.
 	b.Watches(&corev1.ConfigMap{}, env.RequestSingleton(),
 		builder.WithPredicates(env.ManagedConfigPredicate(env.InNamespaceNamed(configName, legacyNodeConfigName, registryAuthName))))
-	// The racer DaemonSet supplies the agent placement in Racer mode.
+	// The racer DaemonSet supplies the agent placement in Racer mode. The
+	// retired gantry-acr-auth DaemonSet is no longer watched: the operator
+	// delivers the registry-auth policy to the agent via Machine.spec and reads
+	// it back from Machine.Status instead of installing a per-node DaemonSet.
 	b.Watches(&appsv1.DaemonSet{}, env.RequestSingleton(),
-		builder.WithPredicates(registryAuthWorkloadEvents(env, env.InNamespaceNamed(daemonSetName, legacyNodeConfigDaemonSetName, overlayBDConfigDaemonSetName, registryAuthName, workload.DataplaneDaemonSetName))))
+		builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(daemonSetName, legacyNodeConfigDaemonSetName, overlayBDConfigDaemonSetName, workload.DataplaneDaemonSetName))))
+	// A Machine reporting its registry-auth state (or changing its policy)
+	// triggers a re-read of the node-reported readiness. The watch maps to the
+	// singleton request, so it does not fan out per Site or per node.
+	b.Watches(&unboundedv1alpha3.Machine{}, env.RequestSingleton(),
+		builder.WithPredicates(registryAuthMachinePredicate()))
+	// A Linux AKS Flex node joining or leaving the cluster changes the set of
+	// nodes the registry-auth policy must be delivered to. A newly joined node
+	// may not have its Machine yet, so the Machine watch alone would miss the
+	// initial delivery; this watch ensures membership changes reliably
+	// re-reconcile the registry-auth plan.
+	b.Watches(&corev1.Node{}, env.RequestSingleton(),
+		builder.WithPredicates(registryAuthNodePredicate()))
 	b.Watches(&coordinationv1.Lease{}, env.RequestSingleton(),
 		builder.WithPredicates(chairLeaseDeletePredicate(env.Namespace)))
 	b.Watches(&racerv1.ClusterCache{}, env.RequestSingleton(), builder.WithPredicates(racerCachePredicate()))

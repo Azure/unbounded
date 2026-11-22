@@ -93,6 +93,11 @@ type runOptions struct {
 	// Migration is where isolation mode changes live on the host. Nil is the
 	// real host.
 	Migration *migrationEnv
+
+	// Backends is the backend of every isolation mode this agent can operate.
+	// The registry-auth reconciler uses it to reach the active node stack
+	// (Exec/Status/Logs) for verification and bounded restart.
+	Backends ModeBackends
 }
 
 func (o *runOptions) validate() error {
@@ -135,7 +140,10 @@ func Run(ctx context.Context, log *slog.Logger, modes ModeOperators, backends Mo
 		return err
 	}
 
-	return run(ctx, log, runOptions{NodeOperator: newDispatchOperator(newHostOperator(backends), modes)})
+	return run(ctx, log, runOptions{
+		NodeOperator: newDispatchOperator(newHostOperator(backends), modes),
+		Backends:     backends,
+	})
 }
 
 // run is the inner loop. Tests can override external dependencies through opts.
@@ -217,7 +225,7 @@ func run(ctx context.Context, log *slog.Logger, opts runOptions) error {
 		return ErrRestartRequested
 	}
 
-	return runController(ctx, log, controllerCfg, active.Config.MachineName, active.Config.NodeName, runOpts.NodeOperator, runOpts.installation, handoff)
+	return runController(ctx, log, controllerCfg, active.Config.MachineName, active.Config.NodeName, runOpts.NodeOperator, runOpts.installation, handoff, runOpts.Backends)
 }
 
 // discoverAndMigrate finds the active node under installation ownership and
