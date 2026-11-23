@@ -101,7 +101,9 @@ Requests are answered only from content in the cache. A reference that is not ca
 returns 404; there is no pull-through. The repository name is taken from the request.
 The `?ns=<registry>` query parameter that containerd adds is tried first, and the
 plain name second, so a client that keeps the upstream registry in the reference also
-works.
+works. A registry host that has a port cannot appear as a repository path, because a
+path segment cannot contain a colon, so the agent writes the colon as an underscore
+and metalman decodes it before the cache lookup.
 
 Manifests keep their media type and are served with `Docker-Content-Digest` and their
 content length. Blobs are served with `http.ServeFile`, so range requests work. A
@@ -146,8 +148,11 @@ config it writes for a netbooted Machine.
 - `MirrorReference` rewrites a rootfs image reference to the mirror. An `oci://`
   reference becomes `oci://<mirror>/<repository>`, a reference without a scheme
   becomes `<mirror>/<reference>`, and other schemes such as `file://` or `https://`
-  are left alone. The rewrite happens when the goal state is resolved, so the
-  preflight probes the mirror too.
+  are left alone. A registry host with a port keeps its colon in the mirror
+  authority but writes it as an underscore in the path, so
+  `registry.lan:5000/agent:v1` through mirror `10.0.0.1:5000` becomes
+  `10.0.0.1:5000/registry.lan_5000/agent:v1`. The rewrite happens when the goal
+  state is resolved, so the preflight probes the mirror too.
 - The rendered `OfflineArtifacts.Source` is rewritten the same way.
 - Containerd's `_default` hosts file lists Gantry, unless it is disabled, and the
   mirror with `pull` and `resolve` capabilities. Gantry keeps its short dial timeout

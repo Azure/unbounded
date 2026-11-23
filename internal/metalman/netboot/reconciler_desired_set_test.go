@@ -114,3 +114,40 @@ func TestDaemonSetRequestsCollectsImages(t *testing.T) {
 	// Without a client nothing can be discovered.
 	require.Empty(t, (&OCIReconciler{}).daemonSetRequests(context.Background(), machine, v1alpha3.DefaultPXEArchitecture))
 }
+
+func TestDaemonSetRequestsWithoutKubernetesSpec(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	require.NoError(t, appsv1.AddToScheme(scheme))
+
+	daemonSets := []runtime.Object{
+		&appsv1.DaemonSet{
+			ObjectMeta: metav1.ObjectMeta{Name: "provider-only", Namespace: "kube-system"},
+			Spec: appsv1.DaemonSetSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+				NodeSelector: map[string]string{"kubernetes.io/os": "linux"},
+				Containers:   []corev1.Container{{Name: "agent", Image: "ghcr.io/test/provider-only:v1"}},
+			}}},
+		},
+		&appsv1.DaemonSet{
+			ObjectMeta: metav1.ObjectMeta{Name: "needs-user-label", Namespace: "kube-system"},
+			Spec: appsv1.DaemonSetSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+				NodeSelector: map[string]string{"nvidia.com/gpu.present": "true"},
+				Containers:   []corev1.Container{{Name: "helper", Image: "ghcr.io/test/gpu-helper:v1"}},
+			}}},
+		},
+	}
+
+	reconciler := &OCIReconciler{
+		Client:         fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(daemonSets...).Build(),
+		ProviderLabels: map[string]string{"kubernetes.io/os": "linux"},
+	}
+
+	// A Machine without spec.kubernetes still gets its provider images warmed.
+	machine := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "node-a"}}
+
+	require.Equal(t, []imagePullRequest{{
+		ImageRef:     "ghcr.io/test/provider-only:v1",
+		Architecture: v1alpha3.DefaultPXEArchitecture,
+	}}, reconciler.daemonSetRequests(context.Background(), machine, v1alpha3.DefaultPXEArchitecture))
+}

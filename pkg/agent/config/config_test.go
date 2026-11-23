@@ -200,7 +200,13 @@ func TestAgentConfig_MirrorReference(t *testing.T) {
 			name:   "reference with its own host port",
 			mirror: "10.0.0.1:5000",
 			ref:    "registry.lan:5000/azure/agent:v1",
-			want:   "10.0.0.1:5000/registry.lan:5000/azure/agent:v1",
+			want:   "10.0.0.1:5000/registry.lan_5000/azure/agent:v1",
+		},
+		{
+			name:   "oci artifact source with a host port",
+			mirror: "10.0.0.1:5000",
+			ref:    "oci://registry.lan:5000/azure/bootstrap:tag",
+			want:   "oci://10.0.0.1:5000/registry.lan_5000/azure/bootstrap:tag",
 		},
 		{
 			name:   "empty reference",

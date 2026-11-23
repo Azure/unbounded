@@ -244,7 +244,7 @@ func (c *AgentConfig) MirrorReference(ref string) string {
 	}
 
 	if strings.HasPrefix(ref, "oci://") {
-		return "oci://" + mirror + "/" + strings.TrimPrefix(ref, "oci://")
+		return "oci://" + mirror + "/" + encodeMirrorHost(strings.TrimPrefix(ref, "oci://"))
 	}
 
 	// A reference that already names a scheme, such as an https archive or an
@@ -253,7 +253,20 @@ func (c *AgentConfig) MirrorReference(ref string) string {
 		return ref
 	}
 
-	return mirror + "/" + ref
+	return mirror + "/" + encodeMirrorHost(ref)
+}
+
+// encodeMirrorHost makes the registry host of ref safe to use as the leading
+// path segment under the mirror. A host with a port contains a colon, which an
+// OCI repository path cannot, so the colon becomes an underscore. Metalman
+// reverses this when it looks the reference up in its cache.
+func encodeMirrorHost(ref string) string {
+	host, rest, found := strings.Cut(ref, "/")
+	if !found || !strings.Contains(host, ":") {
+		return ref
+	}
+
+	return strings.ReplaceAll(host, ":", "_") + "/" + rest
 }
 
 // normalizeRegistryMirror strips an optional scheme prefix and trailing slashes

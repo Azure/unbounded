@@ -21,6 +21,7 @@ func TestRegistryServesPrewarmedImages(t *testing.T) {
 
 	cache := NewOCICache(cacheDir)
 	cache.SetDigestForArchitecture("ghcr.io/azure/agent-ubuntu2404:v20261031", "amd64", digest)
+	cache.SetDigestForArchitecture("localhost:5555/agent-ubuntu2404:smoke", "amd64", digest)
 
 	registry := &Registry{Cache: cache}
 
@@ -46,6 +47,18 @@ func TestRegistryServesPrewarmedImages(t *testing.T) {
 		{
 			name:            "manifest with containerd ns parameter",
 			target:          "/v2/azure/agent-ubuntu2404/manifests/v20261031?ns=ghcr.io",
+			wantStatus:      http.StatusOK,
+			wantContentType: ispec.MediaTypeImageIndex,
+		},
+		{
+			name:            "manifest for an upstream host with a port",
+			target:          "/v2/localhost_5555/agent-ubuntu2404/manifests/smoke",
+			wantStatus:      http.StatusOK,
+			wantContentType: ispec.MediaTypeImageIndex,
+		},
+		{
+			name:            "manifest for an upstream host with a port and ns parameter",
+			target:          "/v2/agent-ubuntu2404/manifests/smoke?ns=localhost%3A5555",
 			wantStatus:      http.StatusOK,
 			wantContentType: ispec.MediaTypeImageIndex,
 		},

@@ -202,14 +202,16 @@ func (r *OCIReconciler) daemonSetRequests(ctx context.Context, machine *v1alpha3
 		return nil
 	}
 
-	labels := make(map[string]string, len(machine.Spec.Kubernetes.NodeLabels)+len(r.ProviderLabels))
+	labels := make(map[string]string, len(r.ProviderLabels))
 
 	for key, value := range r.ProviderLabels {
 		labels[key] = value
 	}
 
-	for key, value := range machine.Spec.Kubernetes.NodeLabels {
-		labels[key] = value
+	if machine.Spec.Kubernetes != nil {
+		for key, value := range machine.Spec.Kubernetes.NodeLabels {
+			labels[key] = value
+		}
 	}
 
 	var requests []imagePullRequest

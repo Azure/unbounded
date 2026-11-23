@@ -97,15 +97,53 @@ func (r *Registry) serveManifest(w http.ResponseWriter, req *http.Request, name,
 // manifestRepositories returns the repository spellings a request may use.
 // containerd names the upstream registry in ?ns= and the path without it,
 // while the agent and oras name the mirror as the registry and keep the
-// upstream host in the path.
+// upstream host in the path. The agent writes a host with a port as an
+// underscore path segment, so the decoded spelling is tried as well.
 func manifestRepositories(name string, query url.Values) []string {
 	repository := strings.Trim(name, "/")
+	decoded := decodeMirrorHost(repository)
+	ns := strings.Trim(query.Get("ns"), "/")
 
-	if ns := strings.Trim(query.Get("ns"), "/"); ns != "" && !strings.HasPrefix(repository, ns+"/") {
-		return []string{ns + "/" + repository, repository}
+	var candidates []string
+
+	for _, candidate := range []string{repository, decoded} {
+		if ns != "" && !strings.HasPrefix(candidate, ns+"/") {
+			candidates = append(candidates, ns+"/"+candidate)
+		}
 	}
 
-	return []string{repository}
+	candidates = append(candidates, repository, decoded)
+
+	return uniqueStrings(candidates)
+}
+
+// decodeMirrorHost reverses the agent's encoding of a registry host that has a
+// port: the colon cannot appear in a repository path, so it is written as an
+// underscore.
+func decodeMirrorHost(repository string) string {
+	host, rest, found := strings.Cut(repository, "/")
+	if !found || !strings.Contains(host, "_") {
+		return repository
+	}
+
+	return strings.ReplaceAll(host, "_", ":") + "/" + rest
+}
+
+// uniqueStrings drops duplicates while keeping the first occurrence order.
+func uniqueStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	unique := values[:0]
+
+	for _, value := range values {
+		if _, ok := seen[value]; ok {
+			continue
+		}
+
+		seen[value] = struct{}{}
+		unique = append(unique, value)
+	}
+
+	return unique
 }
 
 // writeManifest serves the manifest blob for a digest.
