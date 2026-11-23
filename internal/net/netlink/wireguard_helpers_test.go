@@ -39,8 +39,8 @@ func TestWireGuardHelperComparisons(t *testing.T) {
 // TestWireGuardKeepaliveAndPeerNeedsUpdate tests wire guard keepalive and peer needs update.
 func TestWireGuardKeepaliveAndPeerNeedsUpdate(t *testing.T) {
 	wm := &WireGuardManager{}
-	if wm.keepaliveDuration(0) != nil {
-		t.Fatalf("expected keepaliveDuration(0) to return nil")
+	if d := wm.keepaliveDuration(0); d == nil || *d != 0 {
+		t.Fatalf("expected keepaliveDuration(0) to disable keepalive, got %#v", d)
 	}
 
 	if d := wm.keepaliveDuration(25); d == nil || *d != 25*time.Second {

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"sort"
 
 	"k8s.io/klog/v2"
@@ -49,6 +50,38 @@ func (state *wireGuardState) storeGatewayWireGuardManager(iface string, manager 
 	}
 
 	state.gatewayWireguardManagers[iface] = manager
+}
+
+func repairWireGuardDrift(state *wireGuardState) error {
+	state.mu.Lock()
+
+	managers := make([]*unboundednetnetlink.WireGuardManager, 0, 1+len(state.gatewayWireguardManagers))
+	if state.wireguardManager != nil {
+		managers = append(managers, state.wireguardManager)
+	}
+
+	interfaces := make([]string, 0, len(state.gatewayWireguardManagers))
+	for iface := range state.gatewayWireguardManagers {
+		interfaces = append(interfaces, iface)
+	}
+
+	slices.Sort(interfaces)
+	for _, iface := range interfaces {
+		if manager := state.gatewayWireguardManagers[iface]; manager != nil {
+			managers = append(managers, manager)
+		}
+	}
+	state.mu.Unlock()
+
+	var repairErrors []error
+
+	for _, manager := range managers {
+		if err := manager.RepairDrift(); err != nil {
+			repairErrors = append(repairErrors, err)
+		}
+	}
+
+	return errors.Join(repairErrors...)
 }
 
 func (state *wireGuardState) clearGatewayPeerMetadataLocked(iface string) {

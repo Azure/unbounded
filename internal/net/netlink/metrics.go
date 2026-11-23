@@ -33,6 +33,12 @@ var (
 		Help:      "Total WireGuard configuration errors.",
 	}, []string{"interface"})
 
+	WireGuardDriftRepairs = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: nodeNamespace,
+		Name:      "wireguard_drift_repairs_total",
+		Help:      "Total WireGuard kernel drift repairs applied.",
+	}, []string{"interface"})
+
 	WireGuardPeersAdded = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: nodeNamespace,
 		Name:      "wireguard_peers_added_total",

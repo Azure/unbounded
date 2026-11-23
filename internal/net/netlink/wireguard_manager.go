@@ -27,7 +27,21 @@ type WireGuardPeer struct {
 type WireGuardManager struct {
 	mu        sync.Mutex
 	ifaceName string
-	client    *wgctrl.Client
+	client    WireGuardClient
+	desired   *wireGuardDesired
+}
+
+// WireGuardClient is the wgctrl operation set used by WireGuardManager.
+type WireGuardClient interface {
+	Device(string) (*wgtypes.Device, error)
+	ConfigureDevice(string, wgtypes.Config) error
+	Close() error
+}
+
+type wireGuardDesired struct {
+	privateKey wgtypes.Key
+	listenPort int
+	peers      map[wgtypes.Key]WireGuardPeer
 }
 
 // NewWireGuardManager creates a new WireGuardManager for the specified interface
@@ -37,14 +51,20 @@ func NewWireGuardManager(ifaceName string) (*WireGuardManager, error) {
 		return nil, fmt.Errorf("failed to create wgctrl client: %w", err)
 	}
 
-	return &WireGuardManager{
-		ifaceName: ifaceName,
-		client:    client,
-	}, nil
+	return NewWireGuardManagerWithClient(ifaceName, client), nil
+}
+
+// NewWireGuardManagerWithClient creates a manager backed by client. It is
+// exported for component tests that need to model kernel WireGuard state.
+func NewWireGuardManagerWithClient(ifaceName string, client WireGuardClient) *WireGuardManager {
+	return &WireGuardManager{ifaceName: ifaceName, client: client}
 }
 
 // Close releases resources held by the WireGuardManager
 func (wm *WireGuardManager) Close() error {
+	wm.mu.Lock()
+	defer wm.mu.Unlock()
+
 	if wm.client != nil {
 		return wm.client.Close()
 	}
@@ -70,31 +90,77 @@ func (wm *WireGuardManager) Configure(privateKey string, listenPort int, peers [
 		return fmt.Errorf("failed to parse private key (invalid format)")
 	}
 
+	desiredPeers := parseDesiredPeers(peers)
+
 	// Get current device state to calculate delta
 	currentDevice, err := wm.client.Device(wm.ifaceName)
 	if err != nil {
 		// Device might not exist yet or have no config, do a full configure
 		klog.V(3).Infof("Could not get current device state for %s, doing full configuration: %v", wm.ifaceName, err)
-		return wm.configureFullReplace(privKey, listenPort, peers)
+		if err := wm.configureFullReplace(privKey, listenPort, desiredPeers); err != nil {
+			return err
+		}
+
+		wm.desired = &wireGuardDesired{privateKey: privKey, listenPort: listenPort, peers: desiredPeers}
+
+		return nil
 	}
 
+	if _, err := wm.applyDelta(currentDevice, privKey, listenPort, desiredPeers, start); err != nil {
+		return err
+	}
+
+	wm.desired = &wireGuardDesired{privateKey: privKey, listenPort: listenPort, peers: desiredPeers}
+
+	return nil
+}
+
+func parseDesiredPeers(peers []WireGuardPeer) map[wgtypes.Key]WireGuardPeer {
+	desiredPeers := make(map[wgtypes.Key]WireGuardPeer, len(peers))
+
+	for _, peer := range peers {
+		pubKey, err := wgtypes.ParseKey(peer.PublicKey)
+		if err != nil {
+			klog.Warningf("Failed to parse public key %s: %v", peer.PublicKey, err)
+			continue
+		}
+
+		peer.AllowedIPs = append([]string(nil), peer.AllowedIPs...)
+		desiredPeers[pubKey] = peer
+	}
+
+	return desiredPeers
+}
+
+// RepairDrift reconciles the live WireGuard device with the last successfully
+// applied configuration. Endpoints with an empty desired value remain learned
+// by WireGuard and are not enforced.
+func (wm *WireGuardManager) RepairDrift() error {
+	wm.mu.Lock()
+	defer wm.mu.Unlock()
+
+	if wm.desired == nil || wm.client == nil {
+		return nil
+	}
+
+	currentDevice, err := wm.client.Device(wm.ifaceName)
+	if err != nil {
+		return fmt.Errorf("read WireGuard device %s: %w", wm.ifaceName, err)
+	}
+
+	changed, err := wm.applyDelta(currentDevice, wm.desired.privateKey, wm.desired.listenPort, wm.desired.peers, time.Now())
+	if err == nil && changed {
+		WireGuardDriftRepairs.WithLabelValues(wm.ifaceName).Inc()
+	}
+
+	return err
+}
+
+func (wm *WireGuardManager) applyDelta(currentDevice *wgtypes.Device, privKey wgtypes.Key, listenPort int, desiredPeers map[wgtypes.Key]WireGuardPeer, start time.Time) (bool, error) {
 	// Build map of current peers by public key
 	currentPeers := make(map[wgtypes.Key]wgtypes.Peer)
 	for _, p := range currentDevice.Peers {
 		currentPeers[p.PublicKey] = p
-	}
-
-	// Build map of desired peers by public key
-	desiredPeers := make(map[wgtypes.Key]WireGuardPeer)
-
-	for _, p := range peers {
-		pubKey, err := wgtypes.ParseKey(p.PublicKey)
-		if err != nil {
-			klog.Warningf("Failed to parse public key %s: %v", p.PublicKey, err)
-			continue
-		}
-
-		desiredPeers[pubKey] = p
 	}
 
 	// Calculate delta
@@ -144,18 +210,27 @@ func (wm *WireGuardManager) Configure(privateKey string, listenPort int, peers [
 		}
 	}
 
+	deviceChanged := currentDevice.PrivateKey != privKey || currentDevice.ListenPort != listenPort
+
 	// If no changes needed, skip the API call
-	if len(peerConfigs) == 0 {
+	if len(peerConfigs) == 0 && !deviceChanged {
 		klog.V(3).Infof("WireGuard device %s: no peer changes needed", wm.ifaceName)
-		return nil
+		return false, nil
 	}
 
 	// Build device config with delta changes (ReplacePeers: false)
 	cfg := wgtypes.Config{
-		PrivateKey:   &privKey,
-		ListenPort:   &listenPort,
 		ReplacePeers: false, // Only apply the specific peer changes
 		Peers:        peerConfigs,
+	}
+	if deviceChanged {
+		if currentDevice.PrivateKey != privKey {
+			cfg.PrivateKey = &privKey
+		}
+
+		if currentDevice.ListenPort != listenPort {
+			cfg.ListenPort = &listenPort
+		}
 	}
 
 	// Apply configuration
@@ -163,7 +238,7 @@ func (wm *WireGuardManager) Configure(privateKey string, listenPort int, peers [
 		WireGuardConfigureErrors.WithLabelValues(wm.ifaceName).Inc()
 		WireGuardConfigureDuration.WithLabelValues(wm.ifaceName).Observe(time.Since(start).Seconds())
 
-		return fmt.Errorf("failed to configure WireGuard device: %w", err)
+		return false, fmt.Errorf("failed to configure WireGuard device: %w", err)
 	}
 
 	WireGuardPeers.WithLabelValues(wm.ifaceName).Set(float64(len(desiredPeers)))
@@ -171,14 +246,14 @@ func (wm *WireGuardManager) Configure(privateKey string, listenPort int, peers [
 	WireGuardPeersRemoved.Add(float64(removed))
 	WireGuardConfigureDuration.WithLabelValues(wm.ifaceName).Observe(time.Since(start).Seconds())
 
-	klog.V(4).Infof("Configured WireGuard device %s with %d peers (added: %d, updated: %d, removed: %d)",
-		wm.ifaceName, len(desiredPeers), added, updated, removed)
+	klog.V(4).Infof("Configured WireGuard device %s with %d peers (added: %d, updated: %d, removed: %d, device changed: %t)",
+		wm.ifaceName, len(desiredPeers), added, updated, removed, deviceChanged)
 
-	return nil
+	return true, nil
 }
 
 // configureFullReplace does a full peer replacement (used on first configuration)
-func (wm *WireGuardManager) configureFullReplace(privKey wgtypes.Key, listenPort int, peers []WireGuardPeer) error {
+func (wm *WireGuardManager) configureFullReplace(privKey wgtypes.Key, listenPort int, peers map[wgtypes.Key]WireGuardPeer) error {
 	peerConfigs := make([]wgtypes.PeerConfig, 0, len(peers))
 	for _, peer := range peers {
 		peerConfig, err := wm.buildPeerConfig(peer)
@@ -201,6 +276,7 @@ func (wm *WireGuardManager) configureFullReplace(privKey wgtypes.Key, listenPort
 		return fmt.Errorf("failed to configure WireGuard device: %w", err)
 	}
 
+	WireGuardPeers.WithLabelValues(wm.ifaceName).Set(float64(len(peers)))
 	klog.V(4).Infof("Configured WireGuard device %s with %d peers (full replace)", wm.ifaceName, len(peerConfigs))
 
 	return nil
@@ -336,11 +412,7 @@ func (wm *WireGuardManager) buildPeerConfig(peer WireGuardPeer) (*wgtypes.PeerCo
 
 // keepaliveDuration converts seconds to a *time.Duration for PersistentKeepalive
 func (wm *WireGuardManager) keepaliveDuration(seconds int) *time.Duration {
-	if seconds <= 0 {
-		return nil
-	}
-
-	d := time.Duration(seconds) * time.Second
+	d := time.Duration(max(seconds, 0)) * time.Second
 
 	return &d
 }
@@ -365,12 +437,19 @@ func prefixToIPNet(prefix netip.Prefix) net.IPNet {
 
 // GetDevice returns the current WireGuard device configuration
 func (wm *WireGuardManager) GetDevice() (*wgtypes.Device, error) {
+	wm.mu.Lock()
+	defer wm.mu.Unlock()
+
+	if wm.client == nil {
+		return nil, fmt.Errorf("WireGuard client for %s is unavailable", wm.ifaceName)
+	}
+
 	return wm.client.Device(wm.ifaceName)
 }
 
 // GetPeers returns the current list of peers configured on the device
 func (wm *WireGuardManager) GetPeers() ([]wgtypes.Peer, error) {
-	device, err := wm.client.Device(wm.ifaceName)
+	device, err := wm.GetDevice()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get device: %w", err)
 	}
