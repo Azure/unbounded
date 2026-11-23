@@ -91,6 +91,29 @@ linters:
           deny:
             - pkg: github.com/Azure/unbounded
               desc: shared helpers may import repository packages only from api/ or internal/
+        # Conventions follow the import rule in internal/AGENTS.md. Tests are
+        # exempt: the systemns drift test renders manifests with hack/ code.
+        conventions:
+          list-mode: lax
+          files:
+            - "${config-path}/internal/bootstraptoken/**"
+            - "${config-path}/internal/logger/**"
+            - "${config-path}/internal/systemns/**"
+            - "${config-path}/internal/version/**"
+            - "!$test"
+          allow:
+            - github.com/Azure/unbounded/api/
+            - github.com/Azure/unbounded/internal/helpers/
+          deny:
+            - pkg: github.com/Azure/unbounded
+              desc: conventions may import repository packages only from api/ or internal/helpers/
+        no-cmd:
+          files:
+            - "${config-path}/internal/**"
+            - "${config-path}/pkg/**"
+          deny:
+            - pkg: github.com/Azure/unbounded/cmd/
+              desc: internal/ and pkg/ must not import cmd/; see "Where new code goes" in internal/AGENTS.md
     errcheck:
       # Treat type assertion as erroneous operation, though assertions should be avoided in general.
       check-type-assertions: true
