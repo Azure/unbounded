@@ -208,10 +208,7 @@ impl VirtualClock {
 
     /// Lock the mutable times; no code panics while holding the lock.
     fn times(&self) -> std::sync::MutexGuard<'_, VirtualTimes> {
-        self.0
-            .times
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.0.times.lock().expect("times lock is never poisoned")
     }
 
     /// Current virtual monotonic time.

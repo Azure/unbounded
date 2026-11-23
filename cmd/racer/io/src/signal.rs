@@ -176,7 +176,9 @@ static STOP_INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// raised by a signal handler wakes every parked lane without a tick.
 pub fn stop_fd() -> Result<RawFd> {
     use std::sync::atomic::Ordering;
-    let _init = STOP_INIT.lock().unwrap_or_else(|e| e.into_inner());
+    let _init = STOP_INIT
+        .lock()
+        .expect("stop fd initialization lock is never poisoned");
     let fd = STOP_FD.load(Ordering::Acquire);
     if fd >= 0 {
         return Ok(fd);

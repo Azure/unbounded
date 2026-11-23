@@ -16,9 +16,9 @@ use racer_dst::{
     invariants::{Class, all_roles_settled},
     scenario::{FaultMix, Fidelity},
     scenarios,
-    world::{DoneFlag, Fault, LaneRole, SimRole, wall_nanos},
+    world::{DoneFlag, Fault, Lane, SimRole, wall_nanos},
 };
-use racer_io::{ctx::VirtualClock, exec::Lane, exec::Next, sim::SimOs};
+use racer_io::{ctx::VirtualClock, exec::Next, sim::SimOs};
 
 fn counter(os: &SimOs) -> u64 {
     let bytes = os.read_file(Path::new("/state/counter")).unwrap();
@@ -194,7 +194,7 @@ fn pending_work_without_wake_is_a_liveness_failure() {
         let mut roles: racer_dst::world::Roles = Vec::new();
         let lane = Lane::new(env.reactor(1, 8)?, DoneFlag::default());
         lane.executor.spawn_detached(pending::<()>());
-        roles.push(("stuck".into(), Box::new(LaneRole(lane))));
+        roles.push(("stuck".into(), Box::new(lane)));
         Ok(roles)
     });
     let out = s.run(Choices::seeded(1));
@@ -347,10 +347,7 @@ fn safety_invariants_and_role_reports_fail_the_run() {
         let lane = Lane::new(env.reactor(1, 8)?, DoneFlag::default());
         lane.executor
             .spawn_detached(async move { report.violation("bytes differ") });
-        Ok(vec![(
-            "r".into(),
-            Box::new(LaneRole(lane)) as Box<dyn SimRole>,
-        )])
+        Ok(vec![("r".into(), Box::new(lane) as Box<dyn SimRole>)])
     });
     let failure = s.run(Choices::seeded(1)).failure.unwrap();
     assert_eq!(failure.name, "role-assert");

@@ -20,8 +20,8 @@ fn signed_opaque_relay_roundtrip_and_exact_attempt_binding() {
     let scope = local.origin.scope().clone();
     let (signed, outstanding) = auth[0].sign_request_to(local, signers[1].node()).unwrap();
     let signature = signed.authentication.original.signature.clone();
-    let (envelope, _) = decode_envelope(
-        encode_envelope(&signed.authentication, false, 0).unwrap(),
+    let (envelope, _) = peer_wire::decode_envelope(
+        peer_wire::encode_envelope(&signed.authentication, false, 0).unwrap(),
         false,
         &peer_wire::test_util::AnyChain,
     )
@@ -51,8 +51,8 @@ fn signed_opaque_relay_roundtrip_and_exact_attempt_binding() {
             .ciphertext,
         vec![5; 32]
     );
-    let (envelope, _) = decode_envelope(
-        encode_envelope(&forwarded.authentication, false, 0).unwrap(),
+    let (envelope, _) = peer_wire::decode_envelope(
+        peer_wire::encode_envelope(&forwarded.authentication, false, 0).unwrap(),
         false,
         &peer_wire::test_util::AnyChain,
     )
@@ -69,8 +69,8 @@ fn signed_opaque_relay_roundtrip_and_exact_attempt_binding() {
         .append_response(verified, signers[0].node())
         .unwrap();
     assert_eq!(reply.authentication.original.signature, reply_signature);
-    let (envelope, _) = decode_envelope(
-        encode_envelope(&reply.authentication, true, 0).unwrap(),
+    let (envelope, _) = peer_wire::decode_envelope(
+        peer_wire::encode_envelope(&reply.authentication, true, 0).unwrap(),
         true,
         &peer_wire::test_util::AnyChain,
     )
@@ -161,8 +161,7 @@ fn not_found_is_authenticated_through_relay_and_restricted_to_fresh_acquire() {
             .collect();
         let mut head = p::response_head(
             &PeerResponse::NotFound,
-            &crate::peer::protocol::signed_digest(&admitted.signed().authentication.original)
-                .unwrap(),
+            &peer_wire::signed_digest(&admitted.signed().authentication.original).unwrap(),
             &path,
         )
         .unwrap();
@@ -202,13 +201,14 @@ fn not_found_is_authenticated_through_relay_and_restricted_to_fresh_acquire() {
             original.signature
         );
         // The outer HTTP status is framing, while the inner 404 and outcome are signed.
-        let envelope = encode_envelope(&reverse_response.authentication, true, 0).unwrap();
+        let envelope =
+            peer_wire::encode_envelope(&reverse_response.authentication, true, 0).unwrap();
         assert!(matches!(
             envelope.start,
             StartLine::Response { status: 200 }
         ));
         let (envelope, length) =
-            decode_envelope(envelope, true, &peer_wire::test_util::AnyChain).unwrap();
+            peer_wire::decode_envelope(envelope, true, &peer_wire::test_util::AnyChain).unwrap();
         assert_eq!(length, 0);
         let decoded = codec.response(envelope, vec![], &scope).unwrap();
         let (_, other) = auth[0]
@@ -291,8 +291,8 @@ fn changed_operation_credentials_replay_and_deadlines_fail() {
         .ciphertext[0] ^= 1;
     assert!(receiver.verify_request(signed).is_err());
     let (signed, _) = sender.sign_request(request(&env, &admission, 2)).unwrap();
-    let (envelope, _) = decode_envelope(
-        encode_envelope(&signed.authentication, false, 0).unwrap(),
+    let (envelope, _) = peer_wire::decode_envelope(
+        peer_wire::encode_envelope(&signed.authentication, false, 0).unwrap(),
         false,
         &peer_wire::test_util::AnyChain,
     )
@@ -515,7 +515,7 @@ fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
                 crate::peer::protocol::accept(&socket.io, connection, signers[2].clone(), &scope)
                     .await?;
             let received = socket.io.receive_head(connection, &scope).await?;
-            let (envelope, length) = decode_envelope(
+            let (envelope, length) = peer_wire::decode_envelope(
                 received.value,
                 false,
                 crate::peer::protocol::chains(&received.connection)?,
@@ -545,7 +545,7 @@ fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
                     .io
                     .send_head(
                         received.connection,
-                        encode_envelope(&response.authentication, true, 0)?,
+                        peer_wire::encode_envelope(&response.authentication, true, 0)?,
                         &scope,
                     )
                     .await?;
@@ -721,10 +721,9 @@ fn equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction() {
         let (signed, _) = Forwarding::new(signers[0].clone())
             .sign_request_to(original, next)
             .unwrap();
-        let receiver =
-            crate::peer::protocol::receiver(&signed.authentication.original.head).unwrap();
-        let (envelope, _) = decode_envelope(
-            encode_envelope(&signed.authentication, false, 0).unwrap(),
+        let receiver = peer_wire::receiver(&signed.authentication.original.head).unwrap();
+        let (envelope, _) = peer_wire::decode_envelope(
+            peer_wire::encode_envelope(&signed.authentication, false, 0).unwrap(),
             false,
             &peer_wire::test_util::AnyChain,
         )
@@ -1474,7 +1473,7 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
             conn = io
                 .send_head(
                     conn,
-                    encode_envelope(&authentication, true, body.len())?,
+                    peer_wire::encode_envelope(&authentication, true, body.len())?,
                     &scope,
                 )
                 .await?
@@ -1768,7 +1767,7 @@ mod established_sessions {
             let (signed, _) = Forwarding::new(self.signers[0].clone())
                 .sign_request(request)
                 .unwrap();
-            encode_envelope(&signed.authentication, false, 0).unwrap()
+            peer_wire::encode_envelope(&signed.authentication, false, 0).unwrap()
         }
         // First successful dispatch uses the production server's accept path.
         fn first(&self, env: &racer_io::Env) -> (ConnectionLease, ConnectionLease) {

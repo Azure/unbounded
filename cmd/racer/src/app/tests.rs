@@ -18,8 +18,6 @@ use crate::peer::protocol::FetchMode;
 use crate::peer::protocol::Operation as PeerOperation;
 use crate::peer::protocol::PeerRequest;
 use crate::peer::protocol::PeerResponse;
-use crate::peer::protocol::decode_envelope;
-use crate::peer::protocol::encode_envelope;
 use crate::runtime::Reactor;
 use crate::security;
 use crate::security::CryptoClient;
@@ -4396,7 +4394,7 @@ fn assembled_peer_io_carries_maximum_client_context_over_eight_signed_links() {
     };
     let (mut request, binding) = forwarding[0].sign_request_to(request, &node(1)).unwrap();
     assert!(
-        encode_envelope(&request.authentication, false, 0)
+        peer_wire::encode_envelope(&request.authentication, false, 0)
             .unwrap()
             .unique("racer-original")
             .unwrap()
@@ -4419,7 +4417,7 @@ fn assembled_peer_io_carries_maximum_client_context_over_eight_signed_links() {
             )
         })
         .unwrap();
-        let head = encode_envelope(&request.authentication, false, 0).unwrap();
+        let head = peer_wire::encode_envelope(&request.authentication, false, 0).unwrap();
         let (sent, received) = drive_peer(reactor, async {
             futures::try_join!(
                 io.send_head(left, head, &scope),
@@ -4427,7 +4425,7 @@ fn assembled_peer_io_carries_maximum_client_context_over_eight_signed_links() {
             )
         })
         .unwrap();
-        let (auth, length) = decode_envelope(
+        let (auth, length) = peer_wire::decode_envelope(
             received.value,
             false,
             crate::peer::protocol::chains(&received.connection).unwrap(),
@@ -4488,7 +4486,7 @@ fn assembled_peer_io_carries_maximum_client_context_over_eight_signed_links() {
     drop(opened);
     for index in (1..=protocol::MAX_HOPS).rev() {
         let (left, right) = sockets.pop().unwrap();
-        let head = encode_envelope(&response.authentication, true, 0).unwrap();
+        let head = peer_wire::encode_envelope(&response.authentication, true, 0).unwrap();
         let (sent, received) = drive_peer(reactor, async {
             futures::try_join!(
                 io.send_head(right, head, &scope),
@@ -4496,7 +4494,7 @@ fn assembled_peer_io_carries_maximum_client_context_over_eight_signed_links() {
             )
         })
         .unwrap();
-        let (auth, _) = decode_envelope(
+        let (auth, _) = peer_wire::decode_envelope(
             received.value,
             true,
             crate::peer::protocol::chains(&received.connection).unwrap(),

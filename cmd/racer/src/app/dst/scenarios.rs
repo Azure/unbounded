@@ -182,7 +182,7 @@ pub(super) fn completed_peer_dispatches_do_not_exhaust_worker_cancellation() {
         cache: harness.definition(0).id,
         key: CacheKey([0; 32]),
     };
-    while app.directory.metadata_owner(&object).unwrap() != WorkerId(1) {
+    while app.directory.node().metadata_owner(&object).unwrap() != WorkerId(1) {
         object.key.0[0] += 1;
     }
     let server = app.peers.clone();

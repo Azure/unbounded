@@ -525,7 +525,7 @@ pub(crate) async fn serve_fill(
     scope: &RequestScope,
 ) -> Vec<PageResult> {
     let directory = local.prefetch_directory();
-    let prefetch = &directory.prefetch;
+    let prefetch = &directory.node().prefetch;
     if local.cache_passthrough(&version.object.cache) {
         return vec![PageResult::Failed(FailCode::Unavailable); pages.len()];
     }
@@ -595,7 +595,7 @@ pub(crate) async fn serve(
     context: &OriginContext,
     scope: &RequestScope,
 ) -> Result<PeerResponse> {
-    if local.prefetch_directory().prefetch.draining() {
+    if local.prefetch_directory().node().prefetch.draining() {
         return Ok(PeerResponse::Unavailable);
     }
     // A node outside the cache's pool never owns its pages. The sender ranked
@@ -652,7 +652,7 @@ async fn dispatch(
             .map(|&page| (unit(page), outcome, None))
             .collect::<Vec<_>>()
     };
-    let prefetch = &local.prefetch_directory().prefetch;
+    let prefetch = &local.prefetch_directory().node().prefetch;
     let Ok(scope) = prefetch.scope(prefetch.now() + DISPATCH_TIMEOUT) else {
         return all(UnitOutcome::Retry(RetryKind::Unavailable, None));
     };
@@ -857,7 +857,7 @@ async fn resolve(
             })
         })
         .collect();
-    let prefetch = &local.prefetch_directory().prefetch;
+    let prefetch = &local.prefetch_directory().node().prefetch;
     let scope = prefetch.scope(prefetch.now() + RESOLVE_TIMEOUT);
     let mut resolved: Vec<Option<Resolution>> = vec![None; distinct.len()];
     if let Ok(scope) = &scope {
@@ -938,7 +938,7 @@ async fn coverage(
     units: Vec<UnitKey>,
     deadline: Instant,
 ) -> u64 {
-    let Ok(scope) = local.prefetch_directory().prefetch.scope(deadline) else {
+    let Ok(scope) = local.prefetch_directory().node().prefetch.scope(deadline) else {
         return 0;
     };
     let me = local.local_node();
@@ -1050,7 +1050,7 @@ async fn handle_inner(
     scope: &RequestScope,
 ) -> std::result::Result<Response, PrefetchError> {
     let directory = local.prefetch_directory().clone();
-    let prefetch = &directory.prefetch;
+    let prefetch = &directory.node().prefetch;
     if prefetch.draining() {
         return Err(unavailable("node is draining"));
     }

@@ -5022,11 +5022,12 @@ pub(super) mod tests {
                         let parsed = codec.decode_head(bytes);
                         let error = match parsed {
                             Err(e) => Error::from(e),
-                            Ok(Some((head, _))) => crate::peer::protocol::decode_envelope(
+                            Ok(Some((head, _))) => peer_wire::decode_envelope(
                                 head,
                                 true,
                                 &peer_wire::test_util::AnyChain,
                             )
+                            .map_err(Error::from)
                             .err()
                             .expect("missing signed wire envelope"),
                             _ => panic!("complete malformed frame"),

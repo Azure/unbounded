@@ -8,23 +8,22 @@
 //!   counter from `/state/counter` (so a crash and restart resumes from what
 //!   was durably written), then per round sleeps a jittered interval (reactor
 //!   timer, jitter from the worker's seeded entropy), atomically rewrites the
-//!   counter, reads it back, and asks `checker` over an xthread mailbox to
-//!   double it.
-//! - `checker`: answers mailbox requests until the writer hangs up.
+//!   counter, reads it back, and sends it to `checker` over an xthread SPSC
+//!   queue, awaiting the doubled value on the reply queue.
+//! - `checker`: answers requests until the writer closes the request queue.
 //!
 //! Both lanes fold what they observe into the trace and report mismatches as
 //! safety violations.
-use std::{path::Path, rc::Rc};
+use std::{future::poll_fn, path::Path};
 
 use racer_io::{
-    exec::Lane,
     ring::OpCtx,
-    xthread::mailbox::{self, Receiver, Sender},
+    xthread::spsc::{self, Receiver, Sender},
 };
 
 use crate::{
     engine::MILLIS,
-    world::{DoneFlag, LaneRole, NodeEnv, Roles},
+    world::{DoneFlag, Lane, NodeEnv, Roles},
 };
 
 const TAG_WRITE: u64 = 100;
@@ -36,28 +35,35 @@ const TAG_RECOVER: u64 = 103;
 pub fn lane_pair(env: &NodeEnv, rounds: u64) -> racer_io::Result<Roles> {
     let writer = env.reactor(1, 64)?;
     let checker = env.reactor(2, 64)?;
-    let (tx, rx) = mailbox::channel::<u64, u64>(2)?;
-    tx.set_notify(checker.wake_handle());
+    let (mut requests, received) = spsc::bounded::<u64>(1)?;
+    let (replies, answered) = spsc::bounded::<u64>(1)?;
+    requests.set_notify(checker.wake_handle());
     let writer_done = DoneFlag::default();
     let checker_done = DoneFlag::default();
 
     let writer_lane = Lane::new(writer.clone(), writer_done.clone());
-    writer_lane
-        .executor
-        .spawn_detached(write_loop(writer, tx, env.clone(), rounds, writer_done));
+    writer_lane.executor.spawn_detached(write_loop(
+        writer,
+        requests,
+        answered,
+        env.clone(),
+        rounds,
+        writer_done,
+    ));
     let checker_lane = Lane::new(checker, checker_done.clone());
     checker_lane
         .executor
-        .spawn_detached(serve(rx, env.clone(), checker_done));
+        .spawn_detached(serve(received, replies, env.clone(), checker_done));
     Ok(vec![
-        ("writer".into(), Box::new(LaneRole(writer_lane))),
-        ("checker".into(), Box::new(LaneRole(checker_lane))),
+        ("writer".into(), Box::new(writer_lane)),
+        ("checker".into(), Box::new(checker_lane)),
     ])
 }
 
 async fn write_loop(
     reactor: racer_io::Reactor,
-    tx: Sender<u64, u64>,
+    mut requests: Sender<u64>,
+    mut answered: Receiver<u64>,
     env: NodeEnv,
     rounds: u64,
     done: DoneFlag,
@@ -100,12 +106,17 @@ async fn write_loop(
                     .violation(format!("node {} read back {:?}", env.index, &*back));
             }
             env.trace.record_bytes(TAG_WRITE, &back);
-            let credit = tx.credit().await.map_err(|e| format!("credit: {e:?}"))?;
-            let reply = credit
-                .call(n)
-                .map_err(|(e, _)| format!("call: {e:?}"))?
+            requests
+                .ready()
                 .await
-                .map_err(|e| format!("reply: {e:?}"))?;
+                .map_err(|e| format!("send ready: {e:?}"))?;
+            requests
+                .try_send(n)
+                .map_err(|failure| format!("send: {:?}", failure.error))?;
+            let reply = poll_fn(|cx| answered.poll_receive(cx))
+                .await
+                .map_err(|e| format!("reply: {e:?}"))?
+                .ok_or("checker closed the reply queue")?;
             if reply != n * 2 {
                 env.report
                     .violation(format!("node {} checker said {reply} for {n}", env.index));
@@ -119,17 +130,17 @@ async fn write_loop(
         env.report
             .violation(format!("node {} writer: {message}", env.index));
     }
-    drop(tx);
+    drop(requests);
     done.set();
 }
 
-async fn serve(rx: Receiver<u64, u64>, env: NodeEnv, done: DoneFlag) {
-    let rx = Rc::new(rx);
-    while let Some(envelope) = rx.recv().await {
-        let (request, responder) = envelope.into_parts();
+async fn serve(mut requests: Receiver<u64>, replies: Sender<u64>, env: NodeEnv, done: DoneFlag) {
+    while let Ok(Some(request)) = poll_fn(|cx| requests.poll_receive(cx)).await {
         env.trace.record(TAG_SERVE, u64::from(env.index), request);
-        if responder.respond(request * 2).is_err() {
-            env.report.violation("reply not delivered");
+        if let Err(failure) = replies.try_send(request * 2) {
+            env.report
+                .violation(format!("reply not delivered: {:?}", failure.error));
+            break;
         }
     }
     done.set();

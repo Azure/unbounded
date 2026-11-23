@@ -208,7 +208,7 @@ impl ScriptedPeers {
                             page: copy.ciphertext.envelope().page.clone(),
                             membership: request.route.membership,
                             receiver: node(self.local),
-                            deadline: crate::peer::protocol::number(
+                            deadline: peer_wire::number(
                                 &crate::peer::protocol::request_head(
                                     &self.env.ctx.clock,
                                     &request,

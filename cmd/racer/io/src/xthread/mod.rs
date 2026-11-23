@@ -1,10 +1,9 @@
-//! Cross-thread queues: a lock-free bounded SPSC ring ([`spsc`]) and one
-//! bounded MPSC mailbox with typed request/reply ([`mailbox`]).
+//! Cross-thread queues: a lock-free bounded SPSC ring ([`spsc`]), owned
+//! command handoffs ([`command`]), and bounded owned offload ([`offload`]).
 //!
 //! Producers on other threads can wake a consumer parked in its ring through
 //! a [`Notify`] (the lane's [`crate::ring::WakeHandle`] implements it).
 pub mod command;
-pub mod mailbox;
 pub mod offload;
 pub mod spsc;
 

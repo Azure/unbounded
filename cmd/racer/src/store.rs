@@ -152,6 +152,7 @@ impl StoreReader {
         self.index.remove_if_matches(&token.page, &token.location);
         Ok(())
     }
+    #[cfg(test)]
     pub fn read_with_token<'a>(
         &'a self,
         page: &'a PageId,
@@ -295,6 +296,7 @@ impl StoreReader {
             )))
         })
     }
+    #[cfg(test)]
     pub fn read<'a>(
         &'a self,
         page: &'a PageId,

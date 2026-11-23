@@ -27,8 +27,6 @@ default = []
 rdma = ["rdma-verbs/native"]
 # Enables the separately loaded CUDA shim (libracer_gpu_cuda.so.1); without a GPU, gpu-read is unavailable.
 cuda = ["racer-gpu/native"]
-# Test-only Go SDK launcher; keeps crate-private fixture assembly out of default builds.
-subscription-interop = []
 # Test support for racer-dst: exposes the whole-application simulation harness.
 dst = [
     "peer-wire/test-util",
@@ -39,11 +37,6 @@ dst = [
     "http1/test-util",
     "topology/test-util",
 ]
-
-[[test]]
-name = "subscription_interop"
-path = "tests/subscription_interop.rs"
-required-features = ["subscription-interop"]
 
 [dependencies]
 peer-wire = { path = "peer-wire" }

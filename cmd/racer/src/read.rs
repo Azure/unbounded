@@ -132,7 +132,11 @@ impl Coordinator {
         credentials: Rc<CredentialCrypto>,
         availability: Rc<crate::control::Availability>,
     ) -> Self {
-        streams.directory().prefetch.attach_metrics(&fill.metrics);
+        streams
+            .directory()
+            .node()
+            .prefetch
+            .attach_metrics(&fill.metrics);
         Self {
             snapshots,
             metadata,
@@ -406,59 +410,49 @@ impl Coordinator {
             // with its own window, at least `range_window_pages`, and releases
             // each page after writing it.
             let direct_window = crate::client::DIRECT_WINDOW_PAGES.max(self.streams.window_pages());
-            let kind = match kind {
-                ReadKind::HostRead { range, .. } | ReadKind::GpuRead { range, .. } => {
-                    ReadKind::Subscription {
-                        pin: None,
-                        range,
-                        page_credits: direct_window,
-                        byte_credits: direct_byte_credits(direct_window, snapshot.page_size),
-                    }
-                }
-                kind => kind,
-            };
-            match kind {
+            let (range, page_credits, byte_credits) = match kind {
                 ReadKind::Subscription {
                     range,
                     page_credits,
                     byte_credits,
                     ..
-                } => {
-                    if metadata.length == 0 && range.is_none() {
-                        return Ok(ReadResponse {
-                            metadata,
-                            payload: ReadPayload::Empty,
-                        });
-                    }
-                    let range = resolve_range(
-                        range.unwrap_or(ByteRange::From(0)),
-                        metadata.length,
-                        snapshot.page_size,
-                    )?;
-                    let passthrough = self.fill.passthrough(&origin.object.cache);
-                    let mut body = self.streams.open(
-                        metadata.clone(),
-                        range,
-                        origin,
-                        membership,
-                        scope.clone(),
-                    )?;
-                    if passthrough {
-                        body.set_passthrough();
-                    }
-                    body.configure_subscription(page_credits, byte_credits)?;
-                    Ok(ReadResponse {
+                } => (range, page_credits, byte_credits),
+                // Direct reads pace themselves with the dataplane window.
+                ReadKind::HostRead { range, .. } | ReadKind::GpuRead { range, .. } => (
+                    range,
+                    direct_window,
+                    direct_byte_credits(direct_window, snapshot.page_size),
+                ),
+                ReadKind::Head | ReadKind::HeadPinned { .. } => {
+                    return Ok(ReadResponse {
                         metadata,
-                        payload: ReadPayload::Stream(body),
-                    })
+                        payload: ReadPayload::Empty,
+                    });
                 }
-                ReadKind::Head | ReadKind::HeadPinned { .. } => Ok(ReadResponse {
+            };
+            if metadata.length == 0 && range.is_none() {
+                return Ok(ReadResponse {
                     metadata,
                     payload: ReadPayload::Empty,
-                }),
-                // Mapped to Subscription above.
-                ReadKind::HostRead { .. } | ReadKind::GpuRead { .. } => Err(Error::Internal),
+                });
             }
+            let range = resolve_range(
+                range.unwrap_or(ByteRange::From(0)),
+                metadata.length,
+                snapshot.page_size,
+            )?;
+            let passthrough = self.fill.passthrough(&origin.object.cache);
+            let mut body =
+                self.streams
+                    .open(metadata.clone(), range, origin, membership, scope.clone())?;
+            if passthrough {
+                body.set_passthrough();
+            }
+            body.configure_subscription(page_credits, byte_credits)?;
+            Ok(ReadResponse {
+                metadata,
+                payload: ReadPayload::Stream(body),
+            })
         })
     }
 
@@ -775,7 +769,7 @@ impl LocalPageService for Coordinator {
                         } => {
                             // A remote demand read joining a prefetch flight
                             // promotes it.
-                            self.streams.directory().prefetch.promote(&page);
+                            self.streams.directory().node().prefetch.promote(&page);
                             self.fill
                                 .acquire_ciphertext(
                                     page.clone(),

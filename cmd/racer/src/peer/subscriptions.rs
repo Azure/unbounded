@@ -254,8 +254,7 @@ impl Subscriptions {
         scope: &crate::runtime::RequestScope,
     ) -> Result<Selection> {
         use crate::peer::protocol::encode_deadline;
-        use crate::peer::protocol::millis;
-        let now = || millis(scope.clock().wall_now());
+        let now = || peer_wire::millis(scope.clock().wall_now());
         scope.check()?;
         let object = subscription.version.object.clone();
         let key = self.admit(

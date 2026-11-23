@@ -16,6 +16,7 @@ impl Harness {
                         self.nodes[node].workers[0]
                             .app
                             .directory
+                            .node()
                             .metadata_owner(&id)
                             .unwrap()
                             == WorkerId(worker as u16)
@@ -142,7 +143,6 @@ impl Harness {
     pub(super) fn peer_security(&mut self, env: &racer_io::Env) {
         use crate::http::Codec;
         use crate::peer::protocol as p;
-        use crate::peer::protocol::encode_envelope;
         use http1::MessageHead;
         use http1::StartLine;
         let receiver = self.rng.pick(self.nodes.len());
@@ -175,7 +175,7 @@ impl Harness {
             original: Arc::new(signed),
             hops: vec![],
         };
-        let wire = encode_envelope(&envelope, false, 0).unwrap();
+        let wire = peer_wire::encode_envelope(&envelope, false, 0).unwrap();
         let bytes = Codec::new(32768).encode_head(&wire).unwrap();
         if self.security_faults.is_empty() {
             self.security_faults.extend([true, false]);
@@ -213,7 +213,7 @@ impl Harness {
                 b'A'
             };
             signed.signature[0] ^= 1;
-            let wire = encode_envelope(
+            let wire = peer_wire::encode_envelope(
                 &crate::peer::forwarding::ForwardedHead {
                     original: Arc::new(signed),
                     hops: vec![],

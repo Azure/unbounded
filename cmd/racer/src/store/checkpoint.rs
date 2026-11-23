@@ -140,6 +140,7 @@ impl Checkpointer {
         )
     }
 
+    #[cfg(any(test, feature = "dst"))]
     pub fn snapshot_shard(&self) -> Operation<'_, ShardImage> {
         Box::pin(async move {
             let geometry = self.geometry.get().ok_or(Error::InvalidConfiguration)?;

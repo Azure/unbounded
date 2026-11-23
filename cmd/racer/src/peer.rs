@@ -516,7 +516,7 @@ pub(crate) enum Delivered {
 /// the subscription interoperability fixture, so cancellation and an adversarial
 /// late-success completion fence remain distinct.
 #[cfg_attr(
-    any(test, feature = "subscription-interop"),
+    test,
     allow(
         clippy::large_enum_variant,
         reason = "Only the test-only Scripted variant is small; production has one variant"
@@ -534,7 +534,7 @@ pub enum Requester {
         transfers: Rc<Transfers>,
         network: Rc<PeerNetwork>,
     },
-    #[cfg(any(test, feature = "subscription-interop"))]
+    #[cfg(test)]
     Scripted {
         #[expect(
             clippy::type_complexity,
@@ -571,7 +571,7 @@ pub enum Requester {
 #[cfg(test)]
 pub(crate) type ScriptedLanding = Box<dyn Fn(&PeerRequest) -> Option<transport::LandedResponse>>;
 impl Requester {
-    #[cfg(any(test, feature = "subscription-interop"))]
+    #[cfg(test)]
     pub(crate) fn scripted<T: 'static>(
         clock: racer_io::Clock,
         state: Rc<T>,
@@ -653,7 +653,7 @@ impl Requester {
             Self::Network {
                 observer: target, ..
             } => *target = observer,
-            #[cfg(any(test, feature = "subscription-interop"))]
+            #[cfg(test)]
             Self::Scripted { .. } => {}
         }
         self
@@ -663,7 +663,7 @@ impl Requester {
             Self::Network {
                 metrics: target, ..
             } => *target = metrics,
-            #[cfg(any(test, feature = "subscription-interop"))]
+            #[cfg(test)]
             Self::Scripted { .. } => {}
         }
         self
@@ -694,7 +694,7 @@ impl Requester {
                         .as_ref()
                         .is_some_and(|a| a.hedge_available(destination))
             }
-            #[cfg(any(test, feature = "subscription-interop"))]
+            #[cfg(test)]
             Self::Scripted { available, .. } => available(membership, destination),
         }
     }
@@ -706,7 +706,7 @@ impl Requester {
     ) -> Operation<'a, VerifiedResponse> {
         match self {
             Self::Network { .. } => self.request_direct_network(request, membership, scope),
-            #[cfg(any(test, feature = "subscription-interop"))]
+            #[cfg(test)]
             Self::Scripted {
                 request: script, ..
             } => script(request, membership, scope.clone(), true),
@@ -720,7 +720,7 @@ impl Requester {
     ) -> Operation<'a, VerifiedResponse> {
         match self {
             Self::Network { .. } => self.request_network(request, membership, scope),
-            #[cfg(any(test, feature = "subscription-interop"))]
+            #[cfg(test)]
             Self::Scripted {
                 request: script, ..
             } => script(request, membership, scope.clone(), false),
@@ -768,7 +768,7 @@ impl Requester {
                 metrics,
                 ..
             } => (forwarding, metrics),
-            #[cfg(any(test, feature = "subscription-interop"))]
+            #[cfg(test)]
             Self::Scripted { .. } => {
                 unreachable!("scripted requests are dispatched before network I/O")
             }
@@ -838,7 +838,7 @@ impl Requester {
             Self::Network { .. } => {
                 self.request_network_landing(request, membership, Some(ordinal), scope)
             }
-            #[cfg(any(test, feature = "subscription-interop"))]
+            #[cfg(test)]
             Self::Scripted {
                 request: script,
                 #[cfg(test)]
@@ -867,7 +867,7 @@ impl Requester {
                 landing: Some((own, _)),
                 ..
             } => *own == ordinal,
-            #[cfg(any(test, feature = "subscription-interop"))]
+            #[cfg(test)]
             Self::Scripted { .. } => false,
         }
     }
@@ -888,7 +888,7 @@ impl Requester {
                 metrics,
                 ..
             } => (network, paths, observer, forwarding, metrics),
-            #[cfg(any(test, feature = "subscription-interop"))]
+            #[cfg(test)]
             Self::Scripted { .. } => {
                 unreachable!("scripted requests are dispatched before network I/O")
             }
@@ -982,7 +982,7 @@ impl Requester {
     pub(crate) fn link_health(&self) -> Rc<crate::topology::LinkHealth> {
         match self {
             Self::Network { health, .. } => health.clone(),
-            #[cfg(any(test, feature = "subscription-interop"))]
+            #[cfg(test)]
             Self::Scripted { health, .. } => health.clone(),
         }
     }
@@ -1015,7 +1015,7 @@ impl Requester {
                 transfers,
                 ..
             } => (network, paths, health, forwarding, transfers),
-            #[cfg(any(test, feature = "subscription-interop"))]
+            #[cfg(test)]
             Self::Scripted { .. } => panic!("scripted candidate cannot exchange opaque envelopes"),
         };
         Box::pin(async move {
@@ -1034,7 +1034,7 @@ impl Requester {
                 .hops
                 .last()
                 .unwrap_or(&request.authentication.original);
-            let next = crate::peer::protocol::receiver(&signed_head.head)?;
+            let next = peer_wire::receiver(&signed_head.head)?;
             // A signature selects the next receiver. Never reroute this envelope
             // independently after signing, even if link health changes.
             let endpoint = network.endpoint(&membership, &next)?;
@@ -1118,7 +1118,7 @@ impl Requester {
                         Self::Network { observer, .. } => {
                             observer.result(Stage::PeerVerify, &scope, verified)
                         }
-                        #[cfg(any(test, feature = "subscription-interop"))]
+                        #[cfg(test)]
                         Self::Scripted { .. } => verified,
                     }
                 }
@@ -1178,7 +1178,7 @@ impl Requester {
     ) -> Result<transport::VerifiedExchange> {
         let forwarding = match self {
             Self::Network { forwarding, .. } => forwarding,
-            #[cfg(any(test, feature = "subscription-interop"))]
+            #[cfg(test)]
             Self::Scripted { .. } => {
                 unreachable!("scripted candidate cannot exchange opaque envelopes")
             }
@@ -1209,7 +1209,7 @@ impl Requester {
                 // All Racer outcomes use HTTP 200. Inspect the authenticated
                 // outcome, exactly as the materialized path does, not HTTP status.
                 connection.state_mut().exchange.verified_response(
-                    crate::peer::protocol::field(
+                    peer_wire::field(
                         &authentication.authentication().original.head,
                         "racer-outcome",
                     )? != "overloaded",

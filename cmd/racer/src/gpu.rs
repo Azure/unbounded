@@ -790,62 +790,23 @@ pub struct GpuHelper {
 
 impl GpuHelper {
     /// Resolve `mode` against hardware. Returns `None` when GPU mode is off.
-    pub fn start(mode: GpuMode, options: GpuOptions) -> Result<Option<Arc<Self>>> {
-        Self::start_built(
-            mode,
-            cfg!(feature = "cuda"),
-            options,
-            Box::new(racer_gpu::Gpu::load),
-        )
-    }
-
-    /// [`Self::start`] with `built` standing in for the `cuda` feature and a
-    /// custom backend loader. `loader` is not called when GPU mode is off.
+    /// `built` stands in for the `cuda` feature and `loader` loads the backend;
+    /// `loader` is not called when GPU mode is off.
     pub fn start_built(
         mode: GpuMode,
         built: bool,
         options: GpuOptions,
         loader: Loader,
     ) -> Result<Option<Arc<Self>>> {
-        match mode {
-            GpuMode::Disabled => Ok(None),
-            GpuMode::Auto if !built => {
-                eprintln!("racer: stage=gpu state=disabled reason=not-built");
-                Ok(None)
-            }
-            _ => Self::start_with_options(mode, options, loader),
-        }
-    }
-
-    /// Start the helper with a custom backend loader and the default staging cap.
-    pub fn start_with(mode: GpuMode, loader: Loader) -> Result<Option<Arc<Self>>> {
-        Self::start_with_staging(mode, crate::config::DEFAULT_GPU_STAGING_BYTES, loader)
-    }
-
-    /// Start the helper with a custom backend loader and a per-GPU staging cap.
-    pub fn start_with_staging(
-        mode: GpuMode,
-        staging_bytes: u64,
-        loader: Loader,
-    ) -> Result<Option<Arc<Self>>> {
-        let options = GpuOptions {
-            staging_bytes,
-            ..GpuOptions::default()
-        };
-        Self::start_with_options(mode, options, loader)
-    }
-
-    /// Start the helper with a custom backend loader and options.
-    pub fn start_with_options(
-        mode: GpuMode,
-        options: GpuOptions,
-        loader: Loader,
-    ) -> Result<Option<Arc<Self>>> {
-        let staging_bytes = options.staging_bytes;
-        let pci_p2pdma = options.pci_p2pdma;
         if mode == GpuMode::Disabled {
             return Ok(None);
         }
+        if mode == GpuMode::Auto && !built {
+            eprintln!("racer: stage=gpu state=disabled reason=not-built");
+            return Ok(None);
+        }
+        let staging_bytes = options.staging_bytes;
+        let pci_p2pdma = options.pci_p2pdma;
         let (jobs, receiver) = mpsc::channel();
         let (ready, started) = mpsc::sync_channel(1);
         let leaked = Arc::new(AtomicU64::new(0));
@@ -3289,8 +3250,9 @@ pub(crate) mod testing {
                 device
             })
             .collect();
-        GpuHelper::start_with_options(
+        GpuHelper::start_built(
             GpuMode::Required,
+            true,
             options,
             Box::new(move || {
                 let simulation = racer_gpu::simulation::Simulation::new(devices);

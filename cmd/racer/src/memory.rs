@@ -1877,7 +1877,7 @@ impl MemoryCache {
         }
         (idle, pinned, writer)
     }
-    #[cfg(any(test, feature = "subscription-interop"))]
+    #[cfg(test)]
     pub(crate) fn remove_cache(&self, cache: &CacheId) -> Result<()> {
         self.remove_caches(&std::collections::HashSet::from([cache.clone()]))
     }

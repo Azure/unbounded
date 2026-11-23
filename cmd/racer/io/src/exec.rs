@@ -102,7 +102,7 @@ impl Wake for TaskWaker {
         self.shared
             .queue
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .expect("ready queue lock is never poisoned")
             .push_back(self.id);
         if thread_token() != self.shared.owner
             && let Some(notify) = &self.shared.notify
@@ -205,7 +205,7 @@ impl LocalExecutor {
         self.shared
             .queue
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .expect("ready queue lock is never poisoned")
             .push_back(id);
     }
 
@@ -225,7 +225,7 @@ impl LocalExecutor {
             .shared
             .queue
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .expect("ready queue lock is never poisoned")
             .is_empty()
     }
 
@@ -233,7 +233,11 @@ impl LocalExecutor {
     pub fn run_ready(&self, budget: usize) -> usize {
         let mut batch = std::mem::take(&mut *self.batch.borrow_mut());
         {
-            let mut queue = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+            let mut queue = self
+                .shared
+                .queue
+                .lock()
+                .expect("ready queue lock is never poisoned");
             let take = queue.len().min(budget);
             batch.extend(queue.drain(..take));
         }
@@ -347,102 +351,6 @@ impl<T> Future for JoinHandle<T> {
     }
 }
 
-/// Lane hooks called once per turn.
-pub trait Tick {
-    /// Periodic application work; returns when it next needs to run.
-    fn tick(&mut self, now: Instant) -> Option<Instant> {
-        let _ = now;
-        None
-    }
-
-    /// Whether the lane should exit.
-    fn done(&self) -> bool {
-        false
-    }
-}
-
-impl Tick for () {}
-
-/// An I/O lane: reactor, executor, and application tick, as a [`Role`].
-///
-/// Each step is `reap (budget) -> run ready tasks (budget) -> tick`; parking
-/// is one `submit_and_wait` bounded by the next deadline.
-pub struct Lane<T> {
-    /// The lane reactor.
-    pub reactor: Reactor,
-
-    /// The lane executor.
-    pub executor: LocalExecutor,
-
-    /// Application hooks.
-    pub tick: T,
-
-    /// CQEs reaped per step.
-    pub reap_budget: usize,
-
-    /// Tasks polled per step.
-    pub run_budget: usize,
-}
-
-impl<T: Tick> Lane<T> {
-    /// A lane over `reactor` with default budgets (256 each).
-    pub fn new(reactor: Reactor, tick: T) -> Self {
-        let executor = LocalExecutor::new(Some(reactor.wake_handle()));
-        Self {
-            reactor,
-            executor,
-            tick,
-            reap_budget: 256,
-            run_budget: 256,
-        }
-    }
-}
-
-impl<T> Lane<T> {
-    /// Whether a step could make progress without waiting: a task is ready,
-    /// a completion (or runnable simulated operation) is ready, or a
-    /// cross-thread wake is pending.
-    pub fn has_pending_wake(&self) -> bool {
-        self.executor.has_ready() || self.reactor.has_ready()
-    }
-
-    /// Whether the lane holds unfinished work: live tasks or operations
-    /// awaiting their completion fences.
-    pub fn has_pending_work(&self) -> bool {
-        !self.executor.is_empty() || self.reactor.in_flight() > 0
-    }
-}
-
-impl<T: Tick> Role for Lane<T> {
-    /// One lane turn.
-    fn step(&mut self) -> Result<Next> {
-        self.reactor.reap(self.reap_budget)?;
-        self.executor.run_ready(self.run_budget);
-        let now = self.reactor.now();
-        let tick = self.tick.tick(now);
-        if self.tick.done() {
-            return Ok(Next::Done);
-        }
-        if self.executor.has_ready() || self.reactor.has_ready() {
-            return Ok(Next::Ready);
-        }
-        let deadline = match (self.reactor.next_deadline(), tick) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
-        Ok(deadline.map_or(Next::Idle, Next::WaitUntil))
-    }
-
-    /// Submit and wait on the ring.
-    fn park(&mut self, next: Next) -> Result<()> {
-        match next {
-            Next::Ready | Next::Done => Ok(()),
-            Next::WaitUntil(until) => self.reactor.park(Some(until)),
-            Next::Idle => self.reactor.park(None),
-        }
-    }
-}
-
 /// Per-future readiness with a thread-safe wake path to the polling owner.
 pub struct Runnable {
     ready: AtomicBool,
@@ -525,36 +433,6 @@ impl Drop for Busy<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn lane_reports_pending_wake_and_work() {
-        let os = crate::sim::SimOs::new();
-        let clock = crate::ctx::VirtualClock::new();
-        let reactor = Reactor::new(
-            crate::Driver::Sim(os.clone()),
-            crate::ring::Config::new(8),
-            crate::WorkerCtx::simulated(&clock, 1, 1),
-        )
-        .unwrap();
-        let mut lane = Lane::new(reactor, ());
-        assert!(!lane.has_pending_wake() && !lane.has_pending_work());
-        let (_left, right) = os.socket_pair();
-        let recv = lane.reactor.recv(
-            std::rc::Rc::new(right),
-            vec![0; 4],
-            (),
-            &crate::OpCtx::none(),
-        );
-        lane.executor.spawn_detached(async move {
-            let _ = recv.await;
-        });
-        assert!(lane.has_pending_wake() && lane.has_pending_work());
-        while lane.step().unwrap() == Next::Ready {}
-        // The receive waits for a peer: work is pending, nothing wakes it.
-        assert!(!lane.has_pending_wake());
-        assert!(lane.has_pending_work());
-        assert_eq!(lane.reactor.in_flight(), 1);
-    }
 
     #[test]
     fn tasks_run_once_per_wake_and_join() {

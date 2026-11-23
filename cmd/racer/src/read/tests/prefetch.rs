@@ -227,7 +227,7 @@ fn bad_bodies_and_draining_nodes_get_json_errors() {
     );
     assert_eq!(status_code(&response), 400);
     assert_eq!(json(&response)["code"], "invalid_request");
-    local.prefetch_directory().prefetch.stop();
+    local.prefetch_directory().node().prefetch.stop();
     let response = run(&mut f, &mut endpoint, &local, PrefetchRequest::List, b"");
     assert_eq!(status_code(&response), 503);
     assert_eq!(json(&response)["code"], "unavailable");

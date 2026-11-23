@@ -92,12 +92,6 @@ impl Mailbox {
         )
     }
 }
-impl std::ops::Deref for Mailbox {
-    type Target = Handoff;
-    fn deref(&self) -> &Handoff {
-        &self.inner
-    }
-}
 
 /// One worker's view of the [`NodeDirectory`]: the shared map and mailboxes
 /// plus this worker's own coordinator, bound by [`WorkerDirectory::install`].
@@ -108,13 +102,6 @@ impl std::ops::Deref for Mailbox {
 pub struct WorkerDirectory {
     shared: Arc<NodeDirectory>,
     local: RefCell<Option<(WorkerId, Weak<Coordinator>)>>,
-}
-
-impl std::ops::Deref for WorkerDirectory {
-    type Target = NodeDirectory;
-    fn deref(&self) -> &NodeDirectory {
-        &self.shared
-    }
 }
 
 /// The map is immutable for the lifetime of this directory. Construct a replacement
@@ -246,14 +233,15 @@ pub struct WorkerEndpoint {
 impl WorkerDirectory {
     #[cfg(test)]
     pub(super) fn test_observation_mailbox(&self) -> usize {
-        for mailbox in &self.mailboxes {
-            if !mailbox.has_queued() && mailbox.outstanding() == 0 {
-                let _ = mailbox.install();
+        for mailbox in &self.shared.mailboxes {
+            if !mailbox.inner.has_queued() && mailbox.inner.outstanding() == 0 {
+                let _ = mailbox.inner.install();
             }
         }
-        self.mailboxes
+        self.shared
+            .mailboxes
             .iter()
-            .map(|mailbox| mailbox.outstanding())
+            .map(|mailbox| mailbox.inner.outstanding())
             .sum()
     }
     /// Scheduler fanout bypasses Fill flights. Count each consuming subscription
@@ -265,7 +253,7 @@ impl WorkerDirectory {
         page: PageResult,
         scope: &RequestScope,
     ) {
-        let Ok(owner) = self.page_owner(page.plaintext.page()) else {
+        let Ok(owner) = self.shared.page_owner(page.plaintext.page()) else {
             return;
         };
         // Reserve bounded worker-owned progress BEFORE retaining a mailbox
@@ -282,7 +270,7 @@ impl WorkerDirectory {
                     Ok::<(), Error>(())
                 }));
             }
-        } else if let Ok(receipt) = self.submit(owner, Work::Observed(page), scope, None) {
+        } else if let Ok(receipt) = self.shared.submit(owner, Work::Observed(page), scope, None) {
             permit.submit_detached(Box::pin(async move {
                 let _ = receipt.await;
                 Ok::<(), Error>(())
@@ -294,11 +282,12 @@ impl WorkerDirectory {
         page: PageId,
         scope: &RequestScope,
     ) -> Result<Option<PageResult>> {
-        let owner = self.page_owner(&page)?;
+        let owner = self.shared.page_owner(&page)?;
         if self.is_local(owner) {
             return self.local()?.fill.cached_page(&page, scope);
         }
         match self
+            .shared
             .submit(owner, Work::Cached(page), scope, None)?
             .await?
             .value?
@@ -318,8 +307,8 @@ impl WorkerDirectory {
     ) -> Result<Operation<'static, PageResult>> {
         // Always use the owned worker driver, even for local ingress. Detaching the
         // stream must not free the provider contract before accepted I/O fences.
-        let owner = self.metadata_owner(&version.object)?;
-        let receipt = self.submit(
+        let owner = self.shared.metadata_owner(&version.object)?;
+        let receipt = self.shared.submit(
             owner,
             Work::Select(version, selection, membership, self.seal(context, scope)?),
             scope,
@@ -337,7 +326,7 @@ impl WorkerDirectory {
         copy: crate::memory::CiphertextCopy,
         scope: &RequestScope,
     ) -> Result<PageResult> {
-        let owner = self.page_owner(&copy.ciphertext.envelope().page)?;
+        let owner = self.shared.page_owner(&copy.ciphertext.envelope().page)?;
         if self.is_local(owner) {
             return self
                 .local()?
@@ -345,7 +334,9 @@ impl WorkerDirectory {
                 .accept_selected_unobserved(copy, scope)
                 .await;
         }
-        let receipt = self.submit(owner, Work::Selected(copy), scope, None)?;
+        let receipt = self
+            .shared
+            .submit(owner, Work::Selected(copy), scope, None)?;
         // Cancellation notifies the owner, but the selection keeps its provider
         // contract until its accepted crypto and publication work completes.
         let completion = std::future::poll_fn(|cx| receipt.poll_completion(cx)).await?;
@@ -360,9 +351,9 @@ impl WorkerDirectory {
     /// Do not execute commands or mark kernel/NIC operations complete here.
     #[cfg(any(test, feature = "dst"))]
     pub(crate) fn simulation_crash(&self) {
-        for mailbox in &self.mailboxes {
-            mailbox.stop_admission();
-            drop(mailbox.take_queued());
+        for mailbox in &self.shared.mailboxes {
+            mailbox.inner.stop_admission();
+            drop(mailbox.inner.take_queued());
         }
     }
     /// Select a logical worker on the single-threaded simulation scheduler.
@@ -405,8 +396,8 @@ impl WorkerDirectory {
             .dependencies
             .writer
             .index()
-            .set_hold_capacity_percent(self.spill_config().retained_percent)?;
-        let mailbox = self.mailbox(worker)?.clone();
+            .set_hold_capacity_percent(self.shared.spill_config().retained_percent)?;
+        let mailbox = self.shared.mailbox(worker)?.clone();
         {
             let mut bound = self.local.borrow_mut();
             if bound
@@ -416,7 +407,7 @@ impl WorkerDirectory {
             {
                 return Err(Error::InvalidConfiguration);
             }
-            mailbox.install()?;
+            mailbox.inner.install()?;
             *bound = Some((worker, Rc::downgrade(&local)));
         }
         Ok(WorkerEndpoint {
@@ -446,6 +437,7 @@ impl WorkerDirectory {
     }
     fn seal(&self, context: &OriginContext, scope: &RequestScope) -> Result<PeerOriginContext> {
         let sequence = self
+            .shared
             .sequence
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .map_err(|_| Error::Unavailable)?;
@@ -465,9 +457,9 @@ impl WorkerDirectory {
         until: std::time::SystemTime,
         scope: &RequestScope,
     ) -> Result<HoldEpoch> {
-        let owner = self.page_owner(page)?;
+        let owner = self.shared.page_owner(page)?;
         let pages = std::iter::once(page.number).collect::<HoldPages>();
-        let receipt = self.submit(
+        let receipt = self.shared.submit(
             owner,
             Work::Hold(page.version.clone(), pages, until),
             scope,
@@ -499,7 +491,7 @@ impl WorkerDirectory {
                 version: version.clone(),
                 number,
             };
-            if let Ok(owner) = self.page_owner(&page) {
+            if let Ok(owner) = self.shared.page_owner(&page) {
                 owners.entry((owner, epoch)).or_default().insert(number);
             }
         }
@@ -518,7 +510,7 @@ impl WorkerDirectory {
             let Ok(permit) = drivers.reserve() else {
                 continue;
             };
-            let clock = self.ctx.clock.clone();
+            let clock = self.shared.ctx.clock.clone();
             let Ok(scope) = RequestScope::with_clock(
                 request,
                 clock.now() + std::time::Duration::from_secs(30),
@@ -526,7 +518,7 @@ impl WorkerDirectory {
             ) else {
                 continue;
             };
-            if let Ok(receipt) = self.submit(
+            if let Ok(receipt) = self.shared.submit(
                 owner,
                 Work::Release(version.clone(), held, epoch),
                 &scope,
@@ -550,9 +542,11 @@ impl WorkerDirectory {
         context: &OriginContext,
         scope: &RequestScope,
     ) -> Result<Operation<'static, ()>> {
-        let owner = self.page_owner(&page)?;
+        let owner = self.shared.page_owner(&page)?;
         let work = Work::SpillFill(page, metadata, membership, self.seal(context, scope)?);
-        let receipt = self.submit(owner, work, scope, Some(super::default_budget(scope)))?;
+        let receipt = self
+            .shared
+            .submit(owner, work, scope, Some(super::default_budget(scope)))?;
         Ok(Box::pin(async move {
             match std::future::poll_fn(|cx| receipt.poll_completion(cx))
                 .await?
@@ -566,11 +560,12 @@ impl WorkerDirectory {
 
     /// Read a page this node holds: memory first, then the held disk copy.
     pub(super) async fn held_page(&self, page: PageId, scope: &RequestScope) -> Result<PageResult> {
-        let owner = self.page_owner(&page)?;
+        let owner = self.shared.page_owner(&page)?;
         if self.is_local(owner) {
             return self.local()?.fill.warm_local(&page, scope).await;
         }
         match self
+            .shared
             .submit(owner, Work::WarmLocal(page), scope, None)?
             .await?
             .value?
@@ -610,9 +605,11 @@ impl WorkerDirectory {
         context: &OriginContext,
         scope: &RequestScope,
     ) -> Result<racer_core::prefetch::PageResult> {
-        let owner = self.page_owner(&page)?;
+        let owner = self.shared.page_owner(&page)?;
         let work = Work::PrefetchFill(page, metadata, membership, self.seal(context, scope)?);
-        let receipt = self.submit(owner, work, scope, Some(super::default_budget(scope)))?;
+        let receipt = self
+            .shared
+            .submit(owner, work, scope, Some(super::default_budget(scope)))?;
         match std::future::poll_fn(|cx| receipt.poll_completion(cx))
             .await?
             .value?
@@ -624,11 +621,12 @@ impl WorkerDirectory {
 
     /// Whether the page's owning worker has it on disk.
     pub(crate) async fn probe_page(&self, page: PageId, scope: &RequestScope) -> Result<bool> {
-        let owner = self.page_owner(&page)?;
+        let owner = self.shared.page_owner(&page)?;
         if self.is_local(owner) {
             return probe(&*self.local()?, &page);
         }
         match self
+            .shared
             .submit(owner, Work::Probe(page), scope, None)?
             .await?
             .value?
@@ -648,7 +646,7 @@ impl WorkerDirectory {
         // Exclusive transfer, not a clone or reset. Cancellation leaves zero credits
         // with the caller while accepted work retains the original until fenced.
         let owned = budget.transfer();
-        let completion = self.submit(owner, work, scope, Some(owned))?.await?;
+        let completion = self.shared.submit(owner, work, scope, Some(owned))?.await?;
         *budget = completion.budget.ok_or(Error::StaleFlight)?;
         completion.value
     }
@@ -662,7 +660,7 @@ impl WorkerDirectory {
         budget: &'a mut AcquisitionBudget,
     ) -> Operation<'a, ObjectMetadata> {
         Box::pin(async move {
-            let owner = self.metadata_owner(&context.object)?;
+            let owner = self.shared.metadata_owner(&context.object)?;
             if self.is_local(owner) {
                 return self
                     .local()?
@@ -689,7 +687,7 @@ impl WorkerDirectory {
             if page.version.object != context.object {
                 return Err(Error::InvalidRequest);
             }
-            let owner = self.page_owner(&page)?;
+            let owner = self.shared.page_owner(&page)?;
             if self.is_local(owner) {
                 return self
                     .local()?
@@ -715,7 +713,7 @@ impl WorkerDirectory {
         scope: &RequestScope,
         budget: &mut AcquisitionBudget,
     ) -> Result<PageResult> {
-        let owner = self.page_owner(&page)?;
+        let owner = self.shared.page_owner(&page)?;
         if self.is_local(owner) {
             return self
                 .local()?
@@ -743,8 +741,8 @@ impl WorkerDirectory {
         if page.version.object != context.object {
             return Err(Error::InvalidRequest);
         }
-        let owner = self.page_owner(&page)?;
-        let receipt = self.submit(
+        let owner = self.shared.page_owner(&page)?;
+        let receipt = self.shared.submit(
             owner,
             Work::Fetch(page, membership, self.seal(context, scope)?),
             scope,
@@ -771,8 +769,8 @@ impl WorkerDirectory {
         if page.version.object != context.object {
             return Err(Error::InvalidRequest);
         }
-        let owner = self.page_owner(&page)?;
-        let receipt = self.submit(
+        let owner = self.shared.page_owner(&page)?;
+        let receipt = self.shared.submit(
             owner,
             Work::FetchSealed(page, membership, self.seal(context, scope)?, target),
             scope,
@@ -794,7 +792,7 @@ impl WorkerDirectory {
         passed: bool,
         scope: &RequestScope,
     ) {
-        let Ok(owner) = self.page_owner(&report.page) else {
+        let Ok(owner) = self.shared.page_owner(&report.page) else {
             return;
         };
         // A passed landed page has nothing for its owner to act on, so its
@@ -810,7 +808,7 @@ impl WorkerDirectory {
         // eligible. When the driver queue or mailbox cannot take it, retain
         // it on the owner's mailbox for the owner's next poll.
         let retain = |report: super::sealed::SealedReport| {
-            if !passed && let Ok(mailbox) = self.mailbox(owner) {
+            if !passed && let Ok(mailbox) = self.shared.mailbox(owner) {
                 mailbox.retain_failed_verdict(report);
             }
         };
@@ -825,7 +823,10 @@ impl WorkerDirectory {
             return;
         };
         let kept = (!passed).then(|| report.clone());
-        match self.submit(owner, Work::SealedVerdict(report, passed), &detached, None) {
+        match self
+            .shared
+            .submit(owner, Work::SealedVerdict(report, passed), &detached, None)
+        {
             Ok(receipt) => permit.submit_detached(Box::pin(async move {
                 let _ = receipt.await;
                 Ok::<(), Error>(())
@@ -845,11 +846,12 @@ impl WorkerDirectory {
     ) -> Operation<'a, ()> {
         Box::pin(async move {
             scope.check()?;
-            let owner = self.metadata_owner(&metadata.version.object)?;
+            let owner = self.shared.metadata_owner(&metadata.version.object)?;
             if self.is_local(owner) {
                 return self.local()?.metadata.publish_version(metadata);
             }
             match self
+                .shared
                 .submit(owner, Work::Publish(metadata), scope, None)?
                 .await?
                 .value?
@@ -878,8 +880,10 @@ impl WorkerDirectory {
         metadata: VersionMetadata,
         scope: &'a RequestScope,
     ) -> Result<Operation<'a, ()>> {
-        let owner = self.metadata_owner(&metadata.version.object)?;
-        let receipt = self.submit(owner, Work::Publish(metadata), scope, None)?;
+        let owner = self.shared.metadata_owner(&metadata.version.object)?;
+        let receipt = self
+            .shared
+            .submit(owner, Work::Publish(metadata), scope, None)?;
         Ok(Box::pin(async move {
             match receipt.await?.value? {
                 Value::Published => Ok(()),
@@ -894,11 +898,12 @@ impl WorkerDirectory {
     ) -> Operation<'a, Option<VersionMetadata>> {
         Box::pin(async move {
             let mut found: Option<VersionMetadata> = None;
-            for mailbox in &self.mailboxes {
+            for mailbox in &self.shared.mailboxes {
                 let value = if self.is_local(mailbox.worker) {
                     Value::Retained(self.local()?.fill.retained_metadata(version, scope).await?)
                 } else {
-                    self.submit(mailbox.worker, Work::Retained(version.clone()), scope, None)?
+                    self.shared
+                        .submit(mailbox.worker, Work::Retained(version.clone()), scope, None)?
                         .await?
                         .value?
                 };
@@ -926,22 +931,25 @@ impl WorkerDirectory {
                     return Err(Error::InvalidRequest);
                 }
                 crate::peer::protocol::Operation::Bootstrap { object, .. } => {
-                    self.metadata_owner(object)?
+                    self.shared.metadata_owner(object)?
                 }
-                crate::peer::protocol::Operation::Page { page, .. } => self.page_owner(page)?,
+                crate::peer::protocol::Operation::Page { page, .. } => {
+                    self.shared.page_owner(page)?
+                }
                 crate::peer::protocol::Operation::Metadata { object, .. } => {
-                    self.metadata_owner(object)?
+                    self.shared.metadata_owner(object)?
                 }
                 // Prefetch fans out from the object's metadata worker to each
                 // page's owning worker.
                 crate::peer::protocol::Operation::Prefetch { version, .. } => {
-                    self.metadata_owner(&version.object)?
+                    self.shared.metadata_owner(&version.object)?
                 }
             };
             if self.is_local(owner) {
                 return self.local()?.serve_peer(request, membership, scope).await;
             }
             match self
+                .shared
                 .submit(owner, Work::Peer(request, membership), scope, None)?
                 .await?
                 .value?
@@ -996,11 +1004,11 @@ impl WorkerEndpoint {
         }
     }
     pub fn stop_admission(&self) {
-        self.directory.prefetch.stop();
-        self.mailbox.stop_admission();
+        self.directory.shared.prefetch.stop();
+        self.mailbox.inner.stop_admission();
     }
     pub fn is_drained(&self) -> bool {
-        self.mailbox.outstanding() == 0
+        self.mailbox.inner.outstanding() == 0
     }
     /// Close admission and continue reaping every accepted command. An expired
     /// shutdown scope requests cancellation but never substitutes for completion.
@@ -1009,15 +1017,15 @@ impl WorkerEndpoint {
         Box::pin(std::future::poll_fn(move |cx| {
             self.apply_failed_verdicts();
             self.active
-                .poll_drain(&self.mailbox, scope, cx, self.local.clone())
+                .poll_drain(&self.mailbox.inner, scope, cx, self.local.clone())
         }))
     }
     /// Register a reactor waker and execute at most `work_budget` command/poll steps.
     pub fn poll(&mut self, cx: &mut Context<'_>, work_budget: usize) -> Result<()> {
         self.apply_failed_verdicts();
-        self.directory.prefetch.tick();
+        self.directory.shared.prefetch.tick();
         self.active
-            .poll(&self.mailbox, cx, work_budget, self.local.clone())
+            .poll(&self.mailbox.inner, cx, work_budget, self.local.clone())
     }
     pub fn poll_budgeted(&mut self, work_budget: usize) -> Result<()> {
         let waker = futures::task::noop_waker();
@@ -1027,9 +1035,9 @@ impl WorkerEndpoint {
     /// node-wide prefetch expiry. The owning lane parks no later than this.
     pub fn next_deadline(&self) -> Option<std::time::Instant> {
         self.active
-            .next_deadline(&self.mailbox)
+            .next_deadline(&self.mailbox.inner)
             .into_iter()
-            .chain(self.directory.prefetch.next_wake())
+            .chain(self.directory.shared.prefetch.next_wake())
             .min()
     }
     pub fn uninstall(&mut self) -> Result<()> {
@@ -1037,7 +1045,7 @@ impl WorkerEndpoint {
         if !self.is_drained() || !self.active.is_empty() {
             return Err(Error::Unavailable);
         }
-        self.mailbox.uninstall()?;
+        self.mailbox.inner.uninstall()?;
         self.directory.local.borrow_mut().take();
         Ok(())
     }
@@ -1048,7 +1056,7 @@ impl Drop for WorkerEndpoint {
         self.directory.local.borrow_mut().take();
         // Queued work has not started and can be fenced as non-submission. Drop
         // outside the mailbox lock because its permit releases against that lock.
-        Executor::reject_queued(&self.mailbox, Error::Unavailable);
+        Executor::reject_queued(&self.mailbox.inner, Error::Unavailable);
     }
 }
 
@@ -1242,7 +1250,7 @@ async fn execute(
         }
         Work::Fetch(page, membership, envelope) => {
             // A demand read joining a prefetch flight promotes it.
-            let _promoted = local.streams.directory().prefetch.promote(&page);
+            let _promoted = local.streams.directory().node().prefetch.promote(&page);
             let context = local.open_context(envelope)?;
             local
                 .fill
@@ -1258,7 +1266,7 @@ async fn execute(
         }
         Work::FetchSealed(page, membership, envelope, target) => {
             // A demand read joining a prefetch flight promotes it.
-            let _promoted = local.streams.directory().prefetch.promote(&page);
+            let _promoted = local.streams.directory().node().prefetch.promote(&page);
             let context = local.open_context(envelope)?;
             local
                 .fill
@@ -1443,7 +1451,7 @@ mod tests {
                 version: version(),
                 number: crate::model::PageNumber(number),
             })
-            .find(|page| directory.page_owner(page).unwrap() == worker)
+            .find(|page| directory.shared.page_owner(page).unwrap() == worker)
             .unwrap()
     }
     fn failed_report(page: PageId) -> super::super::sealed::SealedReport {
@@ -1506,7 +1514,11 @@ mod tests {
         }
         drop(full);
         assert_eq!(applied_by_owner(&env, &directory), 1);
-        assert!(directory.mailboxes[1].take_failed_verdicts().is_empty());
+        assert!(
+            directory.shared.mailboxes[1]
+                .take_failed_verdicts()
+                .is_empty()
+        );
     }
     #[test]
     fn failed_sealed_verdict_survives_full_mailbox() {
@@ -1522,17 +1534,20 @@ mod tests {
             )
             .unwrap(),
         );
-        directory.mailboxes[1].install().unwrap();
+        directory.shared.mailboxes[1].inner.install().unwrap();
         let page = page_owned_by(&directory, WorkerId(1));
         {
             let (local, _fixture) = crate::read::tests::admission_coordinator(&env);
             let _local = directory.simulation_scope(Some((WorkerId(0), local)));
             // The first verdict takes the only mailbox slot; the second is retained.
             directory.report_sealed(&queue, failed_report(page.clone()), false, &scope());
-            assert_eq!(directory.mailboxes[1].outstanding(), 1);
+            assert_eq!(directory.shared.mailboxes[1].inner.outstanding(), 1);
             directory.report_sealed(&queue, failed_report(page), false, &scope());
         }
-        assert_eq!(directory.mailboxes[1].take_failed_verdicts().len(), 1);
+        assert_eq!(
+            directory.shared.mailboxes[1].take_failed_verdicts().len(),
+            1
+        );
     }
     /// Run `report_sealed` for a landed page owned by worker 1 from worker 0,
     /// and return worker 0's new CorruptMiss count and worker 1's mailbox.
@@ -1548,7 +1563,7 @@ mod tests {
             )
             .unwrap(),
         );
-        directory.mailboxes[1].install().unwrap();
+        directory.shared.mailboxes[1].inner.install().unwrap();
         let page = page_owned_by(&directory, WorkerId(1));
         let (local, _fixture) = crate::read::tests::admission_coordinator(env);
         let before = local
@@ -1564,8 +1579,12 @@ mod tests {
             .metrics
             .count(crate::telemetry::Event::CorruptMiss)
             - before;
-        let outstanding = directory.mailboxes[1].outstanding();
-        assert!(directory.mailboxes[1].take_failed_verdicts().is_empty());
+        let outstanding = directory.shared.mailboxes[1].inner.outstanding();
+        assert!(
+            directory.shared.mailboxes[1]
+                .take_failed_verdicts()
+                .is_empty()
+        );
         (local_misses, outstanding)
     }
     #[test]
@@ -1586,12 +1605,14 @@ mod tests {
         let directory = directory(1);
         let page = page_owned_by(&directory, WorkerId(1));
         for _ in 0..FAILED_VERDICT_LIMIT {
-            assert!(directory.mailboxes[1].retain_failed_verdict(failed_report(page.clone())));
+            assert!(
+                directory.shared.mailboxes[1].retain_failed_verdict(failed_report(page.clone()))
+            );
         }
-        assert!(!directory.mailboxes[1].retain_failed_verdict(failed_report(page.clone())));
-        assert!(!directory.mailboxes[1].retain_failed_verdict(failed_report(page)));
+        assert!(!directory.shared.mailboxes[1].retain_failed_verdict(failed_report(page.clone())));
+        assert!(!directory.shared.mailboxes[1].retain_failed_verdict(failed_report(page)));
         assert_eq!(
-            directory.mailboxes[1].take_failed_verdicts().len(),
+            directory.shared.mailboxes[1].take_failed_verdicts().len(),
             FAILED_VERDICT_LIMIT
         );
         // The owner counts the drops once on its next poll.
@@ -1608,7 +1629,7 @@ mod tests {
         );
         let page = page_owned_by(&directory, WorkerId(1));
         for _ in 0..FAILED_VERDICT_LIMIT + 2 {
-            directory.mailboxes[1].retain_failed_verdict(failed_report(page.clone()));
+            directory.shared.mailboxes[1].retain_failed_verdict(failed_report(page.clone()));
         }
         let (owner, _fixture) = crate::read::tests::admission_coordinator(&env);
         let mut endpoint = directory.install(WorkerId(1), owner.clone()).unwrap();
@@ -1721,8 +1742,8 @@ mod tests {
             racer_io::WorkerCtx::host(),
         )
         .unwrap();
-        for mailbox in &directory.mailboxes {
-            mailbox.install().unwrap();
+        for mailbox in &directory.shared.mailboxes {
+            mailbox.inner.install().unwrap();
         }
         directory
     }
@@ -1756,17 +1777,26 @@ mod tests {
                 content_type: None,
             },
         );
-        let owner = directory.page_owner(page.plaintext.page()).unwrap();
+        let owner = directory.shared.page_owner(page.plaintext.page()).unwrap();
         let mut selected = Box::pin(directory.accept_selected(page.copy(), &scope));
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         assert!(selected.as_mut().poll(&mut cx).is_pending());
-        let command = directory.mailbox(owner).unwrap().pop().unwrap();
+        let command = directory
+            .shared
+            .mailbox(owner)
+            .unwrap()
+            .inner
+            .pop()
+            .unwrap();
         assert!(
             matches!(&command.work, Work::Selected(copy) if copy.metadata.version == version())
         );
         scope.cancel().unwrap();
         assert!(selected.as_mut().poll(&mut cx).is_pending());
-        assert_eq!(directory.mailbox(owner).unwrap().outstanding(), 1);
+        assert_eq!(
+            directory.shared.mailbox(owner).unwrap().inner.outstanding(),
+            1
+        );
         command
             .reply
             .complete(
@@ -1782,7 +1812,10 @@ mod tests {
             Poll::Ready(Err(Error::Canceled))
         ));
         drop((selected, command));
-        assert_eq!(directory.mailbox(owner).unwrap().outstanding(), 0);
+        assert_eq!(
+            directory.shared.mailbox(owner).unwrap().inner.outstanding(),
+            0
+        );
     }
 
     #[test]
@@ -1805,8 +1838,8 @@ mod tests {
                     content_type: None,
                 },
             );
-            let owner = directory.page_owner(page.plaintext.page()).unwrap();
-            let mailbox = directory.mailbox(owner).unwrap().clone();
+            let owner = directory.shared.page_owner(page.plaintext.page()).unwrap();
+            let mailbox = directory.shared.mailbox(owner).unwrap().clone();
             let mut endpoint = WorkerEndpoint {
                 mailbox: mailbox.clone(),
                 directory: directory.clone(),
@@ -1822,8 +1855,8 @@ mod tests {
             let waker = Waker::from(count.clone());
             let mut cx = Context::from_waker(&waker);
             assert!(selected.as_mut().poll(&mut cx).is_pending());
-            assert!(mailbox.has_queued());
-            assert_eq!(mailbox.outstanding(), 1);
+            assert!(mailbox.inner.has_queued());
+            assert_eq!(mailbox.inner.outstanding(), 1);
             assert_eq!(
                 admission.used(ResourceClass::Ciphertext),
                 page_alloc::buf::GRANULE
@@ -1841,14 +1874,18 @@ mod tests {
                 count.count() > before,
                 "queued completion must wake its waiter"
             );
-            assert!(!mailbox.has_queued());
+            assert!(!mailbox.inner.has_queued());
             assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
-            assert_eq!(mailbox.outstanding(), 1, "unread receipt retains its slot");
+            assert_eq!(
+                mailbox.inner.outstanding(),
+                1,
+                "unread receipt retains its slot"
+            );
             assert!(matches!(
                 selected.as_mut().poll(&mut cx),
                 Poll::Ready(Err(Error::Canceled))
             ));
-            assert_eq!(mailbox.outstanding(), 0);
+            assert_eq!(mailbox.inner.outstanding(), 0);
             assert_eq!(drain.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
             drop(drain);
             assert!(
@@ -1865,7 +1902,7 @@ mod tests {
         for detach in [false, true] {
             let directory = Rc::new(directory(1));
             let mut endpoint = WorkerEndpoint {
-                mailbox: directory.mailboxes[0].clone(),
+                mailbox: directory.shared.mailboxes[0].clone(),
                 directory: directory.clone(),
                 local: crate::test_support::wake_test_coordinator(&env),
                 active: Executor::default(),
@@ -1877,6 +1914,7 @@ mod tests {
                 .unwrap();
             budget.charge_links(3).unwrap();
             let mut receipt = directory
+                .shared
                 .submit(
                     WorkerId(0),
                     Work::Retained(version()),
@@ -1890,7 +1928,7 @@ mod tests {
             let mut drain = endpoint.drain(&shutdown);
             if detach {
                 drop(receipt);
-                assert_eq!(directory.mailboxes[0].outstanding(), 1);
+                assert_eq!(directory.shared.mailboxes[0].inner.outstanding(), 1);
                 assert_eq!(drain.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
             } else {
                 assert!(drain.as_mut().poll(&mut cx).is_pending());
@@ -1902,12 +1940,12 @@ mod tests {
                 assert_eq!(budget.remaining_attempts(), 3);
                 assert_eq!(budget.remaining_links(), 5);
                 assert_eq!(budget.deadline(), caller.deadline.0);
-                assert_eq!(directory.mailboxes[0].outstanding(), 1);
+                assert_eq!(directory.shared.mailboxes[0].inner.outstanding(), 1);
                 drop(receipt);
                 assert_eq!(drain.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
             }
             drop(drain);
-            assert_eq!(directory.mailboxes[0].outstanding(), 0);
+            assert_eq!(directory.shared.mailboxes[0].inner.outstanding(), 0);
             assert!(endpoint.active.is_empty());
             endpoint.uninstall().unwrap();
         }
@@ -1922,11 +1960,17 @@ mod tests {
                 version: version(),
                 number: crate::model::PageNumber(9),
             };
-            let owner = directory.page_owner(&page).unwrap();
+            let owner = directory.shared.page_owner(&page).unwrap();
             let mut lookup = Box::pin(directory.cached_page(page.clone(), &scope));
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             assert!(lookup.as_mut().poll(&mut cx).is_pending());
-            let command = directory.mailbox(owner).unwrap().pop().unwrap();
+            let command = directory
+                .shared
+                .mailbox(owner)
+                .unwrap()
+                .inner
+                .pop()
+                .unwrap();
             assert!(matches!(&command.work, Work::Cached(requested) if requested == &page));
             assert!(command.budget.is_none(), "cache lookup cannot acquire");
             command
@@ -1945,7 +1989,10 @@ mod tests {
                 _ => panic!("unexpected lookup completion"),
             }
             drop((lookup, command));
-            assert_eq!(directory.mailbox(owner).unwrap().outstanding(), 0);
+            assert_eq!(
+                directory.shared.mailbox(owner).unwrap().inner.outstanding(),
+                0
+            );
         }
     }
 
@@ -1982,9 +2029,9 @@ mod tests {
             let scope = scope();
             let mut lookup = directory.retained_metadata(&version, &scope);
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-            for (mailbox, value) in directory.mailboxes.iter().zip(values) {
+            for (mailbox, value) in directory.shared.mailboxes.iter().zip(values) {
                 assert!(lookup.as_mut().poll(&mut cx).is_pending());
-                let command = mailbox.pop().unwrap();
+                let command = mailbox.inner.pop().unwrap();
                 assert!(
                     matches!(&command.work, Work::Retained(requested) if requested == &version)
                 );
@@ -2002,8 +2049,8 @@ mod tests {
             }
             assert_eq!(lookup.as_mut().poll(&mut cx), Poll::Ready(expected));
             drop(lookup);
-            for mailbox in &directory.mailboxes {
-                assert_eq!(mailbox.outstanding(), 0);
+            for mailbox in &directory.shared.mailboxes {
+                assert_eq!(mailbox.inner.outstanding(), 0);
             }
         }
     }
@@ -2015,7 +2062,7 @@ mod tests {
             for complete_before_poll in [false, true] {
                 let directory = Rc::new(directory(4));
                 let mut endpoint = WorkerEndpoint {
-                    mailbox: directory.mailboxes[0].clone(),
+                    mailbox: directory.shared.mailboxes[0].clone(),
                     directory: directory.clone(),
                     local: crate::test_support::wake_test_coordinator(&env),
                     active: Executor::default(),
@@ -2067,7 +2114,7 @@ mod tests {
         let directory = Rc::new(directory(4));
         let (local, _fixture) = crate::read::tests::admission_coordinator(&env);
         let mut endpoint = WorkerEndpoint {
-            mailbox: directory.mailboxes[0].clone(),
+            mailbox: directory.shared.mailboxes[0].clone(),
             directory: directory.clone(),
             local: local.clone(),
             active: Executor::default(),
@@ -2104,6 +2151,7 @@ mod tests {
             .unwrap(),
         );
         let mut waiting = directory
+            .shared
             .submit(
                 WorkerId(0),
                 Work::Acquire(page.clone(), membership, envelope),
@@ -2124,6 +2172,7 @@ mod tests {
         }
         assert!(Pin::new(&mut waiting).poll(&mut cx).is_pending());
         let mut other = directory
+            .shared
             .submit(WorkerId(0), Work::Cached(page), &caller, None)
             .unwrap();
         for _ in 0..8 {
@@ -2153,17 +2202,22 @@ mod tests {
         let directory = directory(1);
         let scope = scope();
         let receipt = directory
+            .shared
             .submit(WorkerId(0), Work::Retained(version()), &scope, None)
             .unwrap();
         assert!(matches!(
-            directory.submit(WorkerId(0), Work::Retained(version()), &scope, None),
+            directory
+                .shared
+                .submit(WorkerId(0), Work::Retained(version()), &scope, None),
             Err(Error::Overloaded)
         ));
-        let command = directory.mailboxes[0].pop().unwrap();
+        let command = directory.shared.mailboxes[0].inner.pop().unwrap();
         drop(receipt);
         assert!(command.reply.is_abandoned());
         assert!(matches!(
-            directory.submit(WorkerId(0), Work::Retained(version()), &scope, None),
+            directory
+                .shared
+                .submit(WorkerId(0), Work::Retained(version()), &scope, None),
             Err(Error::Overloaded)
         ));
         command
@@ -2179,13 +2233,14 @@ mod tests {
         assert!(command.reply.is_abandoned());
         drop(command);
         let next = directory
+            .shared
             .submit(WorkerId(0), Work::Retained(version()), &scope, None)
             .unwrap();
-        let command = directory.mailboxes[0].pop().unwrap();
+        let command = directory.shared.mailboxes[0].inner.pop().unwrap();
         drop(next);
-        assert_eq!(directory.mailboxes[0].outstanding(), 1);
+        assert_eq!(directory.shared.mailboxes[0].inner.outstanding(), 1);
         drop(command);
-        assert_eq!(directory.mailboxes[0].outstanding(), 0);
+        assert_eq!(directory.shared.mailboxes[0].inner.outstanding(), 0);
     }
     #[test]
     fn completion_fence_rejects_late_and_duplicate_results_and_returns_spent_budget() {
@@ -2193,6 +2248,7 @@ mod tests {
         let scope = scope();
         let mut receipt = Box::pin(
             directory
+                .shared
                 .submit(
                     WorkerId(0),
                     Work::Retained(version()),
@@ -2201,7 +2257,7 @@ mod tests {
                 )
                 .unwrap(),
         );
-        let mut command = directory.mailboxes[0].pop().unwrap();
+        let mut command = directory.shared.mailboxes[0].inner.pop().unwrap();
         let waker = futures::task::noop_waker();
         let mut cx = Context::from_waker(&waker);
         assert!(receipt.as_mut().poll(&mut cx).is_pending());
@@ -2243,7 +2299,9 @@ mod tests {
         drop(command);
         // Completed but unread replies still consume their bounded slot.
         assert!(matches!(
-            directory.submit(WorkerId(0), Work::Retained(version()), &scope, None),
+            directory
+                .shared
+                .submit(WorkerId(0), Work::Retained(version()), &scope, None),
             Err(Error::Overloaded)
         ));
         let Poll::Ready(Ok(completion)) = receipt.as_mut().poll(&mut cx) else {
@@ -2260,7 +2318,7 @@ mod tests {
         );
         assert!(matches!(completion.value, Ok(Value::Retained(None))));
         drop(receipt);
-        assert_eq!(directory.mailboxes[0].outstanding(), 0);
+        assert_eq!(directory.shared.mailboxes[0].inner.outstanding(), 0);
     }
     #[test]
     fn metadata_owner_matches_page_zero_across_versions_and_closed_mailboxes_reject() {
@@ -2269,13 +2327,23 @@ mod tests {
             version: version(),
             number: crate::model::PageNumber(0),
         };
-        let owner = directory.metadata_owner(&page.version.object).unwrap();
-        assert_eq!(directory.page_owner(&page).unwrap(), owner);
+        let owner = directory
+            .shared
+            .metadata_owner(&page.version.object)
+            .unwrap();
+        assert_eq!(directory.shared.page_owner(&page).unwrap(), owner);
         page.version.etag = StrongEtag::test_value("another-version");
-        assert_eq!(directory.page_owner(&page).unwrap(), owner);
-        directory.mailbox(owner).unwrap().stop_admission();
+        assert_eq!(directory.shared.page_owner(&page).unwrap(), owner);
+        directory
+            .shared
+            .mailbox(owner)
+            .unwrap()
+            .inner
+            .stop_admission();
         assert!(matches!(
-            directory.submit(owner, Work::Retained(version()), &scope(), None),
+            directory
+                .shared
+                .submit(owner, Work::Retained(version()), &scope(), None),
             Err(Error::Unavailable)
         ));
     }

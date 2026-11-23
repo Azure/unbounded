@@ -3455,7 +3455,7 @@ mod timeouts {
                         Deadline(call.signed_deadline),
                     )
                     .unwrap(),
-                    crate::peer::protocol::millis(racer_io::Clock::host().wall_now()).unwrap(),
+                    peer_wire::millis(racer_io::Clock::host().wall_now()).unwrap(),
                 )
                 .expect("later exchange must not renew the provider contract");
             let crate::peer::subscriptions::Selection::Leader { work, waiter } = selected else {

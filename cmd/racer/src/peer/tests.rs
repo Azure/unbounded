@@ -15,8 +15,6 @@ use crate::peer::protocol::PeerRequest;
 use crate::peer::protocol::PeerResponse;
 use crate::peer::protocol::SecurityCodec;
 use crate::peer::protocol::Signatures;
-use crate::peer::protocol::decode_envelope;
-use crate::peer::protocol::encode_envelope;
 use crate::runtime::RequestScope;
 use crate::security::EncryptedAuthorization;
 use crate::security::PeerOriginContext;
@@ -250,7 +248,7 @@ mod body_progress {
                     crate::peer::protocol::accept(&io, conn, signers[2].clone(), &server_scope)
                         .await?;
                 let received = io.receive_head(conn, &server_scope).await?;
-                let (head, _) = decode_envelope(
+                let (head, _) = peer_wire::decode_envelope(
                     received.value,
                     false,
                     crate::peer::protocol::chains(&received.connection)?,
@@ -314,7 +312,7 @@ mod body_progress {
                 let mut conn = io
                     .send_head(
                         received.connection,
-                        encode_envelope(&response.authentication, true, length + 16)?,
+                        peer_wire::encode_envelope(&response.authentication, true, length + 16)?,
                         &server_scope,
                     )
                     .await?
@@ -849,7 +847,7 @@ mod destination_disconnect {
                 mode: FetchMode::CopyOnly,
             };
             let (signed, binding) = sender.sign_request(request).unwrap();
-            let head = encode_envelope(&signed.authentication, false, 0).unwrap();
+            let head = peer_wire::encode_envelope(&signed.authentication, false, 0).unwrap();
             let client = drive(&reactor, async {
                 let sending = async {
                     let client = crate::peer::protocol::connect(
@@ -930,7 +928,7 @@ mod destination_disconnect {
                     assert_eq!(reactor.in_flight(), 0, "success must fence the FIN watch");
                     let received =
                         drive(&reactor, io.receive_head(client.connection, &parent)).unwrap();
-                    let (head, length) = decode_envelope(
+                    let (head, length) = peer_wire::decode_envelope(
                         received.value,
                         true,
                         crate::peer::protocol::chains(&received.connection).unwrap(),
@@ -1254,7 +1252,7 @@ mod encrypted_http {
                     }
                 };
                 let received = ios[1].receive_head(conn, &scope).await?;
-                let (head, _) = decode_envelope(
+                let (head, _) = peer_wire::decode_envelope(
                     received.value,
                     false,
                     crate::peer::protocol::chains(&received.connection)?,
@@ -1279,7 +1277,7 @@ mod encrypted_http {
                 let mut conn = ios[1]
                     .send_head(
                         received.connection,
-                        encode_envelope(&response.authentication, true, length + 16)?,
+                        peer_wire::encode_envelope(&response.authentication, true, length + 16)?,
                         &scope,
                     )
                     .await?
@@ -1441,8 +1439,6 @@ mod requester_safety {
     use crate::peer::Outcome;
     use crate::peer::protocol as connection;
     use crate::peer::protocol::PeerResponse;
-    use crate::peer::protocol::decode_envelope;
-    use crate::peer::protocol::encode_envelope;
     use crate::peer::transport::RelayResponse;
     use crate::peer::*;
     use crate::runtime::Reactor;
@@ -1664,7 +1660,7 @@ mod requester_safety {
             let conn = crate::http::from_accepted(fd, &admission)?;
             let conn = connection::accept(&io, conn, signers[2].clone(), &scope).await?;
             let received = io.receive_head(conn, &scope).await?;
-            let (head, length) = decode_envelope(
+            let (head, length) = peer_wire::decode_envelope(
                 received.value,
                 false,
                 crate::peer::protocol::chains(&received.connection)?,
@@ -1690,7 +1686,7 @@ mod requester_safety {
                     .unwrap()
                     .value = b"overloaded".to_vec();
             }
-            let head = encode_envelope(&response.authentication, true, 0)?;
+            let head = peer_wire::encode_envelope(&response.authentication, true, 0)?;
             let sent = io.send_head(received.connection, head, &scope).await?;
             drop(sent);
             Ok::<_, Error>(())
@@ -1984,8 +1980,8 @@ mod subscriptions {
             let first_scope = first.origin.scope().clone();
             let (first, first_binding) = senders[0].sign_request(first).unwrap();
             // Exercise the actual versioned wire and canonical logical decoding.
-            let (first, _) = decode_envelope(
-                encode_envelope(&first.authentication, false, 0).unwrap(),
+            let (first, _) = peer_wire::decode_envelope(
+                peer_wire::encode_envelope(&first.authentication, false, 0).unwrap(),
                 false,
                 &peer_wire::test_util::AnyChain,
             )
@@ -2026,8 +2022,8 @@ mod subscriptions {
             assert_eq!(grant.page.number.0, 8);
             assert_eq!(grant.receiver.0, B);
             let body = ciphertext.bytes().to_vec();
-            let (encoded, length) = decode_envelope(
-                encode_envelope(&second.authentication, true, body.len()).unwrap(),
+            let (encoded, length) = peer_wire::decode_envelope(
+                peer_wire::encode_envelope(&second.authentication, true, body.len()).unwrap(),
                 true,
                 &peer_wire::test_util::AnyChain,
             )
@@ -2198,8 +2194,8 @@ mod subscriptions {
         .unwrap();
         let contract = subscription.clone();
         let (signed, _) = sender.sign_request(request).unwrap();
-        let (wire, _) = decode_envelope(
-            encode_envelope(&signed.authentication, false, 0).unwrap(),
+        let (wire, _) = peer_wire::decode_envelope(
+            peer_wire::encode_envelope(&signed.authentication, false, 0).unwrap(),
             false,
             &peer_wire::test_util::AnyChain,
         )
@@ -2220,7 +2216,7 @@ mod subscriptions {
         other.id = [71; 16];
         let (send, receive) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
-            let now = crate::peer::protocol::millis(std::time::SystemTime::now()).unwrap();
+            let now = peer_wire::millis(std::time::SystemTime::now()).unwrap();
             let Selection::Leader { work, mut waiter } = scheduler
                 .schedule(
                     other,
@@ -2268,8 +2264,8 @@ mod subscriptions {
             mode: FetchMode::Acquire,
         };
         let (signed, binding) = sender.sign_request(request).unwrap();
-        let (wire, _) = decode_envelope(
-            encode_envelope(&signed.authentication, false, 0).unwrap(),
+        let (wire, _) = peer_wire::decode_envelope(
+            peer_wire::encode_envelope(&signed.authentication, false, 0).unwrap(),
             false,
             &peer_wire::test_util::AnyChain,
         )
@@ -2400,8 +2396,7 @@ mod subscriptions {
             // Sign directly to test receiver validation independently of sign_response.
             let mut head = crate::peer::protocol::response_head(
                 &response,
-                &crate::peer::protocol::signed_digest(&admitted.signed().authentication.original)
-                    .unwrap(),
+                &peer_wire::signed_digest(&admitted.signed().authentication.original).unwrap(),
                 &[NodeId(A.into()), NodeId(C.into())],
             )
             .unwrap();
@@ -2469,7 +2464,7 @@ mod subscriptions {
                 set(&mut local, None);
                 let older = protocol::request_head(&env.ctx.clock, &local).unwrap();
                 assert!(matches!(
-                    protocol::agrees(&head, &older, false),
+                    peer_wire::agrees(&head, &older, false).map_err(Error::from),
                     Err(Error::Unauthorized)
                 ));
                 set(&mut local, requested);
@@ -2508,10 +2503,7 @@ mod subscriptions {
                 };
                 let mut head = crate::peer::protocol::response_head(
                     &response,
-                    &crate::peer::protocol::signed_digest(
-                        &admitted.signed().authentication.original,
-                    )
-                    .unwrap(),
+                    &peer_wire::signed_digest(&admitted.signed().authentication.original).unwrap(),
                     &[NodeId(A.into()), NodeId(C.into())],
                 )
                 .unwrap();
@@ -3080,7 +3072,7 @@ mod timing {
             let auth = Forwarding::new(signers[2].clone());
             for attempt in 0..3 {
                 let received = io.receive_head(connection, &scope).await?;
-                let (head, _) = decode_envelope(
+                let (head, _) = peer_wire::decode_envelope(
                     received.value,
                     false,
                     crate::peer::protocol::chains(&received.connection)?,
@@ -3101,7 +3093,7 @@ mod timing {
                 let sent = io
                     .send_head(
                         received.connection,
-                        encode_envelope(&response.authentication, true, 19)?,
+                        peer_wire::encode_envelope(&response.authentication, true, 19)?,
                         &scope,
                     )
                     .await?;
