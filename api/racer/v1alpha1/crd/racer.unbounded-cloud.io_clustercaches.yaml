@@ -217,8 +217,10 @@ spec:
                       of revalidating it every metadataTTL. Set it only when objects are
                       immutable: pages are keyed by version, so metadata that outlives a content
                       change keeps serving the old version and reads fail with a version
-                      mismatch rather than mixing versions. Requires dataplanes that understand
-                      it; older dataplanes reject the cache.
+                      mismatch rather than mixing versions. Upgrade the authority replicas and
+                      every dataplane before any cache enables it: an older parser rejects the
+                      whole publication, including caches that do not set the field, which
+                      blocks updates for unrelated caches.
                     type: boolean
                   metadataTTL:
                     description: |-
