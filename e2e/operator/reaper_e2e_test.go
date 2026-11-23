@@ -143,13 +143,12 @@ func TestOperatorReaperMigration(t *testing.T) {
 	assertRestrictedSiteControllerPermissions(ctx, t, kubeconfig)
 
 	reaper := &operator.LegacyReaper{
-		Client:           cli,
-		APIReader:        cli,
-		TargetNamespace:  targetNS,
-		LegacyNamespaces: operator.LegacyNamespaces,
-		SkipSecretNames:  map[string]struct{}{"unbounded-net-serving-cert": {}},
-		CopyConfigMaps:   []string{"machina-config", "unbounded-net-config"},
-		Interval:         2 * time.Second,
+		Client:          cli,
+		APIReader:       cli,
+		TargetNamespace: targetNS,
+		SkipSecretNames: map[string]struct{}{"unbounded-net-serving-cert": {}},
+		CopyConfigMaps:  []string{"machina-config", "unbounded-net-config"},
+		Interval:        2 * time.Second,
 	}
 
 	runCtx, cancelRun := context.WithTimeout(ctx, 4*time.Minute)

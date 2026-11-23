@@ -16,7 +16,6 @@ import (
 	"io/fs"
 	"log/slog"
 	"path/filepath"
-	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -129,7 +128,7 @@ func (h *installHandler) execute(ctx context.Context) error {
 	// Refuse to install into a legacy namespace: the operator's migration reaper
 	// drains and deletes these namespaces, so installing into one would delete
 	// the components we just bootstrapped.
-	if slices.Contains(operator.LegacyNamespaces, h.namespace) {
+	if operator.IsLegacyNamespace(h.namespace) {
 		return fmt.Errorf(
 			"refusing to install into legacy namespace %q: the operator's migration reaper drains and deletes this namespace; choose a different --namespace (default %q)",
 			h.namespace, unbounded.SystemNamespace(),

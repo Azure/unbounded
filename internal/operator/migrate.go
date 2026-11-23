@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -60,9 +61,12 @@ const (
 	defaultReapInterval = 30 * time.Second
 )
 
-// LegacyNamespaces are the pre-consolidation namespaces components used before
-// everything moved to the unified namespace.
-var LegacyNamespaces = []string{legacyKubeNamespace, legacyNetNamespace}
+var defaultLegacyNamespaces = []string{legacyKubeNamespace, legacyNetNamespace}
+
+// IsLegacyNamespace reports whether ns is one of the reaper's default migration sources.
+func IsLegacyNamespace(ns string) bool {
+	return slices.Contains(defaultLegacyNamespaces, ns)
+}
 
 // legacySiteGVK is the pre-redesign cluster-scoped Site type in the net group.
 // Existing clusters carry these; the reaper translates them into the machina
@@ -197,7 +201,7 @@ type LegacyReaper struct {
 	// TargetNamespace is the unified namespace components are consolidated into.
 	TargetNamespace string
 
-	// LegacyNamespaces is the set of pre-consolidation namespaces to drain.
+	// LegacyNamespaces is the set of namespaces to drain. An empty list uses the operator defaults.
 	LegacyNamespaces []string
 
 	// SkipSecretNames are regenerable secrets that must not be copied (e.g. the
@@ -267,14 +271,14 @@ func (r *LegacyReaper) applyDefaults() {
 	}
 
 	if len(r.LegacyNamespaces) == 0 {
-		r.LegacyNamespaces = LegacyNamespaces
+		r.LegacyNamespaces = defaultLegacyNamespaces
 	}
 
 	// Never treat the migration target as a legacy namespace: draining and
 	// deleting it in cleanup() would destroy the namespace we just migrated
 	// into. This guards against the operator running with
 	// --namespace unbounded-kube (or unbounded-net). A fresh slice is built so
-	// the shared package-level LegacyNamespaces var is never mutated.
+	// filtering leaves the defaults and any caller-supplied slice untouched.
 	target := r.TargetNamespace
 	if target == "" {
 		target = DefaultNamespace
