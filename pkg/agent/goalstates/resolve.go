@@ -148,7 +148,7 @@ func resolveMachine(
 	nvidia := nspawnConfig.Nvidia
 	amd := nspawnConfig.AMD
 
-	ociImage := ResolveOCIImage(log, cfg.OCIImage, len(nvidia.GPUDevicePaths) > 0)
+	ociImage := cfg.MirrorReference(ResolveOCIImage(log, cfg.OCIImage, len(nvidia.GPUDevicePaths) > 0))
 
 	kubelet, err := resolveKubelet(cfg)
 	if err != nil {
@@ -217,6 +217,7 @@ func resolveMachine(
 		MachineDir:      filepath.Join("/var/lib/machines", machineName),
 		Containerd:      containerd,
 		Gantry:          ResolveGantry(cfg.Gantry),
+		RegistryMirror:  cfg.RegistryMirror,
 		Kubelet:         kubelet,
 		LocalDNS:        localDNS,
 		Nvidia:          nvidia,

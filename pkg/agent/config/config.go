@@ -59,6 +59,13 @@ type AgentConfig struct {
 	// When empty the agent uses the built-in default image.
 	OCIImage string `json:"OCIImage,omitempty"`
 
+	// RegistryMirror is the registry endpoint (host or host:port, optionally with
+	// an http:// prefix) that every OCI image and OCI artifact pull is redirected
+	// to. The mirror must expose the standard distribution API for the same
+	// repository path, so github.com/org/image:v1 is pulled from
+	// <mirror>/github.com/org/image:v1. Empty leaves pulls unchanged.
+	RegistryMirror string `json:"RegistryMirror,omitempty"`
+
 	// Isolation selects where the node stack runs: nspawn, none or container.
 	// Empty means nspawn, which is also what every config written before this
 	// field existed means. Only the modes this agent can operate are accepted,
@@ -221,6 +228,41 @@ func (a *AgentOfflineArtifacts) DeepCopy() *AgentOfflineArtifacts {
 // OfflineArtifactsConfigured reports whether an offline artifact source is configured.
 func (a *AgentConfig) OfflineArtifactsConfigured() bool {
 	return a != nil && a.OfflineArtifacts != nil && strings.TrimSpace(a.OfflineArtifacts.Source) != ""
+}
+
+// MirrorReference rewrites an OCI image reference or an oci:// artifact source
+// to pull through RegistryMirror. It returns the reference unchanged when no
+// mirror is configured or when the reference is not an OCI reference.
+func (c *AgentConfig) MirrorReference(ref string) string {
+	if ref == "" || c == nil {
+		return ref
+	}
+
+	mirror := normalizeRegistryMirror(c.RegistryMirror)
+	if mirror == "" {
+		return ref
+	}
+
+	if strings.HasPrefix(ref, "oci://") {
+		return "oci://" + mirror + "/" + strings.TrimPrefix(ref, "oci://")
+	}
+
+	// A reference that already names a scheme, such as an https archive or an
+	// oci-layout directory, is not a registry pull and is left alone.
+	if strings.Contains(ref, "://") {
+		return ref
+	}
+
+	return mirror + "/" + ref
+}
+
+// normalizeRegistryMirror strips an optional scheme prefix and trailing slashes
+// from a configured registry mirror.
+func normalizeRegistryMirror(mirror string) string {
+	mirror = strings.TrimPrefix(mirror, "http://")
+	mirror = strings.TrimPrefix(mirror, "https://")
+
+	return strings.TrimRight(mirror, "/")
 }
 
 // BackfillNodeName resolves and stores the Kubernetes Node name once. An

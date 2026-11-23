@@ -128,6 +128,15 @@ type BuildAgentConfigParams struct {
 	// the agent resolves the node name from the host hostname.
 	NodeName string
 
+	// RegistryMirror redirects every OCI pull the agent makes to a local
+	// registry (e.g. "http://10.0.0.1:8880"). Empty leaves pulls unchanged.
+	RegistryMirror string
+
+	// OfflineArtifactsSource is an OCI artifact holding the node bootstrap
+	// bundle. When set, the agent takes its binary and container image
+	// downloads from the bundle instead of the upstream locations.
+	OfflineArtifactsSource string
+
 	// ExperimentalContainerIsolation opts the agent in to the experimental
 	// container isolation mode (Experimental.ContainerIsolation). It is set
 	// for every Machine the caller provisions, not only for one that declares
@@ -210,11 +219,16 @@ func BuildAgentConfig(params BuildAgentConfigParams) UnboundedAgentConfig {
 				Labels:             labels,
 				RegisterWithTaints: taints,
 			},
-			OCIImage:  ociImage,
-			Isolation: string(machine.Spec.Isolation),
-			LocalDNS:  localDNS,
+			OCIImage:       ociImage,
+			Isolation:      string(machine.Spec.Isolation),
+			LocalDNS:       localDNS,
+			RegistryMirror: params.RegistryMirror,
 		},
 		Downloads: downloads,
+	}
+
+	if params.OfflineArtifactsSource != "" {
+		cfg.OfflineArtifacts = &AgentOfflineArtifacts{Source: params.OfflineArtifactsSource}
 	}
 
 	if params.AttestURL != "" {

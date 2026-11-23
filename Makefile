@@ -108,6 +108,10 @@ MACHINE_OPS_SITE ?=
 METALMAN_BIN=bin/metalman
 METALMAN_CMD=./cmd/metalman
 NETBOOT_IMAGE ?= $(CONTAINER_REGISTRY)/netboot:$(VERSION_TAG)
+# Offline agent bootstrap bundle pre-warmed by metalman for the cluster's
+# Kubernetes version. {{.KubernetesVersion}} is rendered by serve-pxe.
+BOOTSTRAP_ARTIFACTS_REPOSITORY ?= $(CONTAINER_REGISTRY)/unbounded/bootstrap-artifacts
+BOOTSTRAP_ARTIFACTS_REF ?= $(BOOTSTRAP_ARTIFACTS_REPOSITORY):$(VERSION_TAG)-k8s-{{.KubernetesVersion}}
 
 UNBOUNDED_OPERATOR_BIN=bin/unbounded-operator
 UNBOUNDED_OPERATOR_CMD=./cmd/unbounded-operator
@@ -183,7 +187,8 @@ BUILD_TIME ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 STAMP_LDFLAGS=-X github.com/Azure/unbounded/internal/version.Version=$(VERSION) \
               -X github.com/Azure/unbounded/internal/version.GitCommit=$(GIT_COMMIT) \
               -X github.com/Azure/unbounded/internal/version.BuildTime=$(BUILD_TIME)
-METALMAN_LDFLAGS=$(STAMP_LDFLAGS) -X github.com/Azure/unbounded/internal/metalman/commands.DefaultNetbootImage=$(NETBOOT_IMAGE)
+METALMAN_LDFLAGS=$(STAMP_LDFLAGS) -X github.com/Azure/unbounded/internal/metalman/commands.DefaultNetbootImage=$(NETBOOT_IMAGE) \
+                   -X github.com/Azure/unbounded/internal/metalman/commands.DefaultBootstrapArtifactsRef=$(BOOTSTRAP_ARTIFACTS_REF)
 
 METALMAN_IMAGE=$(CONTAINER_REGISTRY)/metalman:$(VERSION_TAG)
 

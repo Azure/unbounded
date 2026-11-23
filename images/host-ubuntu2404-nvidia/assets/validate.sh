@@ -68,6 +68,8 @@ echo "kernel: $KVER"
 for path in /etc /var /etc/netplan /etc/cloud/cloud.cfg /usr/bin/cloud-init \
   /usr/sbin/netplan /usr/sbin/sshd /usr/bin/growpart \
   "/boot/vmlinuz-$KVER" "/boot/initrd.img-$KVER" \
+  /usr/bin/systemd-nspawn /usr/sbin/nft /usr/bin/curl /usr/bin/nsenter \
+  /usr/bin/lsblk /usr/bin/mountpoint \
   /usr/bin/nvidia-smi /usr/bin/nvidia-modprobe /usr/bin/nv-fabricmanager \
   /usr/bin/nvidia-fabricmanager-start.sh /opt/nvidia/nvlsm/sbin/nvlsm \
   /usr/share/nvidia/nvswitch/fabricmanager.cfg \
