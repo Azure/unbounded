@@ -51,7 +51,7 @@
   {"name": "RACER_PEER_RECEIVE_QUEUE_MAX", "owner": "dataplane", "scope": "node", "kind": "unsigned", "min": "1", "max": "65536", "step": "1", "default": "256", "empty_unset": false},
   {"name": "RACER_PEER_RECEIVE_WAIT_MS", "owner": "dataplane", "scope": "node", "kind": "unsigned", "min": "1", "max": "30000", "step": "1", "default": "1000", "empty_unset": false},
   {"name": "RACER_PAGE_HEDGE_DELAY_MS", "owner": "dataplane", "scope": "node", "kind": "unsigned", "min": "1", "max": "30000", "step": "1", "default": "100", "empty_unset": false},
-  {"name": "RACER_PAGE_HEDGE_SLOTS", "owner": "dataplane", "scope": "node", "kind": "unsigned", "min": "0", "max": "32", "step": "1", "default": "0", "empty_unset": false},
+  {"name": "RACER_PAGE_HEDGE_SLOTS", "owner": "dataplane", "scope": "node", "kind": "unsigned", "min": "0", "max": "32", "step": "1", "default": "1", "empty_unset": false},
   {"name": "RACER_PAGE_HEDGE_BYTES", "owner": "dataplane", "scope": "node", "kind": "unsigned", "min": "0", "max": "1073742336", "step": "1", "default": "33554448", "empty_unset": false},
   {"name": "RACER_REPLICA_SELECTION", "owner": "dataplane", "scope": "node", "kind": "enum", "values": ["primary", "spread"], "default": "spread", "empty_unset": false},
   {"name": "RACER_CACHE_ORIGIN_CONNECTIONS_PER_WORKER", "owner": "dataplane", "scope": "per-worker", "kind": "unsigned", "min": "1", "max": "1024", "step": "1", "default": "32", "empty_unset": false},

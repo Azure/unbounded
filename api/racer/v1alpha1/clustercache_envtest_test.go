@@ -84,6 +84,7 @@ func TestEnvtestClusterCacheOriginValidation(t *testing.T) {
 		"workload identity": {"origin": azureCredential(map[string]any{"workloadIdentity": map[string]any{"clientID": testClientID, "tenantID": testClientID}})},
 		"tuning": {"origin": withOrigin(func(o map[string]any) {
 			o["metadataTTL"] = "0s"
+			o["metadataImmutable"] = true
 			o["requestTimeout"] = "1m30s"
 			o["maxConcurrentRequests"] = int64(65536)
 		})},
@@ -174,6 +175,7 @@ func TestEnvtestClusterCacheOriginValidation(t *testing.T) {
 	t.Run("preserves fields", func(t *testing.T) {
 		spec := map[string]any{"origin": withOrigin(func(o map[string]any) {
 			o["metadataTTL"] = "10s"
+			o["metadataImmutable"] = true
 			o["requestTimeout"] = "2m0s"
 			o["maxConcurrentRequests"] = int64(32)
 			o["azure"] = map[string]any{
@@ -188,6 +190,8 @@ func TestEnvtestClusterCacheOriginValidation(t *testing.T) {
 		origin := cache.Spec.Origin
 		require.NotNil(t, origin)
 		require.Equal(t, "10s", origin.MetadataTTL.Duration.String())
+		require.NotNil(t, origin.MetadataImmutable)
+		require.True(t, *origin.MetadataImmutable)
 		require.Equal(t, "2m0s", origin.RequestTimeout.Duration.String())
 		require.Equal(t, int32(32), *origin.MaxConcurrentRequests)
 		require.Equal(t, "https://account.blob.core.windows.net/models", origin.Azure.ContainerURL)
@@ -302,6 +306,7 @@ func TestEnvtestClusterCacheOriginValidation(t *testing.T) {
 
 	mutable := map[string]func(map[string]any){
 		"metadataTTL":           func(o map[string]any) { o["metadataTTL"] = "5s" },
+		"metadataImmutable":     func(o map[string]any) { o["metadataImmutable"] = true },
 		"requestTimeout":        func(o map[string]any) { o["requestTimeout"] = "2m0s" },
 		"maxConcurrentRequests": func(o map[string]any) { o["maxConcurrentRequests"] = int64(8) },
 		"credential": func(o map[string]any) {

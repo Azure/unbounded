@@ -2570,9 +2570,10 @@ mod tests {
         }
     }
     #[test]
-    fn page_hedges_are_off_by_default_and_require_bounded_capacity() {
-        assert_eq!(parse(&[]).unwrap().page_hedge.slots, 0);
-        assert!(parse(&[("RACER_PAGE_HEDGE_SLOTS", "1")]).is_ok());
+    fn page_hedges_are_on_by_default_and_require_bounded_capacity() {
+        assert_eq!(parse(&[]).unwrap().page_hedge.slots, 1);
+        assert!(parse(&[("RACER_PAGE_HEDGE_SLOTS", "0")]).is_ok());
+        assert!(parse(&[("RACER_PAGE_HEDGE_SLOTS", "2")]).is_ok());
         for pairs in [
             vec![("RACER_PAGE_HEDGE_SLOTS", "33")],
             vec![("RACER_PAGE_HEDGE_DELAY_MS", "0")],

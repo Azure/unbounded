@@ -2985,9 +2985,9 @@ fn validate_payload(response: &PeerResponse, operation: &PeerOperation) -> Resul
     }
 }
 
-// Opt-in, node-shared speculative page hedging (`RACER_PAGE_HEDGE_SLOTS=0` disables it;
-// `RACER_PAGE_HEDGE_DELAY_MS` defaults to 100, `RACER_PAGE_HEDGE_BYTES` to one duplicate
-// plaintext+ciphertext pair). Only non-owner plaintext page reads with two direct healthy owners
+// Node-shared speculative page hedging, on by default with one slot (`RACER_PAGE_HEDGE_SLOTS=0`
+// disables it; `RACER_PAGE_HEDGE_DELAY_MS` defaults to 100, `RACER_PAGE_HEDGE_BYTES` to one
+// duplicate plaintext+ciphertext pair). Only non-owner plaintext page reads with two direct healthy owners
 // race, over pinned first hops. Credits are partitioned, never replenished; duplicate escrow is held
 // on top of buffer quota, and admission preflights both contender buffers before spending credits,
 // so low quotas fall back to the serial walk. The serial continuation skips the consumed primary.
@@ -3009,7 +3009,7 @@ impl Default for HedgeConfig {
     fn default() -> Self {
         Self {
             delay: Duration::from_millis(100),
-            slots: 0,
+            slots: 1,
             bytes: DUPLICATE_BYTES,
         }
     }
@@ -5178,8 +5178,20 @@ pub(super) mod tests {
             drop(permit);
             assert!(owner.acquire(MAX_PAGE).is_ok());
             assert!(
-                !Hedges::new(
+                Hedges::new(
                     HedgeConfig::default(),
+                    Metrics::default(),
+                    sim_ctx.clock.clone()
+                )
+                .unwrap()
+                .enabled()
+            );
+            assert!(
+                !Hedges::new(
+                    HedgeConfig {
+                        slots: 0,
+                        ..HedgeConfig::default()
+                    },
                     Metrics::default(),
                     sim_ctx.clock.clone()
                 )

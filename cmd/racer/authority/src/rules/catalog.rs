@@ -126,12 +126,18 @@ fn origin_definition(
             .and_then(|n| u32::try_from(n).ok())
             .ok_or(invalid)?,
     };
+    let metadata_immutable = match present(origin, "metadataImmutable") {
+        None => false,
+        Some(Value::Bool(b)) => b,
+        Some(_) => return Err(invalid),
+    };
     let definition = wire::OriginDefinition {
         azure: wire::AzureOriginDefinition {
             container_url: wire::AzureContainerUrl::parse(&url)?,
             credential,
         },
         metadata_ttl: duration("metadataTTL", wire::DEFAULT_ORIGIN_METADATA_TTL, false)?,
+        metadata_immutable,
         request_timeout: duration("requestTimeout", wire::DEFAULT_ORIGIN_REQUEST_TIMEOUT, true)?,
         max_concurrent_requests,
     };
@@ -575,7 +581,14 @@ mod tests {
         assert_eq!(o.metadata_ttl, std::time::Duration::from_secs(90));
         assert_eq!(o.request_timeout, std::time::Duration::from_secs(5));
         assert_eq!(o.max_concurrent_requests, 7);
+        assert!(!o.metadata_immutable);
         assert_eq!(o.azure.container_url.account_path(), Some("acct"));
+        let o = parse(serde_json::json!({
+            "metadataImmutable":true,"azure":{"containerURL":url}
+        }))
+        .unwrap()
+        .unwrap();
+        assert!(o.metadata_immutable);
 
         for (credential, want) in [
             (
@@ -630,6 +643,8 @@ mod tests {
             serde_json::json!({"azure":{"containerURL":url},"maxConcurrentRequests":65537}),
             serde_json::json!({"azure":{"containerURL":url},"maxConcurrentRequests":-1}),
             serde_json::json!({"azure":{"containerURL":url},"maxConcurrentRequests":"8"}),
+            serde_json::json!({"azure":{"containerURL":url},"metadataImmutable":"true"}),
+            serde_json::json!({"azure":{"containerURL":url},"metadataImmutable":1}),
             azure(serde_json::json!({})),
             azure(serde_json::json!({"default":{},"workloadIdentity":{"clientID":g}})),
             azure(serde_json::json!({"default":{"secretRef":{"name":"s"}}})),
