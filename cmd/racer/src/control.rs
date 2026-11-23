@@ -241,7 +241,8 @@ impl Availability {
     }
 
     /// Freshness policy of this cache's published origin. Absent when the cache
-    /// has no published origin and freshness is defined by that origin instead.
+    /// has no published origin and a self-deployed origin process defines
+    /// freshness instead.
     pub(crate) fn metadata_policy(&self, cache: &CacheId) -> Option<MetadataPolicy> {
         self.with_cache(cache, |c| {
             c.and_then(|c| c.origin.as_ref()).map(|o| MetadataPolicy {

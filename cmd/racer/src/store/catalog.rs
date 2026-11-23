@@ -1059,8 +1059,10 @@ impl Index {
         Ok(())
     }
     /// Latest freshness a fresh observation may claim right now. `None` means
-    /// the origin is immutable, or defines its own expiry because it is not an
-    /// Azure origin.
+    /// the origin is immutable, or the cache has no published origin and a
+    /// self-deployed origin process defines freshness instead. Truncating `now`
+    /// and adding the TTL matches the Azure origin because TTLs are whole
+    /// milliseconds.
     fn metadata_bound(
         &self,
         cache: &racer_wire::control::CacheId,
