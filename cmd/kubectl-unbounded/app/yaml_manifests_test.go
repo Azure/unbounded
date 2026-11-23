@@ -15,7 +15,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
-func TestApplyResourcesV2_SingleResource(t *testing.T) {
+func TestApplyManifests_SingleResource(t *testing.T) {
 	data := []byte(`apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -51,7 +51,7 @@ data:
 	require.Equal(t, []string{"test-cm"}, appliedObjects)
 }
 
-func TestApplyResourcesV2_MultipleResources(t *testing.T) {
+func TestApplyManifests_MultipleResources(t *testing.T) {
 	data := []byte(`apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -91,7 +91,7 @@ metadata:
 	require.Equal(t, []string{"cm-one", "cm-two"}, appliedObjects)
 }
 
-func TestApplyResourcesV2_EmptyDocument(t *testing.T) {
+func TestApplyManifests_EmptyDocument(t *testing.T) {
 	data := []byte(`---
 ---
 `)
@@ -109,7 +109,7 @@ func TestApplyResourcesV2_EmptyDocument(t *testing.T) {
 	require.NoError(t, err)
 }
 
-func TestApplyResourcesV2_InvalidYAML(t *testing.T) {
+func TestApplyManifests_InvalidYAML(t *testing.T) {
 	data := []byte(`not: valid: yaml: [`)
 
 	cli := fake.NewClientBuilder().Build()
