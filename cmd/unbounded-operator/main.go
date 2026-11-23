@@ -252,7 +252,6 @@ func run(ctx context.Context, cfg config) error {
 			Client:            mgr.GetClient(),
 			APIReader:         mgr.GetAPIReader(),
 			TargetNamespace:   namespace,
-			LegacyNamespaces:  operator.LegacyNamespaces,
 			SkipSecretNames:   map[string]struct{}{"unbounded-net-serving-cert": {}},
 			CopyConfigMaps:    []string{"machina-config", "unbounded-net-config"},
 			APIServerEndpoint: cfg.apiServerEndpoint,

@@ -11,6 +11,8 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/util/strategicpatch"
+
+	"github.com/Azure/unbounded/internal/operator/component"
 )
 
 // schedulingPaths are pulled out of a patch before the strategic merge and
@@ -203,7 +205,7 @@ func captureIdentity(workload *unstructured.Unstructured) identity {
 		values := map[string]any{}
 
 		for key, value := range nestedMap(workload.Object, path...) {
-			if strings.HasPrefix(key, ReservedPrefix) {
+			if strings.HasPrefix(key, component.ReservedPrefix) {
 				values[key] = deepCopyValue(value)
 			}
 		}
@@ -241,7 +243,7 @@ func restoreIdentity(workload *unstructured.Unstructured, captured identity) err
 		}
 
 		for key := range values {
-			if strings.HasPrefix(key, ReservedPrefix) {
+			if strings.HasPrefix(key, component.ReservedPrefix) {
 				delete(values, key)
 			}
 		}

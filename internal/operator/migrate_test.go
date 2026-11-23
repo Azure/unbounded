@@ -1238,10 +1238,7 @@ func TestReapOnceCompletesWhenDrained(t *testing.T) {
 func TestApplyDefaultsFiltersTargetFromLegacy(t *testing.T) {
 	// Installing into a legacy namespace must not make the reaper drain and
 	// delete the very namespace it migrated into.
-	r := &LegacyReaper{
-		TargetNamespace:  legacyKubeNamespace,
-		LegacyNamespaces: []string{legacyKubeNamespace, legacyNetNamespace},
-	}
+	r := &LegacyReaper{TargetNamespace: legacyKubeNamespace}
 	r.applyDefaults()
 
 	for _, got := range r.LegacyNamespaces {
@@ -1255,9 +1252,9 @@ func TestApplyDefaultsFiltersTargetFromLegacy(t *testing.T) {
 		t.Fatalf("expected only %q to remain, got %#v", legacyNetNamespace, r.LegacyNamespaces)
 	}
 
-	// The shared package-level var must never be mutated.
-	if len(LegacyNamespaces) != 2 {
-		t.Fatalf("shared LegacyNamespaces was mutated: %#v", LegacyNamespaces)
+	// Filtering this reaper's target must not change which namespaces kubectl rejects.
+	if !IsLegacyNamespace(legacyKubeNamespace) || !IsLegacyNamespace(legacyNetNamespace) {
+		t.Fatal("filtering the migration target changed the default legacy namespaces")
 	}
 }
 

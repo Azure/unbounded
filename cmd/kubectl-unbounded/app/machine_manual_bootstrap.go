@@ -191,7 +191,7 @@ func (h *manualBootstrapHandler) execute(ctx context.Context) error {
 
 	// Build kubernetes clients unless pre-injected (tests).
 	if h.kubeCli == nil {
-		kubeCli, kubeConfig, err := kube.ClientAndConfigFromFile(h.kubeconfigPath)
+		kubeCli, kubeConfig, err := clientAndConfigFromFile(h.kubeconfigPath)
 		if err != nil {
 			return fmt.Errorf("creating Kubernetes client: %w", err)
 		}

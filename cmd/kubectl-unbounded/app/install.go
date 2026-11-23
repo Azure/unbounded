@@ -32,7 +32,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	operatormanifests "github.com/Azure/unbounded/deploy/unbounded-operator"
-	"github.com/Azure/unbounded/internal/kube"
 	"github.com/Azure/unbounded/internal/operator"
 	"github.com/Azure/unbounded/internal/unbounded"
 )
@@ -129,7 +128,7 @@ func (h *installHandler) execute(ctx context.Context) error {
 	// Refuse to install into a legacy namespace: the operator's migration reaper
 	// drains and deletes these namespaces, so installing into one would delete
 	// the components we just bootstrapped.
-	if unbounded.IsLegacyNamespace(h.namespace) {
+	if operator.IsLegacyNamespace(h.namespace) {
 		return fmt.Errorf(
 			"refusing to install into legacy namespace %q: the operator's migration reaper drains and deletes this namespace; choose a different --namespace (default %q)",
 			h.namespace, unbounded.SystemNamespace(),
@@ -241,7 +240,7 @@ func (h *installHandler) initializeClients() error {
 		return fmt.Errorf("kubeconfig %q not readable", h.kubeconfigPath)
 	}
 
-	kubeCli, restCfg, err := kube.ClientAndConfigFromFile(h.kubeconfigPath)
+	kubeCli, restCfg, err := clientAndConfigFromFile(h.kubeconfigPath)
 	if err != nil {
 		return fmt.Errorf("creating Kubernetes client: %w", err)
 	}

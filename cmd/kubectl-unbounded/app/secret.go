@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package kube
+package app
 
 import (
 	"context"
@@ -13,7 +13,7 @@ import (
 	"k8s.io/client-go/util/retry"
 )
 
-func ApplySecret(ctx context.Context,
+func applySecret(ctx context.Context,
 	kubeCli kubernetes.Interface,
 	s *v1.SecretApplyConfiguration, opts metav1.ApplyOptions,
 ) error {

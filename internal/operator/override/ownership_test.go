@@ -46,8 +46,8 @@ func TestValidateReservesRacerOwnership(t *testing.T) {
 
 func TestApplyRestampsReservedMetadata(t *testing.T) {
 	const (
-		owned  = ReservedPrefix + "other-component-identity"
-		forged = ReservedPrefix + "not-operator-declared"
+		owned  = component.ReservedPrefix + "other-component-identity"
+		forged = component.ReservedPrefix + "not-operator-declared"
 	)
 
 	for _, path := range reservedMetadataPaths {

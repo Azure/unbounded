@@ -26,7 +26,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	"github.com/Azure/unbounded/internal/unbounded"
 )
 
 func TestConfigImage(t *testing.T) {
@@ -834,7 +833,7 @@ func TestWorkloadPredicateFiresOnOperatorMetadataDrift(t *testing.T) {
 		}}
 	}
 
-	hash := map[string]string{unbounded.ReservedPrefix + "override-hash": "h1"}
+	hash := map[string]string{ReservedPrefix + "override-hash": "h1"}
 
 	cases := map[string]struct {
 		old, updated *appsv1.DaemonSet
@@ -847,7 +846,7 @@ func TestWorkloadPredicateFiresOnOperatorMetadataDrift(t *testing.T) {
 		},
 		"override hash changed": {
 			old:     withAnnotations(1, hash),
-			updated: withAnnotations(1, map[string]string{unbounded.ReservedPrefix + "override-hash": "h2"}),
+			updated: withAnnotations(1, map[string]string{ReservedPrefix + "override-hash": "h2"}),
 			want:    true,
 		},
 		"override hash added": {
@@ -866,8 +865,8 @@ func TestWorkloadPredicateFiresOnOperatorMetadataDrift(t *testing.T) {
 		"unrelated annotation churn": {
 			old: withAnnotations(1, hash),
 			updated: withAnnotations(1, map[string]string{
-				unbounded.ReservedPrefix + "override-hash": "h1",
-				"deployment.kubernetes.io/revision":        "7",
+				ReservedPrefix + "override-hash":    "h1",
+				"deployment.kubernetes.io/revision": "7",
 			}),
 			want: false,
 		},
@@ -896,7 +895,7 @@ func TestOwnedWorkloadPredicateSharesTheSameRule(t *testing.T) {
 
 	older := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{
 		Generation:  1,
-		Annotations: map[string]string{unbounded.ReservedPrefix + "override-hash": "h1"},
+		Annotations: map[string]string{ReservedPrefix + "override-hash": "h1"},
 	}}
 	newer := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Generation: 1}}
 

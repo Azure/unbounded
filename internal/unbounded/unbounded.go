@@ -1,10 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package unbounded holds small cross-cutting helpers shared by the unbounded
-// components. It deliberately has no dependencies (other than the standard
-// library) so that any package (under cmd/, internal/, or hack/cmd/) can import
-// it without risking an import cycle.
+// Package unbounded defines the system namespace used by Unbounded components.
 package unbounded
 
 import "os"
@@ -36,31 +33,4 @@ func SystemNamespace() string {
 	}
 
 	return systemNamespace
-}
-
-// ReservedPrefix marks the labels and annotations the operator owns on the
-// objects it manages. They carry config hashes, Site scoping and override
-// visibility, so a user patch may not write them and a change to one is drift
-// the operator must repair.
-//
-// It lives here rather than beside the override allowlist because both the
-// allowlist and the workload watch predicates need it, and the override package
-// already depends on the component package that holds those predicates.
-const ReservedPrefix = "unbounded-cloud.io/"
-
-const (
-	// LegacyKubeNamespace is where machina and metalman ran before
-	// the consolidation onto SystemNamespace().
-	LegacyKubeNamespace = "unbounded-kube"
-
-	// LegacyNetNamespace is where unbounded-net ran before the consolidation.
-	LegacyNetNamespace = "unbounded-net"
-)
-
-// IsLegacyNamespace reports whether ns is one of the pre-consolidation
-// namespaces the operator's migration reaper drains and deletes. Installing
-// unbounded into one of these is unsafe: the reaper would delete the very
-// namespace it just migrated into.
-func IsLegacyNamespace(ns string) bool {
-	return ns == LegacyKubeNamespace || ns == LegacyNetNamespace
 }

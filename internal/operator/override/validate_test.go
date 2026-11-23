@@ -8,6 +8,8 @@ import (
 	"testing"
 
 	"sigs.k8s.io/yaml"
+
+	"github.com/Azure/unbounded/internal/operator/component"
 )
 
 // entryFrom builds a single sourced entry from a YAML fragment, so tests read
@@ -345,7 +347,7 @@ func TestValidateRejectsReservedMetadataPrefix(t *testing.T) {
 				t.Fatal("the reserved prefix must be rejected")
 			}
 
-			if !strings.Contains(err.Error(), ReservedPrefix) {
+			if !strings.Contains(err.Error(), component.ReservedPrefix) {
 				t.Fatalf("error = %q, want it to name the reserved prefix", err)
 			}
 		})

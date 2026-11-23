@@ -67,6 +67,31 @@ func TestInstallRejectsLegacyNamespace(t *testing.T) {
 	}
 }
 
+func TestInstallAcceptsNonLegacyNamespaces(t *testing.T) {
+	t.Setenv("POD_NAMESPACE", "")
+
+	for _, tc := range []struct{ name, namespace, want string }{
+		{"system namespace", "unbounded-system", "unbounded-system"},
+		{"unspecified namespace", "", "unbounded-system"},
+		{"default namespace", "default", "default"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cli, captured := newCapturingInstallClient()
+			h := installHandler{
+				namespace:         tc.namespace,
+				kubeResourcesCli:  cli,
+				imageRegistry:     "registry.example.com",
+				apiServerEndpoint: "https://api.example.test:6443",
+				logger:            discardLogger(),
+			}
+
+			require.NoError(t, h.execute(t.Context()))
+			require.NotNil(t, captured.deployment)
+			require.Equal(t, tc.want, captured.deployment.GetNamespace())
+		})
+	}
+}
+
 func TestInstallRefusesHelmManagedOperator(t *testing.T) {
 	helmAnnotations := map[string]string{
 		"meta.helm.sh/release-name":      "flex-operator",

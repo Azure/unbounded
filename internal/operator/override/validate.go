@@ -12,6 +12,8 @@ import (
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/util/validation"
+
+	"github.com/Azure/unbounded/internal/operator/component"
 )
 
 // knownComponents are the components that generate workloads an override can
@@ -675,9 +677,9 @@ func reportReservedKeys(value any, path string, report func(string)) {
 	sort.Strings(keys)
 
 	for _, key := range keys {
-		if strings.HasPrefix(key, ReservedPrefix) {
+		if strings.HasPrefix(key, component.ReservedPrefix) {
 			report(fmt.Sprintf("%s is reserved; the %s prefix carries operator config hashes, Site scoping and override visibility",
-				joinPath(path, key), ReservedPrefix))
+				joinPath(path, key), component.ReservedPrefix))
 		}
 	}
 }
