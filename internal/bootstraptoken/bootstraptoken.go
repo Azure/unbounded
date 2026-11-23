@@ -1,7 +1,13 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package kube
+// Package bootstraptoken defines the Kubernetes bootstrap tokens Unbounded
+// agents join a cluster with: how a token is generated, named and stored, which
+// Site it belongs to, and the group it authenticates as. kubectl,
+// token-refresher and machine-ops create these tokens, and the agent and
+// machina's CSR approver depend on their format, so every component uses this
+// package instead of its own copy.
+package bootstraptoken
 
 import (
 	"context"
@@ -22,22 +28,30 @@ import (
 )
 
 const (
-	bootstrapTokenAlphabet   = "abcdefghijklmnopqrstuvwxyz0123456789"
-	DefaultBootstrapTokenTTL = 24 * time.Hour
+	alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
+
+	// DefaultTTL is how long a new token is valid.
+	DefaultTTL = 24 * time.Hour
+
+	// Group is the extra group every token adds to the identity it
+	// authenticates. machina approves an agent daemon's client certificate
+	// request only when the requester is in this group.
+	Group = "system:bootstrappers:unbounded-agent-daemons"
 )
 
-// ErrBootstrapTokenNotFound is returned by GetBootstrapToken when no matching
-// bootstrap token secret exists in the cluster.
-var ErrBootstrapTokenNotFound = errors.New("bootstrap token not found")
+// ErrNotFound is returned by ForSite when no usable token exists for the Site.
+var ErrNotFound = errors.New("bootstrap token not found")
 
-type BootstrapToken struct {
+// Token is a bootstrap token and the metadata stored with it.
+type Token struct {
 	ID        string
 	Secret    string
 	Labels    map[string]string
 	ExpiresAt time.Time
 }
 
-func (t *BootstrapToken) WithLabel(key, value string) *BootstrapToken {
+// WithLabel sets a label on the token's Secret and returns the token.
+func (t *Token) WithLabel(key, value string) *Token {
 	if t.Labels == nil {
 		t.Labels = make(map[string]string)
 	}
@@ -47,11 +61,13 @@ func (t *BootstrapToken) WithLabel(key, value string) *BootstrapToken {
 	return t
 }
 
-func (t *BootstrapToken) String() string {
+// String returns the token with its secret masked.
+func (t *Token) String() string {
 	return fmt.Sprintf("%s.%s", t.ID, strings.Repeat("x", len(t.Secret)))
 }
 
-func NewBootstrapToken() (*BootstrapToken, error) {
+// New returns a random token that expires DefaultTTL from now.
+func New() (*Token, error) {
 	// Generate 6-character token ID
 	id, err := generateRandomString(6)
 	if err != nil {
@@ -64,19 +80,21 @@ func NewBootstrapToken() (*BootstrapToken, error) {
 		return nil, fmt.Errorf("failed to generate bootstrap token secret: %w", err)
 	}
 
-	return &BootstrapToken{ID: id, Secret: secret, ExpiresAt: time.Now().UTC().Add(DefaultBootstrapTokenTTL)}, nil
+	return &Token{ID: id, Secret: secret, ExpiresAt: time.Now().UTC().Add(DefaultTTL)}, nil
 }
 
-func ApplyBootstrapToken(ctx context.Context, kubeCli kubernetes.Interface, fieldManager string, token *BootstrapToken) error {
+// Apply creates or updates the token's Secret in kube-system with server-side
+// apply.
+func Apply(ctx context.Context, kubeCli kubernetes.Interface, fieldManager string, token *Token) error {
 	ao := metav1.ApplyOptions{
 		FieldManager: fieldManager,
 	}
 
-	name := bootstrapTokenName(token)
+	name := SecretName(token.ID)
 	s := v1.Secret(name, metav1.NamespaceSystem).
 		WithType(corev1.SecretTypeBootstrapToken).
 		WithLabels(token.Labels).
-		WithData(BootstrapTokenSecretData(token))
+		WithData(SecretData(token))
 
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		_, err := kubeCli.CoreV1().Secrets(metav1.NamespaceSystem).Apply(ctx, s, ao)
@@ -88,16 +106,16 @@ func ApplyBootstrapToken(ctx context.Context, kubeCli kubernetes.Interface, fiel
 	return nil
 }
 
-// BootstrapTokenSecretData returns the data of the bootstrap token Secret for
-// token. A zero ExpiresAt expires DefaultBootstrapTokenTTL from now.
-func BootstrapTokenSecretData(token *BootstrapToken) map[string][]byte {
+// SecretData returns the data of the token's Secret. A zero ExpiresAt expires
+// DefaultTTL from now.
+func SecretData(token *Token) map[string][]byte {
 	expiresAt := token.ExpiresAt
 	if expiresAt.IsZero() {
-		expiresAt = time.Now().UTC().Add(DefaultBootstrapTokenTTL)
+		expiresAt = time.Now().UTC().Add(DefaultTTL)
 	}
 
 	return map[string][]byte{
-		"auth-extra-groups":              []byte("system:bootstrappers:unbounded-agent-daemons"),
+		"auth-extra-groups":              []byte(Group),
 		"expiration":                     []byte(expiresAt.UTC().Format(time.RFC3339)),
 		"token-id":                       []byte(token.ID),
 		"token-secret":                   []byte(token.Secret),
@@ -106,7 +124,9 @@ func BootstrapTokenSecretData(token *BootstrapToken) map[string][]byte {
 	}
 }
 
-func GetBootstrapTokenForSite(ctx context.Context, kubeCli kubernetes.Interface, siteName string) (*BootstrapToken, error) {
+// ForSite returns the newest usable token for siteName. It returns ErrNotFound
+// when there is none.
+func ForSite(ctx context.Context, kubeCli kubernetes.Interface, siteName string) (*Token, error) {
 	l, err := kubeCli.CoreV1().Secrets(metav1.NamespaceSystem).List(ctx, metav1.ListOptions{
 		LabelSelector: fmt.Sprintf("unbounded-cloud.io/site=%s", siteName),
 	})
@@ -119,7 +139,7 @@ func GetBootstrapTokenForSite(ctx context.Context, kubeCli kubernetes.Interface,
 	for i := range l.Items {
 		secret := &l.Items[i]
 
-		if !ValidBootstrapTokenSecretForSite(secret, siteName, time.Now()) {
+		if !IsValidForSite(secret, siteName, time.Now()) {
 			continue
 		}
 
@@ -129,23 +149,22 @@ func GetBootstrapTokenForSite(ctx context.Context, kubeCli kubernetes.Interface,
 	}
 
 	if newest == nil {
-		return nil, fmt.Errorf("bootstrap token not found for site %q: %w", siteName, ErrBootstrapTokenNotFound)
+		return nil, fmt.Errorf("bootstrap token not found for site %q: %w", siteName, ErrNotFound)
 	}
 
-	return &BootstrapToken{
+	return &Token{
 		ID:        string(newest.Data["token-id"]),
 		Secret:    string(newest.Data["token-secret"]),
 		Labels:    newest.Labels,
-		ExpiresAt: bootstrapTokenExpiration(newest),
+		ExpiresAt: expiration(newest),
 	}, nil
 }
 
-// ValidBootstrapTokenSecretForSite reports whether secret contains a usable,
-// unexpired bootstrap token scoped to siteName. A MachineAllocation's token
-// carries the site label too, but belongs to that allocation alone and is
-// revoked with it, so a Secret with the allocation UID label is never a site
-// token.
-func ValidBootstrapTokenSecretForSite(secret *corev1.Secret, siteName string, now time.Time) bool {
+// IsValidForSite reports whether secret contains a usable, unexpired bootstrap
+// token scoped to siteName. A MachineAllocation's token carries the site label
+// too, but belongs to that allocation alone and is revoked with it, so a Secret
+// with the allocation UID label is never a site token.
+func IsValidForSite(secret *corev1.Secret, siteName string, now time.Time) bool {
 	if secret == nil || secret.Type != corev1.SecretTypeBootstrapToken {
 		return false
 	}
@@ -162,27 +181,27 @@ func ValidBootstrapTokenSecretForSite(secret *corev1.Secret, siteName string, no
 		return false
 	}
 
-	return !isExpiredBootstrapToken(secret, now)
+	return !isExpired(secret, now)
 }
 
-// BootstrapTokenSecretName returns the Kubernetes Secret name for a token ID.
-func BootstrapTokenSecretName(tokenID string) string {
+// SecretName returns the Kubernetes Secret name for a token ID.
+func SecretName(tokenID string) string {
 	return fmt.Sprintf("bootstrap-token-%s", tokenID)
 }
 
-// BootstrapTokenExpiration returns the expiration encoded in a bootstrap token
-// Secret. A missing or invalid expiration returns the zero time.
-func BootstrapTokenExpiration(secret *corev1.Secret) time.Time {
-	return bootstrapTokenExpiration(secret)
+// Expiration returns the expiration encoded in a bootstrap token Secret. A
+// missing or invalid expiration returns the zero time.
+func Expiration(secret *corev1.Secret) time.Time {
+	return expiration(secret)
 }
 
-func isExpiredBootstrapToken(secret *corev1.Secret, now time.Time) bool {
-	expiresAt := bootstrapTokenExpiration(secret)
+func isExpired(secret *corev1.Secret, now time.Time) bool {
+	expiresAt := expiration(secret)
 
 	return !expiresAt.IsZero() && !now.Before(expiresAt)
 }
 
-func bootstrapTokenExpiration(secret *corev1.Secret) time.Time {
+func expiration(secret *corev1.Secret) time.Time {
 	raw := strings.TrimSpace(string(secret.Data["expiration"]))
 	if raw == "" {
 		return time.Time{}
@@ -203,19 +222,15 @@ func bootstrapTokenExpiration(secret *corev1.Secret) time.Time {
 	return time.Time{}
 }
 
-func bootstrapTokenName(tok *BootstrapToken) string {
-	return BootstrapTokenSecretName(tok.ID)
-}
-
 func generateRandomString(length int) (string, error) {
 	result := make([]byte, length)
 	for i := 0; i < length; i++ {
-		num, err := rand.Int(rand.Reader, big.NewInt(int64(len(bootstrapTokenAlphabet))))
+		num, err := rand.Int(rand.Reader, big.NewInt(int64(len(alphabet))))
 		if err != nil {
 			return "", err
 		}
 
-		result[i] = bootstrapTokenAlphabet[num.Int64()]
+		result[i] = alphabet[num.Int64()]
 	}
 
 	return string(result), nil

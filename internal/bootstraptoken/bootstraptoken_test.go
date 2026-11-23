@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package kube
+package bootstraptoken
 
 import (
 	"context"
@@ -14,12 +14,12 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 )
 
-func TestApplyBootstrapTokenAddsExpiration(t *testing.T) {
+func TestApplyAddsExpiration(t *testing.T) {
 	ctx := context.Background()
 	client := fake.NewClientset()
-	token := &BootstrapToken{ID: "abc123", Secret: "0123456789abcdef"}
+	token := &Token{ID: "abc123", Secret: "0123456789abcdef"}
 
-	err := ApplyBootstrapToken(ctx, client, "test", token)
+	err := Apply(ctx, client, "test", token)
 	require.NoError(t, err)
 
 	secret, err := client.CoreV1().Secrets(metav1.NamespaceSystem).Get(ctx, "bootstrap-token-abc123", metav1.GetOptions{})
@@ -31,19 +31,19 @@ func TestApplyBootstrapTokenAddsExpiration(t *testing.T) {
 	require.True(t, expiresAt.After(time.Now()))
 }
 
-func TestGetBootstrapTokenForSiteIgnoresExpiredTokens(t *testing.T) {
+func TestForSiteIgnoresExpiredTokens(t *testing.T) {
 	ctx := context.Background()
 	client := fake.NewClientset(
 		bootstrapSecret("old123", "oldsecret0000000", "site-a", time.Now().Add(-time.Hour)),
 		bootstrapSecret("new123", "newsecret0000000", "site-a", time.Now().Add(time.Hour)),
 	)
 
-	token, err := GetBootstrapTokenForSite(ctx, client, "site-a")
+	token, err := ForSite(ctx, client, "site-a")
 	require.NoError(t, err)
 	require.Equal(t, "new123", token.ID)
 }
 
-func TestValidBootstrapTokenSecretForSite(t *testing.T) {
+func TestIsValidForSite(t *testing.T) {
 	now := time.Now()
 	valid := bootstrapSecret("abc123", "0123456789abcdef", "site-a", now.Add(time.Hour))
 	wrongType := valid.DeepCopy()
@@ -78,12 +78,12 @@ func TestValidBootstrapTokenSecretForSite(t *testing.T) {
 
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			require.Equal(t, tt.want, ValidBootstrapTokenSecretForSite(tt.secret, tt.site, now))
+			require.Equal(t, tt.want, IsValidForSite(tt.secret, tt.site, now))
 		})
 	}
 }
 
-func TestGetBootstrapTokenForSiteIgnoresAllocationTokens(t *testing.T) {
+func TestForSiteIgnoresAllocationTokens(t *testing.T) {
 	ctx := context.Background()
 	allocation := bootstrapSecret("alloc1", "allocsecret00000", "site-a", time.Now().Add(2*time.Hour))
 	allocation.Labels["unbounded-cloud.io/allocation-uid"] = "alloc-uid"
@@ -92,19 +92,19 @@ func TestGetBootstrapTokenForSiteIgnoresAllocationTokens(t *testing.T) {
 		allocation,
 	)
 
-	token, err := GetBootstrapTokenForSite(ctx, client, "site-a")
+	token, err := ForSite(ctx, client, "site-a")
 	require.NoError(t, err)
 	require.Equal(t, "site12", token.ID)
 
 	onlyAllocation := fake.NewClientset(allocation.DeepCopy())
-	_, err = GetBootstrapTokenForSite(ctx, onlyAllocation, "site-a")
-	require.ErrorIs(t, err, ErrBootstrapTokenNotFound)
+	_, err = ForSite(ctx, onlyAllocation, "site-a")
+	require.ErrorIs(t, err, ErrNotFound)
 }
 
-func TestBootstrapTokenSecretData(t *testing.T) {
+func TestSecretData(t *testing.T) {
 	expiresAt := time.Date(2026, 4, 28, 12, 0, 0, 0, time.UTC)
 
-	data := BootstrapTokenSecretData(&BootstrapToken{ID: "abc123", Secret: "0123456789abcdef", ExpiresAt: expiresAt})
+	data := SecretData(&Token{ID: "abc123", Secret: "0123456789abcdef", ExpiresAt: expiresAt})
 	require.Equal(t, map[string][]byte{
 		"auth-extra-groups":              []byte("system:bootstrappers:unbounded-agent-daemons"),
 		"expiration":                     []byte("2026-04-28T12:00:00Z"),
@@ -115,11 +115,11 @@ func TestBootstrapTokenSecretData(t *testing.T) {
 	}, data)
 }
 
-func TestBootstrapTokenExpirationAcceptsTimezoneLessUTC(t *testing.T) {
+func TestExpirationAcceptsTimezoneLessUTC(t *testing.T) {
 	secret := bootstrapSecret("abc123", "0123456789abcdef", "site-a", time.Now().Add(time.Hour))
 	secret.Data["expiration"] = []byte("2026-08-25T15:48:24")
 
-	require.Equal(t, time.Date(2026, 8, 25, 15, 48, 24, 0, time.UTC), bootstrapTokenExpiration(secret))
+	require.Equal(t, time.Date(2026, 8, 25, 15, 48, 24, 0, time.UTC), expiration(secret))
 }
 
 func bootstrapSecret(id, secret, site string, expiresAt time.Time) *corev1.Secret {

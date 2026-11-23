@@ -24,6 +24,7 @@ import (
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	netv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
+	"github.com/Azure/unbounded/internal/bootstraptoken"
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/config"
 	daemon "github.com/Azure/unbounded/pkg/agent/daemon"
@@ -464,7 +465,7 @@ func buildMachineCR(cfg *provision.AgentConfig) v1alpha3.Machine {
 		Spec: v1alpha3.MachineSpec{
 			Kubernetes: &v1alpha3.KubernetesSpec{
 				BootstrapTokenRef: &v1alpha3.LocalObjectReference{
-					Name: "bootstrap-token-" + tokenID,
+					Name: bootstraptoken.SecretName(tokenID),
 				},
 				NodeLabels:         cfg.Kubelet.Labels,
 				RegisterWithTaints: cfg.Kubelet.RegisterWithTaints,

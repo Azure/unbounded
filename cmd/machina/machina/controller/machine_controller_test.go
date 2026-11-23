@@ -21,7 +21,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	"github.com/Azure/unbounded/internal/unbounded"
+	"github.com/Azure/unbounded/internal/systemns"
 )
 
 // ---------------------------------------------------------------------------
@@ -99,7 +99,7 @@ func newSSHKeySecret(t *testing.T, name string) *corev1.Secret {
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
-			Namespace: unbounded.SystemNamespace(),
+			Namespace: systemns.Name(),
 		},
 		Data: map[string][]byte{
 			"ssh-privatekey": generateTestSSHKeyPEM(t),
@@ -810,7 +810,7 @@ func TestGetSecretValue(t *testing.T) {
 		t.Parallel()
 
 		secret := &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{Name: "my-secret", Namespace: unbounded.SystemNamespace()},
+			ObjectMeta: metav1.ObjectMeta{Name: "my-secret", Namespace: systemns.Name()},
 			Data:       map[string][]byte{"custom-key": []byte("secret-value")},
 		}
 
@@ -826,7 +826,7 @@ func TestGetSecretValue(t *testing.T) {
 		t.Parallel()
 
 		secret := &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{Name: "my-secret", Namespace: unbounded.SystemNamespace()},
+			ObjectMeta: metav1.ObjectMeta{Name: "my-secret", Namespace: systemns.Name()},
 			Data:       map[string][]byte{"ssh-privatekey": []byte("my-key")},
 		}
 
@@ -853,7 +853,7 @@ func TestGetSecretValue(t *testing.T) {
 		t.Parallel()
 
 		secret := &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{Name: "my-secret", Namespace: unbounded.SystemNamespace()},
+			ObjectMeta: metav1.ObjectMeta{Name: "my-secret", Namespace: systemns.Name()},
 			Data:       map[string][]byte{"other-key": []byte("value")},
 		}
 
@@ -982,7 +982,7 @@ func TestBuildSSHConfig(t *testing.T) {
 		t.Parallel()
 
 		secret := &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{Name: "ssh-key-secret", Namespace: unbounded.SystemNamespace()},
+			ObjectMeta: metav1.ObjectMeta{Name: "ssh-key-secret", Namespace: systemns.Name()},
 			Data:       map[string][]byte{"ssh-privatekey": []byte("not-a-valid-key")},
 		}
 

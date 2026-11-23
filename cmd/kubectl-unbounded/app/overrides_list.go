@@ -18,7 +18,7 @@ import (
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/operator/override"
-	"github.com/Azure/unbounded/internal/unbounded"
+	"github.com/Azure/unbounded/internal/systemns"
 )
 
 func overridesListCommand() *cobra.Command {
@@ -51,7 +51,7 @@ Example:
 		},
 	}
 
-	cmd.Flags().StringVar(&namespace, "namespace", unbounded.SystemNamespace(),
+	cmd.Flags().StringVar(&namespace, "namespace", systemns.Name(),
 		"Namespace holding the overrides ConfigMap")
 	cmd.Flags().StringVar(&kubeconfig, "kubeconfig", "", "Path to kubeconfig file")
 

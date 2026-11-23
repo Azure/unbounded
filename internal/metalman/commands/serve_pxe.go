@@ -31,7 +31,7 @@ import (
 	metalmachineops "github.com/Azure/unbounded/internal/metalman/machineops"
 	"github.com/Azure/unbounded/internal/metalman/netboot"
 	"github.com/Azure/unbounded/internal/metalman/redfish"
-	"github.com/Azure/unbounded/internal/unbounded"
+	"github.com/Azure/unbounded/internal/systemns"
 )
 
 // DefaultNetbootImage is the default netboot OCI image used when a Machine
@@ -77,11 +77,11 @@ func ServePXECmd() *cobra.Command {
 			leID := LeaderElectionID(site)
 
 			// Leader-election lease lives in the namespace metalman is
-			// deployed into. unbounded.SystemNamespace() sources it from the
+			// deployed into. systemns.Name() sources it from the
 			// Downward API POD_NAMESPACE env (set by the deployment) so the
 			// lease and its RBAC stay co-located even when the install
 			// namespace is overridden, falling back to the default when unset.
-			leaderElectionNamespace := unbounded.SystemNamespace()
+			leaderElectionNamespace := systemns.Name()
 
 			scheme := BuildScheme()
 

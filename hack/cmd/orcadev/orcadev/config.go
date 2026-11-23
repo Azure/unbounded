@@ -11,7 +11,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/Azure/unbounded/internal/orca/config"
-	"github.com/Azure/unbounded/internal/unbounded"
+	"github.com/Azure/unbounded/internal/systemns"
 )
 
 // azuriteWellKnownDevKey is the documented well-known shared key for
@@ -115,7 +115,7 @@ func defaultGlobalFlags() *globalFlags {
 		// preset+namespace are the structural defaults; everything
 		// else is filled by applyPresetDev below.
 		preset:    PresetDev,
-		namespace: unbounded.SystemNamespace(),
+		namespace: systemns.Name(),
 	}
 
 	applyPresetDev(g)

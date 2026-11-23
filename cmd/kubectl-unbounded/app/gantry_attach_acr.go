@@ -33,7 +33,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	"github.com/Azure/unbounded/internal/registryauth"
-	"github.com/Azure/unbounded/internal/unbounded"
+	"github.com/Azure/unbounded/internal/systemns"
 )
 
 const acrAttachManager = "unbounded-acr-attach"
@@ -61,7 +61,7 @@ func gantryCommandGroup() *cobra.Command {
 	cmd.Flags().StringVar(&h.acrID, "acr-resource-id", "", "Existing ACR Azure resource ID")
 	cmd.Flags().StringVar(&h.authMode, "auth-mode", registryauth.ExternalMode, "external preserves authentication; aks-identity-binding explicitly enables managed authentication")
 	cmd.Flags().StringVar(&h.clusterID, "cluster-resource-id", "", "AKS resource ID (required for aks-identity-binding)")
-	cmd.Flags().StringVar(&h.namespace, "namespace", unbounded.SystemNamespace(), "Operator and Gantry namespace")
+	cmd.Flags().StringVar(&h.namespace, "namespace", systemns.Name(), "Operator and Gantry namespace")
 	cmd.Flags().StringVar(&h.kubeconfig, "kubeconfig", "", "Kubeconfig path")
 	cmd.Flags().DurationVar(&h.timeout, "timeout", 10*time.Minute, "Setup and node configuration timeout")
 
