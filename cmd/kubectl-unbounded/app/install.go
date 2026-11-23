@@ -32,7 +32,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	operatormanifests "github.com/Azure/unbounded/deploy/unbounded-operator"
-	"github.com/Azure/unbounded/internal/kube"
 	"github.com/Azure/unbounded/internal/operator"
 	"github.com/Azure/unbounded/internal/unbounded"
 )
@@ -241,7 +240,7 @@ func (h *installHandler) initializeClients() error {
 		return fmt.Errorf("kubeconfig %q not readable", h.kubeconfigPath)
 	}
 
-	kubeCli, restCfg, err := kube.ClientAndConfigFromFile(h.kubeconfigPath)
+	kubeCli, restCfg, err := clientAndConfigFromFile(h.kubeconfigPath)
 	if err != nil {
 		return fmt.Errorf("creating Kubernetes client: %w", err)
 	}

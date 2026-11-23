@@ -124,7 +124,7 @@ func (h *machineRegisterHandler) execute(ctx context.Context) error {
 func (h *machineRegisterHandler) executeAfterValidation(ctx context.Context) error {
 	// Allow tests to pre-inject clients by skipping creation when already set.
 	if h.kubeCli == nil {
-		kubeCli, kubeConfig, err := kube.ClientAndConfigFromFile(h.kubeconfigPath)
+		kubeCli, kubeConfig, err := clientAndConfigFromFile(h.kubeconfigPath)
 		if err != nil {
 			return fmt.Errorf("creating Kubernetes client: %w", err)
 		}
@@ -259,7 +259,7 @@ func (h *machineRegisterHandler) executeAfterValidation(ctx context.Context) err
 		return fmt.Errorf("marshaling machine %s: %w", h.name, err)
 	}
 
-	if err := kube.ApplyManifests(ctx, h.logger, h.kubeResourcesCli, fieldManagerID, data); err != nil {
+	if err := applyManifests(ctx, h.logger, h.kubeResourcesCli, fieldManagerID, data); err != nil {
 		return fmt.Errorf("applying machine %s: %w", h.name, err)
 	}
 

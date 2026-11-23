@@ -32,7 +32,6 @@ import (
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/yaml"
 
-	"github.com/Azure/unbounded/internal/kube"
 	"github.com/Azure/unbounded/internal/registryauth"
 	"github.com/Azure/unbounded/internal/unbounded"
 )
@@ -122,7 +121,7 @@ func (h *attachACRHandler) execute(ctx context.Context) error {
 	defer cancel()
 
 	if h.client == nil {
-		h.client, h.restConfig, err = kube.ClientAndConfigFromFile(getKubeconfigPath(h.kubeconfig))
+		h.client, h.restConfig, err = clientAndConfigFromFile(getKubeconfigPath(h.kubeconfig))
 		if err != nil {
 			return err
 		}

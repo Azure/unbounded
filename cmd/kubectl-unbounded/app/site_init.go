@@ -85,7 +85,7 @@ func (h *siteInitHandler) execute(ctx context.Context) error {
 		return fmt.Errorf("validating input for site initialization %s: %w", h.name, err)
 	}
 
-	kubeCli, kubeConfig, err := kube.ClientAndConfigFromFile(h.kubeconfigPath)
+	kubeCli, kubeConfig, err := clientAndConfigFromFile(h.kubeconfigPath)
 	if err != nil {
 		return fmt.Errorf("creating Kubernetes client for site initialization %s: %w", h.name, err)
 	}
@@ -434,7 +434,7 @@ func (h *siteInitHandler) ensureUnboundedSite(ctx context.Context, cfg unbounded
 		}
 	}
 
-	if err := kube.ApplyManifests(ctx, h.logger, h.kubeResourcesCli, fieldManagerID, buf.Bytes()); err != nil {
+	if err := applyManifests(ctx, h.logger, h.kubeResourcesCli, fieldManagerID, buf.Bytes()); err != nil {
 		return fmt.Errorf("applying site manifests for %s: %w", cfg.SiteName, err)
 	}
 
