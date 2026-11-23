@@ -308,12 +308,12 @@ impl StoreReader {
         })
     }
 
-    /// Locate a published v2 record's ciphertext on its device for a direct
+    /// Locate a published page record's ciphertext on its device for a direct
     /// (cuFile) read, reading and validating only the header through host
-    /// memory. Returns None on a miss, for v1 records, and for any record
-    /// this read path would also treat as a miss. The ciphertext is not
-    /// verified here: the consumer must check the GCM tag (the GPU does)
-    /// before trusting the bytes.
+    /// memory. Returns None on a miss, for a record written in an older
+    /// format, and for any record this read path would also treat as a miss.
+    /// The ciphertext is not verified here: the consumer must check the GCM
+    /// tag (the GPU does) before trusting the bytes.
     pub(crate) fn direct_read<'a>(
         &'a self,
         page: &'a PageId,
@@ -379,7 +379,7 @@ impl StoreReader {
             };
             let decoded = match parse_prefix(buffer.bytes()?, location.extent) {
                 Ok(decoded) => decoded,
-                // A short prefix of a valid v1 record, another version, or
+                // A short prefix of a valid record, another version, or
                 // damage: the host read path classifies and reports it.
                 Err(_) => return Ok(None),
             };
@@ -403,8 +403,9 @@ impl StoreReader {
             else {
                 return Ok(None);
             };
-            // cuFile reads whole 4 KiB blocks. v2 extents are 4 KiB multiples
-            // and the ciphertext ends the record, so rounding up stays inside it.
+            // cuFile reads whole 4 KiB blocks. Record extents are 4 KiB
+            // multiples and the ciphertext ends the record, so rounding up
+            // stays inside it.
             let rounded = ciphertext.length.next_multiple_of(CIPHERTEXT_ALIGNMENT);
             let read_length = if decoded.ciphertext.start + rounded <= location.extent.length() {
                 rounded
@@ -428,7 +429,7 @@ impl StoreReader {
     }
 }
 
-/// A published v2 record located for a direct read by [`StoreReader::direct_read`].
+/// A published page record located for a direct read by [`StoreReader::direct_read`].
 pub(crate) struct DirectRecord {
     /// Invalidates exactly this mapping if the bytes fail verification.
     pub token: ReadToken,

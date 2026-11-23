@@ -293,7 +293,6 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::PageDecrypt => "racer_page_decrypts_total",
             Self::PeerBootstrap => "racer_peer_bootstraps_total",
             Self::DiagnosticFailures => "racer_diagnostic_failures_total",
-            Self::DeliveryPipeDrain => "racer_delivery_pipe_drains_total",
             Self::DeliveryDirectBytes => "racer_delivery_direct_bytes_total",
             Self::DeliveryBytes => "racer_delivery_bytes_total",
             Self::CryptoEncryptStarted => "racer_crypto_encrypt_started_total",

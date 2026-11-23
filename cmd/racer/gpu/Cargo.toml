@@ -14,8 +14,8 @@ native = []
 simulation = []
 
 [dependencies]
-libc = "0.2"
-zeroize = "1"
+libc.workspace = true
+zeroize.workspace = true
 
 [build-dependencies]
 cc = "1"

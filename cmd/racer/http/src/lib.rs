@@ -60,9 +60,9 @@
 //!
 //! # Body transfer profiles
 //!
-//! [`delivery`] sends immutable backing through a staging pipe and owned sends;
+//! [`delivery`] sends immutable backing through owned sends without pipe admission;
 //! [`relay`] transfers opaque fixed-length bodies with bounded synchronous steps.
-//! Both adapt [`flow_control::PipeLease`] without selecting application
+//! Relay adapts [`flow_control::PipeLease`] without selecting application
 //! authorization, telemetry, quotas, or scheduling policy. Callers retain exchange
 //! finalization and must keep complete transfer owners through completion fences.
 //!

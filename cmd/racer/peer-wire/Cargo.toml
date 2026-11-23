@@ -15,7 +15,10 @@ racer-crypto = { path = "../crypto" }
 racer-wire = { path = "../wire" }
 racer-io = { path = "../io" }
 base64 = "0.22"
-sha2 = { version = "0.10", features = ["asm"] }
+sha2.workspace = true
 
 [dev-dependencies]
 racer-crypto = { path = "../crypto", features = ["test-util"] }
+
+[lints.rust]
+unsafe_code = "forbid"

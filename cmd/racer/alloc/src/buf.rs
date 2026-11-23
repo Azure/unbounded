@@ -59,10 +59,6 @@
 //! `store.rs` (disk reads `take` from the worker pool; encrypt writes aligned
 //! pooled output), and the admission policy gains a `Pool` resource class whose
 //! [`PoolAccount`] adapter is `flow_control::QuotaPoolAccount`.
-//!
-//! [`CiphertextPage`] is the pooled ciphertext shape: `Aligned { buf, offset,
-//! len }` or `Registered(R)`, where `R` is the RDMA registered page type from
-//! the root crate. `Owned(Vec)` and slab variants fold into `Aligned`.
 
 use crate::sync::{Arc, AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use crate::{
@@ -1145,80 +1141,6 @@ unsafe impl<C: Charge> racer_io::ring::IoBuffer for Buf<C> {
     }
 }
 
-/// Bytes of a registered (RDMA) page. Implemented by the root crate.
-pub trait RegisteredPage {
-    /// The page's ciphertext.
-    fn bytes(&self) -> &[u8];
-}
-
-/// Placeholder for callers without registered pages.
-#[derive(Debug)]
-pub enum NoRegistration {}
-
-impl RegisteredPage for NoRegistration {
-    fn bytes(&self) -> &[u8] {
-        match *self {}
-    }
-}
-
-enum PageRepr<C: Charge, R> {
-    Aligned { buf: Buf<C>, offset: u32, len: u32 },
-    Registered(R),
-}
-
-/// Immutable page ciphertext in pooled aligned storage or registered memory.
-pub struct CiphertextPage<C: Charge = (), R = NoRegistration> {
-    repr: PageRepr<C, R>,
-}
-
-impl<C: Charge, R: RegisteredPage> CiphertextPage<C, R> {
-    /// Ciphertext at `offset..offset + len` of `buf`, which must be in bounds.
-    pub fn aligned(buf: Buf<C>, offset: u32, len: u32) -> Result<Self> {
-        let end = (offset as usize)
-            .checked_add(len as usize)
-            .ok_or(Error::InvalidConfiguration)?;
-        if end > buf.len() {
-            return Err(Error::InvalidConfiguration);
-        }
-        Ok(Self {
-            repr: PageRepr::Aligned { buf, offset, len },
-        })
-    }
-
-    /// Ciphertext in a registered page.
-    pub fn registered(page: R) -> Self {
-        Self {
-            repr: PageRepr::Registered(page),
-        }
-    }
-
-    /// The ciphertext bytes.
-    pub fn bytes(&self) -> &[u8] {
-        match &self.repr {
-            PageRepr::Aligned { buf, offset, len } => {
-                &buf[*offset as usize..*offset as usize + *len as usize]
-            }
-            PageRepr::Registered(page) => page.bytes(),
-        }
-    }
-
-    /// The backing pooled buffer, when aligned.
-    pub fn buf(&self) -> Option<&Buf<C>> {
-        match &self.repr {
-            PageRepr::Aligned { buf, .. } => Some(buf),
-            PageRepr::Registered(_) => None,
-        }
-    }
-
-    /// The registered page, when registered.
-    pub fn registered_page(&self) -> Option<&R> {
-        match &self.repr {
-            PageRepr::Aligned { .. } => None,
-            PageRepr::Registered(page) => Some(page),
-        }
-    }
-}
-
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
@@ -1874,40 +1796,12 @@ mod tests {
     }
 
     #[test]
-    fn ciphertext_page_bounds() {
-        let mut buf = Buf::unpooled(16, 64, (), false).unwrap();
-        buf.copy_from_slice(&[1; 16]);
-        assert!(
-            CiphertextPage::<(), NoRegistration>::aligned(
-                Buf::unpooled(16, 64, (), false).unwrap(),
-                8,
-                9
-            )
-            .is_err()
-        );
-        let page = CiphertextPage::<(), NoRegistration>::aligned(buf, 4, 8).unwrap();
-        assert_eq!(page.bytes(), &[1; 8]);
-        assert!(page.buf().is_some() && page.registered_page().is_none());
-
-        struct Reg(Vec<u8>);
-        impl RegisteredPage for Reg {
-            fn bytes(&self) -> &[u8] {
-                &self.0
-            }
-        }
-        let page = CiphertextPage::<(), Reg>::registered(Reg(vec![2; 3]));
-        assert_eq!(page.bytes(), &[2; 3]);
-        assert!(page.buf().is_none());
-    }
-
-    #[test]
     fn send_and_sync_follow_the_charge() {
         fn send<T: Send>() {}
         fn sync<T: Sync>() {}
         send::<Buf<()>>();
         sync::<Buf<()>>();
         send::<Pool>();
-        send::<CiphertextPage<()>>();
     }
 }
 
