@@ -97,6 +97,7 @@ func (wm *WireGuardManager) Configure(privateKey string, listenPort int, peers [
 	if err != nil {
 		// Device might not exist yet or have no config, do a full configure
 		klog.V(3).Infof("Could not get current device state for %s, doing full configuration: %v", wm.ifaceName, err)
+
 		if err := wm.configureFullReplace(privKey, listenPort, desiredPeers); err != nil {
 			return err
 		}
@@ -223,6 +224,7 @@ func (wm *WireGuardManager) applyDelta(currentDevice *wgtypes.Device, privKey wg
 		ReplacePeers: false, // Only apply the specific peer changes
 		Peers:        peerConfigs,
 	}
+
 	if deviceChanged {
 		if currentDevice.PrivateKey != privKey {
 			cfg.PrivateKey = &privKey

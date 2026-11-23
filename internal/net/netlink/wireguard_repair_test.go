@@ -37,6 +37,7 @@ func (c *repairWireGuardClient) ConfigureDevice(_ string, cfg wgtypes.Config) er
 	if cfg.PrivateKey != nil {
 		c.device.PrivateKey = *cfg.PrivateKey
 	}
+
 	if cfg.ListenPort != nil {
 		c.device.ListenPort = *cfg.ListenPort
 	}
@@ -61,9 +62,11 @@ func (c *repairWireGuardClient) ConfigureDevice(_ string, cfg wgtypes.Config) er
 		if change.Endpoint != nil {
 			c.device.Peers[index].Endpoint = change.Endpoint
 		}
+
 		if change.ReplaceAllowedIPs {
 			c.device.Peers[index].AllowedIPs = append([]net.IPNet(nil), change.AllowedIPs...)
 		}
+
 		if change.PersistentKeepaliveInterval != nil {
 			c.device.Peers[index].PersistentKeepaliveInterval = *change.PersistentKeepaliveInterval
 		}
@@ -115,20 +118,25 @@ func TestRepairDriftRestoresExplicitEndpointAndPreservesLearnedEndpoint(t *testi
 	if got := client.device.Peers[explicitIndex].Endpoint.String(); got != "192.0.2.10:51821" {
 		t.Fatalf("explicit endpoint was not repaired: %s", got)
 	}
+
 	if got := client.device.Peers[learnedIndex].Endpoint; got != learned {
 		t.Fatalf("learned endpoint changed: got %v, want %v", got, learned)
 	}
+
 	if got := client.device.Peers[learnedIndex].PersistentKeepaliveInterval; got != 0 {
 		t.Fatalf("keepalive was not disabled: %v", got)
 	}
+
 	if len(client.configure) != 1 || len(client.configure[0].Peers) != 2 {
 		t.Fatalf("repair wrote unexpected configuration: %+v", client.configure)
 	}
 
 	client.configure = nil
+
 	if err := manager.RepairDrift(); err != nil {
 		t.Fatal(err)
 	}
+
 	if len(client.configure) != 0 {
 		t.Fatal("unchanged state caused another WireGuard write")
 	}
@@ -155,9 +163,11 @@ func TestRepairDriftRestoresDeviceAndPeerMembership(t *testing.T) {
 	if err := manager.RepairDrift(); err != nil {
 		t.Fatal(err)
 	}
+
 	if client.device.PrivateKey != privateKey || client.device.ListenPort != 51820 {
 		t.Fatal("device configuration was not repaired")
 	}
+
 	if len(client.device.Peers) != 1 || client.device.Peers[0].PublicKey != peerKey {
 		t.Fatalf("peer membership was not repaired: %+v", client.device.Peers)
 	}

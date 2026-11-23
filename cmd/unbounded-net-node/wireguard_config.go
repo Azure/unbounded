@@ -66,6 +66,7 @@ func repairWireGuardDrift(state *wireGuardState) error {
 	}
 
 	slices.Sort(interfaces)
+
 	for _, iface := range interfaces {
 		if manager := state.gatewayWireguardManagers[iface]; manager != nil {
 			managers = append(managers, manager)
