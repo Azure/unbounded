@@ -35,6 +35,9 @@ const (
 	// every object it applies.
 	FieldOwner = "unbounded-operator"
 
+	// ReservedPrefix marks the labels and annotations the operator owns on managed workloads.
+	ReservedPrefix = "unbounded-cloud.io/"
+
 	// CRDKind is the Kind of a CustomResourceDefinition object in the embedded
 	// manifests. The operator installs CRDs once at startup, so components skip
 	// them during reconcile.

@@ -13,8 +13,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
-
-	"github.com/Azure/unbounded/internal/unbounded"
 )
 
 // RequestSingleton enqueues the synthetic singleton request. Cluster components
@@ -151,13 +149,13 @@ func reservedMetadataChanged(older, newer client.Object) bool {
 
 func reservedKeysDiffer(older, newer map[string]string) bool {
 	for key, value := range older {
-		if strings.HasPrefix(key, unbounded.ReservedPrefix) && newer[key] != value {
+		if strings.HasPrefix(key, ReservedPrefix) && newer[key] != value {
 			return true
 		}
 	}
 
 	for key, value := range newer {
-		if strings.HasPrefix(key, unbounded.ReservedPrefix) && older[key] != value {
+		if strings.HasPrefix(key, ReservedPrefix) && older[key] != value {
 			return true
 		}
 	}

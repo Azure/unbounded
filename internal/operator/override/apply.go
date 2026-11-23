@@ -18,15 +18,15 @@ const (
 	// object. The matching desired hash lives in Site status rather than here,
 	// because writing it would mean touching an object the operator may have
 	// just decided not to apply.
-	HashAnnotation = ReservedPrefix + "override-hash"
+	HashAnnotation = component.ReservedPrefix + "override-hash"
 
 	// SourceAnnotation names the ConfigMap keys and entry indices that shaped
 	// this object.
-	SourceAnnotation = ReservedPrefix + "override-source"
+	SourceAnnotation = component.ReservedPrefix + "override-source"
 
 	// VersionDriftAnnotation is present only when an override changed a
 	// container image, breaking version lockstep with the operator.
-	VersionDriftAnnotation = ReservedPrefix + "version-drift"
+	VersionDriftAnnotation = component.ReservedPrefix + "version-drift"
 )
 
 // WorkloadResult describes what happened to one overridden workload.

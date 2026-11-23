@@ -29,7 +29,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	"github.com/Azure/unbounded/internal/unbounded"
 )
 
 const (
@@ -47,12 +46,11 @@ const (
 	helmReleaseSecretType = "helm.sh/release.v1"
 
 	// legacyKubeNamespace is where machina and metalman ran before
-	// the move to unbounded-system. Sourced from internal/unbounded so the CLI
-	// install guard and the reaper share a single source of truth.
-	legacyKubeNamespace = unbounded.LegacyKubeNamespace
+	// the move to unbounded-system.
+	legacyKubeNamespace = "unbounded-kube"
 
 	// legacyNetNamespace is where unbounded-net ran before the move.
-	legacyNetNamespace = unbounded.LegacyNetNamespace
+	legacyNetNamespace = "unbounded-net"
 
 	// clusterSiteName is the conventional name of the Site that represents the
 	// main control-plane cluster (created by `kubectl unbounded site init`).
