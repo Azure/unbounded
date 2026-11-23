@@ -156,7 +156,7 @@ func (h *machineRegisterHandler) executeAfterValidation(ctx context.Context) err
 				"ssh-private-key": keyData,
 			})
 
-		if err := kube.ApplySecret(ctx, h.kubeCli, s, ao); err != nil {
+		if err := applySecret(ctx, h.kubeCli, s, ao); err != nil {
 			return fmt.Errorf("applying SSH secret %s: %w", h.sshSecretName, err)
 		}
 
@@ -177,7 +177,7 @@ func (h *machineRegisterHandler) executeAfterValidation(ctx context.Context) err
 				"ssh-private-key": keyData,
 			})
 
-		if err := kube.ApplySecret(ctx, h.kubeCli, s, ao); err != nil {
+		if err := applySecret(ctx, h.kubeCli, s, ao); err != nil {
 			return fmt.Errorf("applying bastion SSH secret %s: %w", h.bastionSSHSecretName, err)
 		}
 

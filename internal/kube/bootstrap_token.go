@@ -16,6 +16,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	v1 "k8s.io/client-go/applyconfigurations/core/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/util/retry"
 
 	"github.com/Azure/unbounded/api/machina/v1alpha3"
 )
@@ -71,12 +72,20 @@ func ApplyBootstrapToken(ctx context.Context, kubeCli kubernetes.Interface, fiel
 		FieldManager: fieldManager,
 	}
 
-	s := v1.Secret(bootstrapTokenName(token), metav1.NamespaceSystem).
+	name := bootstrapTokenName(token)
+	s := v1.Secret(name, metav1.NamespaceSystem).
 		WithType(corev1.SecretTypeBootstrapToken).
 		WithLabels(token.Labels).
 		WithData(BootstrapTokenSecretData(token))
 
-	return ApplySecret(ctx, kubeCli, s, ao)
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		_, err := kubeCli.CoreV1().Secrets(metav1.NamespaceSystem).Apply(ctx, s, ao)
+		return err
+	}); err != nil {
+		return fmt.Errorf("applying secret %q: %w", name+"/"+metav1.NamespaceSystem, err)
+	}
+
+	return nil
 }
 
 // BootstrapTokenSecretData returns the data of the bootstrap token Secret for
