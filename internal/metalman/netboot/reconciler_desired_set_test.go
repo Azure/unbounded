@@ -103,6 +103,7 @@ func TestDaemonSetRequestsCollectsImages(t *testing.T) {
 	delete(machine.Spec.Kubernetes.NodeLabels, "nvidia.com/gpu.present")
 
 	requests := reconciler.daemonSetRequests(context.Background(), machine, v1alpha3.DefaultPXEArchitecture)
+
 	refs := make([]string, 0, len(requests))
 	for _, request := range requests {
 		refs = append(refs, request.ImageRef)

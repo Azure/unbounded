@@ -146,6 +146,36 @@ func TestRegistrySetsDigestHeader(t *testing.T) {
 	}
 }
 
+func TestRegistryRejectsDigestTraversal(t *testing.T) {
+	cacheDir := t.TempDir()
+	writeLayout(t, cacheDir, "sha256:"+repeatHex("a"))
+
+	secretPath := filepath.Join(cacheDir, "secret")
+	if err := os.WriteFile(secretPath, []byte("secret"), 0o644); err != nil {
+		t.Fatalf("write secret: %v", err)
+	}
+
+	registry := &Registry{Cache: NewOCICache(cacheDir)}
+
+	targets := []string{
+		"/v2/image/blobs/..:secret",
+		"/v2/image/blobs/sha256:../secret",
+		"/v2/image/blobs/sha256:..",
+		"/v2/image/blobs/:",
+	}
+
+	for _, target := range targets {
+		t.Run(target, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			registry.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, target, nil))
+
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("status: got %d, want %d (body %q)", rec.Code, http.StatusNotFound, rec.Body.String())
+			}
+		})
+	}
+}
+
 func TestSplitImageReference(t *testing.T) {
 	tests := []struct {
 		imageRef   string

@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -143,10 +144,16 @@ func (r *Registry) serveBlob(w http.ResponseWriter, req *http.Request, digest st
 	http.ServeFile(w, req, blobPath)
 }
 
+// digestComponentPattern restricts a digest algorithm or encoded value to
+// characters that cannot escape the layout directory. It deliberately rejects
+// the dot that the OCI algorithm grammar allows, because a dot is enough to
+// form a parent-directory reference.
+var digestComponentPattern = regexp.MustCompile(`^[A-Za-z0-9_+=-]+$`)
+
 // blobPath returns the cached file for a digest, searching every layout.
 func (r *Registry) blobPath(digest string) string {
 	algorithm, encoded, ok := strings.Cut(digest, ":")
-	if !ok || algorithm == "" || encoded == "" || strings.ContainsAny(encoded, "/\\.") {
+	if !ok || !digestComponentPattern.MatchString(algorithm) || !digestComponentPattern.MatchString(encoded) {
 		return ""
 	}
 
@@ -157,12 +164,26 @@ func (r *Registry) blobPath(digest string) string {
 
 	for _, layoutDir := range layouts {
 		candidate := filepath.Join(layoutDir, "blobs", algorithm, encoded)
+		if !withinDir(layoutDir, candidate) {
+			continue
+		}
+
 		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
 			return candidate
 		}
 	}
 
 	return ""
+}
+
+// withinDir reports whether target stays inside dir.
+func withinDir(dir, target string) bool {
+	rel, err := filepath.Rel(dir, target)
+	if err != nil {
+		return false
+	}
+
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 // splitImageReference splits an image reference into its repository and its
