@@ -15,9 +15,9 @@ import (
 
 	"k8s.io/utils/ptr"
 
-	"github.com/Azure/unbounded/internal/hostroot"
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/hostroot"
 )
 
 // Ignition configuration types, covering only the subset this command emits,
