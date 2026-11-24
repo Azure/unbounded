@@ -3431,25 +3431,19 @@ fn network_keyring_bootstrap_rotation_recovery_and_failure_retention() {
         bundle.cluster = config.cluster.clone();
     }
     let recovery_scope = scope(&racer_io::Clock::host(), Duration::from_secs(40)).unwrap();
-    let mut recovery = control.keyring_progress(&recovery_scope);
-    drive(
-        &runtime,
-        &mut engine,
-        Box::pin(std::future::poll_fn(|cx| {
-            if let Poll::Ready(result) = recovery.as_mut().poll(cx) {
-                result?;
-                recovery = control.keyring_progress(&recovery_scope);
-            }
-            if worker.keys.active(&cache, KeyPurpose::Page)?.id() != accepted {
-                Poll::Ready(Ok(()))
-            } else {
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-        })),
-    )
-    .unwrap();
-    drop(recovery);
+    // Drive one complete keyring turn at a time. Replacing an in-flight turn
+    // after each completion and dropping it on exit can abandon a TCP
+    // connection that the fixture later accepts. That stray connection would
+    // consume the one-shot bad_certificate alert armed below instead of the
+    // request that must read the rotated token.
+    while worker.keys.active(&cache, KeyPurpose::Page).unwrap().id() == accepted {
+        drive(
+            &runtime,
+            &mut engine,
+            control.keyring_progress(&recovery_scope),
+        )
+        .unwrap();
+    }
     assert_eq!(control.projection_error(), None);
     assert_eq!(
         fixture.keyring_tokens.lock().unwrap().last().unwrap(),
