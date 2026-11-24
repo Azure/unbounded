@@ -69,7 +69,7 @@ cloud sees exactly one fetch.
 | Origin concurrency cap | Each replica caps in-flight origin fetches at `floor(origin.target_global / cluster.target_replicas)` - 64 by default. When the origin throttles (503, 429, retryable 5xx), the leader retries with exponential backoff before sending any HTTP headers, so the client never sees the throttle. |
 | Tenancy | One tenant, one set of origin credentials. |
 | Listeners | Three: edge `:8443`, internal-fill `:8444`, ops `:8442` (`/healthz`, `/readyz`). All plain HTTP in dev. |
-| Repo home | This repo. Code under `internal/orca/`, manifests under `deploy/orca/`, dev harness under `hack/orca/`. |
+| Repo home | This repo. Code under `cmd/orca/` (the binary, `internal/`, and the `hack/orcadev` dev tool), manifests under `deploy/orca/`, dev harness scripts under `hack/orca/`. |
 
 ## 3. Terminology
 
@@ -78,11 +78,11 @@ cloud sees exactly one fetch.
 - **Client** - whoever is calling the S3-compatible HTTP API.
 - **Origin** - the upstream cloud store (AWS S3 or Azure Blob).
   Orca only reads from it. Interface in
-  `internal/orca/origin/origin.go`.
+  `cmd/orca/internal/origin/origin.go`.
 - **CacheStore** - the shared in-DC chunk store. The truth for
   what's cached. Today this is `cachestore/s3` (an in-DC
   S3-compatible object store). Interface in
-  `internal/orca/cachestore/cachestore.go`; commit rules in
+  `cmd/orca/internal/cachestore/cachestore.go`; commit rules in
   [s8](#8-commit-stat-then-put).
 - **Chunk** - one piece of an object. The size is chosen per
   request from a small ladder: 8 MiB for small objects, up to 128
@@ -576,11 +576,11 @@ The named seams these mechanisms run through:
 
 | Seam | File | Role |
 |---|---|---|
-| `origin.Origin` | `internal/orca/origin/origin.go` (interface); `internal/orca/origin/awss3/`, `internal/orca/origin/azureblob/` | Read-only adapter to the upstream blob store. `If-Match: <etag>` on every `GetRange`. |
-| `cachestore.CacheStore` | `internal/orca/cachestore/cachestore.go` (interface); `internal/orca/cachestore/s3/` | In-DC chunk store; source of truth for chunk presence. `PutChunk` commits stat-then-put (returns `ErrCommitLost` when the chunk is already present). |
-| `chunkcatalog.Catalog` | `internal/orca/chunkcatalog/chunkcatalog.go` | Bounded in-memory LRU recording chunks known to be in the cachestore. Presence-only. |
-| `cluster.Cluster` | `internal/orca/cluster/cluster.go` | Peer discovery (DNS), rendezvous hashing, internal-fill RPC client + response validator. |
-| `fetch.Coordinator` | `internal/orca/fetch/fetch.go` | Per-replica fill orchestrator. Owns the singleflight, the origin semaphore, and the pre-header retry loop. |
+| `origin.Origin` | `cmd/orca/internal/origin/origin.go` (interface); `cmd/orca/internal/origin/awss3/`, `cmd/orca/internal/origin/azureblob/` | Read-only adapter to the upstream blob store. `If-Match: <etag>` on every `GetRange`. |
+| `cachestore.CacheStore` | `cmd/orca/internal/cachestore/cachestore.go` (interface); `cmd/orca/internal/cachestore/s3/` | In-DC chunk store; source of truth for chunk presence. `PutChunk` commits stat-then-put (returns `ErrCommitLost` when the chunk is already present). |
+| `chunkcatalog.Catalog` | `cmd/orca/internal/chunkcatalog/chunkcatalog.go` | Bounded in-memory LRU recording chunks known to be in the cachestore. Presence-only. |
+| `cluster.Cluster` | `cmd/orca/internal/cluster/cluster.go` | Peer discovery (DNS), rendezvous hashing, internal-fill RPC client + response validator. |
+| `fetch.Coordinator` | `cmd/orca/internal/fetch/fetch.go` | Per-replica fill orchestrator. Owns the singleflight, the origin semaphore, and the pre-header retry loop. |
 
 ### 7.1 Per-`ChunkKey` singleflight
 
@@ -1180,7 +1180,7 @@ were designed and not built. Commit is the same stat-then-put as
 ordinary filesystem operations. The posixfs flavor adds backend
 detection, an NFS minimum-version check, refusal on Alluxio
 FUSE, and a 2-character hex path fan-out. Both would share
-helpers via `internal/orca/cachestore/internal/posixcommon/`.
+helpers via `cmd/orca/internal/cachestore/internal/posixcommon/`.
 
 These would let Orca run against shared-filesystem deployments
 that don't have an in-DC S3-compatible object store. The

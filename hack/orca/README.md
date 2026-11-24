@@ -391,13 +391,13 @@ auth, mTLS, custom chunk sizes, multi-origin, ...) see the
 fully-annotated reference at
 [`config.example.yaml`](./config.example.yaml). The file is
 maintained by hand alongside the schema in
-`internal/orca/config/config.go` and is exercised by a config-package
+`cmd/orca/internal/config/config.go` and is exercised by a config-package
 test on every CI run, so it cannot silently drift.
 
 ### Go-only integration tests (no Kubernetes cluster)
 
 For Go-level behavior coverage (chunked fetch, dedup, peer fallback)
-the integration suite under `internal/orca/inttest/` runs against
+the integration suite under `cmd/orca/internal/inttest/` runs against
 testcontainers-managed Garage + Azurite and finishes in ~30s with
 no Kubernetes setup at all:
 

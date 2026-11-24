@@ -32,7 +32,7 @@ make orca-inttest
 Equivalent to:
 
 ```sh
-go test -tags=integrationtest -timeout 15m ./internal/orca/inttest/...
+go test -tags=integrationtest -timeout 15m ./cmd/orca/internal/inttest/...
 # CI also adds -race
 ```
 
@@ -89,7 +89,7 @@ mutate one replica's view of the cluster independently.
 ## File layout
 
 ```
-internal/orca/inttest/
+cmd/orca/internal/inttest/
 ├── doc.go              package overview, build tag, TODOs
 ├── images.go           pinned container image tags + Azurite dev creds
 ├── garage.go          testcontainers wrapper + S3 helpers
@@ -108,7 +108,7 @@ internal/orca/inttest/
 
 Driver-level branch coverage (versioning gate, blob-type rejection)
 lives as fast unit tests in the respective driver packages
-(`internal/orca/cachestore/s3`, `internal/orca/origin/azureblob`),
+(`cmd/orca/internal/cachestore/s3`, `cmd/orca/internal/origin/azureblob`),
 not here. Those tests run as part of `go test ./...` and cover all
 state branches (empty / Enabled / Suspended versioning;
 BlockBlob / PageBlob / AppendBlob / nil / disabled).
@@ -178,11 +178,11 @@ conditional writes (the reason Garage is usable at all).
 | Dropped from integration | Lives now as |
 |---|---|
 | `TestBootSelfTest_Pass` | implicit in every other `StartCluster` test (boots through the same `app.Start` path) |
-| `TestNotFound` | `internal/orca/server.TestWriteOriginError` (covers all 5 error mappings) |
-| `TestList` | `internal/orca/server.TestHandleList` (covers normal/empty/truncated/error) |
-| `TestHead` | `internal/orca/server.TestHandleHead` (covers normal/missing-fields/404) |
-| `TestVersionedCachestoreBucketRefused` | `internal/orca/cachestore/s3.TestValidateBucketVersioning` (covers all 3 statuses) |
-| `TestAzureUnsupportedBlobType` | `internal/orca/origin/azureblob.TestValidateBlobType` (covers all 5 cases) |
+| `TestNotFound` | `cmd/orca/internal/server.TestWriteOriginError` (covers all 5 error mappings) |
+| `TestList` | `cmd/orca/internal/server.TestHandleList` (covers normal/empty/truncated/error) |
+| `TestHead` | `cmd/orca/internal/server.TestHandleHead` (covers normal/missing-fields/404) |
+| `TestVersionedCachestoreBucketRefused` | `cmd/orca/internal/cachestore/s3.TestValidateBucketVersioning` (covers all 3 statuses) |
+| `TestAzureUnsupportedBlobType` | `cmd/orca/internal/origin/azureblob.TestValidateBlobType` (covers all 5 cases) |
 
 ## Production-code seams used
 
@@ -198,7 +198,7 @@ The harness depends on three test-friendly seams in production code:
    `cfg.Cluster.InternalListen` port); set in tests so `FillFromPeer`
    dials each peer's distinct port.
 
-3. **`internal/orca/app.Start(ctx, *config.Config, ...Option)`**:
+3. **`cmd/orca/internal/app.Start(ctx, *config.Config, ...Option)`**:
    programmatic factory wiring origin / cachestore / cluster / fetch
    coordinator / edge + internal listeners. Options:
    - `WithLogger`, `WithResolver`, `WithPeerSource`,

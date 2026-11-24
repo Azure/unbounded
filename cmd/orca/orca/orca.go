@@ -3,7 +3,7 @@
 
 // Package orca wires the Orca cache binary together. It is invoked by
 // cmd/orca/main.go and is responsible for parsing flags, loading the
-// YAML config, and delegating to internal/orca/app for actual runtime
+// YAML config, and delegating to cmd/orca/internal/app for actual runtime
 // wiring.
 package orca
 
@@ -19,8 +19,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/Azure/unbounded/internal/orca/app"
-	"github.com/Azure/unbounded/internal/orca/config"
+	"github.com/Azure/unbounded/cmd/orca/internal/app"
+	"github.com/Azure/unbounded/cmd/orca/internal/config"
 )
 
 // Run is the entrypoint invoked by cmd/orca/main.go.

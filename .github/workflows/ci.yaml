@@ -736,7 +736,7 @@ jobs:
 
   # ---------- Orca Integration Tests ----------
   # Spins up Garage and Azurite via testcontainers-go and runs the
-  # orca in-process integration suite (internal/orca/inttest). Docker
+  # orca in-process integration suite (cmd/orca/internal/inttest). Docker
   # is preinstalled on GitHub-hosted Ubuntu runners; no extra services:
   # block is required.
   orca-inttest:
