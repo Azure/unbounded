@@ -72,9 +72,8 @@ impl StrongEtag {
         }
     }
 
-    /// Parse the SDK's quoted ASCII strong-tag grammar, preserving exact bytes.
-    /// Commas and backslashes inside quotes are literal, not lists or escapes.
-    pub fn parse(value: &[u8]) -> Result<Self> {
+    /// Validate the SDK's quoted ASCII strong-tag grammar without copying it.
+    pub fn validate(value: &[u8]) -> Result<()> {
         if !(2..=MAX_FIELD_BYTES).contains(&value.len())
             || value.first() != Some(&b'"')
             || value.last() != Some(&b'"')
@@ -84,6 +83,13 @@ impl StrongEtag {
         {
             return Err(Error::InvalidRequest);
         }
+        Ok(())
+    }
+
+    /// Parse the SDK's quoted ASCII strong-tag grammar, preserving exact bytes.
+    /// Commas and backslashes inside quotes are literal, not lists or escapes.
+    pub fn parse(value: &[u8]) -> Result<Self> {
+        Self::validate(value)?;
         let value = std::str::from_utf8(value).map_err(|_| Error::InvalidRequest)?;
         Ok(Self(value.to_owned()))
     }
@@ -389,6 +395,14 @@ pub const MAX_CONTENT_TYPE_BYTES: usize = 256;
 pub struct ContentType(crate::http::ContentType);
 
 impl ContentType {
+    /// Validate syntax and the object-protocol field limit without copying.
+    pub fn validate(bytes: &[u8]) -> Result<()> {
+        if bytes.len() > MAX_CONTENT_TYPE_BYTES {
+            return Err(Error::InvalidRequest);
+        }
+        crate::http::ContentType::validate(bytes).map_err(Into::into)
+    }
+
     /// Validate syntax and the object-protocol field limit.
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         if bytes.len() > MAX_CONTENT_TYPE_BYTES {

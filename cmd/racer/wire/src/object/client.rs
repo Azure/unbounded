@@ -2,8 +2,8 @@
 
 use crate::http::{Header, MessageHead, StartLine, is_token, trim_ows};
 use crate::object::model::{
-    ByteRange, CacheKey, MAX_FIELD_BYTES, MAX_WIRE_INTEGER, ObjectMetadata, PAGE_BYTES, PageSize,
-    ResolvedRange, StrongEtag, parse_decimal,
+    ByteRange, CacheKey, ContentType, MAX_FIELD_BYTES, MAX_WIRE_INTEGER, ObjectMetadata,
+    PAGE_BYTES, PageSize, ResolvedRange, StrongEtag, parse_decimal,
 };
 use crate::object::{Error, Result};
 use std::collections::HashSet;
@@ -11,6 +11,21 @@ use std::time::UNIX_EPOCH;
 
 /// Maximum client request head size, including raw HTTP framing.
 pub const MAX_HEAD_BYTES: usize = 32 * 1024;
+
+/// Maximum fields accepted in a client-socket response head.
+pub const MAX_RESPONSE_HEADERS: usize = 64;
+
+/// Fixed-width subscription frame header size.
+pub const FRAME_SIZE: usize = 21;
+
+/// Fixed-width page credit size: page number and length.
+pub const CREDIT_SIZE: usize = 12;
+
+/// Page payload frame kind.
+pub const PAGE_FRAME: u8 = 1;
+
+/// Completion frame kind.
+pub const COMPLETE_FRAME: u8 = 2;
 
 /// A metadata read or a credit-bounded object subscription.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -492,13 +507,128 @@ pub fn direct_head(
 }
 
 /// Encode the fixed-width page or completion frame without managing page leases.
-pub fn frame(kind: u8, number: u64, offset: u64, length: u32) -> [u8; 21] {
-    let mut bytes = [0; 21];
+pub fn frame(kind: u8, number: u64, offset: u64, length: u32) -> [u8; FRAME_SIZE] {
+    let mut bytes = [0; FRAME_SIZE];
     bytes[0] = kind;
     bytes[1..9].copy_from_slice(&number.to_be_bytes());
     bytes[9..17].copy_from_slice(&offset.to_be_bytes());
     bytes[17..].copy_from_slice(&length.to_be_bytes());
     bytes
+}
+
+/// One decoded page or completion frame header.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Frame {
+    /// [`PAGE_FRAME`] or [`COMPLETE_FRAME`].
+    pub kind: u8,
+
+    /// Zero-based page number, or the delivered page count on completion.
+    pub number: u64,
+
+    /// Absolute object offset, or the delivered byte count on completion.
+    pub offset: u64,
+
+    /// Payload bytes following a page header; zero on completion.
+    pub length: u32,
+}
+
+impl Frame {
+    /// Decode one fixed-width frame header.
+    pub fn decode(bytes: &[u8; FRAME_SIZE]) -> Self {
+        Self {
+            kind: bytes[0],
+            number: u64::from_be_bytes(bytes[1..9].try_into().unwrap_or_default()),
+            offset: u64::from_be_bytes(bytes[9..17].try_into().unwrap_or_default()),
+            length: u32::from_be_bytes(bytes[17..21].try_into().unwrap_or_default()),
+        }
+    }
+
+    /// Encode one fixed-width frame header.
+    pub fn encode(&self) -> [u8; FRAME_SIZE] {
+        frame(self.kind, self.number, self.offset, self.length)
+    }
+}
+
+/// Encode the credit returned for a consumed page.
+pub fn credit_bytes(frame: &Frame) -> [u8; CREDIT_SIZE] {
+    let mut bytes = [0; CREDIT_SIZE];
+    bytes[..8].copy_from_slice(&frame.number.to_be_bytes());
+    bytes[8..].copy_from_slice(&frame.length.to_be_bytes());
+    bytes
+}
+
+/// Number of pages covering `[first, end)` at the protocol page size.
+pub fn page_count(first: u64, end: u64) -> u64 {
+    if end <= first {
+        0
+    } else {
+        (end - 1) / PAGE_BYTES - first / PAGE_BYTES + 1
+    }
+}
+
+/// Frame validation state for one subscription range.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Sequence {
+    first: u64,
+    end: u64,
+    /// Pages covering the selected range.
+    pub pages: u64,
+    delivered: u64,
+    bytes: u64,
+}
+
+impl Sequence {
+    /// Expect the pages covering `[first, end)`.
+    pub fn new(first: u64, end: u64) -> Self {
+        Self {
+            first,
+            end,
+            pages: page_count(first, end),
+            delivered: 0,
+            bytes: 0,
+        }
+    }
+
+    /// Validate the next frame header. Page frames advance the sequence.
+    pub fn accept(&mut self, frame: &Frame) -> Result<()> {
+        let bad = Error::BadGateway;
+        if frame.kind == COMPLETE_FRAME {
+            if frame.number != self.pages
+                || self.delivered != self.pages
+                || frame.offset != self.end - self.first
+                || self.bytes != frame.offset
+                || frame.length != 0
+            {
+                return Err(bad);
+            }
+            return Ok(());
+        }
+        if frame.kind != PAGE_FRAME
+            || frame.length == 0
+            || frame.offset < self.first
+            || frame.offset >= self.end
+            || frame.number != frame.offset / PAGE_BYTES
+            || self.delivered == self.pages
+        {
+            return Err(bad);
+        }
+        let start = self.first.max(frame.number * PAGE_BYTES);
+        let end = self.end.min((frame.number + 1) * PAGE_BYTES);
+        if frame.offset != start
+            || u64::from(frame.length) != end - start
+            || frame.number != self.first / PAGE_BYTES + self.delivered
+        {
+            return Err(bad);
+        }
+        self.delivered += 1;
+        self.bytes += u64::from(frame.length);
+        Ok(())
+    }
+
+    /// Whether every page was delivered.
+    pub fn last_page(&self) -> bool {
+        self.delivered == self.pages
+    }
 }
 
 /// Encode a HEAD success after validating immutable metadata and expiry precision.
@@ -553,7 +683,529 @@ pub fn error_head(status: u16, unsatisfied_length: Option<u64>) -> Result<Messag
     })
 }
 
+/// Validated object metadata from a client-socket response head.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResponseMetadata<'a> {
+    /// Object length in bytes.
+    pub size: u64,
+
+    /// Exact quoted strong entity tag.
+    pub etag: &'a [u8],
+
+    /// Exact object MIME metadata, if the response carried it.
+    pub content_type: Option<&'a [u8]>,
+}
+
+/// A validated subscription response head.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SubscriptionResponse<'a> {
+    /// Object metadata from the response head.
+    pub metadata: ResponseMetadata<'a>,
+
+    /// Inclusive first selected offset.
+    pub first: u64,
+
+    /// Exclusive selected end offset.
+    pub end: u64,
+
+    /// Pages covering the selection.
+    pub pages: u64,
+}
+
+/// Fields of a client-socket response head after raw validation.
+///
+/// The borrowed values point into the exact head bytes supplied to
+/// [`ResponseHead::parse`]. Body bytes that arrived with the head must not be
+/// included.
+#[derive(Default)]
+pub struct ResponseHead<'a> {
+    status: u16,
+    content_length: Option<&'a [u8]>,
+    content_type: Option<&'a [u8]>,
+    content_range: Option<&'a [u8]>,
+    etag: Option<&'a [u8]>,
+    expires: Option<&'a [u8]>,
+    racer_content_type: Option<&'a [u8]>,
+    object_length: Option<&'a [u8]>,
+    range_start: Option<&'a [u8]>,
+    range_end: Option<&'a [u8]>,
+    allow: Option<&'a [u8]>,
+    close: bool,
+    forbidden: bool,
+}
+
+impl<'a> ResponseHead<'a> {
+    /// Parse exactly one response head, including its terminator.
+    pub fn parse(raw: &'a [u8]) -> Result<Self> {
+        let bad = Error::BadGateway;
+        let mut headers = [httparse::EMPTY_HEADER; MAX_RESPONSE_HEADERS];
+        let mut response = httparse::Response::new(&mut headers);
+        match response.parse(raw) {
+            Ok(httparse::Status::Complete(length)) if length == raw.len() => {}
+            _ => return Err(bad),
+        }
+        if response.version != Some(1) {
+            return Err(bad);
+        }
+        let mut head = Self {
+            status: response.code.ok_or(bad)?,
+            ..Self::default()
+        };
+        for field in response.headers.iter() {
+            let value = field.value;
+            if value
+                .iter()
+                .any(|&byte| (byte < 0x20 && byte != b'\t') || byte == 0x7f)
+            {
+                return Err(bad);
+            }
+            let name = field.name;
+            let slot = if name.eq_ignore_ascii_case("content-length") {
+                &mut head.content_length
+            } else if name.eq_ignore_ascii_case("content-type") {
+                &mut head.content_type
+            } else if name.eq_ignore_ascii_case("content-range") {
+                &mut head.content_range
+            } else if name.eq_ignore_ascii_case("etag") {
+                &mut head.etag
+            } else if name.eq_ignore_ascii_case("racer-expires-at") {
+                &mut head.expires
+            } else if name.eq_ignore_ascii_case("racer-content-type") {
+                &mut head.racer_content_type
+            } else if name.eq_ignore_ascii_case("racer-object-length") {
+                &mut head.object_length
+            } else if name.eq_ignore_ascii_case("racer-range-start") {
+                &mut head.range_start
+            } else if name.eq_ignore_ascii_case("racer-range-end") {
+                &mut head.range_end
+            } else if name.eq_ignore_ascii_case("allow") {
+                if head.allow.is_none() {
+                    head.allow = Some(value);
+                }
+                continue;
+            } else if name.eq_ignore_ascii_case("connection") {
+                for token in value.split(|&byte| byte == b',') {
+                    let token = token.trim_ascii();
+                    head.close |= token.eq_ignore_ascii_case(b"close");
+                    head.forbidden |= token.eq_ignore_ascii_case(b"upgrade");
+                }
+                continue;
+            } else {
+                head.forbidden |= [
+                    "transfer-encoding",
+                    "content-encoding",
+                    "trailer",
+                    "upgrade",
+                    "expect",
+                    "if-none-match",
+                    "if-modified-since",
+                    "if-unmodified-since",
+                    "if-range",
+                ]
+                .iter()
+                .any(|forbidden| name.eq_ignore_ascii_case(forbidden));
+                continue;
+            };
+            // Singleton fields must not repeat.
+            if slot.replace(value).is_some() {
+                return Err(bad);
+            }
+        }
+        if head.forbidden {
+            return Err(bad);
+        }
+        Ok(head)
+    }
+
+    /// Whether the response asked for connection closure.
+    pub fn closes_connection(&self) -> bool {
+        self.close
+    }
+
+    /// Validate a metadata response.
+    pub fn stat(&self) -> Result<ResponseMetadata<'a>> {
+        let bad = Error::BadGateway;
+        let length = self.content_length.and_then(response_decimal).ok_or(bad)?;
+        if self.status != 200 && self.status != 206 {
+            let failure = status_error(self.status);
+            let known = matches!(
+                self.status,
+                400 | 401 | 403 | 404 | 405 | 412 | 416 | 431 | 500 | 502 | 503
+            );
+            if !known
+                || length != 0
+                || self.etag.is_some()
+                || self.expires.is_some()
+                || self.racer_content_type.is_some()
+            {
+                return Err(bad);
+            }
+            if self.status == 416 {
+                let value = self.content_range.ok_or(bad)?;
+                value
+                    .strip_prefix(b"bytes */")
+                    .and_then(response_decimal)
+                    .ok_or(bad)?;
+            } else if self.content_range.is_some() {
+                return Err(bad);
+            }
+            if self.status == 405 && self.allow != Some(b"HEAD, POST") {
+                return Err(bad);
+            }
+            return Err(failure);
+        }
+        if self.status != 200 || self.content_range.is_some() {
+            return Err(bad);
+        }
+        let mut metadata = self.metadata()?;
+        metadata.size = length;
+        Ok(metadata)
+    }
+
+    /// Validate a subscription response head and return its selected range.
+    pub fn subscription(&self, pin: Option<&[u8]>) -> Result<SubscriptionResponse<'a>> {
+        let bad = Error::BadGateway;
+        let length = self.content_length.and_then(response_decimal).ok_or(bad)?;
+        if self.status != 200 {
+            if length != 0 {
+                return Err(bad);
+            }
+            let content_range = self.content_range.filter(|value| !value.is_empty());
+            if self.status == 416 {
+                let size = content_range
+                    .and_then(|value| value.strip_prefix(b"bytes */"))
+                    .and_then(response_decimal)
+                    .ok_or(bad)?;
+                return Err(Error::UnsatisfiableRangeWithLength(size));
+            } else if content_range.is_some() {
+                return Err(bad);
+            }
+            return Err(status_error(self.status));
+        }
+        if !self.close
+            || self.content_range.is_some_and(|value| !value.is_empty())
+            || self.content_type != Some(b"application/octet-stream")
+        {
+            return Err(bad);
+        }
+        let size = self.object_length.and_then(response_decimal).ok_or(bad)?;
+        let first = self.range_start.and_then(response_decimal).ok_or(bad)?;
+        let end = self.range_end.and_then(response_decimal).ok_or(bad)?;
+        let mut metadata = self.metadata()?;
+        metadata.size = size;
+        if first > end || end > size || pin.is_some_and(|pin| pin != metadata.etag) {
+            return Err(bad);
+        }
+        let pages = page_count(first, end);
+        let framing = (pages + 1) * FRAME_SIZE as u64;
+        if length != (end - first).checked_add(framing).ok_or(bad)? {
+            return Err(bad);
+        }
+        Ok(SubscriptionResponse {
+            metadata,
+            first,
+            end,
+            pages,
+        })
+    }
+
+    /// Validate immutable metadata shared by stat and subscription responses.
+    fn metadata(&self) -> Result<ResponseMetadata<'a>> {
+        let bad = Error::BadGateway;
+        let etag = self
+            .etag
+            .filter(|etag| StrongEtag::validate(etag).is_ok())
+            .ok_or(bad)?;
+        self.expires.and_then(response_decimal).ok_or(bad)?;
+        let content_type = match self.racer_content_type {
+            Some(value) if value.is_empty() || ContentType::validate(value).is_err() => {
+                return Err(bad);
+            }
+            other => other,
+        };
+        Ok(ResponseMetadata {
+            size: 0,
+            etag,
+            content_type,
+        })
+    }
+}
+
+/// Canonical wire decimal, reported as a response protocol failure by callers.
+fn response_decimal(value: &[u8]) -> Option<u64> {
+    parse_decimal(value).ok()
+}
+
+/// Map a Racer status to its client-protocol failure.
+fn status_error(status: u16) -> Error {
+    match status {
+        400 => Error::InvalidRequest,
+        401 => Error::OriginRejected,
+        403 => Error::OriginForbidden,
+        404 => Error::NotFound,
+        405 => Error::MethodNotAllowed,
+        412 => Error::VersionUnavailable,
+        416 => Error::UnsatisfiableRange,
+        431 => Error::HeaderTooLarge,
+        503 => Error::Unavailable,
+        _ => Error::BadGateway,
+    }
+}
+
 /// Build one HTTP field without normalizing its bytes.
 fn header(name: &str, value: impl AsRef<[u8]>) -> Header {
     Header::new(name, value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn head(raw: &str) -> Result<ResponseMetadata<'_>> {
+        ResponseHead::parse(raw.as_bytes())?.stat()
+    }
+
+    #[test]
+    fn stat_heads() {
+        let ok = head("HTTP/1.1 200 OK\r\nETag: \"v\"\r\nRacer-Expires-At: 1\r\nRacer-Content-Type: text/plain\r\nContent-Length: 10\r\n\r\n").unwrap();
+        assert_eq!(ok.size, 10);
+        assert_eq!(ok.etag, b"\"v\"");
+        assert_eq!(ok.content_type, Some(&b"text/plain"[..]));
+        for (status, want) in [
+            (400, Error::InvalidRequest),
+            (401, Error::OriginRejected),
+            (403, Error::OriginForbidden),
+            (404, Error::NotFound),
+            (412, Error::VersionUnavailable),
+            (431, Error::HeaderTooLarge),
+            (500, Error::BadGateway),
+            (502, Error::BadGateway),
+            (503, Error::Unavailable),
+            (418, Error::BadGateway),
+        ] {
+            let raw = format!("HTTP/1.1 {status} X\r\nContent-Length: 0\r\n\r\n");
+            let got = head(&raw);
+            assert_eq!(got, Err(want), "{status}");
+        }
+        assert_eq!(
+            head("HTTP/1.1 405 X\r\nContent-Length: 0\r\nAllow: HEAD, POST\r\n\r\n"),
+            Err(Error::MethodNotAllowed)
+        );
+        for bad in [
+            "HTTP/1.1 405 X\r\nContent-Length: 0\r\n\r\n",
+            "HTTP/1.1 404 X\r\nContent-Length: 1\r\n\r\n",
+            "HTTP/1.1 404 X\r\nContent-Length: 0\r\nETag: \"v\"\r\n\r\n",
+            "HTTP/1.1 416 X\r\nContent-Length: 0\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nETag: v\r\nRacer-Expires-At: 1\r\nContent-Length: 10\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nETag: \"v\"\r\nContent-Length: 10\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nETag: \"v\"\r\nETag: \"v\"\r\nRacer-Expires-At: 1\r\nContent-Length: 10\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nETag: \"v\"\r\nRacer-Expires-At: 1\r\nContent-Length: 10\r\nTransfer-Encoding: chunked\r\n\r\n",
+            "HTTP/1.0 200 OK\r\nETag: \"v\"\r\nRacer-Expires-At: 1\r\nContent-Length: 10\r\n\r\n",
+            "HTTP/1.1 206 OK\r\nETag: \"v\"\r\nRacer-Expires-At: 1\r\nContent-Length: 10\r\n\r\n",
+        ] {
+            assert_eq!(head(bad), Err(Error::BadGateway), "{bad}");
+        }
+    }
+
+    fn subscription<'a>(
+        raw: &'a str,
+        pin: Option<&[u8]>,
+    ) -> Result<(ResponseMetadata<'a>, u64, u64)> {
+        let response = ResponseHead::parse(raw.as_bytes())?.subscription(pin)?;
+        Ok((response.metadata, response.first, response.end))
+    }
+
+    #[test]
+    fn subscription_heads() {
+        let ok = "HTTP/1.1 200 OK\r\nETag: \"v\"\r\nRacer-Expires-At: 1\r\nContent-Type: application/octet-stream\r\nRacer-Object-Length: 10\r\nRacer-Range-Start: 2\r\nRacer-Range-End: 5\r\nContent-Length: 45\r\nConnection: close\r\n\r\n";
+        let (metadata, first, end) = subscription(ok, None).unwrap();
+        assert_eq!((metadata.size, first, end), (10, 2, 5));
+        assert_eq!(subscription(ok, Some(b"\"w\"")), Err(Error::BadGateway));
+        assert_eq!(
+            subscription(
+                &ok.replace("Content-Length: 45", "Content-Length: 44"),
+                None
+            ),
+            Err(Error::BadGateway)
+        );
+        assert_eq!(
+            subscription(&ok.replace("Connection: close\r\n", ""), None),
+            Err(Error::BadGateway)
+        );
+        assert_eq!(
+            subscription(
+                "HTTP/1.1 416 X\r\nContent-Length: 0\r\nContent-Range: bytes */7\r\nConnection: close\r\n\r\n",
+                None
+            ),
+            Err(Error::UnsatisfiableRangeWithLength(7))
+        );
+        assert_eq!(
+            subscription("HTTP/1.1 416 X\r\nContent-Length: 0\r\n\r\n", None),
+            Err(Error::BadGateway)
+        );
+        assert_eq!(
+            subscription("HTTP/1.1 412 X\r\nContent-Length: 0\r\n\r\n", None),
+            Err(Error::VersionUnavailable)
+        );
+        for (from, to) in [
+            ("Racer-Range-Start: 2", "Racer-Range-Start: 6"),
+            ("Racer-Range-End: 5", "Racer-Range-End: 11"),
+            ("Racer-Range-Start: 2", "Racer-Range-Start: 02"),
+            ("Racer-Object-Length: 10\r\n", ""),
+            ("Racer-Range-End: 5\r\n", ""),
+            ("application/octet-stream", "text/plain"),
+            ("ETag: \"v\"", "ETag: v"),
+            ("Racer-Expires-At: 1\r\n", ""),
+            (
+                "Connection: close",
+                "Connection: close\r\nContent-Range: bytes 2-4/10",
+            ),
+            (
+                "Connection: close",
+                "Connection: close\r\nContent-Encoding: gzip",
+            ),
+        ] {
+            assert_eq!(
+                subscription(&ok.replace(from, to), None),
+                Err(Error::BadGateway),
+                "{to}"
+            );
+        }
+        let with_content_type =
+            ok.replace("Connection", "Racer-Content-Type: text/plain\r\nConnection");
+        let (metadata, ..) = subscription(&with_content_type, Some(b"\"v\"")).unwrap();
+        assert_eq!(metadata.content_type, Some(&b"text/plain"[..]));
+        assert_eq!(
+            subscription("HTTP/1.1 404 X\r\nContent-Length: 0\r\n\r\n", None),
+            Err(Error::NotFound)
+        );
+        assert_eq!(
+            subscription("HTTP/1.1 404 X\r\nContent-Length: 3\r\n\r\n", None),
+            Err(Error::BadGateway)
+        );
+    }
+
+    #[test]
+    fn pages() {
+        assert_eq!(page_count(0, 0), 0);
+        assert_eq!(page_count(0, 1), 1);
+        assert_eq!(page_count(0, PAGE_BYTES), 1);
+        assert_eq!(page_count(PAGE_BYTES - 4, PAGE_BYTES + 7), 2);
+        let frame = Frame {
+            kind: PAGE_FRAME,
+            number: 3,
+            offset: 3 * PAGE_BYTES,
+            length: 9,
+        };
+        assert_eq!(Frame::decode(&frame.encode()), frame);
+    }
+
+    #[test]
+    fn credits() {
+        let frame = Frame {
+            kind: PAGE_FRAME,
+            number: 0x0102,
+            offset: 0,
+            length: 0x0a0b0c0d,
+        };
+        assert_eq!(
+            credit_bytes(&frame),
+            [0, 0, 0, 0, 0, 0, 1, 2, 0x0a, 0x0b, 0x0c, 0x0d]
+        );
+    }
+
+    fn page(number: u64, offset: u64, length: u32) -> Frame {
+        Frame {
+            kind: PAGE_FRAME,
+            number,
+            offset,
+            length,
+        }
+    }
+
+    fn complete(pages: u64, bytes: u64) -> Frame {
+        Frame {
+            kind: COMPLETE_FRAME,
+            number: pages,
+            offset: bytes,
+            length: 0,
+        }
+    }
+
+    #[test]
+    fn sequence_accepts_valid_streams() {
+        // Empty selection: completion only.
+        let mut sequence = Sequence::new(0, 0);
+        assert!(sequence.last_page());
+        assert_eq!(sequence.accept(&complete(0, 0)), Ok(()));
+        // A small range inside one page.
+        let mut sequence = Sequence::new(2, 5);
+        assert_eq!(sequence.accept(&page(0, 2, 3)), Ok(()));
+        assert!(sequence.last_page());
+        assert_eq!(sequence.accept(&complete(1, 3)), Ok(()));
+        // A small range crossing a page boundary.
+        let mut sequence = Sequence::new(PAGE_BYTES - 2, PAGE_BYTES + 3);
+        assert_eq!(sequence.accept(&page(0, PAGE_BYTES - 2, 2)), Ok(()));
+        assert!(!sequence.last_page());
+        assert_eq!(sequence.accept(&page(1, PAGE_BYTES, 3)), Ok(()));
+        assert_eq!(sequence.accept(&complete(2, 5)), Ok(()));
+        // Full pages followed by a short last page.
+        let end = 2 * PAGE_BYTES + 1;
+        let mut sequence = Sequence::new(0, end);
+        assert_eq!(sequence.accept(&page(0, 0, PAGE_BYTES as u32)), Ok(()));
+        assert_eq!(
+            sequence.accept(&page(1, PAGE_BYTES, PAGE_BYTES as u32)),
+            Ok(())
+        );
+        assert_eq!(sequence.accept(&page(2, 2 * PAGE_BYTES, 1)), Ok(()));
+        assert_eq!(sequence.accept(&complete(3, end)), Ok(()));
+    }
+
+    #[test]
+    fn sequence_rejects_invalid_frames() {
+        let bad = Err(Error::BadGateway);
+        let fresh = || Sequence::new(PAGE_BYTES - 2, PAGE_BYTES + 3);
+        for frame in [
+            // Unknown kind.
+            Frame {
+                kind: 3,
+                ..page(0, PAGE_BYTES - 2, 2)
+            },
+            // Empty page.
+            page(0, PAGE_BYTES - 2, 0),
+            // Wrong offset, length, or number.
+            page(0, PAGE_BYTES - 3, 3),
+            page(0, PAGE_BYTES - 2, 1),
+            page(1, PAGE_BYTES - 2, 2),
+            // Out of order: the second page first.
+            page(1, PAGE_BYTES, 3),
+            // Outside the selection.
+            page(1, PAGE_BYTES + 3, 1),
+            // Completion before any page (truncated stream).
+            complete(2, 5),
+            complete(0, 0),
+        ] {
+            assert_eq!(fresh().accept(&frame), bad, "{frame:?}");
+        }
+        // Completion after a partial delivery.
+        let mut sequence = fresh();
+        assert_eq!(sequence.accept(&page(0, PAGE_BYTES - 2, 2)), Ok(()));
+        assert_eq!(sequence.accept(&complete(2, 5)), bad);
+        assert_eq!(sequence.accept(&complete(1, 2)), bad);
+        // A repeated page.
+        assert_eq!(sequence.accept(&page(0, PAGE_BYTES - 2, 2)), bad);
+        // Extra pages after the last, and a mismatched completion.
+        assert_eq!(sequence.accept(&page(1, PAGE_BYTES, 3)), Ok(()));
+        assert_eq!(sequence.accept(&page(1, PAGE_BYTES, 3)), bad);
+        assert_eq!(sequence.accept(&complete(2, 4)), bad);
+        assert_eq!(sequence.accept(&complete(3, 5)), bad);
+        assert_eq!(
+            sequence.accept(&Frame {
+                length: 1,
+                ..complete(2, 5)
+            }),
+            bad
+        );
+        assert_eq!(sequence.accept(&complete(2, 5)), Ok(()));
+    }
 }

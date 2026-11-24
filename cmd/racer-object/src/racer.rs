@@ -11,6 +11,12 @@
 //! status codes keep their meaning.
 
 use crate::object::{Failure, Identity, RangeSpec, fmt_u64, itoa_buf};
+use racer_wire::object::Error as WireError;
+use racer_wire::object::PAGE_BYTES;
+use racer_wire::object::client::{
+    COMPLETE_FRAME, MAX_HEAD_BYTES, ResponseHead, ResponseMetadata, Sequence as WireSequence,
+};
+pub use racer_wire::object::client::{FRAME_SIZE, Frame, credit_bytes, page_count};
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,13 +28,7 @@ use tokio::net::UnixStream;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Racer page size; only the last page of an object may be shorter.
-pub const PAGE_SIZE: u64 = 16 * 1024 * 1024;
-/// Page frame header: kind, number, offset, length.
-pub const FRAME_SIZE: usize = 21;
-/// Largest response head Racer may send.
-const MAX_HEAD: usize = 32 * 1024;
-const PAGE_FRAME: u8 = 1;
-const COMPLETE_FRAME: u8 = 2;
+pub const PAGE_SIZE: u64 = PAGE_BYTES;
 /// Pages Racer may send ahead of the reader (the SDK default).
 const PAGE_CREDITS: u64 = 2;
 /// Racer holds an ingress slot per open connection, so only a few idle Stat
@@ -202,13 +202,13 @@ impl Client {
                 }
                 Err(HeadError::Protocol) => return Err(Failure::BadGateway),
             };
-            let head = parse_head(&scratch.response[..head_len])?;
-            let result = head.stat();
+            let head = ResponseHead::parse(&scratch.response[..head_len]).map_err(failure)?;
+            let result = head.stat().map(response_meta).map_err(failure);
             // Well-formed error responses (404, 412, ...) leave the
             // connection in a clean state; only protocol violations and
             // upstream 5xx gateway failures are not reused.
             if result != Err(Failure::BadGateway)
-                && !head.close
+                && !head.closes_connection()
                 && scratch.response.len() == head_len
             {
                 self.recycle(stream, expires);
@@ -242,8 +242,9 @@ impl Client {
             Ok(Err(HeadError::Protocol)) => return Err(Failure::BadGateway),
             Ok(Err(HeadError::Io(..))) | Err(_) => return Err(Failure::Unavailable),
         };
-        let head = parse_head(&response[..head_len])?;
-        let (meta, first, end) = head.subscription(pin)?;
+        let head = ResponseHead::parse(&response[..head_len]).map_err(failure)?;
+        let start = head.subscription(pin).map_err(failure)?;
+        let (meta, first, end) = (response_meta(start.metadata), start.first, start.end);
         let seq = Sequence::new(first, end);
         Ok(Subscription {
             stream,
@@ -305,6 +306,49 @@ pub fn subscribe_request(
     request.extend_from_slice(b"\r\n\r\n");
 }
 
+/// Canonical wire decimal: no sign, no leading zeros, at most `i64::MAX`.
+pub fn decimal(s: &[u8]) -> Option<u64> {
+    racer_wire::object::parse_decimal(s).ok()
+}
+
+/// A strong entity tag as Racer and the SDK require.
+pub fn valid_etag(s: &[u8]) -> bool {
+    racer_wire::object::StrongEtag::validate(s).is_ok()
+}
+
+/// Racer content type check: a media type with unique parameters.
+pub fn valid_content_type(s: &[u8]) -> bool {
+    s.is_empty() || racer_wire::object::ContentType::validate(s).is_ok()
+}
+
+/// Copy validated response metadata into the sidecar's owned form.
+fn response_meta(metadata: ResponseMetadata<'_>) -> Meta {
+    Meta {
+        size: metadata.size,
+        etag: metadata.etag.to_vec(),
+        content_type: metadata.content_type.map(<[u8]>::to_vec),
+    }
+}
+
+/// Racer protocol failure to sidecar failure.
+fn failure(error: WireError) -> Failure {
+    match error {
+        WireError::InvalidRequest | WireError::MethodNotAllowed | WireError::HeaderTooLarge => {
+            Failure::BadRequest
+        }
+        WireError::NotFound => Failure::NotFound,
+        WireError::VersionUnavailable => Failure::PreconditionFailed,
+        WireError::UnsatisfiableRange => Failure::RangeNotSatisfiable(None),
+        WireError::UnsatisfiableRangeWithLength(size) => Failure::RangeNotSatisfiable(Some(size)),
+        WireError::Unavailable => Failure::Unavailable,
+        WireError::OriginRejected | WireError::OriginForbidden => Failure::Forbidden,
+        WireError::InvalidRange
+        | WireError::BadGateway
+        | WireError::Internal
+        | WireError::CorruptRecord => Failure::BadGateway,
+    }
+}
+
 fn stale(kind: io::ErrorKind) -> bool {
     matches!(
         kind,
@@ -343,439 +387,45 @@ async fn read_head(stream: &mut UnixStream, buf: &mut Vec<u8>) -> Result<usize, 
         let from = scanned.saturating_sub(3);
         if let Some(i) = buf[from..].windows(4).position(|w| w == b"\r\n\r\n") {
             let len = from + i + 4;
-            return if len > MAX_HEAD {
+            return if len > MAX_HEAD_BYTES {
                 Err(HeadError::Protocol)
             } else {
                 Ok(len)
             };
         }
         scanned = buf.len();
-        if scanned > MAX_HEAD {
+        if scanned > MAX_HEAD_BYTES {
             return Err(HeadError::Protocol);
         }
     }
 }
 
-/// Fields of a Racer response head after raw validation.
-#[derive(Default)]
-struct Head<'a> {
-    status: u16,
-    content_length: Option<&'a [u8]>,
-    content_type: Option<&'a [u8]>,
-    content_range: Option<&'a [u8]>,
-    etag: Option<&'a [u8]>,
-    expires: Option<&'a [u8]>,
-    racer_content_type: Option<&'a [u8]>,
-    object_length: Option<&'a [u8]>,
-    range_start: Option<&'a [u8]>,
-    range_end: Option<&'a [u8]>,
-    allow: Option<&'a [u8]>,
-    close: bool,
-    forbidden: bool,
-}
-
-fn parse_head(raw: &[u8]) -> Result<Head<'_>, Failure> {
-    let bad = Failure::BadGateway;
-    let mut headers = [httparse::EMPTY_HEADER; 64];
-    let mut response = httparse::Response::new(&mut headers);
-    match response.parse(raw) {
-        Ok(httparse::Status::Complete(n)) if n == raw.len() => {}
-        _ => return Err(bad),
-    }
-    if response.version != Some(1) {
-        return Err(bad);
-    }
-    let mut head = Head {
-        status: response.code.ok_or(bad)?,
-        ..Head::default()
-    };
-    for h in response.headers.iter() {
-        let value = h.value;
-        if value.iter().any(|&c| (c < 0x20 && c != b'\t') || c == 0x7f) {
-            return Err(bad);
-        }
-        let name = h.name;
-        let slot = if name.eq_ignore_ascii_case("content-length") {
-            &mut head.content_length
-        } else if name.eq_ignore_ascii_case("content-type") {
-            &mut head.content_type
-        } else if name.eq_ignore_ascii_case("content-range") {
-            &mut head.content_range
-        } else if name.eq_ignore_ascii_case("etag") {
-            &mut head.etag
-        } else if name.eq_ignore_ascii_case("racer-expires-at") {
-            &mut head.expires
-        } else if name.eq_ignore_ascii_case("racer-content-type") {
-            &mut head.racer_content_type
-        } else if name.eq_ignore_ascii_case("racer-object-length") {
-            &mut head.object_length
-        } else if name.eq_ignore_ascii_case("racer-range-start") {
-            &mut head.range_start
-        } else if name.eq_ignore_ascii_case("racer-range-end") {
-            &mut head.range_end
-        } else if name.eq_ignore_ascii_case("allow") {
-            if head.allow.is_none() {
-                head.allow = Some(value);
-            }
-            continue;
-        } else if name.eq_ignore_ascii_case("connection") {
-            for token in value.split(|&c| c == b',') {
-                let token = token.trim_ascii();
-                head.close |= token.eq_ignore_ascii_case(b"close");
-                head.forbidden |= token.eq_ignore_ascii_case(b"upgrade");
-            }
-            continue;
-        } else {
-            head.forbidden |= [
-                "transfer-encoding",
-                "content-encoding",
-                "trailer",
-                "upgrade",
-                "expect",
-                "if-none-match",
-                "if-modified-since",
-                "if-unmodified-since",
-                "if-range",
-            ]
-            .iter()
-            .any(|f| name.eq_ignore_ascii_case(f));
-            // Other singleton fields only matter for duplicate detection.
-            continue;
-        };
-        // Singleton fields must not repeat.
-        if slot.replace(value).is_some() {
-            return Err(bad);
-        }
-    }
-    if head.forbidden {
-        return Err(bad);
-    }
-    Ok(head)
-}
-
-/// Canonical wire decimal: no sign, no leading zeros, at most `i64::MAX`.
-pub fn decimal(s: &[u8]) -> Option<u64> {
-    if s.is_empty() || s.len() > 19 || (s.len() > 1 && s[0] == b'0') {
-        return None;
-    }
-    let mut n: u64 = 0;
-    for &c in s {
-        if !c.is_ascii_digit() {
-            return None;
-        }
-        n = n * 10 + u64::from(c - b'0');
-    }
-    (n <= i64::MAX as u64).then_some(n)
-}
-
-/// A strong entity tag as Racer and the SDK require.
-pub fn valid_etag(s: &[u8]) -> bool {
-    s.len() >= 2
-        && s.len() <= 8192
-        && s[0] == b'"'
-        && s[s.len() - 1] == b'"'
-        && s[1..s.len() - 1]
-            .iter()
-            .all(|&c| c == 0x21 || (0x23..=0x7e).contains(&c))
-}
-
-fn token_char(c: u8) -> bool {
-    c.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&c)
-}
-
-/// Racer content type check: a media type with unique parameters.
-pub fn valid_content_type(s: &[u8]) -> bool {
-    if s.is_empty() {
-        return true;
-    }
-    if s.len() > 256 || s.trim_ascii() != s || s.iter().any(|&c| !(0x20..=0x7e).contains(&c)) {
-        return false;
-    }
-    let mut rest = s;
-    let token = |rest: &mut &[u8]| -> usize {
-        let n = rest.iter().take_while(|&&c| token_char(c)).count();
-        *rest = &rest[n..];
-        n
-    };
-    let consume = |rest: &mut &[u8], b: u8| -> bool {
-        if rest.first() == Some(&b) {
-            *rest = &rest[1..];
-            true
-        } else {
-            false
-        }
-    };
-    let spaces = |rest: &mut &[u8]| {
-        while rest.first() == Some(&b' ') {
-            *rest = &rest[1..];
-        }
-    };
-    if token(&mut rest) == 0 || !consume(&mut rest, b'/') || token(&mut rest) == 0 {
-        return false;
-    }
-    let mut names: Vec<&[u8]> = Vec::new();
-    while !rest.is_empty() {
-        spaces(&mut rest);
-        if !consume(&mut rest, b';') {
-            return false;
-        }
-        spaces(&mut rest);
-        let before = rest;
-        let n = token(&mut rest);
-        if n == 0 {
-            return false;
-        }
-        let name = &before[..n];
-        if names.iter().any(|old| old.eq_ignore_ascii_case(name)) {
-            return false;
-        }
-        names.push(name);
-        spaces(&mut rest);
-        if !consume(&mut rest, b'=') {
-            return false;
-        }
-        spaces(&mut rest);
-        if consume(&mut rest, b'"') {
-            loop {
-                let Some((&b, tail)) = rest.split_first() else {
-                    return false;
-                };
-                rest = tail;
-                if b == b'"' {
-                    break;
-                }
-                if b == b'\\' {
-                    let Some((_, tail)) = rest.split_first() else {
-                        return false;
-                    };
-                    rest = tail;
-                }
-            }
-        } else if token(&mut rest) == 0 {
-            return false;
-        }
-    }
-    true
-}
-
-/// Racer status to sidecar failure.
-fn status_failure(status: u16) -> Failure {
-    match status {
-        400 | 405 | 431 => Failure::BadRequest,
-        401 | 403 => Failure::Forbidden,
-        404 => Failure::NotFound,
-        412 => Failure::PreconditionFailed,
-        416 => Failure::RangeNotSatisfiable(None),
-        503 => Failure::Unavailable,
-        _ => Failure::BadGateway,
-    }
-}
-
-impl Head<'_> {
-    fn metadata(&self) -> Result<Meta, Failure> {
-        let bad = Failure::BadGateway;
-        let etag = self.etag.filter(|t| valid_etag(t)).ok_or(bad)?;
-        self.expires.and_then(decimal).ok_or(bad)?;
-        let content_type = match self.racer_content_type {
-            Some(t) if t.is_empty() || !valid_content_type(t) => return Err(bad),
-            other => other.map(<[u8]>::to_vec),
-        };
-        Ok(Meta {
-            size: 0,
-            etag: etag.to_vec(),
-            content_type,
-        })
-    }
-
-    /// Validate a metadata response.
-    fn stat(&self) -> Result<Meta, Failure> {
-        let bad = Failure::BadGateway;
-        let length = self.content_length.and_then(decimal).ok_or(bad)?;
-        if self.status != 200 && self.status != 206 {
-            let failure = status_failure(self.status);
-            let known = matches!(
-                self.status,
-                400 | 401 | 403 | 404 | 405 | 412 | 416 | 431 | 500 | 502 | 503
-            );
-            if !known
-                || length != 0
-                || self.etag.is_some()
-                || self.expires.is_some()
-                || self.racer_content_type.is_some()
-            {
-                return Err(bad);
-            }
-            if self.status == 416 {
-                let cr = self.content_range.ok_or(bad)?;
-                cr.strip_prefix(b"bytes */").and_then(decimal).ok_or(bad)?;
-            } else if self.content_range.is_some() {
-                return Err(bad);
-            }
-            if self.status == 405 && self.allow != Some(b"HEAD, POST") {
-                return Err(bad);
-            }
-            return Err(failure);
-        }
-        if self.status != 200 || self.content_range.is_some() {
-            return Err(bad);
-        }
-        let mut meta = self.metadata()?;
-        meta.size = length;
-        Ok(meta)
-    }
-
-    /// Validate a subscription response and return metadata plus the selected `[first, end)`.
-    fn subscription(&self, pin: Option<&[u8]>) -> Result<(Meta, u64, u64), Failure> {
-        let bad = Failure::BadGateway;
-        let length = self.content_length.and_then(decimal).ok_or(bad)?;
-        if self.status != 200 {
-            if length != 0 {
-                return Err(bad);
-            }
-            let content_range = self.content_range.filter(|v| !v.is_empty());
-            if self.status == 416 {
-                let size = content_range
-                    .and_then(|v| v.strip_prefix(b"bytes */"))
-                    .and_then(decimal)
-                    .ok_or(bad)?;
-                return Err(Failure::RangeNotSatisfiable(Some(size)));
-            } else if content_range.is_some() {
-                return Err(bad);
-            }
-            return Err(status_failure(self.status));
-        }
-        if !self.close
-            || self.content_range.is_some_and(|v| !v.is_empty())
-            || self.content_type != Some(b"application/octet-stream")
-        {
-            return Err(bad);
-        }
-        let size = self.object_length.and_then(decimal).ok_or(bad)?;
-        let first = self.range_start.and_then(decimal).ok_or(bad)?;
-        let end = self.range_end.and_then(decimal).ok_or(bad)?;
-        let mut meta = self.metadata()?;
-        meta.size = size;
-        if first > end || end > size || pin.is_some_and(|p| p != meta.etag.as_slice()) {
-            return Err(bad);
-        }
-        let pages = page_count(first, end);
-        let framing = (pages + 1) * FRAME_SIZE as u64;
-        if length != (end - first).checked_add(framing).ok_or(bad)? {
-            return Err(bad);
-        }
-        Ok((meta, first, end))
-    }
-}
-
-/// Number of pages covering `[first, end)`.
-pub fn page_count(first: u64, end: u64) -> u64 {
-    if end <= first {
-        0
-    } else {
-        (end - 1) / PAGE_SIZE - first / PAGE_SIZE + 1
-    }
-}
-
-/// One page frame header.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Frame {
-    pub kind: u8,
-    pub number: u64,
-    pub offset: u64,
-    pub length: u32,
-}
-
-impl Frame {
-    pub fn decode(b: &[u8; FRAME_SIZE]) -> Self {
-        let u64_at = |i: usize| u64::from_be_bytes(b[i..i + 8].try_into().unwrap_or_default());
-        Self {
-            kind: b[0],
-            number: u64_at(1),
-            offset: u64_at(9),
-            length: u32::from_be_bytes(b[17..21].try_into().unwrap_or_default()),
-        }
-    }
-
-    pub fn encode(&self) -> [u8; FRAME_SIZE] {
-        let mut b = [0; FRAME_SIZE];
-        b[0] = self.kind;
-        b[1..9].copy_from_slice(&self.number.to_be_bytes());
-        b[9..17].copy_from_slice(&self.offset.to_be_bytes());
-        b[17..].copy_from_slice(&self.length.to_be_bytes());
-        b
-    }
-}
-
-/// Credit returned for a consumed page: page number and length.
-pub fn credit_bytes(f: &Frame) -> [u8; 12] {
-    let mut b = [0u8; 12];
-    b[..8].copy_from_slice(&f.number.to_be_bytes());
-    b[8..].copy_from_slice(&f.length.to_be_bytes());
-    b
-}
-
 /// Frame validation state for one subscription.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Sequence {
-    first: u64,
-    end: u64,
+    inner: WireSequence,
+    /// Pages covering the selected range.
     pub pages: u64,
-    delivered: u64,
-    bytes: u64,
 }
 
 impl Sequence {
     /// Expect the pages covering `[first, end)`.
     pub fn new(first: u64, end: u64) -> Self {
+        let inner = WireSequence::new(first, end);
         Self {
-            first,
-            end,
-            pages: page_count(first, end),
-            delivered: 0,
-            bytes: 0,
+            inner,
+            pages: inner.pages,
         }
     }
 
-    /// Validate the next frame header. Page
-    /// frames advance the sequence.
-    pub fn accept(&mut self, f: &Frame) -> Result<(), Failure> {
-        let bad = Failure::BadGateway;
-        if f.kind == COMPLETE_FRAME {
-            if f.number != self.pages
-                || self.delivered != self.pages
-                || f.offset != self.end - self.first
-                || self.bytes != f.offset
-                || f.length != 0
-            {
-                return Err(bad);
-            }
-            return Ok(());
-        }
-        if f.kind != PAGE_FRAME
-            || f.length == 0
-            || f.offset < self.first
-            || f.offset >= self.end
-            || f.number != f.offset / PAGE_SIZE
-            || self.delivered == self.pages
-        {
-            return Err(bad);
-        }
-        let start = self.first.max(f.number * PAGE_SIZE);
-        let end = self.end.min((f.number + 1) * PAGE_SIZE);
-        if f.offset != start
-            || u64::from(f.length) != end - start
-            || f.number != self.first / PAGE_SIZE + self.delivered
-        {
-            return Err(bad);
-        }
-        self.delivered += 1;
-        self.bytes += u64::from(f.length);
-        Ok(())
+    /// Validate the next frame header. Page frames advance the sequence.
+    pub fn accept(&mut self, frame: &Frame) -> Result<(), Failure> {
+        self.inner.accept(frame).map_err(failure)
     }
 
     /// Whether every page was delivered.
     pub fn last_page(&self) -> bool {
-        self.delivered == self.pages
+        self.inner.last_page()
     }
 }
 
@@ -1110,23 +760,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn pages() {
-        assert_eq!(page_count(0, 0), 0);
-        assert_eq!(page_count(0, 1), 1);
-        assert_eq!(page_count(0, PAGE_SIZE), 1);
-        assert_eq!(page_count(PAGE_SIZE - 4, PAGE_SIZE + 7), 2);
-        let f = Frame {
-            kind: 1,
-            number: 3,
-            offset: 3 * PAGE_SIZE,
-            length: 9,
-        };
-        assert_eq!(Frame::decode(&f.encode()), f);
-    }
-
     fn head(raw: &str) -> Result<Meta, Failure> {
-        parse_head(raw.as_bytes())?.stat()
+        ResponseHead::parse(raw.as_bytes())
+            .map_err(failure)?
+            .stat()
+            .map(response_meta)
+            .map_err(failure)
     }
 
     #[test]
@@ -1171,7 +810,15 @@ mod tests {
     }
 
     fn sub(raw: &str, pin: Option<&[u8]>) -> Result<(Meta, u64, u64), Failure> {
-        parse_head(raw.as_bytes())?.subscription(pin)
+        let response = ResponseHead::parse(raw.as_bytes())
+            .map_err(failure)?
+            .subscription(pin)
+            .map_err(failure)?;
+        Ok((
+            response_meta(response.metadata),
+            response.first,
+            response.end,
+        ))
     }
 
     #[test]
@@ -1246,6 +893,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn status_failures() {
+        for (error, expected) in [
+            (WireError::InvalidRequest, Failure::BadRequest),
+            (WireError::MethodNotAllowed, Failure::BadRequest),
+            (WireError::HeaderTooLarge, Failure::BadRequest),
+            (WireError::NotFound, Failure::NotFound),
+            (WireError::VersionUnavailable, Failure::PreconditionFailed),
+            (
+                WireError::UnsatisfiableRange,
+                Failure::RangeNotSatisfiable(None),
+            ),
+            (
+                WireError::UnsatisfiableRangeWithLength(7),
+                Failure::RangeNotSatisfiable(Some(7)),
+            ),
+            (WireError::Unavailable, Failure::Unavailable),
+            (WireError::OriginRejected, Failure::Forbidden),
+            (WireError::OriginForbidden, Failure::Forbidden),
+            (WireError::BadGateway, Failure::BadGateway),
+            (WireError::Internal, Failure::BadGateway),
+        ] {
+            assert_eq!(failure(error), expected, "{error:?}");
+        }
+    }
+
     fn id() -> Identity {
         crate::object::identity(b"bucket", b"key", b"").unwrap()
     }
@@ -1297,112 +970,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn credits() {
-        let f = Frame {
-            kind: PAGE_FRAME,
-            number: 0x0102,
-            offset: 0,
-            length: 0x0a0b0c0d,
-        };
-        assert_eq!(
-            credit_bytes(&f),
-            [0, 0, 0, 0, 0, 0, 1, 2, 0x0a, 0x0b, 0x0c, 0x0d]
-        );
-    }
-
-    fn page(number: u64, offset: u64, length: u32) -> Frame {
-        Frame {
-            kind: PAGE_FRAME,
-            number,
-            offset,
-            length,
-        }
-    }
-
-    fn complete(pages: u64, bytes: u64) -> Frame {
-        Frame {
-            kind: COMPLETE_FRAME,
-            number: pages,
-            offset: bytes,
-            length: 0,
-        }
-    }
-
-    #[test]
-    fn sequence_accepts_valid_streams() {
-        // Empty selection: completion only.
-        let mut s = Sequence::new(0, 0);
-        assert!(s.last_page());
-        assert_eq!(s.accept(&complete(0, 0)), Ok(()));
-        // A small range inside one page.
-        let mut s = Sequence::new(2, 5);
-        assert_eq!(s.accept(&page(0, 2, 3)), Ok(()));
-        assert!(s.last_page());
-        assert_eq!(s.accept(&complete(1, 3)), Ok(()));
-        // A small range crossing a page boundary.
-        let mut s = Sequence::new(PAGE_SIZE - 2, PAGE_SIZE + 3);
-        assert_eq!(s.accept(&page(0, PAGE_SIZE - 2, 2)), Ok(()));
-        assert!(!s.last_page());
-        assert_eq!(s.accept(&page(1, PAGE_SIZE, 3)), Ok(()));
-        assert_eq!(s.accept(&complete(2, 5)), Ok(()));
-        // Full pages followed by a short last page.
-        let end = 2 * PAGE_SIZE + 1;
-        let mut s = Sequence::new(0, end);
-        assert_eq!(s.accept(&page(0, 0, PAGE_SIZE as u32)), Ok(()));
-        assert_eq!(s.accept(&page(1, PAGE_SIZE, PAGE_SIZE as u32)), Ok(()));
-        assert_eq!(s.accept(&page(2, 2 * PAGE_SIZE, 1)), Ok(()));
-        assert_eq!(s.accept(&complete(3, end)), Ok(()));
-    }
-
-    #[test]
-    fn sequence_rejects_invalid_frames() {
-        let bad = Err(Failure::BadGateway);
-        let fresh = || Sequence::new(PAGE_SIZE - 2, PAGE_SIZE + 3);
-        for f in [
-            // Unknown kind.
-            Frame {
-                kind: 3,
-                ..page(0, PAGE_SIZE - 2, 2)
-            },
-            // Empty page.
-            page(0, PAGE_SIZE - 2, 0),
-            // Wrong offset, length, or number.
-            page(0, PAGE_SIZE - 3, 3),
-            page(0, PAGE_SIZE - 2, 1),
-            page(1, PAGE_SIZE - 2, 2),
-            // Out of order: the second page first.
-            page(1, PAGE_SIZE, 3),
-            // Outside the selection.
-            page(1, PAGE_SIZE + 3, 1),
-            // Completion before any page (truncated stream).
-            complete(2, 5),
-            complete(0, 0),
-        ] {
-            assert_eq!(fresh().accept(&f), bad, "{f:?}");
-        }
-        // Completion after a partial delivery.
-        let mut s = fresh();
-        assert_eq!(s.accept(&page(0, PAGE_SIZE - 2, 2)), Ok(()));
-        assert_eq!(s.accept(&complete(2, 5)), bad);
-        assert_eq!(s.accept(&complete(1, 2)), bad);
-        // A repeated page.
-        assert_eq!(s.accept(&page(0, PAGE_SIZE - 2, 2)), bad);
-        // Extra pages after the last, and a mismatched completion.
-        assert_eq!(s.accept(&page(1, PAGE_SIZE, 3)), Ok(()));
-        assert_eq!(s.accept(&page(1, PAGE_SIZE, 3)), bad);
-        assert_eq!(s.accept(&complete(2, 4)), bad);
-        assert_eq!(s.accept(&complete(3, 5)), bad);
-        assert_eq!(
-            s.accept(&Frame {
-                length: 1,
-                ..complete(2, 5)
-            }),
-            bad
-        );
-        assert_eq!(s.accept(&complete(2, 5)), Ok(()));
-    }
-
     async fn read(chunks: &[&[u8]], close: bool) -> (Result<usize, HeadError>, Vec<u8>) {
         let (mut ours, mut theirs) = UnixStream::pair().unwrap();
         let chunks: Vec<Vec<u8>> = chunks.iter().map(|c| c.to_vec()).collect();
@@ -1441,7 +1008,7 @@ mod tests {
             Err(HeadError::Io(io::ErrorKind::UnexpectedEof, true))
         ));
         // Oversized heads, with and without a terminator.
-        let filler = format!("X: {}\r\n", "a".repeat(MAX_HEAD));
+        let filler = format!("X: {}\r\n", "a".repeat(MAX_HEAD_BYTES));
         let (r, _) = read(&[b"HTTP/1.1 200 OK\r\n", filler.as_bytes(), b"\r\n"], true).await;
         assert!(matches!(r, Err(HeadError::Protocol)));
         let (r, _) = read(&[b"HTTP/1.1 200 OK\r\n", filler.as_bytes()], false).await;

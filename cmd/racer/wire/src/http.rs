@@ -479,8 +479,8 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 impl ContentType {
-    /// Validate one MIME type with optional unique parameters and retain its bytes.
-    pub fn parse(bytes: &[u8]) -> Result<Self> {
+    /// Validate one MIME type with optional unique parameters without copying it.
+    pub fn validate(bytes: &[u8]) -> Result<()> {
         if bytes.is_empty()
             || bytes.iter().any(|b| !(0x20..=0x7e).contains(b))
             || bytes.first() == Some(&b' ')
@@ -522,6 +522,12 @@ impl ContentType {
                 token(&mut rest)?;
             }
         }
+        Ok(())
+    }
+
+    /// Validate one MIME type with optional unique parameters and retain its bytes.
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        Self::validate(bytes)?;
         Ok(Self(
             String::from_utf8(bytes.to_vec()).map_err(|_| Error::Malformed)?,
         ))
