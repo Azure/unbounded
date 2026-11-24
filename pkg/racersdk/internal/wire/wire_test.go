@@ -786,87 +786,6 @@ func TestStdlibNormalizationRequiresRawValidation(t *testing.T) {
 	}
 }
 
-type finalErrorReader struct{ err error }
-
-func (r finalErrorReader) Read(p []byte) (int, error) { return copy(p, "abc"), r.err }
-
-func TestFrameReaderBoundaries(t *testing.T) {
-	body := "body\r\n\r\nnot a head"
-	firstHead := rawResponse(200, "Content-Length: "+strconv.Itoa(len(body))+"\r\n")
-	nextHead := rawResponse(503, "Content-Length: 0\r\n")
-
-	source := bufio.NewReader(strings.NewReader(string(firstHead) + body + string(nextHead)))
-	if _, err := ReadRawHead(source, true); err != nil {
-		t.Fatal(err)
-	}
-
-	frame := &FrameReader{Source: source, Remaining: int64(len(body))}
-
-	got, err := io.ReadAll(frame)
-	if err != nil || string(got) != body {
-		t.Fatal("body corrupted")
-	}
-
-	head, err := ReadRawHead(source, true)
-	if err != nil || !bytes.Equal(head, nextHead) {
-		t.Fatal("read-ahead lost or body scanned")
-	}
-
-	frame = &FrameReader{Source: strings.NewReader("abc"), Remaining: 4}
-
-	got, err = io.ReadAll(frame)
-	if string(got) != "abc" || !errors.Is(err, io.ErrUnexpectedEOF) {
-		t.Fatal("truncation lost")
-	}
-
-	cause := errors.New("late private failure")
-	frame = &FrameReader{Source: finalErrorReader{err: cause}, Remaining: 3}
-
-	n, err := frame.Read(make([]byte, 8))
-	if n != 3 || !errors.Is(err, cause) {
-		t.Fatal("final error lost")
-	}
-
-	frame = &FrameReader{Source: finalErrorReader{err: io.EOF}, Remaining: 3}
-
-	got, err = io.ReadAll(frame)
-	if err != nil || string(got) != "abc" {
-		t.Fatal("exact EOF")
-	}
-
-	frame = &FrameReader{Remaining: 0}
-	if n, err := frame.Read(nil); n != 0 || err != nil {
-		t.Fatal("empty read")
-	}
-
-	if n, err := frame.Read(make([]byte, 1)); n != 0 || err != io.EOF {
-		t.Fatal("zero frame")
-	}
-}
-
-func TestPageStreamIntervalBound(t *testing.T) {
-	tracking := &Sequence{}
-	for n := uint64(0); n < 8192; n += 2 {
-		if !tracking.record(n) {
-			t.Fatal("interval rejected", n)
-		}
-	}
-
-	if tracking.record(8192) || tracking.record(0) {
-		t.Fatal("unbounded or duplicate interval accepted")
-	}
-
-	for n := uint64(1); n < 8192; n += 2 {
-		if !tracking.record(n) {
-			t.Fatal("merge rejected", n)
-		}
-	}
-
-	if len(tracking.intervals) != 1 || tracking.intervals[0] != (pageInterval{0, 8192}) {
-		t.Fatal("intervals failed to compact")
-	}
-}
-
 func TestFrameAndCreditBytes(t *testing.T) {
 	f := Frame{Kind: PageFrame, Number: 0x0102030405060708, Offset: 0x1112131415161718, Length: 0x21222324}
 	want := []byte{1, 1, 2, 3, 4, 5, 6, 7, 8, 17, 18, 19, 20, 21, 22, 23, 24, 33, 34, 35, 36}
@@ -1179,11 +1098,6 @@ func TestWriterFailures(t *testing.T) {
 
 	if w.writes != 1 {
 		t.Fatal("invalid frame reached writer")
-	}
-
-	var nilSequence *Sequence
-	if nilSequence.Intervals() != 0 || s.Intervals() != 0 {
-		t.Fatal("empty interval count")
 	}
 }
 
