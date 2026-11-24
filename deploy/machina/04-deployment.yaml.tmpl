@@ -58,9 +58,14 @@ spec:
             requests:
               cpu: 100m
               memory: 128Mi
+            # Memory grows with the fleet: the controller caches every
+            # Machine, and one MachineOperation per machine while a selector
+            # operation runs. A lab run measured about 440Mi with 38,000
+            # Machines and 26,000 operations cached, and the earlier 256Mi
+            # limit was reached near 14,000 operations.
             limits:
               cpu: 500m
-              memory: 256Mi
+              memory: 1Gi
           livenessProbe:
             httpGet:
               path: /healthz

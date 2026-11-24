@@ -57,6 +57,19 @@ rules:
   - apiGroups: ["unbounded-cloud.io"]
     resources: ["machines/finalizers"]
     verbs: ["update"]
+  # MachineOperation selector fan-out (pkg/machineops/fanout): reads Machines
+  # to resolve a selector, creates one machineRef operation per Machine,
+  # releases the held ones (a patch of spec.suspend), keeps the counts in the
+  # parent's status and deletes a finished parent after its TTL. No update on machineoperations/finalizers: that
+  # grant marks a controller allowed to write provider state. The create
+  # grant is also what 08-machineoperation-parent-status-policy takes as the
+  # right to write a selector operation's status.
+  - apiGroups: ["unbounded-cloud.io"]
+    resources: ["machineoperations"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
+  - apiGroups: ["unbounded-cloud.io"]
+    resources: ["machineoperations/status"]
+    verbs: ["get", "update"]
   # MachineConfiguration controller
   - apiGroups: ["unbounded-cloud.io"]
     resources: ["machineconfigurations"]
