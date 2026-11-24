@@ -148,8 +148,8 @@
 //!
 //! # Validation
 //!
-//! Run `cargo test -p page-alloc --no-default-features` and
-//! `cargo test -p page-alloc --all-features` under an external TERM timeout.
+//! Run `cargo test -p page-alloc` under an external TERM timeout. The crate has
+//! no features, so there is nothing to toggle.
 //! Simulation provides deterministic fault and cancellation ordering, not proof
 //! of filesystem security or kernel support. Descriptor-replacement test hooks
 //! require an open slab and no live writes and do not revalidate geometry.

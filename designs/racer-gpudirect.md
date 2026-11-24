@@ -151,6 +151,11 @@ restarted dataplane:
 A `host-read` refused because the destination is too small falls back to stream
 for that read only.
 
+Status: this mode-retry design was dropped. The Python client does not remember
+an unsupported mode, does not log a warning for a refused mode, and does not
+retry after an interval; a `gpu-read` answered with 501 still falls back to
+`host-read` for that read.
+
 ### Security
 
 The socket is already the trust boundary (`docs/content/concepts/racer.md`). The

@@ -253,13 +253,12 @@ UID/GID 65532 with mode `0700`, and repairs its owner and mode on every cache
 setup. Origins do not create this directory: mount it with hostPath type
 `Directory`, so origin pods wait until the dataplane has created it. The origin
 creates its socket with mode `0600`; the privileged dataplane can still connect.
-When the dataplane takes over a directory left by an older root origin, it
-re-owns that origin's leftover lock, socket, and staging entries to UID/GID 65532
-instead of deleting them, so the new origin can recover them. Run exactly one origin owner per cache on every
-eligible node that can supply origin reads, not only on nodes that read. A
-DaemonSet with the same placement and tolerations as Racer does this. Every
-origin must return the same bytes for the same key and version. Never delete a
-live socket to take over from another owner.
+The dataplane does not adopt entries left by an older root origin. Run exactly
+one origin owner per cache on every eligible node that can supply origin reads,
+not only on nodes that read. A DaemonSet with the same placement and
+tolerations as Racer does this. Every origin must return the same bytes for the
+same key and version. Never delete a live socket to take over from another
+owner.
 
 ## Node labels and annotations
 
@@ -2389,9 +2388,10 @@ name when sysfs reports no PCI address, so a device renamed by a VF hot-unplug/r
 example `mana_0` becoming `roceP30832p0s0`) keeps its rail. Missing ports retain their rails
 until a new port appears; the new port then takes the lowest rail whose port is missing, so
 a replaced device reuses its predecessor's rail. Ports with no reservation append. The
-journal is versioned; a legacy unversioned journal, which was keyed by device name, is
-discarded on start and rails are renumbered in PCI BDF/port order. Do not delete it
-independently of coordinated topology changes. Corruption fails enrollment instead of renumbering rails.
+journal is versioned. A journal in any other format, including the legacy
+unversioned form keyed by device name, is corrupt: the dataplane fails
+enrollment instead of discarding it and renumbering rails. Do not delete it
+independently of coordinated topology changes.
 
 Dataplanes run privileged as root with escalation allowed and a read-only root filesystem.
 HostPaths `/var/lib/racer/identity`, `/var/lib/racer/slabs`, and `/run/racer` are writable;

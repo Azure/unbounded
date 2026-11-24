@@ -22,11 +22,12 @@ the same test fails when they are stale.
   multiplied by the final worker count) and a plain node-wide form (divided
   among workers). Setting both is an error.
 
-Renamed variables. The dataplane has no compatibility aliases, but the
-operator rewrites the renamed keys in `racer-settings` to their replacements
-with the same value (the old budget keys were already per-worker amounts). It
-removes the `RACER_WARM_*` keys, which never had an effect, and reports
-`RACER_PEER_PORT` for a manual change:
+Renamed variables. The dataplane has no compatibility aliases. The operator
+validates `racer-settings` against the generated table and drops the retired
+keys `RACER_PEER_TCP_NODELAY` and `RACER_PAGE_BYTES`. It does not rewrite
+renamed keys from older releases, so set the current name yourself. The old
+`RACER_WARM_*` keys never had an effect and are now rejected as unknown. These
+older names map to their replacements:
 
 | Old | New |
 | --- | --- |
