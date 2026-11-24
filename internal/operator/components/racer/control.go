@@ -29,8 +29,6 @@ const (
 	stateUIDAnnotation = "unbounded-cloud.io/racer-state-uid"
 )
 
-func objectMeta(name string) metav1.ObjectMeta { return metav1.ObjectMeta{Name: name} }
-
 // controlState is what planning learned about the runtime state Secret.
 type controlState struct {
 	// uid is empty when racer-state does not exist yet.
@@ -78,7 +76,7 @@ func planControl(ctx context.Context, env *component.Env, plan *component.Plan, 
 			return controlState{}, err
 		}
 
-		if err := validateAdoptable(ctx, env, current); err != nil {
+		if err := validateOwner(current); err != nil {
 			return controlState{}, err
 		}
 
@@ -128,7 +126,7 @@ func planEndpointSlice(ctx context.Context, env *component.Env, plan *component.
 	if err == nil {
 		current.SetGroupVersionKind(discoveryv1.SchemeGroupVersion.WithKind("EndpointSlice"))
 
-		if err := validateAdoptable(ctx, env, current); err != nil {
+		if err := validateOwner(current); err != nil {
 			return err
 		}
 

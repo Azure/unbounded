@@ -32,7 +32,6 @@ const (
 	name                = "racer"
 	webhookConfigName   = "racer-object-sidecar-injector"
 	pendingRequeue      = 5 * time.Second
-	reasonMigrating     = "MigratingController"
 	reasonGuards        = "AdmissionGuardUnavailable"
 	reasonInitializing  = "Initializing"
 	reasonOriginInvalid = "OriginInvalid"
@@ -72,22 +71,6 @@ func (Component) Plan(ctx context.Context, env *component.Env, _ []machinav1.Sit
 			return nil, component.Result{}, err
 		}
 
-		renamed, err := planRenamedContainment(ctx, env)
-		if err != nil {
-			return nil, component.Result{}, err
-		}
-
-		// Pre-rename grants retained here are guarded the same way. The rename
-		// cleanup itself waits for a ClusterCache, consistent with retaining
-		// the existing installation.
-		if renamed != nil {
-			if containment == nil {
-				containment = component.NewPlan()
-			}
-
-			containment.Merge(renamed)
-		}
-
 		if containment != nil {
 			return containment, component.NotReadyAfter(reasonGuards, "revoking Racer dataplane permissions until its admission policies are restored", pendingRequeue), nil
 		}
@@ -95,14 +78,7 @@ func (Component) Plan(ctx context.Context, env *component.Env, _ []machinav1.Sit
 		return component.NewPlan(), component.ReconciledAfter("no ClusterCache; existing Racer resources retained with admission guards enforced", time.Hour), nil
 	}
 
-	plan, done, err := planLegacy(ctx, env)
-	if err != nil {
-		return nil, component.Result{}, err
-	}
-
-	if !done {
-		return plan, component.NotReadyAfter(reasonMigrating, "waiting for the retired racer-controller to stop", pendingRequeue), nil
-	}
+	plan := component.NewPlan()
 
 	policies, err := decodePolicies(env)
 	if err != nil {
@@ -112,19 +88,6 @@ func (Component) Plan(ctx context.Context, env *component.Env, _ []machinav1.Sit
 	containment, err := planContainment(ctx, env, policies)
 	if err != nil {
 		return nil, component.Result{}, err
-	}
-
-	renamed, err := planRenamedContainment(ctx, env)
-	if err != nil {
-		return nil, component.Result{}, err
-	}
-
-	if renamed != nil {
-		if containment == nil {
-			containment = component.NewPlan()
-		}
-
-		containment.Merge(renamed)
 	}
 
 	if containment != nil {
@@ -199,36 +162,13 @@ func planInstall(ctx context.Context, env *component.Env, plan *component.Plan, 
 		return nil, component.Result{}, err
 	}
 
-	// Remove what this operator applied under the pre-rename names once the
-	// new DaemonSet is observed live. A config with a UID was read live. The
-	// cleanup is staged across passes and the old objects are not watched, so
-	// a pending cleanup requeues shortly rather than waiting for the hourly
-	// resync.
-	cleaning, err := planRenamedCleanup(ctx, env, plan, config.UID != "")
-	if err != nil {
-		return nil, component.Result{}, err
-	}
-
-	invalid, originsWaiting, err := planOrigins(ctx, env, plan)
+	invalid, err := planOrigins(ctx, env)
 	if err != nil {
 		return nil, component.Result{}, err
 	}
 
 	if len(invalid) != 0 {
 		return plan, component.NotReadyAfter(reasonOriginInvalid, "Racer origins invalid for ClusterCache "+strings.Join(invalid, "; "), time.Minute), nil
-	}
-
-	if originsWaiting {
-		// Legacy origin DaemonSets stay until every dataplane Pod reads
-		// origins in-process; their workloads are watched, but the rollout
-		// is re-checked soon regardless.
-		return plan, component.ReconciledAfter("Racer dataplane installation reconciled; waiting for the dataplane rollout before removing legacy origin DaemonSets", pendingRequeue), nil
-	}
-
-	if cleaning {
-		// The new installation is in place; only pre-rename leftovers remain,
-		// so this stays ready and just re-checks soon.
-		return plan, component.ReconciledAfter("Racer dataplane installation reconciled; removing pre-rename objects", pendingRequeue), nil
 	}
 
 	return plan, component.ReconciledAfter("Racer dataplane installation reconciled", time.Hour), nil
@@ -239,19 +179,15 @@ func (Component) SetupWatches(b *builder.Builder, env *component.Env) {
 	b.Watches(&admissionv1.ValidatingAdmissionPolicyBinding{}, env.RequestSingleton(), builder.WithPredicates(guardPredicate()))
 	b.Watches(&admissionv1.MutatingWebhookConfiguration{}, env.RequestSingleton(), builder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool { return obj.GetName() == webhookConfigName })))
 	b.Watches(&racerv1.ClusterCache{}, env.RequestSingleton(), builder.WithPredicates(clusterCachePredicate()))
-	b.Watches(&appsv1.Deployment{}, env.RequestSingleton(), builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(legacyController))))
 	b.Watches(&appsv1.DaemonSet{}, env.RequestSingleton(), builder.WithPredicates(env.ManagedWorkloadPredicate(runtimeWorkload(env))))
 	b.Watches(&corev1.ServiceAccount{}, env.RequestSingleton(), builder.WithPredicates(predicate.NewPredicateFuncs(runtimeWorkload(env))))
 	b.Watches(&corev1.ConfigMap{}, env.RequestSingleton(), builder.WithPredicates(env.ManagedConfigPredicate(env.InNamespaceNamed(dataplaneConfigName))))
 	b.Watches(&corev1.Secret{}, env.RequestSingleton(), builder.WithPredicates(predicate.NewPredicateFuncs(secretWatched(env))))
 }
 
-// runtimeWorkload matches the dataplane and every origin workload or account
-// left by earlier operator versions, so leftovers are pruned promptly.
+// runtimeWorkload matches the dataplane workload and account.
 func runtimeWorkload(env *component.Env) func(client.Object) bool {
-	dataplane, origin := env.InNamespaceNamed(dataplaneName), env.InNamespaceWithPrefix(originPrefix)
-
-	return func(obj client.Object) bool { return dataplane(obj) || origin(obj) }
+	return env.InNamespaceNamed(dataplaneName)
 }
 
 // secretWatched matches the racer-state Secret.

@@ -11,9 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
@@ -31,40 +29,6 @@ func originCache(name string, credential *racerv1.AzureCredential) *racerv1.Clus
 	}
 
 	return cache
-}
-
-// leftoverOrigin creates the DaemonSet and ServiceAccount an earlier operator
-// version ran for a cache origin. manager is the managerAnnotation value.
-func leftoverOrigin(t *testing.T, env *component.Env, cache, manager string) {
-	t.Helper()
-
-	meta := func() metav1.ObjectMeta {
-		return metav1.ObjectMeta{
-			Name: originPrefix + cache, Namespace: env.Namespace,
-			Labels:      map[string]string{"app.kubernetes.io/name": originAppName, "app.kubernetes.io/component": originAppName},
-			Annotations: map[string]string{managerAnnotation: manager},
-		}
-	}
-
-	require.NoError(t, env.Client.Create(t.Context(), &appsv1.DaemonSet{ObjectMeta: meta()}))
-	require.NoError(t, env.Client.Create(t.Context(), &corev1.ServiceAccount{ObjectMeta: meta()}))
-}
-
-func originExists(t *testing.T, env *component.Env, cache string) (ds, sa bool) {
-	t.Helper()
-
-	exists := func(obj client.Object) bool {
-		err := env.Client.Get(t.Context(), objectKey(env, originPrefix+cache), obj)
-		if apierrors.IsNotFound(err) {
-			return false
-		}
-
-		require.NoError(t, err)
-
-		return true
-	}
-
-	return exists(&appsv1.DaemonSet{}), exists(&corev1.ServiceAccount{})
 }
 
 func updateCache(t *testing.T, env *component.Env, name string, mutate func(*racerv1.ClusterCache)) {
@@ -105,120 +69,12 @@ func TestOriginCachesNeedNoOriginWorkloads(t *testing.T) {
 	require.True(t, result.Ready, "%s: %s", result.Reason, result.Message)
 
 	for _, op := range plan.Operations {
-		require.False(t, strings.HasPrefix(op.Object.GetName(), originPrefix), "%s", op.Ref())
-	}
-
-	dataplaneOp(t, plan)
-}
-
-func TestLeftoverOriginsArePruned(t *testing.T) {
-	env := testEnv(t, originCache("a", nil), cacheObject("plain"))
-	initialize(t, env)
-
-	leftoverOrigin(t, env, "a", component.FieldOwner)
-	leftoverOrigin(t, env, "gone", component.FieldOwner)
-	// An origin the operator does not manage is never pruned.
-	leftoverOrigin(t, env, "foreign", "someone-else")
-
-	plan := planPass(t, env)
-
-	deleted := map[string]bool{}
-
-	for _, op := range plan.Operations {
-		if op.Kind == component.OpDelete {
-			deleted[op.Object.GetKind()+"/"+op.Object.GetName()] = true
+		if kind := op.Object.GetKind(); kind == "DaemonSet" || kind == "ServiceAccount" {
+			require.Equal(t, dataplaneName, op.Object.GetName(), "%s", op.Ref())
 		}
 	}
 
-	require.Equal(t, map[string]bool{
-		"DaemonSet/" + originPrefix + "a": true, "ServiceAccount/" + originPrefix + "a": true,
-		"DaemonSet/" + originPrefix + "gone": true, "ServiceAccount/" + originPrefix + "gone": true,
-	}, deleted)
-	persist(t, env, plan)
-
-	for _, cache := range []string{"a", "gone"} {
-		ds, sa := originExists(t, env, cache)
-		require.False(t, ds || sa, cache)
-	}
-
-	ds, sa := originExists(t, env, "foreign")
-	require.True(t, ds && sa)
-	liveDataplane(t, env)
-}
-
-func deletedOrigins(plan *component.Plan) []string {
-	var deleted []string
-
-	for _, op := range plan.Operations {
-		if op.Kind == component.OpDelete && strings.HasPrefix(op.Object.GetName(), originPrefix) {
-			deleted = append(deleted, op.Object.GetKind()+"/"+op.Object.GetName())
-		}
-	}
-
-	return deleted
-}
-
-func setDataplaneStatus(t *testing.T, env *component.Env, status appsv1.DaemonSetStatus) {
-	t.Helper()
-
-	ds := liveDataplane(t, env)
-	ds.Status = status
-	require.NoError(t, env.Client.Status().Update(t.Context(), ds))
-}
-
-func TestLeftoverOriginsWaitForDataplaneRollout(t *testing.T) {
-	env := testEnv(t, originCache("a", nil))
-	initialize(t, env)
-	leftoverOrigin(t, env, "a", component.FieldOwner)
-	leftoverOrigin(t, env, "gone", component.FieldOwner)
-
-	// Some nodes still run the old dataplane: keep the origins and requeue.
-	setDataplaneStatus(t, env, appsv1.DaemonSetStatus{DesiredNumberScheduled: 3, UpdatedNumberScheduled: 1, NumberAvailable: 3})
-	plan, result := planResult(t, env)
-	require.Empty(t, deletedOrigins(plan))
-	require.True(t, result.Ready)
-	require.Equal(t, pendingRequeue, result.RequeueAfter)
-	require.Contains(t, result.Message, "legacy origin")
-	persist(t, env, plan)
-
-	for _, cache := range []string{"a", "gone"} {
-		ds, sa := originExists(t, env, cache)
-		require.True(t, ds && sa, cache)
-	}
-
-	// Updated but not yet available still waits.
-	setDataplaneStatus(t, env, appsv1.DaemonSetStatus{DesiredNumberScheduled: 3, UpdatedNumberScheduled: 3, NumberAvailable: 2, NumberUnavailable: 1})
-	require.Empty(t, deletedOrigins(planPass(t, env)))
-
-	// A live template without the native-origin marker is an old dataplane.
-	ds := liveDataplane(t, env)
-	delete(ds.Spec.Template.Annotations, nativeOriginAnnotation)
-	require.NoError(t, env.Client.Update(t.Context(), ds))
-	setDataplaneStatus(t, env, appsv1.DaemonSetStatus{DesiredNumberScheduled: 3, UpdatedNumberScheduled: 3, NumberAvailable: 3})
-	done, err := nativeOriginRolledOut(t.Context(), env)
-	require.NoError(t, err)
-	require.False(t, done)
-
-	// Restore the template and complete the rollout: the origins go.
-	persist(t, env, planPass(t, env))
-	ds = liveDataplane(t, env)
-	setDataplaneStatus(t, env, appsv1.DaemonSetStatus{ObservedGeneration: ds.Generation, DesiredNumberScheduled: 3, UpdatedNumberScheduled: 3, NumberAvailable: 3})
-	plan, result = planResult(t, env)
-	require.Len(t, deletedOrigins(plan), 4)
-	require.Equal(t, time.Hour, result.RequeueAfter)
-}
-
-func TestLeftoverOriginsWaitForDataplane(t *testing.T) {
-	env := testEnv(t, originCache("a", nil))
-	initialize(t, env)
-	leftoverOrigin(t, env, "a", component.FieldOwner)
-	require.NoError(t, env.Client.Delete(t.Context(), liveDataplane(t, env)))
-
-	// With no dataplane DaemonSet yet, it is planned and the origins wait.
-	plan, result := planResult(t, env)
 	dataplaneOp(t, plan)
-	require.Empty(t, deletedOrigins(plan))
-	require.Equal(t, pendingRequeue, result.RequeueAfter)
 }
 
 func TestOriginInvalidCacheIsReported(t *testing.T) {
@@ -328,7 +184,7 @@ func TestValidateOriginAcceptsValidSpecs(t *testing.T) {
 	}
 }
 
-func TestOriginWatchPredicates(t *testing.T) {
+func TestRuntimeWorkloadPredicate(t *testing.T) {
 	env := testEnv(t)
 	match := runtimeWorkload(env)
 	predicate := env.ManagedWorkloadPredicate(match)
@@ -338,9 +194,8 @@ func TestOriginWatchPredicates(t *testing.T) {
 		want            bool
 	}{
 		{dataplaneName, env.Namespace, true},
-		{originPrefix + "cache", env.Namespace, true},
-		{originPrefix, env.Namespace, false},
-		{originPrefix + "cache", "other", false},
+		{"racer-origin-cache", env.Namespace, false},
+		{dataplaneName, "other", false},
 		{"unrelated", env.Namespace, false},
 	} {
 		ds := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: tc.name, Namespace: tc.namespace}}
@@ -366,69 +221,4 @@ func planHasObject(plan *component.Plan, kind, name string) bool {
 	}
 
 	return false
-}
-
-// dataplanePod creates a Pod owned by the live dataplane DaemonSet.
-func dataplanePod(t *testing.T, env *component.Env, name string, native, ready bool) {
-	t.Helper()
-
-	ds := liveDataplane(t, env)
-	if ds.UID == "" {
-		ds.UID = types.UID("dataplane-uid")
-		require.NoError(t, env.Client.Update(t.Context(), ds))
-		ds = liveDataplane(t, env)
-	}
-
-	annotations := map[string]string{}
-	if native {
-		annotations[nativeOriginAnnotation] = "true"
-	}
-
-	status := corev1.ConditionFalse
-	if ready {
-		status = corev1.ConditionTrue
-	}
-
-	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:            name,
-			Namespace:       ds.Namespace,
-			Labels:          ds.Spec.Selector.MatchLabels,
-			Annotations:     annotations,
-			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(ds, appsv1.SchemeGroupVersion.WithKind("DaemonSet"))},
-		},
-		Status: corev1.PodStatus{Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: status}}},
-	}
-	require.NoError(t, env.Client.Create(t.Context(), pod))
-}
-
-func TestLeftoverOriginsWaitForSurgeRollout(t *testing.T) {
-	env := testEnv(t, originCache("a", nil))
-	initialize(t, env)
-	leftoverOrigin(t, env, "a", component.FieldOwner)
-
-	// A surge rollout: the old Pod is still ready and serving while its
-	// replacement is not, yet the counters all equal the desired count.
-	dataplanePod(t, env, "old", false, true)
-	dataplanePod(t, env, "new", true, false)
-
-	ds := liveDataplane(t, env)
-	setDataplaneStatus(t, env, appsv1.DaemonSetStatus{ObservedGeneration: ds.Generation, DesiredNumberScheduled: 1, UpdatedNumberScheduled: 1, NumberAvailable: 1})
-
-	plan, result := planResult(t, env)
-	require.Empty(t, deletedOrigins(plan))
-	require.Equal(t, pendingRequeue, result.RequeueAfter)
-
-	// The old Pod goes but the replacement is still unready: keep waiting.
-	require.NoError(t, env.Client.Delete(t.Context(), &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "old", Namespace: ds.Namespace}}))
-
-	plan, _ = planResult(t, env)
-	require.Empty(t, deletedOrigins(plan))
-
-	// Only ready native-origin Pods remain: the origins go.
-	require.NoError(t, env.Client.Delete(t.Context(), &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "new", Namespace: ds.Namespace}}))
-	dataplanePod(t, env, "new2", true, true)
-
-	plan, _ = planResult(t, env)
-	require.Len(t, deletedOrigins(plan), 2)
 }

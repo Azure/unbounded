@@ -103,12 +103,7 @@ func planContainment(ctx context.Context, env *component.Env, policies []*unstru
 		}
 
 		// A binding someone else manages is not ours to remove.
-		ok, err = adoptable(ctx, env, current)
-		if err != nil {
-			return nil, err
-		}
-
-		if !ok {
+		if !owned(current) {
 			continue
 		}
 
