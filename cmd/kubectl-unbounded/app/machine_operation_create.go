@@ -8,22 +8,38 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
 
+// maxConcurrentPattern is the client-side mirror of the API rule for
+// spec.rollout.maxConcurrent: an integer of at least 1, or a percentage from
+// 1% to 100%.
+var maxConcurrentPattern = regexp.MustCompile(`^([1-9][0-9]*|([1-9][0-9]?|100)%)$`)
+
 type machineOperationCreateOptions struct {
 	name          string
 	kind          v1alpha3.OperationKind
 	machine       string
 	selector      string
+	maxConcurrent string
+	// retainChildren keeps every child of a selector operation once it has
+	// finished.
+	retainChildren bool
+	// maxFailures is how many failed machines end a rollout that continues
+	// on failure. Zero leaves the server default.
+	maxFailures   int32
+	onFailure     string
 	parameterArgs []string
 	parameters    map[string]string
 	ttlSeconds    int32
@@ -57,9 +73,16 @@ func newMachineOperationCreateCommand(rt *machineCommandRuntime) *cobra.Command 
 	cmd := &cobra.Command{
 		Use:   "create NAME",
 		Short: "Create a MachineOperation resource",
-		Long: `Create a MachineOperation resource that targets one Machine or a
-Machine selector. Use --wait to stream status until the operation reaches a
-terminal phase.`,
+		Long: `Create a MachineOperation resource that targets one Machine with
+--machine, or a group of Machines with --selector. A selector operation
+resolves the selector once against Machine labels, creates one child
+operation per matched Machine, and acts on the matched machines at the pace
+set by --max-concurrent, which is a number of at least 1 or a percentage from
+1% to 100% of the matched machines. The default pace is one machine at a
+time. --on-failure Stop (the default) starts no further machines after a
+failure; Continue carries on until --max-failures machines have failed
+(1000 by default). Use --wait to stream status until the
+operation reaches a terminal phase.`,
 		Example: `  kubectl unbounded machine operation create reboot-worker-01 \
     --kind HostHardReboot --machine worker-01
 
@@ -68,7 +91,19 @@ terminal phase.`,
 
   kubectl unbounded machine operation create upgrade-worker-01 \
     --kind AgentUpgrade --machine worker-01 \
-    --param downloadURL=https://example.com/unbounded-agent-linux-amd64.tar.gz`,
+    --param downloadURL=https://example.com/unbounded-agent-linux-amd64.tar.gz
+
+  kubectl unbounded machine operation create upgrade-rack-01 \
+    --kind AgentUpgrade \
+    --selector topology.unbounded-cloud.io/rack=dc-a.rack-01 \
+    --param downloadURL=https://example.com/unbounded-agent-linux-amd64.tar.gz \
+    --wait
+
+  kubectl unbounded machine operation create reboot-rack-01 \
+    --kind HostHardReboot \
+    --selector topology.unbounded-cloud.io/rack=dc-a.rack-01 \
+    --max-concurrent 100% \
+    --wait`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			o.name = args[0]
@@ -90,6 +125,10 @@ func addMachineOperationCreateFlags(cmd *cobra.Command, o *machineOperationCreat
 	cmd.Flags().StringVar((*string)(&o.kind), "kind", "", "Operation kind: NodeReboot, AgentUpgrade, AgentReset, HostHardReboot, HostSoftReboot, HostPowerOff, HostPowerOn, or HostReplace")
 	cmd.Flags().StringVar(&o.machine, "machine", "", "Target Machine name")
 	cmd.Flags().StringVarP(&o.selector, "selector", "l", "", "Machine label selector")
+	cmd.Flags().StringVar(&o.maxConcurrent, "max-concurrent", "", "Selector operations only: how many matched machines may be operated on at the same time, a number of at least 1 or a percentage from 1% to 100% (default one at a time)")
+	cmd.Flags().StringVar(&o.onFailure, "on-failure", "", "Selector operations only: what to do after a machine's operation fails, Stop or Continue (default Stop)")
+	cmd.Flags().BoolVar(&o.retainChildren, "retain-children", false, "Selector operations only: keep every per-machine child operation after the operation finishes (default: only the children that failed are kept)")
+	cmd.Flags().Int32Var(&o.maxFailures, "max-failures", 0, "Selector operations with --on-failure Continue only: stop after this many machines have failed, from 1 to 1000 (default 1000)")
 	cmd.Flags().StringArrayVar(&o.parameterArgs, "param", nil, "Operation parameter as key=value (repeatable)")
 	cmd.Flags().Int32Var(&o.ttlSeconds, "ttl", -1, "Seconds after completion before cleanup (0 keeps indefinitely, default keeps indefinitely)")
 	cmd.Flags().Lookup("ttl").DefValue = "unset"
@@ -110,6 +149,12 @@ func addMachineOperationCreateFlags(cmd *cobra.Command, o *machineOperationCreat
 			string(v1alpha3.OperationHostPowerOff),
 			string(v1alpha3.OperationHostPowerOn),
 			string(v1alpha3.OperationHostReplace),
+		}, cobra.ShellCompDirectiveNoFileComp
+	})
+	_ = cmd.RegisterFlagCompletionFunc("on-failure", func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective) { //nolint:errcheck
+		return []string{
+			string(v1alpha3.RolloutFailurePolicyStop),
+			string(v1alpha3.RolloutFailurePolicyContinue),
 		}, cobra.ShellCompDirectiveNoFileComp
 	})
 	_ = cmd.RegisterFlagCompletionFunc("output", func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective) { //nolint:errcheck
@@ -198,6 +243,47 @@ func (o *machineOperationCreateOptions) validate() error {
 		return fmt.Errorf("exactly one of --machine or --selector is required")
 	}
 
+	if o.maxConcurrent != "" || o.onFailure != "" || o.retainChildren || o.maxFailures != 0 {
+		if o.machine != "" {
+			flags := make([]string, 0, 4)
+			if o.maxConcurrent != "" {
+				flags = append(flags, "--max-concurrent")
+			}
+
+			if o.onFailure != "" {
+				flags = append(flags, "--on-failure")
+			}
+
+			if o.retainChildren {
+				flags = append(flags, "--retain-children")
+			}
+
+			if o.maxFailures != 0 {
+				flags = append(flags, "--max-failures")
+			}
+
+			return fmt.Errorf("%s are only allowed with --selector, not with --machine", strings.Join(flags, " and "))
+		}
+	}
+
+	if o.maxConcurrent != "" && !validMaxConcurrent(o.maxConcurrent) {
+		return fmt.Errorf("invalid --max-concurrent value %q: must be an integer of at least 1 or a percentage from 1%% to 100%%", o.maxConcurrent)
+	}
+
+	if o.onFailure != "" && o.onFailure != string(v1alpha3.RolloutFailurePolicyStop) && o.onFailure != string(v1alpha3.RolloutFailurePolicyContinue) {
+		return fmt.Errorf("invalid --on-failure value %q: must be Stop or Continue", o.onFailure)
+	}
+
+	if o.maxFailures != 0 {
+		if o.maxFailures < 1 || o.maxFailures > v1alpha3.MaxRolloutFailures {
+			return fmt.Errorf("invalid --max-failures value %d: must be from 1 to %d", o.maxFailures, v1alpha3.MaxRolloutFailures)
+		}
+
+		if o.onFailure != string(v1alpha3.RolloutFailurePolicyContinue) {
+			return fmt.Errorf("--max-failures is only allowed with --on-failure Continue")
+		}
+	}
+
 	if o.ttlSeconds < 0 && (o.ttlSeconds != -1 || o.ttlSet) {
 		return fmt.Errorf("--ttl must be 0 or greater")
 	}
@@ -234,6 +320,22 @@ func (o *machineOperationCreateOptions) validate() error {
 	return nil
 }
 
+// validMaxConcurrent mirrors the API rule: a percentage from 1% to 100%, or a
+// number of at least 1 that fits the 32-bit field it is stored in.
+func validMaxConcurrent(value string) bool {
+	if !maxConcurrentPattern.MatchString(value) {
+		return false
+	}
+
+	if strings.HasSuffix(value, "%") {
+		return true
+	}
+
+	_, err := strconv.ParseInt(value, 10, 32)
+
+	return err == nil
+}
+
 func (o *machineOperationCreateOptions) build() (*v1alpha3.MachineOperation, error) {
 	parameters, err := o.operationParameters()
 	if err != nil {
@@ -266,6 +368,30 @@ func (o *machineOperationCreateOptions) build() (*v1alpha3.MachineOperation, err
 		}
 
 		op.Spec.MachineSelector = selector
+	}
+
+	if o.maxConcurrent != "" || o.onFailure != "" || o.retainChildren || o.maxFailures != 0 {
+		rollout := &v1alpha3.MachineOperationRollout{}
+
+		if o.maxFailures != 0 {
+			rollout.MaxFailures = &o.maxFailures
+		}
+
+		if o.retainChildren {
+			rollout.ChildRetention = v1alpha3.ChildRetentionAll
+		}
+
+		if o.maxConcurrent != "" {
+			value := intstr.Parse(o.maxConcurrent)
+			rollout.MaxConcurrent = &value
+		}
+
+		if o.onFailure != "" {
+			policy := v1alpha3.RolloutFailurePolicy(o.onFailure)
+			rollout.OnFailure = policy
+		}
+
+		op.Spec.Rollout = rollout
 	}
 
 	if o.ttlSeconds > 0 {

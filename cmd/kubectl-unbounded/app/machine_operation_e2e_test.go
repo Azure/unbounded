@@ -79,6 +79,7 @@ func TestMachineOperationCommandsEndToEnd(t *testing.T) {
 			"site": "edge-1",
 		}, op.Spec.MachineSelector.MatchLabels)
 		require.Equal(t, v1alpha3.OperationNodeReboot, op.Spec.OperationKind)
+		require.Nil(t, op.Spec.Rollout)
 		require.Nil(t, op.Spec.TTLSecondsAfterFinished)
 	})
 
