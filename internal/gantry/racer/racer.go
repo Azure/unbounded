@@ -1075,6 +1075,7 @@ func (w *racerResponseWriter) ReadFrom(r io.Reader) (int64, error) {
 	}
 
 	w.bytes += n
+
 	if err == nil && source.N != 0 {
 		err = io.ErrUnexpectedEOF
 	}
