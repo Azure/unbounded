@@ -34,8 +34,12 @@ const (
 	DefaultTTL = 24 * time.Hour
 
 	// Group is the extra group every token adds to the identity it
-	// authenticates. machina approves an agent daemon's client certificate
-	// request only when the requester is in this group.
+	// authenticates. Two things depend on it. The ClusterRoleBindings in
+	// deploy/machina/07-bootstrapper-rbac.yaml.tmpl let the kubelet create its
+	// first client certificate request and have it approved automatically;
+	// TestMachinaRBACBindsGroup checks them. machina's CSR approver also
+	// requires this group of bootstrap-token requesters before it approves an
+	// agent daemon's certificate.
 	Group = "system:bootstrappers:unbounded-agent-daemons"
 )
 
@@ -128,7 +132,7 @@ func SecretData(token *Token) map[string][]byte {
 // when there is none.
 func ForSite(ctx context.Context, kubeCli kubernetes.Interface, siteName string) (*Token, error) {
 	l, err := kubeCli.CoreV1().Secrets(metav1.NamespaceSystem).List(ctx, metav1.ListOptions{
-		LabelSelector: fmt.Sprintf("unbounded-cloud.io/site=%s", siteName),
+		LabelSelector: fmt.Sprintf("%s=%s", v1alpha3.MachineSiteLabelKey, siteName),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("list secrets: %w", err)
@@ -169,7 +173,7 @@ func IsValidForSite(secret *corev1.Secret, siteName string, now time.Time) bool 
 		return false
 	}
 
-	if secret.Labels["unbounded-cloud.io/site"] != siteName {
+	if secret.Labels[v1alpha3.MachineSiteLabelKey] != siteName {
 		return false
 	}
 
