@@ -25,8 +25,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/bootstraptoken"
 	"github.com/Azure/unbounded/internal/helpers/statusmsg"
-	"github.com/Azure/unbounded/internal/kube"
 	publicmachineops "github.com/Azure/unbounded/pkg/machineops"
 )
 
@@ -132,7 +132,7 @@ func allocationNamesFor(uid types.UID) allocationNames {
 		allocateOperation: machine + "-allocate",
 		releaseOperation:  machine + "-release",
 		tokenID:           string(id),
-		tokenSecret:       kube.BootstrapTokenSecretName(string(id)),
+		tokenSecret:       bootstraptoken.SecretName(string(id)),
 		inputFinalizer:    allocationInputFinalizerPrefix + string(uid),
 	}
 }

@@ -27,7 +27,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	"github.com/Azure/unbounded/internal/unbounded"
+	"github.com/Azure/unbounded/internal/systemns"
 )
 
 const (
@@ -72,12 +72,12 @@ const (
 	// BuildDefaultNamespace is the namespace baked into the embedded component
 	// manifests at build time. RetargetNamespace rewrites it to the operator's
 	// configured namespace when they differ.
-	BuildDefaultNamespace = unbounded.DefaultSystemNamespace
+	BuildDefaultNamespace = systemns.Default
 )
 
 // DefaultNamespace is the namespace the operator installs components into. It
-// follows the operator's own namespace (unbounded.SystemNamespace()).
-var DefaultNamespace = unbounded.SystemNamespace()
+// follows the operator's own namespace (systemns.Name()).
+var DefaultNamespace = systemns.Name()
 
 // Config carries operator-level settings components read while reconciling.
 type Config struct {

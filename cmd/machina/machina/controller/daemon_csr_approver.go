@@ -15,15 +15,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	"github.com/Azure/unbounded/internal/unbounded"
+	"github.com/Azure/unbounded/internal/bootstraptoken"
+	"github.com/Azure/unbounded/internal/systemns"
 	"github.com/Azure/unbounded/pkg/agent/daemoncred"
 )
 
 const (
-	bootstrapSecretPref        = "bootstrap-token-"
 	defaultBootstrapTokenLabel = "unbounded-cloud.io/default-bootstrap-token"
 	daemonGroup                = "unbounded-agent-daemons"
-	bootstrapGroup             = "system:bootstrappers:unbounded-agent-daemons"
 
 	machineNodeRefNameField = "spec.kubernetes.nodeRef.name"
 
@@ -47,7 +46,7 @@ func NewDaemonCSRApprover(
 	claims := &daemonCSRClaimChecker{Client: c, APIReader: apiReader}
 
 	approver, err := daemoncred.NewCSRApprover(daemoncred.CSRApproverOptions{
-		BootstrapGroup:               bootstrapGroup,
+		BootstrapGroup:               bootstraptoken.Group,
 		DaemonGroup:                  daemonGroup,
 		AuthorizeBootstrap:           claims.bootstrapTokenMayClaimNode,
 		CredentialBootstrapRequester: metalmanBootstrapUsername(),
@@ -71,7 +70,7 @@ func (c *daemonCSRClaimChecker) bootstrapTokenMayClaimNode(
 		return false, nil
 	}
 
-	secretName := bootstrapSecretPref + tokenID
+	secretName := bootstraptoken.SecretName(tokenID)
 
 	var token corev1.Secret
 	if err := c.Get(ctx, client.ObjectKey{Namespace: metav1.NamespaceSystem, Name: secretName}, &token); err != nil {
@@ -143,5 +142,5 @@ func (c *daemonCSRClaimChecker) nodeHasMachineBinding(
 }
 
 func metalmanBootstrapUsername() string {
-	return "system:serviceaccount:" + unbounded.SystemNamespace() + ":" + metalmanBootstrapServiceAccount
+	return "system:serviceaccount:" + systemns.Name() + ":" + metalmanBootstrapServiceAccount
 }

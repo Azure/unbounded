@@ -37,7 +37,7 @@ import (
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/metalman/netboot"
-	"github.com/Azure/unbounded/internal/unbounded"
+	"github.com/Azure/unbounded/internal/systemns"
 )
 
 // rsaKeyToTPM2BPublicEK creates a TPM2B_PUBLIC (EK-style) from an RSA public key.
@@ -171,12 +171,12 @@ func testHandler(t *testing.T, objects ...client.Object) *Handler {
 		Build()
 
 	ns := &corev1.Namespace{
-		ObjectMeta: metav1.ObjectMeta{Name: unbounded.SystemNamespace()},
+		ObjectMeta: metav1.ObjectMeta{Name: systemns.Name()},
 	}
 	sa := &corev1.ServiceAccount{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "metalman-bootstrap",
-			Namespace: unbounded.SystemNamespace(),
+			Namespace: systemns.Name(),
 		},
 	}
 	clientset := fake.NewClientset(ns, sa)

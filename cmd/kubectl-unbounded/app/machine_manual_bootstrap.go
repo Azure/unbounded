@@ -27,8 +27,8 @@ import (
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	netv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
+	"github.com/Azure/unbounded/internal/bootstraptoken"
 	"github.com/Azure/unbounded/internal/cloudprovider"
-	"github.com/Azure/unbounded/internal/kube"
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/config"
 	"github.com/Azure/unbounded/pkg/agent/isolation"
@@ -875,8 +875,8 @@ func machineManualBootstrapCommand() *cobra.Command {
 // resolveBootstrapToken tries to find a bootstrap token for the given site.
 // It first looks for a site-scoped token. If that fails, it logs a warning
 // and falls back to the first valid bootstrap token secret in kube-system.
-func resolveBootstrapToken(ctx context.Context, logger *slog.Logger, kubeCli kubernetes.Interface, siteName string) (*kube.BootstrapToken, error) {
-	tok, err := kube.GetBootstrapTokenForSite(ctx, kubeCli, siteName)
+func resolveBootstrapToken(ctx context.Context, logger *slog.Logger, kubeCli kubernetes.Interface, siteName string) (*bootstraptoken.Token, error) {
+	tok, err := bootstraptoken.ForSite(ctx, kubeCli, siteName)
 	if err == nil {
 		return tok, nil
 	}
@@ -905,7 +905,7 @@ func resolveBootstrapToken(ctx context.Context, logger *slog.Logger, kubeCli kub
 			continue
 		}
 
-		return &kube.BootstrapToken{
+		return &bootstraptoken.Token{
 			ID:     string(tokenID),
 			Secret: string(tokenSecret),
 			Labels: secret.Labels,

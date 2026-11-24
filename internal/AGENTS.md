@@ -6,8 +6,9 @@ Shared code that no single component owns.
 
 Only two kinds of package:
 
-- **Conventions, `internal/<name>`:** something every component must do the same way, such as the build version
-  (`version`) or the log format (`logger`). Ask before adding one.
+- **Conventions, `internal/<name>`:** something every component must do the same way. The approved conventions are the
+  build version (`version`), the log format (`logger`), the system namespace (`systemns`) and the bootstrap-token format
+  (`bootstraptoken`). Ask before adding one, and add it to the `conventions` rule in `.golangci.yaml`.
 - **Helpers, `internal/helpers/<name>`:** small functions or constants that two or more components use. Read
   `internal/helpers/AGENTS.md` first.
 

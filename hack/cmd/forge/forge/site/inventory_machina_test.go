@@ -12,7 +12,7 @@ import (
 
 	machinav1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/hack/cmd/forge/forge/site/azuredev"
-	"github.com/Azure/unbounded/internal/unbounded"
+	"github.com/Azure/unbounded/internal/systemns"
 )
 
 func TestMachinaNameFromInventory(t *testing.T) {
@@ -248,7 +248,7 @@ func TestParseSecretKeyRef(t *testing.T) {
 			name:  "no namespace defaults to unbounded-system",
 			input: "machina-ssh:ssh-private-key",
 			expected: machinav1alpha3.SecretKeySelector{
-				Namespace: unbounded.SystemNamespace(),
+				Namespace: systemns.Name(),
 				Name:      "machina-ssh",
 				Key:       "ssh-private-key",
 			},
@@ -265,7 +265,7 @@ func TestParseSecretKeyRef(t *testing.T) {
 			name:  "bare name only",
 			input: "machina-ssh",
 			expected: machinav1alpha3.SecretKeySelector{
-				Namespace: unbounded.SystemNamespace(),
+				Namespace: systemns.Name(),
 				Name:      "machina-ssh",
 			},
 		},

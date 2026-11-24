@@ -20,7 +20,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	"github.com/Azure/unbounded/internal/unbounded"
+	"github.com/Azure/unbounded/internal/systemns"
 )
 
 // writeTempSSHKey writes dummy SSH key content to a temp file and returns the path.
@@ -421,7 +421,7 @@ func TestMachineRegisterHandler_Execute_SSHOnly(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify SSH secret was created.
-	secret, err := kubeCli.CoreV1().Secrets(unbounded.SystemNamespace()).Get(context.Background(), "ssh-dc1", metav1.GetOptions{})
+	secret, err := kubeCli.CoreV1().Secrets(systemns.Name()).Get(context.Background(), "ssh-dc1", metav1.GetOptions{})
 	require.NoError(t, err)
 	require.Equal(t, []byte("fake-ssh-private-key-content"), secret.Data["ssh-private-key"])
 
@@ -474,12 +474,12 @@ func TestMachineRegisterHandler_Execute_WithBastion(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify host SSH secret.
-	hostSecret, err := kubeCli.CoreV1().Secrets(unbounded.SystemNamespace()).Get(context.Background(), "ssh-dc1", metav1.GetOptions{})
+	hostSecret, err := kubeCli.CoreV1().Secrets(systemns.Name()).Get(context.Background(), "ssh-dc1", metav1.GetOptions{})
 	require.NoError(t, err)
 	require.Equal(t, []byte("fake-ssh-private-key-content"), hostSecret.Data["ssh-private-key"])
 
 	// Verify bastion SSH secret (different name).
-	bastionSecret, err := kubeCli.CoreV1().Secrets(unbounded.SystemNamespace()).Get(context.Background(), "bastion-ssh", metav1.GetOptions{})
+	bastionSecret, err := kubeCli.CoreV1().Secrets(systemns.Name()).Get(context.Background(), "bastion-ssh", metav1.GetOptions{})
 	require.NoError(t, err)
 	require.Equal(t, []byte("bastion-key-content"), bastionSecret.Data["ssh-private-key"])
 
@@ -532,7 +532,7 @@ func TestMachineRegisterHandler_Execute_BastionSharedSecret(t *testing.T) {
 	require.NoError(t, err)
 
 	// Only one secret should be created (shared between host and bastion).
-	secrets, err := kubeCli.CoreV1().Secrets(unbounded.SystemNamespace()).List(context.Background(), metav1.ListOptions{})
+	secrets, err := kubeCli.CoreV1().Secrets(systemns.Name()).List(context.Background(), metav1.ListOptions{})
 	require.NoError(t, err)
 	require.Len(t, secrets.Items, 1, "only one secret should be created for shared host/bastion key")
 
@@ -609,11 +609,11 @@ func TestMachineRegisterHandler_Execute_BastionOnlyNoHostKey(t *testing.T) {
 	require.NoError(t, err)
 
 	// No host SSH secret should be created since hostSSHPrivateKey is empty.
-	_, err = kubeCli.CoreV1().Secrets(unbounded.SystemNamespace()).Get(context.Background(), "ssh-dc1", metav1.GetOptions{})
+	_, err = kubeCli.CoreV1().Secrets(systemns.Name()).Get(context.Background(), "ssh-dc1", metav1.GetOptions{})
 	require.Error(t, err, "host SSH secret should not exist when no host key is provided")
 
 	// Bastion secret should be created.
-	bastionSecret, err := kubeCli.CoreV1().Secrets(unbounded.SystemNamespace()).Get(context.Background(), "bastion-ssh", metav1.GetOptions{})
+	bastionSecret, err := kubeCli.CoreV1().Secrets(systemns.Name()).Get(context.Background(), "bastion-ssh", metav1.GetOptions{})
 	require.NoError(t, err)
 	require.NotNil(t, bastionSecret)
 

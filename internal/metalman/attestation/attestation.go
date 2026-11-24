@@ -32,7 +32,7 @@ import (
 	"k8s.io/utils/ptr"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	"github.com/Azure/unbounded/internal/unbounded"
+	"github.com/Azure/unbounded/internal/systemns"
 )
 
 const (
@@ -276,7 +276,7 @@ func (h *Handler) Attest(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
-	tokenResp, err := h.Clientset.CoreV1().ServiceAccounts(unbounded.SystemNamespace()).CreateToken(
+	tokenResp, err := h.Clientset.CoreV1().ServiceAccounts(systemns.Name()).CreateToken(
 		ctx, BootstrapSAName, tokenRequest, metav1.CreateOptions{},
 	)
 	if err != nil {

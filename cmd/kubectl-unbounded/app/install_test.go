@@ -837,7 +837,7 @@ func TestMutateOperatorObjectRetargetsNamespace(t *testing.T) {
 
 // TestMutateOperatorObjectRetargetsClusterRoleBindingSubjectWithPodNamespaceSet
 // guards against a regression where the namespace rewrite source was
-// SystemNamespace() instead of the build-time literal. A ClusterRoleBinding is
+// systemns.Name() instead of the build-time literal. A ClusterRoleBinding is
 // cluster-scoped, so its subject namespace can only be corrected by
 // rewriteNamespace (setNamespace never touches it). When POD_NAMESPACE is set
 // (an in-cluster installer) the old source no longer matched the baked
