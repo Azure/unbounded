@@ -47,6 +47,17 @@ fn unix_millis(now: SystemTime) -> Result<u128> {
         .as_millis())
 }
 
+/// Deadline implied by an observation time and the published TTL.
+fn observation_deadline(observed_at: ExpiresAt, ttl: std::time::Duration) -> Option<ExpiresAt> {
+    let observed = observed_at.to_unix_millis().ok()?;
+    let ttl = u64::try_from(ttl.as_millis()).ok()?;
+    let deadline = observed.checked_add(ttl)?;
+    if deadline > crate::model::MAX_WIRE_INTEGER {
+        return None;
+    }
+    ExpiresAt::from_unix_millis(deadline).ok()
+}
+
 /// One storage shard. The catalog budget is independent of retained page entries;
 /// evicting a catalog item cannot remove a page's attached immutable descriptor.
 pub struct Index {
@@ -1097,7 +1108,6 @@ impl Index {
             return Ok(None);
         }
         let now = self.clock.wall_now();
-        let now_millis = unix_millis(now)?;
         let policy = self
             .availability
             .metadata_policy(&object.cache)
@@ -1118,13 +1128,21 @@ impl Index {
                 }
                 // Reuse less than before is measured from the observation, so a
                 // skipped publication cannot extend an older pointer's life.
-                v.observed_at.to_unix_millis().is_ok_and(|observed| {
-                    now_millis
-                        .checked_sub(u128::from(observed))
-                        .is_some_and(|age| age < policy.ttl.as_millis())
-                })
+                observation_deadline(v.observed_at, policy.ttl)
+                    .is_some_and(|deadline| now < deadline.as_system_time())
             })
-            .cloned())
+            .cloned()
+            .map(|mut current| {
+                // Forward the observation's real deadline, not the one stored
+                // under a longer policy, so a receiver cannot extend it.
+                if let Some(policy) = policy
+                    && let Some(deadline) = observation_deadline(current.observed_at, policy.ttl)
+                    && current.expires_at.as_system_time() > deadline.as_system_time()
+                {
+                    current.expires_at = deadline;
+                }
+                current
+            }))
     }
     /// Page-zero owner only, after fresh revalidation. Atomically retain the
     /// immutable descriptor and advance the volatile pointer; reject length conflicts.
@@ -3159,7 +3177,19 @@ mod tests {
             .borrow_mut()
             .current
             .insert(m.version.object.clone(), pointer(1));
-        assert!(index.current(&m.version.object).unwrap().is_some());
+        let current = index.current(&m.version.object).unwrap().unwrap();
+        assert!(current.expires_at.as_system_time() <= SystemTime::now() + Duration::from_secs(4));
+
+        // A forwarded copy carries the observation's deadline, so a second
+        // catalog cannot extend it from receipt time.
+        let forwarded = current
+            .resolve(&m, env.ctx.clock.wall_now())
+            .unwrap()
+            .unwrap();
+        let second = Index::new(WorkerId(1), 4, availability.clone(), env.ctx.clock.clone());
+        second.publish_current(forwarded).unwrap();
+        let received = second.current(&m.version.object).unwrap().unwrap();
+        assert!(received.expires_at.as_system_time() <= SystemTime::now() + Duration::from_secs(4));
     }
 }
 
