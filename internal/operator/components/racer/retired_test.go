@@ -36,6 +36,19 @@ func TestRetiredSettingErrorNamesReplacement(t *testing.T) {
 	require.ErrorContains(t, err, "TCP_NODELAY is always set")
 }
 
+func TestMigrateRetiredSettingsDropsPageBytes(t *testing.T) {
+	in := map[string]string{"RACER_PAGE_BYTES": "16777216", "RACER_SHARES": "4"}
+
+	out, changed := migrateRetiredSettings(in)
+	require.True(t, changed)
+	require.Equal(t, map[string]string{"RACER_SHARES": "4"}, out)
+	require.NoError(t, validateDataplaneConfig(out))
+
+	err := validateDataplaneConfig(map[string]string{"RACER_PAGE_BYTES": "16777216"})
+	require.ErrorContains(t, err, "RACER_PAGE_BYTES")
+	require.ErrorContains(t, err, "the page size is fixed at 16 MiB")
+}
+
 func TestExistingConfigWithRetiredPeerTCPNodelayIsMigrated(t *testing.T) {
 	env := testEnv(t, cacheObject("cache"))
 	initialize(t, env)

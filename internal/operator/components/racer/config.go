@@ -238,10 +238,13 @@ func dataplaneDecimal(value string) (uint64, bool) {
 // RACER_PEER_TCP_NODELAY was a released setting through v0.25. The dataplane
 // now always sets TCP_NODELAY on peer sockets, so migration drops the key. It
 // stays here because an install may upgrade from v0.25, where the key is still
-// part of racer-settings. Keys retired by v0.24.0 are not listed: the v0.25
-// upgrade floor has already migrated them.
+// part of racer-settings. RACER_PAGE_BYTES was a released setting that accepted
+// only 16 MiB; the page size is now a fixed dataplane constant and migration
+// drops the key. Keys retired by v0.24.0 are not listed: the v0.25 upgrade
+// floor has already migrated them.
 var retiredSettings = map[string]string{
 	"RACER_PEER_TCP_NODELAY": "nothing (TCP_NODELAY is always set)",
+	"RACER_PAGE_BYTES":       "nothing (the page size is fixed at 16 MiB)",
 }
 
 // migrateRetiredSettings returns data with retired keys dropped, and whether

@@ -652,7 +652,6 @@ async fn reconcile(t: &Rc<Term_>) -> Result<(), StateError> {
                             pod_uid: &shared.config.pod_uid,
                             seats: shared.config.seats,
                             peer_port: shared.config.peer_port,
-                            page_size: shared.config.page_size,
                             policy: &policy,
                             inventory: &inventory,
                             synced: ready,
@@ -669,15 +668,6 @@ async fn reconcile(t: &Rc<Term_>) -> Result<(), StateError> {
                     )?
                 };
                 log_rejected_caches(&plan.rejected_caches);
-                if plan.page_size != shared.config.page_size
-                    && !PAGE_SIZE_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
-                {
-                    eprintln!(
-                        "racer: RACER_PAGE_BYTES={} ignored; the cluster publishes its established page size {}",
-                        shared.config.page_size.get(),
-                        plan.page_size.get()
-                    );
-                }
                 if plan.evicted_roots > 0 {
                     eprintln!(
                         "racer: keyring root slots full; evicted {} root(s) no seat offers",
@@ -905,9 +895,6 @@ async fn patch_ca_bundle(shared: &Shared, mwc: &Value, cas: &[Vec<u8>]) -> Resul
 /// How long webhook trust outlives the endpoint that used it. EndpointSlice
 /// propagation to every API server is not atomic with the slice write.
 pub const WEBHOOK_TRUST_GRACE: Duration = Duration::from_secs(120);
-
-/// Set once the page size mismatch warning was logged.
-static PAGE_SIZE_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Removed webhook CAs, by DER, with the time they left the endpoints.
 pub type RetiredTrust = RefCell<BTreeMap<Vec<u8>, Instant>>;

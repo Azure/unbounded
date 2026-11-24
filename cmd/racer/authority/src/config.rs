@@ -87,9 +87,6 @@ pub struct Config {
     pub peer_port: u16,
 
     pub rotation: Rotation,
-
-    /// Cluster-wide page size published to every node.
-    pub page_size: racer_wire::object::PageSize,
 }
 
 impl Config {
