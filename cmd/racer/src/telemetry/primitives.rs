@@ -405,10 +405,29 @@ pub mod metrics {
         fn name(self) -> &'static str;
 
         /// Return its trusted, fixed label set without braces, or "" when
-        /// unlabeled. Members of one labeled family share a name and must be
-        /// contiguous in `ALL` so the family gets a single `# TYPE` line.
+        /// unlabeled. Members of one family share a [`Metric::family`] and must
+        /// be contiguous in `ALL` so the family gets a single `# TYPE` line.
         fn labels(self) -> &'static str {
             ""
+        }
+
+        /// Return the family identifier that owns this sample's `# TYPE` line.
+        /// Defaults to [`Metric::name`]. Histogram samples share one family
+        /// even though each sample has its own suffix and label set.
+        fn family(self) -> &'static str {
+            self.name()
+        }
+
+        /// Return this sample family's Prometheus type. Counters default to
+        /// `counter`; gauge registries always render `gauge`.
+        fn kind(self) -> &'static str {
+            "counter"
+        }
+
+        /// Write one sample value. Defaults to the exact decimal integer; a
+        /// family may render a scaled unit such as seconds from microseconds.
+        fn write_value(self, out: &mut impl fmt::Write, value: u64) -> fmt::Result {
+            write!(out, "{value}")
         }
     }
 
@@ -672,18 +691,33 @@ pub mod metrics {
         pub fn write_prometheus(&self, out: &mut impl fmt::Write) -> fmt::Result {
             let mut previous = None;
             for &metric in C::ALL {
-                let name = metric.name();
-                if previous != Some(name) {
-                    writeln!(out, "# TYPE {name} counter")?;
+                let family = metric.family();
+                if previous != Some(family) {
+                    writeln!(out, "# TYPE {family} {}", metric.kind())?;
                 }
-                previous = Some(name);
+                previous = Some(family);
+                write!(out, "{}", metric.name())?;
                 match metric.labels() {
-                    "" => writeln!(out, "{name} {}", self.count(metric))?,
-                    labels => writeln!(out, "{name}{{{labels}}} {}", self.count(metric))?,
+                    "" => out.write_str(" ")?,
+                    labels => write!(out, "{{{labels}}} ")?,
                 }
+                metric.write_value(out, self.count(metric))?;
+                writeln!(out)?;
             }
+            let mut previous = None;
             for &metric in G::ALL {
-                Exposition::new([(metric.name(), "gauge")]).write(out, [self.gauge(metric)])?;
+                let family = metric.family();
+                if previous != Some(family) {
+                    writeln!(out, "# TYPE {family} gauge")?;
+                }
+                previous = Some(family);
+                write!(out, "{}", metric.name())?;
+                match metric.labels() {
+                    "" => out.write_str(" ")?,
+                    labels => write!(out, "{{{labels}}} ")?,
+                }
+                metric.write_value(out, self.gauge(metric))?;
+                writeln!(out)?;
             }
             Ok(())
         }
@@ -965,6 +999,96 @@ pub mod metrics {
                 "# TYPE plain_total counter\nplain_total 0\n# TYPE reads_total counter\nreads_total{outcome=\"hit\"} 0\nreads_total{outcome=\"miss\"} 5\n"
             ));
             assert_eq!(Metric::labels(Family::Plain), "");
+        }
+
+        crate::metrics! { NoCounter, NO_COUNTERS, NO_COUNTER_COUNT; }
+
+        crate::metrics! { NoGauge, NO_GAUGES, NO_GAUGE_COUNT; }
+
+        crate::metrics! { QueueGauge, QUEUE_GAUGES, QUEUE_GAUGE_COUNT;
+            Self::High => "queue" { "priority=\"high\"" },
+            Self::Normal => "queue" { "priority=\"normal\"" },
+        }
+
+        /// A histogram family shares one type line while each sample keeps its
+        /// own suffix, labels, and scaled value.
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum Histogram {
+            BucketLow,
+            BucketInf,
+            Sum,
+            Count,
+        }
+
+        impl Metric for Histogram {
+            const ALL: &'static [Self] =
+                &[Self::BucketLow, Self::BucketInf, Self::Sum, Self::Count];
+
+            fn index(self) -> usize {
+                self as usize
+            }
+
+            fn name(self) -> &'static str {
+                match self {
+                    Self::BucketLow | Self::BucketInf => "latency_seconds_bucket",
+                    Self::Sum => "latency_seconds_sum",
+                    Self::Count => "latency_seconds_count",
+                }
+            }
+
+            fn labels(self) -> &'static str {
+                match self {
+                    Self::BucketLow => "le=\"1\"",
+                    Self::BucketInf => "le=\"+Inf\"",
+                    Self::Sum | Self::Count => "",
+                }
+            }
+
+            fn family(self) -> &'static str {
+                "latency_seconds"
+            }
+
+            fn kind(self) -> &'static str {
+                "histogram"
+            }
+
+            fn write_value(self, out: &mut impl fmt::Write, value: u64) -> fmt::Result {
+                if self == Self::Sum {
+                    write!(out, "{}.{:06}", value / 1_000_000, value % 1_000_000)
+                } else {
+                    write!(out, "{value}")
+                }
+            }
+        }
+
+        /// Family hooks carry histogram type, sample suffixes, and scaled values.
+        #[test]
+        fn family_hooks_render_histograms_and_labeled_gauges() {
+            let histograms = Metrics::<Histogram, NoGauge>::shards(1).pop().unwrap();
+            histograms.add(Histogram::BucketLow, 1);
+            histograms.add(Histogram::BucketInf, 2);
+            histograms.add(Histogram::Sum, 1_500_000);
+            histograms.add(Histogram::Count, 2);
+            let mut output = String::new();
+            histograms.write_prometheus(&mut output).unwrap();
+            assert_eq!(
+                output,
+                "# TYPE latency_seconds histogram\n\
+                 latency_seconds_bucket{le=\"1\"} 1\n\
+                 latency_seconds_bucket{le=\"+Inf\"} 2\n\
+                 latency_seconds_sum 1.500000\n\
+                 latency_seconds_count 2\n"
+            );
+
+            let gauges = Metrics::<NoCounter, QueueGauge>::shards(1).pop().unwrap();
+            gauges.set(QueueGauge::High, 3);
+            gauges.set(QueueGauge::Normal, 4);
+            output.clear();
+            gauges.write_prometheus(&mut output).unwrap();
+            assert_eq!(
+                output,
+                "# TYPE queue gauge\nqueue{priority=\"high\"} 3\nqueue{priority=\"normal\"} 4\n"
+            );
         }
 
         /// Reject registries without writers.

@@ -44,7 +44,7 @@ pub struct Metrics {
     gpu: Arc<crate::gpu_telemetry::GpuTelemetry>,
 
     /// This worker's handle on the prefetch registry.
-    prefetch: Arc<crate::prefetch::metrics::PrefetchMetrics>,
+    prefetch: Arc<super::prefetch::PrefetchMetrics>,
 
     shard: usize,
 }
@@ -719,7 +719,7 @@ impl Metrics {
     }
 
     /// Node-wide prefetch counters.
-    pub(crate) fn prefetch(&self) -> &Arc<crate::prefetch::metrics::PrefetchMetrics> {
+    pub(crate) fn prefetch(&self) -> &Arc<super::prefetch::PrefetchMetrics> {
         &self.prefetch
     }
 
@@ -1017,7 +1017,7 @@ impl Metrics {
         });
         let cache_disks = crate::telemetry::primitives::SnapshotShards::new(count);
         let gpu = Arc::new(crate::gpu_telemetry::GpuTelemetry::default());
-        let prefetch = crate::prefetch::metrics::PrefetchMetrics::shards(count);
+        let prefetch = super::prefetch::PrefetchMetrics::shards(count);
         Ok(crate::telemetry::primitives::Metrics::shards(count)
             .into_iter()
             .zip(prefetch)
@@ -1264,7 +1264,7 @@ impl Exposition<'_> {
                 } else {
                     match cache - 1 - caches.len() {
                         0 => metrics.gpu.write(out)?,
-                        1 => metrics.prefetch.write(out)?,
+                        1 => metrics.prefetch.write_prometheus(out)?,
                         _ => metrics.write_quotas(out)?,
                     }
                 }
@@ -1327,7 +1327,7 @@ mod held_metric_tests {
     fn prefetch_metrics_are_exported_with_priority_labels_only() {
         let telemetry = Telemetry::default();
         telemetry.metrics.prefetch().add(
-            crate::prefetch::metrics::Counter::RequestedBytes,
+            crate::telemetry::Counter::RequestedBytes,
             crate::prefetch::Priority::High,
             5,
         );
@@ -2117,7 +2117,7 @@ mod tests {
                     + RETENTION_METRICS.len()
                     + HELD_METRICS.len()
                     + HOST_READ_MAPPING_LINES
-                    + crate::prefetch::metrics::SAMPLE_LINES
+                    + crate::telemetry::SAMPLE_LINES
                     + DISK_CLASS_METRICS.len() * 2
                     + crate::gpu_telemetry::BASE_SERIES
             );
@@ -2192,7 +2192,7 @@ mod tests {
                             + RETENTION_METRICS.len()
                             + HELD_METRICS.len()
                             + HOST_READ_MAPPING_LINES
-                            + crate::prefetch::metrics::SAMPLE_LINES
+                            + crate::telemetry::SAMPLE_LINES
                             + DISK_CLASS_METRICS.len() * 2
                             + crate::gpu_telemetry::BASE_SERIES
                     );

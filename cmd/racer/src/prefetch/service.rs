@@ -2,7 +2,6 @@
 //! side of the `prefetch` peer operation.
 
 use super::api::{self, Coverage, Reason, RefError};
-use super::metrics::{Counter, PrefetchMetrics};
 use super::registry::{
     Batch, PutCheck, Registry, Resolution, RetryKind, UnitContext, UnitKey, UnitOutcome,
 };
@@ -16,6 +15,7 @@ use crate::peer::protocol::{Operation as PeerOperation, PeerResponse, PrefetchAc
 use crate::read::Coordinator;
 use crate::runtime::RequestScope;
 use crate::security::{Authorization, OpaqueMetadata, OriginContext};
+use crate::telemetry::{Counter, PrefetchMetrics};
 use crate::topology::Membership;
 use futures::StreamExt;
 use http1::MessageHead;

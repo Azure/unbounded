@@ -37,6 +37,7 @@ mod diagnostics;
 mod forensics;
 mod health;
 mod metrics;
+mod prefetch;
 pub mod primitives;
 mod samples;
 
@@ -44,6 +45,7 @@ pub use diagnostics::*;
 pub use forensics::*;
 pub use health::*;
 pub use metrics::*;
+pub use prefetch::{Counter, Outcome, PrefetchMetrics, SAMPLE_LINES};
 pub use samples::*;
 
 pub use server::CONNECTION_TIMEOUT;
