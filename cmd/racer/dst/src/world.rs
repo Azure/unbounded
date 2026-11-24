@@ -41,10 +41,10 @@ use std::{
 };
 
 use racer_io::{
-    Driver, Reactor, Rng, WorkerCtx,
+    Driver, Rng, Scope, WorkerCtx,
     ctx::VirtualClock,
     exec::{LocalExecutor, Next},
-    ring::Config,
+    scoped,
     sim::SimOs,
 };
 
@@ -73,14 +73,36 @@ pub trait SimRole {
     fn pending(&self) -> bool;
 }
 
-/// A lane: one reactor, one executor, and the flag that finishes it.
+/// The simulated world's scope: every operation is admitted, nothing cancels
+/// it, and no deadline is attached. A role ends because the world drops it or
+/// the lane's flag is set, not because its scope is canceled. The scope never
+/// reads a clock, so simulated runs stay deterministic.
+#[derive(Clone, Copy, Debug)]
+pub struct SimScope;
+
+impl Scope for SimScope {
+    type Error = racer_io::Error;
+
+    fn check(&self) -> racer_io::Result<()> {
+        Ok(())
+    }
+
+    fn polled_checks(&self) -> bool {
+        false
+    }
+}
+
+/// A scoped reactor over one simulated lane.
+pub type SimReactor = scoped::Reactor<SimScope>;
+
+/// A lane: one scoped reactor, one executor, and the flag that finishes it.
 ///
-/// Each step reaps completions and runs ready tasks, in that order. Roles
-/// never `park`: the simulated reactor's park would advance the shared clock
-/// on its own.
+/// Each step reaps completions, checks in-flight scopes, and runs ready
+/// tasks, in that order. Roles never `park`: the simulated reactor's park
+/// would advance the shared clock on its own.
 pub struct Lane {
     /// The lane reactor.
-    pub reactor: Reactor,
+    pub reactor: Rc<SimReactor>,
 
     /// The lane executor.
     pub executor: LocalExecutor,
@@ -98,8 +120,12 @@ pub struct Lane {
 impl Lane {
     /// A lane over `reactor` that finishes when `done` is set, with default
     /// budgets (256 each).
-    pub fn new(reactor: Reactor, done: DoneFlag) -> Self {
-        let executor = LocalExecutor::new(Some(reactor.wake_handle()));
+    pub fn new(reactor: Rc<SimReactor>, done: DoneFlag) -> Self {
+        let executor = LocalExecutor::new(Some(
+            reactor
+                .wake_handle()
+                .expect("the lane reactor is initialized on construction"),
+        ));
         Self {
             reactor,
             executor,
@@ -124,9 +150,10 @@ impl Lane {
 }
 
 impl SimRole for Lane {
-    /// One lane turn: reap, run ready tasks, then report what comes next.
+    /// One lane turn: reap, check in-flight scopes, run ready tasks, then
+    /// report what comes next.
     fn step(&mut self) -> racer_io::Result<Next> {
-        self.reactor.reap(self.reap_budget)?;
+        self.reactor.poll_budgeted(self.reap_budget)?;
         self.executor.run_ready(self.run_budget);
         if self.done.0.get() {
             return Ok(Next::Done);
@@ -357,13 +384,13 @@ impl NodeEnv {
         }
     }
 
-    /// A reactor on this node's `Driver::Sim` with `entries` operations.
-    pub fn reactor(&self, stream: u64, entries: u32) -> racer_io::Result<Reactor> {
-        Reactor::new(
-            Driver::Sim(self.os.clone()),
-            Config::new(entries),
-            self.worker_ctx(stream),
-        )
+    /// A scoped reactor on this node's `Driver::Sim` with `entries`
+    /// operations.
+    pub fn reactor(&self, stream: u64, entries: u32) -> racer_io::Result<Rc<SimReactor>> {
+        let env = racer_io::Env::new(Driver::Sim(self.os.clone()), self.worker_ctx(stream));
+        let reactor = scoped::Reactor::new(entries as usize, &env);
+        reactor.init()?;
+        Ok(Rc::new(reactor))
     }
 }
 

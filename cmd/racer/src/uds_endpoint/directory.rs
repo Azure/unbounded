@@ -1,10 +1,11 @@
 //! Single-component, descriptor-relative operations. No helper follows a named symlink.
 
 use crate::uds_endpoint::{Error, error, file_path, same_inode};
-use std::ffi::CString;
+use std::ffi::{CString, OsStr};
 use std::fs::{self, File, Metadata};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 
 #[cfg(test)]
@@ -13,11 +14,10 @@ thread_local! {
 }
 
 pub(crate) fn component(name: &[u8]) -> io::Result<CString> {
-    if name.is_empty() || name == b"." || name == b".." || name.contains(&b'/') || name.len() > 255
-    {
-        return Err(error(Error::InvalidName));
-    }
-    CString::new(name).map_err(|_| error(Error::InvalidName))
+    // One normal component of at most 255 bytes, the bound `sun_path` names
+    // share with NAME_MAX. The secure filesystem vocabulary owns the check.
+    racer_io::scoped::fs::secure::component(OsStr::from_bytes(name), 255)
+        .map_err(|_| error(Error::InvalidName))
 }
 
 #[derive(Clone, Copy)]

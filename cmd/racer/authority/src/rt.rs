@@ -7,13 +7,18 @@
 //! bounded step and reports when it next needs to run, which a deterministic
 //! test can drive itself.
 //!
+//! Every operation runs under one control scope that admits all work, never
+//! cancels, and carries no deadline. That is the scoped form of the raw
+//! `OpCtx::none()` drive loop this runtime used before.
+//!
 //! The reactor in use is thread-local while [`Executor::run`],
 //! [`Executor::turn`], or [`Executor::block_on`] is on the stack.
 
 use racer_io::{
-    Driver, OpCtx, Reactor, WorkerCtx,
+    Scope, WorkerCtx,
     exec::{LocalExecutor, Next},
-    ring::{Config, Descriptor, SocketAddress, WakeHandle},
+    ring::{Descriptor, SocketAddress, WakeHandle},
+    scoped,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -36,11 +41,37 @@ const MAX_QUEUE: usize = 16 * 1024;
 /// Smallest reactor.
 const MIN_QUEUE: usize = 256;
 
+/// The control runtime's scope: every operation is admitted, nothing cancels
+/// it, and no deadline is attached. This is the scoped form of the raw drive
+/// loop's `OpCtx::none()`. Because `check` cannot fail, the adapter never
+/// cancels an operation for this scope, and no periodic scan is needed.
+#[derive(Clone, Copy, Debug)]
+struct ControlScope;
+
+impl Scope for ControlScope {
+    type Error = racer_io::Error;
+
+    fn check(&self) -> racer_io::Result<()> {
+        Ok(())
+    }
+
+    fn polled_checks(&self) -> bool {
+        false
+    }
+}
+
+/// The one scope every control operation uses.
+static SCOPE: ControlScope = ControlScope;
+
+/// The scoped reactor type shared by the runtime and its futures.
+type RuntimeReactor = scoped::Reactor<ControlScope>;
+
 struct Current {
-    reactor: Reactor,
+    reactor: Rc<RuntimeReactor>,
     executor: Rc<LocalExecutor>,
     tasks: Rc<Cell<usize>>,
     max_tasks: usize,
+    wake: Arc<WakeHandle>,
 }
 
 thread_local! {
@@ -55,7 +86,7 @@ fn current() -> Rc<Current> {
 /// `Rc<Current>`: the runtime owns its tasks, so a task holding the runtime
 /// is a cycle that keeps every task, socket and listener alive after the
 /// [`Executor`] is dropped.
-fn reactor() -> Reactor {
+fn reactor() -> Rc<RuntimeReactor> {
     current().reactor.clone()
 }
 
@@ -98,14 +129,7 @@ pub struct Executor {
 impl Executor {
     /// A kernel (io_uring) executor with a fixed task limit.
     pub fn new(max_tasks: usize) -> io::Result<Self> {
-        let entries = max_tasks.next_power_of_two().clamp(MIN_QUEUE, MAX_QUEUE);
-        let reactor = Reactor::new(
-            Driver::Uring,
-            Config::new(entries as u32),
-            WorkerCtx::host(),
-        )
-        .map_err(to_io)?;
-        Ok(Self::with_reactor(reactor, max_tasks))
+        Self::with_env(racer_io::Env::host(), max_tasks)
     }
 
     /// A simulated executor: `os` is the simulated disk and network, shared
@@ -117,32 +141,48 @@ impl Executor {
         seed: u64,
         max_tasks: usize,
     ) -> io::Result<Self> {
-        let entries = max_tasks.next_power_of_two().clamp(MIN_QUEUE, MAX_QUEUE);
-        let reactor = Reactor::new(
-            Driver::Sim(os),
-            Config::new(entries as u32),
-            WorkerCtx::simulated(clock, seed, 0),
+        Self::with_env(
+            racer_io::Env::sim(&os, WorkerCtx::simulated(clock, seed, 0)),
+            max_tasks,
         )
-        .map_err(to_io)?;
-        Ok(Self::with_reactor(reactor, max_tasks))
     }
 
-    /// An executor over an existing reactor, such as a simulated one.
-    pub fn with_reactor(reactor: Reactor, max_tasks: usize) -> Self {
-        let executor = Rc::new(LocalExecutor::new(Some(reactor.wake_handle())));
-        Self {
+    /// An executor over `env`: the kernel or a simulated OS, with its clock.
+    /// Construction initializes the reactor, so an unavailable backend fails
+    /// here rather than at the first operation.
+    pub fn with_env(env: racer_io::Env, max_tasks: usize) -> io::Result<Self> {
+        let entries = max_tasks.next_power_of_two().clamp(MIN_QUEUE, MAX_QUEUE);
+        let reactor = scoped::Reactor::new(entries, &env);
+        reactor.init().map_err(to_io)?;
+        let wake = reactor.wake_handle().map_err(to_io)?;
+        let executor = Rc::new(LocalExecutor::new(Some(wake.clone())));
+        Ok(Self {
             current: Rc::new(Current {
-                reactor,
+                reactor: Rc::new(reactor),
                 executor,
                 tasks: Rc::new(Cell::new(0)),
                 max_tasks,
+                wake,
             }),
-        }
+        })
+    }
+
+    /// An executor over an existing reactor's backend and worker context.
+    /// The scoped adapter owns its reactor, so it builds a fresh one over the
+    /// same backend and context rather than adopting the given handle.
+    #[cfg(test)]
+    pub fn with_reactor(reactor: racer_io::Reactor, max_tasks: usize) -> Self {
+        let driver = match reactor.sim_os() {
+            Some(os) => racer_io::Driver::Sim(os),
+            None => racer_io::Driver::Uring,
+        };
+        let env = racer_io::Env::new(driver, reactor.ctx().clone());
+        Self::with_env(env, max_tasks).expect("the existing reactor's configuration is valid")
     }
 
     /// Cross-thread wake handle.
     pub fn notifier(&self) -> Notifier {
-        Notifier(self.current.reactor.wake_handle())
+        Notifier(self.current.wake.clone())
     }
 
     /// Run `f` with this runtime current, for setup outside a turn.
@@ -151,11 +191,12 @@ impl Executor {
         f()
     }
 
-    /// One bounded step: reap completions and poll ready tasks.
+    /// One bounded step: reap completions, check in-flight scopes, and poll
+    /// ready tasks.
     pub fn turn(&mut self) -> io::Result<Next> {
         let _enter = Enter::new(&self.current);
         let c = &self.current;
-        c.reactor.reap(BUDGET).map_err(to_io)?;
+        c.reactor.poll_budgeted(BUDGET).map_err(to_io)?;
         c.executor.run_ready(BUDGET);
         Ok(self.next())
     }
@@ -175,12 +216,11 @@ impl Executor {
     /// Block until the condition reported by `next`: a completion, a
     /// cross-thread wake, or the deadline.
     pub fn park(&mut self, next: Next) -> io::Result<()> {
-        let until = match next {
-            Next::Ready | Next::Done => return Ok(()),
-            Next::WaitUntil(at) => Some(at),
-            Next::Idle => None,
-        };
-        self.current.reactor.park(until).map_err(to_io)
+        match next {
+            Next::Ready | Next::Done => Ok(()),
+            Next::WaitUntil(at) => self.current.reactor.wait_until(Some(at)).map_err(to_io),
+            Next::Idle => self.current.reactor.wait_until(None).map_err(to_io),
+        }
     }
 
     /// Run until `done` returns true. `done` is checked after each turn.
@@ -235,7 +275,10 @@ impl Drop for Executor {
     /// against the right reactor.
     fn drop(&mut self) {
         let _enter = Enter::new(&self.current);
-        self.current.reactor.stop();
+        // Cancel like the raw `stop` loop did. A zero timeout returns after
+        // the cancel request; the scoped reactor's own drop fences what is
+        // left with its bounded wait.
+        let _ = self.current.reactor.shutdown(Duration::ZERO);
     }
 }
 
@@ -279,7 +322,7 @@ pub fn task_count() -> usize {
 
 /// Current time on the reactor clock, or the host clock outside a runtime.
 pub fn now() -> Instant {
-    try_current().map_or_else(Instant::now, |c| c.reactor.now())
+    try_current().map_or_else(Instant::now, |c| c.reactor.ctx().now())
 }
 
 /// Current wall time on the reactor clock, or the host clock outside a
@@ -321,7 +364,11 @@ pub fn sim_os() -> Option<racer_io::sim::SimOs> {
 
 /// Sleep until an instant on the reactor clock.
 pub fn sleep_until(at: Instant) -> impl Future<Output = ()> {
-    current().reactor.sleep_until(at)
+    let reactor = reactor();
+    async move {
+        // The control scope cannot fail, so a scope error is unreachable.
+        let _ = reactor.sleep_until_scheduled(at, &SCOPE).await;
+    }
 }
 
 /// Sleep for a duration.
@@ -357,8 +404,8 @@ pub async fn timeout<T>(
 /// reactor, so the control thread never blocks on the filesystem.
 /// Ordinary symlinks are followed; files over `limit` bytes fail.
 pub async fn read_file(path: &std::path::Path, limit: usize) -> io::Result<Vec<u8>> {
-    let bytes = reactor()
-        .read_path(path, limit, &OpCtx::none())
+    let reactor = reactor();
+    let bytes = scoped::fs::secure::read_path(&reactor, path, limit, &SCOPE)
         .await
         .map_err(to_io)?;
     Ok(bytes.to_vec())
@@ -411,7 +458,7 @@ impl Tcp {
         };
         let fd = Rc::new(fd);
         reactor
-            .connect(fd.clone(), SocketAddress::Inet(address), (), &OpCtx::none())
+            .connect(fd.clone(), SocketAddress::Inet(address), &SCOPE)
             .await
             .map_err(to_io)?;
         let fd = Rc::try_unwrap(fd).map_err(|_| io::Error::other("descriptor still shared"))?;
@@ -424,7 +471,7 @@ impl Tcp {
         self.receiving.set(true);
         let _receiving = Receiving(self.receiving.clone());
         let done = reactor()
-            .recv(self.fd.clone(), buf, (), &OpCtx::none())
+            .recv(self.fd.clone(), buf, (), &SCOPE)
             .await
             .map_err(to_io)?;
         out.extend_from_slice(&done.buffer[..done.bytes]);
@@ -438,7 +485,7 @@ impl Tcp {
     pub async fn readable(&mut self) -> io::Result<()> {
         self.buf = None;
         reactor()
-            .poll_ready(self.fd.clone(), libc::POLLIN as u32, (), &OpCtx::none())
+            .readiness(self.fd.clone(), libc::POLLIN as u32, &SCOPE)
             .await
             .map_err(to_io)?;
         Ok(())
@@ -456,7 +503,7 @@ impl Tcp {
         let mut data = data;
         loop {
             let done = reactor()
-                .send(self.fd.clone(), data, (), &OpCtx::none())
+                .send(self.fd.clone(), data, (), &SCOPE)
                 .await
                 .map_err(to_io)?;
             if done.bytes == 0 {
@@ -504,7 +551,7 @@ impl Listener {
     /// Accept one connection.
     pub async fn accept(&self) -> io::Result<(Tcp, SocketAddr)> {
         let fd = reactor()
-            .accept(self.fd.clone(), &OpCtx::none())
+            .accept(self.fd.clone(), &SCOPE)
             .await
             .map_err(to_io)?;
         let peer = fd

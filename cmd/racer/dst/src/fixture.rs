@@ -14,16 +14,16 @@
 //!
 //! Both lanes fold what they observe into the trace and report mismatches as
 //! safety violations.
-use std::{future::poll_fn, path::Path};
+use std::{future::poll_fn, path::Path, rc::Rc, time::Duration};
 
 use racer_io::{
-    ring::OpCtx,
+    scoped::fs::secure,
     xthread::spsc::{self, Receiver, Sender},
 };
 
 use crate::{
     engine::MILLIS,
-    world::{DoneFlag, Lane, NodeEnv, Roles},
+    world::{DoneFlag, Lane, NodeEnv, Roles, SimReactor, SimScope},
 };
 
 const TAG_WRITE: u64 = 100;
@@ -37,7 +37,11 @@ pub fn lane_pair(env: &NodeEnv, rounds: u64) -> racer_io::Result<Roles> {
     let checker = env.reactor(2, 64)?;
     let (mut requests, received) = spsc::bounded::<u64>(1)?;
     let (replies, answered) = spsc::bounded::<u64>(1)?;
-    requests.set_notify(checker.wake_handle());
+    requests.set_notify(
+        checker
+            .wake_handle()
+            .expect("the checker reactor is initialized on construction"),
+    );
     let writer_done = DoneFlag::default();
     let checker_done = DoneFlag::default();
 
@@ -61,20 +65,19 @@ pub fn lane_pair(env: &NodeEnv, rounds: u64) -> racer_io::Result<Roles> {
 }
 
 async fn write_loop(
-    reactor: racer_io::Reactor,
+    reactor: Rc<SimReactor>,
     mut requests: Sender<u64>,
     mut answered: Receiver<u64>,
     env: NodeEnv,
     rounds: u64,
     done: DoneFlag,
 ) {
-    let ctx = OpCtx::none();
+    let scope = SimScope;
     let result: Result<(), String> = async {
-        let dir = reactor
-            .open_directory(Path::new("/state"), true, false, &ctx)
+        let dir = secure::directory(&reactor, Path::new("/state"), true, false, &scope)
             .await
             .map_err(|e| format!("open_directory: {e:?}"))?;
-        let mut n: u64 = match reactor.read_child(&dir, "counter", 64, false, &ctx).await {
+        let mut n: u64 = match secure::read_at(&reactor, &dir, "counter", 64, false, &scope).await {
             Ok(bytes) => std::str::from_utf8(&bytes)
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -89,16 +92,17 @@ async fn write_loop(
                 .next_u64()
                 .map_err(|e| format!("rng: {e:?}"))?
                 % (5 * MILLIS);
-            let until = reactor.now() + std::time::Duration::from_nanos(MILLIS + jitter);
-            reactor.sleep_until(until).await;
+            let until = reactor.ctx().now() + Duration::from_nanos(MILLIS + jitter);
+            reactor
+                .sleep_until_scheduled(until, &scope)
+                .await
+                .map_err(|e| format!("sleep: {e:?}"))?;
             n += 1;
             let text = n.to_string();
-            reactor
-                .atomic_write(&dir, "counter", text.as_bytes(), &ctx)
+            secure::atomic_write(&reactor, &dir, "counter", text.as_bytes(), &scope)
                 .await
                 .map_err(|e| format!("atomic_write: {e:?}"))?;
-            let back = reactor
-                .read_child(&dir, "counter", 64, false, &ctx)
+            let back = secure::read_at(&reactor, &dir, "counter", 64, false, &scope)
                 .await
                 .map_err(|e| format!("read back: {e:?}"))?;
             if *back != *text.as_bytes() {

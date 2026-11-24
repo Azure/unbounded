@@ -137,29 +137,6 @@ impl Buffer {
             end: length,
         })
     }
-
-    /// Zeroed storage of `length` bytes (at most `u32::MAX`).
-    pub(crate) fn new(length: usize) -> Result<Self> {
-        if length > u32::MAX as usize {
-            return Err(Error::Overloaded);
-        }
-        Self::allocate(length)
-    }
-
-    /// A copy of `bytes`.
-    #[cfg(test)]
-    pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let mut buffer = Self::new(bytes.len())?;
-        buffer.data.copy_from_slice(bytes);
-        Ok(buffer)
-    }
-
-    /// Reset to `bytes`, which must fit the allocation.
-    pub(crate) fn fill(&mut self, bytes: &[u8]) {
-        self.start = 0;
-        self.end = bytes.len();
-        self.data[..bytes.len()].copy_from_slice(bytes);
-    }
 }
 
 /// Descriptor filesystem operations sharing the reactor's completion fences.
