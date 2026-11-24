@@ -1863,7 +1863,9 @@ impl ControlSim {
             .then(|| self.committed.as_ref().map(|r| r.sequence))
             .flatten();
         let inputs = rules::RenewInputs::from_view(
-            &self.view,
+            self.view
+                .live(self.view_changed_at, now)
+                .then_some(&self.view),
             index as usize,
             &format!("n{pod}"),
             p.primary.is_some(),

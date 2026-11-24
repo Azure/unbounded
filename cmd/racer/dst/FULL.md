@@ -97,6 +97,14 @@ record) or a new `HashMap` iteration on a behavior path.
   cycle), so a restarted Pod failed to bind its addresses. Fixed in
   `authority/src/rt.rs`; regression test
   `dropped_authority_restarts_with_the_same_identity`.
+- `authority-crash-restart` seed 151: three authorities restarted one after
+  another, and the stale primary Lease named each Node's old seat in
+  `SEAT_NODES`. Every freshly claimed seat was released as a duplicate of that
+  dead view, and the cold-start claim window kept growing while a seat Lease
+  waited out its observation window, so no primary appeared for more than
+  120 s. Fixed in `authority/src/rules/seat.rs`: a held seat is retried when
+  its observation window ends, and `duplicate`/`shrink` come only from a live
+  primary view. Regression seed `authority-crash-restart seed=151`.
 
 # Full fidelity: application nodes
 

@@ -60,6 +60,12 @@ pub struct Lottery {
     observer: Observer,
     seen: BTreeMap<usize, LeaseObservation>,
     desired: usize,
+    /// After a read of a seat that a live Lease still holds, the seat and the
+    /// instant its observation window ends. The cold-start window below
+    /// spreads a herd of Pods, but a Pod that already found its seat held
+    /// only has to wait for the Lease to expire, so it retries that same seat
+    /// then instead of growing the window for minutes.
+    retry: Option<(usize, Instant)>,
 }
 
 impl Lottery {
@@ -69,6 +75,26 @@ impl Lottery {
             return Plan::Idle(Duration::from_secs(2));
         }
         let live = i.view.live(i.primary_changed_at, now);
+        if live {
+            // Only the primary view's vacancies matter while it is live.
+            self.retry = None;
+        } else if let Some((index, at)) = self.retry.take()
+            && index < i.initial_seats
+        {
+            // Read the held seat again as soon as its observation window
+            // ends. The cold window grows on every attempt to spread a herd
+            // of Pods, and would otherwise delay a claim that is certain to
+            // succeed to well past the end of the Lease. A seat from a wider
+            // (stale) primary view is not an initial seat and is dropped.
+            let wait = at.saturating_duration_since(now);
+            self.attempt = 0;
+            self.desired = i.initial_seats;
+            let spread = jitter(i.pod_uid, rng, 3, Duration::from_millis(500));
+            return Plan::Attempt {
+                delay: wait + spread,
+                index,
+            };
+        }
         let (candidates, window) = if live {
             if i.view.node_seated(i.node) {
                 (Vec::new(), 0)
@@ -120,12 +146,21 @@ impl Lottery {
         self.observer.observe(obs, now);
         self.seen.insert(index, obs.clone());
         let views = claim_views(&self.seen, &self.observer, index, now);
-        election::seat_to_claim(&views, self.desired, node, identity) == Some(index)
+        let claim = election::seat_to_claim(&views, self.desired, node, identity) == Some(index);
+        // A seat held by a live Lease can only be claimed once its observation
+        // window ends, so retry that seat then.
+        self.retry = if !claim && !self.observer.expired(obs, now) {
+            self.observer.expires_at(obs).map(|at| (index, at))
+        } else {
+            None
+        };
+        claim
     }
 
     /// The claim PUT succeeded.
     pub fn won(&mut self) {
         self.attempt = 0;
+        self.retry = None;
     }
 }
 
@@ -186,9 +221,13 @@ pub struct RenewInputs {
 }
 
 impl RenewInputs {
-    /// Fill `duplicate` and `shrink` from the primary view.
+    /// Fill `duplicate` and `shrink` from `live`, the primary view while its
+    /// Lease is live. Both act only on a live view: once the primary Lease
+    /// has expired its `SEAT_NODES` and `SEATS` annotations are stale, so a
+    /// seat claimed now could be released for good (its Node still named at a
+    /// lower index) or below the count the next primary asks for.
     pub fn from_view(
-        view: &PrimaryView,
+        live: Option<&PrimaryView>,
         index: usize,
         node: &str,
         is_primary: bool,
@@ -196,13 +235,15 @@ impl RenewInputs {
         rotation: bool,
         ready_changed: bool,
     ) -> Self {
-        let duplicate = view
-            .seat_nodes
-            .iter()
-            .enumerate()
-            .any(|(i, n)| i < index && n == node);
-        let shrink =
-            view.holder.is_some() && election::must_release(index, view.desired) && !is_primary;
+        let duplicate = live.is_some_and(|view| {
+            view.seat_nodes
+                .iter()
+                .enumerate()
+                .any(|(i, n)| i < index && n == node)
+        });
+        let shrink = live.is_some_and(|view| {
+            view.holder.is_some() && election::must_release(index, view.desired) && !is_primary
+        });
         Self {
             stopping,
             duplicate,
@@ -534,6 +575,55 @@ mod tests {
     }
 
     #[test]
+    fn held_seat_retries_when_it_expires() {
+        let now = Instant::now();
+        // No live primary, so the lottery is in its cold-start branch.
+        let v = view(3, &[]);
+        let mut l = Lottery::default();
+        let Plan::Attempt { index, .. } = l.plan(&inputs(&v, None), now, &mut Failing) else {
+            panic!("cold start attempts a seat")
+        };
+        l.begin();
+        let name = annotations::seat_lease(index);
+        let mut held = vacant(&name);
+        held.resource_version = "2".into();
+        held.spec = LeaseSpec {
+            holder: Some("old".into()),
+            duration_secs: 30,
+            ..Default::default()
+        };
+        assert!(!l.observe(index, &held, now, "me", "me/1"));
+        let expires = now + limits::LEASE_DURATION;
+        assert_eq!(l.retry, Some((index, expires)));
+        // The retry is that same seat at its expiry, not the grown cold window.
+        let Plan::Attempt {
+            delay,
+            index: again,
+        } = l.plan(&inputs(&v, None), now, &mut Failing)
+        else {
+            panic!("a held seat is retried")
+        };
+        assert_eq!(again, index);
+        assert!(delay >= limits::LEASE_DURATION, "{delay:?}");
+        assert!(delay < limits::LEASE_DURATION + Duration::from_millis(500));
+        // The retry is used once; a live primary view then drops it and
+        // follows its vacancies.
+        assert_eq!(l.retry, None);
+        assert!(!l.observe(index, &held, now, "me", "me/1"));
+        assert_eq!(l.retry, Some((index, expires)));
+        let live = view(3, &["me"]);
+        let _ = l.plan(&inputs(&live, Some(now)), now, &mut Failing);
+        assert_eq!(l.retry, None);
+        // Reading the held seat again after its window claims it.
+        let mut l = Lottery::default();
+        let _ = l.plan(&inputs(&v, None), now, &mut Failing);
+        l.begin();
+        assert!(!l.observe(index, &held, now, "me", "me/1"));
+        assert!(l.observe(index, &held, expires, "me", "me/1"));
+        assert_eq!(l.retry, None);
+    }
+
+    #[test]
     fn release_reasons_win() {
         let t = Instant::now();
         for i in [
@@ -601,17 +691,21 @@ mod tests {
             seat_nodes: vec!["n1".into(), "n2".into(), "n1".into()],
             ..Default::default()
         };
-        let i = RenewInputs::from_view(&v, 2, "n1", false, false, false, false);
+        let i = RenewInputs::from_view(Some(&v), 2, "n1", false, false, false, false);
         assert!(i.duplicate && i.shrink);
-        let i = RenewInputs::from_view(&v, 2, "n1", true, false, false, false);
+        let i = RenewInputs::from_view(Some(&v), 2, "n1", true, false, false, false);
         assert!(!i.shrink, "the primary keeps its seat");
-        let i = RenewInputs::from_view(&v, 1, "n2", false, false, false, false);
+        let i = RenewInputs::from_view(Some(&v), 1, "n2", false, false, false, false);
         assert!(!i.duplicate && !i.shrink);
+        // A stale (not live) primary view releases nothing: its annotations
+        // describe seats that may no longer exist.
+        let stale = RenewInputs::from_view(None, 2, "n1", false, false, false, false);
+        assert!(!stale.duplicate && !stale.shrink);
         let none = PrimaryView {
             holder: None,
             ..v.clone()
         };
-        assert!(!RenewInputs::from_view(&none, 5, "x", false, false, false, false).shrink);
+        assert!(!RenewInputs::from_view(Some(&none), 5, "x", false, false, false, false).shrink);
     }
 
     const C: &str = "c1c1c1c1-0000-4000-8000-000000000001";
