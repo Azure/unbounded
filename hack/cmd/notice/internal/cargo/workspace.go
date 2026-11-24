@@ -134,6 +134,7 @@ func workspaceVersionsAt(root, cratePath, crateName string) (map[string]string, 
 			if dep.localPath != "" {
 				local := filepath.Clean(filepath.Join(member, dep.localPath))
 				target := filepath.Clean(filepath.Join(base, local))
+
 				if filepath.IsAbs(dep.localPath) || !declared[local] && !otherCrateRoot(root, cratePath, target) {
 					return nil, fmt.Errorf("%s: local dependency %q must be a declared workspace member", path, dep.localPath)
 				}

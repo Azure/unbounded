@@ -494,6 +494,7 @@ func inherit(alias string, spec map[string]any, workspace map[string]any) (map[s
 	}
 
 	resolved := map[string]any{}
+
 	switch entry := entry.(type) {
 	case string:
 		if entry == "" {
