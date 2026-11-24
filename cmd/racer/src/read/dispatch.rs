@@ -9,7 +9,6 @@ use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
 use crate::memory::PageResult;
-use crate::model::AttemptId;
 use crate::model::MetadataSelector;
 use crate::model::ObjectId;
 use crate::model::ObjectMetadata;
@@ -23,8 +22,8 @@ use crate::peer::protocol::PeerResponse;
 use crate::peer::server::LocalPageService;
 use crate::runtime::Cancellation;
 use crate::runtime::RequestScope;
+use crate::security::ChargedOriginContext;
 use crate::security::OriginContext;
-use crate::security::PeerOriginContext;
 use crate::store::holds::{HoldEpoch, HoldPages};
 use racer_io::xthread::command as mailbox;
 use std::cell::RefCell;
@@ -127,7 +126,7 @@ enum Work {
         PageId,
         crate::model::VersionMetadata,
         Arc<crate::topology::Membership>,
-        PeerOriginContext,
+        ChargedOriginContext,
     ),
     WarmLocal(PageId),
     /// Fill one prefetch page on its owning worker and persist it normally.
@@ -135,7 +134,7 @@ enum Work {
         PageId,
         crate::model::VersionMetadata,
         Arc<crate::topology::Membership>,
-        PeerOriginContext,
+        ChargedOriginContext,
     ),
     /// Whether this worker's disk index holds the page.
     Probe(PageId),
@@ -143,7 +142,7 @@ enum Work {
         ObjectVersion,
         super::range_stream::Selection,
         std::sync::Arc<crate::topology::Membership>,
-        PeerOriginContext,
+        ChargedOriginContext,
     ),
     Selected(crate::memory::CiphertextCopy),
     Cached(PageId),
@@ -151,26 +150,30 @@ enum Work {
     Resolve(
         MetadataSelector,
         std::sync::Arc<crate::topology::Membership>,
-        PeerOriginContext,
+        ChargedOriginContext,
     ),
     Acquire(
         PageId,
         std::sync::Arc<crate::topology::Membership>,
-        PeerOriginContext,
+        ChargedOriginContext,
     ),
-    AcquireUnobserved(PageId, Arc<crate::topology::Membership>, PeerOriginContext),
+    AcquireUnobserved(
+        PageId,
+        Arc<crate::topology::Membership>,
+        ChargedOriginContext,
+    ),
     /// One read window page through ordinary Fill.
     Fetch(
         PageId,
         std::sync::Arc<crate::topology::Membership>,
-        PeerOriginContext,
+        ChargedOriginContext,
     ),
     /// One read window page for direct GPU delivery: like `Fetch`, but
     /// ciphertext the GPU can verify is returned sealed.
     FetchSealed(
         PageId,
         std::sync::Arc<crate::topology::Membership>,
-        PeerOriginContext,
+        ChargedOriginContext,
         super::sealed::SealedTarget,
     ),
     /// The GPU's verdict on a sealed page this worker supplied.
@@ -318,7 +321,12 @@ impl WorkerDirectory {
         let owner = self.shared.metadata_owner(&version.object)?;
         let receipt = self.shared.submit(
             owner,
-            Work::Select(version, selection, membership, self.seal(context, scope)?),
+            Work::Select(
+                version,
+                selection,
+                membership,
+                self.local_context(context, scope)?,
+            ),
             scope,
             Some(budget),
         )?;
@@ -443,17 +451,17 @@ impl WorkerDirectory {
             .as_ref()
             .is_some_and(|(worker, _)| *worker == owner)
     }
-    fn seal(&self, context: &OriginContext, scope: &RequestScope) -> Result<PeerOriginContext> {
-        let sequence = self
-            .shared
-            .sequence
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-            .map_err(|_| Error::Unavailable)?;
-        let mut attempt = [0; 16];
-        attempt[8..].copy_from_slice(&sequence.to_be_bytes());
-        self.local()?
-            .credentials
-            .seal(context, AttemptId(attempt), scope)
+    /// Admit this request's origin context for one in-process worker hop.
+    /// Workers in one process share a trust domain, so the context crosses the
+    /// mailbox as an owned copy instead of a sealed envelope. Admission is
+    /// unchanged: `local_peer_context` keeps every charge the seal/open path
+    /// performed.
+    fn local_context(
+        &self,
+        context: &OriginContext,
+        scope: &RequestScope,
+    ) -> Result<ChargedOriginContext> {
+        self.local()?.credentials.local_peer_context(context, scope)
     }
 
     /// Add one holder to `page` on its owning worker only, until `until`.
@@ -541,7 +549,7 @@ impl WorkerDirectory {
     }
 
     /// Start a fill of a page a read holds: the owner fills it and persists it
-    /// under the hold. The context is sealed before returning.
+    /// under the hold. The context travels with the work, charged for the hop.
     pub(super) fn start_spill_page(
         &self,
         page: PageId,
@@ -551,7 +559,12 @@ impl WorkerDirectory {
         scope: &RequestScope,
     ) -> Result<Operation<'static, ()>> {
         let owner = self.shared.page_owner(&page)?;
-        let work = Work::SpillFill(page, metadata, membership, self.seal(context, scope)?);
+        let work = Work::SpillFill(
+            page,
+            metadata,
+            membership,
+            self.local_context(context, scope)?,
+        );
         let receipt = self
             .shared
             .submit(owner, work, scope, Some(super::default_budget(scope)))?;
@@ -634,7 +647,12 @@ impl WorkerDirectory {
         scope: &RequestScope,
     ) -> Result<racer_core::prefetch::PageResult> {
         let owner = self.shared.page_owner(&page)?;
-        let work = Work::PrefetchFill(page, metadata, membership, self.seal(context, scope)?);
+        let work = Work::PrefetchFill(
+            page,
+            metadata,
+            membership,
+            self.local_context(context, scope)?,
+        );
         let receipt = self
             .shared
             .submit(owner, work, scope, Some(super::default_budget(scope)))?;
@@ -696,7 +714,7 @@ impl WorkerDirectory {
                     .resolve_with_budget(selector, membership, context, scope, budget)
                     .await;
             }
-            let work = Work::Resolve(selector, membership, self.seal(context, scope)?);
+            let work = Work::Resolve(selector, membership, self.local_context(context, scope)?);
             match self.budgeted(owner, work, scope, budget).await? {
                 Value::Metadata(value) => Ok(value),
                 _ => Err(Error::StaleFlight),
@@ -723,7 +741,11 @@ impl WorkerDirectory {
                     .acquire_page(page, membership, context, scope, budget)
                     .await;
             }
-            let work = Work::Acquire(page.clone(), membership, self.seal(context, scope)?);
+            let work = Work::Acquire(
+                page.clone(),
+                membership,
+                self.local_context(context, scope)?,
+            );
             match self.budgeted(owner, work, scope, budget).await? {
                 Value::Page(value) => {
                     value.validate_for(&page)?;
@@ -753,7 +775,7 @@ impl WorkerDirectory {
                 .acquire_unobserved(page, membership, context, scope, budget)
                 .await;
         }
-        let work = Work::AcquireUnobserved(page, membership, self.seal(context, scope)?);
+        let work = Work::AcquireUnobserved(page, membership, self.local_context(context, scope)?);
         match self.budgeted(owner, work, scope, budget).await? {
             Value::Page(page) => Ok(page),
             _ => Err(Error::StaleFlight),
@@ -776,7 +798,7 @@ impl WorkerDirectory {
         let owner = self.shared.page_owner(&page)?;
         let receipt = self.shared.submit(
             owner,
-            Work::Fetch(page, membership, self.seal(context, scope)?),
+            Work::Fetch(page, membership, self.local_context(context, scope)?),
             scope,
             Some(budget),
         )?;
@@ -804,7 +826,12 @@ impl WorkerDirectory {
         let owner = self.shared.page_owner(&page)?;
         let receipt = self.shared.submit(
             owner,
-            Work::FetchSealed(page, membership, self.seal(context, scope)?, target),
+            Work::FetchSealed(
+                page,
+                membership,
+                self.local_context(context, scope)?,
+                target,
+            ),
             scope,
             Some(budget),
         )?;
@@ -1157,7 +1184,7 @@ async fn execute(
             // `serve_fill` probed this page on this same owner worker just
             // before submitting the fill, so a probe here would read the same
             // disk index again and learn nothing new.
-            let context = local.open_context(envelope)?;
+            let context = envelope;
             let result = local
                 .fill
                 .acquire_fenced(
@@ -1187,7 +1214,7 @@ async fn execute(
             ))
         }
         Work::SpillFill(page, metadata, membership, envelope) => {
-            let context = local.open_context(envelope)?;
+            let context = envelope;
             let result = local
                 .fill
                 .acquire_fenced(
@@ -1218,7 +1245,7 @@ async fn execute(
             if selection.version != version {
                 return Err(Error::InvalidRequest);
             }
-            let context = local.open_context(envelope)?;
+            let context = envelope;
             let page = local
                 .fill
                 .select_subscription(
@@ -1239,7 +1266,7 @@ async fn execute(
             .map(Value::Page),
         Work::Cached(page) => local.fill.cached_page(&page, scope).map(Value::Cached),
         Work::Resolve(selector, membership, envelope) => {
-            let context = local.open_context(envelope)?;
+            let context = envelope;
             local
                 .metadata
                 .resolve_with_budget(
@@ -1253,7 +1280,7 @@ async fn execute(
                 .map(Value::Metadata)
         }
         Work::Acquire(page, membership, envelope) => {
-            let context = local.open_context(envelope)?;
+            let context = envelope;
             local
                 .fill
                 .acquire_page(
@@ -1267,7 +1294,7 @@ async fn execute(
                 .map(Value::Page)
         }
         Work::AcquireUnobserved(page, membership, envelope) => {
-            let context = local.open_context(envelope)?;
+            let context = envelope;
             local
                 .fill
                 .acquire_unobserved(
@@ -1288,7 +1315,7 @@ async fn execute(
             if local.fill.dependencies.flights.prefetch_fill(&page) {
                 let _ = prefetch.promote(&page);
             }
-            let context = local.open_context(envelope)?;
+            let context = envelope;
             local
                 .fill
                 .acquire_page(
@@ -1307,7 +1334,7 @@ async fn execute(
             if local.fill.dependencies.flights.prefetch_fill(&page) {
                 let _ = prefetch.promote(&page);
             }
-            let context = local.open_context(envelope)?;
+            let context = envelope;
             local
                 .fill
                 .acquire_sealed(
@@ -2179,9 +2206,9 @@ mod tests {
             metadata: None,
             authorization: None,
         };
-        let envelope = local
+        let charged = local
             .credentials
-            .seal(&context, AttemptId([3; 16]), &caller)
+            .local_peer_context(&context, &caller)
             .unwrap();
         let membership = Arc::new(
             crate::topology::Membership::validate(
@@ -2194,7 +2221,7 @@ mod tests {
             .shared
             .submit(
                 WorkerId(0),
-                Work::Acquire(page.clone(), membership, envelope),
+                Work::Acquire(page.clone(), membership, charged),
                 &caller,
                 Some(AcquisitionBudget::new(caller.deadline.0, 4, 8)),
             )
@@ -2236,6 +2263,84 @@ mod tests {
         );
         assert!(endpoint.is_drained());
         endpoint.uninstall().unwrap();
+    }
+    #[test]
+    fn cross_worker_fetch_carries_origin_credentials_without_sealing() {
+        use crate::admission::ResourceClass;
+        let env = racer_io::Env::host();
+        let directory = Rc::new(directory(4));
+        let (local, _fixture) = crate::read::tests::admission_coordinator(&env);
+        let caller = scope();
+        let object = ObjectId {
+            cache: racer_wire::control::CacheId(crate::test_support::security::CACHE.into()),
+            key: CacheKey([7; 32]),
+        };
+        // A page whose owner is the other worker, so this is a real handoff.
+        let page = (0..1024)
+            .map(|number| PageId {
+                version: ObjectVersion {
+                    object: object.clone(),
+                    etag: StrongEtag::test_value("v1"),
+                },
+                number: crate::model::PageNumber(number),
+            })
+            .find(|page| directory.shared.page_owner(page).unwrap() == WorkerId(1))
+            .unwrap();
+        let context = OriginContext {
+            object: object.clone(),
+            metadata: Some(crate::security::OpaqueMetadata::from_header(b"opaque,  \xff").unwrap()),
+            authorization: Some(
+                crate::security::Authorization::from_header(b"Bearer exact  \xfe").unwrap(),
+            ),
+        };
+        let admission = local.fill.dependencies.admission.clone();
+        assert_eq!(admission.used(ResourceClass::RequestContext), 0);
+        let charged = local
+            .credentials
+            .local_peer_context(&context, &caller)
+            .unwrap();
+        let retained = admission.used(ResourceClass::RequestContext);
+        assert!(retained > 0);
+        let membership = Arc::new(
+            crate::topology::Membership::validate(
+                racer_wire::control::MembershipVersion(1),
+                vec![],
+            )
+            .unwrap(),
+        );
+        let _receipt = directory
+            .shared
+            .submit(
+                WorkerId(1),
+                Work::Acquire(page.clone(), membership, charged),
+                &caller,
+                Some(AcquisitionBudget::new(caller.deadline.0, 4, 8)),
+            )
+            .unwrap();
+        let command = directory.shared.mailbox(WorkerId(1)).unwrap().inner.pop();
+        let Some(command) = command else {
+            panic!("fetch was not queued for the other worker");
+        };
+        match &command.work {
+            Work::Acquire(queued, _, context) => {
+                assert_eq!(queued, &page);
+                assert_eq!(context.object, object);
+                // The hop carries the raw origin credentials, not an AEAD
+                // envelope, so the owner fetches with the caller's authority.
+                assert_eq!(
+                    context.authorization.as_ref().unwrap().expose_for_origin(),
+                    b"Bearer exact  \xfe"
+                );
+                assert_eq!(
+                    context.metadata.as_ref().unwrap().as_header(),
+                    b"opaque,  \xff"
+                );
+            }
+            _ => panic!("expected a cross-worker fetch"),
+        }
+        assert_eq!(admission.used(ResourceClass::RequestContext), retained);
+        drop(command);
+        assert_eq!(admission.used(ResourceClass::RequestContext), 0);
     }
     #[test]
     fn cancellation_does_not_reopen_a_full_mailbox_before_completion() {
