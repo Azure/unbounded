@@ -546,6 +546,9 @@ impl Fill {
         if version.object != context.object {
             return Err(Error::InvalidRequest);
         }
+        // Both the warm local check and the fallback acquisition target the
+        // same head page; resolve its owner once.
+        let head_owner = self.dependencies.metadata_owner.node().page_owner(&head)?;
         // A subscription opened while the cache was cached can outlive a
         // switch to passthrough. Passthrough caches retain nothing, so a
         // provider cannot hold a usable copy, and the local route must
@@ -555,7 +558,7 @@ impl Fill {
             return self
                 .dependencies
                 .metadata_owner
-                .acquire_unobserved(head, membership, context, scope, budget)
+                .acquire_unobserved_on(head_owner, head, membership, context, scope, budget)
                 .await;
         }
         // A new or credit-starved subscriber can lag behind provider completion.
@@ -564,7 +567,7 @@ impl Fill {
         if let Some(result) = self
             .dependencies
             .metadata_owner
-            .local_page(head, scope)
+            .local_page_on(head_owner, head, scope)
             .await?
         {
             return Ok(result);
@@ -608,7 +611,8 @@ impl Fill {
         }
         self.dependencies
             .metadata_owner
-            .acquire_unobserved(
+            .acquire_unobserved_on(
+                head_owner,
                 crate::model::PageId {
                     version,
                     number: first,
@@ -1076,15 +1080,26 @@ impl Fill {
         scope: &'a RequestScope,
         budget: &'a mut AcquisitionBudget,
     ) -> Operation<'a, PageResult> {
-        Box::pin(async move {
-            match self
-                .acquire_with_prefetch(page, membership, context, scope, budget, None, true, true)
-                .await?
-            {
-                AcquiredPage::Plaintext(page) => Ok(page),
-                AcquiredPage::Ciphertext(_) => Err(Error::CorruptRecord),
-            }
-        })
+        Box::pin(self.acquire_page(page, membership, context, scope, budget))
+    }
+
+    /// [`Self::acquire`] without the type-erased box, for callers that await
+    /// the concrete future directly.
+    pub(crate) async fn acquire_page(
+        &self,
+        page: PageId,
+        membership: std::sync::Arc<crate::topology::Membership>,
+        context: &OriginContext,
+        scope: &RequestScope,
+        budget: &mut AcquisitionBudget,
+    ) -> Result<PageResult> {
+        match self
+            .acquire_with_prefetch(page, membership, context, scope, budget, None, true, true)
+            .await?
+        {
+            AcquiredPage::Plaintext(page) => Ok(page),
+            AcquiredPage::Ciphertext(_) => Err(Error::CorruptRecord),
+        }
     }
 
     pub(crate) async fn acquire_unobserved(
@@ -1136,7 +1151,7 @@ impl Fill {
         // keep the plaintext path: the bytes are on the CPU anyway.
         if self.cached_page(&page, scope)?.is_some() {
             return self
-                .acquire(page, membership, context, scope, budget)
+                .acquire_page(page, membership, context, scope, budget)
                 .await
                 .map(Fetched::Page);
         }
@@ -1189,7 +1204,7 @@ impl Fill {
                 // A key the GPU cannot use, or an AAD too long for it: the
                 // CPU authenticates the page as for a Get.
                 Err(_) => self
-                    .acquire(page, membership, context, scope, budget)
+                    .acquire_page(page, membership, context, scope, budget)
                     .await
                     .map(Fetched::Page),
             },
@@ -1757,102 +1772,100 @@ impl Fill {
 
     /// Acquire one page with the caller's prefetch, budget, and observation policy.
     #[allow(clippy::too_many_arguments)] // Keep acquisition inputs and borrowed budget explicit.
-    fn acquire_with_prefetch<'a>(
-        &'a self,
+    async fn acquire_with_prefetch(
+        &self,
         page: PageId,
         membership: std::sync::Arc<crate::topology::Membership>,
-        context: &'a OriginContext,
-        scope: &'a RequestScope,
-        budget: &'a mut AcquisitionBudget,
+        context: &OriginContext,
+        scope: &RequestScope,
+        budget: &mut AcquisitionBudget,
         mut prefetch: Option<crate::origin::OriginPage>,
         plaintext: bool,
         observe: bool,
-    ) -> Operation<'a, AcquiredPage> {
-        Box::pin(async move {
-            scope.check()?;
-            if page.version.object != context.object {
-                return Err(Error::InvalidRequest);
-            }
-            // Plaintext another reader still holds is already deliverable.
-            // Optional cold ownership ranking must not introduce a
-            // yield/deadline failure before it. Cached ciphertext without live
-            // plaintext is decrypted by the elected flight below.
-            let interest = crate::retention::Interest::default();
-            if let Some(result) = self
-                .metrics
-                .lookup(LookupTier::Plaintext, self.dependencies.memory.get(&page))?
-            {
+    ) -> Result<AcquiredPage> {
+        scope.check()?;
+        if page.version.object != context.object {
+            return Err(Error::InvalidRequest);
+        }
+        // Plaintext another reader still holds is already deliverable.
+        // Optional cold ownership ranking must not introduce a
+        // yield/deadline failure before it. Cached ciphertext without live
+        // plaintext is decrypted by the elected flight below.
+        let interest = crate::retention::Interest::default();
+        if let Some(result) = self
+            .metrics
+            .lookup(LookupTier::Plaintext, self.dependencies.memory.get(&page))?
+        {
+            result.validate_for(&page)?;
+            self.metrics.record(Event::MemoryHit, 1);
+            let observation = self.retention_observation(&page, &interest, observe);
+            self.persist_verified(&result, observation);
+            self.refresh_verified_background(&result, observation, scope);
+            return Ok(result.into());
+        }
+        // Each independent follower observes before joining. Retries inside
+        // this operation reuse this decision, never their own inserted bit.
+        let _ = self
+            .dependencies
+            .candidates
+            .refresh_ownership_scoped(&page, scope)
+            .await;
+        scope.check()?;
+        let observation = self.retention_observation(&page, &interest, observe);
+        let joined = if plaintext && prefetch.is_none() {
+            self.dependencies
+                .flights
+                .join_wait(page.clone(), membership, context, scope, budget)
+                .await
+        } else {
+            self.dependencies.flights.join_for(
+                page.clone(),
+                membership,
+                context,
+                scope,
+                budget,
+                plaintext,
+            )
+        };
+        let mut waiter = match joined? {
+            JoinedFlight::Complete(result) => {
+                // join checks current UID/key admission before sharing a
+                // completed bundle; registered waiters retain their own rights.
                 result.validate_for(&page)?;
-                self.metrics.record(Event::MemoryHit, 1);
-                let observation = self.retention_observation(&page, &interest, observe);
                 self.persist_verified(&result, observation);
-                self.refresh_verified_background(&result, observation, scope);
                 return Ok(result.into());
             }
-            // Each independent follower observes before joining. Retries inside
-            // this operation reuse this decision, never their own inserted bit.
-            let _ = self
-                .dependencies
-                .candidates
-                .refresh_ownership_scoped(&page, scope)
-                .await;
-            scope.check()?;
-            let observation = self.retention_observation(&page, &interest, observe);
-            let joined = if plaintext && prefetch.is_none() {
-                self.dependencies
-                    .flights
-                    .join_wait(page.clone(), membership, context, scope, budget)
-                    .await
-            } else {
-                self.dependencies.flights.join_for(
-                    page.clone(),
-                    membership,
-                    context,
-                    scope,
-                    budget,
-                    plaintext,
-                )
-            };
-            let mut waiter = match joined? {
-                JoinedFlight::Complete(result) => {
-                    // join checks current UID/key admission before sharing a
-                    // completed bundle; registered waiters retain their own rights.
+            JoinedFlight::Ciphertext(copy) => return Ok(AcquiredPage::Ciphertext(copy)),
+            JoinedFlight::Waiter(waiter) => waiter,
+        };
+        loop {
+            let event = waiter.wait().await;
+            if self.fenced_fill && matches!(event, Err(_) | Ok(AcquisitionEvent::Failed(_))) {
+                waiter.wait_operations().await?;
+            }
+            match event? {
+                AcquisitionEvent::Complete(result) => {
                     result.validate_for(&page)?;
                     self.persist_verified(&result, observation);
                     return Ok(result.into());
                 }
-                JoinedFlight::Ciphertext(copy) => return Ok(AcquiredPage::Ciphertext(copy)),
-                JoinedFlight::Waiter(waiter) => waiter,
-            };
-            loop {
-                let event = waiter.wait().await;
-                if self.fenced_fill && matches!(event, Err(_) | Ok(AcquisitionEvent::Failed(_))) {
-                    waiter.wait_operations().await?;
+                AcquisitionEvent::Ciphertext(copy) => {
+                    return Ok(AcquiredPage::Ciphertext(copy));
                 }
-                match event? {
-                    AcquisitionEvent::Complete(result) => {
-                        result.validate_for(&page)?;
-                        self.persist_verified(&result, observation);
-                        return Ok(result.into());
-                    }
-                    AcquisitionEvent::Ciphertext(copy) => {
-                        return Ok(AcquiredPage::Ciphertext(copy));
-                    }
-                    AcquisitionEvent::Failed(error) => return Err(error),
-                    AcquisitionEvent::Lead(leader) => {
-                        self.drive_elected_acquisition(
-                            &page,
-                            leader,
-                            &mut waiter,
-                            &mut prefetch,
-                            plaintext,
-                            observation,
-                        )
-                        .await?;
-                    }
+                AcquisitionEvent::Failed(error) => return Err(error),
+                AcquisitionEvent::Lead(leader) => {
+                    self.drive_elected_acquisition(
+                        &page,
+                        leader,
+                        &mut waiter,
+                        &mut prefetch,
+                        plaintext,
+                        observation,
+                    )
+                    .await?;
                 }
             }
-        })
+        }
     }
 
     /// Transfer elected work to the worker driver. The caller only waits for its

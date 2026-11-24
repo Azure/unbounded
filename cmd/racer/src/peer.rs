@@ -793,6 +793,7 @@ impl Requester {
                     true,
                     Some(&mut timing),
                     None,
+                    None,
                 )
                 .await?;
             let transport::RelayResponse::Complete(response) = response else {
@@ -931,6 +932,7 @@ impl Requester {
                     false,
                     Some(&mut timing),
                     landing,
+                    Some(route),
                 )
                 .await?;
             // Verified once by `exchange_inner_mode` against `binding`.
@@ -993,7 +995,7 @@ impl Requester {
         relay: Option<Rc<flow_control::Charge<AdmissionPolicy>>>,
         scope: &'a RequestScope,
     ) -> Operation<'a, transport::VerifiedExchange> {
-        self.exchange_inner_mode(request, membership, relay, scope, false, None, None)
+        self.exchange_inner_mode(request, membership, relay, scope, false, None, None, None)
     }
     #[allow(clippy::too_many_arguments)] // Keep transport, routing, and landing inputs explicit.
     fn exchange_inner_mode<'a>(
@@ -1005,6 +1007,10 @@ impl Requester {
         direct_http: bool,
         timing: Option<&'a mut PageTiming<'_>>,
         landing: Option<i32>,
+        // A route the caller already computed for this exact envelope. Only a
+        // request that selected `next` before signing has one; with link health
+        // unchanged since, recomputing it would repeat the same query.
+        planned: Option<crate::topology::Route>,
     ) -> Operation<'a, transport::VerifiedExchange> {
         let (network, paths, health, forwarding, transfers) = match self {
             Self::Network {
@@ -1048,10 +1054,15 @@ impl Requester {
                 }
                 crate::rdma::TransportPlan::Http
             } else if let Some(page) = &rail_hint {
-                let search = search_budget(budget, &network.local)?;
-                let route = paths
-                    .shortest_async(membership.clone(), &network.local, &search, &scope)
-                    .await?;
+                let route = match planned {
+                    Some(route) => route,
+                    None => {
+                        let search = search_budget(budget, &network.local)?;
+                        paths
+                            .shortest_async(membership.clone(), &network.local, &search, &scope)
+                            .await?
+                    }
+                };
                 if route.nodes.get(1) != Some(&next) {
                     return Err(Error::Unavailable);
                 }

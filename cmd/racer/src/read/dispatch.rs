@@ -283,6 +283,14 @@ impl WorkerDirectory {
         scope: &RequestScope,
     ) -> Result<Option<PageResult>> {
         let owner = self.shared.page_owner(&page)?;
+        self.cached_page_on(owner, page, scope).await
+    }
+    async fn cached_page_on(
+        &self,
+        owner: WorkerId,
+        page: PageId,
+        scope: &RequestScope,
+    ) -> Result<Option<PageResult>> {
         if self.is_local(owner) {
             return self.local()?.fill.cached_page(&page, scope);
         }
@@ -561,6 +569,14 @@ impl WorkerDirectory {
     /// Read a page this node holds: memory first, then the held disk copy.
     pub(super) async fn held_page(&self, page: PageId, scope: &RequestScope) -> Result<PageResult> {
         let owner = self.shared.page_owner(&page)?;
+        self.held_page_on(owner, page, scope).await
+    }
+    async fn held_page_on(
+        &self,
+        owner: WorkerId,
+        page: PageId,
+        scope: &RequestScope,
+    ) -> Result<PageResult> {
         if self.is_local(owner) {
             return self.local()?.fill.warm_local(&page, scope).await;
         }
@@ -585,10 +601,22 @@ impl WorkerDirectory {
         page: PageId,
         scope: &RequestScope,
     ) -> Result<Option<PageResult>> {
-        if let Some(result) = self.cached_page(page.clone(), scope).await? {
+        let owner = self.shared.page_owner(&page)?;
+        self.local_page_on(owner, page, scope).await
+    }
+
+    /// [`Self::local_page`] with the owner already resolved, so a caller that
+    /// tries both tiers for one page hashes the page placement once.
+    pub(crate) async fn local_page_on(
+        &self,
+        owner: WorkerId,
+        page: PageId,
+        scope: &RequestScope,
+    ) -> Result<Option<PageResult>> {
+        if let Some(result) = self.cached_page_on(owner, page.clone(), scope).await? {
             return Ok(Some(result));
         }
-        match self.held_page(page, scope).await {
+        match self.held_page_on(owner, page, scope).await {
             Ok(page) => Ok(Some(page)),
             Err(Error::Unavailable) => Ok(None),
             Err(error) => Err(error),
@@ -692,7 +720,7 @@ impl WorkerDirectory {
                 return self
                     .local()?
                     .fill
-                    .acquire(page, membership, context, scope, budget)
+                    .acquire_page(page, membership, context, scope, budget)
                     .await;
             }
             let work = Work::Acquire(page.clone(), membership, self.seal(context, scope)?);
@@ -705,15 +733,19 @@ impl WorkerDirectory {
             }
         })
     }
-    pub(crate) async fn acquire_unobserved(
+
+    /// Acquire a page this node does not hold without observing the copy.
+    /// Takes the owner already resolved so a caller can reuse one placement
+    /// lookup across several operations on the same page.
+    pub(crate) async fn acquire_unobserved_on(
         &self,
+        owner: WorkerId,
         page: PageId,
         membership: Arc<crate::topology::Membership>,
         context: &OriginContext,
         scope: &RequestScope,
         budget: &mut AcquisitionBudget,
     ) -> Result<PageResult> {
-        let owner = self.shared.page_owner(&page)?;
         if self.is_local(owner) {
             return self
                 .local()?
@@ -1224,7 +1256,7 @@ async fn execute(
             let context = local.open_context(envelope)?;
             local
                 .fill
-                .acquire(
+                .acquire_page(
                     page,
                     membership,
                     &context,
@@ -1254,7 +1286,7 @@ async fn execute(
             let context = local.open_context(envelope)?;
             local
                 .fill
-                .acquire(
+                .acquire_page(
                     page,
                     membership,
                     &context,

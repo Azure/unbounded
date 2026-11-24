@@ -1028,6 +1028,8 @@ async fn serve_connection(
         let kind = request.kind.clone();
         let object = request.origin.object.clone();
         let socket = connection.socket();
+        // This watch covers acquisition only. It is fenced before
+        // `handle_read_result` starts the response-delivery watch.
         let watch_scope = scope.child(scope.request, scope.deadline.0)?;
         let mut disconnected = Some(io.disconnected(&connection, &watch_scope));
         let mut disconnect_observed = false;

@@ -172,6 +172,8 @@ async fn handle_read_result(
     }
     let watch_scope = scope.child(scope.request, scope.deadline.0)?;
     let socket = connection.socket();
+    // The acquisition watch in `serve_connection` is already fenced; this one
+    // covers response delivery and is not a duplicate.
     // Keep four slots for duplex sends, receives, and listener progress. Tiny
     // rings retain the synchronous fallback rather than losing delivery capacity.
     let watch_room = admission

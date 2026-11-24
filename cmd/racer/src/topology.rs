@@ -201,8 +201,18 @@ impl LinkHealth {
     pub fn try_acquire_at(&self, neighbor: &NodeId, now: Instant) -> Result<bool> {
         Ok(self.inner.try_acquire(neighbor, now))
     }
-    pub fn retain_neighbors(&self, neighbors: &[NodeId]) {
-        self.inner.retain(neighbors);
+    /// Forget failure records for links that are not in `neighbors`.
+    ///
+    /// Routing passes a cheap cloneable iterator over IDs borrowed from the
+    /// membership, so retaining the neighbor set clones no `NodeId` and
+    /// allocates nothing.
+    pub fn retain_neighbors<'a>(&self, neighbors: impl IntoIterator<Item = &'a NodeId> + Clone) {
+        self.inner.retain_by(|key| {
+            neighbors
+                .clone()
+                .into_iter()
+                .any(|neighbor| neighbor == key)
+        });
     }
     pub fn tracked_links(&self) -> usize {
         self.inner.len()
@@ -1062,7 +1072,8 @@ impl Paths {
                 .map(|node| membership.position(node))
                 .collect::<Result<Vec<_>>>()?;
             let exempt = ping.then_some(&budget.destination);
-            let blocked = self.blocked(&membership, source, exempt)?;
+            let positions = membership.inner.neighbors(source);
+            let blocked = self.blocked(&membership, &positions, exempt)?;
             // Skip relays that may have eaten earlier exchanges with the
             // destination. A ping always detours: it must not cross the
             // primary relay that may have eaten the exchanges it follows up.
@@ -1086,7 +1097,11 @@ impl Paths {
                     blocked: &hint,
                     seed: &seed,
                 };
-                let mut operation = std::pin::pin!(self.inner.route(&membership.inner, query));
+                let mut operation = std::pin::pin!(self.inner.route_with_neighbors(
+                    &membership.inner,
+                    query,
+                    &positions
+                ));
                 std::future::poll_fn(|cx| {
                     if let Err(error) = scope
                         .check()
@@ -1104,7 +1119,7 @@ impl Paths {
             scope.check()?;
             budget.validate_at(from, self.health.clock.now())?;
             // Health/admission may change while yielded. Retry under the same budget.
-            if self.blocked(&membership, source, exempt)? != blocked {
+            if self.blocked(&membership, &positions, exempt)? != blocked {
                 return Err(Error::Unavailable);
             }
             let nodes = nodes?
@@ -1115,21 +1130,23 @@ impl Paths {
         })
     }
 
+    /// Return the positions to block as the first hop, given the route
+    /// source's neighbor `positions`. The caller passes those positions so
+    /// routing borrows member IDs instead of cloning them and computes the list
+    /// once.
     fn blocked(
         &self,
         membership: &Membership,
-        source: usize,
+        positions: &[usize],
         exempt: Option<&NodeId>,
     ) -> Result<Vec<usize>> {
         let now = self.health.clock.now();
-        let positions = membership.inner.neighbors(source);
-        let neighbors: Vec<_> = positions
-            .iter()
-            .map(|&i| membership.members()[i].node.clone())
-            .collect();
-        self.health.retain_neighbors(&neighbors);
+        let members = membership.members();
+        self.health
+            .retain_neighbors(positions.iter().map(|&position| &members[position].node));
         let mut blocked = Vec::new();
-        for (position, node) in positions.into_iter().zip(&neighbors) {
+        for &position in positions {
+            let node = &members[position].node;
             let available = if exempt == Some(node) {
                 // Circuit state only: a ping may reach the silent neighbor it tests.
                 self.health.inner.available(node, now)
@@ -1362,6 +1379,23 @@ pub(crate) mod tests {
             }
             assert_ne!(backoff(&node, 3), backoff(&NodeId("b".into()), 3));
         }
+        /// Retaining borrowed neighbor IDs keeps exactly those failure records.
+        #[test]
+        fn retain_neighbors_keeps_only_borrowed_ids() {
+            let health = LinkHealth::new(4, racer_io::Clock::host());
+            let kept = NodeId("kept".into());
+            let dropped = NodeId("dropped".into());
+            let now = Instant::now();
+            health.observe_at(&kept, LinkOutcome::Timeout, now).unwrap();
+            health
+                .observe_at(&dropped, LinkOutcome::Timeout, now)
+                .unwrap();
+            let neighbors = [kept.clone(), NodeId("unknown".into())];
+            health.retain_neighbors(neighbors.iter());
+            assert_eq!(health.tracked_links(), 1);
+            assert!(!health.available_at(&kept, now).unwrap());
+            assert!(health.available_at(&dropped, now).unwrap());
+        }
         #[test]
         fn capacity_and_placement_are_independent() {
             let health = LinkHealth::new(1, racer_io::Clock::host());
@@ -1381,7 +1415,7 @@ pub(crate) mod tests {
                 before,
                 placement.rank(members, &object(), PageNumber(0)).ordered
             );
-            health.retain_neighbors(&[]);
+            health.retain_neighbors(std::iter::empty());
             assert_eq!(health.tracked_links(), 0);
         }
         #[test]
