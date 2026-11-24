@@ -1,4 +1,4 @@
-//! [`AzureTokenSource`] over the managed and workload identity providers in
+//! Token acquisition over the managed and workload identity providers in
 //! [`crate::origin::azure_auth`].
 //!
 //! [`AzureTokenCaches`] is node-wide: one [`AzureTokenCache`] per distinct
@@ -6,7 +6,7 @@
 //! without credentialed caches never reads token settings. [`AzureTokens`] is
 //! the worker-local view holding one fetching source per credential.
 //!
-//! Storage 401s feed back through [`AzureTokenSource::rejected`]: a
+//! Storage 401s feed back through [`AzureTokens::rejected`]: a
 //! challenge teaches workload identity its tenant, and a rejected token is
 //! dropped so the retry fetches a fresh one. Only the token that was sent is
 //! dropped: when another request or worker already replaced it, the retry
@@ -14,7 +14,7 @@
 //! per worker and credential so a persistent 401 cannot hammer the token
 //! service.
 
-use super::{AzureTokenSource, BearerToken};
+use super::BearerToken;
 use crate::error::{Error, Operation, Result};
 use crate::origin::azure_auth::{self, AuthEndpoints, AuthError, AzureTokenCache};
 use crate::remote::Resolver;
@@ -166,8 +166,10 @@ impl AzureTokens {
     }
 }
 
-impl AzureTokenSource for AzureTokens {
-    fn bearer<'a>(
+impl AzureTokens {
+    /// `Ok(None)` for `AzureCredential::Anonymous`; otherwise a token valid for
+    /// at least the rest of `scope`.
+    pub fn bearer<'a>(
         &'a self,
         credential: &'a AzureCredential,
         scope: &'a RequestScope,
@@ -186,7 +188,9 @@ impl AzureTokenSource for AzureTokens {
         })
     }
 
-    fn rejected(
+    /// Drop the rejected token, learn a tenant from `challenge`, and report
+    /// whether the origin may retry once.
+    pub fn rejected(
         &self,
         credential: &AzureCredential,
         challenge: Option<&[u8]>,
@@ -197,7 +201,7 @@ impl AzureTokenSource for AzureTokens {
 
     /// Drop sources for credentials no published origin uses. A request in
     /// flight keeps its own `Rc` to the source.
-    fn retain(&self, live: &[&OriginDefinition]) {
+    pub fn retain(&self, live: &[&OriginDefinition]) {
         let live: HashSet<Key> = live
             .iter()
             .filter_map(|origin| provider(&origin.azure.credential).map(|(key, _)| key))
@@ -207,10 +211,8 @@ impl AzureTokenSource for AzureTokens {
         drop(sources);
         drop(stale);
     }
-}
 
-impl AzureTokens {
-    /// [`AzureTokenSource::rejected`] at `now`, so tests can step the
+    /// [`AzureTokens::rejected`] at `now`, so tests can step the
     /// invalidation window without sleeping.
     fn rejected_at(
         &self,

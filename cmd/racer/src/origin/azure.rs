@@ -9,10 +9,11 @@
 //! - page: one `GET` with `x-ms-range` and `If-Match: <pinned ETag>`.
 //! - metadata: `HEAD` (Get Blob Properties), with `If-Match` when pinned.
 //!
-//! I/O goes through two thin seams so the HTTP client and credential providers
-//! can be supplied separately: [`AzureTransport`] sends one request head and
-//! receives the body straight into the admitted [`PlaintextBuffer`], and
-//! [`AzureTokenSource`] supplies bearer tokens.
+//! I/O goes through two worker-local seams: [`AzureTransport`] sends one
+//! request head and receives the body straight into the admitted
+//! [`PlaintextBuffer`], and [`AzureTokenSource`] supplies bearer tokens. Tests
+//! substitute in-memory implementations through constructors that exist only
+//! in test builds.
 //!
 //! `max_concurrent_requests` is enforced node-wide by [`AzureLimits`], which all
 //! workers share through an `Arc`. Each origin operation holds one permit for
@@ -80,21 +81,251 @@ impl fmt::Debug for BearerToken {
 }
 
 /// Supplies bearer tokens for a cache's credential.
-pub trait AzureTokenSource {
+pub struct AzureTokenSource(TokenSource);
+
+enum TokenSource {
+    Tokens(tokens::AzureTokens),
+    /// Anonymous access works; every other credential is `Unavailable`.
+    #[cfg(test)]
+    Anonymous,
+    #[cfg(test)]
+    Fake(Rc<dyn TestTokenSource>),
+}
+
+impl AzureTokenSource {
+    /// Wrap the worker-local sources over the node-wide token caches.
+    pub fn new(tokens: tokens::AzureTokens) -> Self {
+        Self(TokenSource::Tokens(tokens))
+    }
+
+    /// A source without credential providers (tests).
+    #[cfg(test)]
+    pub(crate) fn anonymous() -> Self {
+        Self(TokenSource::Anonymous)
+    }
+
+    /// An in-memory source (tests).
+    #[cfg(test)]
+    pub(crate) fn fake(source: Rc<dyn TestTokenSource>) -> Self {
+        Self(TokenSource::Fake(source))
+    }
+
     /// `Ok(None)` for `AzureCredential::Anonymous`; otherwise a token valid for
-    /// at least the rest of `scope`. Implementations cache and refresh tokens
+    /// at least the rest of `scope`. The sources cache and refresh tokens
     /// node-wide; this call is on the request path.
+    pub fn bearer<'a>(
+        &'a self,
+        credential: &'a AzureCredential,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, Option<BearerToken>> {
+        match &self.0 {
+            TokenSource::Tokens(tokens) => tokens.bearer(credential, scope),
+            #[cfg(test)]
+            TokenSource::Anonymous => Box::pin(async move {
+                match credential {
+                    AzureCredential::Anonymous => Ok(None),
+                    _ => Err(Error::Unavailable),
+                }
+            }),
+            #[cfg(test)]
+            TokenSource::Fake(source) => source.bearer(credential, scope),
+        }
+    }
+
+    /// Storage answered 401 to a request for `credential`. `challenge` is its
+    /// `WWW-Authenticate` value and `sent` the bearer token the request
+    /// carried, if any. Drops the rejected token (but not a newer one cached
+    /// since) or learns a tenant from the challenge, and returns whether one
+    /// retry may succeed. The origin retries at most once.
+    pub fn rejected(
+        &self,
+        credential: &AzureCredential,
+        challenge: Option<&[u8]>,
+        sent: Option<&[u8]>,
+    ) -> bool {
+        match &self.0 {
+            TokenSource::Tokens(tokens) => tokens.rejected(credential, challenge, sent),
+            #[cfg(test)]
+            TokenSource::Anonymous => false,
+            #[cfg(test)]
+            TokenSource::Fake(source) => source.rejected(credential, challenge, sent),
+        }
+    }
+
+    /// Drop state for credentials not used by any of `live`. Called when the
+    /// worker observes a new snapshot; in-flight requests keep what they hold.
+    pub fn retain(&self, live: &[&OriginDefinition]) {
+        match &self.0 {
+            TokenSource::Tokens(tokens) => tokens.retain(live),
+            #[cfg(test)]
+            TokenSource::Anonymous => {}
+            #[cfg(test)]
+            TokenSource::Fake(source) => source.retain(live),
+        }
+    }
+}
+
+/// Sends one request to the container's host and receives the response head.
+pub struct AzureTransport(Transport);
+
+enum Transport {
+    Pool(transport::PoolTransport),
+    #[cfg(test)]
+    Fake(Rc<dyn TestTransport>),
+}
+
+impl AzureTransport {
+    /// Wrap the worker's pooled HTTP transport.
+    pub fn new(pool: transport::PoolTransport) -> Self {
+        Self(Transport::Pool(pool))
+    }
+
+    /// An in-memory transport (tests).
+    #[cfg(test)]
+    pub(crate) fn fake(transport: Rc<dyn TestTransport>) -> Self {
+        Self(Transport::Fake(transport))
+    }
+
+    /// Drop per-endpoint state for endpoints not used by any of `live`.
+    /// Called when the worker observes a new snapshot; in-flight exchanges
+    /// keep what they hold.
+    pub fn retain(&self, live: &[&OriginDefinition]) {
+        match &self.0 {
+            Transport::Pool(pool) => pool.retain(live),
+            #[cfg(test)]
+            Transport::Fake(fake) => fake.retain(live),
+        }
+    }
+
+    /// Connect (or reuse a pooled connection) to `url`'s scheme, host, and port,
+    /// send `head` with no body, and receive the response head. Headers must be
+    /// bounded; the body is left unread. Errors use the crate's transport kinds
+    /// (`Io`, `Os`, `Unavailable` for network loss; anything else for malformed
+    /// responses), never text containing the URL or headers.
+    pub fn exchange<'a>(
+        &'a self,
+        url: &'a AzureContainerUrl,
+        head: MessageHead,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, AzureExchange> {
+        match &self.0 {
+            Transport::Pool(pool) => pool.exchange(url, head, scope),
+            #[cfg(test)]
+            Transport::Fake(fake) => fake.exchange(url, head, scope),
+        }
+    }
+}
+
+/// One in-flight response. Dropping it without [`AzureExchange::finish`] or
+/// [`AzureExchange::read_body`] abandons the connection (it is not reused).
+pub struct AzureExchange(Exchange);
+
+// The test variant is a boxed trait object; production builds have only the
+// pooled exchange, so the size difference exists only in test builds.
+#[cfg_attr(test, allow(clippy::large_enum_variant))]
+enum Exchange {
+    Pool(transport::PoolExchange),
+    #[cfg(test)]
+    Fake(Box<dyn TestExchange>),
+}
+
+impl AzureExchange {
+    fn pool(exchange: transport::PoolExchange) -> Self {
+        Self(Exchange::Pool(exchange))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fake(exchange: impl TestExchange + 'static) -> Self {
+        Self(Exchange::Fake(Box::new(exchange)))
+    }
+
+    /// The received response head.
+    pub fn head(&self) -> &MessageHead {
+        match &self.0 {
+            Exchange::Pool(exchange) => exchange.head(),
+            #[cfg(test)]
+            Exchange::Fake(exchange) => exchange.head(),
+        }
+    }
+
+    /// Complete a response with no body to read: a `HEAD` response, or a
+    /// response with `Content-Length: 0`. Returns the connection for reuse.
+    pub fn finish(self) -> Result<()> {
+        match self.0 {
+            Exchange::Pool(exchange) => exchange.finish(),
+            #[cfg(test)]
+            Exchange::Fake(exchange) => exchange.finish(),
+        }
+    }
+
+    /// Receive exactly `buffer.len()` body bytes (the validated
+    /// `Content-Length`) directly into `buffer`, then complete the exchange.
+    /// A short body is an error.
+    pub fn read_body<'a>(
+        self,
+        buffer: PlaintextBuffer,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, PlaintextBuffer> {
+        match self.0 {
+            Exchange::Pool(exchange) => exchange.read_body(buffer, scope),
+            #[cfg(test)]
+            Exchange::Fake(exchange) => exchange.read_body(buffer, scope),
+        }
+    }
+
+    /// Give up on an error response. The pool reads a small, length-framed body
+    /// to keep the connection; otherwise it is abandoned.
+    pub fn discard<'a>(self, scope: &'a RequestScope) -> Operation<'a, ()> {
+        match self.0 {
+            Exchange::Pool(exchange) => exchange.discard(scope),
+            #[cfg(test)]
+            Exchange::Fake(exchange) => exchange.discard(scope),
+        }
+    }
+}
+
+/// In-memory request sender for origin tests.
+#[cfg(test)]
+pub(crate) trait TestTransport {
+    fn exchange<'a>(
+        &'a self,
+        url: &'a AzureContainerUrl,
+        head: MessageHead,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, AzureExchange>;
+
+    fn retain(&self, _live: &[&OriginDefinition]) {}
+}
+
+/// In-memory response for origin tests.
+#[cfg(test)]
+pub(crate) trait TestExchange {
+    fn head(&self) -> &MessageHead;
+
+    fn finish(self: Box<Self>) -> Result<()>;
+
+    fn read_body<'a>(
+        self: Box<Self>,
+        buffer: PlaintextBuffer,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, PlaintextBuffer>
+    where
+        Self: 'a;
+
+    fn discard<'a>(self: Box<Self>, scope: &'a RequestScope) -> Operation<'a, ()>
+    where
+        Self: 'a;
+}
+
+/// In-memory credential source for origin tests.
+#[cfg(test)]
+pub(crate) trait TestTokenSource {
     fn bearer<'a>(
         &'a self,
         credential: &'a AzureCredential,
         scope: &'a RequestScope,
     ) -> Operation<'a, Option<BearerToken>>;
 
-    /// Storage answered 401 to a request for `credential`. `challenge` is its
-    /// `WWW-Authenticate` value and `sent` the bearer token the request
-    /// carried, if any. Drop the rejected token (but not a newer one cached
-    /// since) or learn a tenant from the challenge, and return whether one
-    /// retry may succeed. The origin retries at most once.
     fn rejected(
         &self,
         credential: &AzureCredential,
@@ -102,83 +333,7 @@ pub trait AzureTokenSource {
         sent: Option<&[u8]>,
     ) -> bool;
 
-    /// Drop state for credentials not used by any of `live`. Called when the
-    /// worker observes a new snapshot; in-flight requests keep what they hold.
     fn retain(&self, _live: &[&OriginDefinition]) {}
-}
-
-/// Token source for deployments without credential providers: anonymous
-/// access works, every other credential is `Unavailable`.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct AnonymousOnly;
-
-impl AzureTokenSource for AnonymousOnly {
-    fn bearer<'a>(
-        &'a self,
-        credential: &'a AzureCredential,
-        _scope: &'a RequestScope,
-    ) -> Operation<'a, Option<BearerToken>> {
-        Box::pin(async move {
-            match credential {
-                AzureCredential::Anonymous => Ok(None),
-                _ => Err(Error::Unavailable),
-            }
-        })
-    }
-
-    fn rejected(&self, _: &AzureCredential, _: Option<&[u8]>, _: Option<&[u8]>) -> bool {
-        false
-    }
-}
-
-/// Sends one request to the container's host and receives the response head.
-pub trait AzureTransport {
-    type Exchange: AzureExchange;
-
-    /// Connect (or reuse a pooled connection) to `url`'s scheme, host, and port,
-    /// send `head` with no body, and receive the response head. Headers must be
-    /// bounded; the body is left unread. Errors use the crate's transport kinds
-    /// (`Io`, `Os`, `Unavailable` for network loss; anything else for malformed
-    /// responses), never text containing the URL or headers.
-    fn exchange<'a>(
-        &'a self,
-        url: &'a AzureContainerUrl,
-        head: MessageHead,
-        scope: &'a RequestScope,
-    ) -> Operation<'a, Self::Exchange>;
-
-    /// Drop per-endpoint state for endpoints not used by any of `live`.
-    /// Called when the worker observes a new snapshot; in-flight exchanges
-    /// keep what they hold.
-    fn retain(&self, _live: &[&OriginDefinition]) {}
-}
-
-/// One in-flight response. Dropping it without [`AzureExchange::finish`] or
-/// [`AzureExchange::read_body`] abandons the connection (it is not reused).
-pub trait AzureExchange {
-    /// The received response head.
-    fn head(&self) -> &MessageHead;
-
-    /// Complete a response with no body to read: a `HEAD` response, or a
-    /// response with `Content-Length: 0`. Returns the connection for reuse.
-    fn finish(self) -> Result<()>;
-
-    /// Receive exactly `buffer.len()` body bytes (the validated
-    /// `Content-Length`) directly into `buffer`, then complete the exchange.
-    /// A short body is an error.
-    fn read_body<'a>(
-        self,
-        buffer: PlaintextBuffer,
-        scope: &'a RequestScope,
-    ) -> Operation<'a, PlaintextBuffer>
-    where
-        Self: 'a;
-
-    /// Give up on an error response. Implementations may read a small,
-    /// length-framed body to keep the connection; otherwise it is abandoned.
-    fn discard<'a>(self, scope: &'a RequestScope) -> Operation<'a, ()>
-    where
-        Self: 'a;
 }
 
 /// Node-wide in-flight request counts per cache, shared by every worker.
@@ -296,9 +451,9 @@ impl AzureNode {
 }
 
 /// Reads published Azure origins for one worker.
-pub struct AzureOrigin<T, K> {
-    transport: T,
-    tokens: K,
+pub struct AzureOrigin {
+    transport: AzureTransport,
+    tokens: AzureTokenSource,
     snapshots: Arc<PublicationCell<Snapshot>>,
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     buffers: BufferPool,
@@ -308,10 +463,10 @@ pub struct AzureOrigin<T, K> {
     observed: std::cell::RefCell<std::sync::Weak<Snapshot>>,
 }
 
-impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
+impl AzureOrigin {
     pub fn new(
-        transport: T,
-        tokens: K,
+        transport: AzureTransport,
+        tokens: AzureTokenSource,
         snapshots: Arc<PublicationCell<Snapshot>>,
         admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
         buffers: BufferPool,
@@ -423,7 +578,7 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
         method: AzureMethod,
         range: Option<ByteRange>,
         if_match: Option<&StrongEtag>,
-    ) -> Result<T::Exchange> {
+    ) -> Result<AzureExchange> {
         let url = &definition.azure.container_url;
         let credential = &definition.azure.credential;
         let mut retried = false;
@@ -463,7 +618,7 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
     }
 
     /// Classify an error response, then release its connection.
-    async fn reject(&self, exchange: T::Exchange, pinned: bool, scope: &RequestScope) -> Error {
+    async fn reject(&self, exchange: AzureExchange, pinned: bool, scope: &RequestScope) -> Error {
         let error = classify(exchange.head(), pinned);
         let _ = exchange.discard(scope).await;
         error
@@ -471,7 +626,7 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
 
     async fn read(
         &self,
-        exchange: T::Exchange,
+        exchange: AzureExchange,
         reservation: flow_control::Charge<AdmissionPolicy>,
         length: u64,
         scope: &RequestScope,
@@ -727,7 +882,7 @@ fn metadata(
     })
 }
 
-impl<T: AzureTransport, K: AzureTokenSource> Origin for AzureOrigin<T, K> {
+impl Origin for AzureOrigin {
     fn page_size(&self) -> Result<racer_wire::object::PageSize> {
         self.published_page_size()
     }

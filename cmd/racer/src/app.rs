@@ -1671,15 +1671,19 @@ impl WorkerApplication {
         // Caches published with a native origin read Azure Blob in process;
         // every other cache keeps its origin socket.
         let azure = crate::origin::azure::AzureOrigin::new(
-            crate::origin::azure::transport::PoolTransport::new(
-                http.clone(),
-                origin_io,
-                Rc::new(crate::remote::DnsResolver::new(reactor.clone())),
-                node.azure.trust.clone(),
+            crate::origin::azure::AzureTransport::new(
+                crate::origin::azure::transport::PoolTransport::new(
+                    http.clone(),
+                    origin_io,
+                    Rc::new(crate::remote::DnsResolver::new(reactor.clone())),
+                    node.azure.trust.clone(),
+                ),
             ),
-            crate::origin::azure::tokens::AzureTokens::new(
-                node.azure.tokens.clone(),
-                reactor.clone(),
+            crate::origin::azure::AzureTokenSource::new(
+                crate::origin::azure::tokens::AzureTokens::new(
+                    node.azure.tokens.clone(),
+                    reactor.clone(),
+                ),
             ),
             node.publications.clone(),
             admission.clone(),
@@ -1688,7 +1692,7 @@ impl WorkerApplication {
         );
         let origin: Rc<dyn Origin> = Rc::new(crate::origin::router::OriginRouter::new(
             node.publications.clone(),
-            adapter,
+            Rc::new(adapter),
             Some(azure),
         ));
         let flights = Rc::new(Flights::new(
