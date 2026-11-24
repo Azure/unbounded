@@ -148,6 +148,9 @@ pub struct Fill {
     /// Set for prefetch and spill fills, which stay fenced on their accepted
     /// acquisition work instead of handing a running driver to the next waiter.
     fenced_fill: bool,
+    /// Set for a prefetch owner fill. Its flight entry records the fill so a
+    /// demand join can promote it out of the owner budget.
+    prefetch_fill: bool,
     /// Set for a host-read sealed fetch. An elected driver that acquires a
     /// registered RDMA page then leaves it out of the memory cache, so the
     /// host-read sink's fused pass makes the only copy; the verdict
@@ -1027,6 +1030,7 @@ impl Fill {
             gpu_copies: Rc::default(),
             diagnostic: None,
             fenced_fill: false,
+            prefetch_fill: false,
             defer_registered_publish: false,
             plaintext_wait: None,
         }
@@ -1712,9 +1716,11 @@ impl Fill {
         context: &OriginContext,
         scope: &RequestScope,
         budget: &mut AcquisitionBudget,
+        prefetch: bool,
     ) -> Result<PageResult> {
         let mut fill = self.clone();
         fill.fenced_fill = true;
+        fill.prefetch_fill = prefetch;
         fill.acquire_unobserved(page, membership, context, scope, budget)
             .await
     }
@@ -1813,10 +1819,17 @@ impl Fill {
         scope.check()?;
         let observation = self.retention_observation(&page, &interest, observe);
         let joined = if plaintext && prefetch.is_none() {
-            self.dependencies
-                .flights
-                .join_wait(page.clone(), membership, context, scope, budget)
-                .await
+            if self.prefetch_fill {
+                self.dependencies
+                    .flights
+                    .join_wait_prefetch(page.clone(), membership, context, scope, budget)
+                    .await
+            } else {
+                self.dependencies
+                    .flights
+                    .join_wait(page.clone(), membership, context, scope, budget)
+                    .await
+            }
         } else {
             self.dependencies.flights.join_for(
                 page.clone(),

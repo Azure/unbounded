@@ -767,9 +767,13 @@ impl LocalPageService for Coordinator {
                             page,
                             mode: FetchMode::Acquire,
                         } => {
-                            // A remote demand read joining a prefetch flight
-                            // promotes it.
-                            self.streams.directory().node().prefetch.promote(&page);
+                            // A remote demand read joining an in-flight
+                            // prefetch fill promotes it. A page with no
+                            // prefetch flight takes no node-wide prefetch
+                            // state.
+                            if self.fill.dependencies.flights.prefetch_fill(&page) {
+                                self.streams.directory().node().prefetch.promote(&page);
+                            }
                             self.fill
                                 .acquire_ciphertext(
                                     page.clone(),

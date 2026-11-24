@@ -176,6 +176,56 @@ fn put_fills_every_page_through_the_owner_and_reports_success() {
     endpoint.uninstall().unwrap();
 }
 
+/// A demand fetch with no prefetch ticket never touches node-wide prefetch
+/// state: the page has no prefetch flight, so the read does not ask to promote
+/// one and never takes a prefetch lock.
+#[test]
+fn demand_fetch_without_a_ticket_takes_no_prefetch_state() {
+    let env = racer_io::Env::host();
+    let signers = network(&env, 1);
+    let mut f = fixture_with(&env, PAGE_BYTES + 7, None);
+    f.reactor.init().unwrap();
+    let membership = local_membership(&signers[0]);
+    let (local, mut endpoint, _publication) =
+        coordinator(&env, &f, &signers[0], &membership, NoPeer::requester(&env));
+    let directory = f.fill.dependencies.metadata_owner.clone();
+    let initial = local
+        .prefetch_directory()
+        .node()
+        .prefetch
+        .promote_calls_for_test();
+    let mut future = Box::pin(
+        directory
+            .start_page(
+                f.page.clone(),
+                membership,
+                &f.context,
+                &f.scope,
+                crate::read::default_budget(&f.scope),
+            )
+            .unwrap(),
+    );
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let mut completed = false;
+    for _ in 0..4096 {
+        if future.as_mut().poll(&mut cx).is_ready() {
+            completed = true;
+            break;
+        }
+        pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
+    }
+    assert!(completed, "demand fetch did not complete");
+    assert_eq!(
+        local
+            .prefetch_directory()
+            .node()
+            .prefetch
+            .promote_calls_for_test(),
+        initial
+    );
+    endpoint.uninstall().unwrap();
+}
+
 #[test]
 fn put_to_a_passthrough_cache_is_409_passthrough() {
     let env = racer_io::Env::host();

@@ -1154,11 +1154,9 @@ async fn execute(
         Work::WarmLocal(page) => local.fill.warm_local(&page, scope).await.map(Value::Page),
         Work::Probe(page) => probe(local, &page).map(Value::Resident),
         Work::PrefetchFill(page, metadata, membership, envelope) => {
-            if probe(local, &page)? {
-                return Ok(Value::Prefetched(
-                    racer_core::prefetch::PageResult::Resident,
-                ));
-            }
+            // `serve_fill` probed this page on this same owner worker just
+            // before submitting the fill, so a probe here would read the same
+            // disk index again and learn nothing new.
             let context = local.open_context(envelope)?;
             let result = local
                 .fill
@@ -1168,6 +1166,7 @@ async fn execute(
                     &context,
                     scope,
                     budget.ok_or(Error::StaleFlight)?,
+                    true,
                 )
                 .await?;
             // Never persist or acknowledge a same-ETag copy whose immutable
@@ -1197,6 +1196,7 @@ async fn execute(
                     &context,
                     scope,
                     budget.ok_or(Error::StaleFlight)?,
+                    false,
                 )
                 .await?;
             if !metadata.compatible(&result.metadata.immutable()) {
@@ -1281,8 +1281,13 @@ async fn execute(
                 .map(Value::Page)
         }
         Work::Fetch(page, membership, envelope) => {
-            // A demand read joining a prefetch flight promotes it.
-            let _promoted = local.streams.directory().node().prefetch.promote(&page);
+            // A demand read joining an in-flight prefetch fill promotes it.
+            // Without a prefetch flight on this worker, the read never touches
+            // node-wide prefetch state.
+            let prefetch = &local.streams.directory().node().prefetch;
+            if local.fill.dependencies.flights.prefetch_fill(&page) {
+                let _ = prefetch.promote(&page);
+            }
             let context = local.open_context(envelope)?;
             local
                 .fill
@@ -1297,8 +1302,11 @@ async fn execute(
                 .map(Value::Page)
         }
         Work::FetchSealed(page, membership, envelope, target) => {
-            // A demand read joining a prefetch flight promotes it.
-            let _promoted = local.streams.directory().node().prefetch.promote(&page);
+            // As in `Fetch`, promote only an in-flight prefetch fill here.
+            let prefetch = &local.streams.directory().node().prefetch;
+            if local.fill.dependencies.flights.prefetch_fill(&page) {
+                let _ = prefetch.promote(&page);
+            }
             let context = local.open_context(envelope)?;
             local
                 .fill

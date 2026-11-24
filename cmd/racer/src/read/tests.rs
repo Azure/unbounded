@@ -215,6 +215,54 @@ mod flight {
         use super::*;
         use crate::model::PageNumber;
 
+        /// Only a prefetch owner fill marks its flight for demand promotion, so
+        /// an ordinary demand read never consults node-wide prefetch state.
+        #[test]
+        fn demand_join_marks_nothing_and_a_prefetch_fill_marks_the_flight() {
+            let env = racer_io::Env::host();
+            let flights = flights(&env, FlightLimits::default());
+            let (context, scope) = (origin(), scope(&env));
+            let membership = std::sync::Arc::new(
+                crate::topology::Membership::validate(
+                    racer_wire::control::MembershipVersion(1),
+                    vec![],
+                )
+                .unwrap(),
+            );
+            let mut demand_budget = budget();
+            let JoinedFlight::Waiter(_demand) = flights
+                .join(
+                    test_page(),
+                    membership.clone(),
+                    &context,
+                    &scope,
+                    &mut demand_budget,
+                )
+                .unwrap()
+            else {
+                panic!("waiter");
+            };
+            assert!(!flights.prefetch_fill(&test_page()));
+
+            let mut prefetch_page = test_page();
+            prefetch_page.number = PageNumber(1);
+            let mut prefetch_budget = budget();
+            let JoinedFlight::Waiter(fill) =
+                futures::executor::block_on(flights.join_wait_prefetch(
+                    prefetch_page.clone(),
+                    membership,
+                    &context,
+                    &scope,
+                    &mut prefetch_budget,
+                ))
+                .unwrap()
+            else {
+                panic!("waiter");
+            };
+            assert!(flights.prefetch_fill(&prefetch_page));
+            drop(fill);
+        }
+
         /// Expiry sampling is bounded and does not confuse table and quota ownership.
         #[test]
         fn expiry_snapshot_coverage_completion_and_external_credit() {

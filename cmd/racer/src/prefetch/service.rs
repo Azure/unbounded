@@ -118,6 +118,10 @@ pub struct Prefetch {
     metrics: OnceLock<Arc<PrefetchMetrics>>,
     /// Node-wide time and entropy.
     ctx: racer_io::WorkerCtx,
+    /// Demand promotions attempted, to prove a read with no prefetch fill
+    /// never touches prefetch state.
+    #[cfg(test)]
+    promote_calls: std::sync::atomic::AtomicUsize,
 }
 
 impl Prefetch {
@@ -140,6 +144,8 @@ impl Prefetch {
             next_wake: Mutex::new(None),
             metrics: OnceLock::new(),
             ctx,
+            #[cfg(test)]
+            promote_calls: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -302,6 +308,9 @@ impl Prefetch {
     /// A demand read for `page` is about to join its flight. If an owner
     /// prefetch fill holds a slot for it, release that slot and its tokens.
     pub fn promote(&self, page: &PageId) -> bool {
+        #[cfg(test)]
+        self.promote_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let promoted = self.owner.lock().unwrap().promote(page);
         if promoted {
             let priority = self
@@ -430,6 +439,12 @@ impl Prefetch {
     }
 
     #[cfg(test)]
+    pub(crate) fn promote_calls_for_test(&self) -> usize {
+        self.promote_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
     pub(crate) fn wait_for_test(&self, waker: &Waker, polls: usize) -> usize {
         let waiter = self.waiter();
         for _ in 0..polls {
@@ -540,6 +555,9 @@ pub(crate) async fn serve_fill(
         };
         let membership = membership.clone();
         async move {
+            // The fill relies on this probe: it runs on the page-owner worker
+            // that will execute the fill, so `PrefetchFill` does not probe
+            // again.
             match directory.probe_page(page.clone(), scope).await {
                 Ok(true) => return PageResult::Resident,
                 Ok(false) => {}

@@ -157,6 +157,12 @@ pub(super) struct EntryExt {
     /// it re-evaluates whether any live waiter still needs the work.
     driver_waker: Option<Waker>,
 
+    /// A prefetch owner fill is attached to this flight. A demand join on this
+    /// worker promotes it out of the node-wide owner budget. Keeping this on
+    /// the entry lets an ordinary demand read skip prefetch state entirely
+    /// when the page has no prefetch fill.
+    prefetch: bool,
+
     _reservation: FlightCharge,
 }
 
@@ -795,6 +801,16 @@ impl Flights {
         Ok(())
     }
 
+    /// Whether this worker's flight for `page` carries a prefetch owner fill.
+    /// A demand join on this worker promotes it; a page with no prefetch fill
+    /// leaves node-wide prefetch state untouched.
+    pub(super) fn prefetch_fill(&self, page: &PageId) -> bool {
+        self.table
+            .borrow()
+            .entry(page)
+            .is_some_and(|entry| entry.ext().prefetch)
+    }
+
     /// Run one table transaction at the current time, then wake outside the borrow.
     fn update<T>(&self, f: impl FnOnce(&mut Table, &mut Vec<WakeTarget>) -> T) -> T {
         let mut wakes = Vec::new();
@@ -833,6 +849,20 @@ impl Flights {
         budget: &'a mut AcquisitionBudget,
         plaintext: bool,
     ) -> Result<JoinedFlight<'a>> {
+        self.join_for_as(page, membership, context, scope, budget, plaintext, false)
+    }
+
+    #[allow(clippy::too_many_arguments)] // Keep acquisition inputs and the prefetch marker explicit.
+    fn join_for_as<'a>(
+        self: &Rc<Self>,
+        page: PageId,
+        membership: std::sync::Arc<crate::topology::Membership>,
+        context: &'a OriginContext,
+        scope: &'a RequestScope,
+        budget: &'a mut AcquisitionBudget,
+        plaintext: bool,
+        prefetch: bool,
+    ) -> Result<JoinedFlight<'a>> {
         validate_context(&page, context)?;
         scope.check()?;
         if self.table.borrow().is_stopping() {
@@ -858,7 +888,7 @@ impl Flights {
             }
         }
         self.join_prepared(
-            page, membership, context, scope, budget, plaintext, None, None,
+            page, membership, context, scope, budget, plaintext, prefetch, None, None,
         )
     }
 
@@ -872,6 +902,7 @@ impl Flights {
         scope: &'a RequestScope,
         budget: &'a mut AcquisitionBudget,
         plaintext: bool,
+        prefetch: bool,
         mut prepared_waiter: Option<flow_control::Charge<AdmissionPolicy>>,
         mut prepared_flight: Option<FlightCharge>,
     ) -> Result<JoinedFlight<'a>> {
@@ -953,9 +984,15 @@ impl Flights {
                     created: self.clock.now(),
                     diagnostic: None,
                     driver_waker: None,
+                    prefetch,
                     _reservation: flight,
                 };
                 table.insert(page.clone(), ext, ());
+            }
+            // A prefetch owner fill that joins a demand flight still owns a
+            // budget slot, so later demand joins must be able to promote it.
+            if prefetch && let Some(entry) = table.entry_mut(&page) {
+                entry.ext_mut().prefetch = true;
             }
             table.register_as(
                 &page,
@@ -1015,10 +1052,38 @@ impl Flights {
         scope: &'a RequestScope,
         budget: &'a mut AcquisitionBudget,
     ) -> Result<JoinedFlight<'a>> {
+        self.join_wait_as(page, membership, context, scope, budget, false)
+            .await
+    }
+
+    /// [`Self::join_wait`] for a prefetch owner fill. The resulting entry
+    /// records the fill, so a later demand join on this worker can promote it
+    /// without consulting node-wide prefetch state first.
+    pub(crate) async fn join_wait_prefetch<'a>(
+        self: &Rc<Self>,
+        page: PageId,
+        membership: std::sync::Arc<crate::topology::Membership>,
+        context: &'a OriginContext,
+        scope: &'a RequestScope,
+        budget: &'a mut AcquisitionBudget,
+    ) -> Result<JoinedFlight<'a>> {
+        self.join_wait_as(page, membership, context, scope, budget, true)
+            .await
+    }
+
+    async fn join_wait_as<'a>(
+        self: &Rc<Self>,
+        page: PageId,
+        membership: std::sync::Arc<crate::topology::Membership>,
+        context: &'a OriginContext,
+        scope: &'a RequestScope,
+        budget: &'a mut AcquisitionBudget,
+        prefetch: bool,
+    ) -> Result<JoinedFlight<'a>> {
         validate_context(&page, context)?;
         scope.check()?;
         if self.table.borrow().contains(&page) {
-            return self.join(page, membership, context, scope, budget);
+            return self.join_for_as(page, membership, context, scope, budget, true, prefetch);
         }
         if self.table.borrow().is_stopping() {
             return Err(Error::Canceled);
@@ -1037,7 +1102,7 @@ impl Flights {
                 .reclamation(&page.version.object.cache, ResourceClass::Flight, 1)
                 .is_none()
         {
-            return self.join(page, membership, context, scope, budget);
+            return self.join_for_as(page, membership, context, scope, budget, true, prefetch);
         }
         let cutoff = self.clock.now() + std::time::Duration::from_millis(100);
         let deadline = cutoff.min(scope.deadline.0).min(budget.deadline());
@@ -1176,6 +1241,7 @@ impl Flights {
             scope,
             budget,
             true,
+            prefetch,
             Some(reservation),
             flight,
         );
