@@ -680,8 +680,6 @@ func TestVirtualMediaCleanupFailureDoesNotBlockOtherTargets(t *testing.T) {
 			second.Spec.Netboot().Redfish.URL = "https://second-bmc.example.com"
 			require.NoError(t, r.Create(t.Context(), second))
 
-			current.Spec.MachineRef = ""
-			current.Spec.MachineSelector = &metav1.LabelSelector{MatchLabels: map[string]string{siteLabel: "rack-a"}}
 			require.NoError(t, r.Update(t.Context(), current))
 			current.Status.Targets[0].BootMedia.ImageWritten = true
 			current.Status.Targets[0].BootMedia.LoaderStartedAt = ptrTo(fixedNow())

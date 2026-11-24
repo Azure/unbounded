@@ -510,7 +510,12 @@ func (f *FileResolver) installRequested(ctx context.Context, node *v1alpha3.Mach
 	}
 
 	for _, op := range list.Items {
-		if op.Spec.OperationKind != v1alpha3.OperationHostReplace || op.Status.IsTerminal() {
+		// A selector operation lists every machine it will replace long
+		// before each one's turn. Only the machineRef operation created for
+		// a machine asks for its install. A held operation is not started,
+		// so a machine that boots while it waits must not be handed the
+		// installer either.
+		if op.Spec.OperationKind != v1alpha3.OperationHostReplace || op.Status.IsTerminal() || op.Spec.IsSelectorOperation() || op.IsHeld() {
 			continue
 		}
 

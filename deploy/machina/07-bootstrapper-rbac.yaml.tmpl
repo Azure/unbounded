@@ -20,9 +20,12 @@ rules:
   - apiGroups: ["unbounded-cloud.io"]
     resources: ["machineconfigurationversions"]
     verbs: ["get", "list", "watch"]
+  # No delete: an agent never deletes an operation, and the right to would
+  # let one node remove the operations of other machines, which a selector
+  # operation counts as failures.
   - apiGroups: ["unbounded-cloud.io"]
     resources: ["machineoperations"]
-    verbs: ["get", "list", "watch", "delete"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: ["unbounded-cloud.io"]
     resources: ["machineoperations/status"]
     verbs: ["get", "update", "patch"]

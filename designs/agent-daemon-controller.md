@@ -163,8 +163,8 @@ adapter. It does the following:
 
 - Watches `MachineOperation` objects.
 - Filters out terminal operations.
-- Filters to operations targeting the local machine by `spec.machineRef` or
-  `spec.machineSelector`.
+- Filters to operations that name the local machine in `spec.machineRef` and
+  are not held (`spec.suspend`).
 - Dispatches supported operation kinds to product-owned handlers.
 - Marks matching but unsupported operation kinds as failed.
 - Provides `MachineOperationStore[int64]` for handlers to mark progress and
@@ -245,16 +245,16 @@ daemon that does not implement their kind.
 
 ## Selector Matching
 
-For `MachineOperation.spec.machineSelector`, the Machina reconciler first tries
-to match the selector against the local Node labels. If the Node does not exist,
-it falls back to the local Machine labels.
+The Machina reconciler does not match selectors. A central controller turns a
+`MachineOperation.spec.machineSelector` operation into one `spec.machineRef`
+operation per machine, and the reconciler acts only on those. See
+[MachineOperation Selectors](machine-operation-selectors.md).
 
 This means:
 
 - `machineRef` targeting only needs the `MachineOperation` CRD.
-- Selector targeting can work with only Node labels when the Node exists.
-- Selector fallback to Machine labels needs the Machina `Machine` CRD and local
-  Machine object.
+- An operation without a `machineRef` is never run by the daemon, whatever
+  its selector says.
 
 The Unbounded daemon handlers currently read the local `Machine` object to
 record `ObservedMachineGeneration`, so the current Unbounded daemon still
@@ -318,7 +318,7 @@ The shared package has focused tests for:
 - No-op machine operation behavior.
 - Machina operation handler dispatch.
 - Terminal and unsupported operation behavior.
-- MachineRef, Node selector, and Machine selector fallback mapping.
+- MachineRef matching, and ignoring selector and held operations.
 - Status update helpers.
 
 The Unbounded daemon tests cover the composed behavior for node reboot, agent

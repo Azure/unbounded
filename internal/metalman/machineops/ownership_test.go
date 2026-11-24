@@ -210,15 +210,15 @@ func TestOwningSiteActsWhenOtherSiteReconcilesFirst(t *testing.T) {
 	s := testScheme(t)
 	machineA := testBareMetalMachine("machine-a", "rack-a")
 	machineB := testBareMetalMachine("machine-b", "rack-b")
-	refOp := testOperation("op-ref", v1alpha3.OperationHostPowerOff)
-	refOp.Spec.MachineRef = machineA.Name
-	selectorOp := testOperation("op-selector", v1alpha3.OperationHostPowerOff)
-	selectorOp.Spec.MachineSelector = &metav1.LabelSelector{MatchLabels: map[string]string{siteLabel: "rack-b"}}
+	refOpA := testOperation("op-ref-a", v1alpha3.OperationHostPowerOff)
+	refOpA.Spec.MachineRef = machineA.Name
+	refOpB := testOperation("op-ref-b", v1alpha3.OperationHostPowerOff)
+	refOpB.Spec.MachineRef = machineB.Name
 
 	c := fake.NewClientBuilder().
 		WithScheme(s).
-		WithObjects(machineA, machineB, refOp, selectorOp, testRedfishSecret()).
-		WithStatusSubresource(refOp, selectorOp).
+		WithObjects(machineA, machineB, refOpA, refOpB, testRedfishSecret()).
+		WithStatusSubresource(refOpA, refOpB).
 		Build()
 	powerA := &recordingPowerClient{}
 	powerB := &recordingPowerClient{}
@@ -227,13 +227,13 @@ func TestOwningSiteActsWhenOtherSiteReconcilesFirst(t *testing.T) {
 
 	// Alternate the sites, letting the non-owner go first each round.
 	for range 3 {
-		reconcileOnce(t, siteB, refOp.Name)
-		reconcileOnce(t, siteA, refOp.Name)
-		reconcileOnce(t, siteA, selectorOp.Name)
-		reconcileOnce(t, siteB, selectorOp.Name)
+		reconcileOnce(t, siteB, refOpA.Name)
+		reconcileOnce(t, siteA, refOpA.Name)
+		reconcileOnce(t, siteA, refOpB.Name)
+		reconcileOnce(t, siteB, refOpB.Name)
 	}
 
-	for _, name := range []string{refOp.Name, selectorOp.Name} {
+	for _, name := range []string{refOpA.Name, refOpB.Name} {
 		updated := getOperation(t, c, name)
 		require.Equal(t, v1alpha3.OperationPhaseComplete, updated.Status.Phase, "%s: %s", name, updated.Status.Message)
 		require.Len(t, updated.Status.Targets, 1)
@@ -244,86 +244,27 @@ func TestOwningSiteActsWhenOtherSiteReconcilesFirst(t *testing.T) {
 	require.Equal(t, []string{"machine-b:ForceOff"}, powerB.calls)
 }
 
-func TestEverySiteFailsOperationNoSiteCanOwn(t *testing.T) {
+func TestEverySiteFailsMachineRefOperationForMissingMachine(t *testing.T) {
 	t.Parallel()
 
-	tests := []struct {
-		name    string
-		site    string
-		spec    func(*v1alpha3.MachineOperation)
-		reason  string
-		message string
-	}{
-		{
-			name: "selector naming no site on a site metalman",
-			site: "rack-b",
-			spec: func(op *v1alpha3.MachineOperation) {
-				op.Spec.MachineSelector = &metav1.LabelSelector{MatchLabels: map[string]string{"rack": "a"}}
-			},
-			reason:  reasonInvalidTargetScope,
-			message: "machineSelector must include unbounded-cloud.io/site=rack-b",
-		},
-		{
-			name: "selector naming no site on the default metalman",
-			site: "",
-			spec: func(op *v1alpha3.MachineOperation) {
-				op.Spec.MachineSelector = &metav1.LabelSelector{MatchLabels: map[string]string{"rack": "a"}}
-			},
-			reason:  reasonInvalidTargetScope,
-			message: "selector-based host operations require a non-empty metalman site",
-		},
-		{
-			name: "selector with multi-value In expression",
-			site: "rack-a",
-			spec: func(op *v1alpha3.MachineOperation) {
-				op.Spec.MachineSelector = &metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{{
-					Key: siteLabel, Operator: metav1.LabelSelectorOpIn, Values: []string{"rack-a", "rack-b"},
-				}}}
-			},
-			reason:  reasonInvalidTargetScope,
-			message: "machineSelector must include unbounded-cloud.io/site=rack-a",
-		},
-		{
-			name: "selector naming two sites",
-			site: "rack-b",
-			spec: func(op *v1alpha3.MachineOperation) {
-				op.Spec.MachineSelector = &metav1.LabelSelector{
-					MatchLabels: map[string]string{siteLabel: "rack-a"},
-					MatchExpressions: []metav1.LabelSelectorRequirement{{
-						Key: siteLabel, Operator: metav1.LabelSelectorOpIn, Values: []string{"rack-b"},
-					}},
-				}
-			},
-			reason:  reasonInvalidTargetScope,
-			message: "machineSelector names more than one unbounded-cloud.io/site: rack-a, rack-b",
-		},
-		{
-			name:    "machineRef to a missing Machine",
-			site:    "rack-b",
-			spec:    func(op *v1alpha3.MachineOperation) { op.Spec.MachineRef = "missing" },
-			reason:  reasonMachineNotFound,
-			message: "Machine missing not found",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
+	for _, site := range []string{"rack-a", "rack-b", ""} {
+		t.Run("site="+site, func(t *testing.T) {
 			t.Parallel()
 
 			s := testScheme(t)
 			machine := testBareMetalMachine("machine-a", "rack-a")
 			op := testOperation("op-a", v1alpha3.OperationHostPowerOff)
-			tt.spec(op)
+			op.Spec.MachineRef = "missing"
 
 			c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, testRedfishSecret()).WithStatusSubresource(op).Build()
 			power := &recordingPowerClient{}
 
-			reconcileOnce(t, siteReconciler(c, power, tt.site), op.Name)
+			reconcileOnce(t, siteReconciler(c, power, site), op.Name)
 
 			updated := getOperation(t, c, op.Name)
 			require.Equal(t, v1alpha3.OperationPhaseFailed, updated.Status.Phase)
-			require.Equal(t, tt.message, updated.Status.Message)
-			require.Equal(t, tt.reason, updated.Status.Conditions[0].Reason)
+			require.Equal(t, "Machine missing not found", updated.Status.Message)
+			require.Equal(t, reasonMachineNotFound, updated.Status.Conditions[0].Reason)
 			require.Empty(t, power.calls)
 		})
 	}
@@ -387,58 +328,6 @@ func TestOwnsOperationUsesBootMediaSite(t *testing.T) {
 	}
 }
 
-func TestSelectorSites(t *testing.T) {
-	t.Parallel()
-
-	in := func(values ...string) metav1.LabelSelectorRequirement {
-		return metav1.LabelSelectorRequirement{Key: siteLabel, Operator: metav1.LabelSelectorOpIn, Values: values}
-	}
-
-	tests := []struct {
-		name     string
-		selector metav1.LabelSelector
-		want     []string
-	}{
-		{name: "empty", want: nil},
-		{name: "other labels", selector: metav1.LabelSelector{MatchLabels: map[string]string{"rack": "a"}}, want: nil},
-		{name: "matchLabels", selector: metav1.LabelSelector{MatchLabels: map[string]string{siteLabel: "rack-a"}}, want: []string{"rack-a"}},
-		{name: "empty matchLabels value", selector: metav1.LabelSelector{MatchLabels: map[string]string{siteLabel: ""}}, want: nil},
-		{name: "single-value In", selector: metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{in("rack-a")}}, want: []string{"rack-a"}},
-		{name: "multi-value In", selector: metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{in("rack-a", "rack-b")}}, want: nil},
-		{
-			name: "NotIn",
-			selector: metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{{
-				Key: siteLabel, Operator: metav1.LabelSelectorOpNotIn, Values: []string{"rack-a"},
-			}}},
-			want: nil,
-		},
-		{
-			name: "matchLabels and In agree",
-			selector: metav1.LabelSelector{
-				MatchLabels:      map[string]string{siteLabel: "rack-a"},
-				MatchExpressions: []metav1.LabelSelectorRequirement{in("rack-a")},
-			},
-			want: []string{"rack-a"},
-		},
-		{
-			name: "matchLabels and In disagree",
-			selector: metav1.LabelSelector{
-				MatchLabels:      map[string]string{siteLabel: "rack-b"},
-				MatchExpressions: []metav1.LabelSelectorRequirement{in("rack-a")},
-			},
-			want: []string{"rack-a", "rack-b"},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			require.Equal(t, tt.want, selectorSites(&tt.selector))
-		})
-	}
-}
-
 func TestReconcilerSetsObservedMachineGenerationOnCompletion(t *testing.T) {
 	t.Parallel()
 
@@ -447,14 +336,11 @@ func TestReconcilerSetsObservedMachineGenerationOnCompletion(t *testing.T) {
 	machine.Generation = 7
 	refOp := testOperation("op-ref", v1alpha3.OperationHostPowerOff)
 	refOp.Spec.MachineRef = machine.Name
-	selectorOp := testOperation("op-selector", v1alpha3.OperationHostPowerOn)
-	selectorOp.CreationTimestamp = metav1.NewTime(fixedNow().Add(1))
-	selectorOp.Spec.MachineSelector = &metav1.LabelSelector{MatchLabels: map[string]string{siteLabel: "rack-a"}}
 
 	c := fake.NewClientBuilder().
 		WithScheme(s).
-		WithObjects(machine, refOp, selectorOp, testRedfishSecret()).
-		WithStatusSubresource(refOp, selectorOp).
+		WithObjects(machine, refOp, testRedfishSecret()).
+		WithStatusSubresource(refOp).
 		Build()
 	power := &recordingPowerClient{states: map[string]redfish.PowerState{machine.Name: redfish.PowerOn}}
 	r := siteReconciler(c, power, "rack-a")
@@ -470,15 +356,6 @@ func TestReconcilerSetsObservedMachineGenerationOnCompletion(t *testing.T) {
 	updated = getOperation(t, c, refOp.Name)
 	require.Equal(t, v1alpha3.OperationPhaseComplete, updated.Status.Phase, updated.Status.Message)
 	require.Equal(t, machine.Generation, updated.Status.ObservedMachineGeneration)
-
-	for range 3 {
-		reconcileOnce(t, r, selectorOp.Name)
-	}
-
-	updated = getOperation(t, c, selectorOp.Name)
-	require.Equal(t, v1alpha3.OperationPhaseComplete, updated.Status.Phase, updated.Status.Message)
-	require.Equal(t, machine.Generation, updated.Status.Targets[0].ObservedGeneration)
-	require.Zero(t, updated.Status.ObservedMachineGeneration)
 }
 
 func TestReconcilerDoesNotSetObservedMachineGenerationOnFailure(t *testing.T) {

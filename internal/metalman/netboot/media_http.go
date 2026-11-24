@@ -334,6 +334,12 @@ func nonMediaSuccessor(machine *v1alpha3.Machine, ops []v1alpha3.MachineOperatio
 
 	for i := range ops {
 		op := &ops[i]
+		// A selector operation and a held operation are not live installs:
+		// see installRequested.
+		if op.Spec.IsSelectorOperation() || op.IsHeld() {
+			continue
+		}
+
 		if op.Spec.OperationKind != v1alpha3.OperationHostReplace || op.Status.IsTerminal() || !op.DeletionTimestamp.IsZero() || !operationRequestsInstall(op, machine.Name) {
 			continue
 		}
