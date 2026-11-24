@@ -137,12 +137,27 @@ fn nz(value: usize) -> NonZeroUsize {
     NonZeroUsize::new(value).unwrap()
 }
 fn limits(pages: usize) -> Limits {
+    limits_for(pages, PageSize::DEFAULT)
+}
+/// Per-record allowance for headers and alignment in page-size-relative
+/// budgets. The default page size dwarfs it, so those budgets stay unchanged.
+fn record_overhead(page_size: PageSize) -> usize {
+    if page_size == PageSize::DEFAULT {
+        0
+    } else {
+        racer::store::MAX_HEADER_BYTES
+    }
+}
+/// Byte budgets sized in pages of the rig's published page size.
+fn limits_for(pages: usize, page_size: PageSize) -> Limits {
     let n = nz(64);
+    let page = page_size.bytes();
+    let overhead = record_overhead(page_size);
     Limits {
-        plaintext_bytes: nz(pages * P as usize),
-        ciphertext_bytes: nz((pages + 4) * (P as usize + 4096)),
-        dirty_bytes: nz(pages * (P as usize + 16)),
-        registered_bytes: nz(P as usize + 16),
+        plaintext_bytes: nz(pages * page),
+        ciphertext_bytes: nz((pages + 4) * (page + 4096 + overhead)),
+        dirty_bytes: nz(pages * (page + 16 + overhead)),
+        registered_bytes: nz(page + 16 + overhead),
         request_context_bytes: nz(4 * 1024 * 1024),
         flights: n,
         waiters_per_flight: n,
@@ -245,14 +260,14 @@ struct Adapter {
     thread: Option<thread::JoinHandle<()>>,
 }
 impl Adapter {
-    fn start(path: &PathBuf, length: u64, zero_ttl: bool) -> Self {
+    fn start(path: &PathBuf, length: u64, zero_ttl: bool, page_size: PageSize) -> Self {
         let listener = UnixListener::bind(path).unwrap();
         listener.set_nonblocking(true).unwrap();
         let state = Arc::new(Mutex::new(OriginState {
             benchmark_keys: false,
             version: 1,
             length,
-            page: FIXTURE_PAGE_SIZE.get().get(),
+            page: page_size.get(),
             zero_ttl,
             expires_at: None,
             online: true,
@@ -433,6 +448,8 @@ struct Rig {
     pipes: Rc<flow_control::PipePool<AdmissionPolicy>>,
     writer_task: RefCell<Option<Operation<'static, ()>>>,
     adapter: Adapter,
+    /// Page size this rig's publication announces and its readers enforce.
+    page_size: PageSize,
     _scratch: Scratch,
 }
 struct RigWorker {
@@ -449,6 +466,16 @@ impl Rig {
     fn with_dirty_pages(length: u64, zero_ttl: bool, pages: usize, dirty_pages: usize) -> Self {
         Self::assemble(length, zero_ttl, pages, dirty_pages, None)
     }
+    /// Build a rig whose publication announces `page_size`.
+    fn with_page_size(
+        length: u64,
+        zero_ttl: bool,
+        pages: usize,
+        dirty_pages: usize,
+        page_size: PageSize,
+    ) -> Self {
+        Self::assemble_with(length, zero_ttl, pages, dirty_pages, None, page_size)
+    }
     // One explicit graph serves both pressure scenarios and the worker hotpath.
     // WorkerApplication owns private key/publication/storage state, so using its
     // lifecycle here would remove the admission and held-reader controls these
@@ -459,6 +486,23 @@ impl Rig {
         pages: usize,
         dirty_pages: usize,
         benchmark: Option<RigWorker>,
+    ) -> Self {
+        Self::assemble_with(
+            length,
+            zero_ttl,
+            pages,
+            dirty_pages,
+            benchmark,
+            PageSize::DEFAULT,
+        )
+    }
+    fn assemble_with(
+        length: u64,
+        zero_ttl: bool,
+        pages: usize,
+        dirty_pages: usize,
+        benchmark: Option<RigWorker>,
+        page_size: PageSize,
     ) -> Self {
         let benchmarking = benchmark.is_some();
         let (scratch, runtime, worker, directory, slab_bytes) = match benchmark {
@@ -488,10 +532,11 @@ impl Rig {
         fs::create_dir_all(scratch.path.join("production-fixture/origin")).unwrap();
         let origin_path = scratch.socket("production-fixture/origin/socket");
         assert!(origin_path.as_os_str().len() <= 107);
-        let adapter = Adapter::start(&origin_path, length, zero_ttl);
+        let adapter = Adapter::start(&origin_path, length, zero_ttl, page_size);
         adapter.state.lock().unwrap().benchmark_keys = benchmarking;
-        let mut budget = limits(pages);
-        budget.dirty_bytes = nz(dirty_pages * (P as usize + 16));
+        let mut budget = limits_for(pages, page_size);
+        budget.dirty_bytes =
+            nz(dirty_pages * (page_size.bytes() + 16 + record_overhead(page_size)));
         let (admission, reactor) = match &runtime {
             Some(runtime) => (runtime.admission.clone(), runtime.reactor.clone()),
             None => {
@@ -531,7 +576,7 @@ impl Rig {
             published.clone(),
             reactor.ctx().clock.clone(),
         ));
-        let document = Arc::new(fixture_publication());
+        let document = Arc::new(fixture_publication(page_size));
         let snapshot = snapshots.projection(document.clone()).unwrap()().unwrap();
         snapshots.install_publication(&document, &snapshot).unwrap();
         let network = Rc::new(
@@ -700,6 +745,7 @@ impl Rig {
             pipes,
             writer_task: RefCell::new(None),
             adapter,
+            page_size,
             _scratch: scratch,
         }
     }
@@ -801,8 +847,8 @@ impl Rig {
     }
     fn subscribe(&self, fields: &str) -> Reply {
         let (local, mut remote) = UnixStream::pair().unwrap();
-        let request = subscription_request(fields);
-        let page = FIXTURE_PAGE_SIZE.get().get();
+        let page = self.page_size.get();
+        let request = subscription_request(fields, self.page_size);
         let reader = thread::spawn(move || {
             remote.write_all(request.as_bytes()).unwrap();
             receive_subscription(remote, page)
@@ -891,13 +937,7 @@ fn open_fixture_storage(
     (index, disk, writer)
 }
 
-std::thread_local! {
-    /// Page size the fixture publication announces; tests run one per thread.
-    static FIXTURE_PAGE_SIZE: std::cell::Cell<racer_wire::object::PageSize> =
-        const { std::cell::Cell::new(racer_wire::object::PageSize::DEFAULT) };
-}
-
-fn fixture_publication() -> Publication {
+fn fixture_publication(page_size: PageSize) -> Publication {
     let (client_socket, origin_socket) = canonical_socket_paths("production-fixture").unwrap();
     Publication {
         pools: Vec::new(),
@@ -921,7 +961,7 @@ fn fixture_publication() -> Publication {
             mode: racer_wire::control::CacheMode::Cached,
             origin: None,
         }],
-        page_size: FIXTURE_PAGE_SIZE.get(),
+        page_size,
     }
     .with_default_pool()
 }
@@ -1501,9 +1541,9 @@ fn request(method: &str, fields: &str) -> String {
     )
 }
 
-fn subscription_request(fields: &str) -> String {
+fn subscription_request(fields: &str, page_size: PageSize) -> String {
     // One page of credit at the published page size.
-    let credits = FIXTURE_PAGE_SIZE.get().get();
+    let credits = page_size.get();
     format!(
         "POST /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nAuthorization: fixture-credential\r\nRacer-Metadata: fixture-metadata\r\nRacer-Page-Credits: 1\r\nRacer-Byte-Credits: {credits}\r\n{fields}\r\n",
         "ab".repeat(32)
@@ -1644,11 +1684,14 @@ fn subscription_credits_persist_three_pages_and_serve_partial_disk_range_offline
 fn small_published_pages_fill_persist_and_serve_cross_page_ranges() {
     // The cluster publishes 64 KiB pages; origin fetches, records, and
     // range slicing all follow it instead of the 16 MiB default.
-    let size = racer_wire::object::PageSize::new(64 << 10).unwrap();
-    FIXTURE_PAGE_SIZE.set(size);
+    let size = PageSize::new(64 << 10).unwrap();
     let p = size.get();
     let length = 2 * p + 113;
-    let rig = Rig::with_dirty_pages(length, false, 4, 3);
+    let rig = Rig::with_page_size(length, false, 4, 3, size);
+    assert!(
+        rig.writer.index().page_capacity() >= length.div_ceil(p) as usize,
+        "the rig must index every page this object persists"
+    );
     check_subscription(&rig.subscribe(""), 1, 0, length, length);
     let calls = rig.adapter.calls();
     assert_eq!(calls.len(), 4);
@@ -2007,7 +2050,7 @@ fn cancel_backpressured_reader_preserves_fast_reader_and_releases_leases() {
     let baseline_connections = rig.admission.used(ResourceClass::Connection);
     let (slow_local, mut slow_remote) = UnixStream::pair().unwrap();
     let (fast_local, mut fast_remote) = UnixStream::pair().unwrap();
-    let wire = subscription_request("If-Match: \"v1\"\r\nRange: bytes=0-\r\n");
+    let wire = subscription_request("If-Match: \"v1\"\r\nRange: bytes=0-\r\n", PageSize::DEFAULT);
     slow_remote.write_all(wire.as_bytes()).unwrap();
     fast_remote.write_all(wire.as_bytes()).unwrap();
     let slow_head = Arc::new(AtomicBool::new(false));

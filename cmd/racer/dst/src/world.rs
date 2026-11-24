@@ -770,18 +770,37 @@ impl<'s> World<'s> {
                             .iter()
                             .any(|i| i.class == Class::Resource);
                     if expect {
-                        let busy: Vec<String> = self
-                            .roles()
-                            .into_iter()
-                            .filter(|r| r.next != Next::Done && r.next != Next::Idle)
-                            .map(|r| format!("node {} role {}", r.node, r.name))
-                            .collect();
+                        let mut busy = Vec::new();
+                        for (n, node) in self.nodes.iter().enumerate() {
+                            for slot in &node.roles {
+                                let state = match slot.next {
+                                    Next::Ready => "ready".to_owned(),
+                                    Next::WaitUntil(at) => {
+                                        format!("waiting until {} ns", self.nanos(n, at))
+                                    }
+                                    Next::Idle => "idle".to_owned(),
+                                    Next::Done => "done".to_owned(),
+                                };
+                                if slot.next != Next::Done && slot.next != Next::Idle {
+                                    busy.push(format!(
+                                        "node {} role {} ({state}; pending {})",
+                                        node.env.index,
+                                        slot.name,
+                                        slot.role.pending()
+                                    ));
+                                }
+                            }
+                        }
+                        let up: Vec<bool> = self.nodes.iter().map(|n| n.up).collect();
                         return Err(self.fail(
                             Class::Liveness,
                             "not-quiescent",
                             format!(
-                                "reached end without going quiescent; still scheduled: {}",
-                                busy.join(", ")
+                                "reached end at {end} ns without going quiescent; still scheduled: {}; \
+                                 last fault at {:?} ns, {} partitions, nodes up {up:?}",
+                                busy.join(", "),
+                                self.last_fault,
+                                self.partitions.len()
                             ),
                         ));
                     }

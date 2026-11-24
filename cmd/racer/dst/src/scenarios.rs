@@ -1019,6 +1019,13 @@ pub fn catalog() -> Vec<Scenario> {
             .nodes(3)
             .sites(2)
             .roles(|env| lane_pair(env, 6))
+            // Drawn crashes start before 9 s, so the last restart still leaves
+            // a second to finish: six rounds of a 1-6 ms sleep plus at worst
+            // 15x disk operations and a 20% slow clock need well under 100 ms
+            // (`fixture::lane_pair`). With faults up to 10 s a crash at 9.99 s
+            // leaves the restarted writer mid-round at the end, which
+            // `expect_quiescent` reports as unfinished work.
+            .fault_window(9 * SECONDS)
             .fault(
                 3 * MILLIS,
                 Fault::ClockSkew {

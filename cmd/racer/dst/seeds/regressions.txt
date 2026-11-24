@@ -1,2 +1,17 @@
 # Shrunk failing choice streams, replayed by `make racer-dst` after ci.txt.
 # Add the `words=` line the runner prints for a failure here once it is fixed.
+#
+# lane-pair-faults seeds 27, 137 and 200: a drawn crash at about 9.99 s
+# restarted a writer with no time to finish before the 10 s end. The scenario
+# now draws its faults inside 9 s (`Scenario::fault_window`).
+lane-pair-faults words=0,1b32224d8e1ddae5,240f5dd2cd939c90
+lane-pair-faults words=0,86cdb97fc1e3af5,157a1eb63bb432bc
+lane-pair-faults words=0,1974cd382e431e99,bc345c2ddc497e3f,0,0,0,0,9070964e51ac181f,0,1e591a90709c5
+# authority-crash-restart seed 151: three authorities restarted one after
+# another, the last at 260 s. The stale primary Lease's SEAT_NODES annotation
+# made each freshly claimed seat release itself as a duplicate, and the
+# cold-start claim window grew while a seat Lease was still within its
+# observation window, so no primary appeared for more than 120 s. Checked in
+# as the seed rather than the shrunk stream: shrinking it keeps thousands of
+# draws (election timing depends on every jitter draw), too long for a line.
+authority-crash-restart seed=151

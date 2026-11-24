@@ -77,6 +77,16 @@ type FileResolver struct {
 	ClusterDNS        string
 	ProviderLabels    map[string]string
 
+	// Agent serves the unbounded-agent tarball to hosts. When nil, hosts
+	// download the agent from the release location in their Machine spec.
+	Agent *AgentArtifact
+
+	// BootstrapArtifactsRef is the offline agent bootstrap bundle for the
+	// cluster's Kubernetes version. It is advertised to the agent only once
+	// it is cached, so a cluster without the bundle keeps downloading
+	// artifacts from their upstream locations.
+	BootstrapArtifactsRef string
+
 	// ExperimentalContainerIsolation enables the experimental container
 	// isolation mode (serve-pxe --experimental-container-isolation). When set,
 	// every agent configuration the resolver renders opts in
@@ -279,6 +289,8 @@ func (f *FileResolver) ResolveFileByPathForIP(ctx context.Context, path string, 
 				},
 				ProviderLabels:                 f.ProviderLabels,
 				AttestURL:                      f.ServeURL,
+				RegistryMirror:                 f.ServeURL,
+				OfflineArtifactsSource:         f.offlineArtifactsSource(node),
 				ExperimentalContainerIsolation: f.ExperimentalContainerIsolation,
 			})
 
@@ -295,6 +307,8 @@ func (f *FileResolver) ResolveFileByPathForIP(ctx context.Context, path string, 
 			if err != nil {
 				return nil, err
 			}
+
+			td.InstallEnv = f.agentInstallEnv(node)
 
 			data, err := renderTemplate(string(content), td)
 			if err != nil {
@@ -414,6 +428,47 @@ func newTemplateData(node *v1alpha3.Machine, ci ClusterInfo, serveURL, agentConf
 		InstallEnv:       provision.AgentInstallEnv(agent),
 		InstallRequested: installRequested,
 	}
+}
+
+// agentInstallEnv returns the install environment for a Machine. Unless the
+// Machine names an explicit agent URL, the tarball is served by this metalman,
+// so the host does not need a route to the release location.
+func (f *FileResolver) agentInstallEnv(node *v1alpha3.Machine) []string {
+	var agent *v1alpha3.AgentSpec
+	if node != nil {
+		agent = node.Spec.Agent
+	}
+
+	if f.Agent == nil || (agent != nil && agent.URL != "") {
+		return provision.AgentInstallEnv(agent)
+	}
+
+	return []string{fmt.Sprintf("AGENT_URL=%s", provision.ShellSingleQuote(strings.TrimRight(f.ServeURL, "/")+"/unbounded-agent.tar.gz"))}
+}
+
+// offlineArtifactsSource returns the bootstrap bundle the agent should take
+// its downloads from. It is empty when no bundle is configured, when the
+// bundle is not cached yet, or when the Machine overrides the downloads
+// itself.
+func (f *FileResolver) offlineArtifactsSource(node *v1alpha3.Machine) string {
+	if f.BootstrapArtifactsRef == "" || f.Cache == nil {
+		return ""
+	}
+
+	if node != nil && node.Spec.Agent != nil && node.Spec.Agent.Downloads != nil {
+		return ""
+	}
+
+	repository, reference, ok := splitImageReference(f.BootstrapArtifactsRef)
+	if !ok {
+		return ""
+	}
+
+	if _, ok := f.Cache.DigestForRepositoryReference(repository, reference); !ok {
+		return ""
+	}
+
+	return "oci://" + f.BootstrapArtifactsRef
 }
 
 func selectBootLease(node *v1alpha3.Machine, requestIP string) *v1alpha3.DHCPLease {

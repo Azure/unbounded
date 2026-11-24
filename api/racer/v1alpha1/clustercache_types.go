@@ -141,10 +141,21 @@ func (s ClusterCacheSpec) EffectivePriority() int32 {
 // +kubebuilder:validation:XValidation:rule="has(self.azure)",message="azure is required"
 type ObjectOrigin struct {
 	// MetadataTTL bounds how long object metadata is reused before it is revalidated.
-	// It must not be negative. When unset, 30s.
+	// It must not be negative. When unset, 1h.
 	// +kubebuilder:validation:XValidation:rule="duration(self) >= duration('0s')",message="metadataTTL must not be negative"
 	// +optional
 	MetadataTTL *metav1.Duration `json:"metadataTTL,omitempty"`
+
+	// MetadataImmutable reuses object metadata until the cache drops it instead
+	// of revalidating it every metadataTTL. Set it only when objects are
+	// immutable: pages are keyed by version, so metadata that outlives a content
+	// change keeps serving the old version and reads fail with a version
+	// mismatch rather than mixing versions. Upgrade the authority replicas and
+	// every dataplane before any cache enables it: an older parser rejects the
+	// whole publication, including caches that do not set the field, which
+	// blocks updates for unrelated caches.
+	// +optional
+	MetadataImmutable *bool `json:"metadataImmutable,omitempty"`
 
 	// RequestTimeout bounds each upstream request. It must be positive.
 	// When unset, 1m.

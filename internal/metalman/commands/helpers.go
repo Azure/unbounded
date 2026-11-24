@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 
+	appsv1 "k8s.io/api/apps/v1"
 	certificatesv1 "k8s.io/api/certificates/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -43,6 +44,7 @@ func (u *StatusUpdater) Update(ctx context.Context, node *v1alpha3.Machine) erro
 
 func BuildScheme() *runtime.Scheme {
 	s := runtime.NewScheme()
+	utilruntime.Must(appsv1.AddToScheme(s))
 	utilruntime.Must(corev1.AddToScheme(s))
 	utilruntime.Must(certificatesv1.AddToScheme(s))
 	utilruntime.Must(v1alpha3.AddToScheme(s))

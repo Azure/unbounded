@@ -76,6 +76,16 @@ func (h *HTTPServer) Start(ctx context.Context) error {
 		mux.HandleFunc("GET /pxe/disable", h.handleDisablePXE)
 	}
 
+	if h.Agent != nil {
+		mux.HandleFunc("GET /unbounded-agent.tar.gz", h.handleAgentArtifact)
+	}
+
+	if h.Cache != nil {
+		registry := &Registry{Cache: h.Cache}
+		mux.Handle("GET /v2", registry)
+		mux.Handle("GET /v2/", registry)
+	}
+
 	mux.HandleFunc("GET /", h.handleFile)
 
 	addr := fmt.Sprintf("%s:%d", h.BindAddr, h.Port)
@@ -394,6 +404,35 @@ func (h *HTTPServer) handleCloudInitLog(w http.ResponseWriter, r *http.Request) 
 	h.recordCloudInitStatus(r.Context(), log, machineName, &ev)
 
 	w.WriteHeader(http.StatusOK)
+}
+
+// handleAgentArtifact serves the unbounded-agent tarball for the Machine that
+// made the request, identified by its source address like the cloud-init
+// routes.
+func (h *HTTPServer) handleAgentArtifact(w http.ResponseWriter, r *http.Request) {
+	ip := clientIP(r)
+	log := slog.With("ip", ip)
+
+	node, err := h.LookupNodeByIP(r.Context(), ip)
+	if err != nil {
+		log.Warn("agent download has no Machine", "err", err)
+		http.NotFound(w, r)
+
+		return
+	}
+
+	path, err := h.Agent.Path(r.Context(), node)
+	if err != nil {
+		log.Error("preparing agent tarball", "node", node.Name, "err", err)
+		w.Header().Set("Retry-After", "5")
+		http.Error(w, "agent artifact unavailable", http.StatusServiceUnavailable)
+
+		return
+	}
+
+	log.Info("serving agent tarball", "node", node.Name)
+
+	http.ServeFile(w, r, path)
 }
 
 func (h *HTTPServer) handleInstallLog(w http.ResponseWriter, r *http.Request) {

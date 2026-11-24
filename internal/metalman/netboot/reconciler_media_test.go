@@ -85,7 +85,7 @@ func TestOCIReconcilerMapOperationToImage(t *testing.T) {
 				got, err := decodeImagePullRequest(req.NamespacedName)
 				require.NoError(t, err)
 
-				want := imagePullRequest{ImageRef: spec.Image, Architecture: spec.TargetArchitecture(), PullSecretRef: spec.PullSecretRef}
+				want := imagePullRequest{ImageRef: spec.Image, Architecture: spec.TargetArchitecture(), PullSecretRef: spec.PullSecretRef, Unpack: true}
 				if i == 1 {
 					want.ImageRef, want.PullSecretRef = spec.NetbootImage, spec.NetbootPullSecretRef
 				}
@@ -99,7 +99,7 @@ func TestOCIReconcilerMapOperationToImage(t *testing.T) {
 	// Both watches must produce the same queue identity for shared inputs.
 	r.DefaultNetbootRef = ""
 	machine := &v1alpha3.Machine{Spec: v1alpha3.MachineSpec{Host: &v1alpha3.HostSpec{Netboot: spec}}}
-	require.Equal(t, r.mapMachineToImage(t.Context(), machine), r.mapOperationToImage(t.Context(), op))
+	require.Equal(t, filterAgentImageRequests(r.mapMachineToImage(t.Context(), machine)), r.mapOperationToImage(t.Context(), op))
 }
 
 func TestOCIReconcilerRestoresFrozenMediaAfterRestart(t *testing.T) {

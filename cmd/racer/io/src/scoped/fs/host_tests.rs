@@ -657,14 +657,29 @@ fn real_partial_read_and_abandoned_open_fence_own_resources() {
     assert_eq!(buffer.advance(0), Err(Error::Io));
     assert_eq!(buffer.advance(5), Err(Error::Io));
     drop(buffer);
+    // Canceling before the request is submitted rejects it at admission, so
+    // this branch reports cancellation deterministically without acquiring
+    // kernel resources.
+    let canceled = RequestScope::new(scope.deadline);
+    canceled.cancel();
+    let stat = r.file_stat(fd.clone(), &canceled);
+    assert!(matches!(drive(&r, stat), Err(Error::Canceled)));
+    assert_eq!(r.in_flight(), 0);
+    // Canceling an in-flight stat can legitimately lose to a stat that already
+    // completed: a delivered success wins even when the future is polled after
+    // the cancel, because the side effect happened. Either outcome must still
+    // release the request's owners once it resolves.
     let canceled = RequestScope::new(scope.deadline);
     let mut stat = r.file_stat(fd.clone(), &canceled);
     assert!(poll(&mut stat).is_pending());
     canceled.cancel();
-    assert!(matches!(drive(&r, stat), Err(Error::Canceled)));
+    match drive(&r, stat) {
+        Ok(stat) => assert_eq!(stat.stx_mode as u32 & libc::S_IFMT, libc::S_IFREG),
+        Err(error) => assert_eq!(error, Error::Canceled),
+    }
+    assert_eq!(r.in_flight(), 0);
     drop(fd);
     fs::remove_file(path).unwrap();
-    assert_eq!(r.in_flight(), 0);
 }
 
 /// Check secure path access and replacement against real Linux filesystem behavior.

@@ -2,6 +2,7 @@
 use crate::error::Error;
 use crate::error::Result;
 use crate::model::CurrentVersion;
+use crate::model::ExpiresAt;
 use crate::model::ObjectId;
 use crate::model::ObjectMetadata;
 use crate::model::ObjectVersion;
@@ -22,6 +23,7 @@ use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
+use std::time::SystemTime;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecordLocation {
@@ -37,6 +39,25 @@ pub struct HeldSnapshot {
     pub payload_bytes: u64,
     pub segments: u64,
 }
+/// Whole Unix milliseconds, truncated, as the wire freshness domain requires.
+fn unix_millis(now: SystemTime) -> Result<u128> {
+    Ok(now
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| Error::Internal)?
+        .as_millis())
+}
+
+/// Deadline implied by an observation time and the published TTL.
+fn observation_deadline(observed_at: ExpiresAt, ttl: std::time::Duration) -> Option<ExpiresAt> {
+    let observed = observed_at.to_unix_millis().ok()?;
+    let ttl = u64::try_from(ttl.as_millis()).ok()?;
+    let deadline = observed.checked_add(ttl)?;
+    if deadline > crate::model::MAX_WIRE_INTEGER {
+        return None;
+    }
+    ExpiresAt::from_unix_millis(deadline).ok()
+}
+
 /// One storage shard. The catalog budget is independent of retained page entries;
 /// evicting a catalog item cannot remove a page's attached immutable descriptor.
 pub struct Index {
@@ -1056,34 +1077,101 @@ impl Index {
         s.metadata.insert(metadata.version.clone(), metadata);
         Ok(())
     }
+    /// Latest freshness a fresh observation may claim right now. `None` means
+    /// the origin is immutable, or the cache has no published origin and a
+    /// self-deployed origin process defines freshness instead. Truncating `now`
+    /// and adding the TTL matches the Azure origin because TTLs are whole
+    /// milliseconds.
+    fn metadata_bound(
+        &self,
+        cache: &racer_wire::control::CacheId,
+        now: SystemTime,
+    ) -> Result<Option<ExpiresAt>> {
+        let Some(policy) = self
+            .availability
+            .metadata_policy(cache)
+            .filter(|p| !p.immutable)
+        else {
+            return Ok(None);
+        };
+        let now = unix_millis(now)?;
+        let bound = now
+            .checked_add(policy.ttl.as_millis())
+            .filter(|millis| *millis <= u128::from(crate::model::MAX_WIRE_INTEGER))
+            .ok_or(Error::Internal)?;
+        ExpiresAt::from_unix_millis(bound as u64)
+            .map(Some)
+            .map_err(|_| Error::Internal)
+    }
     pub fn current(&self, object: &ObjectId) -> Result<Option<CurrentVersion>> {
         if !self.available(&object.cache) {
             return Ok(None);
         }
+        let now = self.clock.wall_now();
+        let policy = self
+            .availability
+            .metadata_policy(&object.cache)
+            .filter(|policy| !policy.immutable);
         Ok(self
             .state
             .borrow()
             .current
             .get(object)
-            .filter(|v| self.clock.wall_now() < v.expires_at.as_system_time())
-            .cloned())
+            .filter(|v| now < v.expires_at.as_system_time())
+            .filter(|v| {
+                let Some(policy) = policy else {
+                    return true;
+                };
+                // Only an immutable policy publishes an infinite deadline.
+                if v.expires_at.to_unix_millis().ok() == Some(crate::model::MAX_WIRE_INTEGER) {
+                    return false;
+                }
+                // Reuse less than before is measured from the observation, so a
+                // skipped publication cannot extend an older pointer's life.
+                observation_deadline(v.observed_at, policy.ttl)
+                    .is_some_and(|deadline| now < deadline.as_system_time())
+            })
+            .cloned()
+            .map(|mut current| {
+                // Forward the observation's real deadline, not the one stored
+                // under a longer policy, so a receiver cannot extend it.
+                if let Some(policy) = policy
+                    && let Some(deadline) = observation_deadline(current.observed_at, policy.ttl)
+                    && current.expires_at.as_system_time() > deadline.as_system_time()
+                {
+                    current.expires_at = deadline;
+                }
+                current
+            }))
     }
     /// Page-zero owner only, after fresh revalidation. Atomically retain the
     /// immutable descriptor and advance the volatile pointer; reject length conflicts.
     /// A zero-TTL observation is returned to its waiters without a reusable hit.
-    pub fn publish_current(&self, metadata: ObjectMetadata) -> Result<()> {
+    pub fn publish_current(&self, mut metadata: ObjectMetadata) -> Result<()> {
         if !self.available(&metadata.version.object.cache) {
             return Ok(());
+        }
+        let now = self.clock.wall_now();
+        // An observation that captured the definition before an immutable origin
+        // became mutable must not restore the infinite deadline.
+        if let Some(bound) = self.metadata_bound(&metadata.version.object.cache, now)?
+            && metadata.expires_at.as_system_time() > bound.as_system_time()
+        {
+            metadata.expires_at = bound;
         }
         self.publish_version(metadata.immutable())?;
         let mut s = self.state_mut();
         s.current.remove(&metadata.version.object);
-        if self.clock.wall_now() < metadata.expires_at.as_system_time() {
+        if now < metadata.expires_at.as_system_time() {
             s.current.insert(
                 metadata.version.object.clone(),
                 CurrentVersion {
                     version: metadata.version,
                     expires_at: metadata.expires_at,
+                    observed_at: ExpiresAt::from_unix_millis(
+                        u64::try_from(unix_millis(now)?).map_err(|_| Error::Internal)?,
+                    )
+                    .map_err(|_| Error::Internal)?,
                 },
             );
         }
@@ -2984,6 +3072,124 @@ mod tests {
         index.restore(snapshot).unwrap();
         assert!(index.current(&m.version.object).unwrap().is_none());
         assert_eq!(index.version(&m.version).unwrap(), Some(m));
+    }
+
+    #[test]
+    fn mutable_origin_policy_rebounds_immutable_freshness() {
+        use racer_wire::control::AzureContainerUrl;
+        use racer_wire::control::AzureCredential;
+        use racer_wire::control::CacheMode;
+        use racer_wire::control::DEFAULT_ORIGIN_METADATA_TTL;
+        use racer_wire::control::OriginDefinition;
+
+        let env = racer_io::Env::host();
+        let cache = CacheId(crate::test_support::security::CACHE.into());
+        let availability = crate::test_support::availability(&env);
+        let publish = |immutable| {
+            availability.publish_definitions(
+                &env,
+                vec![crate::control::test_cache_definition(
+                    cache.clone(),
+                    "origin",
+                    CacheMode::Cached,
+                    Some(OriginDefinition {
+                        metadata_immutable: immutable,
+                        ..OriginDefinition::azure(
+                            AzureContainerUrl::parse("https://acct.blob.core.windows.net/models")
+                                .unwrap(),
+                            AzureCredential::Anonymous,
+                        )
+                    }),
+                )],
+            );
+        };
+        let infinite = || crate::model::ObjectMetadata {
+            expires_at: crate::model::ExpiresAt::from_unix_millis(crate::model::MAX_WIRE_INTEGER)
+                .unwrap(),
+            ..descriptor("v1", 17).for_pin()
+        };
+
+        publish(true);
+        let index = Index::new(WorkerId(0), 4, availability.clone(), env.ctx.clock.clone());
+        let m = descriptor("v1", 17);
+        index.publish_current(infinite()).unwrap();
+        assert!(index.current(&m.version.object).unwrap().is_some());
+
+        publish(false);
+        assert!(index.current(&m.version.object).unwrap().is_none());
+        assert_eq!(index.version(&m.version).unwrap(), Some(m.clone()));
+
+        // An observation started under the old policy must not restore the
+        // infinite deadline after the definition became mutable.
+        index.publish_current(infinite()).unwrap();
+        let current = index.current(&m.version.object).unwrap().unwrap();
+        assert!(
+            current.expires_at.as_system_time() <= SystemTime::now() + DEFAULT_ORIGIN_METADATA_TTL
+        );
+    }
+
+    #[test]
+    fn mutable_origin_freshness_is_measured_from_the_observation() {
+        use racer_wire::control::AzureContainerUrl;
+        use racer_wire::control::AzureCredential;
+        use racer_wire::control::CacheMode;
+        use racer_wire::control::OriginDefinition;
+        use std::time::Duration;
+
+        let env = racer_io::Env::host();
+        let cache = CacheId(crate::test_support::security::CACHE.into());
+        let availability = crate::test_support::availability(&env);
+        availability.publish_definitions(
+            &env,
+            vec![crate::control::test_cache_definition(
+                cache.clone(),
+                "origin",
+                CacheMode::Cached,
+                Some(OriginDefinition {
+                    metadata_ttl: Duration::from_secs(5),
+                    ..OriginDefinition::azure(
+                        AzureContainerUrl::parse("https://acct.blob.core.windows.net/models")
+                            .unwrap(),
+                        AzureCredential::Anonymous,
+                    )
+                }),
+            )],
+        );
+        let index = Index::new(WorkerId(0), 4, availability.clone(), env.ctx.clock.clone());
+        let m = descriptor("v1", 17);
+        let now = unix_millis(env.ctx.clock.wall_now()).unwrap() as u64;
+        let pointer = |observed_secs_ago: u64| CurrentVersion {
+            version: m.version.clone(),
+            expires_at: ExpiresAt::from_unix_millis(now + 3_600_000).unwrap(),
+            observed_at: ExpiresAt::from_unix_millis(now - observed_secs_ago * 1000).unwrap(),
+        };
+
+        // A pointer published under a longer TTL, which a skipped publication
+        // never rebounded, is stale by age even though its deadline is ahead.
+        index
+            .state
+            .borrow_mut()
+            .current
+            .insert(m.version.object.clone(), pointer(10));
+        assert!(index.current(&m.version.object).unwrap().is_none());
+        index
+            .state
+            .borrow_mut()
+            .current
+            .insert(m.version.object.clone(), pointer(1));
+        let current = index.current(&m.version.object).unwrap().unwrap();
+        assert!(current.expires_at.as_system_time() <= SystemTime::now() + Duration::from_secs(4));
+
+        // A forwarded copy carries the observation's deadline, so a second
+        // catalog cannot extend it from receipt time.
+        let forwarded = current
+            .resolve(&m, env.ctx.clock.wall_now())
+            .unwrap()
+            .unwrap();
+        let second = Index::new(WorkerId(1), 4, availability.clone(), env.ctx.clock.clone());
+        second.publish_current(forwarded).unwrap();
+        let received = second.current(&m.version.object).unwrap().unwrap();
+        assert!(received.expires_at.as_system_time() <= SystemTime::now() + Duration::from_secs(4));
     }
 }
 

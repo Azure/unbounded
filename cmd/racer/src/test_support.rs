@@ -138,6 +138,7 @@ pub mod clock {
         let current = CurrentVersion {
             version: descriptor.version.clone(),
             expires_at: ExpiresAt::test_time(clock.wall() + Duration::from_secs(2)),
+            observed_at: ExpiresAt::test_time(clock.wall()),
         };
         assert_eq!(
             current

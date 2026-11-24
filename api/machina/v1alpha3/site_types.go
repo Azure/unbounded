@@ -181,6 +181,14 @@ type MetalmanComponentSpec struct {
 	// +optional
 	DHCPAutoInterface *bool `json:"dhcpAutoInterface,omitempty"`
 
+	// AgentBaseURL is the base URL Metalman downloads the unbounded-agent
+	// release tarball from before serving it to hosts. It must use the GitHub
+	// releases layout (<base>/latest/download/<asset> and
+	// <base>/download/<tag>/<asset>), so a mirror of the release assets works.
+	// Defaults to the upstream GitHub releases URL.
+	// +optional
+	AgentBaseURL string `json:"agentBaseURL,omitempty"`
+
 	// Replicas is the desired number of Metalman replicas. Defaults to 1 when
 	// omitted.
 	// +kubebuilder:validation:Minimum=0

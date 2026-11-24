@@ -32,11 +32,19 @@ import (
 	"github.com/Azure/unbounded/internal/metalman/netboot"
 	"github.com/Azure/unbounded/internal/metalman/redfish"
 	"github.com/Azure/unbounded/internal/systemns"
+	"github.com/Azure/unbounded/internal/version"
+	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
 
 // DefaultNetbootImage is the default netboot OCI image used when a Machine
 // omits spec.host.netboot.netbootImage. It is set at build time via -ldflags.
 var DefaultNetbootImage = "netboot:latest"
+
+// DefaultBootstrapArtifactsRef is the OCI artifact holding the offline agent
+// bootstrap bundle, with {{.KubernetesVersion}} standing for the cluster's
+// Kubernetes version. It is set at build time via -ldflags; empty disables
+// pre-warming the bundle.
+var DefaultBootstrapArtifactsRef = ""
 
 // ServePXECmd returns a cobra.Command that runs PXE servers and the BMC control loop.
 func ServePXECmd() *cobra.Command {
@@ -59,6 +67,8 @@ func ServePXECmd() *cobra.Command {
 		operationPollInterval          time.Duration
 		defaultNetbootImage            string
 		defaultNetbootPullSecret       string
+		agentBaseURL                   string
+		bootstrapArtifactsRef          string
 		experimentalContainerIsolation bool
 	)
 
@@ -202,6 +212,12 @@ func ServePXECmd() *cobra.Command {
 
 			defaultNetbootImage = strings.TrimSpace(defaultNetbootImage)
 			defaultNetbootPullSecret = strings.TrimSpace(defaultNetbootPullSecret)
+			agentBaseURL = strings.TrimSpace(agentBaseURL)
+
+			renderedBootstrapArtifactsRef, err := renderBootstrapArtifactsRef(bootstrapArtifactsRef, kubeVersion)
+			if err != nil {
+				return err
+			}
 
 			defaultNetbootPullSecretRef, err := parseNamespacedSecretReference(defaultNetbootPullSecret)
 			if err != nil {
@@ -209,13 +225,24 @@ func ServePXECmd() *cobra.Command {
 			}
 
 			ociCache := netboot.NewOCICache(cacheDir)
+			if err := ociCache.LoadIndex(); err != nil {
+				return fmt.Errorf("loading OCI cache index: %w", err)
+			}
+
+			agentArtifacts := &netboot.AgentArtifact{
+				CacheDir:       cacheDir,
+				DefaultBaseURL: agentBaseURL,
+				DefaultVersion: version.Version,
+			}
 
 			if err := (&netboot.OCIReconciler{
 				Client:                      mgr.GetClient(),
 				Cache:                       ociCache,
 				Site:                        site,
+				ProviderLabels:              providerLabels,
 				DefaultNetbootRef:           defaultNetbootImage,
 				DefaultNetbootPullSecretRef: defaultNetbootPullSecretRef,
+				BootstrapArtifactsRef:       renderedBootstrapArtifactsRef,
 			}).SetupWithManager(mgr); err != nil {
 				return fmt.Errorf("setting up OCI reconciler: %w", err)
 			}
@@ -226,15 +253,16 @@ func ServePXECmd() *cobra.Command {
 			statusQueue := &metalmachineops.StatusQueue{Client: mgr.GetClient(), Site: site}
 
 			resolver := netboot.FileResolver{
-				Cache:             ociCache,
-				Reader:            mgr.GetClient(),
-				Cluster:           clusterInfoWatcher,
-				ServeURL:          serveURL,
-				DefaultNetbootRef: defaultNetbootImage,
-				KubernetesVersion: kubeVersion,
-				ClusterDNS:        clusterDNS,
-				ProviderLabels:    providerLabels,
-
+				Cache:                          ociCache,
+				Reader:                         mgr.GetClient(),
+				Cluster:                        clusterInfoWatcher,
+				ServeURL:                       serveURL,
+				DefaultNetbootRef:              defaultNetbootImage,
+				KubernetesVersion:              kubeVersion,
+				ClusterDNS:                     clusterDNS,
+				ProviderLabels:                 providerLabels,
+				Agent:                          agentArtifacts,
+				BootstrapArtifactsRef:          renderedBootstrapArtifactsRef,
 				ExperimentalContainerIsolation: experimentalContainerIsolation,
 			}
 
@@ -403,11 +431,31 @@ func ServePXECmd() *cobra.Command {
 	cmd.Flags().DurationVar(&operationPollInterval, "operation-poll-interval", 5*time.Second, "Poll interval for in-progress MachineOperations")
 	cmd.Flags().StringVar(&defaultNetbootImage, "default-netboot-image", DefaultNetbootImage, "Default OCI image containing PXE netboot artifacts")
 	cmd.Flags().StringVar(&defaultNetbootPullSecret, "default-netboot-pull-secret", "", "Namespaced Secret reference (namespace/name) for pulling the default netboot OCI image")
+	cmd.Flags().StringVar(&agentBaseURL, "agent-base-url", netboot.DefaultAgentBaseURL, "Base URL the unbounded-agent release tarball is downloaded from before it is served to hosts")
+	cmd.Flags().StringVar(&bootstrapArtifactsRef, "bootstrap-artifacts-ref", DefaultBootstrapArtifactsRef,
+		"OCI artifact holding the offline agent bootstrap bundle; {{.KubernetesVersion}} is replaced with the cluster version. Empty disables pre-warming")
 	cmd.Flags().BoolVar(&experimentalContainerIsolation, "experimental-container-isolation", false,
 		"Enable the experimental container isolation mode: opt every agent configuration in (Experimental.ContainerIsolation); "+
 			"without it a Machine that declares spec.isolation container is not provisioned")
 
 	return cmd
+}
+
+// renderBootstrapArtifactsRef substitutes the cluster Kubernetes version into
+// the configured bootstrap artifact reference. An empty reference disables the
+// offline bundle.
+func renderBootstrapArtifactsRef(ref, kubernetesVersion string) (string, error) {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return "", nil
+	}
+
+	rendered, err := goalstates.RenderOfflineSource(ref, kubernetesVersion)
+	if err != nil {
+		return "", fmt.Errorf("rendering bootstrap artifacts ref: %w", err)
+	}
+
+	return strings.TrimSpace(rendered), nil
 }
 
 func resolveMediaTFTPServer(raw string, serverIP net.IP) (string, error) {

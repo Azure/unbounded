@@ -7,6 +7,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/pelletier/go-toml/v2"
@@ -34,6 +35,121 @@ func TestConfigureContainerdWritesGantryHostsConfig(t *testing.T) {
 	info, err := os.Stat(path)
 	require.NoError(t, err)
 	require.Equal(t, os.FileMode(0o644), info.Mode().Perm())
+}
+
+func TestConfigureContainerdWritesRegistryHostsConfig(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		gantry         goalstates.Gantry
+		registryMirror string
+		wantFile       bool
+		wantGantry     bool
+		wantMirrorHost string
+	}{
+		{
+			name:           "mirror only",
+			gantry:         goalstates.Gantry{Disabled: true},
+			registryMirror: "10.0.0.1:5000",
+			wantFile:       true,
+			wantMirrorHost: `[host."http://10.0.0.1:5000"]`,
+		},
+		{
+			name:           "mirror only with http prefix",
+			gantry:         goalstates.Gantry{Disabled: true},
+			registryMirror: "http://10.0.0.1:5000",
+			wantFile:       true,
+			wantMirrorHost: `[host."http://10.0.0.1:5000"]`,
+		},
+		{
+			name:       "gantry only",
+			wantFile:   true,
+			wantGantry: true,
+		},
+		{
+			name:           "gantry and mirror",
+			registryMirror: "10.0.0.1:5000",
+			wantFile:       true,
+			wantGantry:     true,
+			wantMirrorHost: `[host."http://10.0.0.1:5000"]`,
+		},
+		{
+			name:     "neither",
+			gantry:   goalstates.Gantry{Disabled: true},
+			wantFile: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			machineDir := t.TempDir()
+			goalState := &goalstates.NodeStart{
+				MachineDir:     machineDir,
+				Containerd:     goalstates.ResolveContainerd(goalstates.ContainerdOptions{}),
+				Gantry:         tt.gantry,
+				RegistryMirror: tt.registryMirror,
+			}
+
+			require.NoError(t, ConfigureContainerd(goalState).Do(t.Context()))
+
+			path := filepath.Join(machineDir, goalstates.ContainerdDefaultHostsPath)
+
+			if !tt.wantFile {
+				_, err := os.Stat(path)
+				require.ErrorIs(t, err, os.ErrNotExist)
+
+				return
+			}
+
+			data, err := os.ReadFile(path)
+			require.NoError(t, err)
+
+			lines := strings.Split(string(data), "\n")
+			require.NotEmpty(t, lines)
+			require.Equal(t, gantryHostsManagedMarker, lines[0])
+
+			if tt.wantGantry {
+				require.Contains(t, string(data), `[host."http://127.0.0.1:5000"]`)
+			} else {
+				require.NotContains(t, string(data), "127.0.0.1:5000")
+			}
+
+			if tt.wantMirrorHost != "" {
+				require.Contains(t, string(data), tt.wantMirrorHost)
+				require.Contains(t, string(data), `capabilities = ["pull", "resolve"]`)
+			} else {
+				require.NotContains(t, string(data), "10.0.0.1:5000")
+			}
+		})
+	}
+}
+
+func TestConfigureContainerdRefusesUnmanagedHostsConfigWithMirror(t *testing.T) {
+	t.Parallel()
+
+	machineDir := t.TempDir()
+	path := filepath.Join(machineDir, goalstates.ContainerdDefaultHostsPath)
+	original := []byte("# managed by someone else\n")
+
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	require.NoError(t, os.WriteFile(path, original, 0o644))
+
+	goalState := &goalstates.NodeStart{
+		MachineDir:     machineDir,
+		Containerd:     goalstates.ResolveContainerd(goalstates.ContainerdOptions{}),
+		Gantry:         goalstates.Gantry{Disabled: true},
+		RegistryMirror: "10.0.0.1:5000",
+	}
+
+	err := ConfigureContainerd(goalState).Do(t.Context())
+	require.ErrorContains(t, err, "refusing to overwrite unmanaged containerd hosts file")
+
+	data, readErr := os.ReadFile(path)
+	require.NoError(t, readErr)
+	require.Equal(t, original, data)
 }
 
 func TestConfigureContainerdSetsImagePullTuning(t *testing.T) {
