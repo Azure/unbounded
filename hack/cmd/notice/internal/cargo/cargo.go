@@ -487,7 +487,7 @@ func directDependenciesIn(data string, workspace map[string]any) (map[string]dep
 // entry for the same alias. The member may still rename the package, and the
 // inherited version, features and optional flag do not affect NOTICE beyond
 // the registry name.
-func inherit(alias string, spec map[string]any, workspace map[string]any) (map[string]any, error) {
+func inherit(alias string, spec, workspace map[string]any) (map[string]any, error) {
 	entry, ok := workspace[alias]
 	if !ok {
 		return nil, fmt.Errorf("dependency %s: workspace inheritance has no workspace entry", alias)
