@@ -3,6 +3,17 @@
 
 // Package racer embeds the Racer dataplane templates applied by the operator.
 // Manifests are rendered in memory with template defaults.
+//
+// Unlike deploy/net and deploy/machina, there is no rendered/ tree here. These
+// templates have one consumer, the operator, which retargets the embedded
+// build-time default namespace to its own at runtime
+// (internal/operator/component/env.go, RetargetNamespace). Rendering with empty
+// data bakes that same default, so a generation step would add a make target
+// and a gitignored tree without changing the output. The templates are ready
+// for the rendered/ pattern if a second consumer, such as the kubectl plugin,
+// needs them: `render-manifests --set Namespace=<ns>` produces the same
+// layout, and adopting it means wiring a racer-manifests target into build and
+// test like net-manifests.
 package racer
 
 import (

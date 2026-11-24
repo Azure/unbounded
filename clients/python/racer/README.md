@@ -23,8 +23,9 @@ with racer.HostBuffer(meta.size) as buf:
 ```
 
 `HostBuffer` is a `memfd`. The client passes it to the dataplane with
-`SCM_RIGHTS` (`host-read`), and the dataplane writes straight into it. Older
-dataplanes do not know `host-read`; the client then uses the normal stream.
+`SCM_RIGHTS` (`host-read`), and the dataplane writes straight into it. The
+supported upgrade floor (v0.25) and later dataplanes implement it. A plain
+writable buffer uses the framed stream instead.
 
 ## Reading into GPU memory
 
@@ -36,13 +37,11 @@ client.read_into_gpu(request, alloc)
 t = tensors.as_tensor(alloc)  # uint8 CUDA tensor, no copy
 ```
 
-Modes are tried in order: `gpu-read`, then `host-read` into a pinned staging
-buffer plus a copy to the GPU, then the stream plus a copy. When a dataplane
-says a mode is not supported, the client remembers that for the socket path
-and logs one warning (logger `racer.client`) with the status that caused the
-fallback. It tries the mode again after `mode_retry_seconds` (default 300;
-`None` never retries), or at once when the socket file is replaced, which
-happens when the dataplane restarts. `racer.forget_modes()` clears the memory.
+A destination that can export a descriptor uses `gpu-read`. Otherwise, or when
+the dataplane answers 501 because it has no usable GPU for that allocation, the
+client reads through `host-read` into a pinned staging buffer and copies to the
+GPU. A dataplane that predates `gpu-read` is outside the supported upgrade
+floor; it is not compensated for.
 
 `gpu-read` sends the GPU's UUID (`cuda.device_uuid`) so the dataplane finds
 the right GPU even when device numbers in this container differ from the

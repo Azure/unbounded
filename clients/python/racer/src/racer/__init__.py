@@ -6,11 +6,9 @@ from .client import (
     GPU,
     HOST,
     STREAM,
-    DEFAULT_MODE_RETRY_SECONDS,
     Client,
     Metadata,
     ReadResult,
-    forget_modes,
     socket_path_for,
 )
 from .errors import (
@@ -38,7 +36,6 @@ from .host import HostBuffer
 from .keys import Request, canonical_json, object_key, object_request
 
 __all__ = [
-    "DEFAULT_MODE_RETRY_SECONDS",
     "GPU",
     "HOST",
     "PAGE_SIZE",
@@ -64,7 +61,6 @@ __all__ = [
     "UnsatisfiableRange",
     "VersionUnavailable",
     "canonical_json",
-    "forget_modes",
     "object_key",
     "object_request",
     "socket_path_for",

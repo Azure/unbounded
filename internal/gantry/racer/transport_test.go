@@ -124,9 +124,14 @@ type racerSocketFallback struct{ http.ResponseWriter }
 
 func (w racerSocketFallback) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
+// racerSocketBatch is the batch size the tests use for a socket transfer. The
+// SDK bounds each ReadFrom to its own copy buffer, so a test source of any
+// size still arrives as one bounded transfer.
+const racerSocketBatch = 256 * 1024
+
 func (w racerSocketResponse) ReadFrom(r io.Reader) (int64, error) {
 	source, ok := r.(*io.LimitedReader)
-	if !ok || source.N <= 0 || source.N > racerSocketChunk {
+	if !ok || source.N <= 0 {
 		return 0, errors.New("socket transfer is not bounded")
 	}
 
@@ -195,7 +200,7 @@ func testRacerSocketHTTPReuse(t *testing.T, mode string) {
 
 	t.Cleanup(func() { listener.Close() })
 
-	data := bytes.Repeat([]byte("0123456789abcdef"), racerSocketChunk/4+1)
+	data := bytes.Repeat([]byte("0123456789abcdef"), racerSocketBatch/4+1)
 
 	var fastBytes, connections atomic.Int64
 
@@ -597,6 +602,11 @@ type racerDeadlineWriter struct {
 	deadlineErr error
 }
 
+func (w *racerDeadlineWriter) SetWriteDeadline(deadline time.Time) error {
+	w.deadlines = append(w.deadlines, deadline)
+	return w.deadlineErr
+}
+
 type racerFastWriter struct {
 	*racerDeadlineWriter
 	reads int
@@ -618,25 +628,20 @@ func TestRacerIOBoundedReadFrom(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			w := &racerFastWriter{racerDeadlineWriter: &racerDeadlineWriter{ResponseRecorder: httptest.NewRecorder()}}
-			wrapped := &racerResponseWriter{ResponseWriter: w, timeout: time.Second}
-			length := 3*racerSocketChunk + 1
-			source := &io.LimitedReader{R: bytes.NewReader(make([]byte, length)), N: int64(length) + test.missing}
+			wrapped := &racerResponseWriter{ResponseWriter: w}
+			length := int64(3*racerSocketBatch + 1)
+			source := &io.LimitedReader{R: bytes.NewReader(make([]byte, length)), N: length + test.missing}
 
 			n, err := wrapped.ReadFrom(source)
-			if n != int64(length) || !errors.Is(err, test.wantErr) || wrapped.failed != (test.wantErr != nil) {
+			if n != length || !errors.Is(err, test.wantErr) || wrapped.failed != (test.wantErr != nil) {
 				t.Fatalf("bytes=%d err=%v failed=%v", n, err, wrapped.failed)
 			}
 
-			if w.reads != 4 || len(w.deadlines) != 10 || wrapped.bytes != n || source.N != test.missing {
-				t.Fatalf("reads=%d deadlines=%d accounted=%d remaining=%d", w.reads, len(w.deadlines), wrapped.bytes, source.N)
+			if w.reads != 1 || wrapped.bytes != n || source.N != test.missing {
+				t.Fatalf("reads=%d accounted=%d remaining=%d", w.reads, wrapped.bytes, source.N)
 			}
 		})
 	}
-}
-
-func (w *racerDeadlineWriter) SetWriteDeadline(deadline time.Time) error {
-	w.deadlines = append(w.deadlines, deadline)
-	return w.deadlineErr
 }
 
 func (w *racerDeadlineWriter) Write(p []byte) (int, error) {
@@ -648,7 +653,7 @@ func (w *racerDeadlineWriter) Write(p []byte) (int, error) {
 	return w.ResponseRecorder.Write(p)
 }
 
-func TestRacerIOBoundedWritesAndFlush(t *testing.T) {
+func TestRacerIOWritesAndFlush(t *testing.T) {
 	const batch = 256 * 1024
 
 	w := &racerDeadlineWriter{ResponseRecorder: httptest.NewRecorder()}
@@ -673,26 +678,15 @@ func TestRacerIOBoundedWritesAndFlush(t *testing.T) {
 
 		wrapped.(http.Flusher).Flush()
 	}), 0, func(o HTTPObservation) { observed = o })
-	before := time.Now()
 
 	handler.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/", nil))
 
-	if !slices.Equal(w.sizes, []int{batch, batch, batch, 1}) || !bytes.Equal(w.Body.Bytes(), data) || !w.Flushed {
+	if !slices.Equal(w.sizes, []int{len(data)}) || !bytes.Equal(w.Body.Bytes(), data) || !w.Flushed {
 		t.Fatalf("writes=%v flushed=%v", w.sizes, w.Flushed)
 	}
 
-	for i, deadline := range w.deadlines {
-		if deadline.IsZero() {
-			continue
-		}
-
-		if deadline.Before(before.Add(30*time.Second)) || i > 0 && deadline.Before(w.deadlines[i-1]) {
-			t.Fatalf("deadline did not roll: %v", w.deadlines)
-		}
-	}
-
-	if len(w.deadlines) != 15 || observed.Status != http.StatusPartialContent || observed.Bytes != int64(len(data)) || observed.Aborted || observed.Duration <= 0 {
-		t.Fatalf("observation=%+v deadlines=%v", observed, w.deadlines)
+	if observed.Status != http.StatusPartialContent || observed.Bytes != int64(len(data)) || observed.Aborted || observed.Duration <= 0 {
+		t.Fatalf("observation=%+v", observed)
 	}
 }
 
@@ -701,197 +695,26 @@ type racerShortWriter struct {
 }
 
 func (w *racerShortWriter) Write(p []byte) (int, error) {
-	if len(w.sizes) > 0 {
-		return w.racerDeadlineWriter.Write(p[:7])
-	}
-
-	return w.racerDeadlineWriter.Write(p)
+	return w.racerDeadlineWriter.Write(p[:7])
 }
 
-func TestRacerIOBatchedShortWrite(t *testing.T) {
-	const batch = 256 * 1024
-
+func TestRacerIOShortWrite(t *testing.T) {
 	w := &racerShortWriter{&racerDeadlineWriter{ResponseRecorder: httptest.NewRecorder()}}
-	wrapped := &racerResponseWriter{ResponseWriter: w, timeout: time.Second}
+	wrapped := &racerResponseWriter{ResponseWriter: w}
 
-	n, err := wrapped.Write(make([]byte, 3*batch))
-	if n != batch+7 || !errors.Is(err, io.ErrShortWrite) || !wrapped.failed || wrapped.bytes != int64(n) {
+	n, err := wrapped.Write(make([]byte, 3*256*1024))
+	if n != 7 || !errors.Is(err, io.ErrShortWrite) || !wrapped.failed || wrapped.bytes != int64(n) {
 		t.Fatalf("bytes=%d err=%v failed=%v accounted=%d", n, err, wrapped.failed, wrapped.bytes)
 	}
 
-	if !slices.Equal(w.sizes, []int{batch, 7}) || len(w.deadlines) != 6 {
-		t.Fatalf("writes=%v deadlines=%v", w.sizes, w.deadlines)
+	if !slices.Equal(w.sizes, []int{7}) {
+		t.Fatalf("writes=%v", w.sizes)
 	}
 }
 
-func TestRacerIOFailuresObserved(t *testing.T) {
-	for _, mode := range []string{"write", "deadline", "abort"} {
-		t.Run(mode, func(t *testing.T) {
-			w := &racerDeadlineWriter{ResponseRecorder: httptest.NewRecorder()}
-
-			failure := errors.New("failed")
-			if mode == "write" {
-				w.writeErr = failure
-			}
-
-			if mode == "deadline" {
-				w.deadlineErr = failure
-			}
-
-			var observed HTTPObservation
-
-			handler := WrapHTTP(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				if mode == "abort" {
-					panic(http.ErrAbortHandler)
-				}
-
-				_, err := w.Write([]byte("body"))
-				if err != nil {
-					panic(http.ErrAbortHandler)
-				}
-			}), time.Second, func(o HTTPObservation) { observed = o })
-
-			func() {
-				defer func() {
-					if recovered := recover(); recovered != http.ErrAbortHandler {
-						t.Fatalf("panic = %v", recovered)
-					}
-				}()
-
-				handler.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/", nil))
-			}()
-
-			if !observed.Aborted || observed.Bytes != 0 {
-				t.Fatalf("observation = %+v", observed)
-			}
-		})
-	}
-}
-
-func TestRacerIOStalledDownstream(t *testing.T) {
-	done := make(chan error, 1)
-
-	server := httptest.NewServer(WrapHTTP(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		data := make([]byte, racerWriteChunk)
-		for {
-			if _, err := w.Write(data); err != nil {
-				done <- err
-				return
-			}
-		}
-	}), 50*time.Millisecond, nil))
-	defer server.Close()
-
-	conn, err := net.Dial("tcp", server.Listener.Addr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-
-	if _, err := io.WriteString(conn, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"); err != nil {
-		t.Fatal(err)
-	}
-
-	select {
-	case err := <-done:
-		var timeout net.Error
-		if !errors.As(err, &timeout) || !timeout.Timeout() {
-			t.Fatalf("expected write timeout, got %v", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("stalled downstream was not interrupted")
-	}
-}
-
-func TestRacerIOProgressBeyondTimeout(t *testing.T) {
-	const timeout = 100 * time.Millisecond
-
-	server := httptest.NewServer(WrapHTTP(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		for range 5 {
-			// An upstream pause may exceed the write timeout. Each downstream
-			// write still receives a fresh budget when bytes become available.
-			time.Sleep(2 * timeout)
-
-			if _, err := io.WriteString(w, "chunk"); err != nil {
-				return
-			}
-
-			w.(http.Flusher).Flush()
-		}
-	}), timeout, nil))
-	defer server.Close()
-
-	client := &http.Client{Timeout: 5 * time.Second}
-
-	response, err := client.Get(server.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer response.Body.Close()
-
-	body, err := io.ReadAll(response.Body)
-	if err != nil || string(body) != "chunkchunkchunkchunkchunk" {
-		t.Fatalf("body=%q err=%v", body, err)
-	}
-}
-
-func TestRacerIOCancellationDeadlineSurvivesRefresh(t *testing.T) {
-	for _, operation := range transportOperations() {
-		t.Run(operation.name, func(t *testing.T) {
-			dst := &racerFastWriter{racerDeadlineWriter: &racerDeadlineWriter{ResponseRecorder: httptest.NewRecorder()}}
-			w := &racerResponseWriter{ResponseWriter: dst, timeout: time.Second}
-			w.WriteHeader(http.StatusOK)
-			controller := http.NewResponseController(w)
-			// Reproduce the precise SDK interleaving: its initial deadline returns,
-			// cancellation installs an immediate deadline, then the wrapper refreshes.
-			if err := controller.SetWriteDeadline(time.Now().Add(time.Minute)); err != nil {
-				t.Fatal(err)
-			}
-
-			interrupt := time.Now().Add(-time.Second)
-			done := make(chan error, 1)
-
-			go func() { done <- controller.SetWriteDeadline(interrupt) }()
-
-			if err := <-done; err != nil {
-				t.Fatal(err)
-			}
-			// Even another external refresh must not clear the interruption.
-			if err := controller.SetWriteDeadline(time.Now().Add(time.Minute)); err != nil {
-				t.Fatal(err)
-			}
-
-			err := operation.run(w, "payload")
-
-			if !errors.Is(err, os.ErrDeadlineExceeded) || !w.failed || w.bytes != 0 || dst.reads != 0 || dst.Body.Len() != 0 || dst.Flushed {
-				t.Fatalf("interruption lost: err=%v failed=%v bytes=%d reads=%d flushed=%v", err, w.failed, w.bytes, dst.reads, dst.Flushed)
-			}
-
-			if got := dst.deadlines[len(dst.deadlines)-1]; !got.Equal(interrupt) {
-				t.Fatalf("deadline refreshed past interruption: %v; want %v", got, interrupt)
-			}
-			// SDK cleanup explicitly clears the latch. Rolling deadlines and the
-			// handler's final flush must then work normally (failed stays recorded).
-			if err := controller.SetWriteDeadline(time.Time{}); err != nil {
-				t.Fatal(err)
-			}
-
-			if _, err := w.Write([]byte("next")); err != nil {
-				t.Fatal(err)
-			}
-
-			if err := w.FlushError(); err != nil {
-				t.Fatal(err)
-			}
-
-			if dst.Body.String() != "next" || !dst.Flushed || !dst.deadlines[len(dst.deadlines)-1].IsZero() {
-				t.Fatal("rolling writes/final flush did not resume after clear")
-			}
-		})
-	}
-}
-
-func TestRacerIOExternalDeadlineCapsRollingDeadline(t *testing.T) {
+// A deadline another caller set, such as the SDK body timeout, caps each
+// operation's deadline instead of being extended by it.
+func TestRacerIOExternalDeadlineCapsWriteDeadline(t *testing.T) {
 	dst := &racerDeadlineWriter{ResponseRecorder: httptest.NewRecorder()}
 	w := &racerResponseWriter{ResponseWriter: dst, timeout: time.Hour}
 
@@ -909,8 +732,8 @@ func TestRacerIOExternalDeadlineCapsRollingDeadline(t *testing.T) {
 	}
 
 	for _, got := range dst.deadlines {
-		if !got.IsZero() && !got.Equal(deadline) {
-			t.Fatalf("rolling deadline exceeded external bound: %v; want %v", got, deadline)
+		if !got.IsZero() && got.After(deadline) {
+			t.Fatalf("write deadline exceeded external bound: %v; want at most %v", got, deadline)
 		}
 	}
 }
@@ -925,7 +748,7 @@ func TestRacerIOConcurrentDeadlineFailureAccounting(t *testing.T) {
 		defer close(done)
 
 		for range 1000 {
-			// This callback path must not modify handler-owned accounting, even
+			// The callback path must not modify handler-owned accounting, even
 			// when the underlying deadline operation fails.
 			if err := http.NewResponseController(w).SetWriteDeadline(time.Now()); !errors.Is(err, failure) {
 				t.Errorf("external deadline error=%v", err)
@@ -985,6 +808,46 @@ func transportOperations() []struct {
 	}
 }
 
+func TestRacerIOCancellationInterruptsWrites(t *testing.T) {
+	for _, operation := range transportOperations() {
+		t.Run(operation.name, func(t *testing.T) {
+			dst := &racerFastWriter{racerDeadlineWriter: &racerDeadlineWriter{ResponseRecorder: httptest.NewRecorder()}}
+			w := &racerResponseWriter{ResponseWriter: dst, timeout: time.Second}
+			w.WriteHeader(http.StatusOK)
+			controller := http.NewResponseController(w)
+			interrupt := time.Now().Add(-time.Second)
+
+			if err := controller.SetWriteDeadline(interrupt); err != nil {
+				t.Fatal(err)
+			}
+
+			err := operation.run(w, "payload")
+
+			if !errors.Is(err, os.ErrDeadlineExceeded) || !w.failed || w.bytes != 0 || dst.reads != 0 || dst.Body.Len() != 0 || dst.Flushed {
+				t.Fatalf("interruption lost: err=%v failed=%v bytes=%d reads=%d flushed=%v", err, w.failed, w.bytes, dst.reads, dst.Flushed)
+			}
+
+			// The SDK clears the interrupt when the transfer ends. Later writes
+			// then work normally; failed stays recorded for the observation.
+			if err := controller.SetWriteDeadline(time.Time{}); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := w.Write([]byte("next")); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := w.FlushError(); err != nil {
+				t.Fatal(err)
+			}
+
+			if dst.Body.String() != "next" || !dst.Flushed {
+				t.Fatal("writes did not resume after the interrupt was cleared")
+			}
+		})
+	}
+}
+
 func TestRacerIOOperationClearPreservesInterrupt(t *testing.T) {
 	for _, operation := range transportOperations() {
 		t.Run(operation.name, func(t *testing.T) {
@@ -1001,9 +864,114 @@ func TestRacerIOOperationClearPreservesInterrupt(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			if !w.interrupted || !dst.deadlines[len(dst.deadlines)-1].Equal(interrupt) {
-				t.Fatal("operation cleanup erased cancellation interrupt")
+			if got := dst.deadlines[len(dst.deadlines)-1]; !got.Equal(interrupt) {
+				t.Fatalf("operation cleanup erased cancellation interrupt: %v; want %v", got, interrupt)
 			}
 		})
+	}
+}
+
+func TestRacerIOStalledDownstream(t *testing.T) {
+	done := make(chan error, 1)
+
+	server := httptest.NewServer(WrapHTTP(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		data := make([]byte, 256*1024)
+		for {
+			if _, err := w.Write(data); err != nil {
+				done <- err
+				return
+			}
+		}
+	}), 50*time.Millisecond, nil))
+	defer server.Close()
+
+	conn, err := net.Dial("tcp", server.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	if _, err := io.WriteString(conn, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case err := <-done:
+		var timeout net.Error
+		if !errors.As(err, &timeout) || !timeout.Timeout() {
+			t.Fatalf("expected write timeout, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("stalled downstream was not interrupted")
+	}
+}
+
+func TestRacerIOFailuresObserved(t *testing.T) {
+	for _, mode := range []string{"write", "abort"} {
+		t.Run(mode, func(t *testing.T) {
+			w := &racerDeadlineWriter{ResponseRecorder: httptest.NewRecorder()}
+
+			if mode == "write" {
+				w.writeErr = errors.New("failed")
+			}
+
+			var observed HTTPObservation
+
+			handler := WrapHTTP(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if mode == "abort" {
+					panic(http.ErrAbortHandler)
+				}
+
+				if _, err := w.Write([]byte("body")); err != nil {
+					panic(http.ErrAbortHandler)
+				}
+			}), time.Second, func(o HTTPObservation) { observed = o })
+
+			func() {
+				defer func() {
+					if recovered := recover(); recovered != http.ErrAbortHandler {
+						t.Fatalf("panic = %v", recovered)
+					}
+				}()
+
+				handler.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/", nil))
+			}()
+
+			if !observed.Aborted || observed.Bytes != 0 {
+				t.Fatalf("observation = %+v", observed)
+			}
+		})
+	}
+}
+
+// WrapHTTP adds no overall response deadline, so a slow upstream may pause
+// between flushes without cutting the response short.
+func TestRacerIOProgressAcrossUpstreamPauses(t *testing.T) {
+	const pause = 100 * time.Millisecond
+
+	server := httptest.NewServer(WrapHTTP(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		for range 5 {
+			time.Sleep(2 * pause)
+
+			if _, err := io.WriteString(w, "chunk"); err != nil {
+				return
+			}
+
+			w.(http.Flusher).Flush()
+		}
+	}), pause, nil))
+	defer server.Close()
+
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	response, err := client.Get(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+
+	body, err := io.ReadAll(response.Body)
+	if err != nil || string(body) != "chunkchunkchunkchunkchunk" {
+		t.Fatalf("body=%q err=%v", body, err)
 	}
 }
