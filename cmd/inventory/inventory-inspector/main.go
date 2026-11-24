@@ -12,7 +12,7 @@ import (
 	"github.com/lib/pq"
 	"github.com/spf13/cobra"
 
-	"github.com/Azure/unbounded/internal/inventory/inspector"
+	"github.com/Azure/unbounded/cmd/inventory/internal/inspector"
 	"github.com/Azure/unbounded/internal/version"
 )
 

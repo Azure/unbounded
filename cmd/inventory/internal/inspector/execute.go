@@ -12,7 +12,7 @@ import (
 
 	"github.com/lib/pq"
 
-	"github.com/Azure/unbounded/internal/inventory/aggregator"
+	"github.com/Azure/unbounded/cmd/inventory/internal/aggregator"
 )
 
 // Config holds the configuration for the inventory inspector.
