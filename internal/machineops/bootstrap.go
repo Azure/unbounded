@@ -13,9 +13,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	"github.com/Azure/unbounded/internal/cloudprovider"
 	"github.com/Azure/unbounded/internal/provision"
 )
 
@@ -55,27 +55,25 @@ func ResolveClusterInfo(ctx context.Context, apiServerEndpoint string, k kuberne
 		return nil, fmt.Errorf("kube-dns Service has no ClusterIP")
 	}
 
-	provider, err := cloudprovider.DetectProvider(ctx, k)
+	providerLabels, err := provision.DetectProviderLabels(ctx, k)
 	if err != nil {
 		return nil, fmt.Errorf("detect provider: %w", err)
 	}
+
+	log.FromContext(ctx).Info("detected cloud provider labels", "labels", providerLabels)
 
 	sv, err := k.Discovery().ServerVersion()
 	if err != nil {
 		return nil, fmt.Errorf("get server version: %w", err)
 	}
 
-	info := &ClusterInfo{
-		APIServer:    apiServerEndpoint,
-		CACertBase64: base64.StdEncoding.EncodeToString([]byte(caCert)),
-		ClusterDNS:   svc.Spec.ClusterIP,
-		KubeVersion:  sv.GitVersion,
-	}
-	if provider != nil {
-		info.ProviderLabels = provider.DefaultLabels()
-	}
-
-	return info, nil
+	return &ClusterInfo{
+		APIServer:      apiServerEndpoint,
+		CACertBase64:   base64.StdEncoding.EncodeToString([]byte(caCert)),
+		ClusterDNS:     svc.Spec.ClusterIP,
+		KubeVersion:    sv.GitVersion,
+		ProviderLabels: providerLabels,
+	}, nil
 }
 
 func (r *MachineOperationReconciler) buildReplaceUserData(ctx context.Context, machine *unboundedv1alpha3.Machine, format unboundedv1alpha3.ProvisioningFormat) (string, error) {

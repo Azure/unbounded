@@ -111,8 +111,8 @@ type BuildAgentConfigParams struct {
 	Cluster ClusterEndpoint
 
 	// ProviderLabels are cloud-provider-injected labels that override
-	// all other labels. These are typically resolved from
-	// cloudprovider.Provider.DefaultLabels().
+	// all other labels. These are typically resolved by
+	// DetectProviderLabels.
 	ProviderLabels map[string]string
 
 	// BootstrapToken is the kubelet bootstrap token (e.g. "abc123.xyz789").

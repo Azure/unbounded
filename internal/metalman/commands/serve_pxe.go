@@ -24,13 +24,13 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	"github.com/Azure/unbounded/internal/cloudprovider"
 	"github.com/Azure/unbounded/internal/metalman/attestation"
 	"github.com/Azure/unbounded/internal/metalman/dhcp"
 	"github.com/Azure/unbounded/internal/metalman/indexing"
 	metalmachineops "github.com/Azure/unbounded/internal/metalman/machineops"
 	"github.com/Azure/unbounded/internal/metalman/netboot"
 	"github.com/Azure/unbounded/internal/metalman/redfish"
+	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/internal/systemns"
 	"github.com/Azure/unbounded/internal/version"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
@@ -150,16 +150,12 @@ func ServePXECmd() *cobra.Command {
 
 			// Detect cloud provider for default node labels. These are
 			// static and resolved once at startup.
-			var providerLabels map[string]string
-
-			provider, err := cloudprovider.DetectProvider(ctx, clientset)
+			providerLabels, err := provision.DetectProviderLabels(ctx, clientset)
 			if err != nil {
 				return fmt.Errorf("detect provider: %w", err)
 			}
 
-			if provider != nil {
-				providerLabels = provider.DefaultLabels()
-			}
+			slog.Info("detected cloud provider labels", "labels", providerLabels)
 
 			sv, err := clientset.Discovery().ServerVersion()
 			if err != nil {

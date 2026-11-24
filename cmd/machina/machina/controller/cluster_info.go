@@ -13,7 +13,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 
-	"github.com/Azure/unbounded/internal/cloudprovider"
+	"github.com/Azure/unbounded/internal/provision"
 )
 
 // ClusterInfo holds cluster-level values resolved once at startup and passed
@@ -30,9 +30,9 @@ type ClusterInfo struct {
 	// ClusterDNS is the ClusterIP of the kube-dns Service in kube-system.
 	ClusterDNS string
 
-	// Provider is the detected cluster provider (e.g. AKS). It is nil
-	// when the provider cannot be determined.
-	Provider cloudprovider.Provider
+	// ProviderLabels are the labels the cluster's provider (e.g. AKS)
+	// requires on every node. It is nil when the provider is unknown.
+	ProviderLabels map[string]string
 
 	// KubeVersion is the Kubernetes server version (e.g. "v1.34.2") obtained
 	// from the API server's /version endpoint. It is used as the default
@@ -89,14 +89,15 @@ func ResolveClusterInfo(ctx context.Context, cfg Config, k kubernetes.Interface)
 	logger.Info("Resolved cluster DNS", "clusterDNS", info.ClusterDNS)
 
 	// ---------------------------------------------------------------
-	// Provider – detect the cluster provider (e.g. AKS).
+	// Provider labels – labels the cluster's provider (e.g. AKS)
+	// requires on every node.
 	// ---------------------------------------------------------------
-	provider, err := cloudprovider.DetectProvider(ctx, k)
+	info.ProviderLabels, err = provision.DetectProviderLabels(ctx, k)
 	if err != nil {
 		return nil, fmt.Errorf("detect provider: %w", err)
 	}
 
-	info.Provider = provider
+	logger.Info("Resolved provider labels", "providerLabels", info.ProviderLabels)
 
 	// ---------------------------------------------------------------
 	// KUBE_VERSION – Kubernetes server version from the /version endpoint.
@@ -114,16 +115,11 @@ func ResolveClusterInfo(ctx context.Context, cfg Config, k kubernetes.Interface)
 	// ---------------------------------------------------------------
 	// Summary
 	// ---------------------------------------------------------------
-	providerID := "none"
-	if info.Provider != nil {
-		providerID = info.Provider.ID()
-	}
-
 	logger.Info("All cluster info resolved successfully",
 		"apiServer", info.APIServer,
 		"caCertBase64Length", len(info.CACertBase64),
 		"clusterDNS", info.ClusterDNS,
-		"provider", providerID,
+		"providerLabels", info.ProviderLabels,
 		"kubeVersion", info.KubeVersion,
 	)
 
