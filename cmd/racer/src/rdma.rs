@@ -688,7 +688,9 @@ pub(crate) mod tests {
         #[test]
         fn journal_restore_validates_names_ports_and_encoded_bounds_atomically() {
             let inventory = Inventory::default();
-            inventory.restore(br#"[["valid",1,0]]"#).unwrap();
+            inventory
+                .restore(br#"{"version":2,"rails":[["valid",1,0]]}"#)
+                .unwrap();
             let original = inventory.reservations().unwrap();
             for device in [
                 "".to_owned(),
@@ -700,7 +702,11 @@ pub(crate) mod tests {
                 "a\rb".into(),
                 "x".repeat(64),
             ] {
-                let bytes = serde_json::to_vec(&vec![(device.clone(), 1u8, 0u16)]).unwrap();
+                let bytes = serde_json::to_vec(&serde_json::json!({
+                    "version": 2,
+                    "rails": [[device.clone(), 1u8, 0u16]],
+                }))
+                .unwrap();
                 assert_eq!(inventory.restore(&bytes), Err(Error::CorruptRecord));
                 assert!(
                     inventory
@@ -718,14 +724,15 @@ pub(crate) mod tests {
                 assert_eq!(inventory.reservations().unwrap(), original);
             }
             assert_eq!(
-                inventory.restore(br#"[["valid",0,0]]"#),
+                inventory.restore(br#"{"version":2,"rails":[["valid",0,0]]}"#),
                 Err(Error::CorruptRecord)
             );
-            let oversized = serde_json::to_vec(
-                &(0..1024)
+            let oversized = serde_json::to_vec(&serde_json::json!({
+                "version": 2,
+                "rails": (0..1024)
                     .map(|i| (format!("{i:04}{}", "x".repeat(59)), 255u8, i as u16))
                     .collect::<Vec<_>>(),
-            )
+            }))
             .unwrap();
             assert!(oversized.len() > MAX_JOURNAL_BYTES);
             assert_eq!(inventory.restore(&oversized), Err(Error::CorruptRecord));
@@ -776,7 +783,11 @@ pub(crate) mod tests {
                     .is_empty()
             );
             assert!(restarted.restore(b"bad").is_err());
-            assert!(restarted.restore(br#"[["a",1,0],["b",1,0]]"#).is_err());
+            assert!(
+                restarted
+                    .restore(br#"{"version":2,"rails":[["a",1,0],["b",1,0]]}"#)
+                    .is_err()
+            );
         }
         #[test]
         fn sysfs_pci_order_precedes_device_names_and_ports_have_ordinal_rails() {

@@ -3790,71 +3790,62 @@ fn listen_on_free_port<'a>(
 }
 
 #[test]
-fn peer_tcp_nodelay_assembled_outbound_and_distributed_accept() {
+fn peer_sockets_enable_tcp_nodelay() {
     let env = racer_io::Env::host();
-    for enabled in [false, true] {
-        let mut config = crate::test_support::cluster::config(false);
-        config.peer_tcp_nodelay = enabled;
-        let node = Arc::new(NodeState::on(env.ctx.clone()));
-        let (app, runtime, _) = local_worker(&env, &config, &node, 0);
-        let scope = scope(&racer_io::Clock::host(), Duration::from_secs(5)).unwrap();
-        let (mut serving, address) = listen_on_free_port(&app.peers, &scope);
-        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-        let endpoint = crate::http::Endpoint::Peer(address.to_string());
-        let mut connecting = app.http.checkout(&endpoint, &scope);
-        let mut outbound = None;
-        let mut inbound = None;
-        let until = Instant::now() + Duration::from_secs(3);
-        while outbound.is_none() || inbound.is_none() {
-            if outbound.is_none()
-                && let Poll::Ready(result) = connecting.as_mut().poll(&mut cx)
-            {
-                outbound = Some(result.unwrap());
-            }
-            assert!(serving.as_mut().poll(&mut cx).is_pending());
-            runtime.reactor.poll_budgeted(64).unwrap();
-            if inbound.is_none() {
-                inbound = node
-                    .peer_ingress
-                    .pop_batch::<1>(WorkerId(0), cx.waker(), 1)
-                    .unwrap()[0]
-                    .take();
-            }
-            assert!(Instant::now() < until, "peer socket setup stalled");
+    let config = crate::test_support::cluster::config(false);
+    let node = Arc::new(NodeState::on(env.ctx.clone()));
+    let (app, runtime, _) = local_worker(&env, &config, &node, 0);
+    let scope = scope(&racer_io::Clock::host(), Duration::from_secs(5)).unwrap();
+    let (mut serving, address) = listen_on_free_port(&app.peers, &scope);
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let endpoint = crate::http::Endpoint::Peer(address.to_string());
+    let mut connecting = app.http.checkout(&endpoint, &scope);
+    let mut outbound = None;
+    let mut inbound = None;
+    let until = Instant::now() + Duration::from_secs(3);
+    while outbound.is_none() || inbound.is_none() {
+        if outbound.is_none()
+            && let Poll::Ready(result) = connecting.as_mut().poll(&mut cx)
+        {
+            outbound = Some(result.unwrap());
         }
-        assert_eq!(
-            tcp_nodelay(outbound.as_ref().unwrap().socket().as_ref()),
-            i32::from(enabled)
-        );
-        assert_eq!(
-            tcp_nodelay(&inbound.as_ref().unwrap().fd),
-            i32::from(enabled)
-        );
-        drop(connecting);
-        drop(outbound);
-        drop(inbound);
-        scope.cancel().unwrap();
-        loop {
-            runtime.reactor.poll_budgeted(64).unwrap();
-            if let Poll::Ready(result) = serving.as_mut().poll(&mut cx) {
-                assert_eq!(result, Err(Error::Canceled));
-                break;
-            }
-            assert!(Instant::now() < until, "peer cancellation stalled");
+        assert!(serving.as_mut().poll(&mut cx).is_pending());
+        runtime.reactor.poll_budgeted(64).unwrap();
+        if inbound.is_none() {
+            inbound = node
+                .peer_ingress
+                .pop_batch::<1>(WorkerId(0), cx.waker(), 1)
+                .unwrap()[0]
+                .take();
         }
-        assert_eq!(
-            runtime
-                .admission
-                .used(crate::admission::ResourceClass::Connection),
-            0
-        );
-        assert_eq!(
-            runtime
-                .admission
-                .used(crate::admission::ResourceClass::PeerIngressConnection),
-            0
-        );
+        assert!(Instant::now() < until, "peer socket setup stalled");
     }
+    assert_eq!(tcp_nodelay(outbound.as_ref().unwrap().socket().as_ref()), 1);
+    assert_eq!(tcp_nodelay(&inbound.as_ref().unwrap().fd), 1);
+    drop(connecting);
+    drop(outbound);
+    drop(inbound);
+    scope.cancel().unwrap();
+    loop {
+        runtime.reactor.poll_budgeted(64).unwrap();
+        if let Poll::Ready(result) = serving.as_mut().poll(&mut cx) {
+            assert_eq!(result, Err(Error::Canceled));
+            break;
+        }
+        assert!(Instant::now() < until, "peer cancellation stalled");
+    }
+    assert_eq!(
+        runtime
+            .admission
+            .used(crate::admission::ResourceClass::Connection),
+        0
+    );
+    assert_eq!(
+        runtime
+            .admission
+            .used(crate::admission::ResourceClass::PeerIngressConnection),
+        0
+    );
 }
 
 /// Peer ingress is sized by `peer_connections`, apart from client connections. With every slot
@@ -3959,11 +3950,10 @@ fn a_full_peer_listener_refuses_with_the_overload_head() {
 }
 
 #[test]
-fn peer_tcp_nodelay_accept_failure_closes_owned_socket_and_false_preserves_policy() {
+fn peer_accept_failure_closes_owned_socket() {
     use std::io::Read;
     let env = racer_io::Env::host();
-    let mut config = crate::test_support::cluster::config(false);
-    config.peer_tcp_nodelay = true;
+    let config = crate::test_support::cluster::config(false);
     let (app, _, _) = local_worker(&env, &config, &Arc::new(NodeState::on(env.ctx.clone())), 0);
     let (socket, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
     peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
@@ -3972,19 +3962,6 @@ fn peer_tcp_nodelay_accept_failure_closes_owned_socket_and_false_preserves_polic
         Err(Error::Io)
     ));
     assert_eq!(peer.read(&mut [0]).unwrap(), 0);
-
-    config.peer_tcp_nodelay = false;
-    let (app, _, _) = local_worker(&env, &config, &Arc::new(NodeState::on(env.ctx.clone())), 0);
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let _peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-    let (socket, _) = listener.accept().unwrap();
-    socket.set_nodelay(true).unwrap();
-    let socket = app.peers.configure_accepted(socket.into()).unwrap();
-    assert_eq!(
-        tcp_nodelay(&socket),
-        1,
-        "false must not rewrite existing policy"
-    );
 }
 
 #[test]
@@ -4091,7 +4068,9 @@ fn disabled_rdma_turn_does_not_refresh_inventory() {
     let (mut app, _, _) = local_worker(&env, &config, &node, 0);
     let generation = app.inventory_generation;
     node.inventory.update(vec![]).unwrap();
-    node.inventory.restore(b"[]").unwrap();
+    node.inventory
+        .restore(br#"{"version":2,"rails":[]}"#)
+        .unwrap();
     assert_ne!(generation, node.inventory.generation());
     assert!(app.links.is_none());
     app.refresh_inventory().unwrap();

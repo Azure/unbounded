@@ -278,6 +278,7 @@ var retiredSettings = map[string]retiredSetting{
 	"RACER_API_CA":                       {replacement: "RACER_KUBE_API_CA", rename: true},
 	"RACER_API_TOKEN":                    {replacement: "RACER_KUBE_API_TOKEN", rename: true},
 	"RACER_PEER_PORT":                    {replacement: "the port of RACER_PEER_LISTEN"},
+	"RACER_PEER_TCP_NODELAY":             {replacement: "nothing (TCP_NODELAY is always set)", drop: true},
 	"RACER_WARM_MAX_TTL_SECS":            {replacement: "nothing (it had no effect)", drop: true},
 	"RACER_WARM_FILL_TIMEOUT_SECS":       {replacement: "nothing (it had no effect)", drop: true},
 	"RACER_WARM_MAX_JOBS":                {replacement: "nothing (it had no effect)", drop: true},

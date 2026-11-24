@@ -479,8 +479,8 @@ pub fn request_head(clock: &racer_io::Clock, request: &PeerRequest) -> Result<Me
             );
             push(&mut head, "racer-page-budget", subscription.page_budget);
             push(&mut head, "racer-byte-budget", subscription.byte_budget);
-            // Optional, so the single-flight request stays byte-identical to the
-            // encoding older providers accept. They refuse a request carrying it.
+            // Optional, so a single-flight request stays byte-identical to an
+            // encoding without the field.
             if let Some(flights) = subscription.flights {
                 push(&mut head, SUBSCRIPTION_FLIGHTS, flights);
             }

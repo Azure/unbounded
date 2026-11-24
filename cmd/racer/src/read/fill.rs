@@ -145,7 +145,9 @@ pub struct Fill {
     pub(super) gpu_copies: Rc<super::gpu_copies::GpuCopies>,
 
     diagnostic: Option<DriverDiagnostic>,
-    fence_acquisition: bool,
+    /// Set for prefetch and spill fills, which stay fenced on their accepted
+    /// acquisition work instead of handing a running driver to the next waiter.
+    fenced_fill: bool,
     /// Set for a host-read sealed fetch. An elected driver that acquires a
     /// registered RDMA page then leaves it out of the memory cache, so the
     /// host-read sink's fused pass makes the only copy; the verdict
@@ -1020,7 +1022,7 @@ impl Fill {
             local_plaintext_keys: Rc::default(),
             gpu_copies: Rc::default(),
             diagnostic: None,
-            fence_acquisition: false,
+            fenced_fill: false,
             defer_registered_publish: false,
             plaintext_wait: None,
         }
@@ -1687,8 +1689,8 @@ impl Fill {
         self.gpu_copies.forget(&page);
     }
 
-    /// Warm gates own transfer exclusion until accepted acquisition work is fenced.
-    pub(crate) async fn acquire_warm(
+    /// Prefetch and spill fills own transfer exclusion until accepted acquisition work is fenced.
+    pub(crate) async fn acquire_fenced(
         &self,
         page: PageId,
         membership: Arc<crate::topology::Membership>,
@@ -1697,7 +1699,7 @@ impl Fill {
         budget: &mut AcquisitionBudget,
     ) -> Result<PageResult> {
         let mut fill = self.clone();
-        fill.fence_acquisition = true;
+        fill.fenced_fill = true;
         fill.acquire_unobserved(page, membership, context, scope, budget)
             .await
     }
@@ -1824,9 +1826,7 @@ impl Fill {
             };
             loop {
                 let event = waiter.wait().await;
-                if self.fence_acquisition
-                    && matches!(event, Err(_) | Ok(AcquisitionEvent::Failed(_)))
-                {
+                if self.fenced_fill && matches!(event, Err(_) | Ok(AcquisitionEvent::Failed(_))) {
                     waiter.wait_operations().await?;
                 }
                 match event? {
@@ -1925,13 +1925,13 @@ impl Fill {
         // abandonment must cancel only this work.
         let caller_scope = acquisition.scope.clone();
         let caller_cancellation = caller_scope.cancellation.subscribe()?;
-        // Unless the caller fences on this work (warm gates), the running fill continues for
-        // another live acquisition waiter when the leader expires or is canceled, instead of being
-        // canceled and restarted from scratch by the next leader. The owned scope then runs to a
-        // hard ceiling; the driver cancels it as soon as no live waiter remains
+        // Unless the caller fences on this work (prefetch and spill fills), the running fill
+        // continues for another live acquisition waiter when the leader expires or is canceled,
+        // instead of being canceled and restarted from scratch by the next leader. The owned scope
+        // then runs to a hard ceiling; the driver cancels it as soon as no live waiter remains
         // (`FlightOperation::poll_cancellation`). Attempts and links stay charged to the leader's
         // budget; the extra time is within the adopting waiter's own deadline and budget.
-        let handover = !self.fence_acquisition;
+        let handover = !self.fenced_fill;
         let ceiling = racer_core::read::flight::handover_ceiling(
             caller_scope.clock().now(),
             caller_scope.deadline.0,
@@ -2088,10 +2088,10 @@ impl Fill {
         }));
         let remaining = std::future::poll_fn(|cx| {
             self.dependencies.candidates.drivers().poll(cx, 64);
-            if !self.fence_acquisition || !acquisition.scope.cancellation.is_canceled() {
+            if !self.fenced_fill || !acquisition.scope.cancellation.is_canceled() {
                 acquisition.cancellation.register(cx.waker());
             }
-            if !self.fence_acquisition {
+            if !self.fenced_fill {
                 acquisition.scope.check()?;
             }
             std::pin::Pin::new(&mut receive)
@@ -2100,7 +2100,7 @@ impl Fill {
         })
         .await?;
         *acquisition.budget = remaining;
-        if self.fence_acquisition {
+        if self.fenced_fill {
             acquisition.scope.check()?;
         }
         Ok(())

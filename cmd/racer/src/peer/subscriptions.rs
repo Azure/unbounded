@@ -42,9 +42,8 @@ pub struct Subscription {
     pub byte_budget: u64,
 
     /// Selections the receiver asks to keep in flight on this contract.
-    /// `None` is the original single-flight contract and is not encoded on the
-    /// wire, so older providers still accept it. `Some(n)` requires
-    /// `1..=MAX_SUBSCRIPTION_FLIGHTS`; older providers refuse the request.
+    /// `None` is the single-flight contract and is not encoded on the wire.
+    /// `Some(n)` requires `1..=MAX_SUBSCRIPTION_FLIGHTS`.
     pub flights: Option<u16>,
 }
 

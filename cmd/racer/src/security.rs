@@ -1327,8 +1327,8 @@ pub struct CredentialCrypto {
     rng: racer_io::Rng,
 }
 impl CredentialCrypto {
-    /// Independently charged zeroizing context. Warm admission may transfer this
-    /// owner to a bounded job with its own scope after the HEAD response ends.
+    /// Independently charged zeroizing context. An elected driver may run on a
+    /// bounded job with its own scope after the request's response ends.
     pub(crate) fn local_context(
         &self,
         context: &OriginContext,

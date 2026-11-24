@@ -590,13 +590,6 @@ const BASE: &[Var] = &[
         "Diagnostics listener; must differ from the peer listener.",
     ),
     var(
-        "RACER_PEER_TCP_NODELAY",
-        Group::Network,
-        Kind::Bool,
-        Value("true"),
-        "TCP_NODELAY on peer sockets. `false` only reproduces the old socket behavior.",
-    ),
-    var(
         "RACER_OPAQUE_RELAY",
         Group::Network,
         Kind::Bool,

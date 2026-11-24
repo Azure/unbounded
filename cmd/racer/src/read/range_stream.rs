@@ -52,7 +52,7 @@ use racer_core::read::{self, PageBudget};
 use racer_core::read::{DIRECT_AHEAD, SELECTIONS, window::PAGE_RETRIES};
 
 /// Flights requested per provider contract. A provider grants at most this
-/// many pending selections per contract, or one if it predates multi-flight.
+/// many pending selections per contract.
 pub(crate) const REQUESTED_FLIGHTS: u16 = 4;
 const _: () = assert!(REQUESTED_FLIGHTS <= racer_core::subscriptions::MAX_SUBSCRIPTION_FLIGHTS);
 
@@ -82,7 +82,7 @@ struct Contract {
     /// was omitted).
     requested: u16,
     /// Selections the provider allows pending at once: 1 until a `Selected`
-    /// grant raises it, back to 1 after a refusal.
+    /// grant raises it.
     granted: u16,
 }
 
@@ -212,19 +212,6 @@ impl Scheduler {
         }
         if let Some(contract) = self.state.lock().unwrap().contracts.get_mut(&key) {
             contract.granted = flights.clamp(1, contract.requested);
-        }
-    }
-
-    /// The provider refused a multi-flight request: one flight from now on.
-    pub(crate) fn refused(&self, selection: &Selection, provider: &racer_wire::control::NodeId) {
-        let Some(key) = selection.contract.lock().unwrap().clone() else {
-            return;
-        };
-        if &key.2 != provider {
-            return;
-        }
-        if let Some(contract) = self.state.lock().unwrap().contracts.get_mut(&key) {
-            contract.granted = 1;
         }
     }
 
@@ -3624,7 +3611,7 @@ pub(super) mod tests {
             assert_eq!(expires, deadline);
         }
         #[test]
-        fn contract_serves_up_to_granted_flights_and_refusal_resets_to_one() {
+        fn contract_serves_up_to_granted_flights() {
             let scheduler = Scheduler::new(4, racer_io::WorkerCtx::host());
             let deadline = racer_io::Clock::host().now() + std::time::Duration::from_secs(30);
             let provider = NodeId("provider".into());
@@ -3652,19 +3639,7 @@ pub(super) mod tests {
             held.pop();
             let (_, single) = issue(&scheduler, 3, "provider", None, deadline);
             assert_eq!(single, Err(Error::Overloaded));
-            // A refusal drops the contract to one flight: two still pending
-            // block new ones until both finish.
-            let (selection, result) = issue(&scheduler, 3, "provider", Some(3), deadline);
-            result.unwrap();
-            scheduler.refused(&selection, &provider);
-            held.push(selection);
-            while let Some(selection) = held.pop() {
-                let (_, next) = issue(&scheduler, 4, "provider", Some(3), deadline);
-                assert_eq!(next, Err(Error::Overloaded));
-                drop(selection);
-            }
-            let (_last, last) = issue(&scheduler, 4, "provider", Some(3), deadline);
-            last.unwrap();
+            drop(held);
         }
         #[test]
         fn expired_contract_drains_before_a_fresh_one_replaces_it() {

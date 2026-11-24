@@ -171,10 +171,6 @@ pub struct Config {
     pub gpu_peer: bool,
     /// Opt into experimental opaque HTTP transit; materialized relay is the default.
     pub opaque_relay: bool,
-    /// Peer-only TCP_NODELAY. Peer exchanges are strictly request/response with
-    /// multi-segment signed heads, so Nagle stalls every round on a delayed ACK.
-    /// Defaults on; set false only to reproduce the pre-nodelay socket behavior.
-    pub peer_tcp_nodelay: bool,
     /// cgroup v2 memory-pressure monitoring and reclaim. Defaults on.
     pub memory_pressure: bool,
     pub pprof_enabled: bool,
@@ -513,7 +509,6 @@ impl Config {
             },
             gpu_peer: word("RACER_GPU_PEER") == "auto",
             opaque_relay: flag("RACER_OPAQUE_RELAY"),
-            peer_tcp_nodelay: flag("RACER_PEER_TCP_NODELAY"),
             memory_pressure: flag("RACER_MEMORY_PRESSURE"),
             pprof_enabled: flag("RACER_PPROF_ENABLED"),
             control_endpoint,
@@ -2641,10 +2636,6 @@ mod tests {
             })
             .is_err()
         );
-    }
-    #[test]
-    fn peer_tcp_nodelay_requires_exact_boolean_and_defaults_on() {
-        exact_boolean_default("RACER_PEER_TCP_NODELAY", |c| c.peer_tcp_nodelay, true);
     }
 
     #[test]

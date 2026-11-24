@@ -44,7 +44,6 @@ pub(crate) enum AcceptMode {
 }
 
 pub(crate) struct Settings {
-    pub tcp_nodelay: bool,
     pub accept: AcceptMode,
     pub request_timeout: Duration,
     pub opaque_relay: bool,
@@ -53,7 +52,6 @@ pub(crate) struct Settings {
 pub struct PeerServer {
     /// This worker's detached driver queue for diagnostic samples.
     drivers: std::rc::Rc<crate::drivers::DriverQueue>,
-    tcp_nodelay: bool,
     metrics: crate::telemetry::Metrics,
     send_tag: Option<(
         crate::telemetry::Pair,
@@ -122,10 +120,9 @@ impl PeerServer {
         &self,
         fd: racer_io::ring::Descriptor,
     ) -> crate::error::Result<racer_io::ring::Descriptor> {
-        // False preserves the accepted socket's existing application policy.
-        if self.tcp_nodelay {
-            fd.enable_tcp_nodelay(true).map_err(|_| Error::Io)?;
-        }
+        // Peer exchanges are request/response with multi-segment signed heads,
+        // so Nagle would stall every round on a delayed ACK.
+        fd.enable_tcp_nodelay(true).map_err(|_| Error::Io)?;
         Ok(fd)
     }
     /// Answer a connection the listener has no peer ingress slot for with the unsigned overload
@@ -247,7 +244,6 @@ impl PeerServer {
             pipes,
             transfers,
             Settings {
-                tcp_nodelay: false,
                 accept: AcceptMode::Local,
                 request_timeout: Duration::from_secs(30),
                 opaque_relay: false,
@@ -384,7 +380,6 @@ impl PeerServer {
             drivers,
             subscriptions,
             metrics: crate::telemetry::Metrics::default(),
-            tcp_nodelay: settings.tcp_nodelay,
             send_tag: None,
             placement: crate::topology::Placement::new(64),
             opaque_relay: settings.opaque_relay,

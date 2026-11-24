@@ -42,7 +42,6 @@
   {"name": "RACER_RETAINED_SNAPSHOTS", "owner": "dataplane", "scope": "node", "kind": "unsigned", "min": "2", "max": "64", "step": "1", "default": "2", "empty_unset": false},
   {"name": "RACER_PEER_LISTEN", "owner": "dataplane", "scope": "node", "kind": "text", "default": "0.0.0.0:7443", "empty_unset": false},
   {"name": "RACER_DIAGNOSTICS_LISTEN", "owner": "dataplane", "scope": "node", "kind": "text", "default": "127.0.0.1:9090", "empty_unset": false},
-  {"name": "RACER_PEER_TCP_NODELAY", "owner": "dataplane", "scope": "node", "kind": "bool", "default": "true", "empty_unset": false},
   {"name": "RACER_OPAQUE_RELAY", "owner": "dataplane", "scope": "node", "kind": "bool", "default": "false", "empty_unset": false},
   {"name": "RACER_PEER_INFLIGHT_MAX", "owner": "dataplane", "scope": "node", "kind": "unsigned", "min": "1", "max": "65536", "step": "1", "default": "4096", "empty_unset": false},
   {"name": "RACER_PEER_PER_NEIGHBOR_MAX", "owner": "dataplane", "scope": "node", "kind": "unsigned", "min": "1", "max": "65536", "step": "1", "default": "512", "empty_unset": false},

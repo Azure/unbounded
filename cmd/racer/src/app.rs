@@ -1468,7 +1468,6 @@ impl WorkerApplication {
             admission.clone(),
             limits.connections_per_neighbor.get(),
         );
-        http.config_mut().tcp_nodelay = config.peer_tcp_nodelay;
         http.config_mut().secondary_cap = origin_pool_capacity(
             config.origin_connections_per_cache.get(),
             admission.limit(crate::admission::ResourceClass::OutboundConnection),
@@ -1710,7 +1709,6 @@ impl WorkerApplication {
             pipes.clone(),
             transfers,
             crate::peer::server::Settings {
-                tcp_nodelay: config.peer_tcp_nodelay,
                 accept: if distributed {
                     crate::peer::server::AcceptMode::Distributed(node.peer_ingress.clone())
                 } else {

@@ -120,7 +120,6 @@ pub mod cluster {
             crypto_helpers: None,
             allow_smt: false,
             opaque_relay: false,
-            peer_tcp_nodelay: false,
             memory_pressure: true,
             pprof_enabled: false,
             enable_rdma,

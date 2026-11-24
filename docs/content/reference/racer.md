@@ -453,7 +453,6 @@ each worker and are never divided.
 | --- | --- | --- | --- | --- |
 | `RACER_PEER_LISTEN` | `0.0.0.0:7443` | Node | `ip:port` | Peer listener. A bracketed IPv4 address, as Kubernetes expands `[$(POD_IP)]`, is accepted. Its port is the peer port published to members. |
 | `RACER_DIAGNOSTICS_LISTEN` | `127.0.0.1:9090` | Node | `ip:port` | Diagnostics listener; must differ from the peer listener. |
-| `RACER_PEER_TCP_NODELAY` | `true` | Node | `true`, `false` | TCP_NODELAY on peer sockets. `false` only reproduces the old socket behavior. |
 | `RACER_OPAQUE_RELAY` | `false` | Node | `true`, `false` | Experimental opaque HTTP transit instead of materialized relay. |
 | `RACER_PEER_INFLIGHT_MAX` | `4096` | Node | 1..65,536 | Peer exchanges in flight. |
 | `RACER_PEER_PER_NEIGHBOR_MAX` | `512` | Node | 1..65,536 | Peer exchanges in flight to one neighbor; at most `RACER_PEER_INFLIGHT_MAX`. |

@@ -237,23 +237,15 @@ impl Inventory {
 
     /// Restore reservations before issuing rails. A malformed journal is
     /// `CorruptRecord` and leaves existing state intact: a corrupt journal is
-    /// never discarded and renumbered. A legacy (version 1) journal, a bare
-    /// array keyed by device name, is discarded: its names do not survive
-    /// device renames and may have drifted from other nodes, so rails are
-    /// renumbered from PCI/port order.
+    /// never discarded and renumbered. Only the current journal format is
+    /// accepted.
     pub fn restore(&self, bytes: &[u8]) -> Result<()> {
         if bytes.len() > MAX_JOURNAL_BYTES {
             return Err(Error::CorruptRecord);
         }
         let assigned = match serde_json::from_slice::<Journal>(bytes) {
             Ok(journal) if journal.version == JOURNAL_VERSION => journal.rails,
-            Ok(_) => return Err(Error::CorruptRecord),
-            Err(_) => {
-                let legacy: Vec<(String, u8, u16)> =
-                    serde_json::from_slice(bytes).map_err(|_| Error::CorruptRecord)?;
-                validate(&legacy)?;
-                Vec::new()
-            }
+            _ => return Err(Error::CorruptRecord),
         };
         validate(&assigned)?;
         if journal_bytes(&assigned)
@@ -690,7 +682,9 @@ mod tests {
         inventory.update(vec![nic("../bad", 0, None)]).unwrap();
         assert_eq!(inventory.generation(), 2);
         assert!(inventory.snapshot().unwrap().nics.is_empty());
-        inventory.restore(br#"[["a",1,0]]"#).unwrap();
+        inventory
+            .restore(br#"{"version":2,"rails":[["a",1,0]]}"#)
+            .unwrap();
         assert_eq!(inventory.generation(), 3);
         assert_eq!(inventory.snapshot().unwrap().generation, 3);
     }
@@ -815,35 +809,6 @@ mod tests {
         let journal: serde_json::Value =
             serde_json::from_slice(&inventory.reservations().unwrap()).unwrap();
         assert_eq!(journal["rails"].as_array().unwrap().len(), 2);
-    }
-
-    #[test]
-    /// Nodes with the same hardware publish the same rails regardless of
-    /// journal history, and a drifted legacy journal self-corrects.
-    fn homogeneous_nodes_agree_and_legacy_journal_self_corrects() {
-        let fresh = Inventory::default();
-        let hardware = vec![keyed("roceP30832p0s0", "7870:00:00.0")];
-        let expected = rails(&fresh.update_keyed(hardware.clone()).unwrap());
-        assert_eq!(expected, vec![("roceP30832p0s0".into(), 0)]);
-        // The live drift: the old name holds rail 0, the new name rail 1.
-        let drifted = Inventory::default();
-        drifted
-            .restore(br#"[["mana_0",1,0],["roceP30832p0s0",1,1]]"#)
-            .unwrap();
-        assert_eq!(rails(&drifted.update_keyed(hardware).unwrap()), expected);
-        assert_eq!(
-            drifted.reservations().unwrap(),
-            fresh.reservations().unwrap()
-        );
-        // A renamed node with a version 2 journal also agrees.
-        let renamed = Inventory::default();
-        renamed
-            .restore(br#"{"version":2,"rails":[["pci:7870:00:00.0",1,0]]}"#)
-            .unwrap();
-        let snapshot = renamed
-            .update_keyed(vec![keyed("mana_0", "7870:00:00.0")])
-            .unwrap();
-        assert_eq!(snapshot.nics[0].rail, RailId(0));
     }
 
     #[test]

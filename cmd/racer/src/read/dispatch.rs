@@ -1130,7 +1130,7 @@ async fn execute(
             let context = local.open_context(envelope)?;
             let result = local
                 .fill
-                .acquire_warm(
+                .acquire_fenced(
                     page,
                     membership,
                     &context,
@@ -1159,7 +1159,7 @@ async fn execute(
             let context = local.open_context(envelope)?;
             let result = local
                 .fill
-                .acquire_warm(
+                .acquire_fenced(
                     page,
                     membership,
                     &context,
