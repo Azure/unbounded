@@ -1,16 +1,25 @@
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
-FROM docker.io/library/ubuntu:24.04 AS build
+# Metalman machine image for Ubuntu 24.04. Works on amd64 and arm64.
+# It starts from the Ubuntu cloud image root tarball and bakes in the host
+# packages the unbounded agent requires, so first boot does not run the
+# package manager.
+#
+# Build:
+#   docker buildx build --platform linux/amd64 \
+#     -f images/host-ubuntu2404/Containerfile -t ghcr.io/azure/host-ubuntu2404:dev .
 
+ARG UBUNTU_RELEASE_URL=https://cloud-images.ubuntu.com/releases/noble/release
+
+# Unpack the cloud image root file system. It has no kernel or bootloader.
+FROM --platform=$BUILDPLATFORM docker.io/library/ubuntu:24.04 AS fetch
 ARG TARGETARCH
-ARG UBUNTU_CLOUDIMG_URL=https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-${TARGETARCH}.img
-
+ARG UBUNTU_RELEASE_URL
 RUN apt-get update && \
     ok=false && \
     for attempt in 1 2 3 4 5; do \
-      if apt-get install -y --no-install-recommends \
-           ca-certificates curl pigz qemu-utils; then \
+      if apt-get install -y --no-install-recommends ca-certificates curl xz-utils; then \
         ok=true; break; \
       fi; \
       echo "apt-get install failed (attempt $attempt/5), retrying in 30s..."; \
@@ -18,14 +27,46 @@ RUN apt-get update && \
       apt-get update; \
     done && $ok && \
     rm -rf /var/lib/apt/lists/*
+RUN case "${TARGETARCH}" in amd64|arm64) ;; \
+      *) echo "unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac && \
+    tarball="ubuntu-24.04-server-cloudimg-${TARGETARCH}-root.tar.xz" && \
+    curl -fsSL --retry 5 -o "/tmp/${tarball}" "${UBUNTU_RELEASE_URL}/${tarball}" && \
+    curl -fsSL --retry 5 -o /tmp/SHA256SUMS "${UBUNTU_RELEASE_URL}/SHA256SUMS" && \
+    (cd /tmp && grep " \*\?${tarball}\$" SHA256SUMS | sha256sum -c -) && \
+    mkdir /rootfs && \
+    tar --extract --xz --file="/tmp/${tarball}" --numeric-owner --xattrs \
+      --xattrs-include='*' -C /rootfs && \
+    rm -f "/tmp/${tarball}" /rootfs/etc/resolv.conf && \
+    : > /rootfs/etc/resolv.conf
 
-RUN mkdir -p /disk && \
-    curl -fSL --connect-timeout 10 --retry 3 --retry-delay 2 \
-        -o /tmp/cloudimg.qcow2 "${UBUNTU_CLOUDIMG_URL}" && \
-    qemu-img convert -f qcow2 -O raw /tmp/cloudimg.qcow2 /tmp/disk.img && \
-    rm /tmp/cloudimg.qcow2 && \
-    pigz -1 /tmp/disk.img && \
-    mv /tmp/disk.img.gz /disk/disk.img.gz
+FROM scratch AS rootfs
+ARG KERNEL_PACKAGE=linux-generic
+COPY --from=fetch /rootfs/ /
+COPY images/host-ubuntu2404/assets/rootfs.sh /usr/local/bin/build-rootfs
+RUN KERNEL_PACKAGE="${KERNEL_PACKAGE}" sh /usr/local/bin/build-rootfs install
+RUN KERNEL_PACKAGE="${KERNEL_PACKAGE}" sh /usr/local/bin/build-rootfs finish
+
+FROM --platform=$BUILDPLATFORM docker.io/library/ubuntu:24.04 AS build
+ARG TARGETARCH
+RUN apt-get update && \
+    ok=false && \
+    for attempt in 1 2 3 4 5; do \
+      if apt-get install -y --no-install-recommends \
+           dosfstools e2fsprogs fdisk mtools pigz; then \
+        ok=true; break; \
+      fi; \
+      echo "apt-get install failed (attempt $attempt/5), retrying in 30s..."; \
+      sleep 30; \
+      apt-get update; \
+    done && $ok && \
+    rm -rf /var/lib/apt/lists/*
+COPY --from=rootfs /rootfs.tar /rootfs.kver /
+COPY images/host-azurelinux3/assets/disk.sh /usr/local/bin/build-disk
+COPY images/host-ubuntu2404/assets/validate.sh /usr/local/bin/validate-disk
+RUN TARGETARCH="${TARGETARCH}" DISTRO=ubuntu sh /usr/local/bin/build-disk && \
+    rm /rootfs.tar && \
+    TARGETARCH="${TARGETARCH}" sh /usr/local/bin/validate-disk /disk/disk.img.gz
 
 FROM scratch
 LABEL org.opencontainers.image.source="https://github.com/Azure/unbounded" \

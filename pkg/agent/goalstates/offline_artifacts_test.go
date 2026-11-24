@@ -72,6 +72,36 @@ func assertOfflineArtifactDownloads(t *testing.T, downloads *DownloadOverrides) 
 	require.NotContains(t, downloads.Runc.URL, "ignored")
 }
 
+func TestResolveMachineMirrorsRegistryReferences(t *testing.T) {
+	cfg := &config.AgentConfig{
+		MachineName: "machine-1",
+		NodeName:    "node-1",
+		Cluster: config.AgentClusterConfig{
+			CaCertBase64: "Y2EtYnl0ZXM=",
+			ClusterDNS:   "10.96.0.10",
+			Version:      "1.34.2",
+		},
+		Kubelet: config.AgentKubeletConfig{
+			ApiServer: "https://api.example.com",
+		},
+		OCIImage:       "ghcr.io/azure/agent-ubuntu2404:v20261031",
+		RegistryMirror: "http://10.0.0.1:5000/",
+	}
+
+	got, err := ResolveMachine(discardLogger(), cfg, "kube1", nil)
+	require.NoError(t, err)
+	require.Equal(t, "10.0.0.1:5000/ghcr.io/azure/agent-ubuntu2404:v20261031", got.RootFS.OCIImage)
+	require.Equal(t, "http://10.0.0.1:5000/", got.NodeStart.RegistryMirror)
+
+	source, err := resolveOfflineArtifactSource(
+		cfg,
+		"oci://ghcr.io/azure/unbounded-bootstrap:{{ .KubernetesVersion }}",
+		"v1.34.2",
+	)
+	require.NoError(t, err)
+	require.Equal(t, "oci://10.0.0.1:5000/ghcr.io/azure/unbounded-bootstrap:v1.34.2", source)
+}
+
 func TestResolveDownloadOverridesWithOfflineArtifactsNoopWithoutOfflineConfig(t *testing.T) {
 	t.Parallel()
 

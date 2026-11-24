@@ -13,8 +13,10 @@ import (
 	"github.com/opencontainers/umoci/oci/casext"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
 
 func TestOCIReconcilerMapMachineToImage(t *testing.T) {
@@ -142,7 +144,7 @@ func TestOCIReconcilerMapMachineToImage(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			reqs := tt.r.mapMachineToImage(t.Context(), tt.machine)
+			reqs := filterAgentImageRequests(tt.r.mapMachineToImage(t.Context(), tt.machine))
 			if len(reqs) != len(tt.wantReqs) {
 				t.Fatalf("request count: got %d, want %d: %#v", len(reqs), len(tt.wantReqs), reqs)
 			}
@@ -159,6 +161,32 @@ func TestOCIReconcilerMapMachineToImage(t *testing.T) {
 			}
 		})
 	}
+}
+
+// filterAgentImageRequests drops the built-in agent rootfs images so a test can
+// assert only the boot artifacts of a Machine.
+func filterAgentImageRequests(reqs []reconcile.Request) []reconcile.Request {
+	agentRefs := map[string]bool{
+		goalstates.DefaultOCIImage:                  true,
+		goalstates.DefaultNvidiaOCIImage:            true,
+		goalstates.DefaultUbuntu2604OCIImage:        true,
+		goalstates.DefaultUbuntu2604NvidiaOCIImage:  true,
+		goalstates.DefaultAzureLinux3OCIImage:       true,
+		goalstates.DefaultAzureLinux3NvidiaOCIImage: true,
+	}
+
+	filtered := make([]reconcile.Request, 0, len(reqs))
+
+	for _, req := range reqs {
+		decoded, err := decodeImagePullRequest(req.NamespacedName)
+		if err == nil && agentRefs[decoded.ImageRef] {
+			continue
+		}
+
+		filtered = append(filtered, req)
+	}
+
+	return filtered
 }
 
 func TestCredentialFromPullSecret(t *testing.T) {

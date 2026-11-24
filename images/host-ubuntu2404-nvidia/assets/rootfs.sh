@@ -86,6 +86,7 @@ apt_install \
   libnvsdm \
   "nvlsm=$NVLSM_VERSION" \
   rdma-core ibverbs-providers ibverbs-utils infiniband-diags perftest \
+  systemd-container nftables util-linux \
   pciutils kmod
 
 # The pinning package does not cover NVLSM, and the kernel metapackages

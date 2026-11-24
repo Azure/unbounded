@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"text/template"
 
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
@@ -68,9 +69,9 @@ func (c *configureContainerd) Do(_ context.Context) error {
 		return fmt.Errorf("ensure containerd config: %w", err)
 	}
 
-	if !c.goalState.Gantry.Disabled {
-		if err := c.ensureGantryHostsConfig(); err != nil {
-			return fmt.Errorf("ensure Gantry containerd hosts config: %w", err)
+	if !c.goalState.Gantry.Disabled || containerdMirrorHost(c.goalState.RegistryMirror) != "" {
+		if err := c.ensureContainerdHostsConfig(); err != nil {
+			return fmt.Errorf("ensure containerd registry hosts config: %w", err)
 		}
 	}
 
@@ -113,7 +114,7 @@ func (c *configureContainerd) ensureContainerdConfig() error {
 	return c.write(dest, buf.Bytes(), 0o644)
 }
 
-func (c *configureContainerd) ensureGantryHostsConfig() error {
+func (c *configureContainerd) ensureContainerdHostsConfig() error {
 	dest := c.goalState.Root().Path(goalstates.ContainerdDefaultHostsPath)
 
 	existing, err := os.ReadFile(dest)
@@ -131,7 +132,56 @@ func (c *configureContainerd) ensureGantryHostsConfig() error {
 		return err
 	}
 
-	return c.write(dest, []byte(gantryHostsConfig), 0o644)
+	content := containerdHostsConfig(!c.goalState.Gantry.Disabled, c.goalState.RegistryMirror)
+
+	return c.write(dest, []byte(content), 0o644)
+}
+
+// containerdHostsConfig renders the managed containerd hosts.toml. The managed
+// marker is always the first line so the managed-file check and the reset code
+// recognize the file. The Gantry block is included when gantryEnabled, and a
+// registry mirror block when registryMirror names a host. An empty result means
+// no hosts file is needed.
+func containerdHostsConfig(gantryEnabled bool, registryMirror string) string {
+	gantryBlock := strings.TrimPrefix(gantryHostsConfig, gantryHostsManagedMarker+"\n")
+
+	mirrorHost := containerdMirrorHost(registryMirror)
+
+	if !gantryEnabled && mirrorHost == "" {
+		return ""
+	}
+
+	var b strings.Builder
+
+	b.WriteString(gantryHostsManagedMarker)
+
+	if gantryEnabled {
+		b.WriteString("\n")
+		b.WriteString(gantryBlock)
+	}
+
+	if mirrorHost != "" {
+		b.WriteString("\n[host.\"")
+		b.WriteString(mirrorHost)
+		b.WriteString("\"]\n  capabilities = [\"pull\", \"resolve\"]\n")
+	}
+
+	return b.String()
+}
+
+// containerdMirrorHost normalizes a registry mirror to a containerd host URL,
+// keeping an explicit HTTP or HTTPS scheme and defaulting to plain HTTP.
+func containerdMirrorHost(mirror string) string {
+	mirror = strings.TrimRight(mirror, "/")
+	switch {
+	case mirror == "":
+		return ""
+	case strings.HasPrefix(mirror, "http://"), strings.HasPrefix(mirror, "https://"):
+	default:
+		mirror = "http://" + mirror
+	}
+
+	return mirror
 }
 
 func hasGantryHostsManagedMarker(content []byte) bool {

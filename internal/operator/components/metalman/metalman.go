@@ -329,9 +329,13 @@ func deployment(site *unboundedv1alpha3.Site, namespace string, cfg component.Co
 		unboundedv1alpha3.MachineSiteLabelKey: site.Name,
 	}
 
-	args := []string{"serve-pxe", "--site=" + site.Name}
+	args := []string{"serve-pxe", "--site=" + site.Name, "--cache-dir=/var/cache/metalman"}
 	if site.Spec.Components.Metalman.DHCPAutoInterface != nil && *site.Spec.Components.Metalman.DHCPAutoInterface {
 		args = append(args, "--dhcp-auto-interface")
+	}
+
+	if baseURL := strings.TrimSpace(site.Spec.Components.Metalman.AgentBaseURL); baseURL != "" {
+		args = append(args, "--agent-base-url="+baseURL)
 	}
 
 	replicas := int32(1)

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"github.com/opencontainers/umoci"
 	"github.com/opencontainers/umoci/oci/casext"
 	"github.com/opencontainers/umoci/oci/layer"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"oras.land/oras-go/v2"
 	"oras.land/oras-go/v2/content/oci"
@@ -32,6 +34,7 @@ import (
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/helpers/dockermedia"
 	"github.com/Azure/unbounded/internal/helpers/ociregistry"
+	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
 
 func init() {
@@ -42,35 +45,70 @@ func init() {
 // to detect updated images pushed under the same tag.
 const imageResyncInterval = 5 * time.Minute
 
-// OCIReconciler watches Machines and retained operation media for OCI images.
-// Work items are deduplicated by image reference, architecture, and pull secret
-// so machines sharing the same pull identity only trigger one download.
+// OCIReconciler watches Machines, retained operation media and DaemonSets for
+// OCI images. Work items are deduplicated by image reference, architecture, and
+// pull secret so machines sharing the same pull identity only trigger one
+// download.
+//
+// Every replica runs this controller: each metalman serves its own cache and a
+// node may be answered by any replica.
 type OCIReconciler struct {
 	Client                      client.Client
 	Cache                       *OCICache
 	Site                        string
+	ProviderLabels              map[string]string
 	DefaultNetbootRef           string
 	DefaultNetbootPullSecretRef *v1alpha3.NamespacedSecretReference
+	// BootstrapArtifactsRef is the OCI artifact that carries the offline
+	// agent bootstrap bundle for the cluster's Kubernetes version. Empty
+	// disables pre-warming it.
+	BootstrapArtifactsRef string
 }
 
 type imagePullRequest struct {
 	ImageRef      string                              `json:"imageRef"`
 	Architecture  string                              `json:"architecture"`
 	PullSecretRef *v1alpha3.NamespacedSecretReference `json:"pullSecretRef,omitempty"`
+	// Unpack selects images whose /disk/ tree metalman serves over TFTP and
+	// HTTP. Images consumed by containers or by the agent are kept as OCI
+	// layouts only.
+	Unpack bool `json:"unpack,omitempty"`
 }
+
+// NeedLeaderElection runs the cache warmers on every replica.
+func (r *OCIReconciler) NeedLeaderElection() bool { return false }
 
 func (r *OCIReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		Named("oci-image").
 		Watches(&v1alpha3.Machine{}, handler.EnqueueRequestsFromMapFunc(r.mapMachineToImage)).
 		Watches(&v1alpha3.MachineOperation{}, handler.EnqueueRequestsFromMapFunc(r.mapOperationToImage)).
+		Watches(&appsv1.DaemonSet{}, handler.EnqueueRequestsFromMapFunc(r.mapDaemonSetToMachines)).
 		Complete(r)
+}
+
+// mapDaemonSetToMachines re-enqueues every Machine when a DaemonSet changes,
+// so images it references are warmed for the next boot.
+func (r *OCIReconciler) mapDaemonSetToMachines(ctx context.Context, _ client.Object) []reconcile.Request {
+	var machines v1alpha3.MachineList
+	if err := r.Client.List(ctx, &machines); err != nil {
+		slog.ErrorContext(ctx, "listing machines for DaemonSet change", "err", err)
+		return nil
+	}
+
+	var requests []reconcile.Request
+
+	for i := range machines.Items {
+		requests = append(requests, r.mapMachineToImage(ctx, &machines.Items[i])...)
+	}
+
+	return requests
 }
 
 // mapMachineToImage maps a Machine event to a reconcile request keyed by
 // image reference. This ensures that multiple machines referencing the same
 // image produce only one work item in the queue.
-func (r *OCIReconciler) mapMachineToImage(_ context.Context, obj client.Object) []reconcile.Request {
+func (r *OCIReconciler) mapMachineToImage(ctx context.Context, obj client.Object) []reconcile.Request {
 	machine, ok := obj.(*v1alpha3.Machine)
 	if !ok {
 		return nil
@@ -80,29 +118,161 @@ func (r *OCIReconciler) mapMachineToImage(_ context.Context, obj client.Object) 
 		return nil
 	}
 
-	refs := []imagePullRequest{
-		{
-			ImageRef:      machine.Spec.Netboot().Image,
-			Architecture:  machine.Spec.Netboot().TargetArchitecture(),
-			PullSecretRef: machine.Spec.Netboot().PullSecretRef,
-		},
-	}
+	spec := machine.Spec.Netboot()
+	architecture := spec.TargetArchitecture()
 
-	if machine.Spec.Netboot().NetbootImage != "" {
+	refs := []imagePullRequest{{
+		ImageRef:      spec.Image,
+		Architecture:  architecture,
+		PullSecretRef: spec.PullSecretRef,
+		Unpack:        true,
+	}}
+
+	if spec.NetbootImage != "" {
 		refs = append(refs, imagePullRequest{
-			ImageRef:      machine.Spec.Netboot().NetbootImage,
-			Architecture:  machine.Spec.Netboot().TargetArchitecture(),
-			PullSecretRef: machine.Spec.Netboot().NetbootPullSecretRef,
+			ImageRef:      spec.NetbootImage,
+			Architecture:  architecture,
+			PullSecretRef: spec.NetbootPullSecretRef,
+			Unpack:        true,
 		})
 	} else {
 		refs = append(refs, imagePullRequest{
 			ImageRef:      r.DefaultNetbootRef,
-			Architecture:  machine.Spec.Netboot().TargetArchitecture(),
+			Architecture:  architecture,
 			PullSecretRef: r.DefaultNetbootPullSecretRef,
+			Unpack:        true,
 		})
 	}
 
+	refs = append(refs, r.agentImageRequests(machine, architecture)...)
+	refs = append(refs, r.bootstrapArtifactRequests(architecture)...)
+	refs = append(refs, r.daemonSetRequests(ctx, machine, architecture)...)
+
 	return imageReconcileRequests(refs)
+}
+
+// agentImageRequests returns the machine image (nspawn rootfs) images the
+// agent may pull on this Machine. Without an explicit spec.agent.image the
+// agent chooses between the built-in defaults on the node, so every default
+// for the architecture is warmed.
+func (r *OCIReconciler) agentImageRequests(machine *v1alpha3.Machine, architecture string) []imagePullRequest {
+	imageRefs := []string{
+		goalstates.DefaultOCIImage,
+		goalstates.DefaultNvidiaOCIImage,
+		goalstates.DefaultUbuntu2604OCIImage,
+		goalstates.DefaultUbuntu2604NvidiaOCIImage,
+		goalstates.DefaultAzureLinux3OCIImage,
+		goalstates.DefaultAzureLinux3NvidiaOCIImage,
+	}
+
+	if machine.Spec.Agent != nil && machine.Spec.Agent.Image != "" {
+		imageRefs = []string{machine.Spec.Agent.Image}
+	}
+
+	requests := make([]imagePullRequest, 0, len(imageRefs))
+	for _, imageRef := range imageRefs {
+		requests = append(requests, imagePullRequest{ImageRef: imageRef, Architecture: architecture})
+	}
+
+	return requests
+}
+
+// bootstrapArtifactRequests returns the offline bootstrap bundle, if one is
+// configured. The bundle is an OCI artifact that the agent reads layer by
+// layer, so metalman keeps the layout and does not unpack it.
+func (r *OCIReconciler) bootstrapArtifactRequests(architecture string) []imagePullRequest {
+	if r.BootstrapArtifactsRef == "" {
+		return nil
+	}
+
+	return []imagePullRequest{{ImageRef: r.BootstrapArtifactsRef, Architecture: architecture}}
+}
+
+// daemonSetRequests returns the images of DaemonSets that would run on this
+// Machine, so a node whose only reachable registry is metalman can start them
+// after it joins.
+func (r *OCIReconciler) daemonSetRequests(ctx context.Context, machine *v1alpha3.Machine, architecture string) []imagePullRequest {
+	if r.Client == nil {
+		return nil
+	}
+
+	var daemonSets appsv1.DaemonSetList
+	if err := r.Client.List(ctx, &daemonSets); err != nil {
+		slog.WarnContext(ctx, "listing DaemonSets for image warm-up", "err", err)
+		return nil
+	}
+
+	labels := make(map[string]string, len(r.ProviderLabels))
+
+	for key, value := range r.ProviderLabels {
+		labels[key] = value
+	}
+
+	if machine.Spec.Kubernetes != nil {
+		for key, value := range machine.Spec.Kubernetes.NodeLabels {
+			labels[key] = value
+		}
+	}
+
+	var requests []imagePullRequest
+
+	for i := range daemonSets.Items {
+		daemonSet := &daemonSets.Items[i]
+		if !daemonSetSchedulesOn(daemonSet, labels) {
+			continue
+		}
+
+		pullSecretRef := firstPullSecretRef(daemonSet.Namespace, daemonSet.Spec.Template.Spec.ImagePullSecrets)
+
+		for _, container := range podSpecContainers(daemonSet.Spec.Template.Spec) {
+			if container.Image == "" || container.ImagePullPolicy == corev1.PullNever {
+				continue
+			}
+
+			requests = append(requests, imagePullRequest{
+				ImageRef:      container.Image,
+				Architecture:  architecture,
+				PullSecretRef: pullSecretRef,
+			})
+		}
+	}
+
+	return requests
+}
+
+// daemonSetSchedulesOn reports whether a DaemonSet's node selector is
+// satisfied by the labels the Machine's node will carry.
+func daemonSetSchedulesOn(daemonSet *appsv1.DaemonSet, labels map[string]string) bool {
+	for key, want := range daemonSet.Spec.Template.Spec.NodeSelector {
+		if labels[key] != want {
+			return false
+		}
+	}
+
+	return true
+}
+
+// podSpecContainers returns the regular and init containers of a pod spec.
+func podSpecContainers(spec corev1.PodSpec) []corev1.Container {
+	containers := make([]corev1.Container, 0, len(spec.InitContainers)+len(spec.Containers))
+	containers = append(containers, spec.InitContainers...)
+	containers = append(containers, spec.Containers...)
+
+	return containers
+}
+
+// firstPullSecretRef returns the first image pull secret of a workload, in the
+// workload's namespace.
+func firstPullSecretRef(namespace string, secrets []corev1.LocalObjectReference) *v1alpha3.NamespacedSecretReference {
+	for _, secret := range secrets {
+		if secret.Name == "" {
+			continue
+		}
+
+		return &v1alpha3.NamespacedSecretReference{Namespace: namespace, Name: secret.Name}
+	}
+
+	return nil
 }
 
 func (r *OCIReconciler) mapOperationToImage(_ context.Context, obj client.Object) []reconcile.Request {
@@ -123,11 +293,21 @@ func (r *OCIReconciler) mapOperationToImage(_ context.Context, obj client.Object
 
 		artifactsNeeded := !mediaArtifactsReleased(op, target)
 		if artifactsNeeded {
-			refs = append(refs, imagePullRequest{ImageRef: spec.Image, Architecture: spec.TargetArchitecture(), PullSecretRef: spec.PullSecretRef})
+			refs = append(refs, imagePullRequest{
+				ImageRef:      spec.Image,
+				Architecture:  spec.TargetArchitecture(),
+				PullSecretRef: spec.PullSecretRef,
+				Unpack:        true,
+			})
 		}
 
 		if artifactsNeeded || mediaFirstBootPending(target) {
-			refs = append(refs, imagePullRequest{ImageRef: spec.NetbootImage, Architecture: spec.TargetArchitecture(), PullSecretRef: spec.NetbootPullSecretRef})
+			refs = append(refs, imagePullRequest{
+				ImageRef:      spec.NetbootImage,
+				Architecture:  spec.TargetArchitecture(),
+				PullSecretRef: spec.NetbootPullSecretRef,
+				Unpack:        true,
+			})
 		}
 	}
 
@@ -182,13 +362,13 @@ func (r *OCIReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 
 	// Check if we already have this exact digest cached.
 	existingDigest := r.Cache.DigestForArchitecture(imageRef, architecture)
-	if existingDigest == remoteDigest && r.Cache.IsCachedForArchitecture(remoteDigest, architecture) {
+	if existingDigest == remoteDigest && r.isCached(pullReq, remoteDigest) {
 		return ctrl.Result{RequeueAfter: imageResyncInterval}, nil
 	}
 
-	logger.InfoContext(ctx, "pulling OCI image", "image", imageRef, "digest", remoteDigest, "architecture", architecture)
+	logger.InfoContext(ctx, "pulling OCI image", "image", imageRef, "digest", remoteDigest, "architecture", architecture, "unpack", pullReq.Unpack)
 
-	if err := r.pullAndUnpack(ctx, imageRef, remoteDigest, repo, architecture); err != nil {
+	if err := r.pull(ctx, pullReq, remoteDigest, repo); err != nil {
 		logger.ErrorContext(ctx, "pulling OCI image", "err", err, "image", imageRef, "architecture", architecture)
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
@@ -197,6 +377,17 @@ func (r *OCIReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 	logger.InfoContext(ctx, "OCI image cached", "image", imageRef, "digest", remoteDigest, "architecture", architecture)
 
 	return ctrl.Result{RequeueAfter: imageResyncInterval}, nil
+}
+
+// isCached reports whether the content a pull request needs is already on
+// disk: the unpacked /disk/ tree for the images metalman serves as files, and
+// an OCI layout for the images it serves as a registry.
+func (r *OCIReconciler) isCached(req imagePullRequest, digest string) bool {
+	if req.Unpack {
+		return r.Cache.IsCachedForArchitecture(digest, req.Architecture)
+	}
+
+	return r.Cache.HasLayout(digest)
 }
 
 // newRepository creates a remote.Repository for the given image reference,
@@ -422,33 +613,32 @@ func isDockerHubRegistry(registry string) bool {
 	}
 }
 
-func (r *OCIReconciler) pullAndUnpack(ctx context.Context, imageRef, imageDigest string, repo *remote.Repository, architecture string) error {
-	// Check if already cached (another reconcile may have beaten us).
-	if r.Cache.IsCachedForArchitecture(imageDigest, architecture) {
+// pull stores the image as an OCI layout under the cache directory and, when
+// the request needs it, unpacks the requested platform's root filesystem.
+func (r *OCIReconciler) pull(ctx context.Context, req imagePullRequest, imageDigest string, repo *remote.Repository) error {
+	if r.isCached(req, imageDigest) {
 		return nil
 	}
 
+	layoutDir := r.Cache.LayoutDir(imageDigest)
+
+	if !r.Cache.HasLayout(imageDigest) {
+		if err := r.copyLayout(ctx, repo, layoutDir); err != nil {
+			return err
+		}
+	}
+
+	if !req.Unpack {
+		return nil
+	}
+
+	architecture := normalizeArchitecture(req.Architecture)
 	imageDir := r.Cache.ImageDirForArchitecture(imageDigest, architecture)
 
 	if err := os.MkdirAll(imageDir, 0o755); err != nil {
 		return fmt.Errorf("creating image dir: %w", err)
 	}
 
-	tagOrDigest := repo.Reference.Reference
-
-	// Create a temporary directory for the OCI layout store.
-	layoutDir, err := os.MkdirTemp("", "metalman-oci-*")
-	if err != nil {
-		return fmt.Errorf("create temp dir for OCI layout: %w", err)
-	}
-	defer os.RemoveAll(layoutDir) //nolint:errcheck // best effort cleanup
-
-	// Copy (pull) the image from the remote repository into the local OCI layout.
-	if err := copyToLayout(ctx, repo, tagOrDigest, layoutDir); err != nil {
-		return fmt.Errorf("pull image %q: %w", imageRef, err)
-	}
-
-	// Unpack the OCI layout into the image directory using umoci.
 	if err := unpackOCILayout(ctx, layoutDir, layoutTag, imageDir, architecture); err != nil {
 		os.RemoveAll(imageDir) //nolint:errcheck // Clean up partial unpack.
 		return fmt.Errorf("unpack OCI image: %w", err)
@@ -459,6 +649,40 @@ func (r *OCIReconciler) pullAndUnpack(ctx context.Context, imageRef, imageDigest
 	if _, err := os.Stat(diskDir); err != nil {
 		os.RemoveAll(imageDir) //nolint:errcheck // Clean up partial unpack.
 		return fmt.Errorf("OCI image missing /disk directory")
+	}
+
+	return nil
+}
+
+// copyLayout copies an image from its registry into a local OCI layout. The
+// copy lands in a partial directory first so a failed pull is never served.
+func (r *OCIReconciler) copyLayout(ctx context.Context, repo *remote.Repository, layoutDir string) error {
+	if err := os.MkdirAll(filepath.Dir(layoutDir), 0o755); err != nil {
+		return fmt.Errorf("creating layout dir: %w", err)
+	}
+
+	partialDir := layoutDir + ".partial"
+
+	if err := os.RemoveAll(partialDir); err != nil {
+		return fmt.Errorf("clearing partial layout: %w", err)
+	}
+
+	if err := copyToLayout(ctx, repo, repo.Reference.Reference, partialDir); err != nil {
+		os.RemoveAll(partialDir) //nolint:errcheck // Best effort cleanup.
+
+		return fmt.Errorf("pull image %q: %w", repo.Reference.String(), err)
+	}
+
+	if err := os.RemoveAll(layoutDir); err != nil {
+		os.RemoveAll(partialDir) //nolint:errcheck // Best effort cleanup.
+
+		return fmt.Errorf("clearing layout: %w", err)
+	}
+
+	if err := os.Rename(partialDir, layoutDir); err != nil {
+		os.RemoveAll(partialDir) //nolint:errcheck // Best effort cleanup.
+
+		return fmt.Errorf("storing layout: %w", err)
 	}
 
 	return nil

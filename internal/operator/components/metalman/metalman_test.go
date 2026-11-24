@@ -6,6 +6,7 @@ package metalman
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 
@@ -93,6 +94,7 @@ func TestDeployment(t *testing.T) {
 			SiteComponentSpec: unboundedv1alpha3.SiteComponentSpec{Enabled: &enabled},
 			DHCPAutoInterface: &dhcpAuto,
 			Replicas:          &replicas,
+			AgentBaseURL:      "  https://mirror.example/unbounded/releases  ",
 		}}},
 	}
 
@@ -110,8 +112,15 @@ func TestDeployment(t *testing.T) {
 		t.Fatalf("image = %q", container.Image)
 	}
 
-	if got := container.Args; len(got) != 3 || got[0] != "serve-pxe" || got[1] != "--site=rack-a" || got[2] != "--dhcp-auto-interface" {
-		t.Fatalf("args = %#v", got)
+	wantArgs := []string{
+		"serve-pxe",
+		"--site=rack-a",
+		"--cache-dir=/var/cache/metalman",
+		"--dhcp-auto-interface",
+		"--agent-base-url=https://mirror.example/unbounded/releases",
+	}
+	if !slices.Equal(container.Args, wantArgs) {
+		t.Fatalf("args = %#v, want %#v", container.Args, wantArgs)
 	}
 
 	if d.Spec.Replicas == nil || *d.Spec.Replicas != 3 {
@@ -182,6 +191,11 @@ func TestDeploymentRespectsNamespaceAndDefaults(t *testing.T) {
 
 	if got := findEnv(d.Spec.Template.Spec.Containers[0].Env, "METALMAN_APISERVER_URL"); got != nil {
 		t.Fatalf("METALMAN_APISERVER_URL env = %#v, want unset when APIServerEndpoint is empty", got)
+	}
+
+	wantArgs := []string{"serve-pxe", "--site=rack-a", "--cache-dir=/var/cache/metalman"}
+	if got := d.Spec.Template.Spec.Containers[0].Args; !slices.Equal(got, wantArgs) {
+		t.Fatalf("args = %#v, want %#v", got, wantArgs)
 	}
 }
 
