@@ -66,7 +66,7 @@ func resolveOfflineArtifacts(ctx context.Context, cfg *config.AgentConfig, offli
 		return nil, errors.New("Cluster.Version is required when OfflineArtifacts.Source is configured")
 	}
 
-	renderedSource, err := RenderOfflineSource(offline.Source, clusterVersion)
+	renderedSource, err := resolveOfflineArtifactSource(cfg, offline.Source, clusterVersion)
 	if err != nil {
 		return nil, err
 	}
@@ -106,6 +106,18 @@ func resolveOfflineArtifacts(ctx context.Context, cfg *config.AgentConfig, offli
 	}
 
 	return &ResolvedOfflineArtifacts{SourceRoot: bundle.Root(), Manifest: manifest, bundle: bundle}, nil
+}
+
+// resolveOfflineArtifactSource renders an OfflineArtifacts.Source template and
+// redirects the result through the configured registry mirror. The template is
+// rendered before mirroring so its Kubernetes version placeholders still work.
+func resolveOfflineArtifactSource(cfg *config.AgentConfig, sourceTemplate, clusterVersion string) (string, error) {
+	rendered, err := RenderOfflineSource(sourceTemplate, clusterVersion)
+	if err != nil {
+		return "", err
+	}
+
+	return cfg.MirrorReference(rendered), nil
 }
 
 // RenderOfflineSource renders an OfflineArtifacts.Source template for the given

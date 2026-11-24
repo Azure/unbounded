@@ -138,6 +138,10 @@ rules:
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list", "watch"]
+  # DaemonSets (pre-warm the images a booting node will pull after it joins)
+  - apiGroups: ["apps"]
+    resources: ["daemonsets"]
+    verbs: ["get", "list", "watch"]
   # Kubelet client CSRs from metalman-bootstrap tokens, approved only for the
   # node name recorded with the token's credential on its attested Machine
   - apiGroups: ["certificates.k8s.io"]

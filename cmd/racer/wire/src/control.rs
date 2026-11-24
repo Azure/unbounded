@@ -1378,6 +1378,15 @@ mod codec {
 
         #[serde(rename = "maxConcurrentRequests")]
         max_concurrent_requests: u32,
+
+        // Optional and omitted when false, so caches that do not opt in keep
+        // their canonical bytes and older parsers still accept them.
+        #[serde(
+            rename = "metadataImmutable",
+            default,
+            skip_serializing_if = "std::ops::Not::not"
+        )]
+        metadata_immutable: bool,
     }
 
     /// Wire spelling of `AzureOriginDefinition`.
@@ -1436,6 +1445,7 @@ mod codec {
                 metadata_ttl_millis: millis(o.metadata_ttl)?,
                 request_timeout_millis: millis(o.request_timeout)?,
                 max_concurrent_requests: o.max_concurrent_requests,
+                metadata_immutable: o.metadata_immutable,
             })
         }
 
@@ -1462,6 +1472,7 @@ mod codec {
                 metadata_ttl: Duration::from_millis(self.metadata_ttl_millis),
                 request_timeout: Duration::from_millis(self.request_timeout_millis),
                 max_concurrent_requests: self.max_concurrent_requests,
+                metadata_immutable: self.metadata_immutable,
             })
         }
     }
@@ -2474,9 +2485,22 @@ mod codec {
             ));
             let text = String::from_utf8(encode_publication(&next).unwrap()).unwrap();
             let exact = format!(
-                "\"origin\":{{\"azure\":{{\"containerURL\":\"https://acct.blob.core.windows.net/models\",\"credential\":{{\"workloadIdentity\":{{\"clientID\":\"{guid}\"}}}}}},\"metadataTTLMillis\":30000,\"requestTimeoutMillis\":60000,\"maxConcurrentRequests\":512}}"
+                "\"origin\":{{\"azure\":{{\"containerURL\":\"https://acct.blob.core.windows.net/models\",\"credential\":{{\"workloadIdentity\":{{\"clientID\":\"{guid}\"}}}}}},\"metadataTTLMillis\":3600000,\"requestTimeoutMillis\":60000,\"maxConcurrentRequests\":512}}"
             );
             assert!(text.contains(&exact), "{text}");
+            // Not opted in: the flag is omitted and older parsers accept it.
+            assert!(!text.contains("metadataImmutable"), "{text}");
+
+            // Opted in: the flag round-trips and changes canonical content.
+            next.caches[0].origin.as_mut().unwrap().metadata_immutable = true;
+            let b = encode_publication(&next).unwrap();
+            let opted_in = String::from_utf8(b.clone()).unwrap();
+            assert!(
+                opted_in.contains(",\"metadataImmutable\":true"),
+                "{opted_in}"
+            );
+            assert_eq!(decode_publication(&b).unwrap().caches, next.caches);
+            assert_ne!(content_hashes(&next).unwrap().0, base_content);
 
             // Invalid in-process definitions are rejected by encode and validate.
             let mut bad = next.clone();
@@ -2520,7 +2544,7 @@ mod codec {
                 ),
                 ("\"workloadIdentity\"", "\"secretRef\""),
                 (&format!("\"clientID\":\"{guid}\""), "\"clientID\":\"x\""),
-                (",\"metadataTTLMillis\":30000", ""),
+                (",\"metadataTTLMillis\":3600000", ""),
             ] {
                 let bad = good.replace(from, to);
                 assert_ne!(bad, good, "{from}");

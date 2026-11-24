@@ -117,6 +117,115 @@ func TestCRIConfig_JSONRoundTrip(t *testing.T) {
 	assert.True(t, decoded.Gantry.Disabled)
 }
 
+func TestAgentConfig_RegistryMirrorJSONRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	cfg := AgentConfig{
+		MachineName:    "test",
+		RegistryMirror: "10.0.0.1:5000",
+	}
+
+	data, err := json.Marshal(cfg)
+	require.NoError(t, err)
+
+	var decoded AgentConfig
+	require.NoError(t, json.Unmarshal(data, &decoded))
+
+	assert.Equal(t, "10.0.0.1:5000", decoded.RegistryMirror)
+}
+
+func TestAgentConfig_MirrorReference(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		mirror string
+		ref    string
+		want   string
+	}{
+		{
+			name: "no mirror",
+			ref:  "ghcr.io/azure/agent:v1",
+			want: "ghcr.io/azure/agent:v1",
+		},
+		{
+			name:   "registry reference",
+			mirror: "10.0.0.1:5000",
+			ref:    "ghcr.io/azure/agent:v1",
+			want:   "10.0.0.1:5000/ghcr.io/azure/agent:v1",
+		},
+		{
+			name:   "oci reference",
+			mirror: "10.0.0.1:5000",
+			ref:    "oci://ghcr.io/azure/bundle:v1",
+			want:   "oci://10.0.0.1:5000/ghcr.io/azure/bundle:v1",
+		},
+		{
+			name:   "oci reference with path",
+			mirror: "10.0.0.1:5000",
+			ref:    "oci://ghcr.io/azure/bundle:v1#manifest.json",
+			want:   "oci://10.0.0.1:5000/ghcr.io/azure/bundle:v1#manifest.json",
+		},
+		{
+			name:   "file URL",
+			mirror: "10.0.0.1:5000",
+			ref:    "file:///var/lib/unbounded/bundle",
+			want:   "file:///var/lib/unbounded/bundle",
+		},
+		{
+			name:   "https URL",
+			mirror: "10.0.0.1:5000",
+			ref:    "https://example.test/bundle.tar.gz",
+			want:   "https://example.test/bundle.tar.gz",
+		},
+		{
+			name:   "mirror with http prefix",
+			mirror: "http://10.0.0.1:5000",
+			ref:    "ghcr.io/azure/agent:v1",
+			want:   "10.0.0.1:5000/ghcr.io/azure/agent:v1",
+		},
+		{
+			name:   "mirror with https prefix",
+			mirror: "https://registry.lan:5000",
+			ref:    "ghcr.io/azure/agent:v1",
+			want:   "registry.lan:5000/ghcr.io/azure/agent:v1",
+		},
+		{
+			name:   "mirror with trailing slash",
+			mirror: "http://10.0.0.1:5000/",
+			ref:    "ghcr.io/azure/agent:v1",
+			want:   "10.0.0.1:5000/ghcr.io/azure/agent:v1",
+		},
+		{
+			name:   "reference with its own host port",
+			mirror: "10.0.0.1:5000",
+			ref:    "registry.lan:5000/azure/agent:v1",
+			want:   "10.0.0.1:5000/registry.lan_5000/azure/agent:v1",
+		},
+		{
+			name:   "oci artifact source with a host port",
+			mirror: "10.0.0.1:5000",
+			ref:    "oci://registry.lan:5000/azure/bootstrap:tag",
+			want:   "oci://10.0.0.1:5000/registry.lan_5000/azure/bootstrap:tag",
+		},
+		{
+			name:   "empty reference",
+			mirror: "10.0.0.1:5000",
+			ref:    "",
+			want:   "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := &AgentConfig{RegistryMirror: tt.mirror}
+			assert.Equal(t, tt.want, cfg.MirrorReference(tt.ref))
+		})
+	}
+}
+
 func TestIsSystemdDeviceGroupSpecifier(t *testing.T) {
 	t.Parallel()
 

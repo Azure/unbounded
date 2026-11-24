@@ -240,6 +240,18 @@ impl Availability {
         self.mode(cache).passthrough()
     }
 
+    /// Freshness policy of this cache's published origin. Absent when the cache
+    /// has no published origin and a self-deployed origin process defines
+    /// freshness instead.
+    pub(crate) fn metadata_policy(&self, cache: &CacheId) -> Option<MetadataPolicy> {
+        self.with_cache(cache, |c| {
+            c.and_then(|c| c.origin.as_ref()).map(|o| MetadataPolicy {
+                immutable: o.metadata_immutable,
+                ttl: o.metadata_ttl,
+            })
+        })
+    }
+
     /// Require both cache admission and an active page key for metadata reads.
     pub fn metadata(&self, cache: &CacheId) -> bool {
         self.cache(cache) && self.keys.has_active(cache, KeyPurpose::Page)
@@ -255,6 +267,13 @@ impl Availability {
     pub fn page(&self, cache: &CacheId, key: KeyId) -> bool {
         self.cache(cache) && self.keys.admits(cache, key, KeyPurpose::Page)
     }
+}
+
+/// Origin freshness policy for one cache, copied out of the publication.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MetadataPolicy {
+    pub(crate) immutable: bool,
+    pub(crate) ttl: std::time::Duration,
 }
 
 /// Published cache definitions in publication order, with an id index built
@@ -344,6 +363,26 @@ pub(crate) fn for_cache_modes(
     availability
 }
 
+/// Single-node fixture definition for one cache, with an optional origin.
+#[cfg(test)]
+pub(crate) fn test_cache_definition(
+    id: CacheId,
+    name: &str,
+    mode: racer_wire::control::CacheMode,
+    origin: Option<racer_wire::control::OriginDefinition>,
+) -> CacheDefinition {
+    let (client_socket, origin_socket) = wire::canonical_socket_paths(name).unwrap();
+    CacheDefinition {
+        id,
+        name: name.to_owned(),
+        client_socket,
+        origin_socket,
+        priority: racer_wire::control::DEFAULT_PRIORITY,
+        mode,
+        origin,
+    }
+}
+
 #[cfg(test)]
 impl Availability {
     /// Publish the next single-node fixture with `caches` in their modes, as a
@@ -353,6 +392,16 @@ impl Availability {
         env: &racer_io::Env,
         caches: Vec<(CacheId, racer_wire::control::CacheMode)>,
     ) {
+        let definitions = caches
+            .into_iter()
+            .enumerate()
+            .map(|(i, (id, mode))| test_cache_definition(id, &format!("rotation-{i}"), mode, None))
+            .collect();
+        self.publish_definitions(env, definitions);
+    }
+
+    /// Publish the next single-node fixture with explicit definitions.
+    pub(crate) fn publish_definitions(&self, env: &racer_io::Env, caches: Vec<CacheDefinition>) {
         use racer_wire::control::SCHEMA_VERSION;
         let sequence = self
             .publications
@@ -378,24 +427,7 @@ impl Availability {
                     rails: vec![],
                     site: String::new(),
                 }],
-                caches: caches
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, (id, mode))| {
-                        let name = format!("rotation-{i}");
-                        let (client_socket, origin_socket) =
-                            wire::canonical_socket_paths(&name).unwrap();
-                        CacheDefinition {
-                            id,
-                            name,
-                            client_socket,
-                            origin_socket,
-                            priority: racer_wire::control::DEFAULT_PRIORITY,
-                            mode,
-                            origin: None,
-                        }
-                    })
-                    .collect(),
+                caches,
                 page_size: racer_wire::object::PageSize::DEFAULT,
             }
             .with_default_pool(),

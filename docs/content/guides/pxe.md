@@ -49,7 +49,9 @@ scoping is inherent to the per-site component):
 | `--dhcp-interface` | *(none - relay mode)* | NIC for broadcast DHCP |
 | `--site` | *(none)* | Scope to machines with a specific site label |
 | `--http-port` | 8880 | HTTP server port |
-| `--cache-dir` | `~/.unbounded/metalman/cache` | Local cache for downloaded images |
+| `--cache-dir` | `/var/cache/metalman` (operator) or `~/.unbounded/metalman/cache` (standalone) | Cache for pre-warmed images and the agent tarball. The operator backs it with an emptyDir, so it survives container restarts and is cleared when the pod is deleted |
+| `--agent-base-url` | `https://github.com/Azure/unbounded/releases` | Release location metalman downloads `unbounded-agent` from. The operator passes `spec.components.metalman.agentBaseURL` from the Site when it is set |
+| `--bootstrap-artifacts-ref` | release-matched `bootstrap-artifacts` image | Bootstrap artifact bundle pre-warmed for the cluster's Kubernetes version. Empty disables the bundle and leaves the agent on its normal download sources |
 | `--health-port` | 8081 | Health/readiness probe port |
 | `--serve-url` | | External URL of this metalman instance |
 | `--default-netboot-image` | release-matched `netboot` image | Configured netboot OCI artifact used when `spec.host.netboot.netbootImage` is omitted |
@@ -97,6 +99,51 @@ docker push ghcr.io/azure/netboot:v1
 Template context includes `.Machine`, `.ApiserverURL`, `.ServeURL`, `.KubernetesVersion`, and `.ClusterDNS`.
 
 See the [CRD Reference]({{< relref "/reference/machina-crd" >}}) for the full Machine spec.
+
+## Bootstrapping without internet access
+
+A netbooted Machine needs the machine image, the netboot image, the
+`unbounded-agent` tarball, its agent rootfs image, the Kubernetes binaries and
+container image archives, and the images of the DaemonSets that run on the node.
+Metalman pre-warms all of them and serves them from its own HTTP port, so the
+node only needs network routes to Metalman, the API server, and its NTP servers.
+
+Metalman derives what to warm from cluster state, not from a list:
+
+- the machine and netboot images of each Machine,
+- `spec.agent.image` when it is set, otherwise every default agent rootfs image
+  for the Machine's architecture, GPU and non-GPU,
+- the bootstrap artifact bundle for the cluster's Kubernetes version,
+- the `unbounded-agent` tarball for the Machine's architecture,
+- the images of DaemonSets whose `nodeSelector` matches the labels the node will
+  carry.
+
+It serves them through a read-only distribution endpoint on the same port as the
+file server (`/v2/`). Nothing outside the pre-warmed set is served; a request for
+any other image returns `404` rather than being fetched upstream. The agent
+configuration metalman renders sets the agent's registry mirror to Metalman, and
+containerd's `_default` hosts file lists Gantry and then Metalman, so the
+DaemonSet images resolve locally after the node joins.
+
+Metalman itself still needs outbound access to the registries and to the agent
+release location. To mirror the tarball from somewhere other than GitHub, set the
+Site field:
+
+```yaml
+apiVersion: unbounded-cloud.io/v1alpha3
+kind: Site
+metadata:
+  name: rack-a
+spec:
+  components:
+    metalman:
+      agentBaseURL: https://mirror.example.com/unbounded/releases
+```
+
+A Machine that sets `spec.agent.url` downloads the tarball from that URL instead of
+from Metalman. `spec.agent.baseURL` and `spec.agent.version` change where Metalman
+fetches the tarball, but Metalman still serves it. A Machine that sets
+`spec.agent.downloads` keeps its own artifact sources, so it is not LAN-only.
 
 ## Machine CRD
 

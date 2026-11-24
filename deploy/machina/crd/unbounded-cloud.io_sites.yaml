@@ -129,6 +129,14 @@ spec:
                     description: Metalman configures the Metalman PXE controller for
                       this site.
                     properties:
+                      agentBaseURL:
+                        description: |-
+                          AgentBaseURL is the base URL Metalman downloads the unbounded-agent
+                          release tarball from before serving it to hosts. It must use the GitHub
+                          releases layout (<base>/latest/download/<asset> and
+                          <base>/download/<tag>/<asset>), so a mirror of the release assets works.
+                          Defaults to the upstream GitHub releases URL.
+                        type: string
                       dhcpAutoInterface:
                         description: DHCPAutoInterface lets Metalman choose the DHCP
                           interface automatically.

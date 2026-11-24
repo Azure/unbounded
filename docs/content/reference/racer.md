@@ -178,7 +178,8 @@ spec:
 
 | Field | Meaning |
 |-------|---------|
-| `metadataTTL` | Optional. How long object metadata is reused; not negative; rounded down to whole milliseconds. Default `30s` |
+| `metadataTTL` | Optional. How long object metadata is reused; not negative; rounded down to whole milliseconds. Ignored when `metadataImmutable` is set. Default `1h` |
+| `metadataImmutable` | Optional. Reuse object metadata until the cache drops it instead of revalidating it every `metadataTTL`. Set it only when objects are immutable: pages are keyed by version, so metadata that outlives a content change keeps serving the old version and reads fail with a version mismatch rather than mixing versions. Upgrade every publication consumer (control seats and dataplanes) before enabling it; an older parser rejects the whole publication, so unrelated caches stop updating too. Default `false` |
 | `requestTimeout` | Optional. Limit for each origin operation, including token acquisition and one retry after an authentication challenge; positive; rounded up to whole milliseconds. Default `1m` |
 | `maxConcurrentRequests` | Optional. Upstream operations in flight for this cache on each node, 1 to 65536. Operations over the limit fail as overloaded rather than wait. Default `512` |
 | `azure.containerURL` | Required. The one blob container the cache may read, as `<account URL>/<container>`, for example `https://account.blob.core.windows.net/models`. `http` or `https`, no credentials, query, fragment, or trailing slash. The container name follows Azure rules: 3 to 63 lowercase letters, digits, and single hyphens. Azurite-style URLs may include one account path segment. Immutable |
@@ -461,7 +462,7 @@ each worker and are never divided.
 | `RACER_PEER_RECEIVE_QUEUE_MAX` | `256` | Node | 1..65,536 | Peer requests queued at the receive gate. |
 | `RACER_PEER_RECEIVE_WAIT_MS` | `1000` | Node | 1..30,000 ms | Longest wait at the receive gate. |
 | `RACER_PAGE_HEDGE_DELAY_MS` | `100` | Node | 1..30,000 ms | Delay before a hedged second page request. |
-| `RACER_PAGE_HEDGE_SLOTS` | `0` | Node | 0..32 | Concurrent hedged page requests; `0` turns hedging off. |
+| `RACER_PAGE_HEDGE_SLOTS` | `1` | Node | 0..32 | Concurrent hedged page requests; `0` turns hedging off. |
 | `RACER_PAGE_HEDGE_BYTES` | `33554448` | Node | 0..1,073,742,336 bytes | Memory for hedged duplicates; with hedging on, at least one duplicate (two pages plus 16 bytes). |
 | `RACER_REPLICA_SELECTION` | `spread` | Node | `primary`, `spread` | Which owner a non-owner asks first. `spread`: direct neighbors first, then a per-node hash spreads pages across owners. `primary`: the first-ranked owner. |
 

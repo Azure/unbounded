@@ -510,6 +510,10 @@ pub struct CurrentVersion {
     pub version: ObjectVersion,
 
     pub expires_at: ExpiresAt,
+
+    /// Wall time the observation was admitted. Freshness is measured from here,
+    /// so a shorter published TTL also bounds already-retained metadata.
+    pub observed_at: ExpiresAt,
 }
 
 impl ObjectMetadata {
@@ -982,6 +986,7 @@ mod tests {
         let mut current = CurrentVersion {
             version: descriptor.version.clone(),
             expires_at: ExpiresAt(UNIX_EPOCH + Duration::from_secs(1)),
+            observed_at: ExpiresAt(UNIX_EPOCH),
         };
         assert_eq!(
             current.resolve(&descriptor, UNIX_EPOCH),
@@ -1020,6 +1025,7 @@ mod tests {
         let current = CurrentVersion {
             version: new.version.clone(),
             expires_at: ExpiresAt(now + Duration::from_secs(1)),
+            observed_at: ExpiresAt(now),
         };
         assert_eq!(current.resolve(&old, now), Err(Error::VersionUnavailable));
         assert_eq!(current.resolve(&new, now).unwrap().unwrap().length, 500);
@@ -1034,6 +1040,7 @@ mod tests {
         let current = CurrentVersion {
             version: descriptor.version.clone(),
             expires_at: ExpiresAt(deadline),
+            observed_at: ExpiresAt(UNIX_EPOCH),
         };
         for now in [deadline, deadline + Duration::from_secs(1)] {
             assert_eq!(current.resolve(&descriptor, now).unwrap(), None);

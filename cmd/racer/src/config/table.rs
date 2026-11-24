@@ -656,7 +656,7 @@ const BASE: &[Var] = &[
         "RACER_PAGE_HEDGE_SLOTS",
         Group::Network,
         uint(0, 32, COUNT),
-        Value("0"),
+        Value("1"),
         "Concurrent hedged page requests; `0` turns hedging off.",
     ),
     var(

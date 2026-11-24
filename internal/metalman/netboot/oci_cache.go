@@ -4,7 +4,9 @@
 package netboot
 
 import (
+	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +16,17 @@ import (
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
+
+// indexFileName is the cache index kept inside CacheDir. It records which
+// digest was last pulled for each image reference and architecture so a
+// restarted metalman can serve its cache before it reaches any registry.
+const indexFileName = "index.json"
+
+// cacheIndex is the on-disk shape of indexFileName.
+type cacheIndex struct {
+	// Images maps architecture to image reference to digest.
+	Images map[string]map[string]string `json:"images"`
+}
 
 type ImageMetadata struct {
 	DHCPBootImageName string `yaml:"dhcpBootImageName"`
@@ -57,6 +70,102 @@ func NewOCICache(cacheDir string) *OCICache {
 	}
 }
 
+// LoadIndex restores the reference to digest mapping written by a previous
+// process. Entries whose content is no longer on disk are dropped.
+func (c *OCICache) LoadIndex() error {
+	data, err := os.ReadFile(filepath.Join(c.CacheDir, indexFileName))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+
+		return fmt.Errorf("reading cache index: %w", err)
+	}
+
+	var idx cacheIndex
+	if err := json.Unmarshal(data, &idx); err != nil {
+		return fmt.Errorf("parsing cache index: %w", err)
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for architecture, refs := range idx.Images {
+		for imageRef, digest := range refs {
+			if !c.HasLayout(digest) && !c.IsCachedForArchitecture(digest, architecture) {
+				continue
+			}
+
+			c.digests[imageRefCacheKey(imageRef, architecture)] = digest
+		}
+	}
+
+	return nil
+}
+
+// saveIndexLocked writes the reference to digest mapping. The caller must
+// hold c.mu.
+func (c *OCICache) saveIndexLocked() error {
+	idx := cacheIndex{Images: make(map[string]map[string]string, len(c.digests))}
+
+	for key, digest := range c.digests {
+		refs, ok := idx.Images[key.architecture]
+		if !ok {
+			refs = make(map[string]string)
+			idx.Images[key.architecture] = refs
+		}
+
+		refs[key.imageRef] = digest
+	}
+
+	data, err := json.MarshalIndent(idx, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal cache index: %w", err)
+	}
+
+	dest := filepath.Join(c.CacheDir, indexFileName)
+	tmp := dest + ".tmp"
+
+	if err := os.WriteFile(tmp, append(data, '\n'), 0o644); err != nil {
+		return fmt.Errorf("write cache index: %w", err)
+	}
+
+	return os.Rename(tmp, dest)
+}
+
+// LayoutDir returns the directory of the OCI layout (manifests and blobs)
+// cached for a digest. The same directory serves every architecture an image
+// index contains.
+func (c *OCICache) LayoutDir(digest string) string {
+	return filepath.Join(c.CacheDir, "layouts", strings.ReplaceAll(digest, ":", "_"))
+}
+
+// HasLayout reports whether the OCI layout for a digest is cached.
+func (c *OCICache) HasLayout(digest string) bool {
+	_, err := os.Stat(filepath.Join(c.LayoutDir(digest), "oci-layout"))
+
+	return err == nil
+}
+
+// DigestForRepositoryReference returns the digest recorded for a repository
+// reference, which may be a tag or a digest, for any architecture.
+func (c *OCICache) DigestForRepositoryReference(repository, reference string) (string, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	candidates := []string{repository + ":" + reference, repository + "@" + reference}
+
+	for key, digest := range c.digests {
+		for _, candidate := range candidates {
+			if key.imageRef == candidate {
+				return digest, true
+			}
+		}
+	}
+
+	return "", false
+}
+
 func (c *OCICache) SetDigest(imageRef, digest string) {
 	c.SetDigestForArchitecture(imageRef, v1alpha3.DefaultPXEArchitecture, digest)
 }
@@ -66,6 +175,10 @@ func (c *OCICache) SetDigestForArchitecture(imageRef, architecture, digest strin
 	defer c.mu.Unlock()
 
 	c.digests[imageRefCacheKey(imageRef, architecture)] = digest
+
+	if err := c.saveIndexLocked(); err != nil {
+		slog.Error("saving cache index", "err", err)
+	}
 }
 
 func (c *OCICache) DigestFor(imageRef string) string {
@@ -244,6 +357,10 @@ func (c *OCICache) InvalidateRefForArchitecture(imageRef, architecture string) {
 	defer c.mu.Unlock()
 
 	delete(c.digests, imageRefCacheKey(imageRef, architecture))
+
+	if err := c.saveIndexLocked(); err != nil {
+		slog.Error("saving cache index", "err", err)
+	}
 }
 
 func imageRefCacheKey(imageRef, architecture string) imageRefKey {

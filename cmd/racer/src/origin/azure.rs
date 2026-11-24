@@ -695,6 +695,10 @@ struct Begun {
 }
 
 /// `expires_at = now + metadata_ttl`, truncated to milliseconds as in Go.
+///
+/// Immutable origins never expire metadata: a far-future deadline keeps it
+/// reusable until the cache drops it. Pages are keyed by version, so a changed
+/// object then fails reads instead of mixing versions.
 fn metadata(
     object: &ObjectId,
     etag: StrongEtag,
@@ -703,11 +707,15 @@ fn metadata(
     definition: &OriginDefinition,
     now: SystemTime,
 ) -> Result<ObjectMetadata> {
-    let expires = now
-        .checked_add(definition.metadata_ttl)
-        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .ok_or(Error::Internal)?;
-    let millis = u64::try_from(expires.as_millis()).map_err(|_| Error::Internal)?;
+    let millis = if definition.metadata_immutable {
+        crate::model::MAX_WIRE_INTEGER
+    } else {
+        let expires = now
+            .checked_add(definition.metadata_ttl)
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .ok_or(Error::Internal)?;
+        u64::try_from(expires.as_millis()).map_err(|_| Error::Internal)?
+    };
     Ok(ObjectMetadata {
         content_type,
         version: ObjectVersion {

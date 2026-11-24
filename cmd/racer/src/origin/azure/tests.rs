@@ -330,6 +330,23 @@ fn target(head: &MessageHead) -> (&str, &str) {
 }
 
 #[test]
+fn immutable_origin_metadata_never_expires() {
+    let mut h = harness();
+    h.definition.metadata_immutable = true;
+    h.blob(
+        206,
+        PAGE_BYTES,
+        Some(format!("bytes 0-{}/{PAGE_BYTES}", PAGE_BYTES - 1)),
+        &[],
+    );
+    let reply = h.bootstrap(&context("dir/model.bin", "")).unwrap();
+    assert_eq!(
+        reply.metadata.expires_at.to_unix_millis().unwrap(),
+        crate::model::MAX_WIRE_INTEGER
+    );
+}
+
+#[test]
 fn bootstrap_reads_metadata_and_page_zero_in_one_request() {
     let h = harness();
     let total = 3 * PAGE_BYTES + 7;

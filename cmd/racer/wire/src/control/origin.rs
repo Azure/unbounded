@@ -9,7 +9,7 @@ use crate::control::{Error, Result};
 use std::time::Duration;
 
 /// Default for `OriginDefinition::metadata_ttl`.
-pub const DEFAULT_ORIGIN_METADATA_TTL: Duration = Duration::from_secs(30);
+pub const DEFAULT_ORIGIN_METADATA_TTL: Duration = Duration::from_secs(3600);
 
 /// Default for `OriginDefinition::request_timeout`.
 pub const DEFAULT_ORIGIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -29,7 +29,17 @@ pub struct OriginDefinition {
     pub azure: AzureOriginDefinition,
 
     /// How long object metadata is reused before revalidation. Millisecond precision.
+    ///
+    /// Ignored when `metadata_immutable` is set.
     pub metadata_ttl: Duration,
+
+    /// Reuse object metadata until the cache drops it instead of revalidating it
+    /// every `metadata_ttl`.
+    ///
+    /// Only for origins whose objects are immutable. Pages are keyed by version,
+    /// so metadata that outlives a content change keeps serving the old version
+    /// and reads fail with `VersionUnavailable` instead of mixing versions.
+    pub metadata_immutable: bool,
 
     /// Bound on each upstream request. Positive, millisecond precision.
     pub request_timeout: Duration,
@@ -292,6 +302,7 @@ impl OriginDefinition {
                 credential,
             },
             metadata_ttl: DEFAULT_ORIGIN_METADATA_TTL,
+            metadata_immutable: false,
             request_timeout: DEFAULT_ORIGIN_REQUEST_TIMEOUT,
             max_concurrent_requests: DEFAULT_ORIGIN_MAX_CONCURRENT_REQUESTS,
         }
