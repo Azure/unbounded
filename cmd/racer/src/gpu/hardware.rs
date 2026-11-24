@@ -287,7 +287,7 @@ fn counter(value: &AtomicU64) -> u64 {
 
 /// Requests the executors still hold an import for.
 fn imported(helper: &GpuHelper) -> usize {
-    helper.owners.lock().unwrap().len()
+    helper.imported_requests()
 }
 
 /// No request holds anything: no import, open sink, queued page or leak.

@@ -1049,6 +1049,15 @@ impl GpuHelper {
         self.open.load(Ordering::Relaxed)
     }
 
+    /// Requests whose import the executors still hold.
+    pub fn imported_requests(&self) -> usize {
+        self.shared
+            .owners
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+
     fn send(&self, job: Job) -> Result<()> {
         self.jobs.send(job).map_err(|_| Error::Unavailable)
     }
