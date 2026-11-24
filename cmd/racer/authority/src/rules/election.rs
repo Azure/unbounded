@@ -53,10 +53,19 @@ impl Observer {
         if lease.spec.holder.as_deref().is_none_or(str::is_empty) {
             return true;
         }
+        self.expires_at(lease).is_some_and(|at| now >= at)
+    }
+
+    /// When the observed version of a held `lease` becomes expired, or `None`
+    /// when it is vacant or was not observed at its current version.
+    pub fn expires_at(&self, lease: &LeaseObservation) -> Option<Instant> {
+        if lease.spec.holder.as_deref().is_none_or(str::is_empty) {
+            return None;
+        }
         let duration = Duration::from_secs(u64::from(lease.spec.duration_secs.max(1)));
         match self.seen.get(&lease.name) {
-            Some((rv, at)) if *rv == lease.resource_version => now.duration_since(*at) >= duration,
-            _ => false,
+            Some((rv, at)) if *rv == lease.resource_version => at.checked_add(duration),
+            _ => None,
         }
     }
 

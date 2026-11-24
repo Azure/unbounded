@@ -3392,10 +3392,19 @@ fn staging_pressure_rejects_before_queue_acceptance_and_preserves_accepted_work(
 
 #[test]
 fn shutdown_deadline_discards_second_copy_and_fences_submitted_first_copy() {
-    let env = racer_io::Env::host();
+    use racer_io::sim::{Fault, SimOs};
+    // A submitted write races the shutdown cancel on a real device. When the
+    // write completes before the cancel is processed, the reactor delivers
+    // that success anyway (`Reactor::poll_op`), so the writer legitimately
+    // publishes it and the index is not empty. Delay the write in the
+    // simulated kernel so cancellation deterministically wins and the
+    // expected index state is exact.
+    let simulation = SimOs::new();
+    let env = racer_io::Env::sim(&simulation, racer_io::WorkerCtx::host());
     let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.reactor.init().unwrap();
+    simulation.inject("write", Fault::Delay(6)).unwrap();
     f.enqueue(f.copy(1, 64)).unwrap();
     f.enqueue(f.copy(2, 64)).unwrap();
     f.admission.stop();

@@ -85,6 +85,10 @@ pub struct Scenario {
     pub faults: Vec<(Nanos, Fault)>,
     /// Random faults.
     pub fault_mix: FaultMix,
+    /// Latest instant a [`FaultMix`] fault may start; [`Scenario::end`] when
+    /// unset. A scenario that must go quiescent sets it before `end`, so work
+    /// that the last restart starts still has time to finish.
+    pub fault_window: Option<Nanos>,
     /// Invariants.
     pub invariants: Vec<Invariant>,
     /// Cost table.
@@ -130,6 +134,7 @@ impl std::fmt::Debug for Scenario {
             .field("fidelity", &self.fidelity)
             .field("faults", &self.faults)
             .field("fault_mix", &self.fault_mix)
+            .field("fault_window", &self.fault_window)
             .field("invariants", &self.invariants)
             .field("end", &self.end)
             .finish()
@@ -147,6 +152,7 @@ impl Scenario {
             factory: Rc::new(|_| Ok(Vec::new())),
             faults: Vec::new(),
             fault_mix: FaultMix::default(),
+            fault_window: None,
             invariants: Vec::new(),
             costs: Costs::checked_in(),
             end: 10 * SECONDS,
@@ -204,6 +210,13 @@ impl Scenario {
     /// Random faults.
     pub fn fault_mix(mut self, mix: FaultMix) -> Self {
         self.fault_mix = mix;
+        self
+    }
+
+    /// Latest instant a drawn [`FaultMix`] fault may start (see
+    /// [`Scenario::fault_window`]).
+    pub fn fault_window(mut self, at: Nanos) -> Self {
+        self.fault_window = Some(at);
         self
     }
 
@@ -306,8 +319,11 @@ impl Scenario {
         let node = || first + choices.below(u64::from(self.nodes - first)) as u32;
         let any = || choices.below(u64::from(self.nodes)) as u32;
         let downtime = mix.max_downtime.max(MILLIS);
+        // Starts stay inside the fault window; the paired restart or heal may
+        // run up to `max_downtime` later.
+        let horizon = self.fault_window.unwrap_or(self.end).min(self.end);
         for _ in 0..count {
-            let at = choices.below(self.end);
+            let at = choices.below(horizon);
             match choices.weighted(&weights) {
                 0 => {
                     let node = node();

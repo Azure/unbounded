@@ -47,8 +47,9 @@ use crate::{
 const TOKEN_EXP: u64 = 4_000_000_000;
 
 /// Longest a cluster may go without a primary once every authority is up,
-/// unpartitioned and no fault happened: Lease expiry (30 s) on a clock up
-/// to 10% slow, claim jitter, bootstrap and a failed first attempt.
+/// unpartitioned and no fault happened: Lease expiry (30 s) for the primary
+/// and for a seat Lease on a clock up to 10% slow, claim jitter, bootstrap
+/// and a failed first attempt.
 pub const PRIMARY_BOUND: Nanos = 120 * SECONDS;
 
 const TAG_TERM: u64 = 0x4155_5448_0001;

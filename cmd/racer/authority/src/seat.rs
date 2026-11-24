@@ -424,7 +424,12 @@ pub async fn lottery(shared: Rc<Shared>, primary_changed: Rc<RefCell<(String, Op
                 shared.changed.notify();
                 lottery.won();
                 let s = shared.clone();
-                let _ = rt::spawn(seat_task(s.clone(), seat.clone(), v));
+                let _ = rt::spawn(seat_task(
+                    s.clone(),
+                    seat.clone(),
+                    v,
+                    primary_changed.clone(),
+                ));
                 let _ = rt::spawn(follower(s.clone(), seat.clone()));
                 let _ = rt::spawn(crate::primary::contend(s, seat));
             }
@@ -503,7 +508,12 @@ fn ready_changed(shared: &Shared, seat: &Seat, object: &serde_json::Value) -> bo
 }
 
 /// Renew the seat Lease until it is lost, shrunk away, or the runtime stops.
-pub async fn seat_task(shared: Rc<Shared>, seat: Rc<Seat>, mut object: serde_json::Value) {
+pub async fn seat_task(
+    shared: Rc<Shared>,
+    seat: Rc<Seat>,
+    mut object: serde_json::Value,
+    primary_changed: Rc<RefCell<(String, Option<Instant>)>>,
+) {
     let ns = shared.config.namespace.clone();
     let mut schedule = SeatRenew::new(crate::rt::now());
     loop {
@@ -514,8 +524,9 @@ pub async fn seat_task(shared: Rc<Shared>, seat: Rc<Seat>, mut object: serde_jso
         }
         let now = crate::rt::now();
         let view = shared.primary.borrow().clone();
+        let live = view.live(primary_changed.borrow().1, now);
         let inputs = rules::RenewInputs::from_view(
-            &view,
+            live.then_some(&view),
             seat.index,
             &shared.config.node_name,
             shared.is_primary.get(),

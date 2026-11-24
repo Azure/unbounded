@@ -2030,6 +2030,7 @@ mod tests {
                     observed: self.observed.clone(),
                     failure: self.failure,
                     local: Rc::new(thread::current().id()),
+                    steady: std::cell::Cell::new(true),
                 }))
             }
         }
@@ -2174,6 +2175,11 @@ mod tests {
             observed: Arc<Observed>,
             failure: Failure,
             local: Rc<thread::ThreadId>,
+            // Fairness sampling covers steady-state passes only. The drain phase
+            // does not poll the service and the fence phase polls it after a
+            // completed drain, so counting those would report passes that did not
+            // grant a page or that occur outside the shared steady state.
+            steady: std::cell::Cell<bool>,
         }
         impl Drop for Engine {
             fn drop(&mut self) {
@@ -2207,11 +2213,12 @@ mod tests {
             fn poll_budgeted(&mut self, cx: &mut Context<'_>, budget: usize) -> Result<()> {
                 assert_eq!(*self.local, thread::current().id());
                 assert_eq!(budget, 1, "one page per shard per pass");
-                let mut polls = self.observed.polls.lock().unwrap();
-                if polls.len() < 128 {
-                    polls.push(self.worker.0);
+                if self.steady.get() {
+                    let mut polls = self.observed.polls.lock().unwrap();
+                    if polls.len() < 128 {
+                        polls.push(self.worker.0);
+                    }
                 }
-                drop(polls);
                 // Retain outstanding jobs until tests request release or drain begins.
                 if self.observed.release.load(Ordering::SeqCst)
                     || self.observed.io_draining.load(Ordering::SeqCst) > 0
@@ -2225,6 +2232,9 @@ mod tests {
                 }
             }
             fn drain<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
+                // The steady-state poll_fn has finished; later poll_budgeted
+                // calls belong to the fence phase and are not fairness passes.
+                self.steady.set(false);
                 Box::pin(async move {
                     self.observed.event(self.worker, "crypto-drain");
                     // A pending drain of one shard needs the other shard to drain. This
@@ -2340,9 +2350,12 @@ mod tests {
                 assert!(position("crypto-drain") < position("crypto-shutdown"));
                 assert!(position("crypto-shutdown") < position("crypto-drop"));
             }
-            // While both shards remain active, every pass grants each a single page and
-            // reverses its starting order on the next pass, even with saturated queues.
-            // Passes after one shard leaves the steady state are excluded.
+            // While both shards remain active, every steady-state pass grants each a
+            // single page and reverses its starting order on the next pass, even with
+            // saturated queues. The sampler records steady-state passes only, so the
+            // drain and fence phases (which poll on a different schedule) cannot
+            // unbalance the pairs; passes after one shard leaves steady state still
+            // form the terminating pair.
             let polls = observed.polls.lock().unwrap();
             let pairs: Vec<_> = polls
                 .chunks_exact(2)
