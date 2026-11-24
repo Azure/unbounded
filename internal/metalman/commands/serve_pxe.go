@@ -150,12 +150,17 @@ func ServePXECmd() *cobra.Command {
 
 			// Detect cloud provider for default node labels. These are
 			// static and resolved once at startup.
-			providerLabels, err := provision.DetectProviderLabels(ctx, clientset)
+			var providerLabels map[string]string
+
+			provider, err := provision.DetectClusterProvider(ctx, clientset)
 			if err != nil {
 				return fmt.Errorf("detect provider: %w", err)
 			}
 
-			slog.Info("detected cloud provider labels", "labels", providerLabels)
+			if provider != nil {
+				slog.Info("detected cloud provider", "provider", provider.Name)
+				providerLabels = provider.NodeLabels
+			}
 
 			sv, err := clientset.Discovery().ServerVersion()
 			if err != nil {

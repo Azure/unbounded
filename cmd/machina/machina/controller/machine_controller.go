@@ -603,13 +603,15 @@ func (r *MachineReconciler) provisionMachine(
 	caCertBase64 := ""
 	clusterDNS := ""
 
-	var providerLabels map[string]string
-
 	if r.ClusterInfo != nil {
 		apiServer = r.ClusterInfo.APIServer
 		caCertBase64 = r.ClusterInfo.CACertBase64
 		clusterDNS = r.ClusterInfo.ClusterDNS
-		providerLabels = r.ClusterInfo.ProviderLabels
+	}
+
+	var providerLabels map[string]string
+	if r.ClusterInfo != nil && r.ClusterInfo.Provider != nil {
+		providerLabels = r.ClusterInfo.Provider.NodeLabels
 	}
 
 	agentConfig := provision.BuildAgentConfig(provision.BuildAgentConfigParams{

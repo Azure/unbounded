@@ -55,25 +55,29 @@ func ResolveClusterInfo(ctx context.Context, apiServerEndpoint string, k kuberne
 		return nil, fmt.Errorf("kube-dns Service has no ClusterIP")
 	}
 
-	providerLabels, err := provision.DetectProviderLabels(ctx, k)
+	provider, err := provision.DetectClusterProvider(ctx, k)
 	if err != nil {
 		return nil, fmt.Errorf("detect provider: %w", err)
 	}
-
-	log.FromContext(ctx).Info("detected cloud provider labels", "labels", providerLabels)
 
 	sv, err := k.Discovery().ServerVersion()
 	if err != nil {
 		return nil, fmt.Errorf("get server version: %w", err)
 	}
 
-	return &ClusterInfo{
-		APIServer:      apiServerEndpoint,
-		CACertBase64:   base64.StdEncoding.EncodeToString([]byte(caCert)),
-		ClusterDNS:     svc.Spec.ClusterIP,
-		KubeVersion:    sv.GitVersion,
-		ProviderLabels: providerLabels,
-	}, nil
+	info := &ClusterInfo{
+		APIServer:    apiServerEndpoint,
+		CACertBase64: base64.StdEncoding.EncodeToString([]byte(caCert)),
+		ClusterDNS:   svc.Spec.ClusterIP,
+		KubeVersion:  sv.GitVersion,
+	}
+
+	if provider != nil {
+		log.FromContext(ctx).Info("detected cloud provider", "provider", provider.Name)
+		info.ProviderLabels = provider.NodeLabels
+	}
+
+	return info, nil
 }
 
 func (r *MachineOperationReconciler) buildReplaceUserData(ctx context.Context, machine *unboundedv1alpha3.Machine, format unboundedv1alpha3.ProvisioningFormat) (string, error) {

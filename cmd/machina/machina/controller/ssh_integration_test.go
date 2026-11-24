@@ -1100,7 +1100,7 @@ func TestProvisionMachine_ProviderLabelsOverride(t *testing.T) {
 		Client: fakeClient,
 		Scheme: s,
 		ClusterInfo: &ClusterInfo{
-			ProviderLabels: map[string]string{"kubernetes.azure.com/managed": "false"},
+			Provider: &provision.ClusterProvider{Name: "microsoft-aks", NodeLabels: map[string]string{"kubernetes.azure.com/managed": "false"}},
 		},
 	}
 

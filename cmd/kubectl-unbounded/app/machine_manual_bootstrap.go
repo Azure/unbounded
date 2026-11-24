@@ -533,13 +533,16 @@ func (h *manualBootstrapHandler) buildAgentConfig(ctx context.Context) (*provisi
 	}
 
 	// Detect cloud provider for default node labels.
-	providerLabels, err := provision.DetectProviderLabels(ctx, h.kubeCli)
+	var providerLabels map[string]string
+
+	provider, err := provision.DetectClusterProvider(ctx, h.kubeCli)
 	if err != nil {
 		h.logger.Warn("cloud provider detection failed, continuing without provider labels", "error", err)
 	}
 
-	if providerLabels != nil {
-		h.logger.Info("detected cloud provider labels", "labels", providerLabels)
+	if provider != nil {
+		h.logger.Info("detected cloud provider", "provider", provider.Name)
+		providerLabels = provider.NodeLabels
 	}
 
 	// Build a Machine object from CLI flags for the canonical config builder.

@@ -30,9 +30,9 @@ type ClusterInfo struct {
 	// ClusterDNS is the ClusterIP of the kube-dns Service in kube-system.
 	ClusterDNS string
 
-	// ProviderLabels are the labels the cluster's provider (e.g. AKS)
-	// requires on every node. It is nil when the provider is unknown.
-	ProviderLabels map[string]string
+	// Provider is the detected cluster provider (e.g. AKS). It is nil
+	// when the provider cannot be determined.
+	Provider *provision.ClusterProvider
 
 	// KubeVersion is the Kubernetes server version (e.g. "v1.34.2") obtained
 	// from the API server's /version endpoint. It is used as the default
@@ -89,15 +89,14 @@ func ResolveClusterInfo(ctx context.Context, cfg Config, k kubernetes.Interface)
 	logger.Info("Resolved cluster DNS", "clusterDNS", info.ClusterDNS)
 
 	// ---------------------------------------------------------------
-	// Provider labels – labels the cluster's provider (e.g. AKS)
-	// requires on every node.
+	// Provider – detect the cluster provider (e.g. AKS).
 	// ---------------------------------------------------------------
-	info.ProviderLabels, err = provision.DetectProviderLabels(ctx, k)
+	provider, err := provision.DetectClusterProvider(ctx, k)
 	if err != nil {
 		return nil, fmt.Errorf("detect provider: %w", err)
 	}
 
-	logger.Info("Resolved provider labels", "providerLabels", info.ProviderLabels)
+	info.Provider = provider
 
 	// ---------------------------------------------------------------
 	// KUBE_VERSION – Kubernetes server version from the /version endpoint.
@@ -115,11 +114,16 @@ func ResolveClusterInfo(ctx context.Context, cfg Config, k kubernetes.Interface)
 	// ---------------------------------------------------------------
 	// Summary
 	// ---------------------------------------------------------------
+	providerName := "none"
+	if info.Provider != nil {
+		providerName = info.Provider.Name
+	}
+
 	logger.Info("All cluster info resolved successfully",
 		"apiServer", info.APIServer,
 		"caCertBase64Length", len(info.CACertBase64),
 		"clusterDNS", info.ClusterDNS,
-		"providerLabels", info.ProviderLabels,
+		"provider", providerName,
 		"kubeVersion", info.KubeVersion,
 	)
 
