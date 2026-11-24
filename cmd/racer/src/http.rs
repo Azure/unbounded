@@ -125,11 +125,7 @@ pub(crate) fn acquire_wait<'a>(
         },
     ))
 }
-pub struct RacerOpaque;
-impl http1::Opaque for RacerOpaque {
-    const NAMES: &'static [&'static str] = &["authorization", "racer-metadata"];
-}
-pub type Codec = http1::Codec<RacerOpaque>;
+pub type Codec = http1::Codec<peer_wire::Opaque>;
 pub type ConnectionLease = http1::connection::ConnectionLease<HttpContext>;
 pub type OwnedBuffer = http1::connection::OwnedBuffer<HttpContext>;
 pub type HttpIo = http1::connection::HttpIo<HttpContext>;
@@ -143,7 +139,7 @@ impl http1::connection::Context for HttpContext {
     type Reactor = Reactor;
     type Charge = flow_control::Charge<AdmissionPolicy>;
     type Slot = ConnectionReservation;
-    type Opaque = RacerOpaque;
+    type Opaque = peer_wire::Opaque;
     type State = State;
     type Endpoint = Endpoint;
     fn charge(&self, bytes: usize) -> Result<flow_control::Charge<AdmissionPolicy>> {

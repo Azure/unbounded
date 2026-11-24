@@ -110,7 +110,10 @@ impl From<racer_io::Error> for Error {
     }
 }
 
-/// Opaque field syntax used by the retained peer profile.
+/// Opaque field syntax for Racer HTTP heads.
+///
+/// Credentials and signed metadata are compared byte for byte, so the codec
+/// refuses any spelling that a peer or intermediary could normalize differently.
 pub struct Opaque;
 
 impl http1::Opaque for Opaque {
