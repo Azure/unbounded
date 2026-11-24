@@ -41,24 +41,22 @@
 //!
 //! # Replaced types
 //!
-//! Every type in the left column except `AlignedBuffer` and the slab pool,
-//! which still back disk write staging, has been removed.
+//! Every type in the left column has been removed; this pool now backs disk
+//! reads and writes as well as ciphertext and plaintext storage.
 //!
 //! | Old | New |
 //! |---|---|
-//! | `AlignedBuffer<C>`, slab `BufferPool`, `Slab::allocate` free lists (except disk write staging) | [`Buf<C>`] from [`Pool::take`] |
+//! | `AlignedBuffer<C>`, slab `BufferPool`, `Slab::read`, `Slab::allocate` free lists | [`Buf<C>`] from [`Pool::take`] |
 //! | `FrozenBuffer<C>` | `Arc<Buf<C>>` |
 //! | `WorkerBufferPool`, `SharedPool`, `DetachedBuffer`, `give_back` | [`Pool`] with its cross-thread return stacks; a `Buf` is already `Send` |
 //! | flow `Recycler`/`Buffers`, `Charge::buffer`, `Charge::recycle`, `PoolDemand` sizing | [`Pool::take`] with the request's charge; [`Pool::maintain`] and [`Pool::shed`] for sizing |
 //! | `PoolCharge`, `AlignedBody`, `ChargedBytes`, `ChargedBuffer` (flow and `src`) | [`Buf<Charge<P>>`]; the charge rides in the buffer |
 //! | per-allocation `Charge::requires_wipe` | the `wipe` flag at [`Pool::take`] |
-//! | recycler bytes, shared budget | one [`PoolAccount`] class for idle bytes; idle write staging buffers (slab pool) still keep their primary admission charge |
+//! | recycler bytes, shared budget, idle staging charges | one [`PoolAccount`] class for idle bytes, including idle write staging |
 //!
-//! Wiring changes expected in `src`: `memory.rs` (`rehome` takes a pooled
-//! `Buf` at device alignment with padded capacity instead of copying twice),
-//! `store.rs` (disk reads `take` from the worker pool; encrypt writes aligned
-//! pooled output), and the admission policy gains a `Pool` resource class whose
-//! [`PoolAccount`] adapter is `flow_control::QuotaPoolAccount`.
+//! Disk write staging takes its buffer from a [`Pool`] of this same type. A
+//! write that must keep an additional guard alive through the kernel
+//! completion composes both guards into the buffer's single [`Charge`].
 
 use crate::sync::{Arc, AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use crate::{
@@ -983,14 +981,36 @@ impl<C: Charge> fmt::Debug for Buf<C> {
 
 impl<C: Charge> Buf<C> {
     /// Allocate unpooled zeroed storage, for callers without a worker pool.
+    /// Capacity rounds up to the pool granule.
     pub fn unpooled(len: usize, alignment: usize, charge: C, wipe: bool) -> Result<Self> {
-        if !alignment.is_power_of_two() || alignment > crate::HUGE_PAGE_BYTES {
-            return Err(Error::InvalidConfiguration);
-        }
         let capacity = len
             .max(1)
             .checked_next_multiple_of(alignment.max(GRANULE))
             .ok_or(Error::InvalidConfiguration)?;
+        Self::unpooled_capacity(len, capacity, alignment, charge, wipe)
+    }
+
+    /// Allocate unpooled zeroed storage whose capacity is exactly `len`, for a
+    /// caller that already padded it.
+    pub(crate) fn unpooled_exact(
+        len: usize,
+        alignment: usize,
+        charge: C,
+        wipe: bool,
+    ) -> Result<Self> {
+        Self::unpooled_capacity(len, len.max(1), alignment, charge, wipe)
+    }
+
+    fn unpooled_capacity(
+        len: usize,
+        capacity: usize,
+        alignment: usize,
+        charge: C,
+        wipe: bool,
+    ) -> Result<Self> {
+        if !alignment.is_power_of_two() || alignment > crate::HUGE_PAGE_BYTES {
+            return Err(Error::InvalidConfiguration);
+        }
         if !charge.covers(capacity) {
             return Err(Error::InvalidConfiguration);
         }
@@ -1063,6 +1083,16 @@ impl<C: Charge> Buf<C> {
     /// The whole initialized capacity, for I/O that fills past `len`.
     pub fn spare_mut(&mut self) -> &mut [u8] {
         self.region_mut().bytes_mut()
+    }
+
+    /// Borrow the logical bytes.
+    pub fn as_slice(&self) -> &[u8] {
+        self
+    }
+
+    /// Exclusively borrow the logical bytes.
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        self
     }
 
     /// Rebind to a new charge that covers the capacity, returning the old one.

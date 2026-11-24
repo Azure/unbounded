@@ -4910,7 +4910,7 @@ fn copy_only_rejects_disk_payload_and_tag_corruption_before_retention() {
                 &f,
                 writer
                     .slabs()
-                    .read(&f.reactor, location.extent, staging, lease, &f.scope),
+                    .read_buf(&f.reactor, location.extent, staging, lease, &f.scope),
             )
             .unwrap();
             let parsed = crate::store::parse(&stored, location.extent).unwrap();

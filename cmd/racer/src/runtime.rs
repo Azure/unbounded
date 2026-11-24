@@ -396,11 +396,11 @@ impl crate::control::rest::Scope for RequestScope {
 /// use racer::{memory::PlaintextBuffer, admission::AdmissionPolicy};
 /// use racer_io::ring::IoBuffer;
 /// use flow_control::Charge;
-/// use page_alloc::AlignedBuffer;
+/// use page_alloc::buf::Buf;
 /// fn independent<T: 'static>() {}
 /// fn completion_safe<B: IoBuffer>() { independent::<B>(); }
 /// completion_safe::<PlaintextBuffer>();
-/// completion_safe::<AlignedBuffer<Charge<AdmissionPolicy>>>();
+/// completion_safe::<Buf<Charge<AdmissionPolicy>>>();
 /// ```
 /// Immutable ciphertext cannot be used for receive:
 /// ```compile_fail
@@ -1374,11 +1374,11 @@ mod tests {
             }
             #[test]
             fn direct_io_faults_check_address_offset_and_length_independently() {
-                use page_alloc::AlignedBuffer;
                 use page_alloc::Alignment;
+                use page_alloc::buf::Buf;
                 use racer_io::ring::IoBuffer;
                 struct View {
-                    buffer: AlignedBuffer<flow_control::Charge<AdmissionPolicy>>,
+                    buffer: Buf<flow_control::Charge<AdmissionPolicy>>,
                     start: usize,
                     length: usize,
                 }
@@ -1410,7 +1410,7 @@ mod tests {
                         .reserve(None, ResourceClass::Ciphertext, 8192)
                         .unwrap();
                     let mut buffer = alignment.allocate(8192, quota).unwrap();
-                    buffer.bytes_mut().unwrap().fill(7);
+                    buffer.as_mut_slice().fill(7);
                     let result = drive(
                         &r,
                         r.write_at(

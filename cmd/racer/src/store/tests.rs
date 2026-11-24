@@ -25,6 +25,7 @@ use page_alloc::SegmentId;
 use page_alloc::SegmentState;
 use page_alloc::Segments;
 use page_alloc::Slab;
+use page_alloc::buf::Buf;
 use racer_wire::control::CacheId;
 use std::future::Future;
 use std::path::PathBuf;
@@ -2216,16 +2217,16 @@ fn record_round_trip_preserves_ciphertext_zeroes_padding_and_rejects_torn_header
             .reserve(None, ResourceClass::Ciphertext, disk.length())
             .unwrap();
         let buffer = a.allocate(disk.length(), reserve).unwrap();
-        assert_eq!(buffer.bytes().unwrap().as_ptr() as usize % a.memory(), 0);
+        assert_eq!(buffer.as_slice().as_ptr() as usize % a.memory(), 0);
         let mut encoded = crate::store::encode(&page, Generation(7), a, buffer).unwrap();
         let parsed = crate::store::parse(&encoded.buffer, disk).unwrap();
         assert_eq!(
-            &encoded.buffer.bytes().unwrap()[parsed.ciphertext.clone()],
+            &encoded.buffer.as_slice()[parsed.ciphertext.clone()],
             page.ciphertext.bytes()
         );
         assert_eq!(parsed.header.metadata, page.metadata.immutable());
         assert!(
-            encoded.buffer.bytes().unwrap()[parsed.ciphertext.end..]
+            encoded.buffer.as_slice()[parsed.ciphertext.end..]
                 .iter()
                 .all(|b| *b == 0)
         );
@@ -2235,7 +2236,7 @@ fn record_round_trip_preserves_ciphertext_zeroes_padding_and_rejects_torn_header
         );
         encoded.header.generation = Generation(8);
         assert!(crate::store::decode(&encoded.buffer, &encoded.header).is_err());
-        encoded.buffer.bytes_mut().unwrap()[24] ^= 1;
+        encoded.buffer.as_mut_slice()[24] ^= 1;
         assert!(crate::store::parse(&encoded.buffer, disk).is_err());
     }
 }
@@ -2510,14 +2511,22 @@ fn allocator_integration_reclaims_idle_charge_before_writer_admission_retry() {
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     let page = f.copy(1, 64);
     let cache = &page.metadata.version.object.cache;
-    let slab = f.store.writer.slabs();
-    let length = crate::store::record_length(&page, slab.alignment().unwrap()).unwrap();
-    let charge = f
-        .admission
-        .reserve(Some(cache), ResourceClass::Ciphertext, length)
-        .unwrap();
-    drop(slab.allocate(length, charge).unwrap());
-    assert_eq!(slab.idle_bytes(), length);
+    let length =
+        crate::store::record_length(&page, f.store.writer.slabs().alignment().unwrap()).unwrap();
+    // Put one completed staging buffer in the writer's idle pool, so it holds
+    // a Ciphertext charge exactly as a live staging buffer would.
+    let capacity = {
+        let mut staging = f.store.writer.staging().unwrap();
+        let pool = staging.as_mut().expect("staging pool");
+        let capacity = pool.capacity_for(length).unwrap();
+        let charge = f
+            .admission
+            .reserve(Some(cache), ResourceClass::Ciphertext, capacity)
+            .unwrap();
+        drop(pool.take(length, charge, false).unwrap());
+        capacity
+    };
+    assert_eq!(f.store.writer.retained_staging_bytes(), capacity);
     let pressure = f
         .admission
         .reserve(
@@ -2528,7 +2537,7 @@ fn allocator_integration_reclaims_idle_charge_before_writer_admission_retry() {
         )
         .unwrap();
     f.enqueue(page).unwrap();
-    assert_eq!(slab.idle_bytes(), 0);
+    assert_eq!(f.store.writer.retained_staging_bytes(), 0);
     assert_eq!(f.store.writer.pending_count(), 1);
     assert_eq!(f.store.writer.discard_unsubmitted(), 1);
     drop(pressure);
@@ -2961,10 +2970,10 @@ fn other_format_version_and_unknown_cipher_records_are_cache_misses() {
             f.store
                 .writer
                 .slabs()
-                .read(&f.reactor, location.extent, staging, lease, &request),
+                .read_buf(&f.reactor, location.extent, staging, lease, &request),
         )
         .unwrap();
-        let bytes = stored.bytes_mut().unwrap();
+        let bytes = stored.as_mut_slice();
         let header_len = real_header_end(bytes);
         let cipher_offset = header_len - 36;
         if other_version {
@@ -3039,7 +3048,7 @@ fn stored_payload_and_tag_corruption_reach_the_reader_for_tag_check() {
             f.store
                 .writer
                 .slabs()
-                .read(&f.reactor, location.extent, staging, lease, &request),
+                .read_buf(&f.reactor, location.extent, staging, lease, &request),
         )
         .unwrap();
         let parsed = super::parse(&stored, location.extent).unwrap();
@@ -3049,7 +3058,7 @@ fn stored_payload_and_tag_corruption_reach_the_reader_for_tag_check() {
         } else {
             parsed.ciphertext.start
         };
-        stored.bytes_mut().unwrap()[offset] ^= 1;
+        stored.as_mut_slice()[offset] ^= 1;
         let lease = f.store.writer.lease(&location).unwrap();
         let _ = drive(
             &f.reactor,
@@ -3937,7 +3946,7 @@ mod records {
         admission: &flow_control::Quotas<AdmissionPolicy>,
         alignment: Alignment,
         length: usize,
-    ) -> AlignedBuffer<flow_control::Charge<AdmissionPolicy>> {
+    ) -> Buf<flow_control::Charge<AdmissionPolicy>> {
         alignment
             .allocate(
                 length,
@@ -4016,7 +4025,7 @@ mod records {
             assert_eq!(block % alignment.length(), 0);
             assert_eq!(block + body_len(&page, alignment).unwrap(), record);
             let mut staging = buffer(&admission, alignment, extent.length());
-            staging.bytes_mut().unwrap().fill(0xa5);
+            staging.as_mut_slice().fill(0xa5);
             let mut encoded =
                 encode_at(&page, Generation(u64::MAX), alignment, offset, staging).unwrap();
             assert_eq!(
@@ -4051,7 +4060,7 @@ mod records {
                 page.metadata.length += 1;
             }
             encoded = encode_at(&page, Generation(9), alignment, offset, encoded.buffer).unwrap();
-            let bytes = encoded.buffer.bytes().unwrap();
+            let bytes = encoded.buffer.as_slice();
             let decoded = parse(&encoded.buffer, extent).unwrap();
             assert_eq!(&bytes[decoded.ciphertext.clone()], page.ciphertext.bytes());
             assert!(bytes[decoded.ciphertext.end..].iter().all(|&b| b == 0));
@@ -4218,12 +4227,7 @@ mod records {
             ),
         ] {
             let mut staging = buffer(&admission, normal, length);
-            staging.bytes_mut().unwrap().fill(0xa5);
-            staging.retain(std::rc::Rc::new(
-                admission
-                    .reserve(None, ResourceClass::Ciphertext, 17)
-                    .unwrap(),
-            ));
+            staging.as_mut_slice().fill(0xa5);
             assert_eq!(
                 encode_at(&page, Generation(1), alignment, offset, staging).err(),
                 Some(expected)
@@ -4262,7 +4266,7 @@ mod records {
                 let logical = logical_length(&page).unwrap();
                 let extent = alignment.extent(4096, logical).unwrap();
                 let mut staging = Some(buffer(&admission, alignment, extent.length()));
-                staging.as_mut().unwrap().bytes_mut().unwrap().fill(0xa5);
+                staging.as_mut().unwrap().as_mut_slice().fill(0xa5);
                 for mode in ["sizing", "encode-reuse", "two-sizing+encode"] {
                     let iterations = if mode == "sizing" || size == "tiny" {
                         2000
@@ -4291,7 +4295,7 @@ mod records {
                                     buffer,
                                 )
                                 .unwrap();
-                                black_box(encoded.buffer.bytes().unwrap());
+                                black_box(encoded.buffer.as_slice());
                                 black_box(&encoded.header);
                                 staging = Some(encoded.buffer);
                             }
@@ -4325,7 +4329,7 @@ mod records {
             buffer(&admission, alignment, 1024),
         )
         .unwrap();
-        let bytes = encoded.buffer.bytes().unwrap();
+        let bytes = encoded.buffer.as_slice();
         let header = unhex(GOLDEN_HEADER);
         let ciphertext = unhex(GOLDEN_CIPHERTEXT);
         assert_eq!(bytes[..header.len()], header);
@@ -4353,7 +4357,7 @@ mod records {
         assert_eq!(parsed.header.format_version, FORMAT_VERSION);
         assert_eq!(parsed.header.metadata, page.metadata.immutable());
 
-        let mut corrupted = encoded.buffer.bytes().unwrap().to_vec();
+        let mut corrupted = encoded.buffer.as_slice().to_vec();
         let start = corrupted
             .windows(10)
             .position(|w| w == b"text/plain")
@@ -4377,7 +4381,7 @@ mod records {
             buffer(&admission, alignment, 8192),
         )
         .unwrap();
-        let original = encoded.buffer.bytes().unwrap();
+        let original = encoded.buffer.as_slice();
         assert_eq!(&original[8..12], &FORMAT_VERSION.to_le_bytes());
         let header_len = real_header_end(original);
         // The content type length follows the cache and ETag bytes.
@@ -4436,10 +4440,7 @@ mod records {
             buffer(admission, alignment, 1024),
         )
         .unwrap();
-        (
-            encoded.buffer.bytes().unwrap().to_vec(),
-            encoded.header.extent,
-        )
+        (encoded.buffer.as_slice().to_vec(), encoded.header.extent)
     }
 
     #[test]
@@ -4463,10 +4464,10 @@ mod records {
                     let record = record_length(&page, alignment).unwrap();
                     assert_eq!(record, block + record_unit);
                     let mut staging = buffer(&admission, alignment, record);
-                    staging.bytes_mut().unwrap().fill(0xa5);
+                    staging.as_mut_slice().fill(0xa5);
                     let encoded =
                         encode_at(&page, Generation(3), alignment, unit as u64, staging).unwrap();
-                    let bytes = encoded.buffer.bytes().unwrap();
+                    let bytes = encoded.buffer.as_slice();
                     assert_eq!(real_header_end(bytes), real + extra);
                     assert_eq!(
                         u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize,
@@ -4577,7 +4578,7 @@ mod records {
                 buffer(&admission, alignment, length),
             )
             .unwrap();
-            let bytes = encoded.buffer.bytes().unwrap();
+            let bytes = encoded.buffer.as_slice();
             let extent = encoded.header.extent;
             let full = parse_bytes(bytes, extent).unwrap();
             let block = header_block_len(&page, alignment).unwrap();
@@ -5928,7 +5929,7 @@ fn zero_copy_write_failure_releases_charges_and_does_not_publish() {
         assert_eq!(f.metrics.count(crate::telemetry::Event::DiskPublication), 0);
         assert_eq!(f.metrics.count(crate::telemetry::Event::PersistZeroCopy), 1);
         assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
-        f.store.writer.slabs().reclaim_idle();
+        f.store.writer.reclaim_idle_buffer();
         assert_eq!(f.admission.used(ResourceClass::Ciphertext), page_charge);
         assert_eq!(page.ciphertext.disk_body(alignment).unwrap(), &before[..]);
     }

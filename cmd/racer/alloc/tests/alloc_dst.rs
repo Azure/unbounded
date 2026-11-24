@@ -11,9 +11,10 @@
 //! consecutive seeds from `DST_START_SEED` (default zero). Tune with `DST_STEPS`.
 //! A failure prints the case, step, and operation.
 
+use page_alloc::buf::Buf;
 use page_alloc::{
-    AlignedBuffer, Alignment, Charge, Error, Extent, FreezeGuard, Generation, SegmentId,
-    SegmentLease, SegmentSnapshot, SegmentState, Segments, Slab,
+    Alignment, Charge, Error, Extent, FreezeGuard, Generation, SegmentId, SegmentLease,
+    SegmentSnapshot, SegmentState, Segments, Slab,
 };
 use racer_io::scoped::Reactor;
 use racer_io::sim::{Fault, SimOs};
@@ -553,7 +554,7 @@ struct Pending<'t> {
 
     retained_read: bool,
 
-    operation: Operation<'t, AlignedBuffer<Counted>, TestError>,
+    operation: Operation<'t, Buf<Counted>, TestError>,
 }
 
 thread_local! {
@@ -1029,7 +1030,7 @@ struct Phase<'t, 'w> {
 
     leases: Vec<SegmentLease>,
 
-    buffers: Vec<AlignedBuffer<Counted>>,
+    buffers: Vec<Buf<Counted>>,
 
     frozen: Option<FreezeGuard>,
 
@@ -1658,7 +1659,7 @@ impl<'t, 'w> Phase<'t, 'w> {
         record: usize,
         write: bool,
         fault: Option<FaultKind>,
-        operation: Operation<'t, AlignedBuffer<Counted>, TestError>,
+        operation: Operation<'t, Buf<Counted>, TestError>,
     ) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
@@ -1749,7 +1750,7 @@ impl<'t, 'w> Phase<'t, 'w> {
     fn complete(
         &mut self,
         pending: &Pending<'t>,
-        result: std::result::Result<AlignedBuffer<Counted>, TestError>,
+        result: std::result::Result<Buf<Counted>, TestError>,
     ) {
         let record = pending.record;
         let seg = self.w.records[record].seg;
@@ -1873,7 +1874,7 @@ impl<'t, 'w> Phase<'t, 'w> {
         let operation = self
             .t
             .slab
-            .read(&self.t.reactor, r.extent, buffer, lease, &SCOPE);
+            .read_buf(&self.t.reactor, r.extent, buffer, lease, &SCOPE);
         self.push(record, false, fault, operation)
     }
 
@@ -2197,8 +2198,9 @@ impl<'t, 'w> Phase<'t, 'w> {
             self.poll_fence(0);
         }
         self.maybe_held = false;
-        let live: usize = self.buffers.iter().map(AlignedBuffer::len).sum();
-        assert_eq!(self.w.charge.get(), live + self.t.slab.idle_bytes());
+        let live: usize = self.buffers.iter().map(|b| b.len()).sum();
+        // Idle pool storage is charged to the pool, not to the caller's guard.
+        assert_eq!(self.w.charge.get(), live);
     }
 
     /// Restore a recovery image into this fresh table.
@@ -2253,7 +2255,8 @@ impl<'t, 'w> Phase<'t, 'w> {
                 assert!(leased.is_err(), "superseded record {i} leases");
             }
         }
-        assert!(self.w.charge.get() >= self.t.slab.idle_bytes());
+        // Idle pool storage is charged to the pool, not to this guard, so it
+        // no longer contributes to the caller's reserved bytes.
     }
 }
 

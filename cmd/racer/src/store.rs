@@ -25,13 +25,15 @@ use crate::model::VersionMetadata;
 use crate::runtime::HashMap;
 use crate::runtime::Reactor;
 use crate::runtime::RequestScope;
-use page_alloc::AlignedBuffer;
 use page_alloc::Alignment;
 use page_alloc::Extent;
 use page_alloc::Generation;
 use page_alloc::SegmentLease;
 use page_alloc::Segments;
 use page_alloc::Slab;
+use page_alloc::buf::Buf;
+use page_alloc::buf::Pool as BufPool;
+use page_alloc::buf::PoolAccount;
 use racer_wire::control::CacheId;
 use racer_wire::control::KeyId;
 use sha2::Digest;
@@ -367,7 +369,7 @@ impl StoreReader {
             };
             let buffer = match self
                 .slabs
-                .read(&self.reactor, prefix_extent, buffer, read_lease, scope)
+                .read_buf(&self.reactor, prefix_extent, buffer, read_lease, scope)
                 .await
             {
                 Ok(buffer) => buffer,
@@ -378,7 +380,7 @@ impl StoreReader {
                 }
                 Err(error) => return Err(error),
             };
-            let decoded = match parse_prefix(buffer.bytes()?, location.extent) {
+            let decoded = match parse_prefix(&buffer, location.extent) {
                 Ok(decoded) => decoded,
                 // A short prefix of a valid record, another version, or
                 // damage: the host read path classifies and reports it.
@@ -607,6 +609,12 @@ pub struct StoreWriter {
     space_deferred: Cell<bool>,
     /// Last time a persist failure was logged, for rate limiting.
     last_failure_log: Cell<Option<std::time::Instant>>,
+    /// The worker's aligned write-staging pool. It is the same pooled buffer
+    /// type reads use, charged to ciphertext admission so idle staging keeps
+    /// its primary class and amount.
+    buffers: RefCell<Option<BufPool>>,
+    /// Latest staging pressure, applied when the pool is first used.
+    staging_pressure: Cell<page_alloc::Pressure>,
 }
 /// Why a dirty page write failed, for `racer_dirty_discard_reasons_total`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -684,6 +692,8 @@ impl StoreWriter {
             discarded: Cell::new(0),
             space_deferred: Cell::new(false),
             last_failure_log: Cell::new(None),
+            buffers: RefCell::new(None),
+            staging_pressure: Cell::new(page_alloc::Pressure::Normal),
             closed: Cell::new(false),
         }
     }
@@ -949,6 +959,24 @@ impl StoreWriter {
                 .get(page)
                 .is_some_and(|dirty| dirty.hold.is_some())
     }
+    /// The worker's aligned write-staging pool, created at the device's record
+    /// alignment on first use.
+    fn staging(&self) -> Result<std::cell::RefMut<'_, Option<BufPool>>> {
+        if self.buffers.borrow().is_none() {
+            let alignment = record_alignment(self.slabs.alignment()?)?;
+            let mut pool = BufPool::new(
+                page_alloc::buf::PoolConfig {
+                    alignment: alignment.memory(),
+                    max_idle_per_class: usize::MAX,
+                },
+                StagingAccount::new(&self.admission, 128 * 1024 * 1024),
+            )?;
+            pool.set_pressure(self.staging_pressure.get());
+            *self.buffers.borrow_mut() = Some(pool);
+        }
+        Ok(self.buffers.borrow_mut())
+    }
+
     /// Accepted fills may complete after request admission closes, within quota.
     fn reserve_staging(
         &self,
@@ -963,7 +991,7 @@ impl StoreWriter {
         crate::admission::report_final(&self.admission, || {
             let result = reserve();
             if matches!(result, Err(Error::Overloaded)) {
-                self.slabs.reclaim_idle();
+                self.reclaim_idle_buffer();
                 return reserve();
             }
             result
@@ -1372,7 +1400,7 @@ impl StoreWriter {
     /// Release only enough queued ciphertext/staging charges to cover a deficit.
     /// Submitted writes are absent from queue and keep all completion-owned charges.
     pub(crate) fn reclaim_ciphertext(&self, cache: Option<&CacheId>, bytes: usize) -> usize {
-        let pooled = self.slabs.reclaim_idle();
+        let pooled = self.reclaim_idle_buffer();
         if pooled >= bytes {
             return pooled;
         }
@@ -1640,8 +1668,19 @@ impl StoreWriter {
         } else {
             disk_bytes
         };
-        let mut buffer = self.slabs.allocate(staged, staging)?;
-        buffer.retain(dirty);
+        // Keep both the staging and dirty charges in the buffer so an abandoned
+        // future still owns them until the kernel completion fence.
+        let mut buffer = {
+            let mut staging_pool = self.staging()?;
+            staging_pool.as_mut().expect("staging pool").take(
+                staged,
+                StagingCharge {
+                    staging,
+                    _dirty: dirty,
+                },
+                false,
+            )?
+        };
         // The appended record keeps its segment from eviction until the
         // ticket publishes or drops (including future cancellation).
         let extent = location.extent;
@@ -1650,7 +1689,7 @@ impl StoreWriter {
             if extent.length() != disk_bytes {
                 return Err(Error::InvalidConfiguration);
             }
-            write_header(page, location.generation, alignment, buffer.bytes_mut()?)?;
+            write_header(page, location.generation, alignment, &mut buffer[..])?;
             self.metrics
                 .record(crate::telemetry::Event::PersistZeroCopy, 1);
             let body = DiskBody {
@@ -1737,7 +1776,7 @@ impl StoreWriter {
                 self.progress(8, scope).await?;
             }
             self.slabs.fence_writes().await?;
-            self.slabs.reclaim_idle();
+            self.reclaim_idle_buffer();
             Ok(())
         })
     }
@@ -1766,25 +1805,54 @@ impl StoreWriter {
     pub fn is_idle(&self) -> bool {
         !self.busy.get() && self.pending_count() == 0 && self.writes_in_flight() == 0
     }
-    /// Idle, zeroized staging remains charged until reuse, pressure, or drain.
+    /// Idle pooled staging storage until reuse, pressure, or drain.
     pub fn retained_staging_bytes(&self) -> usize {
-        self.slabs.idle_bytes()
+        self.buffers
+            .borrow()
+            .as_ref()
+            .map_or(0, BufPool::idle_bytes)
     }
     /// Size idle staging to its recent demand; cheap between samples.
     pub fn maintain_staging(&self, now: std::time::Instant) -> usize {
-        self.slabs.maintain_idle(now)
+        self.buffers
+            .try_borrow_mut()
+            .ok()
+            .and_then(|mut staging| staging.as_mut().map(|pool| pool.maintain(now)))
+            .unwrap_or(0)
     }
     /// Set the memory pressure idle staging sizing responds to.
     pub fn set_staging_pressure(&self, pressure: page_alloc::Pressure) {
-        self.slabs.set_idle_pressure(pressure);
+        self.staging_pressure.set(pressure);
+        if let Ok(mut staging) = self.buffers.try_borrow_mut()
+            && let Some(pool) = staging.as_mut()
+        {
+            pool.set_pressure(pressure);
+        }
     }
     /// Idle staging size, demand target, and cumulative counters.
     pub fn staging_pool_stats(&self) -> flow_control::PoolStats {
-        self.slabs.idle_pool_stats()
+        // The pool is created on the first staged write. Until then it holds
+        // nothing, but it still follows the node pressure so a caller sizing or
+        // reporting idle staging sees the same level the pool will start with.
+        self.buffers.borrow().as_ref().map_or_else(
+            || flow_control::PoolStats {
+                constrained: self.staging_pressure.get() != page_alloc::Pressure::Normal,
+                ..flow_control::PoolStats::default()
+            },
+            BufPool::stats,
+        )
     }
     /// Release all idle staging at once and return its size in bytes.
     pub fn reclaim_idle_buffer(&self) -> usize {
-        self.slabs.reclaim_idle()
+        let Ok(mut staging) = self.buffers.try_borrow_mut() else {
+            return 0;
+        };
+        let Some(pool) = staging.as_mut() else {
+            return 0;
+        };
+        let released = pool.shed(usize::MAX);
+        pool.clear();
+        released
     }
 
     fn notify_waiters(&self) {
@@ -2017,9 +2085,80 @@ pub struct RecordHeader {
     pub logical_bytes: u64,
     pub extent: Extent,
 }
-pub struct EncodedRecord {
+pub struct EncodedRecord<C: page_alloc::Charge> {
     pub header: RecordHeader,
-    pub buffer: AlignedBuffer<flow_control::Charge<AdmissionPolicy>>,
+    pub buffer: Buf<C>,
+}
+
+/// Charge that keeps a write's dirty ciphertext reservation alive through the
+/// kernel completion while the staging charge remains primary.
+struct StagingCharge {
+    staging: flow_control::Charge<AdmissionPolicy>,
+
+    _dirty: Rc<flow_control::Charge<AdmissionPolicy>>,
+}
+
+impl page_alloc::Charge for StagingCharge {
+    fn covers(&self, bytes: usize) -> bool {
+        page_alloc::Charge::covers(&self.staging, bytes)
+    }
+
+    fn requires_wipe(&self) -> bool {
+        page_alloc::Charge::requires_wipe(&self.staging)
+    }
+}
+
+/// Idle staging accounting: the same Ciphertext class and amount as a live
+/// staging charge, capped at the former 128 MiB slab budget.
+struct StagingAccount {
+    quota: flow_control::QuotaPoolAccount<AdmissionPolicy>,
+
+    limit: usize,
+
+    used: std::sync::atomic::AtomicUsize,
+}
+
+impl StagingAccount {
+    fn new(admission: &Rc<flow_control::Quotas<AdmissionPolicy>>, limit: usize) -> Self {
+        Self {
+            quota: flow_control::QuotaPoolAccount::new(
+                admission.shared(),
+                ResourceClass::Ciphertext,
+            ),
+            limit,
+            used: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+impl PoolAccount for StagingAccount {
+    fn charge_idle(&self, bytes: usize) -> bool {
+        use std::sync::atomic::Ordering;
+        let mut used = self.used.load(Ordering::Relaxed);
+        loop {
+            let Some(next) = used.checked_add(bytes).filter(|n| *n <= self.limit) else {
+                return false;
+            };
+            match self
+                .used
+                .compare_exchange_weak(used, next, Ordering::AcqRel, Ordering::Relaxed)
+            {
+                Ok(_) => break,
+                Err(actual) => used = actual,
+            }
+        }
+        if self.quota.charge_idle(bytes) {
+            return true;
+        }
+        self.used.fetch_sub(bytes, Ordering::AcqRel);
+        false
+    }
+
+    fn release_idle(&self, bytes: usize) {
+        self.used
+            .fetch_sub(bytes, std::sync::atomic::Ordering::AcqRel);
+        self.quota.release_idle(bytes);
+    }
 }
 pub struct DecodedRecord {
     pub header: RecordHeader,
@@ -2276,52 +2415,52 @@ pub fn logical_length(page: &CiphertextCopy) -> Result<usize> {
         .checked_add(page.ciphertext.bytes().len())
         .ok_or(Error::CorruptRecord)
 }
-pub fn encode(
+pub fn encode<C: page_alloc::Charge>(
     page: &CiphertextCopy,
     generation: Generation,
     alignment: Alignment,
-    buffer: AlignedBuffer<flow_control::Charge<AdmissionPolicy>>,
-) -> Result<EncodedRecord> {
+    buffer: Buf<C>,
+) -> Result<EncodedRecord<C>> {
     encode_at(page, generation, alignment, 0, buffer)
 }
-pub fn encode_at(
+pub fn encode_at<C: page_alloc::Charge>(
     page: &CiphertextCopy,
     generation: Generation,
     alignment: Alignment,
     offset: u64,
-    buffer: AlignedBuffer<flow_control::Charge<AdmissionPolicy>>,
-) -> Result<EncodedRecord> {
+    buffer: Buf<C>,
+) -> Result<EncodedRecord<C>> {
     let layout = layout(page, generation, alignment)?;
     encode_layout(page, generation, alignment, offset, buffer, layout)
 }
 /// Encode with the extent unit as the record unit, the layout written before
 /// the record unit had a 4 KiB floor. Readers must keep accepting it.
 #[cfg(test)]
-pub(crate) fn encode_unit_aligned_at(
+pub(crate) fn encode_unit_aligned_at<C: page_alloc::Charge>(
     page: &CiphertextCopy,
     generation: Generation,
     alignment: Alignment,
     offset: u64,
-    buffer: AlignedBuffer<flow_control::Charge<AdmissionPolicy>>,
-) -> Result<EncodedRecord> {
+    buffer: Buf<C>,
+) -> Result<EncodedRecord<C>> {
     let layout = layout_with_unit(page, generation, alignment.extent(0, 1)?.length())?;
     encode_layout(page, generation, alignment, offset, buffer, layout)
 }
-fn encode_layout(
+fn encode_layout<C: page_alloc::Charge>(
     page: &CiphertextCopy,
     generation: Generation,
     alignment: Alignment,
     offset: u64,
-    mut buffer: AlignedBuffer<flow_control::Charge<AdmissionPolicy>>,
+    mut buffer: Buf<C>,
     layout: RecordLayout,
-) -> Result<EncodedRecord> {
+) -> Result<EncodedRecord<C>> {
     let logical_bytes = layout.logical_bytes;
     let extent = alignment.extent(offset, layout.header_block + layout.body_bytes)?;
     if extent.length() != layout.header_block + layout.body_bytes {
         return Err(Error::InvalidConfiguration);
     }
     alignment.check(extent, &buffer)?;
-    let bytes = buffer.bytes_mut()?;
+    let bytes: &mut [u8] = &mut buffer;
     write_header_layout(page, generation, &layout, &mut bytes[..layout.header_block])?;
     bytes[layout.header_block..logical_bytes].copy_from_slice(page.ciphertext.bytes());
     bytes[logical_bytes..].fill(0);
@@ -2337,11 +2476,8 @@ fn encode_layout(
         buffer,
     })
 }
-pub fn parse(
-    buffer: &AlignedBuffer<flow_control::Charge<AdmissionPolicy>>,
-    extent: Extent,
-) -> Result<DecodedRecord> {
-    parse_bytes(buffer.bytes()?, extent)
+pub fn parse<C: page_alloc::Charge>(buffer: &Buf<C>, extent: Extent) -> Result<DecodedRecord> {
+    parse_bytes(buffer, extent)
 }
 /// Parse and validate a whole record of `extent`'s length.
 pub fn parse_bytes(bytes: &[u8], extent: Extent) -> Result<DecodedRecord> {
@@ -2485,8 +2621,8 @@ fn header_fields_len(r: &mut Decoder<'_>) -> Result<usize> {
     r.take(4 + 4)?;
     Ok(start - r.0.len())
 }
-pub fn decode(
-    buffer: &AlignedBuffer<flow_control::Charge<AdmissionPolicy>>,
+pub fn decode<C: page_alloc::Charge>(
+    buffer: &Buf<C>,
     expected: &RecordHeader,
 ) -> Result<PageEnvelope> {
     let actual = parse(buffer, expected.extent)?.header;

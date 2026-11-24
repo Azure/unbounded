@@ -3323,10 +3323,10 @@ impl Fill {
                 // writes the aligned body in place, or the full padded record
                 // for the copy fallback, so the floor covers either path.
                 let one_page = page_charge.saturating_add(amount);
-                // Idle aligned buffers retain Ciphertext charges after completed
-                // writes. Release that backing before headroom rejection or any
+                // Completed writes leave idle storage in the worker's shared
+                // pool. Release that backing before headroom rejection or any
                 // destructive queued-copy reclaim; this is one bounded pool.
-                self.dependencies.writer.slabs().reclaim_idle();
+                self.dependencies.writer.reclaim_idle_buffer();
                 if !owned && !self.optional_staging_headroom(amount, one_page) {
                     return Err(Error::Overloaded);
                 }

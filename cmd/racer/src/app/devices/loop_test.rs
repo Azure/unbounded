@@ -282,7 +282,10 @@ fn disposable_loop_devices_read_only_bind_restart() {
             .lease(page_alloc::SegmentId(index), page_alloc::Generation(1))
             .unwrap();
         let buffer = slab.allocate(segment as usize, ()).unwrap();
-        let buffer = drive(&reactor, slab.read(&reactor, extent, buffer, lease, &scope));
+        let buffer = drive(
+            &reactor,
+            slab.read_buf(&reactor, extent, buffer, lease, &scope),
+        );
         assert!(buffer.as_slice().iter().all(|b| *b == index as u8 + 1));
     }
     let other = &plan.workers[1];
@@ -320,7 +323,7 @@ fn disposable_loop_devices_read_only_bind_restart() {
         let buffer = other_slab.allocate(segment as usize, ()).unwrap();
         let buffer = drive(
             &reactor,
-            other_slab.read(&reactor, extent, buffer, lease, &scope),
+            other_slab.read_buf(&reactor, extent, buffer, lease, &scope),
         );
         assert!(buffer.as_slice().iter().all(|b| *b == index as u8 + 32));
     }
