@@ -1,13 +1,13 @@
 //! Cancellation-safe publication over a shared [`DiskIndex`].
 //!
-//! [`PendingWrite`] owns a [`PageTicket`] and then the [`Writing`] token for
+//! [`PendingWrite`] owns a [`SlotTicket`] and then the [`Writing`] token for
 //! one record. The order reserve -> append -> write -> publish is enforced by
 //! the tokens; dropping a `PendingWrite` (for example when a persist future
 //! is canceled) cancels the reservation or reports the write failed, so no
 //! in-flight or write count leaks.
 
 use crate::disk_index::{
-    CacheKey, DiskIndex, PageSlot, PageTicket, RecordLocation, Removed, Writing,
+    CacheKey, DiskIndex, PageSlot, RecordLocation, Removed, SlotTicket, Writing,
 };
 use crate::{Result, SegmentLease, Segments};
 use std::cell::RefCell;
@@ -15,7 +15,7 @@ use std::rc::Rc;
 
 #[derive(Debug)]
 enum Stage {
-    Reserved(PageTicket),
+    Reserved(SlotTicket),
     Writing(Writing),
     Done,
 }
@@ -41,7 +41,7 @@ impl PendingWrite {
     }
 
     /// Guard an already reserved ticket (for example from `reserve_replacing`).
-    pub fn from_ticket(index: Rc<RefCell<DiskIndex>>, ticket: PageTicket) -> Self {
+    pub fn from_ticket(index: Rc<RefCell<DiskIndex>>, ticket: SlotTicket) -> Self {
         Self {
             index,
             stage: Stage::Reserved(ticket),

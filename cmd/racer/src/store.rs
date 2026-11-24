@@ -44,7 +44,6 @@ use std::rc::Rc;
 pub mod catalog;
 pub mod checkpoint;
 pub mod holds;
-mod pages;
 
 pub struct Store {
     pub reader: Rc<StoreReader>,
@@ -489,6 +488,13 @@ fn queued_position(queue: &VecDeque<PageId>, page: &PageId) -> Option<usize> {
 
 /// Pending versions summarized for [`StoreWriter::metadata`], so a lookup
 /// costs O(1) unless one version's queued pages use different keys.
+///
+/// This is not the catalog's published version table. It describes bytes that
+/// are still queued for publication and disappears with the queue; the catalog
+/// keeps page-attached descriptors in `State::versions` (refcounted by stored
+/// pages) and standalone descriptors in `State::metadata`. A version may be in
+/// both views at once while a replacement write is in flight, and each view
+/// answers a different question.
 struct PendingVersion {
     pages: usize,
     metadata: VersionMetadata,

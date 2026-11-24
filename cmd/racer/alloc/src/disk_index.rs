@@ -12,7 +12,7 @@
 //!
 //! - A [`RecordLocation`] can only come from [`DiskIndex::append`] (or a
 //!   validated [`DiskIndex::restore`]); its fields are private.
-//! - Publishing requires a [`PageTicket`] from [`DiskIndex::reserve`] and the
+//! - Publishing requires a [`SlotTicket`] from [`DiskIndex::reserve`] and the
 //!   [`Written`] token from [`DiskIndex::write_complete`]; neither can be
 //!   constructed or cloned outside this module.
 //! - Segment generations come only from [`Segments`], which increments them
@@ -33,7 +33,7 @@
 //!
 //! # Callers
 //!
-//! The racer storage worker (`src/store/pages.rs`) interns `PageId -> PageSlot`
+//! The racer storage worker (`src/store/catalog.rs`) interns `PageId -> PageSlot`
 //! and cache IDs with [`crate::intern`], keeps `PageId` in records and
 //! checkpoints, and calls [`DiskIndex::reserve`], [`DiskIndex::append`],
 //! [`DiskIndex::write_complete`], and [`DiskIndex::publish`] around each write.
@@ -133,13 +133,13 @@ pub struct Removed {
 /// [`DiskIndex::cancel`] if the write is abandoned.
 #[must_use = "cancel or publish the ticket"]
 #[derive(Debug)]
-pub struct PageTicket {
+pub struct SlotTicket {
     slot: PageSlot,
 
     cache: CacheKey,
 }
 
-impl PageTicket {
+impl SlotTicket {
     /// The reserved slot.
     pub fn slot(&self) -> PageSlot {
         self.slot
@@ -150,7 +150,7 @@ impl PageTicket {
 #[must_use = "complete or fail the write"]
 #[derive(Debug)]
 pub struct Writing {
-    ticket: PageTicket,
+    ticket: SlotTicket,
 
     location: RecordLocation,
 }
@@ -171,7 +171,7 @@ impl Writing {
 #[must_use = "publish the written record"]
 #[derive(Debug)]
 pub struct Written {
-    ticket: PageTicket,
+    ticket: SlotTicket,
 
     location: RecordLocation,
 }
@@ -751,15 +751,15 @@ impl DiskIndex {
         Ok(())
     }
 
-    fn reserve_unchecked(&mut self, slot: PageSlot, cache: CacheKey) -> PageTicket {
+    fn reserve_unchecked(&mut self, slot: PageSlot, cache: CacheKey) -> SlotTicket {
         self.update(slot, |this| this.entries[slot.0 as usize].flags |= INFLIGHT);
         self.caches[usize::from(cache.idx.0)].inflight += 1;
-        PageTicket { slot, cache }
+        SlotTicket { slot, cache }
     }
 
     /// Reserve the right to publish `slot` for `cache`. A stored slot may be
     /// re-published (replacing its record) without extra capacity.
-    pub fn reserve(&mut self, slot: PageSlot, cache: CacheKey) -> Result<PageTicket> {
+    pub fn reserve(&mut self, slot: PageSlot, cache: CacheKey) -> Result<SlotTicket> {
         self.check_reserve(slot, cache, 0)?;
         Ok(self.reserve_unchecked(slot, cache))
     }
@@ -772,7 +772,7 @@ impl DiskIndex {
         slot: PageSlot,
         cache: CacheKey,
         victim: PageSlot,
-    ) -> Result<(PageTicket, Removed)> {
+    ) -> Result<(SlotTicket, Removed)> {
         let entry = self.entry(victim)?;
         if victim == slot || !entry.stored() || entry.inflight() || entry.holders != 0 {
             return Err(Error::Busy);
@@ -782,8 +782,8 @@ impl DiskIndex {
         Ok((self.reserve_unchecked(slot, cache), removed))
     }
 
-    fn release_ticket(&mut self, ticket: PageTicket) {
-        let PageTicket { slot, cache } = ticket;
+    fn release_ticket(&mut self, ticket: SlotTicket) {
+        let SlotTicket { slot, cache } = ticket;
         self.update(slot, |this| {
             this.entries[slot.0 as usize].flags &= !INFLIGHT
         });
@@ -792,7 +792,7 @@ impl DiskIndex {
     }
 
     /// Abandon a reservation.
-    pub fn cancel(&mut self, ticket: PageTicket) {
+    pub fn cancel(&mut self, ticket: SlotTicket) {
         self.release_ticket(ticket);
     }
 
@@ -801,9 +801,9 @@ impl DiskIndex {
     pub fn append(
         &mut self,
         segments: &Segments,
-        ticket: PageTicket,
+        ticket: SlotTicket,
         length: usize,
-    ) -> std::result::Result<(SegmentLease, Writing), (PageTicket, Error)> {
+    ) -> std::result::Result<(SegmentLease, Writing), (SlotTicket, Error)> {
         // Check before appending: a lease dropped on this error path would
         // strand its extent until the segment is recycled.
         if segments.count() > self.segments.len() {
@@ -2087,7 +2087,7 @@ mod tests {
         let mut model = Reference::default();
         let mut rng = Rng(seed | 1);
         let mut now = Monotonic(0);
-        let mut tickets: Vec<PageTicket> = Vec::new();
+        let mut tickets: Vec<SlotTicket> = Vec::new();
         let mut writing: Vec<(SegmentLease, Writing)> = Vec::new();
         for cache in 0..3u16 {
             model
