@@ -1092,10 +1092,14 @@ impl Index {
             return Ok(None);
         }
         let now = self.clock.wall_now();
-        // A pointer published under an immutable policy carries an effectively
-        // infinite deadline. Once the published definition is mutable again, it
-        // is no longer fresher than a fresh observation would be.
-        let bound = self.metadata_bound(&object.cache, now)?;
+        // Only an immutable policy publishes an infinite deadline. Once the
+        // definition is mutable again, reject it before the worker observes the
+        // change; the TTL itself is enforced from the observation time by
+        // invalidating pointers when the published policy shrinks.
+        let mutable = self
+            .availability
+            .metadata_policy(&object.cache)
+            .is_some_and(|policy| !policy.immutable);
         Ok(self
             .state
             .borrow()
@@ -1103,7 +1107,8 @@ impl Index {
             .get(object)
             .filter(|v| now < v.expires_at.as_system_time())
             .filter(|v| {
-                bound.is_none_or(|bound| v.expires_at.as_system_time() <= bound.as_system_time())
+                !mutable
+                    || v.expires_at.to_unix_millis().ok() != Some(crate::model::MAX_WIRE_INTEGER)
             })
             .cloned())
     }
@@ -1139,6 +1144,20 @@ impl Index {
     /// Drop volatile freshness on clock uncertainty, preserving version descriptors.
     pub fn invalidate_freshness(&self) -> Result<()> {
         self.state_mut().current.clear();
+        Ok(())
+    }
+    /// Drop volatile freshness for caches whose origin policy no longer admits
+    /// their stored pointers, preserving version descriptors.
+    pub(crate) fn invalidate_freshness_for(
+        &self,
+        caches: &HashSet<racer_wire::control::CacheId>,
+    ) -> Result<()> {
+        if caches.is_empty() {
+            return Ok(());
+        }
+        self.state_mut()
+            .current
+            .retain(|object, _| !caches.contains(&object.cache));
         Ok(())
     }
     /// Reclaim standalone catalog entries and any pointers depending on them.

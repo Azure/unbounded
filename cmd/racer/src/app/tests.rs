@@ -1738,6 +1738,95 @@ fn snapshot_refresh_purges_cache_entering_passthrough() {
 }
 
 #[test]
+fn snapshot_refresh_drops_freshness_when_metadata_policy_shrinks() {
+    use racer_wire::control as wire;
+    let env = racer_io::Env::host();
+    let config = crate::test_support::cluster::config(false);
+    let node = Arc::new(NodeState::on(env.ctx.clone()));
+    let (mut worker, _, _) = local_worker(&env, &config, &node, 1);
+    let current_scope = scope(&racer_io::Clock::host(), Duration::from_secs(1)).unwrap();
+    let origin = |metadata_ttl, metadata_immutable| {
+        Some(wire::OriginDefinition {
+            metadata_ttl,
+            metadata_immutable,
+            ..wire::OriginDefinition::azure(
+                wire::AzureContainerUrl::parse("https://acct.blob.core.windows.net/models")
+                    .unwrap(),
+                wire::AzureCredential::Anonymous,
+            )
+        })
+    };
+    let mut cached = definition();
+    cached.origin = origin(Duration::from_secs(3600), true);
+    worker
+        .snapshots
+        .apply(publication(&config, 1, vec![cached.clone()]))
+        .unwrap();
+    worker.refresh_snapshot(&current_scope).unwrap();
+    let (_, _, roots) = crate::test_support::security::issued();
+    worker
+        .keys
+        .install(wire::KeyringBundle {
+            schema_version: wire::KEYRING_SCHEMA_VERSION,
+            cluster: config.cluster.clone(),
+            generation: wire::BundleGeneration(1),
+            peer_trust_roots: roots,
+            cache_keys: vec![wire::CacheEncryptionKey::new(
+                wire::CacheKeyRef {
+                    cache: cached.id.clone(),
+                    id: crate::model::key_id_from_generation(1, 7).unwrap(),
+                    purpose: wire::CacheKeyPurpose::Page,
+                },
+                wire::CacheKeyState::Active,
+                zeroize::Zeroizing::new([19; 32]),
+            )],
+        })
+        .unwrap();
+    let index = worker.store.writer.index().clone();
+    let mut metadata = page(&worker).metadata;
+    let object = metadata.version.object.clone();
+    let version = metadata.version.clone();
+    let deadline = |seconds: u64| {
+        let now = env
+            .ctx
+            .clock
+            .wall_now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        ExpiresAt::from_unix_millis(now + seconds * 1000).unwrap()
+    };
+    metadata.expires_at = deadline(60);
+    index.publish_current(metadata).unwrap();
+    assert!(index.current(&object).unwrap().is_some());
+
+    // Turning immutability off drops the pointer published under it.
+    let mut bounded = cached.clone();
+    bounded.origin = origin(Duration::from_secs(5), false);
+    worker
+        .snapshots
+        .apply(publication(&config, 2, vec![bounded.clone()]))
+        .unwrap();
+    worker.refresh_snapshot(&current_scope).unwrap();
+    assert!(index.current(&object).unwrap().is_none());
+    assert!(index.version(&version).unwrap().is_some());
+
+    // A shorter TTL drops a pointer whose old deadline still lies ahead.
+    let mut metadata = page(&worker).metadata;
+    metadata.expires_at = deadline(3);
+    index.publish_current(metadata).unwrap();
+    assert!(index.current(&object).unwrap().is_some());
+    let mut shorter = bounded.clone();
+    shorter.origin = origin(Duration::from_secs(1), false);
+    worker
+        .snapshots
+        .apply(publication(&config, 3, vec![shorter]))
+        .unwrap();
+    worker.refresh_snapshot(&current_scope).unwrap();
+    assert!(index.current(&object).unwrap().is_none());
+}
+
+#[test]
 fn snapshot_refresh_retries_canceled_publication_and_applies_skipped_removal() {
     use racer_wire::control as wire;
     let env = racer_io::Env::host();
