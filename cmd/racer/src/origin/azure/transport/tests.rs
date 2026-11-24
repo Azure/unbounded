@@ -2,7 +2,7 @@
 
 use super::super::identity;
 use super::super::tokens::{AzureTokenCaches, AzureTokens};
-use super::super::{AnonymousOnly, AzureLimits, AzureOrigin, AzureTokenSource};
+use super::super::{AzureLimits, AzureOrigin, AzureTokenSource, AzureTransport};
 use super::*;
 use crate::admission::{AdmissionPolicy, ResourceClass};
 use crate::config::Limits;
@@ -142,9 +142,9 @@ fn reactor(env: &racer_io::Env) -> Option<Rc<Reactor>> {
     Some(reactor)
 }
 
-struct Fixture<K> {
+struct Fixture {
     reactor: Rc<Reactor>,
-    origin: AzureOrigin<PoolTransport, K>,
+    origin: AzureOrigin,
     definition: OriginDefinition,
 }
 
@@ -152,21 +152,21 @@ fn cache() -> CacheId {
     CacheId("44444444-4444-4444-8444-444444444444".into())
 }
 
-fn fixture<K: AzureTokenSource>(
+fn fixture(
     reactor: Rc<Reactor>,
     url: &str,
     credential: AzureCredential,
     resolver: MapResolver,
     trust: TrustRoots,
-    tokens: K,
-) -> Fixture<K> {
+    tokens: AzureTokenSource,
+) -> Fixture {
     let admission = reactor.admission().clone();
-    let transport = PoolTransport::new(
+    let transport = AzureTransport::new(PoolTransport::new(
         Rc::new(crate::http::new_pool(reactor.clone(), admission.clone(), 4)),
         Rc::new(crate::http::client_io(reactor.clone(), admission.clone())),
         Rc::new(resolver),
         Arc::new(trust),
-    );
+    ));
     let origin = AzureOrigin::new(
         transport,
         tokens,
@@ -194,7 +194,7 @@ fn context(key: &str) -> OriginContext {
     }
 }
 
-impl<K: AzureTokenSource> Fixture<K> {
+impl Fixture {
     fn reserve(&self) -> flow_control::Charge<AdmissionPolicy> {
         self.reactor
             .admission()
@@ -274,7 +274,7 @@ fn plain_http_reads_pages_and_classifies_errors_on_one_connection() {
         AzureCredential::Anonymous,
         MapResolver::new(vec![]),
         TrustRoots::unavailable("/nonexistent/racer-bundle.pem".into()),
-        AnonymousOnly,
+        AzureTokenSource::anonymous(),
     );
 
     // Empty blob: the ranged GET is unsatisfiable, so a HEAD follows.
@@ -359,7 +359,7 @@ fn https_with_a_private_ca_by_name() {
         AzureCredential::Anonymous,
         MapResolver::new(vec![address]),
         TrustRoots::fixed(http1::tls::client_config(identity.roots.clone())),
-        AnonymousOnly,
+        AzureTokenSource::anonymous(),
     );
     let reply = f.bootstrap("big").unwrap();
     assert_eq!(reply.metadata.length, SIZE as u64);
@@ -390,7 +390,7 @@ fn https_without_a_trust_bundle_fails_per_request() {
         AzureCredential::Anonymous,
         MapResolver::new(vec![]),
         trust,
-        AnonymousOnly,
+        AzureTokenSource::anonymous(),
     );
     assert_eq!(f.bootstrap("big").err(), Some(Error::Unavailable));
 }
@@ -438,8 +438,10 @@ fn workload_identity_learns_its_tenant_from_the_storage_challenge() {
         federated_token_file: Some(token_file),
         tls: Some(http1::tls::client_config(identity.roots.clone())),
     }));
-    let tokens = AzureTokens::new(caches, reactor.clone())
-        .with_resolver(Rc::new(MapResolver::new(vec![login])));
+    let tokens = AzureTokenSource::new(
+        AzureTokens::new(caches, reactor.clone())
+            .with_resolver(Rc::new(MapResolver::new(vec![login]))),
+    );
     let f = fixture(
         reactor,
         &format!("http://127.0.0.1:{}/account/models", storage.port()),
@@ -483,7 +485,7 @@ fn decoded_response_head_stays_charged_while_the_exchange_lives() {
         AzureCredential::Anonymous,
         MapResolver::new(vec![]),
         TrustRoots::unavailable("/nonexistent/racer-bundle.pem".into()),
-        AnonymousOnly,
+        AzureTokenSource::anonymous(),
     );
     let container = AzureContainerUrl::parse(&url).unwrap();
     let request = |method: &str, key: &str, range: bool| {
@@ -625,7 +627,7 @@ fn connect_failure_fails_over_to_the_next_resolved_address() {
         AzureCredential::Anonymous,
         MapResolver::new(vec![dead, address]),
         TrustRoots::fixed(http1::tls::client_config(identity.roots.clone())),
-        AnonymousOnly,
+        AzureTokenSource::anonymous(),
     );
     let reply = f.bootstrap("big").unwrap();
     assert_eq!(reply.metadata.length, SIZE as u64);
@@ -651,7 +653,7 @@ fn connect_failure_on_every_address_is_reported() {
         AzureCredential::Anonymous,
         MapResolver::new(vec![dead, second.address]),
         TrustRoots::unavailable("/nonexistent/racer-bundle.pem".into()),
-        AnonymousOnly,
+        AzureTokenSource::anonymous(),
     );
     assert!(f.bootstrap("big").is_err());
 }
@@ -709,7 +711,7 @@ fn stalled_handshake_fails_over_before_the_request_deadline() {
         AzureCredential::Anonymous,
         MapResolver::new(vec![stalled.local_addr().unwrap(), address]),
         TrustRoots::fixed(http1::tls::client_config(identity.roots.clone())),
-        AnonymousOnly,
+        AzureTokenSource::anonymous(),
     );
     let container = AzureContainerUrl::parse(&url).unwrap();
     let head = MessageHead {
@@ -903,7 +905,7 @@ fn reused_connection_closed_before_response_retries_on_fresh_connection() {
         AzureCredential::Anonymous,
         MapResolver::new(vec![]),
         TrustRoots::unavailable("/nonexistent/racer-bundle.pem".into()),
-        AnonymousOnly,
+        AzureTokenSource::anonymous(),
     );
     assert_eq!(f.metadata("small").unwrap().metadata.length, 5);
     assert_eq!(f.metadata("small").unwrap().metadata.length, 5);

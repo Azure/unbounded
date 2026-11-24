@@ -51,7 +51,7 @@ mod materialized_pairing {
         page: &CiphertextPage,
         scope: &RequestScope,
     ) -> Result<ConnectionLease> {
-        let head = encode_envelope(&response.authentication, true, page.bytes().len())?;
+        let head = peer_wire::encode_envelope(&response.authentication, true, page.bytes().len())?;
         let head = conn.state_mut().session.as_mut().unwrap().sign(head)?;
         let mut encoded = Codec::new(protocol::MAX_ENVELOPE_HEAD).encode_head(&head)?;
         encoded.extend_from_slice(&page.bytes()[..173]);
@@ -180,7 +180,7 @@ mod materialized_pairing {
             let mut previous = None;
             loop {
                 let received = ios[2].receive_head(conn, &scope).await?;
-                let (head, length) = decode_envelope(
+                let (head, length) = peer_wire::decode_envelope(
                     received.value,
                     false,
                     crate::peer::protocol::chains(&received.connection)?,
@@ -284,7 +284,7 @@ mod materialized_pairing {
             let conn = ios[0]
                 .send_head(
                     conn,
-                    encode_envelope(&signed.authentication, false, 0)?,
+                    peer_wire::encode_envelope(&signed.authentication, false, 0)?,
                     &scope,
                 )
                 .await?
@@ -314,11 +314,11 @@ mod materialized_pairing {
                 let received = ios[0]
                     .exchange_head(
                         conn,
-                        encode_envelope(&signed.authentication, false, 0)?,
+                        peer_wire::encode_envelope(&signed.authentication, false, 0)?,
                         &scope,
                     )
                     .await?;
-                let (head, length) = decode_envelope(
+                let (head, length) = peer_wire::decode_envelope(
                     received.value,
                     true,
                     crate::peer::protocol::chains(&received.connection)?,
@@ -458,7 +458,7 @@ mod safety {
             let conn = crate::http::from_accepted(fd, &f.admissions[2])?;
             let conn = connection::accept(&f.ios[2], conn, f.signers[2].clone(), &f.scope).await?;
             let received = f.ios[2].receive_head(conn, &f.scope).await?;
-            let (head, length) = decode_envelope(
+            let (head, length) = peer_wire::decode_envelope(
                 received.value,
                 false,
                 crate::peer::protocol::chains(&received.connection)?,
@@ -534,7 +534,7 @@ mod safety {
             let conn = f.ios[0]
                 .send_head(
                     conn,
-                    encode_envelope(&signed.authentication, false, 0)?,
+                    peer_wire::encode_envelope(&signed.authentication, false, 0)?,
                     &f.scope,
                 )
                 .await?
@@ -714,7 +714,7 @@ mod safety {
                 connection::accept(&f.ios[2], conn, f.signers[2].clone(), &f.scope).await?;
             for wrong in [true, false] {
                 let received = f.ios[2].receive_head(conn, &f.scope).await?;
-                let (head, _) = decode_envelope(
+                let (head, _) = peer_wire::decode_envelope(
                     received.value,
                     false,
                     crate::peer::protocol::chains(&received.connection)?,
@@ -736,7 +736,7 @@ mod safety {
                 conn = f.ios[2]
                     .send_head(
                         received.connection,
-                        encode_envelope(&response.authentication, true, length + 16)?,
+                        peer_wire::encode_envelope(&response.authentication, true, length + 16)?,
                         &f.scope,
                     )
                     .await?
@@ -778,11 +778,11 @@ mod safety {
                 let received = f.ios[0]
                     .exchange_head(
                         conn,
-                        encode_envelope(&signed.authentication, false, 0)?,
+                        peer_wire::encode_envelope(&signed.authentication, false, 0)?,
                         &f.scope,
                     )
                     .await?;
-                let (head, size) = decode_envelope(
+                let (head, size) = peer_wire::decode_envelope(
                     received.value,
                     true,
                     crate::peer::protocol::chains(&received.connection)?,
@@ -1354,7 +1354,7 @@ impl RelayFixture {
             let mut conn = connection::accept(&ios[2], conn, signers[2].clone(), &scope).await?;
             for i in 0..rounds {
                 let received = ios[2].receive_head(conn, &scope).await?;
-                let (head, length) = decode_envelope(
+                let (head, length) = peer_wire::decode_envelope(
                     received.value,
                     false,
                     crate::peer::protocol::chains(&received.connection)?,
@@ -1389,7 +1389,7 @@ impl RelayFixture {
                 };
                 let response = auth.sign_response(request.binding(), response)?;
                 conn = received.connection;
-                let head = encode_envelope(&response.authentication, true, body.len())?;
+                let head = peer_wire::encode_envelope(&response.authentication, true, body.len())?;
                 if truncated && i + 1 == rounds {
                     conn = ios[2].send_head(conn, head, &scope).await?.connection;
                     let done = ios[2]
@@ -1473,11 +1473,11 @@ impl RelayFixture {
                 let received = ios[0]
                     .exchange_head(
                         conn,
-                        encode_envelope(&signed.authentication, false, 0)?,
+                        peer_wire::encode_envelope(&signed.authentication, false, 0)?,
                         &scope,
                     )
                     .await?;
-                let (head, length) = decode_envelope(
+                let (head, length) = peer_wire::decode_envelope(
                     received.value,
                     true,
                     crate::peer::protocol::chains(&received.connection)?,
@@ -1696,7 +1696,7 @@ fn opaque_head_rejects_binding_length_authority_and_reverse_proof_substitution()
                         .find(|h| h.name == "racer-response-path")
                         .unwrap()
                         .value =
-                        protocol::nodes(&[signers[0].node().clone(), signers[2].node().clone()])
+                        peer_wire::nodes(&[signers[0].node().clone(), signers[2].node().clone()])
                             .unwrap()
                             .into_bytes()
                 }

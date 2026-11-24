@@ -267,6 +267,67 @@ ignored = { path = "missing" }
 	}
 }
 
+func TestLocalDependencyIntoAnotherCrateRoot(t *testing.T) {
+	root := t.TempDir()
+
+	if !otherCrateRoot(root, "cmd/racer-object", filepath.Join(root, "cmd/racer/wire")) {
+		t.Fatal("rejected a dependency inside another crate root")
+	}
+
+	if otherCrateRoot(root, "cmd/racer-object", filepath.Join(root, "cmd/racer-sibling")) {
+		t.Fatal("accepted a dependency outside every crate root")
+	}
+
+	if otherCrateRoot(root, "cmd/racer", filepath.Join(root, "cmd/racer/wire")) {
+		t.Fatal("accepted the crate root itself")
+	}
+}
+
+func TestWorkspaceInheritedDependencies(t *testing.T) {
+	workspace := map[string]any{
+		"serde":     map[string]any{"version": "1", "features": []any{"derive"}},
+		"zeroize":   "1",
+		"alias":     map[string]any{"version": "2", "package": "actual"},
+		"localwire": map[string]any{"path": "../wire"},
+	}
+
+	direct, err := directDependenciesIn(`[dependencies]
+serde = { workspace = true }
+zeroize = { workspace = true }
+alias = { workspace = true }
+localwire = { workspace = true }
+[build-dependencies]
+serde = { workspace = true }
+[dev-dependencies]
+serde = { workspace = true, path = "staged" }
+`, workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, name := range []string{"serde", "zeroize", "actual"} {
+		if !containsPackage(direct, name) {
+			t.Fatalf("missing %s in %v", name, direct)
+		}
+	}
+
+	if direct["alias"].packageName != "actual" {
+		t.Fatalf("direct = %v", direct)
+	}
+
+	if direct["path:../wire"].localPath != "../wire" {
+		t.Fatalf("direct = %v", direct)
+	}
+
+	if _, err := directDependenciesIn("[dependencies]\nmissing = { workspace = true }\n", workspace); err == nil {
+		t.Fatal("accepted an inherited dependency with no workspace entry")
+	}
+
+	if _, err := directDependenciesIn("[dependencies]\nserde = { workspace = true }\n", nil); err == nil {
+		t.Fatal("accepted workspace inheritance without a workspace table")
+	}
+}
+
 func TestLockedPackageFailures(t *testing.T) {
 	for _, tc := range []struct{ lock, want string }{
 		{"[[package]]\nname='racer'\nversion='1'\ndependencies=['foo 1']\n", "no lock entry"},

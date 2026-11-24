@@ -1,10 +1,11 @@
 //! Registry and owner-budget rules without I/O.
 
+use super::Config;
 use super::Priority;
 use super::api::{self, Reason, RefError, RefOutcome, State};
 use super::registry::{PutCheck, Registry, Resolution, RetryKind, UnitKey, UnitOutcome};
-use super::{Config, metrics::Counter, metrics::Outcome};
 use crate::model::{CacheKey, ObjectId, ObjectVersion, PAGE_BYTES, StrongEtag, VersionMetadata};
+use crate::telemetry::{Counter, Outcome};
 use racer_wire::control::{CacheId, NodeId};
 use racer_wire::object::prefetch::{ErrorCode, RefsFilter};
 use std::time::{Duration, Instant};

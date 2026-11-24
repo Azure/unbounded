@@ -8,7 +8,6 @@
 use crate::error::{Error, Result};
 
 pub mod api;
-pub mod metrics;
 pub mod registry;
 pub mod service;
 #[cfg(test)]

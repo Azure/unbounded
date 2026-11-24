@@ -2,8 +2,9 @@
 //! Application admission, credential ownership, I/O, and encryption stay with callers.
 //!
 //! `model` defines canonical keys, quoted version tags, exact millisecond expiry,
-//! and bounded page ranges. `client` parses borrowed request context and encodes
-//! response heads; `origin` validates framing before interpreting adapter status.
+//! and bounded page ranges. `client` parses borrowed request context and
+//! client-socket response heads, and encodes response heads and subscription
+//! frames; `origin` validates framing before interpreting adapter status.
 //! These modules do not authorize requests or authenticate encrypted pages.
 //!
 //! HTTP framing must be validated before semantic parsing. In particular, opaque

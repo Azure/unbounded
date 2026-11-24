@@ -18,6 +18,25 @@ func workspaceVersions(root string) (map[string]string, error) {
 	return workspaceVersionsAt(root, cratePath, crateName)
 }
 
+// otherCrateRoot reports whether target lies inside a different crate root
+// that the notice check reads on its own. Such a dependency is locked by that
+// root's Cargo.lock and contributes no registry notices here, so it does not
+// have to be a member of this workspace.
+func otherCrateRoot(root, cratePath, target string) bool {
+	for _, r := range crateRoots {
+		if r.path == cratePath {
+			continue
+		}
+
+		base := filepath.Join(root, r.path)
+		if target == base || strings.HasPrefix(target, base+string(os.PathSeparator)) {
+			return true
+		}
+	}
+
+	return false
+}
+
 func workspaceVersionsAt(root, cratePath, crateName string) (map[string]string, error) {
 	base := filepath.Join(root, cratePath)
 
@@ -28,8 +47,9 @@ func workspaceVersionsAt(root, cratePath, crateName string) (map[string]string, 
 
 	var workspace struct {
 		Workspace struct {
-			Members []string
-			Exclude []string
+			Members      []string
+			Exclude      []string
+			Dependencies map[string]any
 		}
 	}
 	if err := toml.Unmarshal(manifest, &workspace); err != nil {
@@ -103,7 +123,7 @@ func workspaceVersionsAt(root, cratePath, crateName string) (map[string]string, 
 			name = crateName
 		}
 
-		direct, err := directDependencies(string(data))
+		direct, err := directDependenciesIn(string(data), workspace.Workspace.Dependencies)
 		if err != nil {
 			return nil, fmt.Errorf("parsing %s: %w", path, err)
 		}
@@ -113,7 +133,9 @@ func workspaceVersionsAt(root, cratePath, crateName string) (map[string]string, 
 		for _, dep := range direct {
 			if dep.localPath != "" {
 				local := filepath.Clean(filepath.Join(member, dep.localPath))
-				if filepath.IsAbs(dep.localPath) || !declared[local] {
+				target := filepath.Clean(filepath.Join(base, local))
+
+				if filepath.IsAbs(dep.localPath) || !declared[local] && !otherCrateRoot(root, cratePath, target) {
 					return nil, fmt.Errorf("%s: local dependency %q must be a declared workspace member", path, dep.localPath)
 				}
 			}

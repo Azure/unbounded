@@ -189,6 +189,27 @@ impl PathKey {
 
     /// Check the query and sort its lists so equal queries get equal keys.
     fn new<M: Member>(membership: &Membership<M>, query: &PathQuery<'_>) -> Result<Self> {
+        Self::build(membership, query, None)
+    }
+
+    /// Like [`Self::new`], with the neighbors of `query.from` already known.
+    ///
+    /// `neighbors` must be sorted and must equal
+    /// [`Membership::neighbors`]`(query.from)`. Callers that already hold that
+    /// list pass it so the key does not walk the pools again.
+    fn with_neighbors<M: Member>(
+        membership: &Membership<M>,
+        query: &PathQuery<'_>,
+        neighbors: &[usize],
+    ) -> Result<Self> {
+        Self::build(membership, query, Some(neighbors))
+    }
+
+    fn build<M: Member>(
+        membership: &Membership<M>,
+        query: &PathQuery<'_>,
+        neighbors: Option<&[usize]>,
+    ) -> Result<Self> {
         let count = membership.members().len();
         if query.from >= count
             || query.to >= count
@@ -212,8 +233,13 @@ impl PathKey {
         blocked.sort_unstable();
         blocked.dedup();
         if !blocked.is_empty() {
-            let neighbors = membership.neighbors(query.from);
-            blocked.retain(|v| neighbors.binary_search(v).is_ok());
+            match neighbors {
+                Some(neighbors) => blocked.retain(|v| neighbors.binary_search(v).is_ok()),
+                None => {
+                    let neighbors = membership.neighbors(query.from);
+                    blocked.retain(|v| neighbors.binary_search(v).is_ok());
+                }
+            }
         }
         Ok(Self {
             membership: membership.topology_identity(),
@@ -571,7 +597,33 @@ impl<S: Searches> Paths<S> {
         membership: &Membership<M>,
         query: PathQuery<'_>,
     ) -> Result<Vec<usize>> {
-        let key = PathKey::new(membership, &query)?;
+        self.route_among(membership, query, None).await
+    }
+
+    /// Like [`Self::route`], with the neighbors of `query.from` already known.
+    ///
+    /// `neighbors` must be sorted and must equal
+    /// [`Membership::neighbors`]`(query.from)`. A caller that already holds
+    /// that list passes it so the cache key does not walk the pools again.
+    pub async fn route_with_neighbors<M: Member>(
+        &self,
+        membership: &Membership<M>,
+        query: PathQuery<'_>,
+        neighbors: &[usize],
+    ) -> Result<Vec<usize>> {
+        self.route_among(membership, query, Some(neighbors)).await
+    }
+
+    async fn route_among<M: Member>(
+        &self,
+        membership: &Membership<M>,
+        query: PathQuery<'_>,
+        neighbors: Option<&[usize]>,
+    ) -> Result<Vec<usize>> {
+        let key = match neighbors {
+            Some(neighbors) => PathKey::with_neighbors(membership, &query, neighbors)?,
+            None => PathKey::new(membership, &query)?,
+        };
         if key.from == key.to {
             return Ok(vec![key.from]);
         }
@@ -2163,5 +2215,27 @@ mod tests {
                 assert_eq!(search(&members, &key(255)), search(&members, &key(3)));
             }
         }
+    }
+
+    /// A key and route built from a known neighbor list match the ones that
+    /// recompute that list from the pools.
+    #[test]
+    fn known_neighbors_produce_the_same_key_and_route() {
+        let members = membership(1500);
+        let neighbors = members.neighbors(0);
+        let blocked = common(&members, 0, 1499);
+        assert!(!blocked.is_empty());
+        let query = PathQuery {
+            blocked: &blocked,
+            ..query(0, 1499, 4)
+        };
+        assert!(
+            PathKey::with_neighbors(&members, &query, &neighbors).unwrap()
+                == PathKey::new(&members, &query).unwrap()
+        );
+        assert_eq!(
+            block_on(Paths::new(0).route(&members, query)).unwrap(),
+            block_on(Paths::new(0).route_with_neighbors(&members, query, &neighbors)).unwrap()
+        );
     }
 }

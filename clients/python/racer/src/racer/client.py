@@ -12,19 +12,24 @@ from __future__ import annotations
 import array
 import contextlib
 import json
-import logging
 import os
 import re
 import socket
 import threading
-import time
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Callable, Optional
 
 from . import _wire as wire
 from . import prefetch as _prefetch
-from .errors import PrefetchError, ProtocolError, RacerError, StatusError, TruncatedError, UnsatisfiableRange
+from .errors import (
+    NotImplementedStatus,
+    PrefetchError,
+    ProtocolError,
+    RacerError,
+    TruncatedError,
+    UnsatisfiableRange,
+)
 from .prefetch import PrefetchSpec, PrefetchStatus
 from .keys import Request
 
@@ -34,42 +39,7 @@ GPU = "gpu"
 HOST = "host"
 STREAM = "stream"
 
-# Statuses that mean "this dataplane does not support the mode" on a first
-# attempt (designs/racer-gpudirect.md, Fallback).
-FALLBACK_STATUSES = frozenset({400, 404, 405, 501})
-
 DEFAULT_STAGING_BYTES = 4 * wire.PAGE_SIZE
-
-# Seconds before a mode remembered as unsupported is tried again.
-DEFAULT_MODE_RETRY_SECONDS = 300.0
-
-_SUPPORTED = "supported"
-_UNSUPPORTED = "unsupported"
-
-log = logging.getLogger(__name__)
-
-
-@dataclass
-class _ModeEntry:
-    state: str
-    since: float  # clock() when the state was recorded
-    socket_id: tuple | None  # (st_dev, st_ino) of the socket file then
-
-
-# Mode support per socket path. An entry is dropped when the socket file is
-# replaced (the dataplane restarted), and an unsupported entry also expires
-# after the client's mode_retry_seconds.
-_mode_lock = threading.Lock()
-_mode_state: dict[str, dict[str, _ModeEntry]] = {}
-
-
-def _socket_id(path: str) -> tuple | None:
-    try:
-        st = os.stat(path)
-    except OSError:
-        return None
-    return (st.st_dev, st.st_ino)
-
 
 def _dest_device(dest) -> int | None:
     """Return the CUDA device ordinal of a read destination, if it has one."""
@@ -120,15 +90,6 @@ def socket_path_for(cache: str | None = None, socket_path: str | None = None) ->
     if "/" in cache or cache in (".", ".."):
         raise RacerError("invalid cache name")
     return f"/run/racer/{cache}/client/socket"
-
-
-def forget_modes(path: str | None = None) -> None:
-    """Clear remembered mode support (for tests, or after a dataplane upgrade)."""
-    with _mode_lock:
-        if path is None:
-            _mode_state.clear()
-        else:
-            _mode_state.pop(path, None)
 
 
 @dataclass(frozen=True)
@@ -239,8 +200,6 @@ class Client:
         timeout: float | None = 60.0,
         staging_bytes: int = DEFAULT_STAGING_BYTES,
         pin_staging: bool = True,
-        mode_retry_seconds: float | None = DEFAULT_MODE_RETRY_SECONDS,
-        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.socket_path = socket_path_for(cache, socket_path)
         self.timeout = timeout
@@ -248,62 +207,8 @@ class Client:
             raise RacerError("staging_bytes must be positive")
         self.staging_bytes = staging_bytes
         self.pin_staging = pin_staging
-        if mode_retry_seconds is not None and mode_retry_seconds < 0:
-            raise RacerError("mode_retry_seconds must not be negative")
-        # None keeps an unsupported mode until the socket file changes.
-        self.mode_retry_seconds = mode_retry_seconds
-        self._clock = clock
         self._pool: list = []
         self._pool_lock = threading.Lock()
-
-    # Mode memory -----------------------------------------------------------
-
-    def mode_state(self, mode: str) -> str | None:
-        """Return "supported", "unsupported", or None when unknown.
-
-        Memory is dropped when the socket file was replaced since it was
-        recorded, and "unsupported" expires after mode_retry_seconds.
-        """
-        sid = _socket_id(self.socket_path)
-        with _mode_lock:
-            modes = _mode_state.get(self.socket_path)
-            if not modes:
-                return None
-            if any(e.socket_id != sid for e in modes.values()):
-                # The dataplane restarted (or the socket is gone): forget all.
-                _mode_state.pop(self.socket_path, None)
-                return None
-            e = modes.get(mode)
-            if e is None:
-                return None
-            if (
-                e.state == _UNSUPPORTED
-                and self.mode_retry_seconds is not None
-                and self._clock() - e.since >= self.mode_retry_seconds
-            ):
-                del modes[mode]
-                return None
-            return e.state
-
-    def _set_mode(self, mode: str, state: str, reason: str | None = None, next_mode: str | None = None) -> None:
-        sid = _socket_id(self.socket_path)
-        with _mode_lock:
-            modes = _mode_state.setdefault(self.socket_path, {})
-            prev = modes.get(mode)
-            modes[mode] = _ModeEntry(state, self._clock(), sid)
-        if state == _UNSUPPORTED and (prev is None or prev.state != _UNSUPPORTED):
-            log.warning(
-                "racer: %s-read is not available from %s (%s); falling back to %s until %s",
-                mode,
-                self.socket_path,
-                reason or "unsupported",
-                f"{next_mode} mode" if next_mode else "the next mode",
-                "the dataplane restarts"
-                if self.mode_retry_seconds is None
-                else f"a retry in {self.mode_retry_seconds:g}s or a dataplane restart",
-            )
-        elif state == _SUPPORTED and prev is not None and prev.state == _UNSUPPORTED:
-            log.info("racer: %s-read is available again from %s", mode, self.socket_path)
 
     # Staging pool ----------------------------------------------------------
 
@@ -566,7 +471,6 @@ class Client:
         write: Callable[[int, memoryview], None],
         on_page: OnPage,
         max_length: int | None = None,
-        on_head: Callable[[], None] | None = None,
     ) -> ReadResult:
         head = (
             f"POST {wire.OBJECT_PREFIX}{request.hex} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\n"
@@ -590,12 +494,7 @@ class Client:
             if body != end - first + wire.FRAME_SIZE * (pages + 1):
                 raise ProtocolError("bad Content-Length")
             if max_length is not None and end - first > max_length:
-                # An earlier direct mode may have refused this read with 400
-                # for the same reason; that refusal says nothing about support
-                # (designs/racer-gpudirect.md, Fallback), so do not confirm it.
                 raise RacerError("destination is smaller than the range")
-            if on_head:
-                on_head()
             seq = wire.Sequence(first, end)
             for _ in range(pages):
                 f = wire.decode_frame(conn.read_exact(wire.FRAME_SIZE))
@@ -643,7 +542,6 @@ class Client:
         length: int | None,
         if_match: str | None,
         on_frame: Callable[[int, int], None] | None,
-        on_head: Callable[[], None] | None = None,
         gpu_uuid: str | None = None,
     ) -> ReadResult:
         if dest_offset < 0 or dest_length <= 0:
@@ -671,8 +569,6 @@ class Client:
             meta, first, end = self._check_selection(h, offset, length, if_match)
             if end - first > dest_length:
                 raise ProtocolError("range is larger than the destination")
-            if on_head:
-                on_head()
             pages = wire.page_count(first, end)
             if wire.decimal(h.get("content-length")) != wire.FRAME_SIZE * (pages + 1):
                 raise ProtocolError("bad Content-Length")
@@ -741,52 +637,6 @@ class Client:
             gpu_uuid=gpu_uuid,
         )
 
-    # Fallback driver -------------------------------------------------------
-
-    def _run_modes(self, attempts: list[tuple[str, Callable[[Callable[[], None]], ReadResult]]]) -> ReadResult:
-        """Try modes in order.
-
-        A mode with no remembered state that answers 400/404/405/501 is
-        skipped. 501 marks it unsupported at once. 400/404/405 mark it
-        unsupported only once a later mode gets a 200 head, so a missing
-        object (404 everywhere) does not disable a mode for good.
-        """
-        pending: list[tuple[str, str]] = []
-        last: StatusError | None = None
-        current = [""]
-
-        def understood() -> None:
-            for m, why in pending:
-                self._set_mode(m, _UNSUPPORTED, why, current[0])
-            pending.clear()
-
-        for i, (mode, run) in enumerate(attempts):
-            current[0] = mode
-            state = self.mode_state(mode) if mode != STREAM else _SUPPORTED
-            if state == _UNSUPPORTED:
-                continue
-            try:
-                result = run(understood)
-            except _Skip:
-                continue
-            except StatusError as exc:
-                if mode == STREAM or state is not None or exc.status not in FALLBACK_STATUSES:
-                    raise
-                why = f"status {exc.status}: {exc}"
-                if exc.status == 501:
-                    nxt = attempts[i + 1][0] if i + 1 < len(attempts) else None
-                    self._set_mode(mode, _UNSUPPORTED, why, nxt)
-                else:
-                    pending.append((mode, why))
-                last = exc
-                continue
-            if mode != STREAM and state != _SUPPORTED:
-                self._set_mode(mode, _SUPPORTED)
-            return result
-        if last is not None:  # pragma: no cover - stream always runs last
-            raise last
-        raise RacerError("no read mode available")
-
     # High level: host ------------------------------------------------------
 
     def read_into_host(
@@ -802,8 +652,8 @@ class Client:
     ) -> ReadResult:
         """Read a range into host memory at dest_offset.
 
-        dest is a HostBuffer (host-read, then stream) or any writable buffer
-        (stream only). Object offset o lands at dest_offset + (o - offset).
+        dest is a HostBuffer (host-read) or any writable buffer (stream).
+        Object offset o lands at dest_offset + (o - offset).
         """
         view = memoryview(dest.view if hasattr(dest, "view") else dest).cast("B")
         window = len(view) - dest_offset
@@ -811,28 +661,18 @@ class Client:
             raise RacerError("invalid destination window")
         if length and length > window:
             raise RacerError("destination is smaller than the range")
-        attempts = []
-        if hasattr(dest, "fileno"):
-            attempts.append(
-                (
-                    HOST,
-                    lambda ok: self._rpc(
-                        HOST, request, dest.fileno(), dest_offset, window, None, offset, length, if_match, on_page, ok
-                    ),
+        try:
+            if hasattr(dest, "fileno"):
+                return self._rpc(
+                    HOST, request, dest.fileno(), dest_offset, window, None, offset, length, if_match, on_page
                 )
-            )
 
-        def stream(ok):
             def write(o: int, piece: memoryview) -> None:
                 at = dest_offset + o - offset
                 view[at : at + len(piece)] = piece
 
             scratch = memoryview(bytearray(min(window, 1 << 20)))
-            return self._stream(request, offset, length, if_match, scratch, write, on_page, window, ok)
-
-        attempts.append((STREAM, stream))
-        try:
-            return self._run_modes(attempts)
+            return self._stream(request, offset, length, if_match, scratch, write, on_page, window)
         finally:
             view.release()
 
@@ -853,10 +693,11 @@ class Client:
 
         dest is a racer.cuda.GpuAllocation, a racer.tensors.TensorTarget, or
         any object with ``size``, ``copy_from_host(offset, data)`` and
-        optionally ``export_fd()`` and ``gpu_uuid()``. Modes: gpu-read, then
-        host-read into a pinned staging memfd plus a host-to-device copy, then
-        stream into the staging buffer plus a copy. on_page(object_offset, length) runs once a
-        page is in GPU memory.
+        optionally ``export_fd()`` and ``gpu_uuid()``. A destination that can
+        export a descriptor uses gpu-read; otherwise, or when the dataplane has
+        no usable GPU for it (501), the read uses host-read into a pinned
+        staging memfd plus a host-to-device copy. on_page(object_offset, length)
+        runs once a page is in GPU memory.
         """
         window = dest.size - dest_offset
         if dest_offset < 0 or window <= 0:
@@ -864,14 +705,13 @@ class Client:
         if length and length > window:
             raise RacerError("destination is smaller than the range")
 
-        attempts: list = []
-        if hasattr(dest, "export_fd"):
-
-            def gpu(ok):
-                try:
-                    fd = dest.export_fd()
-                except NotImplementedError:
-                    raise _Skip() from None
+        export = getattr(dest, "export_fd", None)
+        if export is not None:
+            try:
+                fd = export()
+            except NotImplementedError:
+                fd = None
+            if fd is not None:
                 try:
                     return self._rpc(
                         GPU,
@@ -884,19 +724,19 @@ class Client:
                         length,
                         if_match,
                         on_page,
-                        ok,
                         gpu_uuid=_dest_uuid(dest),
                     )
+                except NotImplementedStatus:
+                    # 501 means this dataplane cannot use the destination's GPU
+                    # (GPU reads off, or a UUID it cannot resolve). The host
+                    # path below needs no GPU support on the dataplane.
+                    pass
                 finally:
                     os.close(fd)
 
-            attempts.append((GPU, gpu))
-        attempts.append((HOST, lambda ok: self._gpu_via_host(request, dest, dest_offset, window, offset, length, if_match, on_page, ok)))
-        attempts.append((STREAM, lambda ok: self._gpu_via_stream(request, dest, dest_offset, window, offset, length, if_match, on_page, ok)))
+        return self._gpu_via_host(request, dest, dest_offset, window, offset, length, if_match, on_page)
 
-        return self._run_modes(attempts)
-
-    def _gpu_via_host(self, request, dest, dest_offset, window, offset, length, if_match, on_page, ok) -> ReadResult:
+    def _gpu_via_host(self, request, dest, dest_offset, window, offset, length, if_match, on_page) -> ReadResult:
         staging = self._take_staging(_dest_device(dest))
         try:
             chunk = staging.size
@@ -909,11 +749,10 @@ class Client:
                     raise UnsatisfiableRange(416)
                 total = meta.size - offset
                 if_match = meta.etag
-                ok()
                 if total > window:
                     raise RacerError("destination is smaller than the range")
                 if total == 0:
-                    return self._rpc(HOST, request, staging.fileno(), 0, chunk, None, offset, None, if_match, None, ok)
+                    return self._rpc(HOST, request, staging.fileno(), 0, chunk, None, offset, None, if_match, None)
             first_result = None
             pos = 0
             pages = 0
@@ -926,7 +765,7 @@ class Client:
                     if on_page:
                         on_page(o, size)
 
-                r = self._rpc(HOST, request, staging.fileno(), 0, n, None, base, n, if_match, frame, ok)
+                r = self._rpc(HOST, request, staging.fileno(), 0, n, None, base, n, if_match, frame)
                 if first_result is None:
                     first_result = r
                     if_match = r.metadata.etag
@@ -936,18 +775,3 @@ class Client:
             return ReadResult(first_result.metadata, offset, offset + total, HOST, pages)
         finally:
             self._give_staging(staging)
-
-    def _gpu_via_stream(self, request, dest, dest_offset, window, offset, length, if_match, on_page, ok) -> ReadResult:
-        staging = self._take_staging(_dest_device(dest))
-        try:
-
-            def write(o: int, piece: memoryview) -> None:
-                dest.copy_from_host(dest_offset + (o - offset), piece)
-
-            return self._stream(request, offset, length, if_match, staging.view, write, on_page, window, ok)
-        finally:
-            self._give_staging(staging)
-
-
-class _Skip(Exception):
-    """The destination cannot use this mode. Nothing is remembered."""

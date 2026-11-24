@@ -484,3 +484,60 @@ fn kernel_sleep_until_drop_deregisters_cancel_waiter() {
     drop(sleep);
     assert_eq!(scope.0.waiters(), 0);
 }
+
+/// A scope that never cancels and owns no clock, for an externally scheduled
+/// simulated reactor.
+#[derive(Clone, Copy)]
+struct Unbounded;
+
+impl Scope for Unbounded {
+    type Error = Error;
+
+    fn check(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn polled_checks(&self) -> bool {
+        false
+    }
+}
+
+/// A simulated reactor whose virtual clock the test advances itself.
+fn simulated(clock: &crate::ctx::VirtualClock) -> crate::scoped::Reactor<Unbounded> {
+    let reactor = crate::scoped::Reactor::new(
+        8,
+        &crate::Env::sim(
+            &crate::sim::SimOs::new(),
+            crate::WorkerCtx::simulated(clock, 1, 0),
+        ),
+    );
+    reactor.init().unwrap();
+    reactor
+}
+
+/// A scheduled sleep is a reactor deadline even on a virtual clock, so an
+/// external scheduler sees when to advance time instead of spinning.
+#[test]
+fn scheduled_sleep_registers_a_reactor_deadline_on_a_virtual_clock() {
+    let clock = crate::ctx::VirtualClock::new();
+    let reactor = simulated(&clock);
+    let until = clock.now() + Duration::from_millis(5);
+    let mut sleep = reactor.sleep_until_scheduled(until, &Unbounded);
+    assert_eq!(reactor.next_deadline(), None);
+    assert!(poll(&mut sleep).is_pending());
+    assert_eq!(reactor.next_deadline(), Some(until));
+    clock.advance_to(until).unwrap();
+    reactor.poll_budgeted(8).unwrap();
+    assert!(poll(&mut sleep).is_ready());
+}
+
+/// Parking at an instant advances a simulated clock, which is what
+/// executor-driven runtimes need from their park step.
+#[test]
+fn wait_until_advances_a_virtual_clock() {
+    let clock = crate::ctx::VirtualClock::new();
+    let reactor = simulated(&clock);
+    let target = clock.now() + Duration::from_millis(7);
+    reactor.wait_until(Some(target)).unwrap();
+    assert!(clock.now() >= target);
+}

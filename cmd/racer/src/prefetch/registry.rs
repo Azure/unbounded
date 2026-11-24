@@ -11,9 +11,9 @@
 use super::api::{
     self, Bytes, Reason, RefError, RefOutcome, RefStatus, Spec, State, Status, Summary,
 };
-use super::metrics::{Counter, Outcome};
 use super::{Config, Priority, REFS_PAGE};
 use crate::model::{CacheKey, ObjectId, ObjectVersion, PageSize, StrongEtag, VersionMetadata};
+use crate::telemetry::{Counter, Outcome};
 use racer_wire::control::{CacheId, NodeId};
 use racer_wire::object::prefetch::{ErrorCode, PrefetchError, RefsFilter};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};

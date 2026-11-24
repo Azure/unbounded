@@ -215,6 +215,54 @@ mod flight {
         use super::*;
         use crate::model::PageNumber;
 
+        /// Only a prefetch owner fill marks its flight for demand promotion, so
+        /// an ordinary demand read never consults node-wide prefetch state.
+        #[test]
+        fn demand_join_marks_nothing_and_a_prefetch_fill_marks_the_flight() {
+            let env = racer_io::Env::host();
+            let flights = flights(&env, FlightLimits::default());
+            let (context, scope) = (origin(), scope(&env));
+            let membership = std::sync::Arc::new(
+                crate::topology::Membership::validate(
+                    racer_wire::control::MembershipVersion(1),
+                    vec![],
+                )
+                .unwrap(),
+            );
+            let mut demand_budget = budget();
+            let JoinedFlight::Waiter(_demand) = flights
+                .join(
+                    test_page(),
+                    membership.clone(),
+                    &context,
+                    &scope,
+                    &mut demand_budget,
+                )
+                .unwrap()
+            else {
+                panic!("waiter");
+            };
+            assert!(!flights.prefetch_fill(&test_page()));
+
+            let mut prefetch_page = test_page();
+            prefetch_page.number = PageNumber(1);
+            let mut prefetch_budget = budget();
+            let JoinedFlight::Waiter(fill) =
+                futures::executor::block_on(flights.join_wait_prefetch(
+                    prefetch_page.clone(),
+                    membership,
+                    &context,
+                    &scope,
+                    &mut prefetch_budget,
+                ))
+                .unwrap()
+            else {
+                panic!("waiter");
+            };
+            assert!(flights.prefetch_fill(&prefetch_page));
+            drop(fill);
+        }
+
         /// Expiry sampling is bounded and does not confuse table and quota ownership.
         #[test]
         fn expiry_snapshot_coverage_completion_and_external_credit() {
@@ -2379,11 +2427,6 @@ mod timeouts {
         stalled: usize,
         fenced: Cell<bool>,
         late_success: bool,
-        /// Drop multi-flight Subscribes unanswered, as an older provider does.
-        refuse_flights: Cell<bool>,
-        /// Answer Subscribes with a signed `Unavailable`, as a relay does
-        /// when the provider behind it drops the exchange.
-        relay_unavailable: Cell<bool>,
         /// Page requests fail at once with a transport error (`Io`).
         fail_pages: Cell<bool>,
         /// The destination answers page requests with a signed
@@ -2422,9 +2465,6 @@ mod timeouts {
                 ),
             };
             let response = match &request.operation {
-                PeerOperation::Subscribe { .. } if self.relay_unavailable.get() => {
-                    PeerResponse::Unavailable
-                }
                 PeerOperation::Page { .. } if self.pages_unavailable.get() => {
                     PeerResponse::Unavailable
                 }
@@ -2492,13 +2532,8 @@ mod timeouts {
                 attempts: request.route.remaining_attempts,
                 links: request.route.remaining_links,
             });
-            let refused = (self.refuse_flights.get()
-                && matches!(
-                    &request.operation,
-                    PeerOperation::Subscribe { subscription, .. } if subscription.flights.is_some()
-                ))
-                || (self.fail_pages.get()
-                    && matches!(&request.operation, PeerOperation::Page { .. }));
+            let refused =
+                self.fail_pages.get() && matches!(&request.operation, PeerOperation::Page { .. });
             Box::pin(async move {
                 let _membership = membership;
                 if refused {
@@ -2582,8 +2617,6 @@ mod timeouts {
                 stalled,
                 fenced: Cell::new(true),
                 late_success,
-                refuse_flights: Cell::new(false),
-                relay_unavailable: Cell::new(false),
                 fail_pages: Cell::new(false),
                 pages_unavailable: Cell::new(false),
                 shed_pages: Cell::new(0),
@@ -3455,7 +3488,7 @@ mod timeouts {
                         Deadline(call.signed_deadline),
                     )
                     .unwrap(),
-                    crate::peer::protocol::millis(racer_io::Clock::host().wall_now()).unwrap(),
+                    peer_wire::millis(racer_io::Clock::host().wall_now()).unwrap(),
                 )
                 .expect("later exchange must not renew the provider contract");
             let crate::peer::subscriptions::Selection::Leader { work, waiter } = selected else {
@@ -3472,154 +3505,6 @@ mod timeouts {
             calls.iter().map(|call| u32::from(call.links)).sum::<u32>()
                 + u32::from(f.budget.remaining_links()),
             24
-        );
-    }
-
-    #[test]
-    fn multi_flight_subscribe_falls_back_to_single_flight_after_refusal() {
-        use crate::read::candidates::ProviderSelection;
-        let env = racer_io::Env::host();
-        let mut f = Fixture::new(&env, Some(1), 0, false);
-        f.peers.refuse_flights.set(true);
-        let scheduler = crate::read::range_stream::Scheduler::new(1, racer_io::WorkerCtx::host());
-        let demand =
-            racer_core::subscriptions::Demand::new(vec![flow_control::subscriptions::Interval {
-                start: 0,
-                end: 1,
-            }])
-            .unwrap();
-        let version = ObjectVersion {
-            object: f.context.object.clone(),
-            etag: StrongEtag::test_value("v1"),
-        };
-        let select = |f: &mut Fixture, flights: u16| {
-            let asked = Cell::new(None);
-            let selection = crate::read::range_stream::Selection::for_test(
-                &scheduler,
-                version.clone(),
-                demand.clone(),
-            );
-            let result = futures::executor::block_on(f.policy.subscribe_provider(
-                &version.object,
-                PageNumber(0),
-                flights,
-                |provider, requested| {
-                    asked.set(Some(requested));
-                    scheduler.contract(
-                        &selection,
-                        f.candidates.membership.version,
-                        provider.clone(),
-                        requested,
-                        f.scope.deadline.0,
-                    )
-                },
-                f.candidates.membership.clone(),
-                &f.context,
-                &f.scope,
-                &mut f.budget,
-            ))
-            .unwrap();
-            // Each request has finished; free the contract for the next.
-            drop(selection);
-            let sent = f.peers.calls.borrow().last().unwrap().subscription.clone();
-            (result, asked.get().unwrap(), sent.unwrap().flights)
-        };
-        // A single flight never sends the field.
-        let (result, asked, sent) = select(&mut f, 1);
-        assert!(matches!(result, ProviderSelection::Skipped));
-        assert_eq!((asked, sent), (None, None));
-        let (result, asked, sent) = select(&mut f, 4);
-        let ProviderSelection::Refused { provider } = result else {
-            panic!("an unanswered multi-flight request is a refusal")
-        };
-        assert_eq!(provider, f.peers.calls.borrow().last().unwrap().destination);
-        assert_eq!((asked, sent), (Some(4), Some(4)));
-        // The provider is now single-flight: the retry omits the field.
-        let (result, asked, sent) = select(&mut f, 4);
-        assert!(matches!(result, ProviderSelection::Skipped));
-        assert_eq!((asked, sent), (None, None));
-        let calls = f.peers.calls.borrow();
-        assert!(
-            calls
-                .windows(2)
-                .all(|pair| pair[0].subscription.as_ref().unwrap().sequence
-                    < pair[1].subscription.as_ref().unwrap().sequence),
-            "every request, refused or not, uses a new sequence"
-        );
-    }
-
-    #[test]
-    fn multi_flight_subscribe_falls_back_to_single_flight_after_relayed_refusal() {
-        use crate::read::candidates::ProviderSelection;
-        let env = racer_io::Env::host();
-        let mut f = Fixture::new(&env, Some(1), 0, false);
-        // Every Subscribe reaches the provider through a relay that signs
-        // `Unavailable` for the dropped exchange.
-        f.peers.relay_unavailable.set(true);
-        let scheduler = crate::read::range_stream::Scheduler::new(1, racer_io::WorkerCtx::host());
-        let demand =
-            racer_core::subscriptions::Demand::new(vec![flow_control::subscriptions::Interval {
-                start: 0,
-                end: 1,
-            }])
-            .unwrap();
-        let version = ObjectVersion {
-            object: f.context.object.clone(),
-            etag: StrongEtag::test_value("v1"),
-        };
-        let select = |f: &mut Fixture, flights: u16| {
-            let asked = Cell::new(None);
-            let selection = crate::read::range_stream::Selection::for_test(
-                &scheduler,
-                version.clone(),
-                demand.clone(),
-            );
-            let result = futures::executor::block_on(f.policy.subscribe_provider(
-                &version.object,
-                PageNumber(0),
-                flights,
-                |provider, requested| {
-                    asked.set(Some(requested));
-                    scheduler.contract(
-                        &selection,
-                        f.candidates.membership.version,
-                        provider.clone(),
-                        requested,
-                        f.scope.deadline.0,
-                    )
-                },
-                f.candidates.membership.clone(),
-                &f.context,
-                &f.scope,
-                &mut f.budget,
-            ))
-            .unwrap();
-            // Each request has finished; free the contract for the next.
-            drop(selection);
-            let sent = f.peers.calls.borrow().last().unwrap().subscription.clone();
-            (result, asked.get().unwrap(), sent.unwrap().flights)
-        };
-        // A single flight never sends the field and is merely skipped.
-        let (result, asked, sent) = select(&mut f, 1);
-        assert!(matches!(result, ProviderSelection::Skipped));
-        assert_eq!((asked, sent), (None, None));
-        let (result, asked, sent) = select(&mut f, 4);
-        let ProviderSelection::Refused { provider } = result else {
-            panic!("a relayed unavailable multi-flight request is a refusal")
-        };
-        assert_eq!(provider, f.peers.calls.borrow().last().unwrap().destination);
-        assert_eq!((asked, sent), (Some(4), Some(4)));
-        // The provider is now single-flight: the retry omits the field.
-        let (result, asked, sent) = select(&mut f, 4);
-        assert!(matches!(result, ProviderSelection::Skipped));
-        assert_eq!((asked, sent), (None, None));
-        let calls = f.peers.calls.borrow();
-        assert!(
-            calls
-                .windows(2)
-                .all(|pair| pair[0].subscription.as_ref().unwrap().sequence
-                    < pair[1].subscription.as_ref().unwrap().sequence),
-            "every request, refused or not, uses a new sequence"
         );
     }
 

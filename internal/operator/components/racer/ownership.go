@@ -70,7 +70,7 @@ func ownedOperation(ctx context.Context, env *component.Env, op component.Operat
 		return op, err
 	}
 
-	if err := validateAdoptable(ctx, env, current); err != nil {
+	if err := validateOwner(current); err != nil {
 		return op, err
 	}
 

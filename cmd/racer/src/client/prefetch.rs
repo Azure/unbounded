@@ -38,7 +38,7 @@ pub(super) async fn serve(
     timeout: Duration,
     cancellation: Cancellation,
 ) -> Result<()> {
-    let limits = reads.prefetch_directory().prefetch.config().limits();
+    let limits = reads.prefetch_directory().node().prefetch.config().limits();
     let parsed = racer_wire::object::prefetch::parse(&head, &limits, header_limit);
     let budget = match &parsed {
         Ok(PrefetchRequest::Get { query, .. }) => {

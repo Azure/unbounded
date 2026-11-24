@@ -1563,43 +1563,6 @@ func SubscriptionHeaders(m Metadata, first, end uint64) (http.Header, error) {
 	return h, nil
 }
 
-// FrameReader streams a fixed-length body from the reader used by ReadRawHead.
-// It never reads past the frame or closes its input. Zero length is immediately EOF.
-// Truncation wraps io.ErrUnexpectedEOF; other errors with final bytes survive.
-// Validate length first and do not reuse a failed or aborted frame. This reader
-// cannot detect extra body bytes; callback bodies need the server's EOF probe.
-type FrameReader struct {
-	Source    io.Reader
-	Remaining int64
-}
-
-func (r *FrameReader) Read(p []byte) (int, error) {
-	if len(p) == 0 {
-		return 0, nil
-	}
-
-	if r.Remaining == 0 {
-		return 0, io.EOF
-	}
-
-	if int64(len(p)) > r.Remaining {
-		p = p[:r.Remaining]
-	}
-
-	n, err := r.Source.Read(p)
-
-	r.Remaining -= int64(n)
-	if err == io.EOF {
-		if r.Remaining != 0 {
-			err = io.ErrUnexpectedEOF
-		} else {
-			err = nil
-		}
-	}
-
-	return n, ioFailure("body read", err)
-}
-
 // Frame describes a page payload or the terminal page/byte totals. Payload is external.
 type Frame struct {
 	Kind           byte
@@ -1647,30 +1610,18 @@ func (c Credit) Encode() [CreditSize]byte {
 	return b
 }
 
-type pageInterval struct{ first, end uint64 }
-
 // Sequence validates frame headers without reading payload, so callers can splice it.
 // Call Accept only in the single receive goroutine, and do not continue after an error.
 // Counts advance on accepted headers; callers must consume each payload before the next.
 type Sequence struct {
 	first, end, pages, delivered, bytes uint64
 	complete                            bool
-	intervals                           []pageInterval
 }
 
 // NewSequence tracks one subscription range. Pages must arrive strictly in order:
 // the server may fetch out of order, but it always delivers in page order.
 func NewSequence(first, end uint64) *Sequence {
 	return &Sequence{first: first, end: end, pages: PageCount(first, end)}
-}
-
-// Intervals reports bounded tracking storage for diagnostics after a receive operation.
-func (s *Sequence) Intervals() int {
-	if s == nil {
-		return 0
-	}
-
-	return len(s.intervals)
 }
 
 func PageCount(first, end uint64) uint64 {
@@ -1682,6 +1633,7 @@ func PageCount(first, end uint64) uint64 {
 }
 
 // Accept checks page identity, shape, uniqueness, ordering, and terminal totals.
+// Ordering alone rejects duplicates: every accepted page advances delivered exactly once.
 // The operation names the SDK consumer in diagnostics.
 func (s *Sequence) Accept(f Frame, operation string) error {
 	bad := failure(ErrorProtocol, operation, nil)
@@ -1710,10 +1662,6 @@ func (s *Sequence) Accept(f Frame, operation string) error {
 		return bad
 	}
 
-	if !s.record(f.Number) {
-		return bad
-	}
-
 	s.delivered++
 	s.bytes += uint64(f.Length)
 
@@ -1728,41 +1676,4 @@ func (s *Sequence) Write(w io.Writer, f Frame) error {
 	}
 
 	return WriteFrame(w, f)
-}
-
-// record merges adjacent intervals with a hard memory limit for fragmented streams.
-func (s *Sequence) record(n uint64) bool {
-	i := 0
-	for i < len(s.intervals) && s.intervals[i].end <= n {
-		i++
-	}
-
-	if i < len(s.intervals) && s.intervals[i].first <= n {
-		return false
-	}
-
-	if i > 0 && s.intervals[i-1].end == n {
-		s.intervals[i-1].end++
-		if i < len(s.intervals) && s.intervals[i].first == n+1 {
-			s.intervals[i-1].end = s.intervals[i].end
-			s.intervals = append(s.intervals[:i], s.intervals[i+1:]...)
-		}
-
-		return true
-	}
-
-	if i < len(s.intervals) && s.intervals[i].first == n+1 {
-		s.intervals[i].first = n
-		return true
-	}
-
-	if len(s.intervals) == 4096 {
-		return false
-	}
-
-	s.intervals = append(s.intervals, pageInterval{})
-	copy(s.intervals[i+1:], s.intervals[i:])
-	s.intervals[i] = pageInterval{n, n + 1}
-
-	return true
 }

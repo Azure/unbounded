@@ -150,35 +150,11 @@ func TestDaemonSetRuntimeContract(t *testing.T) {
 	}
 }
 
-func TestDaemonSetHostNetworkAndDiagnosticsPort(t *testing.T) {
-	cfg := testConfig()
-	cfg.HostNetwork, cfg.PeerPort = true, 9090
-
-	ds, err := DaemonSet(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if !ds.Spec.Template.Spec.HostNetwork || ds.Spec.Template.Spec.DNSPolicy != corev1.DNSClusterFirstWithHostNet {
-		t.Fatal("host network not applied")
-	}
-
-	if envMap(t, ds.Spec.Template.Spec.Containers[0])["RACER_DIAGNOSTICS_LISTEN"].Value != "[$(RACER_POD_IP)]:9091" {
-		t.Fatal("diagnostics port must move off a 9090 peer port")
-	}
-}
-
 func TestConfigValidation(t *testing.T) {
 	for name, mutate := range map[string]func(*Config){
-		"namespace":         func(c *Config) { c.Namespace = "Bad_NS" },
-		"dataplane image":   func(c *Config) { c.DataplaneImage = " " },
-		"object image":      func(c *Config) { c.ObjectImage = "" },
-		"privileged peer":   func(c *Config) { c.PeerPort = 80 },
-		"privileged diag":   func(c *Config) { c.DiagnosticsPort = 80 },
-		"peer is control":   func(c *Config) { c.PeerPort = ControlPort },
-		"diag is webhook":   func(c *Config) { c.DiagnosticsPort = WebhookPort },
-		"diag equals peer":  func(c *Config) { c.DiagnosticsPort = c.PeerPort },
-		"peer equals diag0": func(c *Config) { c.DiagnosticsPort = 9090; c.PeerPort = 9090 },
+		"namespace":       func(c *Config) { c.Namespace = "Bad_NS" },
+		"dataplane image": func(c *Config) { c.DataplaneImage = " " },
+		"object image":    func(c *Config) { c.ObjectImage = "" },
 	} {
 		t.Run(name, func(t *testing.T) {
 			cfg := testConfig()

@@ -45,7 +45,6 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
-use std::time::SystemTime;
 #[cfg(test)]
 use std::time::UNIX_EPOCH;
 
@@ -145,7 +144,10 @@ impl Signatures {
     ) -> Result<VerifiedPeer> {
         let signed = binding.retained_proof(&self.ctx().clock)?;
         self.inner
-            .verify_retained_request(signed, number(&signed.head, "racer-route-deadline")?)
+            .verify_retained_request(
+                signed,
+                peer_wire::number(&signed.head, "racer-route-deadline")?,
+            )
             .map_err(Into::into)
     }
 }
@@ -154,9 +156,9 @@ struct RequestMac;
 
 impl peer_wire::RequestMac for RequestMac {
     fn sign(&self, keys: &Keyring, head: &mut MessageHead) -> peer_wire::Result<()> {
-        use peer_wire::{field, mac_base, push_binary};
+        use peer_wire::{mac_base, push_binary};
         if head.unique("racer-kind")? == Some(b"request".as_slice()) {
-            let cache = CacheId(field(head, "racer-cache")?);
+            let cache = CacheId(peer_wire::field(head, "racer-cache")?);
             let key = keys.active(
                 &cache,
                 racer_crypto::identity::KeyPurpose::OriginCredentials,
@@ -170,10 +172,10 @@ impl peer_wire::RequestMac for RequestMac {
     }
 
     fn verify(&self, keys: &Keyring, head: &MessageHead) -> peer_wire::Result<()> {
-        use peer_wire::{Error, decode_binary, field, mac_base};
+        use peer_wire::{Error, mac_base};
         if head.unique("racer-kind")? == Some(b"request".as_slice()) {
-            let cache = CacheId(field(head, "racer-cache")?);
-            let id = decode_binary(field(head, "racer-mac-key")?.as_bytes())?
+            let cache = CacheId(peer_wire::field(head, "racer-cache")?);
+            let id = peer_wire::decode_binary(peer_wire::field(head, "racer-mac-key")?.as_bytes())?
                 .try_into()
                 .map_err(|_| Error::Unauthorized)?;
             let key = keys.lease(
@@ -185,7 +187,7 @@ impl peer_wire::RequestMac for RequestMac {
                 &cache,
                 key.id(),
                 &mac_base(head)?,
-                &decode_binary(field(head, "racer-request-mac")?.as_bytes())?,
+                &peer_wire::decode_binary(peer_wire::field(head, "racer-request-mac")?.as_bytes())?,
             )?;
         }
         Ok(())
@@ -210,17 +212,6 @@ impl From<peer_wire::Error> for Error {
 #[cfg(test)]
 pub(crate) use peer_wire::is_auth_field;
 
-pub fn node_field(head: &MessageHead, name: &str) -> Result<NodeId> {
-    peer_wire::node_field(head, name).map_err(Into::into)
-}
-pub fn receiver(head: &MessageHead) -> Result<NodeId> {
-    peer_wire::receiver(head).map_err(Into::into)
-}
-/// Domain-separated SHA-256 binding of the exact signature base and Ed25519
-/// signature. Includes the signature itself, so a request ID is never sufficient.
-pub fn signed_digest(head: &SignedHead) -> Result<[u8; 32]> {
-    peer_wire::signed_digest(head).map_err(Into::into)
-}
 /// Never cloned, reset, or detached from its socket. Idle pooling moves this value.
 pub use peer_wire::Session;
 
@@ -377,26 +368,9 @@ pub const MIN_REQUEST_CONTEXT_BYTES: usize = 8 * MAX_ENVELOPE_HEAD;
 // The profile's opaque payload cap must track the application's page contract.
 const _: () = assert!(peer_wire::MAX_BODY == PAGE_BYTES as usize + 16);
 
-/// Canonical Kubernetes UUID spelling. Reject normalization at the trust boundary.
-pub fn uuid(value: &str) -> Result<()> {
-    peer_wire::uuid(value).map_err(Into::into)
-}
-
 /// Infallible wire formatting needs no application error adapter.
 pub use peer_wire::{binary, push, push_binary};
 
-pub fn decode_binary(value: &[u8]) -> Result<Vec<u8>> {
-    peer_wire::decode_binary(value).map_err(Into::into)
-}
-pub fn field(head: &MessageHead, name: &str) -> Result<String> {
-    peer_wire::field(head, name).map_err(Into::into)
-}
-pub fn number(head: &MessageHead, name: &str) -> Result<u64> {
-    peer_wire::number(head, name).map_err(Into::into)
-}
-pub fn millis(time: SystemTime) -> Result<u64> {
-    peer_wire::millis(time).map_err(Into::into)
-}
 /// Stable environment clock mapping. Decode wire deadlines with `decode_deadline`,
 /// never reconstruct them from a new relative timeout at each hop.
 ///
@@ -420,16 +394,8 @@ pub fn decode_deadline(clock: &racer_io::Clock, value: u64) -> Result<Deadline> 
         .map(Deadline)
         .map_err(Into::into)
 }
-/// Canonical node-list encoding: concatenated u32 big-endian length + UTF-8 ID,
-/// then padded base64. Empty lists encode as an empty header value.
-pub fn nodes(nodes: &[NodeId]) -> Result<String> {
-    peer_wire::nodes(nodes).map_err(Into::into)
-}
-pub fn decode_nodes(value: &[u8]) -> Result<Vec<NodeId>> {
-    peer_wire::decode_nodes(value).map_err(Into::into)
-}
 fn object_fields(head: &mut MessageHead, object: &ObjectId) -> Result<()> {
-    uuid(&object.cache.0)?;
+    peer_wire::uuid(&object.cache.0)?;
     push(head, "racer-cache", &object.cache.0);
     push(
         head,
@@ -454,9 +420,13 @@ pub fn route_headers(
     push(head, "racer-route-membership", route.membership.0);
     push_binary(head, "racer-route-request", &route.request.0);
     push_binary(head, "racer-route-attempt", &route.attempt.0);
-    uuid(&route.destination.0)?;
+    peer_wire::uuid(&route.destination.0)?;
     push(head, "racer-route-destination", &route.destination.0);
-    push(head, "racer-route-visited", nodes(&route.visited)?);
+    push(
+        head,
+        "racer-route-visited",
+        peer_wire::nodes(&route.visited)?,
+    );
     push(head, "racer-route-links", route.remaining_links);
     push(head, "racer-route-attempts", route.remaining_attempts);
     push(
@@ -509,8 +479,8 @@ pub fn request_head(clock: &racer_io::Clock, request: &PeerRequest) -> Result<Me
             );
             push(&mut head, "racer-page-budget", subscription.page_budget);
             push(&mut head, "racer-byte-budget", subscription.byte_budget);
-            // Optional, so the single-flight request stays byte-identical to the
-            // encoding older providers accept. They refuse a request carrying it.
+            // Optional, so a single-flight request stays byte-identical to an
+            // encoding without the field.
             if let Some(flights) = subscription.flights {
                 push(&mut head, SUBSCRIPTION_FLIGHTS, flights);
             }
@@ -650,12 +620,15 @@ const PREFETCH_MODE: FetchMode = FetchMode::Acquire;
 fn prefetch_action(head: &MessageHead) -> Result<PrefetchAction> {
     let pages = racer_core::prefetch::decode_pages(&bytes(head, "racer-prefetch-pages")?)
         .ok_or(Error::InvalidRequest)?;
-    Ok(match field(head, "racer-prefetch-action")?.as_str() {
+    let action = peer_wire::field(head, "racer-prefetch-action")?;
+    Ok(match action.as_str() {
         "fill" => {
-            let length = number(head, "racer-object-length")?;
-            let page_size =
-                racer_wire::object::PageSize::from_wire(number(head, "racer-page-size")?)
-                    .map_err(|_| Error::InvalidRequest)?;
+            let length = peer_wire::number(head, "racer-object-length")?;
+            let page_size = racer_wire::object::PageSize::from_wire(peer_wire::number(
+                head,
+                "racer-page-size",
+            )?)
+            .map_err(|_| Error::InvalidRequest)?;
             if !prefetch_fill_in_range(&pages, length, page_size) {
                 return Err(Error::InvalidRequest);
             }
@@ -667,8 +640,11 @@ fn prefetch_action(head: &MessageHead) -> Result<PrefetchAction> {
                     .unique("racer-content-type")?
                     .map(crate::model::ContentType::parse)
                     .transpose()?,
-                priority: racer_core::prefetch::Priority::parse(&field(head, "racer-priority")?)
-                    .ok_or(Error::InvalidRequest)?,
+                priority: racer_core::prefetch::Priority::parse(&peer_wire::field(
+                    head,
+                    "racer-priority",
+                )?)
+                .ok_or(Error::InvalidRequest)?,
             }
         }
         "probe" => PrefetchAction::Probe { pages },
@@ -801,7 +777,7 @@ fn response_prefix(binding: &[u8; 32], path: &[NodeId]) -> Result<MessageHead> {
     };
     push(&mut head, "racer-kind", "response");
     push_binary(&mut head, "racer-request-binding", binding);
-    push(&mut head, "racer-response-path", nodes(path)?);
+    push(&mut head, "racer-response-path", peer_wire::nodes(path)?);
     Ok(head)
 }
 
@@ -828,7 +804,7 @@ pub(crate) fn grant_fields(
     head: &mut MessageHead,
     grant: &crate::peer::subscriptions::TransferGrant,
 ) -> Result<()> {
-    uuid(&grant.receiver.0)?;
+    peer_wire::uuid(&grant.receiver.0)?;
     if grant.membership.0 == 0 {
         return Err(Error::InvalidRequest);
     }
@@ -918,30 +894,6 @@ fn opaque_page_response(
     response_tail(&mut head, outcome.name(), u64::from(e.ciphertext_length));
     Ok(head)
 }
-/// Exact logical agreement, rejecting unknown application fields as well as
-/// missing fields. Only the signing layer's fixed authentication fields are elided.
-pub fn agrees(actual: &MessageHead, expected: &MessageHead, ignore_route: bool) -> Result<()> {
-    peer_wire::agrees(actual, expected, ignore_route).map_err(Into::into)
-}
-
-/// Versioned HTTP envelope. Signed header values and signatures are preserved using
-/// the HTTP codec; this wrapper is framing only and is never a signing authority.
-pub fn encode_envelope(
-    authentication: &ForwardedHead,
-    response: bool,
-    body_length: usize,
-) -> Result<MessageHead> {
-    peer_wire::encode_envelope(authentication, response, body_length).map_err(Into::into)
-}
-/// Decode framing and resolve each proof's chain from the carrying session, which
-/// admitted the head; proof verification is separate.
-pub fn decode_envelope(
-    head: MessageHead,
-    response: bool,
-    chains: &dyn peer_wire::Chains,
-) -> Result<(ForwardedHead, usize)> {
-    peer_wire::decode_envelope(head, response, chains).map_err(Into::into)
-}
 /// The session of a connection that delivered a head, which resolves its chains.
 /// Every production peer exchange runs on a session; a missing one is a fault.
 pub(crate) fn chains(connection: &crate::http::ConnectionLease) -> Result<&Session> {
@@ -950,12 +902,6 @@ pub(crate) fn chains(connection: &crate::http::ConnectionLease) -> Result<&Sessi
         .session
         .as_ref()
         .ok_or(Error::Unauthorized)
-}
-pub(crate) fn encode_signed(head: &SignedHead) -> Result<Vec<u8>> {
-    peer_wire::encode_signed(head).map_err(Into::into)
-}
-pub(crate) fn decode_signed(bytes: &[u8]) -> Result<SignedHead> {
-    peer_wire::decode_signed(bytes).map_err(Into::into)
 }
 
 /// Decode the canonical security profile while retaining charged body ownership.
@@ -990,7 +936,7 @@ impl ResponseBody {
     }
 }
 fn bytes(head: &MessageHead, name: &str) -> Result<Vec<u8>> {
-    decode_binary(field(head, name)?.as_bytes())
+    peer_wire::decode_binary(peer_wire::field(head, name)?.as_bytes()).map_err(Into::into)
 }
 fn array<const N: usize>(head: &MessageHead, name: &str) -> Result<[u8; N]> {
     bytes(head, name)?
@@ -998,12 +944,12 @@ fn array<const N: usize>(head: &MessageHead, name: &str) -> Result<[u8; N]> {
         .map_err(|_| Error::InvalidRequest)
 }
 fn object(head: &MessageHead) -> Result<ObjectId> {
-    let cache = field(head, "racer-cache")?;
-    uuid(&cache)?;
+    let cache = peer_wire::field(head, "racer-cache")?;
+    peer_wire::uuid(&cache)?;
     if cache.is_empty() || cache.len() > 256 {
         return Err(Error::InvalidRequest);
     }
-    let key = field(head, "racer-key")?;
+    let key = peer_wire::field(head, "racer-key")?;
     let decoded =
         racer_wire::codec::decode_hex(key.as_bytes()).map_err(|_| Error::InvalidRequest)?;
     Ok(ObjectId {
@@ -1012,7 +958,7 @@ fn object(head: &MessageHead) -> Result<ObjectId> {
     })
 }
 fn etag(head: &MessageHead) -> Result<StrongEtag> {
-    StrongEtag::parse(field(head, "racer-etag")?.as_bytes()).map_err(Into::into)
+    StrongEtag::parse(peer_wire::field(head, "racer-etag")?.as_bytes()).map_err(Into::into)
 }
 fn version(head: &MessageHead) -> Result<ObjectVersion> {
     Ok(ObjectVersion {
@@ -1042,18 +988,18 @@ pub(crate) fn demand(head: &MessageHead) -> Result<racer_core::subscriptions::De
 pub(crate) fn grant(head: &MessageHead) -> Result<super::subscriptions::TransferGrant> {
     Ok(super::subscriptions::TransferGrant {
         subscription_id: array(head, "racer-subscription")?,
-        sequence: number(head, "racer-subscription-sequence")?,
+        sequence: peer_wire::number(head, "racer-subscription-sequence")?,
         page: PageId {
             version: version(head)?,
-            number: PageNumber(number(head, "racer-page")?),
+            number: PageNumber(peer_wire::number(head, "racer-page")?),
         },
-        membership: MembershipVersion(number(head, "racer-grant-membership")?),
-        receiver: node_field(head, "racer-grant-receiver")?,
-        deadline: number(head, "racer-grant-deadline")?,
-        remaining_page_budget: number(head, "racer-page-budget")?
+        membership: MembershipVersion(peer_wire::number(head, "racer-grant-membership")?),
+        receiver: peer_wire::node_field(head, "racer-grant-receiver")?,
+        deadline: peer_wire::number(head, "racer-grant-deadline")?,
+        remaining_page_budget: peer_wire::number(head, "racer-page-budget")?
             .try_into()
             .map_err(|_| Error::InvalidRequest)?,
-        remaining_byte_budget: number(head, "racer-byte-budget")?,
+        remaining_byte_budget: peer_wire::number(head, "racer-byte-budget")?,
         flights: subscription_flights(head)?,
     })
 }
@@ -1067,7 +1013,7 @@ pub(crate) fn subscription_flights(head: &MessageHead) -> Result<Option<u16>> {
     if head.unique(SUBSCRIPTION_FLIGHTS)?.is_none() {
         return Ok(None);
     }
-    match u16::try_from(number(head, SUBSCRIPTION_FLIGHTS)?) {
+    match u16::try_from(peer_wire::number(head, SUBSCRIPTION_FLIGHTS)?) {
         Ok(flights) if (1..=MAX_SUBSCRIPTION_FLIGHTS).contains(&flights) => Ok(Some(flights)),
         _ => Err(Error::InvalidRequest),
     }
@@ -1083,8 +1029,8 @@ fn metadata(head: &MessageHead) -> Result<ObjectMetadata> {
     Ok(ObjectMetadata {
         content_type,
         version: version(head)?,
-        length: number(head, "racer-length")?,
-        expires_at: ExpiresAt::from_unix_millis(number(head, "racer-expires")?)?,
+        length: peer_wire::number(head, "racer-length")?,
+        expires_at: ExpiresAt::from_unix_millis(peer_wire::number(head, "racer-expires")?)?,
     })
 }
 
@@ -1092,21 +1038,25 @@ pub(crate) fn page_descriptor(head: &MessageHead) -> Result<(ObjectMetadata, Pag
     let metadata = metadata(head)?;
     let envelope = PageEnvelope {
         cipher: crate::model::PageCipher::try_from(
-            u32::try_from(number(head, "racer-page-cipher")?).map_err(|_| Error::InvalidRequest)?,
+            u32::try_from(peer_wire::number(head, "racer-page-cipher")?)
+                .map_err(|_| Error::InvalidRequest)?,
         )
         .map_err(|_| Error::InvalidRequest)?,
-        page_size: racer_wire::object::PageSize::from_wire(number(head, "racer-page-size")?)
-            .map_err(|_| Error::InvalidRequest)?,
+        page_size: racer_wire::object::PageSize::from_wire(peer_wire::number(
+            head,
+            "racer-page-size",
+        )?)
+        .map_err(|_| Error::InvalidRequest)?,
         page: PageId {
             version: metadata.version.clone(),
-            number: PageNumber(number(head, "racer-page")?),
+            number: PageNumber(peer_wire::number(head, "racer-page")?),
         },
         key_id: KeyId(array(head, "racer-page-key")?),
         nonce: Nonce(array(head, "racer-page-nonce")?),
-        plaintext_length: number(head, "racer-plaintext-length")?
+        plaintext_length: peer_wire::number(head, "racer-plaintext-length")?
             .try_into()
             .map_err(|_| Error::InvalidRequest)?,
-        ciphertext_length: number(head, "racer-ciphertext-length")?
+        ciphertext_length: peer_wire::number(head, "racer-ciphertext-length")?
             .try_into()
             .map_err(|_| Error::InvalidRequest)?,
     };
@@ -1117,7 +1067,7 @@ pub(crate) fn page_descriptor(head: &MessageHead) -> Result<(ObjectMetadata, Pag
     Ok((metadata, envelope))
 }
 fn present(head: &MessageHead, name: &str) -> Result<bool> {
-    match number(head, name)? {
+    match peer_wire::number(head, name)? {
         0 => Ok(false),
         1 => Ok(true),
         _ => Err(Error::InvalidRequest),
@@ -1126,9 +1076,9 @@ fn present(head: &MessageHead, name: &str) -> Result<bool> {
 /// Decode only the canonical signed metadata. The caller must authenticate the
 /// original and reverse proofs before exposing this head or any body bytes.
 pub(crate) fn opaque_response_head(head: &MessageHead, length: usize) -> Result<MessageHead> {
-    let outcome = field(head, "racer-outcome")?;
+    let outcome = peer_wire::field(head, "racer-outcome")?;
     let binding = array(head, "racer-request-binding")?;
-    let path = decode_nodes(field(head, "racer-response-path")?.as_bytes())?;
+    let path = peer_wire::decode_nodes(peer_wire::field(head, "racer-response-path")?.as_bytes())?;
     if matches!(outcome.as_str(), "page" | "selected")
         || (outcome == "bootstrap" && present(head, "racer-page-present")?)
     {
@@ -1184,24 +1134,25 @@ fn bodyless_response(head: &MessageHead, outcome: &str) -> Result<PeerResponse> 
     })
 }
 fn route(clock: &racer_io::Clock, head: &MessageHead) -> Result<RouteBudget> {
-    let remaining_links = number(head, "racer-route-links")?
+    let remaining_links = peer_wire::number(head, "racer-route-links")?
         .try_into()
         .map_err(|_| Error::InvalidRequest)?;
-    let visited = decode_nodes(field(head, "racer-route-visited")?.as_bytes())?;
+    let visited =
+        peer_wire::decode_nodes(peer_wire::field(head, "racer-route-visited")?.as_bytes())?;
     if !racer_core::route::within_wire(visited.len(), u64::from(remaining_links)) {
         return Err(Error::HopBudgetExhausted);
     }
     Ok(RouteBudget {
-        membership: MembershipVersion(number(head, "racer-route-membership")?),
+        membership: MembershipVersion(peer_wire::number(head, "racer-route-membership")?),
         request: RequestId(array(head, "racer-route-request")?),
         attempt: AttemptId(array(head, "racer-route-attempt")?),
-        destination: node_field(head, "racer-route-destination")?,
+        destination: peer_wire::node_field(head, "racer-route-destination")?,
         visited,
         remaining_links,
-        remaining_attempts: number(head, "racer-route-attempts")?
+        remaining_attempts: peer_wire::number(head, "racer-route-attempts")?
             .try_into()
             .map_err(|_| Error::InvalidRequest)?,
-        deadline: decode_deadline(clock, number(head, "racer-route-deadline")?)?,
+        deadline: decode_deadline(clock, peer_wire::number(head, "racer-route-deadline")?)?,
     })
 }
 impl SecurityCodec {
@@ -1222,7 +1173,7 @@ impl SecurityCodec {
         let _decode_reservation =
             self.admission
                 .reserve(None, ResourceClass::RequestContext, length.max(1))?;
-        let mode = match field(head, "racer-mode")?.as_str() {
+        let mode = match peer_wire::field(head, "racer-mode")?.as_str() {
             "copy" => FetchMode::CopyOnly,
             "acquire" => FetchMode::Acquire,
             "offer" => FetchMode::Offer,
@@ -1235,17 +1186,17 @@ impl SecurityCodec {
             ResourceClass::RequestContext,
             length.checked_add(512).ok_or(Error::InvalidRequest)?,
         )?;
-        let operation = match field(head, "racer-operation")?.as_str() {
+        let operation = match peer_wire::field(head, "racer-operation")?.as_str() {
             "subscribe" => Operation::Subscribe {
                 subscription: super::subscriptions::Subscription {
                     id: array(head, "racer-subscription")?,
                     version: version(head)?,
                     demand: demand(head)?,
-                    sequence: number(head, "racer-subscription-sequence")?,
-                    page_budget: number(head, "racer-page-budget")?
+                    sequence: peer_wire::number(head, "racer-subscription-sequence")?,
+                    page_budget: peer_wire::number(head, "racer-page-budget")?
                         .try_into()
                         .map_err(|_| Error::InvalidRequest)?,
-                    byte_budget: number(head, "racer-byte-budget")?,
+                    byte_budget: peer_wire::number(head, "racer-byte-budget")?,
                     flights: subscription_flights(head)?,
                 },
                 mode,
@@ -1257,13 +1208,13 @@ impl SecurityCodec {
             "page" => Operation::Page {
                 page: PageId {
                     version: version(head)?,
-                    number: PageNumber(number(head, "racer-page")?),
+                    number: PageNumber(peer_wire::number(head, "racer-page")?),
                 },
                 mode,
             },
             "metadata" => Operation::Metadata {
                 object: object.clone(),
-                selector: match field(head, "racer-selector")?.as_str() {
+                selector: match peer_wire::field(head, "racer-selector")?.as_str() {
                     "fresh" => MetadataSelector::Fresh,
                     "pinned" => MetadataSelector::Pinned(etag(head)?),
                     _ => return Err(Error::InvalidRequest),
@@ -1319,7 +1270,7 @@ impl SecurityCodec {
             origin,
             route: original_route,
         };
-        agrees(head, &request_head(clock, &request)?, false)?;
+        peer_wire::agrees(head, &request_head(clock, &request)?, false)?;
         request.route = effective_route;
         Ok(SignedRequest {
             authentication,
@@ -1369,7 +1320,7 @@ impl SecurityCodec {
     ) -> Result<SignedResponse> {
         scope.check()?;
         let head = &authentication.original.head;
-        let outcome = field(head, "racer-outcome")?;
+        let outcome = peer_wire::field(head, "racer-outcome")?;
         let response = match outcome.as_str() {
             "page" | "selected" | "bootstrap"
                 if outcome != "bootstrap" || present(head, "racer-page-present")? =>
@@ -1433,8 +1384,9 @@ impl SecurityCodec {
             }
         };
         let binding = array(head, "racer-request-binding")?;
-        let path = decode_nodes(field(head, "racer-response-path")?.as_bytes())?;
-        agrees(head, &response_head(&response, &binding, &path)?, false)?;
+        let path =
+            peer_wire::decode_nodes(peer_wire::field(head, "racer-response-path")?.as_bytes())?;
+        peer_wire::agrees(head, &response_head(&response, &binding, &path)?, false)?;
         Ok(SignedResponse {
             authentication,
             response,
@@ -2047,8 +1999,8 @@ pub(crate) mod tests {
         #[test]
         fn envelope_preserves_signature_and_opaque_headers() {
             let original = envelope();
-            let (decoded, length) = decode_envelope(
-                encode_envelope(&original, true, 27).unwrap(),
+            let (decoded, length) = peer_wire::decode_envelope(
+                peer_wire::encode_envelope(&original, true, 27).unwrap(),
                 true,
                 &peer_wire::test_util::AnyChain,
             )
@@ -2060,33 +2012,40 @@ pub(crate) mod tests {
         #[test]
         fn rejects_versions_duplicates_holes_and_request_bodies() {
             for version in ["0", "1", "3", "10"] {
-                let mut head = encode_envelope(&envelope(), false, 0).unwrap();
+                let mut head = peer_wire::encode_envelope(&envelope(), false, 0).unwrap();
                 head.headers[0].value = version.as_bytes().to_vec();
-                assert!(decode_envelope(head, false, &peer_wire::test_util::AnyChain).is_err());
+                assert!(
+                    peer_wire::decode_envelope(head, false, &peer_wire::test_util::AnyChain)
+                        .is_err()
+                );
             }
-            let mut head = encode_envelope(&envelope(), false, 0).unwrap();
+            let mut head = peer_wire::encode_envelope(&envelope(), false, 0).unwrap();
             head.headers.push(Header {
                 name: "Content-Length".into(),
                 value: b"0".to_vec(),
             });
-            assert!(decode_envelope(head, false, &peer_wire::test_util::AnyChain).is_err());
-            let mut head = encode_envelope(&envelope(), false, 0).unwrap();
+            assert!(
+                peer_wire::decode_envelope(head, false, &peer_wire::test_util::AnyChain).is_err()
+            );
+            let mut head = peer_wire::encode_envelope(&envelope(), false, 0).unwrap();
             head.headers.push(Header {
                 name: "racer-hop-1".into(),
-                value: encode_signed(&envelope().original).unwrap(),
+                value: peer_wire::encode_signed(&envelope().original).unwrap(),
             });
-            assert!(decode_envelope(head, false, &peer_wire::test_util::AnyChain).is_err());
-            assert!(encode_envelope(&envelope(), false, 1).is_err());
-            assert!(encode_envelope(&envelope(), true, usize::MAX).is_err());
+            assert!(
+                peer_wire::decode_envelope(head, false, &peer_wire::test_util::AnyChain).is_err()
+            );
+            assert!(peer_wire::encode_envelope(&envelope(), false, 1).is_err());
+            assert!(peer_wire::encode_envelope(&envelope(), true, usize::MAX).is_err());
         }
         #[test]
         fn rejects_trailing_or_oversized_embedded_head() {
             let mut encoded = STANDARD
-                .decode(encode_signed(&envelope().original).unwrap())
+                .decode(peer_wire::encode_signed(&envelope().original).unwrap())
                 .unwrap();
             encoded.extend_from_slice(b"extra");
-            assert!(decode_signed(STANDARD.encode(encoded).as_bytes()).is_err());
-            assert!(decode_signed(&vec![b'A'; MAX_SIGNED_HEAD * 2]).is_err());
+            assert!(peer_wire::decode_signed(STANDARD.encode(encoded).as_bytes()).is_err());
+            assert!(peer_wire::decode_signed(&vec![b'A'; MAX_SIGNED_HEAD * 2]).is_err());
         }
         #[test]
         fn maximum_signed_heads_and_hop_count_fit_outer_signature_profile() {
@@ -2122,21 +2081,23 @@ pub(crate) mod tests {
                 codec.encode_head(&maximum.head).unwrap().len(),
                 MAX_SIGNED_HEAD
             );
-            let encoded = encode_signed(&maximum).unwrap();
+            let encoded = peer_wire::encode_signed(&maximum).unwrap();
             assert!(encoded.len() > MAX_SIGNED_HEAD);
             let mut envelope = ForwardedHead {
                 original: Arc::new(maximum),
                 hops: (0..MAX_HOPS)
-                    .map(|_| decode_signed(&encoded).unwrap())
+                    .map(|_| peer_wire::decode_signed(&encoded).unwrap())
                     .collect(),
             };
-            let mut outer = encode_envelope(&envelope, true, 0).unwrap();
+            let mut outer = peer_wire::encode_envelope(&envelope, true, 0).unwrap();
             push(&mut outer, "racer-receiver", &signers[1].node().0);
             let outer = signers[0].sign_fields(outer).unwrap();
             signers[1].verify_proof(outer).unwrap();
-            envelope.hops.push(decode_signed(&encoded).unwrap());
-            assert!(encode_envelope(&envelope, true, 0).is_err());
-            let mut too_large = decode_signed(&encoded).unwrap();
+            envelope
+                .hops
+                .push(peer_wire::decode_signed(&encoded).unwrap());
+            assert!(peer_wire::encode_envelope(&envelope, true, 0).is_err());
+            let mut too_large = peer_wire::decode_signed(&encoded).unwrap();
             too_large
                 .head
                 .headers
@@ -2146,12 +2107,12 @@ pub(crate) mod tests {
                 .value
                 .push(b'x');
             assert!(matches!(
-                encode_signed(&too_large),
+                peer_wire::encode_signed(&too_large).map_err(Error::from),
                 Err(Error::HeaderTooLarge)
             ));
             let mut decoded = STANDARD.decode(&encoded).unwrap();
             decoded.insert(decoded.len() - 4, b'x');
-            assert!(decode_signed(STANDARD.encode(decoded).as_bytes()).is_err());
+            assert!(peer_wire::decode_signed(STANDARD.encode(decoded).as_bytes()).is_err());
         }
     }
 
@@ -2241,11 +2202,14 @@ pub(crate) mod tests {
             };
             let mut previous = None;
             for sequence in 1..=2 {
-                let wire = a.sign(encode_envelope(&auth, false, 0).unwrap()).unwrap();
+                let wire = a
+                    .sign(peer_wire::encode_envelope(&auth, false, 0).unwrap())
+                    .unwrap();
                 let copy = clone_head(&wire);
                 let decoded = b.admit(wire).unwrap();
                 let (retained, _) =
-                    decode_envelope(decoded, false, &peer_wire::test_util::AnyChain).unwrap();
+                    peer_wire::decode_envelope(decoded, false, &peer_wire::test_util::AnyChain)
+                        .unwrap();
                 assert_eq!(retained.original.signature, proof.signature);
                 assert_eq!(b.rx, sequence);
                 if let Some(old) = previous {
@@ -2300,7 +2264,10 @@ pub(crate) mod tests {
             let bytes = std::mem::size_of_val(&a) + std::mem::size_of_val(&b);
             for sequence in 1..=5000 {
                 let h = a.sign(frame()).unwrap();
-                assert_eq!(number(&h, "racer-timestamp").unwrap(), millis(now).unwrap());
+                assert_eq!(
+                    peer_wire::number(&h, "racer-timestamp").unwrap(),
+                    peer_wire::millis(now).unwrap()
+                );
                 b.admit(h).unwrap();
                 assert_eq!(b.rx, sequence);
                 assert_eq!(a.tx, sequence);
@@ -2826,7 +2793,11 @@ pub(crate) mod tests {
                         && h.name != "signature-input"
                         && h.name != "racer-timestamp"
                 });
-                push(&mut stale.head, "racer-timestamp", millis(time).unwrap());
+                push(
+                    &mut stale.head,
+                    "racer-timestamp",
+                    peer_wire::millis(time).unwrap(),
+                );
                 let input = signature_input(&stale.head).unwrap();
                 push(&mut stale.head, "signature-input", format!("racer={input}"));
                 stale.signature = n[0]
@@ -2862,7 +2833,7 @@ pub(crate) mod tests {
             object_fields(&mut head, &expected).unwrap();
             assert_eq!(object(&head).unwrap(), expected);
             assert_eq!(
-                field(&head, "racer-key").unwrap(),
+                peer_wire::field(&head, "racer-key").unwrap(),
                 "0008101820283038404850586068707880889098a0a8b0b8c0c8d0d8e0e8f0f8"
             );
             for value in [
@@ -2901,25 +2872,25 @@ pub(crate) mod tests {
         fn canonical_binary_numbers_node_lists_and_deadline_round_trip() {
             let env = racer_io::Env::host();
             assert_eq!(binary(&[0, 1, 255]), "AAH/");
-            assert!(decode_binary(b"YQ").is_err());
-            assert!(decode_binary(b"YR==").is_err());
+            assert!(peer_wire::decode_binary(b"YQ").is_err());
+            assert!(peer_wire::decode_binary(b"YR==").is_err());
             let mut head = MessageHead {
                 start: StartLine::Response { status: 200 },
                 headers: Vec::new(),
             };
             push(&mut head, "n", "01");
-            assert!(number(&head, "n").is_err());
+            assert!(peer_wire::number(&head, "n").is_err());
             let nodes = vec![
                 crate::test_support::security::node(1),
                 crate::test_support::security::node(2),
             ];
             assert_eq!(
-                decode_nodes(crate::peer::protocol::nodes(&nodes).unwrap().as_bytes()).unwrap(),
+                peer_wire::decode_nodes(peer_wire::nodes(&nodes).unwrap().as_bytes()).unwrap(),
                 nodes
             );
             // Duplicates are rejected at encode time and at decode time.
             assert_eq!(
-                crate::peer::protocol::nodes(&[nodes[0].clone(), nodes[0].clone()]),
+                peer_wire::nodes(&[nodes[0].clone(), nodes[0].clone()]).map_err(Error::from),
                 Err(Error::InvalidRequest)
             );
             let mut duplicate = Vec::new();
@@ -2927,7 +2898,7 @@ pub(crate) mod tests {
                 duplicate.extend_from_slice(&(nodes[0].0.len() as u32).to_be_bytes());
                 duplicate.extend_from_slice(nodes[0].0.as_bytes());
             }
-            assert!(decode_nodes(binary(&duplicate).as_bytes()).is_err());
+            assert!(peer_wire::decode_nodes(binary(&duplicate).as_bytes()).is_err());
             let deadline = Deadline(Instant::now() + Duration::from_secs(30));
             let encoded = encode_deadline(&env.ctx.clock, deadline).unwrap();
             let decoded = decode_deadline(&env.ctx.clock, encoded).unwrap();

@@ -42,9 +42,8 @@ pub struct Subscription {
     pub byte_budget: u64,
 
     /// Selections the receiver asks to keep in flight on this contract.
-    /// `None` is the original single-flight contract and is not encoded on the
-    /// wire, so older providers still accept it. `Some(n)` requires
-    /// `1..=MAX_SUBSCRIPTION_FLIGHTS`; older providers refuse the request.
+    /// `None` is the single-flight contract and is not encoded on the wire.
+    /// `Some(n)` requires `1..=MAX_SUBSCRIPTION_FLIGHTS`.
     pub flights: Option<u16>,
 }
 
@@ -254,8 +253,7 @@ impl Subscriptions {
         scope: &crate::runtime::RequestScope,
     ) -> Result<Selection> {
         use crate::peer::protocol::encode_deadline;
-        use crate::peer::protocol::millis;
-        let now = || millis(scope.clock().wall_now());
+        let now = || peer_wire::millis(scope.clock().wall_now());
         scope.check()?;
         let object = subscription.version.object.clone();
         let key = self.admit(

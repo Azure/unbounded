@@ -1,13 +1,22 @@
-//! Worker command channels and one-shot operation results.
+//! Worker command queues and one-shot operation results.
 //!
 //! Each I/O worker gets one [`Worker`] handle. The node owner holds one
 //! [`Owner`] that drains every worker's bounded command queue. Results go
 //! back through per-operation one-shot cells ([`Op`] and [`Completer`]), so a
 //! worker never drains results it did not ask for.
 //!
-//! No `unsafe`: queues and cells are `Mutex`es held only for short,
-//! non-panicking critical sections, and wakes use `AtomicWaker` like the rest
-//! of the crate. Wakers are always called after the lock is released.
+//! Queues are [`futures::channel::mpsc`] channels and results are
+//! [`futures::channel::oneshot`] channels. A futures mpsc channel holds
+//! `buffer + senders` commands, and each worker has exactly one sender, so a
+//! queue of `n` commands is built with `n - 1` buffer slots.
+//!
+//! The owner never polls a receiver as a stream: it drains one command at a
+//! time with `try_recv` from its own pass, and an [`AtomicWaker`] shared by
+//! every worker wakes it after a send or a worker drop. A worker that finds
+//! its queue full waits on [`mpsc::Sender::poll_ready`]; futures wakes it
+//! when the owner receives one of its commands.
+//!
+//! No `unsafe`. Wakers are called after the enclosing lock is released.
 //!
 //! Cancellation:
 //! - Dropping the [`Owner`] closes every queue and drops queued commands.
@@ -17,14 +26,24 @@
 //! - Dropping a [`Completer`] without completing resolves the [`Op`] to
 //!   [`Error::Canceled`]. Dropping an [`Op`] makes [`Completer::complete`]
 //!   hand the value back so the owner can clean it up.
+//! - [`Op::cancel`] closes the receiver before taking a value, so a value
+//!   sent while the op is being abandoned is either returned by `cancel` or
+//!   handed back to [`Completer::complete`], never dropped unseen.
 
 use std::{
-    collections::VecDeque,
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    future::Future,
+    pin::Pin,
+    sync::{
+        Arc, Mutex, MutexGuard, PoisonError,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     task::{Context, Poll},
 };
 
-use futures::task::AtomicWaker;
+use futures::{
+    channel::{mpsc, oneshot},
+    task::AtomicWaker,
+};
 
 use crate::{Error, Result};
 
@@ -33,23 +52,18 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-struct Queue<C> {
-    commands: VecDeque<C>,
-    /// The owner is gone; no more commands are accepted.
-    owner_gone: bool,
-    /// The worker is gone; no more commands will arrive.
-    worker_gone: bool,
-}
+/// Queue depth shared by one worker and the owner.
+struct Queue {
+    /// Commands queued or in the middle of being sent. A send reserves a
+    /// slot before the command is visible to the owner and releases it on
+    /// receipt or on failure, so the count never understates the queue.
+    queued: AtomicUsize,
 
-/// State shared by one worker and the owner.
-struct Channel<C> {
-    queue: Mutex<Queue<C>>,
+    /// Commands the queue holds before a send fails.
     capacity: usize,
-    /// Woken when the owner frees space or goes away.
-    worker: AtomicWaker,
-    /// Shared by every channel of one owner. Woken on new commands or a
-    /// worker drop.
-    owner: Arc<AtomicWaker>,
+
+    /// The worker handle is alive.
+    live: AtomicBool,
 }
 
 /// Create one owner and `workers` worker handles, each with a queue of
@@ -62,31 +76,29 @@ pub(crate) fn channels<C>(workers: usize, capacity: usize) -> Result<(Vec<Worker
     }
 
     let waker = Arc::new(AtomicWaker::new());
-    let shared: Vec<_> = (0..workers)
-        .map(|_| {
-            Arc::new(Channel {
-                queue: Mutex::new(Queue {
-                    commands: VecDeque::with_capacity(capacity),
-                    owner_gone: false,
-                    worker_gone: false,
-                }),
-                capacity,
-                worker: AtomicWaker::new(),
-                owner: waker.clone(),
-            })
-        })
-        .collect();
-    let handles = shared
-        .iter()
-        .map(|channel| Worker {
-            channel: channel.clone(),
-        })
-        .collect();
+    let mut handles = Vec::with_capacity(workers);
+    let mut channels = Vec::with_capacity(workers);
+
+    for _ in 0..workers {
+        // Capacity is `buffer + senders`, and this worker is the only sender.
+        let (sender, receiver) = mpsc::channel(capacity - 1);
+        let queue = Arc::new(Queue {
+            queued: AtomicUsize::new(0),
+            capacity,
+            live: AtomicBool::new(true),
+        });
+        handles.push(Worker {
+            sender: Mutex::new(sender),
+            queue: queue.clone(),
+            owner: waker.clone(),
+        });
+        channels.push(Channel { receiver, queue });
+    }
 
     Ok((
         handles,
         Owner {
-            channels: shared,
+            channels,
             waker,
             next: 0,
         },
@@ -95,7 +107,11 @@ pub(crate) fn channels<C>(workers: usize, capacity: usize) -> Result<(Vec<Worker
 
 /// One I/O worker's sending side.
 pub(crate) struct Worker<C> {
-    channel: Arc<Channel<C>>,
+    sender: Mutex<mpsc::Sender<C>>,
+    queue: Arc<Queue>,
+    /// Shared by every channel of one owner. Woken on new commands or a
+    /// worker drop.
+    owner: Arc<AtomicWaker>,
 }
 
 impl<C> Worker<C> {
@@ -105,48 +121,50 @@ impl<C> Worker<C> {
     /// full; call [`Worker::poll_ready`] to wait) or [`Error::Unavailable`]
     /// (owner gone).
     pub(crate) fn try_send(&self, command: C) -> std::result::Result<(), (Error, C)> {
-        {
-            let mut queue = lock(&self.channel.queue);
+        // Reserve the slot before the command can be seen by the owner.
+        self.queue.queued.fetch_add(1, Ordering::AcqRel);
 
-            if queue.owner_gone {
-                return Err((Error::Unavailable, command));
+        let sent = {
+            let mut sender = lock(&self.sender);
+            sender.try_send(command)
+        };
+
+        match sent {
+            Ok(()) => {
+                self.owner.wake();
+                Ok(())
             }
-
-            if queue.commands.len() >= self.channel.capacity {
-                return Err((Error::Overloaded, command));
+            Err(error) => {
+                self.queue.queued.fetch_sub(1, Ordering::AcqRel);
+                let kind = if error.is_full() {
+                    Error::Overloaded
+                } else {
+                    Error::Unavailable
+                };
+                Err((kind, error.into_inner()))
             }
-
-            queue.commands.push_back(command);
         }
-
-        self.channel.owner.wake();
-        Ok(())
     }
 
     /// Whether the queue is at capacity.
     pub(crate) fn is_full(&self) -> bool {
-        lock(&self.channel.queue).commands.len() >= self.channel.capacity
+        self.queue.queued.load(Ordering::Acquire) >= self.queue.capacity
     }
 
     /// Whether the queue holds commands the owner has not drained.
     pub(crate) fn is_pending(&self) -> bool {
-        !lock(&self.channel.queue).commands.is_empty()
+        self.queue.queued.load(Ordering::Acquire) > 0
     }
 
     /// Ready once the queue has space. Fails with [`Error::Unavailable`]
     /// once the owner is gone.
     pub(crate) fn poll_ready(&self, cx: &mut Context<'_>) -> Poll<Result<()>> {
-        // Register first so a drain between the check and the return wakes us.
-        self.channel.worker.register(cx.waker());
+        let mut sender = lock(&self.sender);
 
-        let queue = lock(&self.channel.queue);
-
-        if queue.owner_gone {
-            Poll::Ready(Err(Error::Unavailable))
-        } else if queue.commands.len() < self.channel.capacity {
-            Poll::Ready(Ok(()))
-        } else {
-            Poll::Pending
+        match sender.poll_ready(cx) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(_)) => Poll::Ready(Err(Error::Unavailable)),
+            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -154,14 +172,20 @@ impl<C> Worker<C> {
 impl<C> Drop for Worker<C> {
     /// Tell the owner no more commands come from this worker.
     fn drop(&mut self) {
-        lock(&self.channel.queue).worker_gone = true;
-        self.channel.owner.wake();
+        self.queue.live.store(false, Ordering::Release);
+        self.owner.wake();
     }
+}
+
+/// The node owner's receiving side for one worker.
+struct Channel<C> {
+    receiver: mpsc::Receiver<C>,
+    queue: Arc<Queue>,
 }
 
 /// The node owner's receiving side for every worker.
 pub(crate) struct Owner<C> {
-    channels: Vec<Arc<Channel<C>>>,
+    channels: Vec<Channel<C>>,
     waker: Arc<AtomicWaker>,
     /// Worker to start the next drain at, for fairness.
     next: usize,
@@ -222,11 +246,11 @@ impl<C> Owner<C> {
                 }
 
                 let index = (start + step) % count;
-                let channel = &self.channels[index];
-                let command = lock(&channel.queue).commands.pop_front();
+                let channel = &mut self.channels[index];
 
-                if let Some(command) = command {
-                    channel.worker.wake();
+                // Receiving unparks a sender waiting on `poll_ready`.
+                if let Ok(command) = channel.receiver.try_recv() {
+                    channel.queue.queued.fetch_sub(1, Ordering::AcqRel);
                     handle(index, command);
                     handled += 1;
                     progressed = true;
@@ -249,8 +273,8 @@ impl<C> Owner<C> {
     #[cfg(test)]
     pub(crate) fn is_closed(&self, index: usize) -> bool {
         self.channels.get(index).is_none_or(|channel| {
-            let queue = lock(&channel.queue);
-            queue.worker_gone && queue.commands.is_empty()
+            !channel.queue.live.load(Ordering::Acquire)
+                && channel.queue.queued.load(Ordering::Acquire) == 0
         })
     }
 }
@@ -258,78 +282,83 @@ impl<C> Owner<C> {
 impl<C> Drop for Owner<C> {
     /// Close every queue, drop queued commands, and wake waiting workers.
     fn drop(&mut self) {
-        for channel in &self.channels {
-            let commands = {
-                let mut queue = lock(&channel.queue);
-                queue.owner_gone = true;
-                std::mem::take(&mut queue.commands)
-            };
+        // Closing first makes every later send fail before any command runs
+        // its completion.
+        for channel in &mut self.channels {
+            channel.receiver.close();
+        }
 
-            // Dropped outside the lock: commands may complete ops and wake.
-            drop(commands);
-            channel.worker.wake();
+        for channel in &mut self.channels {
+            while let Ok(command) = channel.receiver.try_recv() {
+                channel.queue.queued.fetch_sub(1, Ordering::AcqRel);
+                // Dropped outside any lock: commands may complete ops and
+                // wake.
+                drop(command);
+            }
         }
     }
 }
 
-enum State<T> {
-    Pending,
-    Done(Result<T>),
-    /// The result was taken by `Op::poll`.
-    Taken,
-}
-
-struct OpCell<T> {
-    state: Mutex<State<T>>,
-    /// Cleared when the `Op` drops.
-    waiting: Mutex<bool>,
-    waker: AtomicWaker,
-}
-
 /// Create a pending operation and the handle that completes it.
 pub(crate) fn op<T>() -> (Op<T>, Completer<T>) {
-    let cell = Arc::new(OpCell {
-        state: Mutex::new(State::Pending),
-        waiting: Mutex::new(true),
-        waker: AtomicWaker::new(),
-    });
+    let (sender, receiver) = oneshot::channel::<Result<T>>();
 
-    (Op(cell.clone()), Completer(Some(cell)))
+    (Op(Mutex::new(Some(receiver))), Completer(Some(sender)))
 }
 
 /// One-shot result of an owner operation.
-pub struct Op<T>(Arc<OpCell<T>>);
+///
+/// Wraps a [`oneshot::Receiver`] because the public API polls it through
+/// `&self`.
+pub struct Op<T>(Mutex<Option<oneshot::Receiver<Result<T>>>>);
 
 impl<T> Op<T> {
     /// The result, once. Polling after `Ready` returns
     /// [`Error::InvalidRequest`].
     pub fn poll(&self, cx: &mut Context<'_>) -> Poll<Result<T>> {
-        self.0.waker.register(cx.waker());
+        let mut receiver = lock(&self.0);
+        let Some(inner) = receiver.as_mut() else {
+            return Poll::Ready(Err(Error::InvalidRequest));
+        };
 
-        let mut state = lock(&self.0.state);
-
-        match std::mem::replace(&mut *state, State::Taken) {
-            State::Pending => {
-                *state = State::Pending;
-                Poll::Pending
+        match Pin::new(inner).poll(cx) {
+            Poll::Ready(Ok(result)) => {
+                *receiver = None;
+                Poll::Ready(result)
             }
-            State::Done(result) => Poll::Ready(result),
-            State::Taken => Poll::Ready(Err(Error::InvalidRequest)),
+            Poll::Ready(Err(oneshot::Canceled)) => {
+                *receiver = None;
+                Poll::Ready(Err(Error::Canceled))
+            }
+            Poll::Pending => Poll::Pending,
         }
     }
 
     /// Abandon the op and return its result if it completed but was not
     /// read. Atomic with respect to the owner's completion: a result is
-    /// either returned here or handed back to the owner, never lost.
+    /// either returned here or handed back to the [`Completer`], never lost.
     pub fn cancel(self) -> Option<Result<T>> {
-        let mut waiting = lock(&self.0.waiting);
-        *waiting = false;
-        let state = std::mem::replace(&mut *lock(&self.0.state), State::Taken);
-        drop(waiting);
+        let mut receiver = self
+            .0
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner)?;
 
-        match state {
-            State::Done(result) => Some(result),
-            State::Pending | State::Taken => None,
+        // The completer may have already resolved the op.
+        match receiver.try_recv() {
+            Ok(Some(result)) => return Some(result),
+            Err(oneshot::Canceled) => return Some(Err(Error::Canceled)),
+            Ok(None) => {}
+        }
+
+        // Fail a later completion, then pick up a value that was sent while
+        // closing. `Receiver::close` marks the channel complete, so
+        // `Sender::send` either fails and returns the value to the owner or
+        // stored it before the close, where `try_recv` takes it back.
+        receiver.close();
+
+        match receiver.try_recv() {
+            Ok(Some(result)) => Some(result),
+            Ok(None) | Err(oneshot::Canceled) => None,
         }
     }
 }
@@ -340,58 +369,21 @@ impl<T> std::fmt::Debug for Op<T> {
     }
 }
 
-impl<T> Drop for Op<T> {
-    /// Mark the op abandoned and drop any unread result.
-    fn drop(&mut self) {
-        *lock(&self.0.waiting) = false;
-
-        let state = std::mem::replace(&mut *lock(&self.0.state), State::Taken);
-        drop(state);
-    }
-}
-
 /// The owner's side of an [`Op`]. Dropping it uncompleted cancels the op.
-pub(crate) struct Completer<T>(Option<Arc<OpCell<T>>>);
+pub(crate) struct Completer<T>(Option<oneshot::Sender<Result<T>>>);
 
 impl<T> Completer<T> {
-    /// True once the [`Op`] is dropped.
+    /// True once the [`Op`] is dropped or canceled.
     pub(crate) fn is_abandoned(&self) -> bool {
-        self.0.as_ref().is_none_or(|cell| !*lock(&cell.waiting))
+        self.0.as_ref().is_none_or(oneshot::Sender::is_canceled)
     }
 
     /// Resolve the op and wake its poller. If the [`Op`] is gone the value
     /// comes back as `Err` so the caller can clean it up.
     pub(crate) fn complete(mut self, result: Result<T>) -> std::result::Result<(), Result<T>> {
-        let cell = self.0.take().expect("completer used once");
+        let sender = self.0.take().expect("completer used once");
 
-        Self::resolve(&cell, result)
-    }
-
-    fn resolve(cell: &OpCell<T>, result: Result<T>) -> std::result::Result<(), Result<T>> {
-        {
-            // Lock order: waiting, then state. `Op::drop` takes them one at a
-            // time, so holding `waiting` makes the check and store atomic
-            // with respect to the drop.
-            let waiting = lock(&cell.waiting);
-
-            if !*waiting {
-                return Err(result);
-            }
-
-            *lock(&cell.state) = State::Done(result);
-        }
-
-        cell.waker.wake();
-        Ok(())
-    }
-}
-
-impl<T> Drop for Completer<T> {
-    /// Cancel an uncompleted op.
-    fn drop(&mut self) {
-        if let Some(cell) = self.0.take() {
-            let _ = Self::resolve(&cell, Err(Error::Canceled));
-        }
+        sender.send(result)
     }
 }
 
@@ -506,6 +498,33 @@ mod tests {
     }
 
     #[test]
+    fn capacity_is_exactly_the_requested_bound() {
+        let (workers, _owner) = channels::<u32>(1, 3).unwrap();
+
+        for sequence in 0..3 {
+            assert!(workers[0].try_send(sequence).is_ok());
+        }
+
+        assert!(workers[0].is_full());
+        assert_eq!(workers[0].try_send(3), Err((Error::Overloaded, 3)));
+    }
+
+    #[test]
+    fn a_one_slot_queue_holds_one_command() {
+        let (workers, mut owner) = channels::<u32>(1, 1).unwrap();
+        let (count, waker) = counter();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(workers[0].try_send(1).is_ok());
+        assert_eq!(workers[0].try_send(2), Err((Error::Overloaded, 2)));
+        assert!(workers[0].poll_ready(&mut cx).is_pending());
+
+        assert_eq!(drain_all(&mut owner, 8), vec![(0, 1)]);
+        assert_eq!(wakes(&count), 1);
+        assert_eq!(workers[0].poll_ready(&mut cx), Poll::Ready(Ok(())));
+    }
+
+    #[test]
     fn owner_drop_cancels_queued_and_rejects_new() {
         let (workers, owner) = channels::<Completer<u32>>(1, 4).unwrap();
         let (op, completer) = op();
@@ -597,6 +616,14 @@ mod tests {
         assert_eq!(op.cancel(), None);
         assert!(completer.is_abandoned());
         assert_eq!(completer.complete(Ok(7)), Err(Ok(7)));
+    }
+
+    #[test]
+    fn cancel_after_completer_drop_reports_canceled() {
+        let (op, completer) = op::<u32>();
+
+        drop(completer);
+        assert_eq!(op.cancel(), Some(Err(Error::Canceled)));
     }
 
     #[test]

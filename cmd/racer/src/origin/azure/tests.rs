@@ -39,26 +39,25 @@ struct FakeExchange {
     discarded: Rc<Cell<usize>>,
 }
 
-impl AzureTransport for Rc<Fake> {
-    type Exchange = FakeExchange;
+impl TestTransport for Fake {
     fn exchange<'a>(
         &'a self,
         url: &'a AzureContainerUrl,
         head: MessageHead,
         scope: &'a RequestScope,
-    ) -> Operation<'a, FakeExchange> {
+    ) -> Operation<'a, AzureExchange> {
         Box::pin(async move {
             scope.check()?;
             assert_eq!(url.container(), "models");
             self.sent.borrow_mut().push(head);
             let next = self.script.borrow_mut().pop_front().ok_or(Error::Io)?;
-            Ok(FakeExchange {
+            Ok(AzureExchange::fake(FakeExchange {
                 head: next.head,
                 body: next.body,
                 finished: self.finished.clone(),
                 read: self.read.clone(),
                 discarded: self.discarded.clone(),
-            })
+            }))
         })
     }
 
@@ -67,16 +66,16 @@ impl AzureTransport for Rc<Fake> {
     }
 }
 
-impl AzureExchange for FakeExchange {
+impl TestExchange for FakeExchange {
     fn head(&self) -> &MessageHead {
         &self.head
     }
-    fn finish(self) -> Result<()> {
+    fn finish(self: Box<Self>) -> Result<()> {
         self.finished.set(self.finished.get() + 1);
         Ok(())
     }
     fn read_body<'a>(
-        self,
+        self: Box<Self>,
         mut buffer: PlaintextBuffer,
         _scope: &'a RequestScope,
     ) -> Operation<'a, PlaintextBuffer>
@@ -94,7 +93,7 @@ impl AzureExchange for FakeExchange {
             Ok(buffer)
         })
     }
-    fn discard<'a>(self, _scope: &'a RequestScope) -> Operation<'a, ()>
+    fn discard<'a>(self: Box<Self>, _scope: &'a RequestScope) -> Operation<'a, ()>
     where
         Self: 'a,
     {
@@ -112,7 +111,7 @@ struct Tokens(
     Cell<bool>,
 );
 
-impl AzureTokenSource for Rc<Tokens> {
+impl TestTokenSource for Tokens {
     fn bearer<'a>(
         &'a self,
         credential: &'a AzureCredential,
@@ -138,7 +137,7 @@ impl AzureTokenSource for Rc<Tokens> {
 }
 
 struct Harness {
-    origin: AzureOrigin<Rc<Fake>, Rc<Tokens>>,
+    origin: AzureOrigin,
     fake: Rc<Fake>,
     tokens: Rc<Tokens>,
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
@@ -180,8 +179,8 @@ fn harness() -> Harness {
     let shared = Arc::new(AzureLimits::default());
     let snapshots = Arc::new(PublicationCell::new(Snapshot::retention(2)));
     let origin = AzureOrigin::new(
-        fake.clone(),
-        tokens.clone(),
+        AzureTransport::fake(fake.clone()),
+        AzureTokenSource::fake(tokens.clone()),
         snapshots.clone(),
         admission.clone(),
         BufferPool::new(admission.clone()),
@@ -812,12 +811,12 @@ fn anonymous_credentials_send_no_authorization() {
     assert_eq!(header(&sent, "Host"), Some(&b"127.0.0.1:10000"[..]));
     assert_eq!(target(&sent).1, "/devstoreaccount1/models/a%20b");
     assert!(
-        block_on(AnonymousOnly.bearer(&AzureCredential::Anonymous, &scope()))
+        block_on(AzureTokenSource::anonymous().bearer(&AzureCredential::Anonymous, &scope()))
             .unwrap()
             .is_none()
     );
     assert!(matches!(
-        block_on(AnonymousOnly.bearer(
+        block_on(AzureTokenSource::anonymous().bearer(
             &AzureCredential::ManagedIdentity { client_id: None },
             &scope()
         )),
@@ -851,7 +850,7 @@ mod router {
     #[derive(Default)]
     struct Adapter(Cell<usize>);
 
-    impl Origin for Rc<Adapter> {
+    impl Origin for Adapter {
         fn bootstrap_reserved<'a>(
             &'a self,
             _: &'a OriginAuthority,
@@ -959,9 +958,7 @@ mod router {
         context
     }
 
-    type Router = OriginRouter<Rc<Adapter>, Rc<Fake>, Rc<Tokens>>;
-
-    fn router(h: Harness, native: bool) -> (Router, Rc<Adapter>, Rc<Fake>) {
+    fn router(h: Harness, native: bool) -> (OriginRouter, Rc<Adapter>, Rc<Fake>) {
         let adapter = Rc::new(Adapter::default());
         let fake = h.fake.clone();
         let router = OriginRouter::new(

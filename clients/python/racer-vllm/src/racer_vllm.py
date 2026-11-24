@@ -871,7 +871,6 @@ def _patterns(extra: dict, key: str) -> list:
 
 def settings(extra: dict) -> dict:
     """Loader options from model_loader_extra_config, with defaults."""
-    retry = extra.get("mode_retry_seconds", racer.DEFAULT_MODE_RETRY_SECONDS)
     prefetch_ttl = _int_option(extra, "prefetch_ttl_seconds", DEFAULT_PREFETCH_TTL_SECONDS)
     if prefetch_ttl < 0:
         raise ValueError("prefetch_ttl_seconds must be at least 0")
@@ -885,7 +884,6 @@ def settings(extra: dict) -> dict:
         "clone": bool(extra.get("clone", True)),
         "socket": extra.get("socket"),
         "use_vmm": bool(extra.get("use_vmm", True)),
-        "mode_retry_seconds": None if retry is None else float(retry),
         "sharded_state": bool(extra.get("sharded_state", False)),
         "pattern": extra.get("pattern"),
         "prefetch": _bool_option(extra, "prefetch", DEFAULT_PREFETCH),
@@ -952,7 +950,6 @@ def register() -> None:
                 cache=uri.cache,
                 socket_path=o["socket"],
                 staging_bytes=o["staging_bytes"],
-                mode_retry_seconds=o["mode_retry_seconds"],
                 pin_staging=o["tensor_device"] == "cuda",
             )
             try:

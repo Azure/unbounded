@@ -5,7 +5,7 @@
 //! an Azure origin configured, every cache uses the adapter socket, exactly as
 //! before native origins existed.
 
-use super::azure::{AzureOrigin, AzureTokenSource, AzureTransport};
+use super::azure::AzureOrigin;
 use super::{MetadataReply, Origin, OriginPage};
 use crate::admission::AdmissionPolicy;
 use crate::control::Snapshot;
@@ -15,19 +15,20 @@ use crate::model::{MetadataSelector, ObjectId, PageId, PageNumber};
 use crate::read::candidates::OriginAuthority;
 use crate::runtime::RequestScope;
 use crate::security::OriginContext;
+use std::rc::Rc;
 use std::sync::Arc;
 
-pub struct OriginRouter<U, T, K> {
+pub struct OriginRouter {
     snapshots: Arc<PublicationCell<Snapshot>>,
-    adapter: U,
-    azure: Option<AzureOrigin<T, K>>,
+    adapter: Rc<dyn Origin>,
+    azure: Option<AzureOrigin>,
 }
 
-impl<U: Origin, T: AzureTransport, K: AzureTokenSource> OriginRouter<U, T, K> {
+impl OriginRouter {
     pub fn new(
         snapshots: Arc<PublicationCell<Snapshot>>,
-        adapter: U,
-        azure: Option<AzureOrigin<T, K>>,
+        adapter: Rc<dyn Origin>,
+        azure: Option<AzureOrigin>,
     ) -> Self {
         Self {
             snapshots,
@@ -39,7 +40,7 @@ impl<U: Origin, T: AzureTransport, K: AzureTokenSource> OriginRouter<U, T, K> {
     /// The current snapshot and cache index when `object` belongs to a cache
     /// with a native origin, looked up by cache UID. Any lookup failure falls
     /// through to the adapter, which reports it as before.
-    fn native(&self, object: &ObjectId) -> Option<(&AzureOrigin<T, K>, Arc<Snapshot>, usize)> {
+    fn native(&self, object: &ObjectId) -> Option<(&AzureOrigin, Arc<Snapshot>, usize)> {
         let azure = self.azure.as_ref()?;
         let snapshot = self.snapshots.current().ok()??;
         azure.observe(&snapshot);
@@ -51,7 +52,7 @@ impl<U: Origin, T: AzureTransport, K: AzureTokenSource> OriginRouter<U, T, K> {
     }
 }
 
-impl<U: Origin, T: AzureTransport, K: AzureTokenSource> Origin for OriginRouter<U, T, K> {
+impl Origin for OriginRouter {
     /// The published cluster page size; the default before any publication.
     fn page_size(&self) -> crate::error::Result<racer_wire::object::PageSize> {
         Ok(self

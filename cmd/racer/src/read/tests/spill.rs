@@ -38,6 +38,7 @@ fn spill_reader(
     f.fill
         .dependencies
         .metadata_owner
+        .node()
         .configure_spill(crate::read::spill::Config {
             range_spill_pages: spill,
             ..Default::default()

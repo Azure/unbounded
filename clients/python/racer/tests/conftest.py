@@ -26,10 +26,8 @@ def small_pages(monkeypatch):
 @pytest.fixture
 def server(tmp_path, small_pages):
     s = FakeRacer(str(tmp_path / "s"))
-    racer.forget_modes()
     yield s
     s.close()
-    racer.forget_modes()
 
 
 class FakeGpu:

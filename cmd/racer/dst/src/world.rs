@@ -13,7 +13,7 @@
 //! 1. Deliver world events (faults) due at the current instant.
 //! 2. Collect runnable roles: last step said `Ready`, its `WaitUntil` deadline
 //!    has passed, or a wake source fired ([`SimRole::woken`]: a CQE, a
-//!    cross-role mailbox wake, a ready task). Order is `(node, role)` index.
+//!    cross-role queue wake, a ready task). Order is `(node, role)` index.
 //! 3. If any are runnable, [`Choices`] picks one and it takes one bounded
 //!    step. Safety invariants and role-reported violations are checked.
 //! 4. Otherwise time jumps to the earliest of every role's deadline and the
@@ -41,10 +41,10 @@ use std::{
 };
 
 use racer_io::{
-    Driver, Reactor, Rng, WorkerCtx,
+    Driver, Rng, Scope, WorkerCtx,
     ctx::VirtualClock,
-    exec::{Lane, Next, Role, Tick},
-    ring::Config,
+    exec::{LocalExecutor, Next},
+    scoped,
     sim::SimOs,
 };
 
@@ -58,8 +58,8 @@ use crate::{
 
 /// A role as the DST scheduler sees it.
 ///
-/// [`LaneRole`] adapts a `racer_io` [`Lane`]. Other roles (crypto helpers,
-/// RDMA owners) implement this directly over their racer-io parts.
+/// [`Lane`] is the common case. Other roles (crypto helpers, RDMA owners)
+/// implement this directly over their racer-io parts.
 pub trait SimRole {
     /// One bounded nonblocking step (`racer_io::exec::Role::step`).
     fn step(&mut self) -> racer_io::Result<Next>;
@@ -73,24 +73,112 @@ pub trait SimRole {
     fn pending(&self) -> bool;
 }
 
-/// [`SimRole`] over a racer-io lane.
-pub struct LaneRole<T>(pub Lane<T>);
+/// The simulated world's scope: every operation is admitted, nothing cancels
+/// it, and no deadline is attached. A role ends because the world drops it or
+/// the lane's flag is set, not because its scope is canceled. The scope never
+/// reads a clock, so simulated runs stay deterministic.
+#[derive(Clone, Copy, Debug)]
+pub struct SimScope;
 
-impl<T: Tick> SimRole for LaneRole<T> {
-    fn step(&mut self) -> racer_io::Result<Next> {
-        self.0.step()
+impl Scope for SimScope {
+    type Error = racer_io::Error;
+
+    fn check(&self) -> racer_io::Result<()> {
+        Ok(())
     }
 
-    fn woken(&self) -> bool {
-        self.0.has_pending_wake()
-    }
-
-    fn pending(&self) -> bool {
-        self.0.has_pending_work()
+    fn polled_checks(&self) -> bool {
+        false
     }
 }
 
-/// A lane [`Tick`] that finishes when its flag is set.
+/// A scoped reactor over one simulated lane.
+pub type SimReactor = scoped::Reactor<SimScope>;
+
+/// A lane: one scoped reactor, one executor, and the flag that finishes it.
+///
+/// Each step reaps completions, checks in-flight scopes, and runs ready
+/// tasks, in that order. Roles never `park`: the simulated reactor's park
+/// would advance the shared clock on its own.
+pub struct Lane {
+    /// The lane reactor.
+    pub reactor: Rc<SimReactor>,
+
+    /// The lane executor.
+    pub executor: LocalExecutor,
+
+    /// Whether the lane finished.
+    pub done: DoneFlag,
+
+    /// CQEs reaped per step.
+    pub reap_budget: usize,
+
+    /// Tasks polled per step.
+    pub run_budget: usize,
+}
+
+impl Lane {
+    /// A lane over `reactor` that finishes when `done` is set, with default
+    /// budgets (256 each).
+    pub fn new(reactor: Rc<SimReactor>, done: DoneFlag) -> Self {
+        let executor = LocalExecutor::new(Some(
+            reactor
+                .wake_handle()
+                .expect("the lane reactor is initialized on construction"),
+        ));
+        Self {
+            reactor,
+            executor,
+            done,
+            reap_budget: 256,
+            run_budget: 256,
+        }
+    }
+
+    /// Whether a step could make progress without waiting: a task is ready,
+    /// a completion (or runnable simulated operation) is ready, or a
+    /// cross-thread wake is pending.
+    pub fn has_pending_wake(&self) -> bool {
+        self.executor.has_ready() || self.reactor.has_ready()
+    }
+
+    /// Whether the lane holds unfinished work: live tasks or operations
+    /// awaiting their completion fences.
+    pub fn has_pending_work(&self) -> bool {
+        !self.executor.is_empty() || self.reactor.in_flight() > 0
+    }
+}
+
+impl SimRole for Lane {
+    /// One lane turn: reap, check in-flight scopes, run ready tasks, then
+    /// report what comes next.
+    fn step(&mut self) -> racer_io::Result<Next> {
+        self.reactor.poll_budgeted(self.reap_budget)?;
+        self.executor.run_ready(self.run_budget);
+        if self.done.0.get() {
+            return Ok(Next::Done);
+        }
+        if self.executor.has_ready() || self.reactor.has_ready() {
+            return Ok(Next::Ready);
+        }
+        Ok(self
+            .reactor
+            .next_deadline()
+            .map_or(Next::Idle, Next::WaitUntil))
+    }
+
+    /// A ready task or a ready reactor completion.
+    fn woken(&self) -> bool {
+        self.has_pending_wake()
+    }
+
+    /// Live tasks or unfenced operations.
+    fn pending(&self) -> bool {
+        self.has_pending_work()
+    }
+}
+
+/// A flag that finishes a lane when it is set.
 #[derive(Clone, Debug, Default)]
 pub struct DoneFlag(pub Rc<Cell<bool>>);
 
@@ -98,12 +186,6 @@ impl DoneFlag {
     /// Mark the lane finished.
     pub fn set(&self) {
         self.0.set(true);
-    }
-}
-
-impl Tick for DoneFlag {
-    fn done(&self) -> bool {
-        self.0.get()
     }
 }
 
@@ -302,13 +384,13 @@ impl NodeEnv {
         }
     }
 
-    /// A reactor on this node's `Driver::Sim` with `entries` operations.
-    pub fn reactor(&self, stream: u64, entries: u32) -> racer_io::Result<Reactor> {
-        Reactor::new(
-            Driver::Sim(self.os.clone()),
-            Config::new(entries),
-            self.worker_ctx(stream),
-        )
+    /// A scoped reactor on this node's `Driver::Sim` with `entries`
+    /// operations.
+    pub fn reactor(&self, stream: u64, entries: u32) -> racer_io::Result<Rc<SimReactor>> {
+        let env = racer_io::Env::new(Driver::Sim(self.os.clone()), self.worker_ctx(stream));
+        let reactor = scoped::Reactor::new(entries as usize, &env);
+        reactor.init()?;
+        Ok(Rc::new(reactor))
     }
 }
 

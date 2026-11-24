@@ -1,9 +1,11 @@
 //! One local executor per lane, the lane loop, and the [`Role`] abstraction.
 //!
 //! [`LocalExecutor`] owns a slab of `!Send` tasks and a ready queue. Wakers
-//! push the task index; a wake from another thread also wakes the lane through
-//! its [`WakeHandle`] (an eventfd polled on the ring), so a parked lane has
-//! exactly one wait primitive and never polls on a fixed interval.
+//! push the task index: a wake on the executor's own thread appends to a
+//! thread-local queue without a lock, and a wake from another thread appends to
+//! a small shared queue and also wakes the lane through its [`WakeHandle`] (an
+//! eventfd polled on the ring), so a parked lane has exactly one wait primitive
+//! and never polls on a fixed interval.
 //!
 //! Every thread is a [`Role`]: [`Role::step`] does a bounded amount of
 //! nonblocking work and reports when it next needs to run. Production runs a
@@ -68,15 +70,78 @@ fn thread_token() -> u64 {
     TOKEN.with(|token| *token)
 }
 
+/// Unique identity of one executor, distinct on every construction.
+fn executor_key() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+// Ready ids pushed by wakers running on the executor's own thread, keyed by
+// executor because one thread can run several executors (the simulated world
+// steps every lane on one thread).
+thread_local! {
+    static LOCAL_READY: RefCell<VecDeque<(u64, u64)>> =
+        const { RefCell::new(VecDeque::new()) };
+}
+
 /// Ready queue shared with wakers.
 struct Shared {
-    /// FIFO so that a budgeted [`LocalExecutor::run_ready`] takes from the
-    /// front in O(taken) rather than shifting the remainder.
-    queue: Mutex<VecDeque<u64>>,
+    /// Ids woken from another thread. The owner pulls them after its local
+    /// queue, so a wake on the owner thread never takes this lock.
+    remote: Mutex<VecDeque<u64>>,
+
+    /// Identity of this executor in the thread-local ready queue.
+    key: u64,
 
     owner: u64,
 
     notify: Option<Arc<WakeHandle>>,
+}
+
+/// Queue `id` on the calling thread when it owns `shared`'s executor, and on
+/// the shared queue (notifying the lane) otherwise.
+fn enqueue(shared: &Shared, id: u64) {
+    if thread_token() == shared.owner {
+        LOCAL_READY.with(|queue| queue.borrow_mut().push_back((shared.key, id)));
+        return;
+    }
+    shared
+        .remote
+        .lock()
+        .expect("ready queue lock is never poisoned")
+        .push_back(id);
+    if let Some(notify) = &shared.notify {
+        notify.wake();
+    }
+}
+
+/// Move up to `limit` ids of executor `key` from this thread's queue into
+/// `batch`, in queue order, leaving other executors' ids queued.
+fn take_local(key: u64, batch: &mut Vec<u64>, limit: usize) {
+    LOCAL_READY.with(|queue| {
+        let mut queue = queue.borrow_mut();
+        // Rotate the deque once: pop the front, keep this executor's ids in
+        // `batch` and push every other executor's id back. Popping `remaining`
+        // times visits exactly the entries queued on entry and preserves the
+        // order of both the taken ids and the ones left behind.
+        let mut remaining = queue.len();
+        let mut taken = 0;
+        while remaining > 0 && taken < limit {
+            let (owner, id) = queue.pop_front().expect("local queue is not empty");
+            remaining -= 1;
+            if owner == key {
+                batch.push(id);
+                taken += 1;
+            } else {
+                queue.push_back((owner, id));
+            }
+        }
+    });
+}
+
+/// Whether executor `key` has a queued id on this thread.
+fn local_ready(key: u64) -> bool {
+    LOCAL_READY.with(|queue| queue.borrow().iter().any(|&(owner, _)| owner == key))
 }
 
 /// One task's waker.
@@ -99,16 +164,7 @@ impl Wake for TaskWaker {
         if self.queued.swap(true, Ordering::AcqRel) {
             return;
         }
-        self.shared
-            .queue
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push_back(self.id);
-        if thread_token() != self.shared.owner
-            && let Some(notify) = &self.shared.notify
-        {
-            notify.wake();
-        }
+        enqueue(&self.shared, self.id);
     }
 }
 
@@ -140,7 +196,8 @@ impl LocalExecutor {
     pub fn new(wake: Option<Arc<WakeHandle>>) -> Self {
         Self {
             shared: Arc::new(Shared {
-                queue: Mutex::new(VecDeque::new()),
+                remote: Mutex::new(VecDeque::new()),
+                key: executor_key(),
                 owner: thread_token(),
                 notify: wake,
             }),
@@ -202,11 +259,8 @@ impl LocalExecutor {
             queued: AtomicBool::new(true),
         }));
         self.live.set(self.live.get() + 1);
-        self.shared
-            .queue
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push_back(id);
+        // Spawning runs on the executor's thread, so this is a local push.
+        enqueue(&self.shared, id);
     }
 
     /// Live tasks.
@@ -221,22 +275,36 @@ impl LocalExecutor {
 
     /// Whether some task is queued to run.
     pub fn has_ready(&self) -> bool {
-        !self
-            .shared
-            .queue
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_empty()
+        local_ready(self.shared.key)
+            || !self
+                .shared
+                .remote
+                .lock()
+                .expect("ready queue lock is never poisoned")
+                .is_empty()
     }
 
     /// Poll up to `budget` queued tasks; returns how many were polled.
     pub fn run_ready(&self, budget: usize) -> usize {
         let mut batch = std::mem::take(&mut *self.batch.borrow_mut());
-        {
-            let mut queue = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
-            let take = queue.len().min(budget);
-            batch.extend(queue.drain(..take));
-        }
+        let mut remote = self
+            .shared
+            .remote
+            .lock()
+            .expect("ready queue lock is never poisoned");
+        // Local ids run first. While remote ids wait, the local queue takes at
+        // most half the budget, so a lane whose own tasks re-wake themselves on
+        // every poll cannot starve wakers on other threads (any budget of two
+        // or more polls at least one of them).
+        let local_budget = if remote.is_empty() {
+            budget
+        } else {
+            budget.div_ceil(2)
+        };
+        take_local(self.shared.key, &mut batch, local_budget);
+        let take = remote.len().min(budget.saturating_sub(batch.len()));
+        batch.extend(remote.drain(..take));
+        drop(remote);
         let mut polled = 0;
         for id in batch.drain(..) {
             let index = (id & 0xFFFF_FFFF) as usize;
@@ -347,102 +415,6 @@ impl<T> Future for JoinHandle<T> {
     }
 }
 
-/// Lane hooks called once per turn.
-pub trait Tick {
-    /// Periodic application work; returns when it next needs to run.
-    fn tick(&mut self, now: Instant) -> Option<Instant> {
-        let _ = now;
-        None
-    }
-
-    /// Whether the lane should exit.
-    fn done(&self) -> bool {
-        false
-    }
-}
-
-impl Tick for () {}
-
-/// An I/O lane: reactor, executor, and application tick, as a [`Role`].
-///
-/// Each step is `reap (budget) -> run ready tasks (budget) -> tick`; parking
-/// is one `submit_and_wait` bounded by the next deadline.
-pub struct Lane<T> {
-    /// The lane reactor.
-    pub reactor: Reactor,
-
-    /// The lane executor.
-    pub executor: LocalExecutor,
-
-    /// Application hooks.
-    pub tick: T,
-
-    /// CQEs reaped per step.
-    pub reap_budget: usize,
-
-    /// Tasks polled per step.
-    pub run_budget: usize,
-}
-
-impl<T: Tick> Lane<T> {
-    /// A lane over `reactor` with default budgets (256 each).
-    pub fn new(reactor: Reactor, tick: T) -> Self {
-        let executor = LocalExecutor::new(Some(reactor.wake_handle()));
-        Self {
-            reactor,
-            executor,
-            tick,
-            reap_budget: 256,
-            run_budget: 256,
-        }
-    }
-}
-
-impl<T> Lane<T> {
-    /// Whether a step could make progress without waiting: a task is ready,
-    /// a completion (or runnable simulated operation) is ready, or a
-    /// cross-thread wake is pending.
-    pub fn has_pending_wake(&self) -> bool {
-        self.executor.has_ready() || self.reactor.has_ready()
-    }
-
-    /// Whether the lane holds unfinished work: live tasks or operations
-    /// awaiting their completion fences.
-    pub fn has_pending_work(&self) -> bool {
-        !self.executor.is_empty() || self.reactor.in_flight() > 0
-    }
-}
-
-impl<T: Tick> Role for Lane<T> {
-    /// One lane turn.
-    fn step(&mut self) -> Result<Next> {
-        self.reactor.reap(self.reap_budget)?;
-        self.executor.run_ready(self.run_budget);
-        let now = self.reactor.now();
-        let tick = self.tick.tick(now);
-        if self.tick.done() {
-            return Ok(Next::Done);
-        }
-        if self.executor.has_ready() || self.reactor.has_ready() {
-            return Ok(Next::Ready);
-        }
-        let deadline = match (self.reactor.next_deadline(), tick) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
-        Ok(deadline.map_or(Next::Idle, Next::WaitUntil))
-    }
-
-    /// Submit and wait on the ring.
-    fn park(&mut self, next: Next) -> Result<()> {
-        match next {
-            Next::Ready | Next::Done => Ok(()),
-            Next::WaitUntil(until) => self.reactor.park(Some(until)),
-            Next::Idle => self.reactor.park(None),
-        }
-    }
-}
-
 /// Per-future readiness with a thread-safe wake path to the polling owner.
 pub struct Runnable {
     ready: AtomicBool,
@@ -527,36 +499,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lane_reports_pending_wake_and_work() {
-        let os = crate::sim::SimOs::new();
-        let clock = crate::ctx::VirtualClock::new();
-        let reactor = Reactor::new(
-            crate::Driver::Sim(os.clone()),
-            crate::ring::Config::new(8),
-            crate::WorkerCtx::simulated(&clock, 1, 1),
-        )
-        .unwrap();
-        let mut lane = Lane::new(reactor, ());
-        assert!(!lane.has_pending_wake() && !lane.has_pending_work());
-        let (_left, right) = os.socket_pair();
-        let recv = lane.reactor.recv(
-            std::rc::Rc::new(right),
-            vec![0; 4],
-            (),
-            &crate::OpCtx::none(),
-        );
-        lane.executor.spawn_detached(async move {
-            let _ = recv.await;
-        });
-        assert!(lane.has_pending_wake() && lane.has_pending_work());
-        while lane.step().unwrap() == Next::Ready {}
-        // The receive waits for a peer: work is pending, nothing wakes it.
-        assert!(!lane.has_pending_wake());
-        assert!(lane.has_pending_work());
-        assert_eq!(lane.reactor.in_flight(), 1);
-    }
-
-    #[test]
     fn tasks_run_once_per_wake_and_join() {
         let executor = LocalExecutor::new(None);
         let counter = Rc::new(Cell::new(0));
@@ -615,6 +557,151 @@ mod tests {
         .unwrap();
         assert!(executor.has_ready());
         executor.run_ready(16);
+        assert!(handle.is_finished());
+    }
+
+    /// A wake on the executor's own thread stays in the thread-local queue:
+    /// the shared queue and its lock are never touched.
+    #[test]
+    fn same_thread_wakes_use_the_local_queue() {
+        let executor = LocalExecutor::new(None);
+        let slot: Rc<RefCell<Option<Waker>>> = Rc::default();
+        let task_slot = slot.clone();
+        let handle = executor.spawn(std::future::poll_fn(move |cx| -> Poll<()> {
+            *task_slot.borrow_mut() = Some(cx.waker().clone());
+            Poll::Pending
+        }));
+        assert_eq!(executor.run_ready(16), 1);
+        let waker = slot.borrow_mut().take().unwrap();
+        waker.wake_by_ref();
+        assert!(
+            executor
+                .shared
+                .remote
+                .lock()
+                .expect("ready queue lock is never poisoned")
+                .is_empty()
+        );
+        assert!(executor.has_ready());
+        assert_eq!(executor.run_ready(16), 1);
+        assert!(!handle.is_finished());
+    }
+
+    /// Executors sharing a thread keep their queues apart: one neither sees nor
+    /// polls the other's local wakes.
+    #[test]
+    fn executors_on_one_thread_drain_only_their_own_wakes() {
+        let first = LocalExecutor::new(None);
+        let second = LocalExecutor::new(None);
+        let slot: Rc<RefCell<Option<Waker>>> = Rc::default();
+        let polls = Rc::new(Cell::new(0));
+        let (task_slot, task_polls) = (slot.clone(), polls.clone());
+        let handle = first.spawn(std::future::poll_fn(move |cx| -> Poll<()> {
+            task_polls.set(task_polls.get() + 1);
+            *task_slot.borrow_mut() = Some(cx.waker().clone());
+            Poll::Pending
+        }));
+        assert_eq!(first.run_ready(16), 1);
+        slot.borrow_mut().as_ref().unwrap().wake_by_ref();
+        assert!(!second.has_ready());
+        assert_eq!(second.run_ready(16), 0);
+        assert!(first.has_ready());
+        assert_eq!(first.run_ready(16), 1);
+        assert_eq!(polls.get(), 2);
+        assert!(!handle.is_finished());
+    }
+
+    /// A simulated reactor for the cross-thread wake handle; no kernel needed.
+    fn simulated_reactor() -> Reactor {
+        let os = crate::sim::SimOs::new();
+        let clock = crate::ctx::VirtualClock::new();
+        Reactor::new(
+            crate::ring::Driver::Sim(os),
+            crate::ring::Config::new(64),
+            crate::ctx::WorkerCtx::simulated(&clock, 1, 1),
+        )
+        .expect("simulated reactor")
+    }
+
+    /// A wake from another thread that lands after the local drain still
+    /// notifies the lane through its wake handle, so a lane about to park sees
+    /// it instead of sleeping through it.
+    #[test]
+    fn remote_wake_after_the_drain_notifies_the_lane() {
+        let reactor = simulated_reactor();
+        let executor = LocalExecutor::new(Some(reactor.wake_handle()));
+        let slot: Rc<RefCell<Option<Waker>>> = Rc::default();
+        let flag = Arc::new(AtomicBool::new(false));
+        let (task_slot, task_flag) = (slot.clone(), flag.clone());
+        let handle = executor.spawn(std::future::poll_fn(move |cx| {
+            if task_flag.load(Ordering::Acquire) {
+                Poll::Ready(())
+            } else {
+                *task_slot.borrow_mut() = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }));
+        assert_eq!(executor.run_ready(16), 1);
+        assert!(!executor.has_ready());
+        let waker = slot.borrow_mut().take().unwrap();
+        let remote = flag.clone();
+        std::thread::spawn(move || {
+            remote.store(true, Ordering::Release);
+            waker.wake();
+        })
+        .join()
+        .unwrap();
+        assert!(
+            !executor
+                .shared
+                .remote
+                .lock()
+                .expect("ready queue lock is never poisoned")
+                .is_empty()
+        );
+        assert!(executor.has_ready());
+        assert!(reactor.has_ready(), "the lane's wake handle is pending");
+        assert_eq!(executor.run_ready(16), 1);
+        assert!(handle.is_finished());
+    }
+
+    /// Remote ids share the turn budget with self-waking local tasks, so a
+    /// saturated local queue cannot hold them off forever.
+    #[test]
+    fn remote_wakes_are_polled_alongside_self_waking_local_tasks() {
+        let executor = LocalExecutor::new(None);
+        let local_polls = Rc::new(Cell::new(0));
+        for _ in 0..4 {
+            let local_polls = local_polls.clone();
+            executor.spawn_detached(std::future::poll_fn(move |cx| -> Poll<()> {
+                local_polls.set(local_polls.get() + 1);
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }));
+        }
+        let slot: Rc<RefCell<Option<Waker>>> = Rc::default();
+        let flag = Arc::new(AtomicBool::new(false));
+        let (task_slot, task_flag) = (slot.clone(), flag.clone());
+        let handle = executor.spawn(std::future::poll_fn(move |cx| {
+            if task_flag.load(Ordering::Acquire) {
+                Poll::Ready(())
+            } else {
+                *task_slot.borrow_mut() = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }));
+        // The first turn polls every task; the busy ones queue themselves again.
+        assert_eq!(executor.run_ready(8), 5);
+        let waker = slot.borrow_mut().take().unwrap();
+        let remote = flag.clone();
+        std::thread::spawn(move || {
+            remote.store(true, Ordering::Release);
+            waker.wake();
+        })
+        .join()
+        .unwrap();
+        // A two-poll turn serves one local id and the remote one.
+        assert_eq!(executor.run_ready(2), 2);
         assert!(handle.is_finished());
     }
 

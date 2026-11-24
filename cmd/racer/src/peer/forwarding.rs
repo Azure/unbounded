@@ -48,12 +48,7 @@ use crate::peer::protocol::Signatures;
 use crate::peer::protocol::SignedHead;
 use crate::peer::protocol::SignedRequest;
 use crate::peer::protocol::SignedResponse;
-use crate::peer::protocol::field;
-use crate::peer::protocol::node_field;
-use crate::peer::protocol::number;
 use crate::peer::protocol::push;
-use crate::peer::protocol::receiver;
-use crate::peer::protocol::signed_digest;
 use crate::topology::RouteBudget;
 use http1::MessageHead;
 use http1::StartLine;
@@ -178,8 +173,8 @@ pub struct RequestBinding {
 impl RequestBinding {
     pub(crate) fn retained_proof(&self, clock: &racer_io::Clock) -> Result<&SignedHead> {
         check_request_deadline(self, clock)?;
-        if field(&self.original.head, "racer-kind")? != "request"
-            || self.deadline > number(&self.original.head, "racer-route-deadline")?
+        if peer_wire::field(&self.original.head, "racer-kind")? != "request"
+            || self.deadline > peer_wire::number(&self.original.head, "racer-route-deadline")?
         {
             return Err(Error::Unauthorized);
         }
@@ -460,7 +455,7 @@ impl Forwarding {
         next: &NodeId,
     ) -> Result<(SignedRequest, RequestBinding)> {
         let route = RouteState::from_budget(&self.signatures.ctx().clock, &request.route)?;
-        if route.deadline <= protocol::millis(self.signatures.ctx().clock.wall_now())? {
+        if route.deadline <= peer_wire::millis(self.signatures.ctx().clock.wall_now())? {
             return Err(Error::DeadlineExceeded);
         }
         if route.visited != [self.signatures.node().clone()]
@@ -508,13 +503,13 @@ impl Forwarding {
             return Err(Error::HopBudgetExhausted);
         }
         let origin = self.signatures.verify_historical(&auth.original)?;
-        protocol::agrees(
+        peer_wire::agrees(
             &auth.original.head,
             &protocol::request_head(&self.signatures.ctx().clock, &request.request)?,
             true,
         )?;
         let mut route = RouteState::from_head(&auth.original.head)?;
-        if field(&auth.original.head, "racer-mode")? == "copy" && route.attempts != 0 {
+        if peer_wire::field(&auth.original.head, "racer-mode")? == "copy" && route.attempts != 0 {
             return Err(Error::Unauthorized);
         }
         if route.visited != [origin.node().clone()] {
@@ -524,7 +519,7 @@ impl Forwarding {
         let mut forwarders = Vec::new();
         for hop in &auth.hops {
             let peer = self.signatures.verify_historical(hop)?;
-            if peer.node() != &receiver(&previous.head)? {
+            if peer.node() != &peer_wire::receiver(&previous.head)? {
                 return Err(Error::Unauthorized);
             }
             let next = RouteState::from_head(&hop.head)?;
@@ -535,14 +530,16 @@ impl Forwarding {
             forwarders.push(peer);
         }
         if route != RouteState::from_budget(&self.signatures.ctx().clock, &request.request.route)?
-            || route.visited.contains(&receiver(&previous.head)?)
+            || route
+                .visited
+                .contains(&peer_wire::receiver(&previous.head)?)
         {
             return Err(Error::Unauthorized);
         }
-        if route.deadline <= protocol::millis(self.signatures.ctx().clock.wall_now())? {
+        if route.deadline <= peer_wire::millis(self.signatures.ctx().clock.wall_now())? {
             return Err(Error::DeadlineExceeded);
         }
-        if receiver(&previous.head)? != *self.signatures.node() {
+        if peer_wire::receiver(&previous.head)? != *self.signatures.node() {
             return Err(Error::Unauthorized);
         }
         let deadline = route.deadline;
@@ -567,8 +564,11 @@ impl Forwarding {
         if request.path.last() != Some(self.signatures.node()) || request.path.len() < 2 {
             return Err(Error::Unauthorized);
         }
-        let mut head =
-            protocol::response_head(&response, &signed_digest(&request.original)?, &request.path)?;
+        let mut head = protocol::response_head(
+            &response,
+            &peer_wire::signed_digest(&request.original)?,
+            &request.path,
+        )?;
         check_grant_deadline(&head, request)?;
         response_matches(&head, &request.original.head, &self.signatures.ctx().clock)?;
         response_authority(&head, &request.original.head, self.signatures.node())?;
@@ -615,13 +615,13 @@ impl Forwarding {
         envelope: &crate::model::PageEnvelope,
         request: &RequestBinding,
     ) -> Result<()> {
-        let path = protocol::decode_nodes(
-            field(&authentication.original.head, "racer-response-path")?.as_bytes(),
+        let path = peer_wire::decode_nodes(
+            peer_wire::field(&authentication.original.head, "racer-response-path")?.as_bytes(),
         )?;
         let expected = protocol::landed_response_head(
             metadata,
             envelope,
-            &signed_digest(&request.original)?,
+            &peer_wire::signed_digest(&request.original)?,
             &path,
         )?;
         self.verify_response_head(authentication, &expected, request)
@@ -632,8 +632,8 @@ impl Forwarding {
         response: &SignedResponse,
         request: &RequestBinding,
     ) -> Result<(VerifiedPeer, Vec<VerifiedPeer>)> {
-        let path = protocol::decode_nodes(
-            field(
+        let path = peer_wire::decode_nodes(
+            peer_wire::field(
                 &response.authentication.original.head,
                 "racer-response-path",
             )?
@@ -641,7 +641,7 @@ impl Forwarding {
         )?;
         let expected = protocol::response_head(
             &response.response,
-            &signed_digest(&request.original)?,
+            &peer_wire::signed_digest(&request.original)?,
             &path,
         )?;
         self.verify_response_head(&response.authentication, &expected, request)
@@ -656,9 +656,11 @@ impl Forwarding {
         // Extraction cannot change the verified response's delivery behavior.
         let provenance = (|| {
             let id = |name| -> Result<[u8; 16]> {
-                protocol::decode_binary(field(&request.original.head, name)?.as_bytes())?
-                    .try_into()
-                    .map_err(|_| Error::InvalidRequest)
+                peer_wire::decode_binary(
+                    peer_wire::field(&request.original.head, name)?.as_bytes(),
+                )?
+                .try_into()
+                .map_err(|_| Error::InvalidRequest)
             };
             Ok::<_, Error>(crate::telemetry::PeerProvenance {
                 request: crate::model::RequestId(id("racer-request")?),
@@ -713,19 +715,21 @@ impl Forwarding {
             return Err(Error::HopBudgetExhausted);
         }
         let origin = self.signatures.verify_historical(&auth.original)?;
-        let path =
-            protocol::decode_nodes(field(&auth.original.head, "racer-response-path")?.as_bytes())?;
+        let path = peer_wire::decode_nodes(
+            peer_wire::field(&auth.original.head, "racer-response-path")?.as_bytes(),
+        )?;
         if path.len() < 2
             || !path.starts_with(&request.path)
             || path.last() != Some(origin.node())
-            || path[1] != receiver(&request.original.head)?
+            || path[1] != peer_wire::receiver(&request.original.head)?
             || path.len() > RouteState::from_head(&request.original.head)?.links as usize + 1
         {
             return Err(Error::Unauthorized);
         }
-        protocol::agrees(&auth.original.head, expected, false)?;
-        if protocol::decode_binary(field(&auth.original.head, "racer-request-binding")?.as_bytes())?
-            != signed_digest(&request.original)?
+        peer_wire::agrees(&auth.original.head, expected, false)?;
+        if peer_wire::decode_binary(
+            peer_wire::field(&auth.original.head, "racer-request-binding")?.as_bytes(),
+        )? != peer_wire::signed_digest(&request.original)?
         {
             return Err(Error::Unauthorized);
         }
@@ -735,7 +739,7 @@ impl Forwarding {
             &self.signatures.ctx().clock,
         )?;
         response_authority(&auth.original.head, &request.original.head, origin.node())?;
-        if receiver(&auth.original.head)? != path[path.len() - 2] {
+        if peer_wire::receiver(&auth.original.head)? != path[path.len() - 2] {
             return Err(Error::Unauthorized);
         }
         let mut previous = auth.original.as_ref();
@@ -747,7 +751,7 @@ impl Forwarding {
                 .filter(|n| *n > 0)
                 .ok_or(Error::Unauthorized)?;
             let peer = self.signatures.verify_historical(hop)?;
-            if peer.node() != &path[index] || receiver(&hop.head)? != path[index - 1] {
+            if peer.node() != &path[index] || peer_wire::receiver(&hop.head)? != path[index - 1] {
                 return Err(Error::Unauthorized);
             }
             let expected = response_hop_head(
@@ -757,7 +761,7 @@ impl Forwarding {
                 &path,
                 index - 1,
             )?;
-            protocol::agrees(&hop.head, &expected, false)?;
+            peer_wire::agrees(&hop.head, &expected, false)?;
             previous = hop;
             forwarders.push(peer);
         }
@@ -768,7 +772,7 @@ impl Forwarding {
         if index + 1 != request.path.len() || request.path.last() != Some(self.signatures.node()) {
             return Err(Error::Unauthorized);
         }
-        if receiver(&previous.head)? != *self.signatures.node() {
+        if peer_wire::receiver(&previous.head)? != *self.signatures.node() {
             return Err(Error::Unauthorized);
         }
         Ok((origin, forwarders))
@@ -803,7 +807,7 @@ impl Forwarding {
         let old =
             RouteState::from_budget(&self.signatures.ctx().clock, &request.signed.request.route)?;
         let next = RouteState::from_budget(&self.signatures.ctx().clock, &budget)?;
-        if next.deadline <= protocol::millis(self.signatures.ctx().clock.wall_now())? {
+        if next.deadline <= peer_wire::millis(self.signatures.ctx().clock.wall_now())? {
             return Err(Error::DeadlineExceeded);
         }
         old.transition(&next, self.signatures.node())?;
@@ -840,8 +844,9 @@ impl Forwarding {
         previous_hop: &NodeId,
     ) -> Result<()> {
         check_request_deadline(binding, &self.signatures.ctx().clock)?;
-        let path =
-            protocol::decode_nodes(field(&auth.original.head, "racer-response-path")?.as_bytes())?;
+        let path = peer_wire::decode_nodes(
+            peer_wire::field(&auth.original.head, "racer-response-path")?.as_bytes(),
+        )?;
         let index = path
             .len()
             .checked_sub(auth.hops.len() + 2)
@@ -919,9 +924,9 @@ fn response_matches(
     request: &MessageHead,
     clock: &racer_io::Clock,
 ) -> Result<()> {
-    let outcome = field(response, "racer-outcome")?;
+    let outcome = peer_wire::field(response, "racer-outcome")?;
     if outcome == "selected" {
-        if field(request, "racer-operation")? != "subscribe" {
+        if peer_wire::field(request, "racer-operation")? != "subscribe" {
             return Err(Error::Unauthorized);
         }
         for name in [
@@ -931,37 +936,42 @@ fn response_matches(
             "racer-subscription",
             "racer-subscription-sequence",
         ] {
-            if field(response, name)? != field(request, name)? {
+            if peer_wire::field(response, name)? != peer_wire::field(request, name)? {
                 return Err(Error::Unauthorized);
             }
         }
-        let receivers = protocol::decode_nodes(field(request, "racer-route-visited")?.as_bytes())?;
-        if !crate::peer::protocol::demand(request)?.contains(number(response, "racer-page")?)
+        let receivers =
+            peer_wire::decode_nodes(peer_wire::field(request, "racer-route-visited")?.as_bytes())?;
+        if !crate::peer::protocol::demand(request)?
+            .contains(peer_wire::number(response, "racer-page")?)
             || !route::grant_membership_ok(
-                number(response, "racer-grant-membership")?,
-                number(request, "racer-route-membership")?,
+                peer_wire::number(response, "racer-grant-membership")?,
+                peer_wire::number(request, "racer-route-membership")?,
             )
-            || !route::grant_receiver_ok(&receivers, &node_field(response, "racer-grant-receiver")?)
+            || !route::grant_receiver_ok(
+                &receivers,
+                &peer_wire::node_field(response, "racer-grant-receiver")?,
+            )
             || !route::grant_deadline_ok(
-                number(response, "racer-grant-deadline")?,
-                number(request, "racer-route-deadline")?,
+                peer_wire::number(response, "racer-grant-deadline")?,
+                peer_wire::number(request, "racer-route-deadline")?,
                 // Read the clock only when the route bound holds, as before.
-                if number(response, "racer-grant-deadline")?
-                    > number(request, "racer-route-deadline")?
+                if peer_wire::number(response, "racer-grant-deadline")?
+                    > peer_wire::number(request, "racer-route-deadline")?
                 {
                     u64::MAX
                 } else {
-                    protocol::millis(clock.wall_now())?
+                    peer_wire::millis(clock.wall_now())?
                 },
             )
             || !route::page_budget_ok(
-                number(response, "racer-page-budget")?,
-                number(request, "racer-page-budget")?,
+                peer_wire::number(response, "racer-page-budget")?,
+                peer_wire::number(request, "racer-page-budget")?,
             )
             || !route::byte_budget_ok(
-                number(response, "racer-byte-budget")?,
-                number(response, "racer-ciphertext-length")?,
-                number(request, "racer-byte-budget")?,
+                peer_wire::number(response, "racer-byte-budget")?,
+                peer_wire::number(response, "racer-ciphertext-length")?,
+                peer_wire::number(request, "racer-byte-budget")?,
             )
         {
             return Err(Error::Unauthorized);
@@ -977,9 +987,9 @@ fn response_matches(
     }
     if outcome == "not-found"
         && !route::not_found_ok(
-            &field(request, "racer-operation")?,
-            &field(request, "racer-mode")?,
-            &field(request, "racer-selector")?,
+            &peer_wire::field(request, "racer-operation")?,
+            &peer_wire::field(request, "racer-mode")?,
+            &peer_wire::field(request, "racer-selector")?,
         )
     {
         return Err(Error::Unauthorized);
@@ -988,13 +998,16 @@ fn response_matches(
     if typed.is_prefetch() {
         // Results answer exactly the requested pages, in order, and a probe
         // reports only residency.
-        if field(request, "racer-operation")? != "prefetch" {
+        if peer_wire::field(request, "racer-operation")? != "prefetch" {
             return Err(Error::Unauthorized);
         }
-        let pages = protocol::decode_binary(field(request, "racer-prefetch-pages")?.as_bytes())?;
-        let results =
-            protocol::decode_binary(field(response, "racer-prefetch-results")?.as_bytes())?;
-        let probe = field(request, "racer-prefetch-action")? == "probe";
+        let pages = peer_wire::decode_binary(
+            peer_wire::field(request, "racer-prefetch-pages")?.as_bytes(),
+        )?;
+        let results = peer_wire::decode_binary(
+            peer_wire::field(response, "racer-prefetch-results")?.as_bytes(),
+        )?;
+        let probe = peer_wire::field(request, "racer-prefetch-action")? == "probe";
         let pages = racer_core::prefetch::decode_pages(&pages).ok_or(Error::Unauthorized)?;
         let results = racer_core::prefetch::decode_results(&results).ok_or(Error::Unauthorized)?;
         if !racer_core::prefetch::results_answer(&results, pages.len(), probe) {
@@ -1005,11 +1018,11 @@ fn response_matches(
     if !typed.echoes_operation() {
         return Ok(());
     }
-    if field(request, "racer-operation")? != outcome {
+    if peer_wire::field(request, "racer-operation")? != outcome {
         return Err(Error::Unauthorized);
     }
     for name in ["racer-cache", "racer-key"] {
-        if field(response, name)? != field(request, name)? {
+        if peer_wire::field(response, name)? != peer_wire::field(request, name)? {
             return Err(Error::Unauthorized);
         }
     }
@@ -1018,14 +1031,16 @@ fn response_matches(
     {
         return Err(Error::Unauthorized);
     }
-    if outcome == "page" && field(response, "racer-page")? != field(request, "racer-page")? {
+    if outcome == "page"
+        && peer_wire::field(response, "racer-page")? != peer_wire::field(request, "racer-page")?
+    {
         return Err(Error::Unauthorized);
     }
     if outcome == "bootstrap" {
-        let length = protocol::number(response, "racer-length")?;
-        let present = protocol::number(response, "racer-page-present")?;
+        let length = peer_wire::number(response, "racer-length")?;
+        let present = peer_wire::number(response, "racer-page-present")?;
         if !route::bootstrap_presence_ok(length, present)
-            || (present == 1 && protocol::number(response, "racer-page")? != 0)
+            || (present == 1 && peer_wire::number(response, "racer-page")? != 0)
         {
             return Err(Error::Unauthorized);
         }
@@ -1039,21 +1054,23 @@ fn response_authority(
     request: &MessageHead,
     signer: &NodeId,
 ) -> Result<()> {
-    let outcome = route::Outcome::from_wire(&field(response, "racer-outcome")?);
-    if outcome.asserts_success() && signer != &node_field(request, "racer-route-destination")? {
+    let outcome = route::Outcome::from_wire(&peer_wire::field(response, "racer-outcome")?);
+    if outcome.asserts_success()
+        && signer != &peer_wire::node_field(request, "racer-route-destination")?
+    {
         return Err(Error::Unauthorized);
     }
     Ok(())
 }
 fn check_request_deadline(request: &RequestBinding, clock: &racer_io::Clock) -> Result<()> {
-    if request.deadline <= protocol::millis(clock.wall_now())? {
+    if request.deadline <= peer_wire::millis(clock.wall_now())? {
         return Err(Error::DeadlineExceeded);
     }
     Ok(())
 }
 fn check_grant_deadline(head: &MessageHead, request: &RequestBinding) -> Result<()> {
-    if field(head, "racer-outcome")? == "selected"
-        && number(head, "racer-grant-deadline")? > request.deadline
+    if peer_wire::field(head, "racer-outcome")? == "selected"
+        && peer_wire::number(head, "racer-grant-deadline")? > request.deadline
     {
         return Err(Error::Unauthorized);
     }
@@ -1951,7 +1968,7 @@ mod tests {
         route.remaining_attempts = 4;
         let forwarded = f[1].append_request(first, &node(2), route).unwrap();
         assert_eq!(
-            number(
+            peer_wire::number(
                 &forwarded.authentication.original.head,
                 "racer-route-attempts"
             )
@@ -1959,7 +1976,7 @@ mod tests {
             7
         );
         assert_eq!(
-            number(
+            peer_wire::number(
                 &forwarded.authentication.hops[0].head,
                 "racer-route-attempts"
             )
@@ -1970,16 +1987,14 @@ mod tests {
         // Real wire framing and canonical logical decode retain the effective
         // balance independently of the immutable original signed ceiling.
         use crate::peer::protocol::SecurityCodec;
-        use crate::peer::protocol::decode_envelope;
-        use crate::peer::protocol::encode_envelope;
         let scope = forwarded.request.origin.scope().clone();
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         )));
         let codec =
             SecurityCodec::new(admission.clone(), crate::memory::BufferPool::new(admission));
-        let (auth, _) = decode_envelope(
-            encode_envelope(&forwarded.authentication, false, 0).unwrap(),
+        let (auth, _) = peer_wire::decode_envelope(
+            peer_wire::encode_envelope(&forwarded.authentication, false, 0).unwrap(),
             false,
             &peer_wire::test_util::AnyChain,
         )
@@ -2150,7 +2165,7 @@ mod tests {
     /// session fields fit `MAX_ENVELOPE_HEAD`.
     #[test]
     fn maximum_request_proof_and_nine_proof_envelope_fit_their_limits() {
-        use crate::peer::protocol::{MAX_ENVELOPE_HEAD, MAX_SIGNED_HEAD, encode_envelope};
+        use crate::peer::protocol::{MAX_ENVELOPE_HEAD, MAX_SIGNED_HEAD};
         let env = racer_io::Env::host();
         let signatures = network(&env, 2);
         let forwarding = Forwarding::new(signatures[0].clone());
@@ -2192,7 +2207,7 @@ mod tests {
                 .map(|_| crate::test_support::security::clone_head(original))
                 .collect(),
         };
-        let mut head = encode_envelope(&auth, false, 0).unwrap();
+        let mut head = peer_wire::encode_envelope(&auth, false, 0).unwrap();
         head.headers
             .retain(|h| !h.name.eq_ignore_ascii_case("racer-proof-signers"));
         push(&mut head, "racer-receiver", &node(1).0);
@@ -2215,8 +2230,6 @@ mod tests {
     fn prefetch_actions_round_trip_and_bind_their_results() {
         use crate::peer::protocol::PrefetchAction;
         use crate::peer::protocol::SecurityCodec;
-        use crate::peer::protocol::decode_envelope;
-        use crate::peer::protocol::encode_envelope;
         use racer_core::prefetch::{FailCode, PageResult};
         let env = racer_io::Env::host();
         let signatures = network(&env, 2);
@@ -2268,8 +2281,8 @@ mod tests {
                 .sign_request_to(prefetch_request(&env, id, action.clone()), &node(1))
                 .unwrap();
             let scope = signed.request.origin.scope().clone();
-            let (auth, _) = decode_envelope(
-                encode_envelope(&signed.authentication, false, 0).unwrap(),
+            let (auth, _) = peer_wire::decode_envelope(
+                peer_wire::encode_envelope(&signed.authentication, false, 0).unwrap(),
                 false,
                 &peer_wire::test_util::AnyChain,
             )
@@ -2585,7 +2598,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            field(&response.authentication.original.head, "content-range").unwrap(),
+            peer_wire::field(&response.authentication.original.head, "content-range").unwrap(),
             "bytes 0-6/7"
         );
         for change in 0..7 {
@@ -2721,7 +2734,7 @@ mod tests {
             };
             let mut head = protocol::response_head(
                 &response,
-                &signed_digest(&binding.original).unwrap(),
+                &peer_wire::signed_digest(&binding.original).unwrap(),
                 &[node(0), node(2)],
             )
             .unwrap();
@@ -2898,7 +2911,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            protocol::field(
+            peer_wire::field(
                 &signed.authentication.original.head,
                 "racer-metadata-version"
             )
@@ -2906,7 +2919,7 @@ mod tests {
             "1"
         );
         assert_eq!(
-            protocol::field(&signed.authentication.original.head, "content-length").unwrap(),
+            peer_wire::field(&signed.authentication.original.head, "content-length").unwrap(),
             "0"
         );
         if let PeerResponse::Metadata(metadata) = &mut signed.response {
@@ -2959,7 +2972,7 @@ mod tests {
         let response = PeerResponse::Metadata(metadata);
         let mut head = protocol::response_head(
             &response,
-            &signed_digest(&binding.original).unwrap(),
+            &peer_wire::signed_digest(&binding.original).unwrap(),
             &[node(0), node(1)],
         )
         .unwrap();

@@ -217,31 +217,9 @@ other container with `403`.
 
 If the spec is not valid, the operator reports `OriginInvalid`.
 
-#### Upgrading from per-cache origin DaemonSets
-
-Earlier versions ran a `racer-origin-<cache>` DaemonSet and ServiceAccount per
-cache. The operator deletes them on upgrade, and the `racer` dataplane pod
-reads the origin instead. Do these steps before you upgrade:
-
-- **`workloadIdentity` caches.** The old federated credential trusts
-  `system:serviceaccount:<Racer namespace>:racer-origin-<cache>`. That does not
-  cover the new token, so reads fail until the identity also trusts the `racer`
-  ServiceAccount. Add a federated credential to each identity with your cluster's
-  OIDC issuer, subject `system:serviceaccount:<Racer namespace>:racer`, and
-  audience `api://AzureADTokenExchange`. See
-  [Private Containers]({{< relref "guides/azure-blob-cache" >}}#private-containers)
-  for an `az` example. Remove the old `racer-origin-<cache>` credentials after
-  the rollout.
-- **`default` caches.** The dataplane gets tokens from IMDS on its own node. Attach
-  the identity to every Racer node.
-- **`default.secretRef` caches.** This field is no longer supported, and the API
-  rejects new uses of it. Racer cannot read the
-  Secret. If the authority service still sees the field, it rejects the
-  whole catalog and keeps the last published one, so no cache changes take
-  effect. Before you upgrade, change the cache's `credential` to
-  `workloadIdentity` or `default` with an identity attached to the nodes. You
-  can edit `credential` in place; only `containerURL` is immutable. Then delete
-  the Secret if nothing else uses it.
+`default.secretRef` is no longer supported, and the API rejects new uses of
+it. Use `workloadIdentity` or `default` with an identity attached to the nodes.
+`credential` can be edited in place; only `containerURL` is immutable.
 
 ## Node requirements
 
@@ -275,13 +253,12 @@ UID/GID 65532 with mode `0700`, and repairs its owner and mode on every cache
 setup. Origins do not create this directory: mount it with hostPath type
 `Directory`, so origin pods wait until the dataplane has created it. The origin
 creates its socket with mode `0600`; the privileged dataplane can still connect.
-When the dataplane takes over a directory left by an older root origin, it
-re-owns that origin's leftover lock, socket, and staging entries to UID/GID 65532
-instead of deleting them, so the new origin can recover them. Run exactly one origin owner per cache on every
-eligible node that can supply origin reads, not only on nodes that read. A
-DaemonSet with the same placement and tolerations as Racer does this. Every
-origin must return the same bytes for the same key and version. Never delete a
-live socket to take over from another owner.
+The dataplane does not adopt entries left by an older root origin. Run exactly
+one origin owner per cache on every eligible node that can supply origin reads,
+not only on nodes that read. A DaemonSet with the same placement and
+tolerations as Racer does this. Every origin must return the same bytes for the
+same key and version. Never delete a live socket to take over from another
+owner.
 
 ## Node labels and annotations
 
@@ -453,7 +430,6 @@ each worker and are never divided.
 | --- | --- | --- | --- | --- |
 | `RACER_PEER_LISTEN` | `0.0.0.0:7443` | Node | `ip:port` | Peer listener. A bracketed IPv4 address, as Kubernetes expands `[$(POD_IP)]`, is accepted. Its port is the peer port published to members. |
 | `RACER_DIAGNOSTICS_LISTEN` | `127.0.0.1:9090` | Node | `ip:port` | Diagnostics listener; must differ from the peer listener. |
-| `RACER_PEER_TCP_NODELAY` | `true` | Node | `true`, `false` | TCP_NODELAY on peer sockets. `false` only reproduces the old socket behavior. |
 | `RACER_OPAQUE_RELAY` | `false` | Node | `true`, `false` | Experimental opaque HTTP transit instead of materialized relay. |
 | `RACER_PEER_INFLIGHT_MAX` | `4096` | Node | 1..65,536 | Peer exchanges in flight. |
 | `RACER_PEER_PER_NEIGHBOR_MAX` | `512` | Node | 1..65,536 | Peer exchanges in flight to one neighbor; at most `RACER_PEER_INFLIGHT_MAX`. |
@@ -523,7 +499,6 @@ each worker and are never divided.
 | `RACER_WEBHOOK_LISTEN` | `:9443` | Node | `ip:port` | Object sidecar admission webhook listener. `:port` binds every IPv4 address. |
 | `RACER_OBJECT_IMAGE` | Unset: webhook serving off | Node | image reference | Image injected as the object sidecar. |
 | `RACER_RETAINED_PAGE_KEYS` | `7` | Node | 1..16 | Readable page keys per cache: the active key plus older decrypt keys. Read by the authority. Lowering it never drops keys at once: extra decrypt keys are dropped at the next key rotation. |
-| `RACER_PAGE_BYTES` | `16777216` (16 MiB) | Node | 16,777,216..16,777,216 bytes | Cluster-wide logical page size. Only 16777216 (16 MiB) is accepted: the client SDKs and the disk index do not yet support other sizes. Fixed at cluster creation: the authority publishes the value of the primary that made the first publication, records it in the `racer-state` Secret, and ignores later changes with a warning in the primary's log. Running nodes reject a publication that changes it. |
 | `RACER_KUBE_API_CA` | `/var/run/secrets/kubernetes.io/serviceaccount/ca.crt` | Node | absolute path | Kubernetes API CA bundle. |
 | `RACER_KUBE_API_TOKEN` | `/var/run/secrets/kubernetes.io/serviceaccount/token` | Node | absolute path | Default-audience token, used only for the Kubernetes API. |
 | `RACER_DAEMONSET` | `racer` | Node | DNS label | Dataplane DaemonSet name. |
@@ -1133,8 +1108,7 @@ Out-of-range values fail startup.
 
 The prefetch limits are listed under [environment variables](#environment-variables).
 
-The old `RACER_WARM_*` settings never had an effect. The operator removes them
-from `racer-settings` on upgrade.
+The old `RACER_WARM_*` settings never had an effect.
 
 #### Prefetch metrics
 
@@ -1457,14 +1431,6 @@ The operator still checks the admission guards. If they drift or disappear, it
 revokes dataplane permissions and repairs the guards. It restores permissions
 only when a cache exists again.
 
-Earlier releases named these objects `racer-dataplane`, with ConfigMap
-`racer-dataplane-config`. On upgrade the operator seeds `racer-settings` from
-`racer-dataplane-config`, renaming `RACER_DATAPLANE_NVIDIA` to `RACER_NVIDIA`.
-Once the new DaemonSet is applied, it deletes the old objects it created: the
-DaemonSet, ServiceAccount, RBAC, and ConfigMap first, then the old admission
-policies. Old and new Pods may run side by side briefly. It leaves alone any
-old-named object it did not create.
-
 | Setting in `racer-settings` | Default | Purpose |
 |------------------------------------|---------|---------|
 | `RACER_CONTROL_SEATS` | `auto` | Choose the number of control seats automatically, or request 1 to 16 |
@@ -1755,32 +1721,8 @@ credentials, and node identity state. Do not delete them to force a fresh start.
 Cached bytes are disposable; this installation state is not. Deleting and
 recreating a ClusterCache creates a new cache identity, even with the same name.
 
-The move from `racer-controller` to elected dataplane seats is a cold-cache alpha
-upgrade. Quiesce traffic and let the operator retire the old authority before
-the new one starts. Do not run old and new controllers together. Checkpoint
-recovery rejects the previous format and a different cluster ID rather than
-restoring entries under unrelated keys. Origins must remain available while
-caches refill. Never clear raw-device guards or unrelated host files as part of
-this upgrade.
-
-The operator refuses migration if the old `racer-config` requests a non-default
-peer port, a diagnostics port, host networking, a pod-network node split, or a
-non-default `RACER_NVIDIA`. Managed ports are now fixed at 8082 and
-9090. Review and remove these old settings before migration; use a DaemonSet
-override for host networking and set `RACER_NVIDIA` in
-`racer-config`. The operator does
-not silently discard them or stop the old controller first.
-
 The operator writes `racer-settings` only when it is absent, so upgrades keep
-existing values. It rewrites retired keys in place: a renamed key, such as
-`RACER_SLAB_BYTES`, moves to its replacement, such as
-`RACER_SLAB_BYTES_PER_WORKER`, with the same value, because the old budget keys
-were already per-worker amounts. If the replacement is already set to a
-different value, the operator reports the conflict and keeps the current
-DaemonSet until you remove one of them. It removes the `RACER_WARM_*` keys and
-reports `RACER_PEER_PORT`, which you replace with the port of
-`RACER_PEER_LISTEN`. The DaemonSet rolls only after the rewritten ConfigMap is
-saved.
+existing values.
 
 New installs seed `RACER_SEGMENT_BYTES` at 1 GiB and
 `RACER_SLAB_BYTES_PER_WORKER` at 4 GiB; earlier releases seeded 64 MiB and
@@ -2446,9 +2388,10 @@ name when sysfs reports no PCI address, so a device renamed by a VF hot-unplug/r
 example `mana_0` becoming `roceP30832p0s0`) keeps its rail. Missing ports retain their rails
 until a new port appears; the new port then takes the lowest rail whose port is missing, so
 a replaced device reuses its predecessor's rail. Ports with no reservation append. The
-journal is versioned; a legacy unversioned journal, which was keyed by device name, is
-discarded on start and rails are renumbered in PCI BDF/port order. Do not delete it
-independently of coordinated topology changes. Corruption fails enrollment instead of renumbering rails.
+journal is versioned. A journal in any other format, including the legacy
+unversioned form keyed by device name, is corrupt: the dataplane fails
+enrollment instead of discarding it and renumbering rails. Do not delete it
+independently of coordinated topology changes.
 
 Dataplanes run privileged as root with escalation allowed and a read-only root filesystem.
 HostPaths `/var/lib/racer/identity`, `/var/lib/racer/slabs`, and `/run/racer` are writable;

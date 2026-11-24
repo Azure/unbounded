@@ -12,8 +12,8 @@ test-util = []
 
 [dependencies]
 base64 = "0.22"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde.workspace = true
+serde_json.workspace = true
 racer-wire = { path = "../wire" }
 getrandom = "0.2"
 rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
@@ -33,8 +33,8 @@ cipher = { version = "0.5", features = ["zeroize"] }
 # chacha20poly1305/zeroize does not forward Poly1305 state wiping.
 poly1305 = { version = "0.9", features = ["zeroize"] }
 ed25519-dalek = { version = "2", features = ["pkcs8"] }
-sha2 = { version = "0.10", features = ["asm"] }
-zeroize = "1"
+sha2.workspace = true
+zeroize.workspace = true
 # Tag-only page verification (GHASH without decrypting).
 ghash = { version = "0.6", features = ["zeroize"] }
 
@@ -43,7 +43,7 @@ ghash = { version = "0.6", features = ["zeroize"] }
 # Previous page AEAD backend, kept as an interoperability oracle.
 ring = "0.17"
 xaes-256-gcm = { version = "0.1", default-features = false, features = ["zeroize"] }
-futures = "0.3"
+futures.workspace = true
 # NUMA binding and the production non-temporal copy for the fused_numa bench.
-libc = "0.2"
+libc.workspace = true
 page-alloc = { path = "../alloc" }

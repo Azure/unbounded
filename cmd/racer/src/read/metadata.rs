@@ -507,17 +507,10 @@ impl MetadataService {
                     return Err(Error::Unavailable);
                 }
                 let driver_permit = self.candidates.drivers().reserve().map_err(Error::from)?;
-                let mut nonce = [0; 16];
-                self.candidates
-                    .ctx()
-                    .rng
-                    .fill(&mut nonce)
-                    .map_err(|_| Error::Unavailable)?;
-                let attempt = crate::model::AttemptId(nonce);
-                let sealed = self.credentials.seal(context, attempt, scope)?;
-                let owned_context =
-                    self.credentials
-                        .open_charged(sealed, scope.request, attempt)?;
+                // The refresh driver runs in this process, so it gets an owned
+                // charged context directly instead of sealing one and opening
+                // it again on the same worker.
+                let owned_context = self.credentials.local_context(context, scope)?;
                 let service = self.clone();
                 let driver_registration = registration.clone();
                 // Detaching one refresh must not cancel the shared peer

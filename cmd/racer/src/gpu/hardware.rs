@@ -113,10 +113,14 @@ pub(crate) fn rig_with(test: &str, options: GpuOptions) -> Option<Rig> {
         skip(test, why);
         return None;
     }
-    let helper =
-        GpuHelper::start_with_options(GpuMode::Required, options, Box::new(racer_gpu::Gpu::load))
-            .expect("the helper starts on a usable GPU")
-            .expect("required mode starts the helper");
+    let helper = GpuHelper::start_built(
+        GpuMode::Required,
+        true,
+        options,
+        Box::new(racer_gpu::Gpu::load),
+    )
+    .expect("the helper starts on a usable GPU")
+    .expect("required mode starts the helper");
     let device = helper.devices()[0].clone();
     assert!(
         helper.decrypts(device.ordinal),
@@ -283,7 +287,7 @@ fn counter(value: &AtomicU64) -> u64 {
 
 /// Requests the executors still hold an import for.
 fn imported(helper: &GpuHelper) -> usize {
-    helper.owners.lock().unwrap().len()
+    helper.imported_requests()
 }
 
 /// No request holds anything: no import, open sink, queued page or leak.

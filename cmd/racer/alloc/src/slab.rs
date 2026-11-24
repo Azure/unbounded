@@ -5,9 +5,10 @@
 //! still fail with ENOSPC. Recycling never truncates or erases disk bytes.
 //! Parent directories must be trusted against hostile rename and unlink, even
 //! though descriptor-relative traversal rejects symlinks and parent components.
+use crate::buf::{Buf, IdleLimit, Pool, PoolConfig};
 use crate::segments::TableIdentity;
 use crate::{
-    AlignedBuffer, Alignment, Charge, Error, Extent, Result, SegmentGeometry, SegmentLease,
+    Alignment, Charge, Error, Extent, PoolStats, Pressure, Result, SegmentGeometry, SegmentLease,
     Segments,
 };
 use racer_io::ring::SharedWriteBuffer;
@@ -73,7 +74,12 @@ pub struct Slab<C: Charge> {
 
     writes: Rc<WriteState>,
 
-    idle_buffer: Rc<crate::StagingPool<C>>,
+    /// Idle write-staging storage for callers that use [`Self::allocate`].
+    /// The store writer stages through its worker's shared pool instead.
+    staging: RefCell<Option<Pool>>,
+
+    /// The charge type [`Self::allocate`] accepts.
+    _charge: std::marker::PhantomData<C>,
 }
 
 impl<C: Charge> Slab<C> {
@@ -93,7 +99,8 @@ impl<C: Charge> Slab<C> {
             sim: RefCell::new(None),
             opened: RefCell::new(None),
             writes: Rc::new(WriteState::default()),
-            idle_buffer: Rc::new(crate::StagingPool::default()),
+            staging: RefCell::new(None),
+            _charge: std::marker::PhantomData,
         }
     }
 
@@ -243,13 +250,22 @@ impl<C: Charge> Slab<C> {
 
     /// Accounted backing capacity in the bounded idle free lists.
     pub fn idle_bytes(&self) -> usize {
-        self.idle_buffer.borrow().bytes()
+        self.staging.borrow().as_ref().map_or(0, Pool::idle_bytes)
     }
 
     /// Release only idle memory, returning its size without touching live I/O.
     pub fn reclaim_idle(&self) -> usize {
-        let idle = self.idle_buffer.borrow_mut().take_all();
-        idle.iter().map(|b| b.allocation().layout.size()).sum()
+        let Ok(mut staging) = self.staging.try_borrow_mut() else {
+            return 0;
+        };
+        let Some(pool) = staging.as_mut() else {
+            return 0;
+        };
+        // Cool warm storage, then unmap the cooled mappings now that the
+        // caller asked to release everything.
+        let released = pool.shed(usize::MAX);
+        pool.clear();
+        released
     }
 
     /// Run demand maintenance at `now`, freeing whole idle entries the
@@ -257,24 +273,29 @@ impl<C: Charge> Slab<C> {
     /// pressure. Without pressure an entry stays while freeing it would leave
     /// less than the target. Returns released bytes.
     pub fn maintain_idle(&self, now: std::time::Instant) -> usize {
-        let Ok(mut pool) = self.idle_buffer.try_borrow_mut() else {
+        let Ok(mut staging) = self.staging.try_borrow_mut() else {
             return 0;
         };
-        let released = pool.maintain(now);
-        drop(pool);
-        released.iter().map(|b| b.allocation().layout.size()).sum()
+        staging.as_mut().map_or(0, |pool| pool.maintain(now))
     }
 
     /// Apply memory pressure to the idle pool. Elevated pressure keeps only
     /// what the controller still targets, critical pressure keeps no returns,
     /// and maintenance releases the rest, or all idle entries when critical.
-    pub fn set_idle_pressure(&self, pressure: crate::Pressure) {
-        self.idle_buffer.borrow_mut().set_pressure(pressure);
+    pub fn set_idle_pressure(&self, pressure: Pressure) {
+        if let Ok(mut staging) = self.staging.try_borrow_mut()
+            && let Some(pool) = staging.as_mut()
+        {
+            pool.set_pressure(pressure);
+        }
     }
 
     /// Current idle pool size, target, and cumulative counters.
-    pub fn idle_pool_stats(&self) -> crate::PoolStats {
-        self.idle_buffer.borrow().stats()
+    pub fn idle_pool_stats(&self) -> PoolStats {
+        self.staging
+            .borrow()
+            .as_ref()
+            .map_or_else(PoolStats::default, Pool::stats)
     }
 
     /// Wait for accepted writes to release their runtime completion fences.
@@ -554,10 +575,10 @@ impl<C: Charge> Slab<C> {
     }
 
     /// Borrow-check a request before moving its resources into a submission.
-    fn submission(
+    fn submission<D: Charge>(
         &self,
         extent: Extent,
-        buffer: &AlignedBuffer<C>,
+        buffer: &Buf<D>,
         lease: &SegmentLease,
     ) -> Result<(Rc<Descriptor>, Extent)> {
         self.locate_checked(extent, lease, |alignment, extent| {
@@ -646,12 +667,12 @@ impl<C: Charge> Slab<C> {
     }
 
     /// Consume a checked request so its descriptor, buffer, and lease travel together.
-    fn prepare(
+    fn prepare<D: Charge>(
         &self,
         extent: Extent,
-        buffer: AlignedBuffer<C>,
+        buffer: Buf<D>,
         lease: SegmentLease,
-    ) -> Result<Submission<C>> {
+    ) -> Result<Submission<D>> {
         let (file, extent) = self.submission(extent, &buffer, &lease)?;
         Ok(Submission {
             file,
@@ -661,20 +682,23 @@ impl<C: Charge> Slab<C> {
         })
     }
 
-    /// Read exactly one checked extent, retaining its buffer and lease until completion.
-    /// Dropping the waiting future does not release kernel-owned resources.
-    /// Neither a lease nor a successful read proves initialization in this
-    /// generation. Append only reserves space; recycled bytes may come from an
-    /// earlier generation or a different cache. Before exposing a valid record,
-    /// the caller must check its integrity, authentication, and cache identity.
-    pub fn read<'a, S: Scope>(
+    /// Read exactly one checked extent into a pooled [`crate::buf::Buf`].
+    ///
+    /// The buffer and lease stay with the kernel until completion, and the
+    /// bytes prove nothing until the caller validates them. The buffer's length
+    /// must equal the extent length and its first byte must meet the slab's
+    /// memory alignment. Dropping the returned buffer returns its storage to
+    /// the owning pool. Neither a lease nor a successful read proves
+    /// initialization in this generation: before exposing a valid record, the
+    /// caller must check its integrity, authentication, and cache identity.
+    pub fn read_buf<'a, D: Charge, S: Scope>(
         &'a self,
         reactor: &'a Reactor<S>,
         extent: Extent,
-        buffer: AlignedBuffer<C>,
+        buffer: Buf<D>,
         lease: SegmentLease,
         scope: &'a S,
-    ) -> Operation<'a, AlignedBuffer<C>, S::Error>
+    ) -> Operation<'a, Buf<D>, S::Error>
     where
         S::Error: From<Error>,
     {
@@ -685,59 +709,20 @@ impl<C: Charge> Slab<C> {
         })
     }
 
-    /// Read exactly one checked extent into a pooled [`crate::buf::Buf`].
-    ///
-    /// Ownership rules match [`Self::read`]: the buffer and lease stay with the
-    /// kernel until completion, and the bytes prove nothing until the caller
-    /// validates them. The buffer's length must equal the extent length and its
-    /// first byte must meet the slab's memory alignment. Unlike [`Self::read`],
-    /// dropping the returned buffer returns its storage to the owning pool.
-    pub fn read_buf<'a, D: Charge, S: Scope>(
-        &'a self,
-        reactor: &'a Reactor<S>,
-        extent: Extent,
-        buffer: crate::buf::Buf<D>,
-        lease: SegmentLease,
-        scope: &'a S,
-    ) -> Operation<'a, crate::buf::Buf<D>, S::Error>
-    where
-        S::Error: From<Error>,
-    {
-        Box::pin(async move {
-            let (file, extent) = self.locate_checked(extent, &lease, |alignment, extent| {
-                if !(buffer.as_ptr() as usize).is_multiple_of(alignment.memory())
-                    || !extent.offset().is_multiple_of(alignment.offset())
-                    || !extent.length().is_multiple_of(alignment.length())
-                    || buffer.len() != extent.length()
-                {
-                    return Err(Error::InvalidConfiguration);
-                }
-                Ok(())
-            })?;
-            let completion = reactor
-                .read_at(file, extent.offset(), buffer, lease, scope)
-                .await?;
-            if completion.bytes != extent.length() {
-                return Err(Error::Io.into());
-            }
-            Ok(completion.buffer)
-        })
-    }
-
     /// Write exactly one checked extent with completion-owned accounting and lease.
     /// Failed writes do not roll back the space reserved by append.
     /// Any lease permits writes within its captured prefix, including a lease from
     /// [`Segments::lease`]; it does not grant exclusive record ownership. The trusted
     /// caller must write only reserved extents it owns, never overwrite published or
     /// readable records, and publish a mapping only after the write succeeds.
-    pub fn write<'a, S: Scope>(
+    pub fn write<'a, D: Charge, S: Scope>(
         &'a self,
         reactor: &'a Reactor<S>,
         extent: Extent,
-        buffer: AlignedBuffer<C>,
+        buffer: Buf<D>,
         lease: SegmentLease,
         scope: &'a S,
-    ) -> Operation<'a, AlignedBuffer<C>, S::Error>
+    ) -> Operation<'a, Buf<D>, S::Error>
     where
         S::Error: From<Error>,
     {
@@ -756,22 +741,22 @@ impl<C: Charge> Slab<C> {
     /// sum to the extent length. Fencing, lease ownership, and the caller
     /// obligations match [`Self::write`]. A short or failed completion is an
     /// error and drops both owners after completion; success returns them.
-    pub fn write_vectored<'a, S: Scope, T: SharedWriteBuffer>(
+    pub fn write_vectored<'a, D: Charge, S: Scope, T: SharedWriteBuffer>(
         &'a self,
         reactor: &'a Reactor<S>,
         extent: Extent,
-        header: AlignedBuffer<C>,
+        header: Buf<D>,
         body: T,
         lease: SegmentLease,
         scope: &'a S,
-    ) -> Operation<'a, (AlignedBuffer<C>, T), S::Error>
+    ) -> Operation<'a, (Buf<D>, T), S::Error>
     where
         S::Error: From<Error>,
     {
         Box::pin(async move {
             let (file, extent) = {
                 let body = body.write_bytes()?;
-                let header = header.as_slice();
+                let header: &[u8] = &header;
                 self.locate_checked(extent, &lease, |alignment, extent| {
                     check_vectored(alignment, extent, header, body)
                 })?
@@ -787,8 +772,13 @@ impl<C: Charge> Slab<C> {
         })
     }
 
-    /// Reuse charged capacity in the same size class without discarding mismatches.
-    pub fn allocate(&self, length: usize, charge: C) -> Result<AlignedBuffer<C>> {
+    /// Check out pooled staging storage for exactly `length` bytes.
+    ///
+    /// This is a convenience for callers that own no worker pool. The store
+    /// writer takes its write staging from the worker's shared [`crate::buf::Pool`]
+    /// instead. A returned buffer is charged to the pool's idle budget; the
+    /// caller's charge covers the pooled capacity and is released on return.
+    pub fn allocate(&self, length: usize, charge: C) -> Result<Buf<C>> {
         let alignment = self.alignment()?;
         if length == 0
             || length > Alignment::MAX_TRANSFER_LENGTH
@@ -797,23 +787,21 @@ impl<C: Charge> Slab<C> {
         {
             return Err(Error::InvalidConfiguration);
         }
-        let idle = self.idle_buffer.borrow_mut().take_for(length, &charge);
-        if let Some(mut buffer) = idle {
-            buffer.rebind(charge)?;
-            buffer.length = length;
-            return Ok(buffer.pooled(&self.idle_buffer));
+        let wipe = charge.requires_wipe();
+        let mut staging = self.staging.borrow_mut();
+        if staging.is_none() {
+            *staging = Some(Pool::new(
+                PoolConfig {
+                    alignment: alignment.memory(),
+                    max_idle_per_class: usize::MAX,
+                },
+                IdleLimit::new(128 * 1024 * 1024),
+            )?);
         }
-        let capacity = crate::buffer_capacity(length)
-            .filter(|&n| {
-                length >= crate::HUGE_PAGE_BYTES
-                    && n <= Alignment::MAX_TRANSFER_LENGTH
-                    && n.is_multiple_of(alignment.length())
-                    && charge.covers(n)
-            })
-            .unwrap_or(length);
-        let mut buffer = alignment.allocate(capacity, charge)?;
-        buffer.length = length;
-        Ok(buffer.pooled(&self.idle_buffer))
+        staging
+            .as_mut()
+            .expect("staging pool")
+            .take(length, charge, wipe)
     }
 
     /// Replace file-mode backing for fault tests; device mode is rejected.
@@ -878,23 +866,23 @@ struct OpenPlacement {
 
 /// A validated transfer owns every resource needed to keep kernel access safe.
 /// Only Slab::prepare constructs this capability, and submission consumes it.
-struct Submission<C: Charge> {
+struct Submission<D: Charge> {
     file: Rc<Descriptor>,
 
     extent: Extent,
 
-    buffer: AlignedBuffer<C>,
+    buffer: Buf<D>,
 
     lease: SegmentLease,
 }
 
-impl<C: Charge> Submission<C> {
+impl<D: Charge> Submission<D> {
     /// Move the complete read capability into the reactor's completion ownership.
     async fn read<S: Scope>(
         self,
         reactor: &Reactor<S>,
         scope: &S,
-    ) -> std::result::Result<AlignedBuffer<C>, S::Error>
+    ) -> std::result::Result<Buf<D>, S::Error>
     where
         S::Error: From<Error>,
     {
@@ -916,7 +904,7 @@ impl<C: Charge> Submission<C> {
         reactor: &Reactor<S>,
         scope: &S,
         fence: WriteFence,
-    ) -> std::result::Result<AlignedBuffer<C>, S::Error>
+    ) -> std::result::Result<Buf<D>, S::Error>
     where
         S::Error: From<Error>,
     {
@@ -936,8 +924,8 @@ impl<C: Charge> Submission<C> {
     fn complete<E: From<Error>>(
         extent: Extent,
         bytes: usize,
-        buffer: AlignedBuffer<C>,
-    ) -> std::result::Result<AlignedBuffer<C>, E> {
+        buffer: Buf<D>,
+    ) -> std::result::Result<Buf<D>, E> {
         if bytes != extent.length() {
             return Err(Error::Io.into());
         }
@@ -1738,7 +1726,7 @@ mod tests {
                 let mut operation = if write {
                     slab.write(&reactor, extent, buffer, lease, &TestScope)
                 } else {
-                    slab.read(&reactor, extent, buffer, lease, &TestScope)
+                    slab.read_buf(&reactor, extent, buffer, lease, &TestScope)
                 };
                 let mut completed = false;
                 for _ in 0..100 {
@@ -1789,30 +1777,29 @@ mod tests {
         );
         let extent = alignment.extent(0, 31).unwrap();
         let mut buffer = slabs.allocate(extent.length(), ()).unwrap();
-        buffer.bytes_mut().unwrap()[..31].fill(42);
+        buffer.as_mut_slice()[..31].fill(42);
         assert_eq!(
-            unsafe { libc::pwrite(fd, buffer.bytes().unwrap().as_ptr().cast(), buffer.len(), 0) },
+            unsafe { libc::pwrite(fd, buffer.as_slice().as_ptr().cast(), buffer.len(), 0) },
             buffer.len() as isize
         );
-        buffer.bytes_mut().unwrap().fill(0);
+        buffer.as_mut_slice().fill(0);
         assert_eq!(
             unsafe {
                 libc::pread(
                     fd,
-                    buffer.bytes_mut().unwrap().as_mut_ptr().cast(),
+                    buffer.as_mut_slice().as_mut_ptr().cast(),
                     extent.length(),
                     0,
                 )
             },
             extent.length() as isize
         );
-        assert_eq!(&buffer.bytes().unwrap()[..31], &[42; 31]);
-        assert!(buffer.bytes().unwrap()[31..].iter().all(|b| *b == 0));
+        assert_eq!(&buffer.as_slice()[..31], &[42; 31]);
+        assert!(buffer.as_slice()[31..].iter().all(|b| *b == 0));
         // statx(2) allows misaligned direct I/O to either fail with EINVAL or fall back to
         // buffered I/O, so only a failure's errno is part of the contract.
         // SAFETY: the descriptor and buffer remain live throughout this synchronous call.
-        let misaligned =
-            unsafe { libc::pwrite(fd, buffer.bytes().unwrap().as_ptr().cast(), 31, 1) };
+        let misaligned = unsafe { libc::pwrite(fd, buffer.as_slice().as_ptr().cast(), 31, 1) };
         if misaligned < 0 {
             assert_eq!(
                 std::io::Error::last_os_error().raw_os_error(),
@@ -1822,8 +1809,9 @@ mod tests {
             assert_eq!(misaligned, 31);
         }
         drop(buffer);
-        assert_eq!(slabs.idle_bytes(), extent.length());
-        assert_eq!(slabs.reclaim_idle(), extent.length());
+        let capacity = extent.length().max(1).next_multiple_of(crate::buf::GRANULE);
+        assert_eq!(slabs.idle_bytes(), capacity);
+        assert_eq!(slabs.reclaim_idle(), capacity);
         assert_eq!(slabs.idle_bytes(), 0);
         assert_eq!(conflicting.open_now(), Err(Error::Unavailable));
     }
@@ -2189,7 +2177,8 @@ mod tests {
         assert_eq!(table.recycle(SegmentId(0)), Err(Error::Busy));
         drop(submission);
         table.recycle(SegmentId(0)).unwrap();
-        assert_eq!(used.get(), 4096);
+        assert_eq!(used.get(), 0);
+        assert_eq!(slab.idle_bytes(), 4096);
         slab.reclaim_idle();
         assert_eq!(used.get(), 0);
     }
@@ -2487,20 +2476,22 @@ mod tests {
             return;
         };
         let length = a.extent(0, 512).unwrap().length();
+        let capacity = length.max(1).next_multiple_of(crate::buf::GRANULE);
         let used = Rc::new(Cell::new(0));
         drop(
-            slab.allocate(length, CountingCharge::new(&used, length))
+            slab.allocate(length, CountingCharge::new(&used, capacity))
                 .unwrap(),
         );
-        assert_eq!(slab.idle_bytes(), length);
-        assert_eq!(used.get(), length);
+        // Idle storage belongs to the pool, so the caller's charge is released.
+        assert_eq!(slab.idle_bytes(), capacity);
+        assert_eq!(used.get(), 0);
         assert!(matches!(
             slab.allocate(0, CountingCharge::new(&used, 0)),
             Err(Error::InvalidConfiguration)
         ));
-        assert_eq!(used.get(), length);
-        assert_eq!(slab.idle_bytes(), length);
-        assert_eq!(slab.reclaim_idle(), length);
+        assert_eq!(used.get(), 0);
+        assert_eq!(slab.idle_bytes(), capacity);
+        assert_eq!(slab.reclaim_idle(), capacity);
         assert_eq!(used.get(), 0);
         assert_eq!(slab.idle_bytes(), 0);
     }
@@ -2515,7 +2506,8 @@ mod tests {
         };
         let length = a.extent(0, (2 << 20) + 1).unwrap().length();
         let next = a.extent(0, length + 1).unwrap().length();
-        let capacity = crate::buffer_capacity(length).unwrap();
+        let capacity = length.max(next).next_multiple_of(crate::buf::GRANULE);
+        assert_eq!(capacity, next.max(1).next_multiple_of(crate::buf::GRANULE));
         let used = Rc::new(Cell::new(0));
         let mut first = slab
             .allocate(length, CountingCharge::new(&used, capacity))

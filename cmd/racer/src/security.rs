@@ -1242,7 +1242,8 @@ impl crate::lifecycle::Service<RequestScope> for PageCryptoEngine {
         self.drain(scope)
     }
 }
-/// Decrypted context remains charged for the complete local origin operation.
+/// An owned context stays charged for the complete local origin operation,
+/// whether the AEAD opened it or an in-process hop copied it.
 pub struct ChargedOriginContext {
     context: OriginContext,
     _reservation: flow_control::Charge<AdmissionPolicy>,
@@ -1327,8 +1328,8 @@ pub struct CredentialCrypto {
     rng: racer_io::Rng,
 }
 impl CredentialCrypto {
-    /// Independently charged zeroizing context. Warm admission may transfer this
-    /// owner to a bounded job with its own scope after the HEAD response ends.
+    /// Independently charged zeroizing context. An elected driver may run on a
+    /// bounded job with its own scope after the request's response ends.
     pub(crate) fn local_context(
         &self,
         context: &OriginContext,
@@ -1355,6 +1356,70 @@ impl CredentialCrypto {
         Ok(ChargedOriginContext {
             context,
             _reservation: reservation,
+        })
+    }
+    /// Admit an independently owned context for one in-process worker hop.
+    ///
+    /// Workers in one process share a trust domain: they own the same `Rc`
+    /// graphs and nothing isolates them, so sealing a context that only moves
+    /// between their mailboxes protects nothing. The hop passes an owned copy
+    /// instead. Admission still mirrors [`Self::seal`] followed by
+    /// [`Self::open_charged`]: the same `RequestContext` bytes are reserved the
+    /// same number of times, and the copy stays charged until the receiving
+    /// operation finishes. Only the AEAD, its AAD, and its nonce disappear.
+    ///
+    /// Peer wire traffic, remote/control HTTP, and stored records still use the
+    /// sealed envelope; they cross a process boundary.
+    pub(crate) fn local_peer_context(
+        &self,
+        context: &OriginContext,
+        scope: &RequestScope,
+    ) -> Result<ChargedOriginContext> {
+        scope.check()?;
+        let metadata = context.metadata.as_ref().map(OpaqueMetadata::as_header);
+        let raw = context
+            .authorization
+            .as_ref()
+            .map(Authorization::expose_for_origin);
+        // `seal` also budgets the AEAD tag, so the retained carrier uses that
+        // bound. `open_charged` then computes the same bound from the
+        // ciphertext length.
+        let size = credential_bounds(&context.object, metadata, raw.map_or(0, <[u8]>::len) + 16)?;
+        // Keep the carrier reservation, the sealing scratch, and the opening
+        // scratch that the sealed path performs, so a hop admits the same
+        // bytes the same number of times. Only `output` is retained, exactly
+        // as `open_charged` retains its decrypted context. The sealing scratch
+        // is released first, so the peak matches opening a sealed envelope.
+        let _carrier = self.admission.reserve(
+            Some(&context.object.cache),
+            ResourceClass::RequestContext,
+            size,
+        )?;
+        let seal_scratch = self.admission.reserve(
+            Some(&context.object.cache),
+            ResourceClass::RequestContext,
+            size,
+        )?;
+        drop(seal_scratch);
+        let output = self.admission.reserve(
+            Some(&context.object.cache),
+            ResourceClass::RequestContext,
+            size,
+        )?;
+        let _open_scratch = self.admission.reserve(
+            Some(&context.object.cache),
+            ResourceClass::RequestContext,
+            size.checked_mul(2).ok_or(Error::InvalidRequest)?,
+        )?;
+        let context = OriginContext {
+            object: context.object.clone(),
+            metadata: metadata.map(OpaqueMetadata::from_header).transpose()?,
+            authorization: raw.map(Authorization::from_header).transpose()?,
+        };
+        scope.check()?;
+        Ok(ChargedOriginContext {
+            context,
+            _reservation: output,
         })
     }
     pub fn new(
@@ -2349,6 +2414,73 @@ mod tests {
                 Err(Error::Canceled)
             ));
             drop((first, second));
+            assert_eq!(admission.used(ResourceClass::RequestContext), 0);
+        }
+        #[test]
+        fn local_hop_admits_the_same_bytes_as_sealing_and_keeps_credentials() {
+            use std::num::NonZeroUsize;
+            let env = racer_io::Env::host();
+            let keys = Rc::new(crate::test_support::security::keys(&env));
+            let context = origin();
+            let scope = scope();
+            let raw = context.authorization.as_ref().unwrap().expose_for_origin();
+            let metadata = context.metadata.as_ref().unwrap().as_header();
+            let size = credential_bounds(&context.object, Some(metadata), raw.len() + 16).unwrap();
+            let limit = |bytes| {
+                let mut limits = crate::test_support::cluster::config(false).limits;
+                limits.request_context_bytes = NonZeroUsize::new(bytes).unwrap();
+                limits
+            };
+            // The hop admits the sealed path's peak: the carrier, the opening
+            // output, and the doubled opening scratch.
+            let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limit(
+                4 * size,
+            ))));
+            let crypto = CredentialCrypto::new(
+                keys.clone(),
+                admission.clone(),
+                racer_io::WorkerCtx::host().rng,
+            );
+            let hop = crypto.local_peer_context(&context, &scope).unwrap();
+            assert_eq!(admission.used(ResourceClass::RequestContext), size);
+            assert_eq!(hop.authorization.as_ref().unwrap().expose_for_origin(), raw);
+            assert_eq!(hop.metadata.as_ref().unwrap().as_header(), metadata);
+            drop(hop);
+            assert_eq!(admission.used(ResourceClass::RequestContext), 0);
+
+            // One byte under the sealed peak is rejected, so the hop cannot
+            // silently admit less than the removed seal/open pair.
+            let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limit(
+                4 * size - 1,
+            ))));
+            let crypto = CredentialCrypto::new(
+                keys.clone(),
+                admission.clone(),
+                racer_io::WorkerCtx::host().rng,
+            );
+            assert!(matches!(
+                crypto.local_peer_context(&context, &scope),
+                Err(Error::Overloaded)
+            ));
+            assert_eq!(admission.used(ResourceClass::RequestContext), 0);
+
+            // The sealed path retains the same bytes at the same peak, so the
+            // by-value hop charges identically.
+            let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limit(
+                4 * size,
+            ))));
+            let crypto =
+                CredentialCrypto::new(keys, admission.clone(), racer_io::WorkerCtx::host().rng);
+            let attempt = AttemptId([9; 16]);
+            let sealed = crypto.seal(&context, attempt, &scope).unwrap();
+            assert_eq!(admission.used(ResourceClass::RequestContext), size);
+            let opened = crypto.open_charged(sealed, scope.request, attempt).unwrap();
+            assert_eq!(admission.used(ResourceClass::RequestContext), size);
+            assert_eq!(
+                opened.authorization.as_ref().unwrap().expose_for_origin(),
+                raw
+            );
+            drop(opened);
             assert_eq!(admission.used(ResourceClass::RequestContext), 0);
         }
         fn scope() -> RequestScope {

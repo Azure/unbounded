@@ -243,8 +243,11 @@ impl CancelToken {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
-        // Wakers never run under this lock, so poisoning cannot leave it torn.
-        self.0.inner.lock().unwrap_or_else(|e| e.into_inner())
+        // Wakers never run under this lock, so it cannot be poisoned.
+        self.0
+            .inner
+            .lock()
+            .expect("cancellation state lock is never poisoned")
     }
 }
 
@@ -422,7 +425,10 @@ impl Cancellation {
 impl CancellationRegistration {
     /// Replace the waiting task and close the race with concurrent cancellation.
     pub fn register(&self, waker: &Waker) {
-        let mut key = self.key.lock().unwrap_or_else(|poison| poison.into_inner());
+        let mut key = self
+            .key
+            .lock()
+            .expect("registration key lock is never poisoned");
         if self
             .cancellation
             .state
@@ -441,7 +447,7 @@ impl Drop for CancellationRegistration {
         let key = self
             .key
             .get_mut()
-            .unwrap_or_else(|poison| poison.into_inner());
+            .expect("registration key lock is never poisoned");
         self.cancellation.state.token.deregister(key);
         self.cancellation.state.live.fetch_sub(1, Ordering::AcqRel);
     }

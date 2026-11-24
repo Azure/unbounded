@@ -171,10 +171,6 @@ pub struct Config {
     pub gpu_peer: bool,
     /// Opt into experimental opaque HTTP transit; materialized relay is the default.
     pub opaque_relay: bool,
-    /// Peer-only TCP_NODELAY. Peer exchanges are strictly request/response with
-    /// multi-segment signed heads, so Nagle stalls every round on a delayed ACK.
-    /// Defaults on; set false only to reproduce the pre-nodelay socket behavior.
-    pub peer_tcp_nodelay: bool,
     /// cgroup v2 memory-pressure monitoring and reclaim. Defaults on.
     pub memory_pressure: bool,
     pub pprof_enabled: bool,
@@ -513,7 +509,6 @@ impl Config {
             },
             gpu_peer: word("RACER_GPU_PEER") == "auto",
             opaque_relay: flag("RACER_OPAQUE_RELAY"),
-            peer_tcp_nodelay: flag("RACER_PEER_TCP_NODELAY"),
             memory_pressure: flag("RACER_MEMORY_PRESSURE"),
             pprof_enabled: flag("RACER_PPROF_ENABLED"),
             control_endpoint,
@@ -1137,10 +1132,6 @@ fn authority(
             retained_page_keys: v.unsigned("RACER_RETAINED_PAGE_KEYS").expect("defaulted") as usize,
             ..Default::default()
         },
-        page_size: racer_wire::object::PageSize::new(
-            v.unsigned("RACER_PAGE_BYTES").expect("defaulted"),
-        )
-        .map_err(|_| ConfigError::new("RACER_PAGE_BYTES", "must be a power of two"))?,
     };
     control.validate().map_err(|error| {
         ConfigError::new(
@@ -2642,10 +2633,6 @@ mod tests {
             .is_err()
         );
     }
-    #[test]
-    fn peer_tcp_nodelay_requires_exact_boolean_and_defaults_on() {
-        exact_boolean_default("RACER_PEER_TCP_NODELAY", |c| c.peer_tcp_nodelay, true);
-    }
 
     #[test]
     fn pprof_requires_exact_boolean_and_defaults_off() {
@@ -3351,26 +3338,6 @@ mod tests {
                     .unwrap()
                     .name,
                 "RACER_RETAINED_PAGE_KEYS"
-            );
-        }
-    }
-
-    #[test]
-    fn authority_page_bytes() {
-        assert_eq!(
-            control(&[]).page_size,
-            racer_wire::object::PageSize::DEFAULT
-        );
-        let c = control(&[("RACER_PAGE_BYTES", "16777216")]);
-        assert_eq!(c.page_size.get(), 16 * 1024 * 1024);
-        // The SDKs and disk index assume 16 MiB pages; other sizes are refused.
-        for bad in ["4096", "65536", "1048576", "98304", "33554432", "x"] {
-            assert_eq!(
-                managed_env(&[("RACER_PAGE_BYTES", bad)])
-                    .err()
-                    .unwrap()
-                    .name,
-                "RACER_PAGE_BYTES"
             );
         }
     }

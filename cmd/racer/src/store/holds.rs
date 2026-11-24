@@ -1,8 +1,16 @@
 //! Worker-local hard holds. Each reserved page charges one whole segment.
 //! Live expiry follows the monotonic clock only. Restart uses wall time
 //! only; checkpoints and payloads keep the store's existing no-fsync crash limits.
+//!
+//! [`page_alloc::disk_index::DiskIndex`] owns the hold identities, the pages
+//! each hold covers, and the per-slot hold refcount; this module keeps only
+//! what the allocator cannot know: the wall-clock deadline a client asked for,
+//! the reader count of each member page, and the RAII activity guard. There is
+//! no second epoch counter: a [`HoldId`] issued by the disk index orders every
+//! reservation and is what each page remembers as its `since`. The version
+//! owning a hold is recovered from the hold's member slots, so no parallel
+//! hold-to-version table is kept here either.
 
-use super::pages::Pages;
 use crate::error::{Error, Result};
 use crate::model::{ObjectVersion, PageNumber};
 use crate::runtime::HashMap;
@@ -14,15 +22,15 @@ use std::time::{Duration, Instant, SystemTime};
 
 pub const MAX_HOLD_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
-/// Identity of one reservation on a worker: the newest disk index hold
-/// identity when the reservation was made. Each page remembers the hold
-/// that made it a member ([`PageHolders::since`]); identities only grow, so a
-/// release only applies to pages whose `since` is not newer than the
-/// release's epoch, and a release taken before a page was trimmed and
-/// re-reserved (or before an expiry, whole release or restart) cannot drop a
-/// holder that the later reservation added. Epochs are process-local.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct HoldEpoch(pub(super) HoldId);
+/// Identity of one reservation on a worker: the disk index hold identity when
+/// the reservation was made. Each page remembers the hold that made it a
+/// member ([`PageHolders::since`]); identities only grow, so a release only
+/// applies to pages whose `since` is not newer than the release's epoch, and a
+/// release taken before a page was trimmed and re-reserved (or before an
+/// expiry, whole release or restart) cannot drop a holder that the later
+/// reservation added. This is the same generation the disk index issues; it is
+/// re-exported under this name for the read pipeline, which treats it opaquely.
+pub type HoldEpoch = HoldId;
 
 /// Sorted, deduplicated page numbers covered by one version's hold.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -104,7 +112,7 @@ pub(super) struct PageHolders {
     /// Reader holders; each releases its pages individually.
     pub count: u32,
     /// The disk index hold that made this page a member.
-    pub since: HoldEpoch,
+    pub since: HoldId,
     /// The page's interned slot.
     pub slot: PageSlot,
 }
@@ -122,8 +130,6 @@ pub(super) struct Hold {
     /// reservation adds one per requested page and each `release_hold_pages`
     /// removes one. Not persisted: restored pages start at one reader.
     pub holders: HashMap<PageNumber, PageHolders>,
-    /// Live disk index holds of this entry.
-    pub ids: Vec<HoldId>,
     pub active: Rc<Cell<usize>>,
 }
 
@@ -134,6 +140,16 @@ impl Hold {
     pub fn live(&self, clock: &racer_io::Clock) -> bool {
         clock.now() < self.monotonic
     }
+
+    /// Live disk index holds of this entry, derived from the member pages.
+    /// Every member remembers the hold that added it, and a disk hold exists
+    /// exactly while it still covers at least one member.
+    pub(super) fn ids(&self) -> Vec<HoldId> {
+        let mut ids: Vec<_> = self.holders.values().map(|holder| holder.since).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
 }
 
 /// Default hold cap, as a percentage of page slots and segments.
@@ -141,8 +157,6 @@ pub const DEFAULT_HOLD_PERCENT: usize = 50;
 
 pub(super) struct Holds {
     pub entries: HashMap<ObjectVersion, Hold>,
-    /// Version of each live disk index hold.
-    pub owners: HashMap<HoldId, ObjectVersion>,
     /// Member pages across all entries.
     pub members: usize,
     pub segments: Option<Rc<Segments>>,
@@ -157,7 +171,6 @@ impl Holds {
         Self {
             base: clock.now(),
             entries: HashMap::default(),
-            owners: HashMap::default(),
             members: 0,
             segments: None,
             free_reserve: 1,
@@ -173,16 +186,12 @@ impl Holds {
 
     /// Forget a disk index hold that was released or expired, with the
     /// members it added. An entry without disk holds is removed.
-    pub fn forget(&mut self, id: HoldId) {
-        let Some(version) = self.owners.remove(&id) else {
+    pub fn forget(&mut self, version: &ObjectVersion, id: HoldId) {
+        let Some(hold) = self.entries.get_mut(version) else {
             return;
         };
-        let Some(hold) = self.entries.get_mut(&version) else {
-            return;
-        };
-        hold.ids.retain(|held| *held != id);
         let before = hold.holders.len();
-        hold.holders.retain(|_, holder| holder.since.0 != id);
+        hold.holders.retain(|_, holder| holder.since != id);
         self.members -= before - hold.holders.len();
         let holders = &hold.holders;
         hold.pages = hold
@@ -190,21 +199,20 @@ impl Holds {
             .iter()
             .filter(|page| holders.contains_key(page))
             .collect();
-        if hold.ids.is_empty() {
-            self.entries.remove(&version);
+        let empty = hold.holders.is_empty();
+        if empty {
+            self.entries.remove(version);
         }
     }
 
-    /// Remove `version`'s entry and release its disk holds.
-    pub fn drop_version(&mut self, pages: &mut Pages, version: &ObjectVersion) {
+    /// Remove `version`'s entry and return the disk holds it still owns, in
+    /// ascending identity order. The caller releases them on the disk index.
+    pub fn drop_version(&mut self, version: &ObjectVersion) -> Vec<HoldId> {
         let Some(hold) = self.entries.remove(version) else {
-            return;
+            return Vec::new();
         };
         self.members -= hold.pages.len();
-        for id in hold.ids {
-            self.owners.remove(&id);
-            pages.release_hold(id);
-        }
+        hold.ids()
     }
 
     pub fn deadline(until: SystemTime, clock: &racer_io::Clock) -> Result<Instant> {
@@ -240,7 +248,6 @@ mod tests {
             monotonic: Holds::deadline(until, clock).unwrap(),
             pages: HoldPages::default(),
             holders: HashMap::default(),
-            ids: Vec::new(),
             active: Rc::default(),
         }
     }

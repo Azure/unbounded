@@ -72,6 +72,10 @@ use crate::store::catalog::Index;
 use crate::store::catalog::SegmentClock;
 use crate::store::checkpoint::CheckpointGeometry;
 use crate::store::checkpoint::Checkpointer;
+use crate::store::checkpoint::EncodeClientPort;
+use crate::store::checkpoint::EncodeWorkerPort;
+use crate::store::checkpoint::EncoderClient;
+use crate::store::checkpoint::EncoderPort;
 use crate::store::checkpoint::Recovery;
 use crate::store::checkpoint::ShardImage;
 use crate::telemetry::Gauge;
@@ -108,6 +112,7 @@ use std::time::UNIX_EPOCH;
 
 use crate::drivers::poll_task;
 
+mod checkpoint;
 mod devices;
 /// Whole-application deterministic simulation harness: real worker graphs on
 /// `Driver::Sim`, driven by `racer-dst` (test support only, not a public API).
@@ -134,6 +139,27 @@ pub struct Application {
 
     /// Worker context every lane, helper, and lifecycle scope runs on.
     ctx: racer_io::WorkerCtx,
+
+    /// Checkpoint encode endpoints, allocated before any lane or helper starts
+    /// so the helper can own the consumer before the lane builds the producer.
+    /// Only the control worker publishes cuts, so one pair serves the node.
+    checkpoint_encoder: Mutex<Option<CheckpointEncoderPair>>,
+}
+
+/// One encode pair in flight from startup to its helper and lane endpoints.
+struct CheckpointEncoderPair {
+    /// Lane index the helper builds its consumer on.
+    lane: usize,
+
+    /// Worker that owns the producer endpoint.
+    worker: WorkerId,
+
+    client: Option<EncodeClientPort>,
+
+    port: Option<EncodeWorkerPort>,
+
+    /// The helper took the consumer, so the lane may bind the producer.
+    served: bool,
 }
 
 /// Shared immutable-publication and partitioned-admission roots. No Rc worker
@@ -468,6 +494,7 @@ impl Application {
             node: Arc::new(NodeState::default()),
             discovered_nics: Vec::new(),
             ctx: racer_io::WorkerCtx::host(),
+            checkpoint_encoder: Mutex::new(None),
         })
     }
 
@@ -1130,6 +1157,10 @@ pub struct WorkerApplication {
 
     checkpoint_budget: usize,
 
+    /// This worker's checkpoint encode helper. Bound on the control worker;
+    /// publication encodes inline when it is absent (simulation and tests).
+    checkpoint_encoder: Option<Rc<EncoderClient>>,
+
     placement: Rc<Placement>,
 
     candidates: Rc<CandidatePolicy>,
@@ -1468,7 +1499,6 @@ impl WorkerApplication {
             admission.clone(),
             limits.connections_per_neighbor.get(),
         );
-        http.config_mut().tcp_nodelay = config.peer_tcp_nodelay;
         http.config_mut().secondary_cap = origin_pool_capacity(
             config.origin_connections_per_cache.get(),
             admission.limit(crate::admission::ResourceClass::OutboundConnection),
@@ -1641,15 +1671,19 @@ impl WorkerApplication {
         // Caches published with a native origin read Azure Blob in process;
         // every other cache keeps its origin socket.
         let azure = crate::origin::azure::AzureOrigin::new(
-            crate::origin::azure::transport::PoolTransport::new(
-                http.clone(),
-                origin_io,
-                Rc::new(crate::remote::DnsResolver::new(reactor.clone())),
-                node.azure.trust.clone(),
+            crate::origin::azure::AzureTransport::new(
+                crate::origin::azure::transport::PoolTransport::new(
+                    http.clone(),
+                    origin_io,
+                    Rc::new(crate::remote::DnsResolver::new(reactor.clone())),
+                    node.azure.trust.clone(),
+                ),
             ),
-            crate::origin::azure::tokens::AzureTokens::new(
-                node.azure.tokens.clone(),
-                reactor.clone(),
+            crate::origin::azure::AzureTokenSource::new(
+                crate::origin::azure::tokens::AzureTokens::new(
+                    node.azure.tokens.clone(),
+                    reactor.clone(),
+                ),
             ),
             node.publications.clone(),
             admission.clone(),
@@ -1658,7 +1692,7 @@ impl WorkerApplication {
         );
         let origin: Rc<dyn Origin> = Rc::new(crate::origin::router::OriginRouter::new(
             node.publications.clone(),
-            adapter,
+            Rc::new(adapter),
             Some(azure),
         ));
         let flights = Rc::new(Flights::new(
@@ -1710,7 +1744,6 @@ impl WorkerApplication {
             pipes.clone(),
             transfers,
             crate::peer::server::Settings {
-                tcp_nodelay: config.peer_tcp_nodelay,
                 accept: if distributed {
                     crate::peer::server::AcceptMode::Distributed(node.peer_ingress.clone())
                 } else {
@@ -1815,6 +1848,7 @@ impl WorkerApplication {
             checkpoint_generation: 0,
             checkpoint_completed: 0,
             checkpoint_budget: config.checkpoint_bytes.get(),
+            checkpoint_encoder: None,
             placement,
             candidates,
             ownership_maintenance: OwnershipMaintenance::new(started),
@@ -2236,6 +2270,9 @@ impl WorkerApplication {
         }
         let worker = self.worker;
         let budget = work_budget.min(64);
+        if let Some(encoder) = &self.checkpoint_encoder {
+            stage_result(worker, "checkpoint-encode", encoder.poll_budgeted(budget))?;
+        }
         stage_result(worker, "native", self.poll_native(cx))?;
         let now = self.ctx().now();
         if !self.stopping
@@ -2725,14 +2762,18 @@ impl Application {
 
     /// Allocate paired worker resources once before building service lanes.
     /// With a plan, crypto helpers on one NUMA node share their queued jobs.
+    /// The control worker's helper also owns checkpoint encoding, so this
+    /// allocates its endpoints before any helper or lane starts.
     fn prepare_workers(&self, plan: Option<&AffinityPlan>) -> Result<()> {
+        let workers: Vec<WorkerId> = self
+            .node
+            .metrics
+            .iter()
+            .map(|(worker, _)| *worker)
+            .collect();
         let resources = crate::worker::Resources::new(
             self.limits.clone(),
-            self.node
-                .metrics
-                .iter()
-                .map(|(worker, _)| *worker)
-                .collect(),
+            workers.clone(),
             1,
             self.ctx.clone(),
         )?;
@@ -2741,7 +2782,32 @@ impl Application {
         }
         self.resources
             .set(resources)
-            .map_err(|_| Error::InvalidConfiguration)
+            .map_err(|_| Error::InvalidConfiguration)?;
+        let Some(lane) = workers
+            .iter()
+            .position(|worker| *worker == self.node.control_worker)
+        else {
+            return Ok(());
+        };
+        let (client, port) = match crate::store::checkpoint::pair(self.node.control_worker) {
+            Ok(pair) => pair,
+            Err(error) => {
+                // Encoding stays on the publishing lane, as simulation does.
+                eprintln!("racer: checkpoint encode helper unavailable: {error}");
+                return Ok(());
+            }
+        };
+        *self
+            .checkpoint_encoder
+            .lock()
+            .map_err(|_| Error::Unavailable)? = Some(CheckpointEncoderPair {
+            lane,
+            worker: self.node.control_worker,
+            client: Some(client),
+            port: Some(port),
+            served: false,
+        });
+        Ok(())
     }
 
     /// Build one worker-local service graph from the node's shared authorities.
@@ -2750,13 +2816,30 @@ impl Application {
         worker: WorkerId,
         runtime: WorkerRuntime,
     ) -> Result<Box<dyn crate::lifecycle::Service<RequestScope>>> {
-        let application = WorkerApplication::assemble(
+        let mut application = WorkerApplication::assemble(
             &self.config,
             self.node.clone(),
             worker,
             runtime,
             self.discovered_nics.clone(),
         )?;
+        // Helpers build before lanes, so the control worker's encoder consumer
+        // is in place by the time its producer is bound here.
+        if worker == self.node.control_worker {
+            let client = {
+                let mut slot = self
+                    .checkpoint_encoder
+                    .lock()
+                    .map_err(|_| Error::Unavailable)?;
+                match slot.as_mut() {
+                    Some(pair) if pair.worker == worker && pair.served => pair.client.take(),
+                    _ => None,
+                }
+            };
+            if let Some(port) = client {
+                application.bind_checkpoint_encoder(Rc::new(EncoderClient::new(port, worker)));
+            }
+        }
         Ok(Box::new(application))
     }
 
@@ -2789,17 +2872,52 @@ impl crate::lifecycle::Factory<RequestScope> for Application {
         &self,
         lane: usize,
     ) -> Result<Box<dyn crate::lifecycle::Service<RequestScope>>> {
-        self.resources
+        let crypto = self
+            .resources
             .get()
             .ok_or(Error::InvalidConfiguration)?
-            .build_helper(lane, |worker, runtime| self.build_crypto(worker, runtime))
+            .build_helper(lane, |worker, runtime| self.build_crypto(worker, runtime))?;
+        let encoder = {
+            let mut slot = self
+                .checkpoint_encoder
+                .lock()
+                .map_err(|_| Error::Unavailable)?;
+            match slot.as_mut() {
+                Some(pair) if pair.lane == lane => {
+                    let port = pair.port.take();
+                    pair.served = port.is_some();
+                    port
+                }
+                _ => None,
+            }
+        };
+        match encoder {
+            Some(port) => Ok(Box::new(checkpoint::Helper::new(
+                crypto,
+                EncoderPort::new(port),
+            ))),
+            None => Ok(crypto),
+        }
     }
 
     fn abandon_lane(&self, lane: usize) -> Result<()> {
-        self.resources
+        let abandoned = self
+            .resources
             .get()
             .ok_or(Error::InvalidConfiguration)?
-            .abandon_lane(lane)
+            .abandon_lane(lane);
+        // A lane that never reached construction has no publication to drain.
+        // Close its encode producer so the helper observes closure and exits.
+        if let Some(pair) = self
+            .checkpoint_encoder
+            .lock()
+            .map_err(|_| Error::Unavailable)?
+            .as_mut()
+            && pair.lane == lane
+        {
+            pair.client.take();
+        }
+        abandoned
     }
 
     fn teardown_scope(&self, startup: &RequestScope) -> RequestScope {
@@ -2808,6 +2926,14 @@ impl crate::lifecycle::Factory<RequestScope> for Application {
             teardown_budget(self.config.shutdown_timeout),
         )
         .unwrap_or_else(|_| startup.clone())
+    }
+}
+
+impl WorkerApplication {
+    /// Route checkpoint validation and encoding to this worker's helper lane.
+    pub(crate) fn bind_checkpoint_encoder(&mut self, encoder: Rc<EncoderClient>) {
+        self.store.checkpoint.bind_encoder(encoder.clone());
+        self.checkpoint_encoder = Some(encoder);
     }
 }
 
@@ -2831,6 +2957,12 @@ impl crate::lifecycle::Service<RequestScope> for WorkerApplication {
             })
     }
 
+    fn register_driver(&self, waker: &std::task::Waker) {
+        if let Some(encoder) = &self.checkpoint_encoder {
+            encoder.register_driver(waker);
+        }
+    }
+
     fn start<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
         WorkerApplication::start(self, scope)
     }
@@ -2840,6 +2972,15 @@ impl crate::lifecycle::Service<RequestScope> for WorkerApplication {
             return Err(Error::Unavailable);
         }
         self.poll_services(cx, work_budget)
+    }
+
+    /// Stop accepting cuts once the lane drains. Accepted encodes still
+    /// publish, and the last publication waits for its completion.
+    fn close(&mut self) -> Result<()> {
+        if let Some(encoder) = &self.checkpoint_encoder {
+            encoder.close_submissions();
+        }
+        Ok(())
     }
 
     fn stop_admission(&mut self) -> Result<()> {

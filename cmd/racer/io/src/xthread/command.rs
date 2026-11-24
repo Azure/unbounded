@@ -460,10 +460,9 @@ impl Drop for Permit {
     }
 }
 
-/// Recover poisoned state without running user callbacks or destructors under lock.
-/// Mutations preserve ownership invariants even if caller code later panics.
+/// Lock guarded command state; no user code runs under it, so it cannot poison.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|error| error.into_inner())
+    mutex.lock().expect("command state lock is never poisoned")
 }
 
 /// Pure ownership, admission, wake-ordering, and reentrant disposal regressions.

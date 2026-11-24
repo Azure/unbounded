@@ -66,7 +66,10 @@ pub struct CancelWait {
 impl CancelWait {
     /// Register or refresh `waker`, waking it at once if already canceled.
     pub fn register(&self, waker: &Waker) {
-        let mut key = self.key.lock().unwrap_or_else(|e| e.into_inner());
+        let mut key = self
+            .key
+            .lock()
+            .expect("registration key lock is never poisoned");
         if self.token.register(&mut key, waker).is_some() {
             waker.wake_by_ref();
         }
@@ -80,7 +83,10 @@ impl CancelWait {
 
 impl Drop for CancelWait {
     fn drop(&mut self) {
-        let key = self.key.get_mut().unwrap_or_else(|e| e.into_inner());
+        let key = self
+            .key
+            .get_mut()
+            .expect("registration key lock is never poisoned");
         self.token.deregister(key);
     }
 }

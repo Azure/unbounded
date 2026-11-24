@@ -44,7 +44,6 @@ pub(crate) enum AcceptMode {
 }
 
 pub(crate) struct Settings {
-    pub tcp_nodelay: bool,
     pub accept: AcceptMode,
     pub request_timeout: Duration,
     pub opaque_relay: bool,
@@ -53,7 +52,6 @@ pub(crate) struct Settings {
 pub struct PeerServer {
     /// This worker's detached driver queue for diagnostic samples.
     drivers: std::rc::Rc<crate::drivers::DriverQueue>,
-    tcp_nodelay: bool,
     metrics: crate::telemetry::Metrics,
     send_tag: Option<(
         crate::telemetry::Pair,
@@ -122,10 +120,9 @@ impl PeerServer {
         &self,
         fd: racer_io::ring::Descriptor,
     ) -> crate::error::Result<racer_io::ring::Descriptor> {
-        // False preserves the accepted socket's existing application policy.
-        if self.tcp_nodelay {
-            fd.enable_tcp_nodelay(true).map_err(|_| Error::Io)?;
-        }
+        // Peer exchanges are request/response with multi-segment signed heads,
+        // so Nagle would stall every round on a delayed ACK.
+        fd.enable_tcp_nodelay(true).map_err(|_| Error::Io)?;
         Ok(fd)
     }
     /// Answer a connection the listener has no peer ingress slot for with the unsigned overload
@@ -247,7 +244,6 @@ impl PeerServer {
             pipes,
             transfers,
             Settings {
-                tcp_nodelay: false,
                 accept: AcceptMode::Local,
                 request_timeout: Duration::from_secs(30),
                 opaque_relay: false,
@@ -384,7 +380,6 @@ impl PeerServer {
             drivers,
             subscriptions,
             metrics: crate::telemetry::Metrics::default(),
-            tcp_nodelay: settings.tcp_nodelay,
             send_tag: None,
             placement: crate::topology::Placement::new(64),
             opaque_relay: settings.opaque_relay,
@@ -500,8 +495,6 @@ impl PeerServer {
         scope: &'a RequestScope,
     ) -> Operation<'a, crate::http::ConnectionLease> {
         Box::pin(async move {
-            use super::protocol::decode_envelope;
-            use super::protocol::encode_envelope;
             scope.check()?;
             let codec = &self.wire;
             // One fixed budget for handshake reads, verification, signing, writes,
@@ -529,7 +522,7 @@ impl PeerServer {
                 &mut received.value,
                 crate::peer::protocol::chains(&received.connection)?,
             )?;
-            let (authentication, length) = decode_envelope(
+            let (authentication, length) = peer_wire::decode_envelope(
                 received.value,
                 false,
                 crate::peer::protocol::chains(&received.connection)?,
@@ -537,7 +530,7 @@ impl PeerServer {
             if length != 0 {
                 return Err(Error::InvalidRequest);
             }
-            if crate::peer::protocol::field(&authentication.original.head, "racer-kind")
+            if peer_wire::field(&authentication.original.head, "racer-kind")
                 .is_ok_and(|kind| kind == peer_wire::link::KIND)
             {
                 if native_control.is_some() || !authentication.hops.is_empty() {
@@ -672,7 +665,7 @@ impl PeerServer {
                             },
                             pipe,
                         )) => {
-                            let head = encode_envelope(&authentication, true, length)?;
+                            let head = peer_wire::encode_envelope(&authentication, true, length)?;
                             received
                                 .connection
                                 .state_mut()
@@ -837,7 +830,7 @@ impl PeerServer {
             } => ciphertext.bytes(),
             _ => &[],
         };
-        let head = super::protocol::encode_envelope(&response.authentication, true, body.len())?;
+        let head = peer_wire::encode_envelope(&response.authentication, true, body.len())?;
         // Counted from the head until the body is written or abandoned.
         let _streaming = self.page_streaming(&response.response);
         let sent = self.io.send_head(connection, head, scope).await?;
@@ -1024,7 +1017,6 @@ impl PeerServer {
         Box::pin(async move {
             use super::subscriptions::Selection;
             use crate::peer::protocol::encode_deadline;
-            use crate::peer::protocol::millis;
             let super::protocol::Operation::Subscribe { subscription, mode } =
                 &request.request().operation
             else {
@@ -1038,7 +1030,7 @@ impl PeerServer {
                     membership.version,
                     request.origin().node().clone(),
                     encode_deadline(scope.clock(), scope.deadline)?,
-                    millis(scope.clock().wall_now())?,
+                    peer_wire::millis(scope.clock().wall_now())?,
                 )?
             } else {
                 self.subscriptions
@@ -1078,7 +1070,7 @@ impl PeerServer {
                                     metadata,
                                     ciphertext,
                                 },
-                                millis(scope.clock().wall_now())?,
+                                peer_wire::millis(scope.clock().wall_now())?,
                             )?;
                         }
                         Ok(other) => {
@@ -1100,9 +1092,9 @@ impl PeerServer {
                     if let Err(error) = scope.check() {
                         return std::task::Poll::Ready(Err(error));
                     }
-                    let now = match millis(scope.clock().wall_now()) {
+                    let now = match peer_wire::millis(scope.clock().wall_now()) {
                         Ok(now) => now,
-                        Err(error) => return std::task::Poll::Ready(Err(error)),
+                        Err(error) => return std::task::Poll::Ready(Err(error.into())),
                     };
                     if let Some(promoted) = waiter.take_work(now) {
                         work = Some(promoted);

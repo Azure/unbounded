@@ -167,9 +167,11 @@ takes two steps:
 After each load, vLLM's log shows one `racer: loaded ...` line with the file
 count, bytes, time, throughput, the number of reads in each delivery mode
 (`gpu`, `host`, `stream`), and any tensors the load skipped. When the
-dataplane refuses a mode, the client logs a warning with the reason once, then
-retries the mode after `mode_retry_seconds` (default 300) or when the
-dataplane restarts.
+destination cannot use `gpu-read`, the dataplane answers 501 and that read
+falls back to `host-read` into pinned host memory. The client does not remember
+the refusal or retry the mode on a timer: each read that targets exportable GPU
+memory tries `gpu-read` again. With `tensor_device` set to `cpu`, reads use
+`host-read`.
 
 With tensor parallelism, each rank reads every weight file of a regular
 checkpoint. Ranks on one node share the dataplane, so repeat reads come from

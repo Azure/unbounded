@@ -450,13 +450,20 @@ func (c *Collector) home() (string, error) {
 }
 
 func directDependencies(data string) (map[string]dependency, error) {
+	return directDependenciesIn(data, nil)
+}
+
+// directDependenciesIn reads one manifest. workspace carries the workspace
+// root's [workspace.dependencies] table so members that inherit a dependency
+// with `workspace = true` resolve to the entry the root declares.
+func directDependenciesIn(data string, workspace map[string]any) (map[string]dependency, error) {
 	var manifest map[string]any
 	if err := toml.Unmarshal([]byte(data), &manifest); err != nil {
 		return nil, err
 	}
 
 	direct := map[string]dependency{}
-	if err := collectDependencyTables(manifest, direct); err != nil {
+	if err := collectDependencyTables(manifest, direct, workspace); err != nil {
 		return nil, err
 	}
 
@@ -467,7 +474,7 @@ func directDependencies(data string) (map[string]dependency, error) {
 				return nil, fmt.Errorf("invalid target dependency table")
 			}
 
-			if err := collectDependencyTables(tables, direct); err != nil {
+			if err := collectDependencyTables(tables, direct, workspace); err != nil {
 				return nil, err
 			}
 		}
@@ -476,7 +483,41 @@ func directDependencies(data string) (map[string]dependency, error) {
 	return direct, nil
 }
 
-func collectDependencyTables(tables map[string]any, direct map[string]dependency) error {
+// inherit replaces a `workspace = true` declaration with the workspace root's
+// entry for the same alias. The member may still rename the package, and the
+// inherited version, features and optional flag do not affect NOTICE beyond
+// the registry name.
+func inherit(alias string, spec, workspace map[string]any) (map[string]any, error) {
+	entry, ok := workspace[alias]
+	if !ok {
+		return nil, fmt.Errorf("dependency %s: workspace inheritance has no workspace entry", alias)
+	}
+
+	resolved := map[string]any{}
+
+	switch entry := entry.(type) {
+	case string:
+		if entry == "" {
+			return nil, fmt.Errorf("dependency %s: invalid workspace entry", alias)
+		}
+
+		resolved["version"] = entry
+	case map[string]any:
+		for key, value := range entry {
+			resolved[key] = value
+		}
+	default:
+		return nil, fmt.Errorf("dependency %s: invalid workspace entry", alias)
+	}
+
+	if renamed, exists := spec["package"]; exists {
+		resolved["package"] = renamed
+	}
+
+	return resolved, nil
+}
+
+func collectDependencyTables(tables map[string]any, direct map[string]dependency, workspace map[string]any) error {
 	for _, section := range []string{"dependencies", "build-dependencies", "dev-dependencies"} {
 		value, exists := tables[section]
 		if !exists {
@@ -489,6 +530,17 @@ func collectDependencyTables(tables map[string]any, direct map[string]dependency
 		}
 
 		for alias, value := range deps {
+			if spec, ok := value.(map[string]any); ok {
+				if _, inherited := spec["workspace"]; inherited {
+					resolved, err := inherit(alias, spec, workspace)
+					if err != nil {
+						return err
+					}
+
+					value = resolved
+				}
+			}
+
 			// Cargo can implicitly enroll path dependencies as workspace members,
 			// even through development edges. Retain those paths for validation,
 			// but never collect registry development dependencies for NOTICE.
@@ -496,10 +548,6 @@ func collectDependencyTables(tables map[string]any, direct map[string]dependency
 				spec, ok := value.(map[string]any)
 				if !ok {
 					continue
-				}
-
-				if _, inherited := spec["workspace"]; inherited {
-					return fmt.Errorf("dependency %s: workspace inheritance is not supported", alias)
 				}
 
 				if _, local := spec["path"]; !local {
@@ -512,10 +560,6 @@ func collectDependencyTables(tables map[string]any, direct map[string]dependency
 			switch value := value.(type) {
 			case string:
 			case map[string]any:
-				if _, inherited := value["workspace"]; inherited {
-					return fmt.Errorf("dependency %s: workspace inheritance is not supported", alias)
-				}
-
 				if _, git := value["git"]; git {
 					return fmt.Errorf("dependency %s: git sources are not supported", alias)
 				}

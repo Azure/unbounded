@@ -631,37 +631,45 @@ e2e-gantry: $(HELM) $(KIND) ## Run the kind-based Gantry e2e suite
 e2e-racer: ## Run the kind-based Racer e2e suite (object caching and the Gantry Racer backend)
 	timeout --signal=TERM --kill-after=30s 7200s $(GOTEST) -tags=e2e -count=1 -timeout=110m -v ./e2e/racer
 
+# Every Racer Rust command uses the pinned toolchain so a stale default cannot
+# change what CI and local runs compile or test. The purity graph shells out to
+# cargo itself, so it gets the toolchain through the environment.
+RACER_RUST_TOOLCHAIN ?= 1.96.0
+RACER_CARGO ?= cargo +$(RACER_RUST_TOOLCHAIN)
+
 .PHONY: racer-test racer-go-test racer-rust-test racer-envtest racer-envtest-ci racer-generate
 racer-go-test: ## Lint and race-test the Go Racer API and workload packages
 	timeout --signal=TERM --kill-after=10s 300s $(GOLINT) ./api/racer/... ./internal/racer/...
 	timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -timeout=5m -race ./api/racer/... ./internal/racer/...
 
 racer-rust-test: ## Test the Rust Racer workspace, including the embedded cluster control plane
-	timeout --signal=TERM --kill-after=10s 1500s cargo test --locked --manifest-path cmd/racer/Cargo.toml --workspace
+	timeout --signal=TERM --kill-after=10s 1500s $(RACER_CARGO) test --locked --manifest-path cmd/racer/Cargo.toml --workspace
 
 racer-test: racer-go-test racer-rust-test ## Check Racer
 
-RACER_RUST_TOOLCHAIN ?= 1.96.0
-
 .PHONY: racer-fmt racer-lint racer-purity-graph
 racer-fmt: ## Format the Rust Racer workspace
-	timeout --signal=TERM --kill-after=10s 300s cargo +$(RACER_RUST_TOOLCHAIN) fmt --manifest-path cmd/racer/Cargo.toml --all
+	timeout --signal=TERM --kill-after=10s 300s $(RACER_CARGO) fmt --manifest-path cmd/racer/Cargo.toml --all
 
 racer-purity-graph: ## Fail when a pure Racer crate depends on an IO crate
-	timeout --signal=TERM --kill-after=10s 300s python3 hack/scripts/racer-purity-graph.py --manifest-path cmd/racer/Cargo.toml --strict
+	RUSTUP_TOOLCHAIN=$(RACER_RUST_TOOLCHAIN) timeout --signal=TERM --kill-after=10s 300s python3 hack/scripts/racer-purity-graph.py --manifest-path cmd/racer/Cargo.toml --strict
 
 racer-lint: racer-purity-graph ## Check Rust formatting, workspace Clippy, and Racer purity
-	timeout --signal=TERM --kill-after=10s 300s cargo +$(RACER_RUST_TOOLCHAIN) fmt --manifest-path cmd/racer/Cargo.toml --all --check
-	timeout --signal=TERM --kill-after=10s 1200s cargo +$(RACER_RUST_TOOLCHAIN) clippy --locked --manifest-path cmd/racer/Cargo.toml --workspace --all-targets -- -D warnings
-	timeout --signal=TERM --kill-after=10s 600s cargo +$(RACER_RUST_TOOLCHAIN) test --locked --manifest-path cmd/racer/Cargo.toml -p racer-core --test purity
+	timeout --signal=TERM --kill-after=10s 300s $(RACER_CARGO) fmt --manifest-path cmd/racer/Cargo.toml --all --check
+	timeout --signal=TERM --kill-after=10s 1200s $(RACER_CARGO) clippy --locked --manifest-path cmd/racer/Cargo.toml --workspace --all-targets -- -D warnings
+	timeout --signal=TERM --kill-after=10s 600s $(RACER_CARGO) test --locked --manifest-path cmd/racer/Cargo.toml -p racer-core --test purity
 
 FUZZ_SECONDS ?= 30
-RACER_FUZZ_TARGETS ?= http_head small_body peer_envelope control_documents store_record checkpoint
+# Derive the target names from the fuzz manifest's [[bin]] entries so this list
+# cannot drift from cmd/racer/fuzz/Cargo.toml.
+RACER_FUZZ_MANIFEST := cmd/racer/fuzz/Cargo.toml
+RACER_FUZZ_TARGETS ?= $(shell sed -n '/^\[\[bin\]\]/,/^$$/s/^name = "\(.*\)"/\1/p' $(RACER_FUZZ_MANIFEST))
 
 .PHONY: racer-fuzz
 racer-fuzz: ## Run each Racer libFuzzer target for FUZZ_SECONDS (default 30)
+	@test -n "$(RACER_FUZZ_TARGETS)" || { echo "no fuzz targets in $(RACER_FUZZ_MANIFEST)" >&2; exit 1; }
 	cd cmd/racer/fuzz && for target in $(RACER_FUZZ_TARGETS); do \
-		timeout --signal=TERM --kill-after=10s 1500s env RUSTC_BOOTSTRAP=1 cargo +$(RACER_RUST_TOOLCHAIN) fuzz run "$$target" "corpus/$$target" -- -max_total_time=$(FUZZ_SECONDS) || exit 1; \
+		timeout --signal=TERM --kill-after=10s 1500s env RUSTC_BOOTSTRAP=1 $(RACER_CARGO) fuzz run "$$target" "corpus/$$target" -- -max_total_time=$(FUZZ_SECONDS) || exit 1; \
 	done
 
 RACER_GPU_NATIVE ?= $(CURDIR)/bin/racer-gpu-native
@@ -676,9 +684,9 @@ RACER_TORCH_INDEX ?= https://download.pytorch.org/whl/cu128
 .PHONY: racer-gpu-test
 racer-gpu-test: ## Build the CUDA shim with kernels (needs nvcc) and run GPU hardware tests (needs a GPU)
 	RACER_GPU_REQUIRE_PTX=1 timeout --signal=TERM --kill-after=10s 600s sh images/racer/build-native-cuda.sh cmd/racer/gpu/native "$(RACER_GPU_NATIVE)/libracer_gpu_cuda.so.1"
-	LD_LIBRARY_PATH="$(RACER_GPU_NATIVE)$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}" timeout --signal=TERM --kill-after=10s 300s cargo test --locked --manifest-path cmd/racer/Cargo.toml -p racer-gpu --no-default-features --features native --lib ffi::tests::required_native_shim_loads_abi_and_symbols -- --exact --ignored
-	LD_LIBRARY_PATH="$(RACER_GPU_NATIVE)$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}" RACER_GPU_TESTS=$(RACER_GPU_TESTS) timeout --signal=TERM --kill-after=10s 900s cargo test --locked --manifest-path cmd/racer/Cargo.toml -p racer-gpu --no-default-features --features native --test hardware -- --nocapture --test-threads=1
-	LD_LIBRARY_PATH="$(RACER_GPU_NATIVE)$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}" RACER_GPU_TESTS=$(RACER_GPU_TESTS) timeout --signal=TERM --kill-after=10s 1800s cargo test --locked --manifest-path cmd/racer/Cargo.toml -p racer --features cuda --lib gpu::hardware:: -- --nocapture --test-threads=1
+	LD_LIBRARY_PATH="$(RACER_GPU_NATIVE)$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}" timeout --signal=TERM --kill-after=10s 300s $(RACER_CARGO) test --locked --manifest-path cmd/racer/Cargo.toml -p racer-gpu --features native --lib ffi::tests::required_native_shim_loads_abi_and_symbols -- --exact --ignored
+	LD_LIBRARY_PATH="$(RACER_GPU_NATIVE)$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}" RACER_GPU_TESTS=$(RACER_GPU_TESTS) timeout --signal=TERM --kill-after=10s 900s $(RACER_CARGO) test --locked --manifest-path cmd/racer/Cargo.toml -p racer-gpu --features native --test hardware -- --nocapture --test-threads=1
+	LD_LIBRARY_PATH="$(RACER_GPU_NATIVE)$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}" RACER_GPU_TESTS=$(RACER_GPU_TESTS) timeout --signal=TERM --kill-after=10s 1800s $(RACER_CARGO) test --locked --manifest-path cmd/racer/Cargo.toml -p racer --features cuda --lib gpu::hardware:: -- --nocapture --test-threads=1
 	@test -x "$(RACER_PY_GPU_VENV)/bin/pytest" || { timeout --signal=TERM --kill-after=10s 120s python3 -m venv "$(RACER_PY_GPU_VENV)" && \
 		timeout --signal=TERM --kill-after=10s 1200s "$(RACER_PY_GPU_VENV)/bin/pip" install -q torch --index-url "$(RACER_TORCH_INDEX)" && \
 		timeout --signal=TERM --kill-after=10s 300s "$(RACER_PY_GPU_VENV)/bin/pip" install -q pytest numpy; }
@@ -710,14 +718,14 @@ RACER_DST_TIMEOUT ?= 1200s
 # DST_STEPS: step budget per run. DST_FILTER: scenario name substring. Each entry runs twice.
 .PHONY: racer-dst
 racer-dst: ## Run the Racer deterministic simulation tests; every seed runs twice and must match
-	DST_SEEDS="$(DST_SEEDS)" DST_STEPS="$(DST_STEPS)" DST_FILTER="$(DST_FILTER)" timeout --signal=TERM --kill-after=10s $(RACER_DST_TIMEOUT) cargo +$(RACER_RUST_TOOLCHAIN) run --locked --profile test --manifest-path cmd/racer/Cargo.toml -p racer-dst --bin racer-dst
+	DST_SEEDS="$(DST_SEEDS)" DST_STEPS="$(DST_STEPS)" DST_FILTER="$(DST_FILTER)" timeout --signal=TERM --kill-after=10s $(RACER_DST_TIMEOUT) $(RACER_CARGO) run --locked --profile test --manifest-path cmd/racer/Cargo.toml -p racer-dst --bin racer-dst
 
 RACER_DST_REPORT_TIMEOUT ?= 7200s
 
 # One Model scenario's JSON report: --scenario, --nodes, --seed, --duration, --config, --out.
 .PHONY: racer-dst-report
 racer-dst-report: ## Write one Racer Model scenario's JSON report; pass options with ARGS='--scenario full-failover --nodes 200'
-	timeout --signal=TERM --kill-after=10s $(RACER_DST_REPORT_TIMEOUT) cargo +$(RACER_RUST_TOOLCHAIN) run --release --locked --manifest-path cmd/racer/Cargo.toml -p racer-dst --bin racer-dst -- $(ARGS)
+	timeout --signal=TERM --kill-after=10s $(RACER_DST_REPORT_TIMEOUT) $(RACER_CARGO) run --release --locked --manifest-path cmd/racer/Cargo.toml -p racer-dst --bin racer-dst -- $(ARGS)
 
 $(SETUP_ENVTEST):
 	@mkdir -p bin tmp/envtest-tools
@@ -778,13 +786,13 @@ racer-object-build: ## Build the Rust racer-object sidecar (release) into bin/ra
 	@mkdir -p bin
 	CARGO_TARGET_DIR="$(RACER_OBJECT_CARGO_TARGET_DIR)" \
 		RACER_OBJECT_VERSION="$(VERSION)" RACER_OBJECT_GIT_COMMIT="$(GIT_COMMIT)" RACER_OBJECT_BUILD_TIME="$(BUILD_TIME)" \
-		timeout --signal=TERM --kill-after=10s 600s cargo build --locked --release --manifest-path $(RACER_OBJECT_MANIFEST)
+		timeout --signal=TERM --kill-after=10s 600s $(RACER_CARGO) build --locked --release --manifest-path $(RACER_OBJECT_MANIFEST)
 	install -m 0755 "$(RACER_OBJECT_CARGO_TARGET_DIR)/release/racer-object" $(RACER_OBJECT_BIN)
 
 racer-object-test: ## Check formatting, run Clippy, and test the racer-object crate
-	timeout --signal=TERM --kill-after=10s 300s cargo fmt --manifest-path $(RACER_OBJECT_MANIFEST) --all --check
-	CARGO_TARGET_DIR="$(RACER_OBJECT_CARGO_TARGET_DIR)" timeout --signal=TERM --kill-after=10s 600s cargo clippy --locked --manifest-path $(RACER_OBJECT_MANIFEST) --all-targets -- -D warnings
-	CARGO_TARGET_DIR="$(RACER_OBJECT_CARGO_TARGET_DIR)" timeout --signal=TERM --kill-after=10s 600s cargo test --locked --manifest-path $(RACER_OBJECT_MANIFEST)
+	timeout --signal=TERM --kill-after=10s 300s $(RACER_CARGO) fmt --manifest-path $(RACER_OBJECT_MANIFEST) --all --check
+	CARGO_TARGET_DIR="$(RACER_OBJECT_CARGO_TARGET_DIR)" timeout --signal=TERM --kill-after=10s 600s $(RACER_CARGO) clippy --locked --manifest-path $(RACER_OBJECT_MANIFEST) --all-targets -- -D warnings
+	CARGO_TARGET_DIR="$(RACER_OBJECT_CARGO_TARGET_DIR)" timeout --signal=TERM --kill-after=10s 600s $(RACER_CARGO) test --locked --manifest-path $(RACER_OBJECT_MANIFEST)
 
 image-racer-object-local: ## Build the racer-object container image locally (single-arch)
 	$(CONTAINER_ENGINE) build \

@@ -52,7 +52,7 @@ use racer_core::read::{self, PageBudget};
 use racer_core::read::{DIRECT_AHEAD, SELECTIONS, window::PAGE_RETRIES};
 
 /// Flights requested per provider contract. A provider grants at most this
-/// many pending selections per contract, or one if it predates multi-flight.
+/// many pending selections per contract.
 pub(crate) const REQUESTED_FLIGHTS: u16 = 4;
 const _: () = assert!(REQUESTED_FLIGHTS <= racer_core::subscriptions::MAX_SUBSCRIPTION_FLIGHTS);
 
@@ -82,7 +82,7 @@ struct Contract {
     /// was omitted).
     requested: u16,
     /// Selections the provider allows pending at once: 1 until a `Selected`
-    /// grant raises it, back to 1 after a refusal.
+    /// grant raises it.
     granted: u16,
 }
 
@@ -212,19 +212,6 @@ impl Scheduler {
         }
         if let Some(contract) = self.state.lock().unwrap().contracts.get_mut(&key) {
             contract.granted = flights.clamp(1, contract.requested);
-        }
-    }
-
-    /// The provider refused a multi-flight request: one flight from now on.
-    pub(crate) fn refused(&self, selection: &Selection, provider: &racer_wire::control::NodeId) {
-        let Some(key) = selection.contract.lock().unwrap().clone() else {
-            return;
-        };
-        if &key.2 != provider {
-            return;
-        }
-        if let Some(contract) = self.state.lock().unwrap().contracts.get_mut(&key) {
-            contract.granted = 1;
         }
     }
 
@@ -742,12 +729,13 @@ impl RangeStream {
         let credits = Window::new(pages, bytes, size).map_err(window_error)?;
         let lease = self
             .directory
+            .node()
             .subscriptions
             .open(self.metadata.version.clone())?;
         self.credits = Some(credits);
         self.lease = Some(lease);
         self.facts.leased = true;
-        let limit = self.directory.spill_config().range_spill_pages;
+        let limit = self.directory.node().spill_config().range_spill_pages;
         self.spill = if self.passthrough { 0 } else { limit };
         self.window = None;
         Ok(())
@@ -1114,7 +1102,7 @@ impl RangeStream {
             return;
         };
         let selection = Selection {
-            scheduler: self.directory.subscriptions.clone(),
+            scheduler: self.directory.node().subscriptions.clone(),
             version: self.metadata.version.clone(),
             demand,
             contract: Mutex::new(None),
@@ -2271,9 +2259,13 @@ pub(super) mod tests {
                 flow_control::subscriptions::Interval { start: 0, end: 1 },
             ])
             .unwrap();
-            Selection::for_test(&directory.subscriptions, metadata.version.clone(), demand)
-                .complete(page_result(&f.admission, &metadata, 0))
-                .unwrap();
+            Selection::for_test(
+                &directory.node().subscriptions,
+                metadata.version.clone(),
+                demand,
+            )
+            .complete(page_result(&f.admission, &metadata, 0))
+            .unwrap();
             if repoll {
                 stream.poll_prefetch(&mut cx);
                 stream.poll_prefetch(&mut cx);
@@ -2419,14 +2411,23 @@ pub(super) mod tests {
         drop(first);
         assert_eq!(pipes.idle_count(), 0, "no pipe was even allocated");
         assert!(matches!(
-            directory.subscriptions.open(metadata.version.clone()),
+            directory
+                .node()
+                .subscriptions
+                .open(metadata.version.clone()),
             Err(Error::Overloaded)
         ));
         futures::executor::block_on(stream.cancel()).unwrap();
         assert!(scope.cancellation.is_canceled());
         assert!(stream.lease.is_none());
         assert!(stream.retained.is_empty());
-        assert!(directory.subscriptions.open(metadata.version).is_ok());
+        assert!(
+            directory
+                .node()
+                .subscriptions
+                .open(metadata.version)
+                .is_ok()
+        );
     }
     #[test]
     fn client_page_progress_outlives_attempt_and_link_totals_without_refilling_retries() {
@@ -2956,7 +2957,7 @@ pub(super) mod tests {
             }])
             .unwrap();
         let selection = Selection::for_test(
-            &f.streams.directory.subscriptions,
+            &f.streams.directory.node().subscriptions,
             metadata.version.clone(),
             demand,
         );
@@ -3042,6 +3043,7 @@ pub(super) mod tests {
         let f = Fixture::new(&env, crate::test_support::cluster::config(false).limits, 4);
         f.streams
             .directory
+            .node()
             .configure_spill(crate::read::spill::Config {
                 range_spill_pages: 4,
                 ..Default::default()
@@ -3101,7 +3103,7 @@ pub(super) mod tests {
         drop(stream);
         // A grant of several flights on a contract of the version lets the
         // read split its holes over several concurrent selections.
-        let scheduler = &f.streams.directory.subscriptions;
+        let scheduler = &f.streams.directory.node().subscriptions;
         let provider = racer_wire::control::NodeId("provider".into());
         let granted = Selection::for_test(
             scheduler,
@@ -3609,7 +3611,7 @@ pub(super) mod tests {
             assert_eq!(expires, deadline);
         }
         #[test]
-        fn contract_serves_up_to_granted_flights_and_refusal_resets_to_one() {
+        fn contract_serves_up_to_granted_flights() {
             let scheduler = Scheduler::new(4, racer_io::WorkerCtx::host());
             let deadline = racer_io::Clock::host().now() + std::time::Duration::from_secs(30);
             let provider = NodeId("provider".into());
@@ -3637,19 +3639,7 @@ pub(super) mod tests {
             held.pop();
             let (_, single) = issue(&scheduler, 3, "provider", None, deadline);
             assert_eq!(single, Err(Error::Overloaded));
-            // A refusal drops the contract to one flight: two still pending
-            // block new ones until both finish.
-            let (selection, result) = issue(&scheduler, 3, "provider", Some(3), deadline);
-            result.unwrap();
-            scheduler.refused(&selection, &provider);
-            held.push(selection);
-            while let Some(selection) = held.pop() {
-                let (_, next) = issue(&scheduler, 4, "provider", Some(3), deadline);
-                assert_eq!(next, Err(Error::Overloaded));
-                drop(selection);
-            }
-            let (_last, last) = issue(&scheduler, 4, "provider", Some(3), deadline);
-            last.unwrap();
+            drop(held);
         }
         #[test]
         fn expired_contract_drains_before_a_fresh_one_replaces_it() {
@@ -3995,7 +3985,7 @@ pub(super) mod tests {
                 );
                 assert!(reader.lease.is_none());
             }
-            let scheduler = &f.streams.directory.subscriptions;
+            let scheduler = &f.streams.directory.node().subscriptions;
             assert!(scheduler.state.lock().unwrap().readers.is_empty());
             let mut credits = Window::new(1, PAGE_BYTES, PAGE_BYTES).unwrap();
             assert_eq!(

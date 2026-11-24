@@ -574,17 +574,37 @@ pub(crate) fn pci_p2pdma(setting: Option<bool>, dev: &std::path::Path) -> bool {
     })
 }
 
-/// Per-GPU state shared with I/O threads.
-struct DeviceShared {
-    ordinal: i32,
+/// Mutable state shared by the helper handle and every GPU thread.
+struct Shared {
+    /// GPU resources leaked on purpose after a failed release.
+    leaked: AtomicU64,
 
-    /// The startup decrypt probe passed and staging holds the scratch slots.
-    decrypt: bool,
+    /// cuFile is worth trying: no driver-level failure has been seen.
+    cufile: AtomicBool,
 
-    slots: Arc<SlotPool>,
+    counters: GpuCounters,
 
-    /// The GPU's executor queue.
-    queue: Arc<Queue>,
+    /// GPU pairs with a working peer path. Set before startup answers.
+    peers: std::sync::OnceLock<PeerMatrix>,
+
+    /// The GPU each imported request is on, until its executor releases it.
+    owners: Mutex<HashMap<u64, i32>>,
+
+    /// Streams the executors hold between requests.
+    streams: AtomicUsize,
+}
+
+impl Shared {
+    fn new() -> Self {
+        Self {
+            leaked: AtomicU64::new(0),
+            cufile: AtomicBool::new(true),
+            counters: GpuCounters::default(),
+            peers: std::sync::OnceLock::new(),
+            owners: Mutex::new(HashMap::new()),
+            streams: AtomicUsize::new(0),
+        }
+    }
 }
 
 /// A message to the coordinator thread.
@@ -771,111 +791,52 @@ pub struct GpuHelper {
     devices: Vec<DeviceInfo>,
     next: AtomicU64,
     open: AtomicUsize,
-    leaked: Arc<AtomicU64>,
-    shared: Arc<Vec<DeviceShared>>,
-    /// cuFile is worth trying: no driver-level failure has been seen.
-    cufile: Arc<AtomicBool>,
-    counters: Arc<GpuCounters>,
-    kernels_off: Arc<Mutex<std::collections::HashSet<i32>>>,
+    /// State the handle shares with the coordinator and the executors.
+    shared: Arc<Shared>,
+    /// Each GPU, shared with the coordinator and its executor.
+    gpus: Arc<Vec<Arc<Device>>>,
     /// Live landing buffers, one per GPU at most. Weak: a buffer is freed
     /// once nothing registers or reads it, and made again on demand.
     landings: Mutex<HashMap<i32, Weak<GpuLanding>>>,
-    /// GPU pairs with a working peer path. Set before startup answers.
-    peers: Arc<std::sync::OnceLock<PeerMatrix>>,
-    /// The GPU each imported request is on, until its executor releases it.
-    owners: Arc<Mutex<HashMap<u64, i32>>>,
-    /// Streams the executors hold between requests.
-    streams: Arc<AtomicUsize>,
 }
 
 impl GpuHelper {
     /// Resolve `mode` against hardware. Returns `None` when GPU mode is off.
-    pub fn start(mode: GpuMode, options: GpuOptions) -> Result<Option<Arc<Self>>> {
-        Self::start_built(
-            mode,
-            cfg!(feature = "cuda"),
-            options,
-            Box::new(racer_gpu::Gpu::load),
-        )
-    }
-
-    /// [`Self::start`] with `built` standing in for the `cuda` feature and a
-    /// custom backend loader. `loader` is not called when GPU mode is off.
+    /// `built` stands in for the `cuda` feature and `loader` loads the backend;
+    /// `loader` is not called when GPU mode is off.
     pub fn start_built(
         mode: GpuMode,
         built: bool,
         options: GpuOptions,
         loader: Loader,
     ) -> Result<Option<Arc<Self>>> {
-        match mode {
-            GpuMode::Disabled => Ok(None),
-            GpuMode::Auto if !built => {
-                eprintln!("racer: stage=gpu state=disabled reason=not-built");
-                Ok(None)
-            }
-            _ => Self::start_with_options(mode, options, loader),
-        }
-    }
-
-    /// Start the helper with a custom backend loader and the default staging cap.
-    pub fn start_with(mode: GpuMode, loader: Loader) -> Result<Option<Arc<Self>>> {
-        Self::start_with_staging(mode, crate::config::DEFAULT_GPU_STAGING_BYTES, loader)
-    }
-
-    /// Start the helper with a custom backend loader and a per-GPU staging cap.
-    pub fn start_with_staging(
-        mode: GpuMode,
-        staging_bytes: u64,
-        loader: Loader,
-    ) -> Result<Option<Arc<Self>>> {
-        let options = GpuOptions {
-            staging_bytes,
-            ..GpuOptions::default()
-        };
-        Self::start_with_options(mode, options, loader)
-    }
-
-    /// Start the helper with a custom backend loader and options.
-    pub fn start_with_options(
-        mode: GpuMode,
-        options: GpuOptions,
-        loader: Loader,
-    ) -> Result<Option<Arc<Self>>> {
-        let staging_bytes = options.staging_bytes;
-        let pci_p2pdma = options.pci_p2pdma;
         if mode == GpuMode::Disabled {
             return Ok(None);
         }
+        if mode == GpuMode::Auto && !built {
+            eprintln!("racer: stage=gpu state=disabled reason=not-built");
+            return Ok(None);
+        }
+        let staging_bytes = options.staging_bytes;
+        let pci_p2pdma = options.pci_p2pdma;
         let (jobs, receiver) = mpsc::channel();
         let (ready, started) = mpsc::sync_channel(1);
-        let leaked = Arc::new(AtomicU64::new(0));
-        let cufile = Arc::new(AtomicBool::new(true));
-        let counters = Arc::new(GpuCounters::default());
         let slots = staging_bytes / SLOT_BYTES;
-        let kernels_off = Arc::new(Mutex::new(std::collections::HashSet::new()));
-        let peers = Arc::new(std::sync::OnceLock::new());
-        let owners = Arc::new(Mutex::new(HashMap::new()));
-        let streams = Arc::new(AtomicUsize::new(0));
+        let shared = Arc::new(Shared::new());
         let state = HelperState {
             peer: options.peer,
-            peers: peers.clone(),
-            leaked: leaked.clone(),
-            cufile: cufile.clone(),
-            counters: counters.clone(),
-            kernels_off: kernels_off.clone(),
+            shared: shared.clone(),
             slots,
             pci_p2pdma,
             queue_depth: options.queue_depth.max(1),
-            owners: owners.clone(),
-            streams: streams.clone(),
         };
         std::thread::Builder::new()
             .name("racer-gpu".into())
             .spawn(move || coordinator_main(loader, receiver, ready, state))
             .map_err(|_| Error::Unavailable)?;
         let found = started.recv().map_err(|_| Error::Unavailable)?;
-        let (devices, decrypt, queues) = match found {
-            Ok((devices, decrypt, queues)) if !devices.is_empty() => (devices, decrypt, queues),
+        let (devices, gpus) = match found {
+            Ok((devices, gpus)) if !devices.is_empty() => (devices, gpus),
             outcome => {
                 let reason = match outcome {
                     Err(error) => error.to_string(),
@@ -890,23 +851,10 @@ impl GpuHelper {
             }
         };
         let scratch = scratch_slots(staging_bytes) as u64;
-        let decrypting = slots >= scratch;
-        let shared = devices
-            .iter()
-            .zip(decrypt.iter().zip(queues))
-            .map(|(device, (kernels, queue))| DeviceShared {
-                ordinal: device.ordinal,
-                decrypt: *kernels && decrypting,
-                slots: Arc::new(SlotPool {
-                    free: Mutex::new((scratch..slots.max(scratch)).rev().collect()),
-                }),
-                queue,
-            })
-            .collect::<Vec<_>>();
         eprintln!(
             "racer: stage=gpu state=enabled usable={} decrypt={} staging_slots={} scratch_slots={} streams={} queue_depth={} pci_p2pdma={}",
             devices.len(),
-            shared.iter().filter(|device| device.decrypt).count(),
+            gpus.iter().filter(|device| device.decrypt).count(),
             slots,
             scratch,
             STREAMS,
@@ -918,15 +866,9 @@ impl GpuHelper {
             devices,
             next: AtomicU64::new(1),
             open: AtomicUsize::new(0),
-            leaked,
-            shared: Arc::new(shared),
-            cufile,
-            counters,
-            kernels_off,
+            shared,
+            gpus: Arc::new(gpus),
             landings: Mutex::new(HashMap::new()),
-            peers,
-            owners,
-            streams,
         })))
     }
 
@@ -938,6 +880,7 @@ impl GpuHelper {
     pub fn peers(&self, dst: i32, src: i32) -> bool {
         dst == src
             || self
+                .shared
                 .peers
                 .get()
                 .and_then(|matrix| matrix.entry(dst, src))
@@ -947,25 +890,25 @@ impl GpuHelper {
     /// Count a sealed fetch that reused GPU ciphertext another request
     /// already had instead of fetching it.
     pub fn record_joined(&self) {
-        self.counters.joined.fetch_add(1, Ordering::Relaxed);
+        self.shared.counters.joined.fetch_add(1, Ordering::Relaxed);
     }
 
     /// GPU decryption counters.
     pub fn counters(&self) -> &GpuCounters {
-        &self.counters
+        &self.shared.counters
     }
 
-    fn device(&self, ordinal: i32) -> Option<&DeviceShared> {
-        self.shared.iter().find(|device| device.ordinal == ordinal)
+    fn device(&self, ordinal: i32) -> Option<&Device> {
+        self.gpus
+            .iter()
+            .find(|device| device.ordinal == ordinal)
+            .map(Arc::as_ref)
     }
 
     /// Whether sealed pages can be decrypted on this GPU.
     pub fn decrypts(&self, ordinal: i32) -> bool {
-        self.device(ordinal).is_some_and(|device| device.decrypt)
-            && self
-                .kernels_off
-                .lock()
-                .is_ok_and(|off| !off.contains(&ordinal))
+        self.device(ordinal)
+            .is_some_and(|device| device.decrypt && !device.kernels_off.load(Ordering::Relaxed))
     }
 
     /// Free staged-ciphertext slots on this GPU.
@@ -984,12 +927,12 @@ impl GpuHelper {
     /// streams used to bounce ciphertext, and streams kept after a failed
     /// fence. None of them belongs to a request.
     pub fn executor_streams(&self) -> usize {
-        self.streams.load(Ordering::Relaxed)
+        self.shared.streams.load(Ordering::Relaxed)
     }
 
     /// Whether a cuFile read is worth trying.
     pub fn cufile(&self) -> bool {
-        self.cufile.load(Ordering::Relaxed)
+        self.shared.cufile.load(Ordering::Relaxed)
     }
 
     /// Read `length` bytes at `file_offset` of `fd` into a staging slot on
@@ -1011,7 +954,10 @@ impl GpuHelper {
         }
         let device = self.device(ordinal).ok_or(Error::Unavailable)?;
         let Some(slot) = device.slots.take() else {
-            self.counters.exhausted.fetch_add(1, Ordering::Relaxed);
+            self.shared
+                .counters
+                .exhausted
+                .fetch_add(1, Ordering::Relaxed);
             return Err(Error::Overloaded);
         };
         let staged = StagedCiphertext {
@@ -1095,12 +1041,21 @@ impl GpuHelper {
 
     /// GPU resources leaked on purpose after a failed release.
     pub fn leaked(&self) -> u64 {
-        self.leaked.load(Ordering::Relaxed)
+        self.shared.leaked.load(Ordering::Relaxed)
     }
 
     /// Requests that currently hold a sink.
     pub fn open_requests(&self) -> usize {
         self.open.load(Ordering::Relaxed)
+    }
+
+    /// Requests whose import the executors still hold.
+    pub fn imported_requests(&self) -> usize {
+        self.shared
+            .owners
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
     }
 
     fn send(&self, job: Job) -> Result<()> {
@@ -1112,7 +1067,10 @@ impl GpuHelper {
         let device = self.device(ordinal).ok_or(Error::Internal)?;
         let result = device.queue.write(task);
         if result == Err(Error::Overloaded) {
-            self.counters.queue_full.fetch_add(1, Ordering::Relaxed);
+            self.shared
+                .counters
+                .queue_full
+                .fetch_add(1, Ordering::Relaxed);
         }
         result
     }
@@ -1121,6 +1079,7 @@ impl GpuHelper {
     /// the coordinator when its import has not answered yet.
     fn release(&self, id: u64, reply: Option<oneshot::Sender<Result<()>>>) -> Result<()> {
         let owner = self
+            .shared
             .owners
             .lock()
             .ok()
@@ -1320,20 +1279,14 @@ struct Remote {
 struct HelperState {
     /// `RACER_GPU_PEER=auto`: try to enable peer access between GPUs.
     peer: bool,
-    peers: Arc<std::sync::OnceLock<PeerMatrix>>,
-    leaked: Arc<AtomicU64>,
-    cufile: Arc<AtomicBool>,
-    counters: Arc<GpuCounters>,
-    /// GPUs whose decrypt kernels failed after startup.
-    kernels_off: Arc<Mutex<std::collections::HashSet<i32>>>,
+    /// State shared with the helper handle and every GPU thread.
+    shared: Arc<Shared>,
     /// Staging slots per GPU.
     slots: u64,
     /// Ask cuFile to use PCI P2PDMA.
     pci_p2pdma: bool,
     /// Page jobs per executor queue.
     queue_depth: usize,
-    owners: Arc<Mutex<HashMap<u64, i32>>>,
-    streams: Arc<AtomicUsize>,
 }
 
 /// A registered cuFile handle and the reads using it.
@@ -1367,7 +1320,7 @@ fn reader_main(
     reader: racer_gpu::FileReader,
     jobs: Arc<Mutex<mpsc::Receiver<FileJob>>>,
     done: mpsc::Sender<FileDone>,
-    counters: Arc<GpuCounters>,
+    shared: Arc<Shared>,
 ) {
     loop {
         let job = match jobs.lock() {
@@ -1380,10 +1333,13 @@ fn reader_main(
         let result = reader.read(job.read);
         let failed = result.is_err();
         if let Err(error) = &result {
-            counters.file_failures.fetch_add(1, Ordering::Relaxed);
+            shared
+                .counters
+                .file_failures
+                .fetch_add(1, Ordering::Relaxed);
             eprintln!("racer: stage=gpu state=cufile-read-failed reason={error}");
         } else {
-            counters.staged.fetch_add(1, Ordering::Relaxed);
+            shared.counters.staged.fetch_add(1, Ordering::Relaxed);
         }
         let _ = done.send(FileDone {
             file: job.file,
@@ -1396,14 +1352,23 @@ fn reader_main(
     }
 }
 
-/// One GPU, shared by the coordinator and every executor.
+/// One GPU, shared by the helper handle, the coordinator, and every
+/// executor.
 struct Device {
     ordinal: i32,
+    /// The startup decrypt probe passed and staging holds the scratch slots.
+    decrypt: bool,
+    /// The decrypt kernels failed after startup, so the GPU no longer
+    /// decrypts sealed pages.
+    kernels_off: AtomicBool,
+    /// Free staging slots for cuFile reads.
+    slots: Arc<SlotPool>,
     context: racer_gpu::Context,
     /// The staging buffer, allocated on first use.
     staging: Mutex<Option<Arc<racer_gpu::StagingBuffer>>>,
     /// Events for fences on this GPU's streams.
     events: racer_gpu::EventPool,
+    /// The GPU's executor queue.
     queue: Arc<Queue>,
 }
 
@@ -1502,7 +1467,7 @@ impl Engine {
 
     fn note_leaks(&self) {
         let leaked = self.gpu.leaked();
-        if self.state.leaked.swap(leaked, Ordering::Relaxed) != leaked {
+        if self.state.shared.leaked.swap(leaked, Ordering::Relaxed) != leaked {
             eprintln!("racer: stage=gpu state=leaked total={leaked}");
         }
     }
@@ -1534,7 +1499,7 @@ struct Coordinator {
     executors: Vec<std::thread::JoinHandle<()>>,
 }
 
-type Started = racer_gpu::Result<(Vec<DeviceInfo>, Vec<bool>, Vec<Arc<Queue>>)>;
+type Started = racer_gpu::Result<(Vec<DeviceInfo>, Vec<Arc<Device>>)>;
 
 fn coordinator_main(
     loader: Loader,
@@ -1547,37 +1512,46 @@ fn coordinator_main(
             // Before any reader or open: the flag applies only to the open
             // that loads cuFile.
             gpu.set_pci_p2pdma(state.pci_p2pdma);
-            let decrypt = contexts.iter().map(probe_decrypt).collect();
-            let _ = state.peers.set(enable_peers(&contexts, state.peer));
+            let decrypt: Vec<bool> = contexts.iter().map(probe_decrypt).collect();
+            let _ = state.shared.peers.set(enable_peers(&contexts, state.peer));
             let (reads, queue) = mpsc::channel();
             let queue = Arc::new(Mutex::new(queue));
             let (finished, done) = mpsc::channel();
             let mut readers = Vec::new();
             for _ in 0..FILE_READERS {
-                let (reader, queue, finished, counters) = (
+                let (reader, queue, finished, shared) = (
                     gpu.file_reader(),
                     queue.clone(),
                     finished.clone(),
-                    state.counters.clone(),
+                    state.shared.clone(),
                 );
                 // Without readers, stages fail and pages go through the host.
                 if let Ok(thread) = std::thread::Builder::new()
                     .name("racer-gpu-read".into())
-                    .spawn(move || reader_main(reader, queue, finished, counters))
+                    .spawn(move || reader_main(reader, queue, finished, shared))
                 {
                     readers.push(thread);
                 }
             }
-            let opener = open_cufile(&gpu, &state.cufile, &state.counters, state.pci_p2pdma);
+            let opener = open_cufile(&gpu, &state.shared, state.pci_p2pdma);
             let uuids = usable
                 .iter()
                 .map(|device: &DeviceInfo| device.uuid)
                 .collect();
+            let slots = state.slots;
+            let scratch = scratch_slots_for(slots);
+            let decrypting = slots >= scratch;
             let devices: Vec<Arc<Device>> = contexts
                 .into_iter()
-                .map(|context| {
+                .zip(decrypt)
+                .map(|(context, kernels)| {
                     Arc::new(Device {
                         ordinal: context.ordinal(),
+                        decrypt: kernels && decrypting,
+                        kernels_off: AtomicBool::new(false),
+                        slots: Arc::new(SlotPool {
+                            free: Mutex::new((scratch..slots.max(scratch)).rev().collect()),
+                        }),
                         events: context.event_pool(IDLE_EVENTS),
                         context,
                         staging: Mutex::new(None),
@@ -1585,7 +1559,6 @@ fn coordinator_main(
                     })
                 })
                 .collect();
-            let queues = devices.iter().map(|device| device.queue.clone()).collect();
             let engine = Arc::new(Engine {
                 gpu,
                 devices,
@@ -1597,7 +1570,7 @@ fn coordinator_main(
                 .iter()
                 .filter_map(|device| spawn_executor(&engine, device))
                 .collect();
-            let _ = ready.send(Ok((usable, decrypt, queues)));
+            let _ = ready.send(Ok((usable, engine.devices.clone())));
             Coordinator {
                 engine,
                 uuids,
@@ -1681,22 +1654,20 @@ fn spawn_executor(
 /// first sealed page. A failed open turns cuFile off, as a failed stage does.
 fn open_cufile(
     gpu: &racer_gpu::Gpu,
-    cufile: &Arc<AtomicBool>,
-    counters: &Arc<GpuCounters>,
+    shared: &Arc<Shared>,
     pci_p2pdma: bool,
 ) -> Option<std::thread::JoinHandle<()>> {
-    if !cufile.load(Ordering::Relaxed) {
+    if !shared.cufile.load(Ordering::Relaxed) {
         return None;
     }
-    let (reader, cufile) = (gpu.file_reader(), cufile.clone());
-    let counters = counters.clone();
+    let (reader, shared) = (gpu.file_reader(), shared.clone());
     std::thread::Builder::new()
         .name("racer-gpu-cufile".into())
         .spawn(move || {
             if let Err(error) = reader.open_driver() {
                 cufile_off(
-                    &cufile,
-                    &counters,
+                    &shared.cufile,
+                    &shared.counters,
                     CufileDisable::DriverOpen,
                     error,
                     pci_p2pdma,
@@ -1911,6 +1882,7 @@ impl Coordinator {
                 let owner = self
                     .engine
                     .state
+                    .shared
                     .owners
                     .lock()
                     .ok()
@@ -2056,6 +2028,7 @@ impl Coordinator {
                     let mut owners = self
                         .engine
                         .state
+                        .shared
                         .owners
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2117,6 +2090,7 @@ impl Coordinator {
         if let Err((error, step)) = registered {
             self.engine
                 .state
+                .shared
                 .counters
                 .file_failures
                 .fetch_add(1, Ordering::Relaxed);
@@ -2149,6 +2123,7 @@ impl Coordinator {
                     Err(error) => {
                         self.engine
                             .state
+                            .shared
                             .counters
                             .file_failures
                             .fetch_add(1, Ordering::Relaxed);
@@ -2232,6 +2207,7 @@ impl Coordinator {
         if self.unsupported.insert(device) {
             self.engine
                 .state
+                .shared
                 .counters
                 .cufile_unsupported
                 .fetch_add(1, Ordering::Relaxed);
@@ -2247,8 +2223,8 @@ impl Coordinator {
     fn disable_cufile(&self, error: racer_gpu::Error, step: CufileDisable) {
         let state = &self.engine.state;
         cufile_off(
-            &state.cufile,
-            &state.counters,
+            &state.shared.cufile,
+            &state.shared.counters,
             step,
             error,
             state.pci_p2pdma,
@@ -2393,7 +2369,7 @@ impl Executor {
 
     /// Drop request `id`'s import and answer `reply`.
     fn release(&mut self, id: u64, reply: Option<oneshot::Sender<Result<()>>>) {
-        if let Ok(mut owners) = self.engine.state.owners.lock() {
+        if let Ok(mut owners) = self.engine.state.shared.owners.lock() {
             owners.remove(&id);
         }
         let before = self.engine.gpu.leaked();
@@ -2444,7 +2420,8 @@ impl Executor {
     /// queue its next step.
     fn advance(&mut self, index: usize) {
         let mut running = self.lanes[index].running.take().expect("running");
-        let counters = self.engine.state.counters.clone();
+        let shared = self.engine.state.shared.clone();
+        let counters = &shared.counters;
         match running.step {
             Step::Copied => {
                 counters.plaintext.fetch_add(1, Ordering::Relaxed);
@@ -2494,7 +2471,7 @@ impl Executor {
 
     /// A sealed page was verified and written.
     fn decrypted(&mut self, index: usize, running: Running) {
-        let counters = &self.engine.state.counters;
+        let counters = &self.engine.state.shared.counters;
         counters.decrypted.fetch_add(1, Ordering::Relaxed);
         if let Work::Sealed(sealed) = &running.task.work
             && matches!(sealed.page.source, SealedSource::Landed(_))
@@ -2599,8 +2576,16 @@ impl Executor {
     fn peer_failed(&self, src: i32, error: &racer_gpu::Error) {
         let dst = self.device.ordinal;
         let state = &self.engine.state;
-        state.counters.peer_failures.fetch_add(1, Ordering::Relaxed);
-        let entry = state.peers.get().and_then(|matrix| matrix.entry(dst, src));
+        state
+            .shared
+            .counters
+            .peer_failures
+            .fetch_add(1, Ordering::Relaxed);
+        let entry = state
+            .shared
+            .peers
+            .get()
+            .and_then(|matrix| matrix.entry(dst, src));
         if entry.is_some_and(|allowed| allowed.swap(false, Ordering::Relaxed)) {
             eprintln!(
                 "racer: stage=gpu ordinal={dst} peer={src} state=peer-disabled reason={error}"
@@ -2622,7 +2607,11 @@ impl Executor {
                     self.free_pairs.push(pair);
                 }
                 drop(tainted.stream);
-                self.engine.state.streams.fetch_sub(1, Ordering::Relaxed);
+                self.engine
+                    .state
+                    .shared
+                    .streams
+                    .fetch_sub(1, Ordering::Relaxed);
             } else {
                 kept.push(tainted);
             }
@@ -2690,7 +2679,11 @@ impl Executor {
         if self.lanes[index].stream.is_none() {
             match self.device.context.stream() {
                 Ok(stream) => {
-                    self.engine.state.streams.fetch_add(1, Ordering::Relaxed);
+                    self.engine
+                        .state
+                        .shared
+                        .streams
+                        .fetch_add(1, Ordering::Relaxed);
                     self.lanes[index].stream = Some(stream);
                 }
                 Err(error) => {
@@ -2836,6 +2829,7 @@ impl Executor {
             let allowed = self
                 .engine
                 .state
+                .shared
                 .peers
                 .get()
                 .and_then(|matrix| matrix.entry(ordinal, src))
@@ -2922,9 +2916,7 @@ impl Executor {
         };
         let decrypted = stream.decrypt(&request, source_buffer, source, destination, at);
         if let Err(racer_gpu::Error::KernelUnavailable) = decrypted {
-            if let Ok(mut off) = self.engine.state.kernels_off.lock() {
-                off.insert(ordinal);
-            }
+            self.device.kernels_off.store(true, Ordering::Relaxed);
             return Err(Error::Unavailable);
         }
         decrypted.map_err(gpu_error)?;
@@ -2962,7 +2954,11 @@ impl Executor {
                     .context
                     .stream()
                     .map_err(gpu_error)?;
-                self.engine.state.streams.fetch_add(1, Ordering::Relaxed);
+                self.engine
+                    .state
+                    .shared
+                    .streams
+                    .fetch_add(1, Ordering::Relaxed);
                 entry.insert(stream)
             }
         };
@@ -2996,7 +2992,7 @@ impl Executor {
         for id in ids {
             self.release(id, None);
         }
-        let streams = &self.engine.state.streams;
+        let streams = &self.engine.state.shared.streams;
         for lane in self.lanes.drain(..) {
             if lane.stream.is_some() {
                 streams.fetch_sub(1, Ordering::Relaxed);
@@ -3240,7 +3236,7 @@ pub(crate) mod testing {
 
     /// The GPU request `id` was imported on.
     pub(crate) fn owner(helper: &GpuHelper, id: u64) -> Option<i32> {
-        helper.owners.lock().unwrap().get(&id).copied()
+        helper.shared.owners.lock().unwrap().get(&id).copied()
     }
 
     /// Release request `id` and wait for the answer.
@@ -3289,8 +3285,9 @@ pub(crate) mod testing {
                 device
             })
             .collect();
-        GpuHelper::start_with_options(
+        GpuHelper::start_built(
             GpuMode::Required,
+            true,
             options,
             Box::new(move || {
                 let simulation = racer_gpu::simulation::Simulation::new(devices);

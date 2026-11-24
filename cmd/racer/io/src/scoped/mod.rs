@@ -271,6 +271,19 @@ impl<S: Scope> Reactor<S> {
         })
     }
 
+    /// The lane's raw cross-thread wake endpoint, initializing the reactor if
+    /// needed. Owners that drive the reactor with an executor use this to
+    /// attach the executor's wake source.
+    pub fn wake_handle(&self) -> Result<Arc<WakeHandle>> {
+        Ok(self.io()?.wake_handle())
+    }
+
+    /// Whether a completion or cross-thread wake is ready without doing work.
+    /// An uninitialized reactor has nothing ready.
+    pub fn has_ready(&self) -> bool {
+        self.io.get().is_some_and(crate::Reactor::has_ready)
+    }
+
     /// Earliest instant, on [`Self::ctx`]'s clock, at which
     /// [`Self::poll_budgeted`] has timed work such as a timer or operation
     /// deadline. `None` when idle, uninitialized, or when the kernel reactor
@@ -368,8 +381,9 @@ impl<S: Scope> Reactor<S> {
 
     /// Submit and await one `racer-io` operation under `scope`. A scope
     /// failure takes precedence over the operation's own error, but only after
-    /// the operation is fenced.
-    pub fn run<'a, T: 'static, F>(
+    /// the operation is fenced. Crate-private: callers outside this crate use
+    /// the typed scoped operations instead of constructing raw ring futures.
+    pub(crate) fn run<'a, T: 'static, F>(
         &'a self,
         scope: &'a S,
         capacity: Option<Rc<SubmissionCapacity>>,
@@ -385,7 +399,7 @@ impl<S: Scope> Reactor<S> {
 
     /// [`Self::run`], also retaining `held` until the operation is fenced,
     /// even when the waiting future is dropped first.
-    pub fn run_holding<'a, T: 'static, F>(
+    pub(crate) fn run_holding<'a, T: 'static, F>(
         &'a self,
         scope: &'a S,
         capacity: Option<Rc<SubmissionCapacity>>,
@@ -896,6 +910,32 @@ impl<S: Scope> Reactor<S> {
         io.park(until)
     }
 
+    /// Park until `until` (or a bounded scan interval), including on a
+    /// simulated clock. An owner that advances a virtual clock itself and
+    /// derives its next step from [`Self::next_deadline`] uses this form;
+    /// [`Self::wait`] is the worker-loop form that never advances a simulated
+    /// clock.
+    pub fn wait_until(&self, until: Option<Instant>) -> Result<()> {
+        let Some(io) = self.io.get() else {
+            return Ok(());
+        };
+        self.scan(io, usize::MAX);
+        // In-flight scopes whose checks only a scan observes need a bounded
+        // park; otherwise completions, wakes, deadline timers, and operation
+        // timers end it.
+        let until = if self.needs_scan() {
+            let limit = io.now().checked_add(MAX_WAIT);
+            match (until, limit) {
+                (Some(at), Some(limit)) => Some(at.min(limit)),
+                (None, Some(limit)) => Some(limit),
+                (at, None) => at,
+            }
+        } else {
+            until
+        };
+        io.park(until)
+    }
+
     /// Whether some in-flight operation can fail its scope check without its
     /// operation context's cancel token or deadline firing.
     fn needs_scan(&self) -> bool {
@@ -1068,6 +1108,50 @@ pub mod timer {
                 }
                 if self.env.sim_os().is_some() {
                     return Err(Error::InvalidConfiguration.into());
+                }
+                let io = self.io()?;
+                let ctx = scope.op_ctx();
+                let target = match ctx.deadline.instant() {
+                    Some(deadline) if !self.foreign_clock.get() => until.min(deadline),
+                    _ => until,
+                };
+                let mut sleep = io.sleep_until(target);
+                // Deregisters on drop, including when this future is dropped.
+                let cancellation = ctx.cancel.as_ref().map(crate::CancelToken::wait);
+                std::future::poll_fn(|cx| {
+                    if let Some(cancellation) = &cancellation {
+                        cancellation.register(cx.waker());
+                        if cancellation.token().is_canceled() {
+                            return Poll::Ready(scope.check().and(Err(Error::Canceled.into())));
+                        }
+                    }
+                    if let Err(error) = scope.check() {
+                        return Poll::Ready(Err(error));
+                    }
+                    Pin::new(&mut sleep).poll(cx).map(|()| scope.check())
+                })
+                .await
+            })
+        }
+    }
+
+    impl<S: Scope> Reactor<S> {
+        /// Sleep until `until` on the reactor's timer heap under the caller's
+        /// scope. Unlike [`Self::sleep_until`], this registers a reactor timer
+        /// on a virtual clock too. An owner that advances the clock itself and
+        /// schedules its next step from [`Reactor::next_deadline`] uses this
+        /// form; the cooperative form would stay runnable and never advance
+        /// time.
+        pub fn sleep_until_scheduled<'a>(
+            &'a self,
+            until: Instant,
+            scope: &'a S,
+        ) -> Operation<'a, (), S::Error> {
+            Box::pin(async move {
+                scope.check()?;
+                let clock = self.ctx().clock.clone();
+                if until <= clock.now() {
+                    return Ok(());
                 }
                 let io = self.io()?;
                 let ctx = scope.op_ctx();

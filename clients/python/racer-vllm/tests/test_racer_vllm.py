@@ -1140,9 +1140,6 @@ def test_settings():
         False,
     )
     assert s["prefetch"] is True and s["prefetch_ttl_seconds"] == 3600
-    assert s["mode_retry_seconds"] == racer.DEFAULT_MODE_RETRY_SECONDS
-    assert rv.settings({"mode_retry_seconds": None})["mode_retry_seconds"] is None
-    assert rv.settings({"mode_retry_seconds": "30"})["mode_retry_seconds"] == 30.0
     assert rv.settings({"prefetch": False, "prefetch_ttl_seconds": 0})["prefetch"] is False
     assert rv.settings({"prefetch": "false"})["prefetch"] is False
     assert rv.settings({"prefetch": " TRUE "})["prefetch"] is True

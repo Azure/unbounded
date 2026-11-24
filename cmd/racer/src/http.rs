@@ -125,11 +125,7 @@ pub(crate) fn acquire_wait<'a>(
         },
     ))
 }
-pub struct RacerOpaque;
-impl http1::Opaque for RacerOpaque {
-    const NAMES: &'static [&'static str] = &["authorization", "racer-metadata"];
-}
-pub type Codec = http1::Codec<RacerOpaque>;
+pub type Codec = http1::Codec<peer_wire::Opaque>;
 pub type ConnectionLease = http1::connection::ConnectionLease<HttpContext>;
 pub type OwnedBuffer = http1::connection::OwnedBuffer<HttpContext>;
 pub type HttpIo = http1::connection::HttpIo<HttpContext>;
@@ -143,7 +139,7 @@ impl http1::connection::Context for HttpContext {
     type Reactor = Reactor;
     type Charge = flow_control::Charge<AdmissionPolicy>;
     type Slot = ConnectionReservation;
-    type Opaque = RacerOpaque;
+    type Opaque = peer_wire::Opaque;
     type State = State;
     type Endpoint = Endpoint;
     fn charge(&self, bytes: usize) -> Result<flow_control::Charge<AdmissionPolicy>> {
@@ -654,11 +650,6 @@ impl http1::delivery::Observer<HttpContext> for DeliveryObserver<'_> {
         self.delivery
             .metrics
             .record(crate::telemetry::Event::DeliveryBytes, count as u64);
-    }
-    fn pipe_drained(&self) {
-        self.delivery
-            .metrics
-            .record(crate::telemetry::Event::DeliveryPipeDrain, 1);
     }
     fn before_send(&self, count: usize, remaining: usize) {
         if let Some(state) = self.final_send {
@@ -1468,9 +1459,6 @@ pub(crate) mod tests {
                 let wall = Instant::now();
                 let mut cpu = Duration::ZERO;
                 let mut pending_turns = 0;
-                let drains = delivery
-                    .metrics
-                    .count(crate::telemetry::Event::DeliveryPipeDrain);
                 for _ in 0..PAGES {
                     let scope = scope();
                     connection.set_framing(
@@ -1533,13 +1521,9 @@ pub(crate) mod tests {
                     assert_eq!(connection.send_remaining(), Some(0));
                     assert_eq!(reactor.in_flight(), 0);
                 }
-                let drains = delivery
-                    .metrics
-                    .count(crate::telemetry::Event::DeliveryPipeDrain)
-                    - drains;
-                assert!(drains == 0 && pending_turns > PAGES);
+                assert!(pending_turns > PAGES);
                 eprintln!(
-                    "delivery_tcp sample={sample} warmup={} bytes={} sender_cpu_ms={:.3} cpu_ns_per_byte={:.4} wall_ms={} pipe_drains={drains} pending_turns={pending_turns}",
+                    "delivery_tcp sample={sample} warmup={} bytes={} sender_cpu_ms={:.3} cpu_ns_per_byte={:.4} wall_ms={} pending_turns={pending_turns}",
                     sample == 0,
                     LENGTH * PAGES,
                     cpu.as_secs_f64() * 1000.0,
@@ -1996,13 +1980,6 @@ pub(crate) mod tests {
             );
             assert_eq!(received, bytes);
             assert_eq!(completed.as_ref().unwrap().send_remaining(), Some(0));
-            assert_eq!(
-                delivery
-                    .metrics
-                    .count(crate::telemetry::Event::DeliveryPipeDrain),
-                0,
-                "a backpressured page sends immutable views without pipe drains"
-            );
             assert!(
                 delivery
                     .metrics

@@ -11,7 +11,6 @@
 //! `Content-Length` is fully consumed. Error bodies up to [`MAX_DISCARD`] bytes
 //! are read and dropped; larger ones abandon the connection.
 
-use super::{AzureExchange, AzureTransport};
 use crate::admission::AdmissionPolicy;
 use crate::error::{Error, Operation, Result};
 use crate::http::{ConnectionLease, Endpoint, HttpIo, HttpPool, exchange_head};
@@ -206,13 +205,11 @@ impl PoolTransport {
     }
 }
 
-impl AzureTransport for PoolTransport {
-    type Exchange = PoolExchange;
-
+impl PoolTransport {
     /// Forget resolved addresses, rotation, and TLS state for endpoints no
     /// published origin uses. Exchanges in flight hold their own clone, and
     /// the pool's idle connections are bounded by its endpoint limit.
-    fn retain(&self, live: &[&OriginDefinition]) {
+    pub fn retain(&self, live: &[&OriginDefinition]) {
         let live: HashSet<_> = live
             .iter()
             .map(|origin| Self::key(&origin.azure.container_url))
@@ -224,12 +221,12 @@ impl AzureTransport for PoolTransport {
         drop(stale);
     }
 
-    fn exchange<'a>(
+    pub fn exchange<'a>(
         &'a self,
         url: &'a AzureContainerUrl,
         head: MessageHead,
         scope: &'a RequestScope,
-    ) -> Operation<'a, PoolExchange> {
+    ) -> Operation<'a, super::AzureExchange> {
         Box::pin(async move {
             scope.check()?;
             let Endpoint::Remote(remote) = self.endpoint(url)? else {
@@ -279,13 +276,13 @@ impl AzureTransport for PoolTransport {
                     Err(failure) => return Err(failure.error),
                 }
             };
-            Ok(PoolExchange {
+            Ok(super::AzureExchange::pool(PoolExchange {
                 head: response.value,
                 lease: response.connection,
                 _decoded: response._decoded,
                 io: self.io.clone(),
                 is_head,
-            })
+            }))
         })
     }
 }
@@ -302,23 +299,20 @@ pub struct PoolExchange {
     is_head: bool,
 }
 
-impl AzureExchange for PoolExchange {
-    fn head(&self) -> &MessageHead {
+impl PoolExchange {
+    pub fn head(&self) -> &MessageHead {
         &self.head
     }
 
-    fn finish(mut self) -> Result<()> {
+    pub fn finish(mut self) -> Result<()> {
         self.lease.finish_exchange().map_err(|_| Error::BadGateway)
     }
 
-    fn read_body<'a>(
+    pub fn read_body<'a>(
         self,
         buffer: PlaintextBuffer,
         scope: &'a RequestScope,
-    ) -> Operation<'a, PlaintextBuffer>
-    where
-        Self: 'a,
-    {
+    ) -> Operation<'a, PlaintextBuffer> {
         Box::pin(async move {
             let mut body = self.io.read_body_exact(self.lease, buffer, scope).await?;
             body.lease
@@ -328,10 +322,7 @@ impl AzureExchange for PoolExchange {
         })
     }
 
-    fn discard<'a>(self, scope: &'a RequestScope) -> Operation<'a, ()>
-    where
-        Self: 'a,
-    {
+    pub fn discard<'a>(self, scope: &'a RequestScope) -> Operation<'a, ()> {
         Box::pin(async move {
             let length = if self.is_head {
                 0

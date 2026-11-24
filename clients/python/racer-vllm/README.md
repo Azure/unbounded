@@ -82,7 +82,6 @@ Extra config keys, all optional:
 | `clone` | true | Copy each tensor out of staging before handing it to vLLM. `sharded_state` loads never clone, because they copy each tensor into the model at once. |
 | `socket` | none | Client socket path. |
 | `use_vmm` | true | Allow exportable `cuMemCreate` staging, needed for `gpu-read`. |
-| `mode_retry_seconds` | 300 | Retry a delivery mode the dataplane refused after this many seconds. `null` retries only after a dataplane restart. |
 | `sharded_state` | false | Read a vLLM `sharded_state` checkpoint; each rank reads only its files. |
 | `pattern` | as vLLM | File name pattern for `sharded_state`, such as `model-rank-{rank}-part-{part}.safetensors`. |
 | `prefetch` | true | Ask the dataplane to fill the weight pages in the background before the loader reads them. |

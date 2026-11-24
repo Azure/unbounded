@@ -28,8 +28,10 @@ fn sim() -> Simulation {
 /// A helper backed by `count` simulated GPUs.
 fn start(mode: GpuMode, count: u8) -> Option<Arc<GpuHelper>> {
     let devices: Vec<SimDevice> = (0..count).map(SimDevice::new).collect();
-    GpuHelper::start_with(
+    GpuHelper::start_built(
         mode,
+        true,
+        crate::gpu::GpuOptions::default(),
         Box::new(move || {
             let simulation = Simulation::new(devices);
             let environment = simulation.enter();
@@ -339,8 +341,10 @@ fn gpu_mode_resolves_against_hardware() {
     assert!(start(GpuMode::Disabled, 1).is_none());
     assert!(start(GpuMode::Auto, 0).is_none());
     assert!(
-        GpuHelper::start_with(
+        GpuHelper::start_built(
             GpuMode::Required,
+            true,
+            crate::gpu::GpuOptions::default(),
             Box::new(|| Err(racer_gpu::Error::Unavailable))
         )
         .is_err()
@@ -350,8 +354,10 @@ fn gpu_mode_resolves_against_hardware() {
         ..SimDevice::new(0)
     };
     assert!(
-        GpuHelper::start_with(
+        GpuHelper::start_built(
             GpuMode::Required,
+            true,
+            crate::gpu::GpuOptions::default(),
             Box::new(move || {
                 let simulation = Simulation::new(vec![unusable]);
                 std::mem::forget(simulation.enter());
@@ -363,9 +369,14 @@ fn gpu_mode_resolves_against_hardware() {
     // Without the cuda feature, auto never loads a backend.
     if !cfg!(feature = "cuda") {
         assert!(
-            GpuHelper::start(GpuMode::Auto, crate::gpu::GpuOptions::default())
-                .unwrap()
-                .is_none()
+            GpuHelper::start_built(
+                GpuMode::Auto,
+                cfg!(feature = "cuda"),
+                crate::gpu::GpuOptions::default(),
+                Box::new(racer_gpu::Gpu::load),
+            )
+            .unwrap()
+            .is_none()
         );
     }
 }
@@ -373,9 +384,13 @@ fn gpu_mode_resolves_against_hardware() {
 /// A helper on one simulated GPU with a staging cap, after `setup` runs on
 /// the fresh simulation.
 fn start_with(staging: u64, setup: fn(&Simulation)) -> Arc<GpuHelper> {
-    GpuHelper::start_with_staging(
+    GpuHelper::start_built(
         GpuMode::Required,
-        staging,
+        true,
+        crate::gpu::GpuOptions {
+            staging_bytes: staging,
+            ..crate::gpu::GpuOptions::default()
+        },
         Box::new(move || {
             let simulation = Simulation::new(vec![SimDevice::new(0)]);
             let environment = simulation.enter();

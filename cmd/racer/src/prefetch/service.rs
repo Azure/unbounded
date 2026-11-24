@@ -2,7 +2,6 @@
 //! side of the `prefetch` peer operation.
 
 use super::api::{self, Coverage, Reason, RefError};
-use super::metrics::{Counter, PrefetchMetrics};
 use super::registry::{
     Batch, PutCheck, Registry, Resolution, RetryKind, UnitContext, UnitKey, UnitOutcome,
 };
@@ -16,6 +15,7 @@ use crate::peer::protocol::{Operation as PeerOperation, PeerResponse, PrefetchAc
 use crate::read::Coordinator;
 use crate::runtime::RequestScope;
 use crate::security::{Authorization, OpaqueMetadata, OriginContext};
+use crate::telemetry::{Counter, PrefetchMetrics};
 use crate::topology::Membership;
 use futures::StreamExt;
 use http1::MessageHead;
@@ -118,6 +118,10 @@ pub struct Prefetch {
     metrics: OnceLock<Arc<PrefetchMetrics>>,
     /// Node-wide time and entropy.
     ctx: racer_io::WorkerCtx,
+    /// Demand promotions attempted, to prove a read with no prefetch fill
+    /// never touches prefetch state.
+    #[cfg(test)]
+    promote_calls: std::sync::atomic::AtomicUsize,
 }
 
 impl Prefetch {
@@ -140,6 +144,8 @@ impl Prefetch {
             next_wake: Mutex::new(None),
             metrics: OnceLock::new(),
             ctx,
+            #[cfg(test)]
+            promote_calls: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -302,6 +308,9 @@ impl Prefetch {
     /// A demand read for `page` is about to join its flight. If an owner
     /// prefetch fill holds a slot for it, release that slot and its tokens.
     pub fn promote(&self, page: &PageId) -> bool {
+        #[cfg(test)]
+        self.promote_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let promoted = self.owner.lock().unwrap().promote(page);
         if promoted {
             let priority = self
@@ -430,6 +439,12 @@ impl Prefetch {
     }
 
     #[cfg(test)]
+    pub(crate) fn promote_calls_for_test(&self) -> usize {
+        self.promote_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
     pub(crate) fn wait_for_test(&self, waker: &Waker, polls: usize) -> usize {
         let waiter = self.waiter();
         for _ in 0..polls {
@@ -525,7 +540,7 @@ pub(crate) async fn serve_fill(
     scope: &RequestScope,
 ) -> Vec<PageResult> {
     let directory = local.prefetch_directory();
-    let prefetch = &directory.prefetch;
+    let prefetch = &directory.node().prefetch;
     if local.cache_passthrough(&version.object.cache) {
         return vec![PageResult::Failed(FailCode::Unavailable); pages.len()];
     }
@@ -540,6 +555,9 @@ pub(crate) async fn serve_fill(
         };
         let membership = membership.clone();
         async move {
+            // The fill relies on this probe: it runs on the page-owner worker
+            // that will execute the fill, so `PrefetchFill` does not probe
+            // again.
             match directory.probe_page(page.clone(), scope).await {
                 Ok(true) => return PageResult::Resident,
                 Ok(false) => {}
@@ -595,7 +613,7 @@ pub(crate) async fn serve(
     context: &OriginContext,
     scope: &RequestScope,
 ) -> Result<PeerResponse> {
-    if local.prefetch_directory().prefetch.draining() {
+    if local.prefetch_directory().node().prefetch.draining() {
         return Ok(PeerResponse::Unavailable);
     }
     // A node outside the cache's pool never owns its pages. The sender ranked
@@ -652,7 +670,7 @@ async fn dispatch(
             .map(|&page| (unit(page), outcome, None))
             .collect::<Vec<_>>()
     };
-    let prefetch = &local.prefetch_directory().prefetch;
+    let prefetch = &local.prefetch_directory().node().prefetch;
     let Ok(scope) = prefetch.scope(prefetch.now() + DISPATCH_TIMEOUT) else {
         return all(UnitOutcome::Retry(RetryKind::Unavailable, None));
     };
@@ -857,7 +875,7 @@ async fn resolve(
             })
         })
         .collect();
-    let prefetch = &local.prefetch_directory().prefetch;
+    let prefetch = &local.prefetch_directory().node().prefetch;
     let scope = prefetch.scope(prefetch.now() + RESOLVE_TIMEOUT);
     let mut resolved: Vec<Option<Resolution>> = vec![None; distinct.len()];
     if let Ok(scope) = &scope {
@@ -938,7 +956,7 @@ async fn coverage(
     units: Vec<UnitKey>,
     deadline: Instant,
 ) -> u64 {
-    let Ok(scope) = local.prefetch_directory().prefetch.scope(deadline) else {
+    let Ok(scope) = local.prefetch_directory().node().prefetch.scope(deadline) else {
         return 0;
     };
     let me = local.local_node();
@@ -1050,7 +1068,7 @@ async fn handle_inner(
     scope: &RequestScope,
 ) -> std::result::Result<Response, PrefetchError> {
     let directory = local.prefetch_directory().clone();
-    let prefetch = &directory.prefetch;
+    let prefetch = &directory.node().prefetch;
     if prefetch.draining() {
         return Err(unavailable("node is draining"));
     }

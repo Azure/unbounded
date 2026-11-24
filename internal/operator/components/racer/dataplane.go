@@ -40,9 +40,8 @@ const (
 	minThreadsRDMA = minThreads + 1
 )
 
-// planDataplaneConfig creates racer-settings when it is absent, seeded
-// from the owned pre-rename racer-dataplane-config or else with defaults, and otherwise reads it. Every key is administrator payload; its
-// hash rolls the DaemonSet.
+// planDataplaneConfig creates racer-settings when it is absent and otherwise
+// reads it. Every key is administrator payload; its hash rolls the DaemonSet.
 func planDataplaneConfig(ctx context.Context, env *component.Env, plan *component.Plan) (*corev1.ConfigMap, error) {
 	decoded, err := env.DecodeManifestFiles(manifests.Manifests, []string{"dataplane-config.yaml"}, nil)
 	if err != nil {
@@ -64,25 +63,6 @@ func planDataplaneConfig(ctx context.Context, env *component.Env, plan *componen
 		config.TypeMeta = metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"}
 		markManaged(config)
 
-		// Carry settings over from the pre-rename ConfigMap the operator owns.
-		renamed, err := renamedConfigData(ctx, env)
-		if err != nil {
-			return nil, err
-		}
-
-		if renamed != nil {
-			// Drop retired keys the earlier template seeded with defaults.
-			renamed, _ = migrateRetiredSettings(renamed)
-
-			// Reject bad carried-over values before the new DaemonSet rolls
-			// out, as for an existing racer-settings.
-			if err := validateDataplaneConfig(renamed); err != nil {
-				return nil, err
-			}
-
-			config.Data = renamed
-		}
-
 		plan.Add(component.Operation{Kind: component.OpCreateIfAbsent, Object: component.ToUnstructured(config), Component: name})
 
 		return config, nil
@@ -94,14 +74,13 @@ func planDataplaneConfig(ctx context.Context, env *component.Env, plan *componen
 
 	config.SetGroupVersionKind(corev1.SchemeGroupVersion.WithKind("ConfigMap"))
 
-	if err := validateAdoptable(ctx, env, config); err != nil {
+	if err := validateOwner(config); err != nil {
 		return nil, err
 	}
 
-	// Earlier templates seeded retired keys with defaults the dataplane now
-	// rejects. Drop them and write the result back, so Pods never import the
-	// old keys through envFrom. The patch carries the observed
-	// resourceVersion, so a concurrent edit conflicts and the pass retries.
+	// A retired key must not reach Pods through envFrom. The patch carries the
+	// observed resourceVersion, so a concurrent edit conflicts and the pass
+	// retries.
 	if migrated, changed := migrateRetiredSettings(config.Data); changed {
 		observed := config.Data
 
@@ -110,22 +89,6 @@ func planDataplaneConfig(ctx context.Context, env *component.Env, plan *componen
 		}
 
 		config.Data = migrated
-		ref := component.RefOf(component.ToUnstructured(config))
-
-		// Legacy migration may already patch this ConfigMap from the same
-		// resourceVersion to drop its stamp. Fold the data into that patch,
-		// since a second patch from the same version would conflict.
-		for i := range plan.Operations {
-			op := &plan.Operations[i]
-			if op.Kind == component.OpMergePatch && op.Ref() == ref {
-				if err := unstructured.SetNestedStringMap(op.Object.Object, migrated, "data"); err != nil {
-					return nil, err
-				}
-
-				return config, nil
-			}
-		}
-
 		base := config.DeepCopy()
 		base.Data = observed
 
@@ -208,41 +171,36 @@ func planDataplane(ctx context.Context, env *component.Env, plan *component.Plan
 }
 
 // recordedStateUID returns the racer-state UID an existing installation runs
-// on, or empty when no managed dataplane object records one. The retired
-// controller's DaemonSet records none, so migration starts a new identity.
-// The pre-rename DaemonSet and ServiceAccount are read too, until
-// planRenamedCleanup removes them, so the rename keeps failing closed.
+// on, or empty when no managed dataplane object records one.
 func recordedStateUID(ctx context.Context, env *component.Env) (string, error) {
 	var uid string
 
-	for _, objName := range []string{dataplaneName, renamedDataplane} {
-		for _, obj := range []client.Object{&corev1.ServiceAccount{}, &unstructured.Unstructured{Object: map[string]any{"apiVersion": "apps/v1", "kind": "DaemonSet"}}} {
-			err := env.LiveReader().Get(ctx, objectKey(env, objName), obj)
-			if apierrors.IsNotFound(err) {
-				continue
-			}
-
-			if err != nil {
-				return "", err
-			}
-
-			// A terminating object still records the identity its Pods may be
-			// running on, so it keeps failing closed until it is gone.
-			if obj.GetUID() == "" || (obj.GetAnnotations()[managerAnnotation] != component.FieldOwner && obj.GetLabels()[managerLabel] != component.FieldOwner) {
-				continue
-			}
-
-			recorded := obj.GetAnnotations()[stateUIDAnnotation]
-			if recorded == "" {
-				continue
-			}
-
-			if uid != "" && uid != recorded {
-				return "", fmt.Errorf("racer dataplane ServiceAccounts and DaemonSets (%s, %s) record different racer-state UIDs", dataplaneName, renamedDataplane)
-			}
-
-			uid = recorded
+	for _, obj := range []client.Object{&corev1.ServiceAccount{}, &unstructured.Unstructured{Object: map[string]any{"apiVersion": "apps/v1", "kind": "DaemonSet"}}} {
+		err := env.LiveReader().Get(ctx, objectKey(env, dataplaneName), obj)
+		if apierrors.IsNotFound(err) {
+			continue
 		}
+
+		if err != nil {
+			return "", err
+		}
+
+		// A terminating object still records the identity its Pods may be
+		// running on, so it keeps failing closed until it is gone.
+		if obj.GetUID() == "" || (obj.GetAnnotations()[managerAnnotation] != component.FieldOwner && obj.GetLabels()[managerLabel] != component.FieldOwner) {
+			continue
+		}
+
+		recorded := obj.GetAnnotations()[stateUIDAnnotation]
+		if recorded == "" {
+			continue
+		}
+
+		if uid != "" && uid != recorded {
+			return "", fmt.Errorf("racer dataplane ServiceAccount and DaemonSet %s record different racer-state UIDs", dataplaneName)
+		}
+
+		uid = recorded
 	}
 
 	return uid, nil

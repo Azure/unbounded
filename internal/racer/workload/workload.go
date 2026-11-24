@@ -53,6 +53,11 @@ const (
 	// WebhookPort serves the object sidecar admission webhook on seat holders.
 	WebhookPort = 9443
 
+	// peerPort is the dataplane peer listener, distinct from control and webhook.
+	peerPort = 8082
+	// diagnosticsPort serves health and metrics on every dataplane Pod.
+	diagnosticsPort = 9090
+
 	// ControlSeatsKey is the administrator seat policy, read from
 	// racer-settings: auto picks 1 to 16 seats, or a fixed count of
 	// 1 to 16. It is never injected as explicit env so the ConfigMap wins.
@@ -112,20 +117,16 @@ type Config struct {
 	DataplaneImage string
 	// ObjectImage is the racer-object sidecar image the webhook injects.
 	ObjectImage string
-	PeerPort    uint16
-	HostNetwork bool
-	// Zero selects 9090, or 9091 when the peer port is 9090.
-	DiagnosticsPort uint16
 	// Empty selects NVIDIAEnv.
 	NVIDIA NVIDIAInjection
 }
 
 // DefaultConfig returns the managed defaults for a namespace and images.
 func DefaultConfig(namespace, dataplaneImage, objectImage string) Config {
-	return Config{Namespace: namespace, DataplaneImage: dataplaneImage, ObjectImage: objectImage, PeerPort: 8082}
+	return Config{Namespace: namespace, DataplaneImage: dataplaneImage, ObjectImage: objectImage}
 }
 
-// Validate checks names, images, and that every listener port is distinct.
+// Validate checks names, images, and the NVIDIA injection mode.
 func (c Config) Validate() error {
 	if len(validation.IsDNS1123Label(c.Namespace)) != 0 {
 		return fmt.Errorf("namespace %q: %w", c.Namespace, ErrInvalid)
@@ -135,21 +136,8 @@ func (c Config) Validate() error {
 		return fmt.Errorf("dataplane and object images are required: %w", ErrInvalid)
 	}
 
-	if c.PeerPort < 1024 || (c.DiagnosticsPort != 0 && c.DiagnosticsPort < 1024) {
-		return fmt.Errorf("ports must be 1024..65535: %w", ErrInvalid)
-	}
-
 	if mode := c.nvidiaMode(); mode != NVIDIAOff && mode != NVIDIAEnv && mode != NVIDIACDI {
 		return fmt.Errorf("NVIDIA injection must be off, env, or cdi: %w", ErrInvalid)
-	}
-
-	ports := map[int32]bool{}
-	for _, port := range []int32{int32(c.PeerPort), c.diagnosticsPort(), ControlPort, WebhookPort} {
-		if ports[port] {
-			return fmt.Errorf("peer, diagnostics, control, and webhook ports must be distinct: %w", ErrInvalid)
-		}
-
-		ports[port] = true
 	}
 
 	return nil
@@ -161,18 +149,6 @@ func (c Config) nvidiaMode() NVIDIAInjection {
 	}
 
 	return c.NVIDIA
-}
-
-func (c Config) diagnosticsPort() int32 {
-	if c.DiagnosticsPort != 0 {
-		return int32(c.DiagnosticsPort)
-	}
-
-	if c.PeerPort == 9090 {
-		return 9091
-	}
-
-	return 9090
 }
 
 // Labels are the immutable selector labels of the dataplane Pods.
@@ -211,7 +187,7 @@ func DaemonSet(c Config) (*appsv1.DaemonSet, error) {
 }
 
 func dataplanePod(c Config) corev1.PodSpec {
-	pod := corev1.PodSpec{
+	return corev1.PodSpec{
 		ServiceAccountName: DataplaneDaemonSetName,
 		// The API credentials are projected explicitly instead, see apiVolume.
 		AutomountServiceAccountToken:  ptr.To(false),
@@ -226,12 +202,6 @@ func dataplanePod(c Config) corev1.PodSpec {
 		Containers:                    []corev1.Container{dataplaneContainer(c)},
 		Volumes:                       dataplaneVolumes(c),
 	}
-	if c.HostNetwork {
-		pod.HostNetwork = true
-		pod.DNSPolicy = corev1.DNSClusterFirstWithHostNet
-	}
-
-	return pod
 }
 
 // DataplaneAffinity is the default node affinity of dataplane Pods. Workloads
@@ -360,8 +330,8 @@ func dataplaneContainer(c Config) corev1.Container {
 		TerminationMessagePolicy: corev1.TerminationMessageReadFile,
 		Env:                      dataplaneEnvironment(c),
 		Ports: []corev1.ContainerPort{
-			{Name: "peer", ContainerPort: int32(c.PeerPort), Protocol: corev1.ProtocolTCP},
-			{Name: "diagnostics", ContainerPort: c.diagnosticsPort(), Protocol: corev1.ProtocolTCP},
+			{Name: "peer", ContainerPort: peerPort, Protocol: corev1.ProtocolTCP},
+			{Name: "diagnostics", ContainerPort: diagnosticsPort, Protocol: corev1.ProtocolTCP},
 			{Name: "control", ContainerPort: ControlPort, Protocol: corev1.ProtocolTCP},
 			{Name: "webhook", ContainerPort: WebhookPort, Protocol: corev1.ProtocolTCP},
 		},
@@ -401,8 +371,8 @@ func dataplaneEnvironment(c Config) []corev1.EnvVar {
 		// Every Pod IP. The webhook also serves the other family, since the
 		// racer-webhook Service primary family need not match status.podIP.
 		fieldEnv("RACER_POD_IPS", "status.podIPs"),
-		{Name: "RACER_PEER_LISTEN", Value: listen(int32(c.PeerPort))},
-		{Name: "RACER_DIAGNOSTICS_LISTEN", Value: listen(c.diagnosticsPort())},
+		{Name: "RACER_PEER_LISTEN", Value: listen(peerPort)},
+		{Name: "RACER_DIAGNOSTICS_LISTEN", Value: listen(diagnosticsPort)},
 		{Name: "RACER_CONTROL_LISTEN", Value: listen(ControlPort)},
 		{Name: "RACER_WEBHOOK_LISTEN", Value: listen(WebhookPort)},
 		{Name: "RACER_OBJECT_IMAGE", Value: c.ObjectImage},

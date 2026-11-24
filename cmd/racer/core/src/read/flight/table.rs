@@ -1253,8 +1253,8 @@ mod tests {
         assert_eq!(f.poll(&other, b), Ok(Wait::Failed(Error::NotFound)));
     }
 
-    /// Local-copy sharing (`coalesce::shared::Table`): copy joins never lead and miss when no
-    /// acquisition runs; they share the result the completion owner publishes.
+    /// Local-copy sharing: copy joins never lead and miss when no acquisition
+    /// runs; they share the result the completion owner publishes.
     #[test]
     fn shared_copy_instance() {
         let mut f = fx::<u64, Rc<[u8]>>(limits());

@@ -63,16 +63,11 @@ pub struct StateRecord {
     pub desired_seats: u8,
     pub keyring: Durable,
     pub committed_at: u64,
-    /// Page size of the committed publication, or 0 before the first one.
-    /// Fixed at cluster creation: later primaries publish this value and
-    /// ignore their own `RACER_PAGE_BYTES`, since running nodes refuse a
-    /// publication that changes the page size.
-    #[serde(default, skip_serializing_if = "is_zero")]
+    /// Page size recorded by earlier releases, before it became fixed.
+    /// Decoding accepts 0 (records written before the field existed) or the
+    /// fixed size, and rejects any other value; new records omit it.
+    #[serde(default, skip_serializing)]
     pub page_bytes: u64,
-}
-
-fn is_zero(v: &u64) -> bool {
-    *v == 0
 }
 
 fn hex64(v: &str) -> bool {
@@ -118,7 +113,7 @@ pub fn decode(
         || published != hex64(&r.membership_hash)
         || (!published && (!r.content_hash.is_empty() || !r.membership_hash.is_empty()))
         || r.desired_seats as usize > crate::annotations::MAX_SEATS
-        || (r.page_bytes != 0 && racer_wire::object::PageSize::from_wire(r.page_bytes).is_err())
+        || (r.page_bytes != 0 && r.page_bytes != racer_wire::object::PageSize::DEFAULT.get())
     {
         return Err(StateError::Invalid);
     }
@@ -451,20 +446,26 @@ mod tests {
         );
     }
 
-    /// The page size is optional (older records lack it) and must be a
-    /// valid size when present.
+    /// Records written while the page size was recorded decode only when
+    /// they carry the fixed size. New records omit the field.
     #[test]
-    fn page_bytes_optional_and_validated() {
+    fn page_bytes_must_match_the_fixed_size() {
         let r = record();
         let b = encode(&r).unwrap();
         assert!(!String::from_utf8_lossy(&b).contains("page_bytes"));
-        let mut sized = r.clone();
-        sized.page_bytes = 1 << 20;
-        let b = encode(&sized).unwrap();
-        assert_eq!(decode(UID, true, Some(&b)).unwrap().unwrap(), sized);
-        sized.page_bytes = 3 << 20;
+        let fixed = racer_wire::object::PageSize::DEFAULT.get();
+        // A record from a release that still wrote the fixed size decodes.
+        let mut value: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        value["page_bytes"] = fixed.into();
+        let decoded = decode(UID, true, Some(&serde_json::to_vec(&value).unwrap()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded.page_bytes, fixed);
+        assert!(!String::from_utf8_lossy(&encode(&decoded).unwrap()).contains("page_bytes"));
+        // No valid configuration ever wrote another size.
+        value["page_bytes"] = (1u64 << 20).into();
         assert_eq!(
-            decode(UID, true, Some(&encode(&sized).unwrap())),
+            decode(UID, true, Some(&serde_json::to_vec(&value).unwrap())),
             Err(StateError::Invalid)
         );
     }

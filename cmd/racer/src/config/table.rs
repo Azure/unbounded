@@ -590,13 +590,6 @@ const BASE: &[Var] = &[
         "Diagnostics listener; must differ from the peer listener.",
     ),
     var(
-        "RACER_PEER_TCP_NODELAY",
-        Group::Network,
-        Kind::Bool,
-        Value("true"),
-        "TCP_NODELAY on peer sockets. `false` only reproduces the old socket behavior.",
-    ),
-    var(
         "RACER_OPAQUE_RELAY",
         Group::Network,
         Kind::Bool,
@@ -908,13 +901,6 @@ const BASE: &[Var] = &[
         uint(1, racer_wire::control::MAX_RETAINED_PAGE_KEYS as u64, COUNT),
         Value("7"),
         "Readable page keys per cache: the active key plus older decrypt keys. Read by the authority. Lowering it never drops keys at once: extra decrypt keys are dropped at the next key rotation.",
-    )),
-    control(var(
-        "RACER_PAGE_BYTES",
-        Group::Kubernetes,
-        uint(16 * 1024 * 1024, 16 * 1024 * 1024, BYTES),
-        Value("16777216"),
-        "Cluster-wide logical page size. Only 16777216 (16 MiB) is accepted: the client SDKs and the disk index do not yet support other sizes. Fixed at cluster creation: the authority publishes the value of the primary that made the first publication, records it in the `racer-state` Secret, and ignores later changes with a warning in the primary's log. Running nodes reject a publication that changes it.",
     )),
     control(var(
         "RACER_KUBE_API_CA",

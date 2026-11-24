@@ -57,7 +57,6 @@ pub struct PassInputs<'a> {
     pub pod_uid: &'a str,
     pub seats: SeatPolicy,
     pub peer_port: u16,
-    pub page_size: racer_wire::object::PageSize,
     pub policy: &'a Policy,
     pub inventory: &'a Inventory,
     /// Nodes, Pods, and ClusterCaches were all synced when the pass began
@@ -117,9 +116,6 @@ pub struct PassPlan {
     pub evicted_roots: usize,
     /// Names of ClusterCaches left out for an invalid `spec.nodeSelector`.
     pub rejected_caches: Vec<String>,
-    /// Page size published; differs from [`PassInputs::page_size`] when the
-    /// cluster was created with another size.
-    pub page_size: racer_wire::object::PageSize,
 }
 
 fn record_of(r: Option<&StateRecord>) -> Record {
@@ -212,7 +208,6 @@ pub fn plan_pass(i: &PassInputs<'_>, rng: &mut dyn Entropy) -> Result<PassPlan, 
             .ok()
             .map(|caches| (caches, c.selectors))
     });
-    let page_size = effective_page_size(i);
     let catalog: Option<Vec<_>> = admitted
         .as_ref()
         .map(|(caches, _)| caches.clone())
@@ -262,7 +257,7 @@ pub fn plan_pass(i: &PassInputs<'_>, rng: &mut dyn Entropy) -> Result<PassPlan, 
                 m.members.values().cloned(),
                 catalog.clone(),
                 &plans,
-                page_size,
+                racer_wire::object::PageSize::DEFAULT,
             )
             .map_err(|_| StateError::TooLarge)?;
             // Held joiners count: seats must not shrink while they wait.
@@ -292,11 +287,9 @@ pub fn plan_pass(i: &PassInputs<'_>, rng: &mut dyn Entropy) -> Result<PassPlan, 
         next.content_hash = p.record.content_hash.clone();
         next.membership_hash = p.record.membership_hash.clone();
         next.publication_bytes = p.encoded.len() as u64;
-        next.page_bytes = p.publication.page_size.get();
     }
     let changed = term_changed
         || plan.changed
-        || next.page_bytes != base.page_bytes
         || next.desired_seats != base.desired_seats
         || next.sequence != base.sequence
         || next.membership_version != base.membership_version;
@@ -316,20 +309,7 @@ pub fn plan_pass(i: &PassInputs<'_>, rng: &mut dyn Entropy) -> Result<PassPlan, 
         refused_roots: plan.refused_roots,
         evicted_roots: plan.evicted_roots,
         rejected_caches,
-        page_size,
     })
-}
-
-/// Page size to publish: the committed one, else the one in the image this
-/// process holds (records written before the size was recorded), else
-/// `RACER_PAGE_BYTES` for a cluster's first publication. Running nodes
-/// refuse a publication that changes the size, so a primary whose setting
-/// differs keeps publishing the established size.
-fn effective_page_size(i: &PassInputs<'_>) -> racer_wire::object::PageSize {
-    i.current
-        .and_then(|c| racer_wire::object::PageSize::from_wire(c.page_bytes).ok())
-        .or_else(|| i.previous_image.map(|im| im.publication.page_size))
-        .unwrap_or(i.page_size)
 }
 
 /// Primary Lease discovery annotations and ready seats.
@@ -520,24 +500,8 @@ mod tests {
         changed: Option<u64>,
         rng: &mut dyn Entropy,
     ) -> Result<PassPlan, StateError> {
-        pass_sized(
-            inv,
-            prev.map(|p| p.0),
-            prev.map(|p| p.1),
-            changed,
-            racer_wire::object::PageSize::DEFAULT,
-            rng,
-        )
-    }
-
-    fn pass_sized(
-        inv: &Inventory,
-        current: Option<&StateRecord>,
-        image: Option<&Image>,
-        changed: Option<u64>,
-        page_size: racer_wire::object::PageSize,
-        rng: &mut dyn Entropy,
-    ) -> Result<PassPlan, StateError> {
+        let (current, image) =
+            prev.map_or((None, None), |(record, image)| (Some(record), Some(image)));
         let (own, live, w) = (ownership(), BTreeMap::new(), writer());
         let policy = Policy::from(crate::Rotation::default());
         plan_pass(
@@ -546,7 +510,6 @@ mod tests {
                 pod_uid: "pod-uid",
                 seats: SeatPolicy::Auto,
                 peer_port: 8082,
-                page_size,
                 policy: &policy,
                 inventory: inv,
                 synced: inv.synced(),
@@ -599,43 +562,24 @@ mod tests {
         assert_eq!(members(p2), 1);
     }
 
-    /// The first publication takes `RACER_PAGE_BYTES`; the size is recorded
-    /// and later primaries with another setting keep publishing it, with or
-    /// without an image of the committed publication.
+    /// Every publication carries the fixed cluster-wide page size, whether
+    /// this is the first one or one after a failover.
     #[test]
-    fn page_size_is_fixed_by_the_first_publication() {
+    fn page_size_is_the_fixed_default() {
         use racer_wire::object::PageSize;
         let inv = inventory(3);
-        let small = PageSize::new(1 << 20).unwrap();
-        let rng = &mut SplitMix64::new(1);
-        let first = pass_sized(&inv, None, None, None, small, rng).unwrap();
-        assert_eq!(first.page_size, small);
-        assert_eq!(first.next.page_bytes, 1 << 20);
-        let image = first.image.unwrap();
-        assert_eq!(image.publication.page_size, small);
-        // A failover primary with another setting and no image.
-        let other =
-            pass_sized(&inv, Some(&first.next), None, None, PageSize::DEFAULT, rng).unwrap();
-        assert_eq!(other.page_size, small);
-        assert_eq!(other.next.page_bytes, 1 << 20);
-        let im = other.image.unwrap();
-        assert_eq!(im.publication.page_size, small);
-        assert_eq!(im.record.sequence, first.next.sequence, "content unchanged");
-        // A record from before the size was recorded falls back to the image.
-        let mut legacy = first.next.clone();
-        legacy.page_bytes = 0;
-        let p = pass_sized(
-            &inv,
-            Some(&legacy),
-            Some(&image),
-            None,
-            PageSize::DEFAULT,
-            rng,
-        )
-        .unwrap();
-        assert_eq!(p.page_size, small);
-        assert!(p.changed, "the size gets recorded");
-        assert_eq!(p.next.page_bytes, 1 << 20);
+        let first = seeded(&inv, None, 1);
+        let image = first.image.expect("image");
+        assert_eq!(image.publication.page_size, PageSize::DEFAULT);
+        // A record written while the size was still recorded decodes and
+        // republishes the same fixed size.
+        let mut committed = first.next.clone();
+        committed.page_bytes = PageSize::DEFAULT.get();
+        let again = seeded(&inv, Some((&committed, &image)), 2);
+        assert_eq!(
+            again.image.unwrap().publication.page_size,
+            PageSize::DEFAULT
+        );
     }
 
     #[test]

@@ -12,7 +12,10 @@ default = []
 test-util = []
 
 [dependencies]
-sha2 = { version = "0.10", features = ["asm"] }
+sha2.workspace = true
 
 [dev-dependencies]
-futures = "0.3"
+futures.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

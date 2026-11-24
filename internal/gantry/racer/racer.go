@@ -42,13 +42,9 @@ const (
 	socketRoot                     = "/run/racer"
 	metadataTTL                    = 24 * time.Hour
 	authenticationChallengeTimeout = 2 * time.Second
-	racerWriteChunk                = 256 * 1024
-	// Socket transfers avoid scratch copying; amortize ReadFrom, deadline and pipe
-	// setup over a larger bounded batch without changing fallback write granularity.
-	racerSocketChunk          = 256 * 1024
-	racerFailureLogBurst      = 10
-	defaultHTTPMaxConnections = 512
-	defaultWriteTimeout       = 30 * time.Second
+	racerFailureLogBurst           = 10
+	defaultHTTPMaxConnections      = 512
+	defaultWriteTimeout            = 30 * time.Second
 )
 
 // Configuration and registry origin adapter.
@@ -848,9 +844,20 @@ type HTTPObservation struct {
 	Aborted  bool
 }
 
-// WrapHTTP bounds each write and flush independently, so progressing
-// responses have no overall deadline. Zero timeout selects 30 seconds. observe
-// may be nil; otherwise it must be concurrency-safe and must not block.
+// WrapHTTP records the downstream status, byte count, and completion for
+// telemetry, and applies the download headers every response needs. The timeout
+// bounds each downstream socket operation, so a client that stops reading cannot
+// hold an SDK transfer open past it. The SDK arms its own deadline around each
+// destination write and moves it to the present to interrupt a canceled Get
+// (pkg/racersdk/object.go); SetWriteDeadline keeps those deadlines coordinated
+// so the shape remains correct with either layer in charge.
+//
+// TestRacerStalledDownstreamClosesSDKStream requires this per-operation bound:
+// it configures a timeout far below the SDK's 60 second body timeout and expects
+// a stalled client to end the stream within it.
+//
+// Zero timeout selects 30 seconds. observe may be nil; otherwise it must be
+// concurrency-safe and must not block.
 func WrapHTTP(next http.Handler, timeout time.Duration, observe func(HTTPObservation)) http.Handler {
 	if timeout == 0 {
 		timeout = defaultWriteTimeout
@@ -873,15 +880,11 @@ func WrapHTTP(next http.Handler, timeout time.Duration, observe func(HTTPObserva
 		}()
 
 		next.ServeHTTP(writer, r)
-		// Flush the final buffered headers/body under a fresh deadline, including
-		// HEAD and short responses. net/http's final flush must not be unbounded.
+		// Flush the final buffered headers/body under one bounded operation,
+		// including HEAD and empty responses. No deadline is left armed
+		// afterward: net/http finishes the stream after the handler returns, and
+		// an expired deadline there would reset a completed HTTP/2 stream.
 		if err := writer.FlushError(); err != nil {
-			panic(http.ErrAbortHandler)
-		}
-		// No upstream work remains. Keep final protocol bytes (HTTP/1 chunk
-		// terminator or HTTP/2 END_STREAM) bounded when net/http finishes the
-		// handler. net/http owns deadline cleanup at that lifecycle boundary.
-		if err := writer.deadline(); err != nil {
 			panic(http.ErrAbortHandler)
 		}
 
@@ -895,11 +898,12 @@ type racerResponseWriter struct {
 	status  int
 	bytes   int64
 	failed  bool
-	// Only deadline state is shared with the SDK cancellation callback. Status,
-	// bytes, and failed remain owned by the handler goroutine.
-	deadlineMu       sync.Mutex
-	externalDeadline time.Time
-	interrupted      bool
+	// deadlineMu serializes deadline changes with the SDK cancellation callback,
+	// which may run on another goroutine. external is the last deadline another
+	// caller set; each bounded operation caps itself with it and restores it
+	// afterward, so a cancellation interrupt is never overwritten or erased.
+	deadlineMu sync.Mutex
+	external   time.Time
 }
 
 func (w *racerResponseWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
@@ -923,37 +927,41 @@ func racerClearRecoveredFailure(w http.ResponseWriter) {
 	}
 }
 
-// SetWriteDeadline coordinates SDK deadlines with rolling handler deadlines.
-// An immediate interruption is sticky until explicitly cleared. Serializing the
-// underlying calls as well as the state prevents a refresh from racing past it.
+// SetWriteDeadline records a deadline set by the SDK or another caller and
+// applies it. Recording it lets each operation cap and restore the caller's
+// bound instead of leaving the socket with no deadline.
 func (w *racerResponseWriter) SetWriteDeadline(deadline time.Time) error {
 	w.deadlineMu.Lock()
 	defer w.deadlineMu.Unlock()
 
-	if !w.interrupted || deadline.IsZero() {
-		w.externalDeadline = deadline
-		w.interrupted = !deadline.IsZero() && !deadline.After(time.Now())
-	}
+	w.external = deadline
 
-	return http.NewResponseController(w.ResponseWriter).SetWriteDeadline(w.externalDeadline)
+	return w.setDeadlineLocked(deadline)
 }
 
+// deadline bounds one downstream operation. It never extends an external
+// deadline, so a cancellation that moved the deadline to the present still
+// interrupts the write it was meant to stop.
 func (w *racerResponseWriter) deadline() error {
 	w.deadlineMu.Lock()
 	defer w.deadlineMu.Unlock()
 
 	now := time.Now()
-	if w.interrupted || !w.externalDeadline.IsZero() && !w.externalDeadline.After(now) {
+	if !w.external.IsZero() && !w.external.After(now) {
+		// Another caller, normally SDK cancellation, already ended this
+		// transfer. Do not hand it more bytes even if the writer ignores
+		// deadlines.
 		w.failed = true
+
 		return os.ErrDeadlineExceeded
 	}
 
 	deadline := now.Add(w.timeout)
-	if !w.externalDeadline.IsZero() && w.externalDeadline.Before(deadline) {
-		deadline = w.externalDeadline
+	if !w.external.IsZero() && w.external.Before(deadline) {
+		deadline = w.external
 	}
 
-	err := http.NewResponseController(w.ResponseWriter).SetWriteDeadline(deadline)
+	err := w.setDeadlineLocked(deadline)
 	if errors.Is(err, http.ErrNotSupported) {
 		return nil // Recorders and non-network writers have no socket to deadline.
 	}
@@ -965,18 +973,13 @@ func (w *racerResponseWriter) deadline() error {
 	return err
 }
 
-// End a downstream operation without clearing an SDK cancellation interrupt.
-// Keep the external bound as state for nested Write calls, but disarm its timer
-// during upstream-only waits, including ReadFrom's userspace copy fallback.
+// clearDeadline restores the external deadline after an operation, so an SDK
+// cancellation interrupt survives once the blocked write returns.
 func (w *racerResponseWriter) clearDeadline() error {
 	w.deadlineMu.Lock()
 	defer w.deadlineMu.Unlock()
 
-	if w.interrupted {
-		return nil
-	}
-
-	err := http.NewResponseController(w.ResponseWriter).SetWriteDeadline(time.Time{})
+	err := w.setDeadlineLocked(w.external)
 	if errors.Is(err, http.ErrNotSupported) {
 		return nil
 	}
@@ -986,6 +989,10 @@ func (w *racerResponseWriter) clearDeadline() error {
 	}
 
 	return err
+}
+
+func (w *racerResponseWriter) setDeadlineLocked(deadline time.Time) error {
+	return http.NewResponseController(w.ResponseWriter).SetWriteDeadline(deadline)
 }
 
 func (w *racerResponseWriter) WriteHeader(status int) {
@@ -1018,57 +1025,39 @@ func (w *racerResponseWriter) Write(p []byte) (int, error) {
 	if w.status == 0 {
 		// Untyped bodies must not be sniffed as HTML. Explicit header commits
 		// apply the same default in WriteHeader, including Flush and ReadFrom.
-		if w.Header().Get("Content-Type") == "" {
-			w.ResponseWriter.Header().Set("Content-Type", "application/octet-stream")
-		}
-
 		w.WriteHeader(http.StatusOK)
 	}
 
-	total := 0
-
-	for len(p) > 0 {
-		if err := w.deadline(); err != nil {
-			return total, err
-		}
-
-		chunk := p[:min(len(p), racerWriteChunk)]
-
-		n, err := w.ResponseWriter.Write(chunk)
-		if clearErr := w.clearDeadline(); err == nil {
-			err = clearErr
-		}
-
-		total += n
-
-		w.bytes += int64(n)
-		if err == nil && n != len(chunk) {
-			err = io.ErrShortWrite
-		}
-
-		if err != nil {
-			w.failed = true
-			return total, err
-		}
-
-		p = p[n:]
+	if err := w.deadline(); err != nil {
+		return 0, err
 	}
 
-	return total, nil
+	n, err := w.ResponseWriter.Write(p)
+	if clearErr := w.clearDeadline(); err == nil {
+		err = clearErr
+	}
+
+	w.bytes += int64(n)
+	if err == nil && n != len(p) {
+		err = io.ErrShortWrite
+	}
+
+	if err != nil {
+		w.failed = true
+	}
+
+	return n, err
 }
 
-// ReadFrom keeps net/http in charge of framing and connection reuse. Only a
-// bounded source supplied by the SDK can use the underlying fast path. Preserve
-// the concrete socket under a single limiter so net.TCPConn can recognize it.
+// ReadFrom keeps net/http in charge of framing and connection reuse. Only the
+// bounded source the SDK supplies can use the underlying fast path, which lets
+// net.TCPConn recognize the socket and splice through the kernel. A userspace
+// fallback arms no deadline of its own; each Write inside it does.
 func (w *racerResponseWriter) ReadFrom(r io.Reader) (int64, error) {
 	source, bounded := r.(*io.LimitedReader)
 
 	fast, supported := w.ResponseWriter.(io.ReaderFrom)
 	if !bounded || !supported {
-		if err := w.clearDeadline(); err != nil {
-			return 0, err
-		}
-
 		return io.Copy(struct{ io.Writer }{w}, r)
 	}
 
@@ -1076,38 +1065,26 @@ func (w *racerResponseWriter) ReadFrom(r io.Reader) (int64, error) {
 		w.WriteHeader(http.StatusOK)
 	}
 
-	var total int64
-
-	for source.N > 0 {
-		if err := w.deadline(); err != nil {
-			return total, err
-		}
-
-		remaining := source.N
-		source.N = min(remaining, int64(racerSocketChunk))
-		chunk := source.N
-
-		n, err := fast.ReadFrom(source)
-		if clearErr := w.clearDeadline(); err == nil {
-			err = clearErr
-		}
-
-		consumed := chunk - source.N
-		source.N += remaining - chunk
-		total += n
-
-		w.bytes += n
-		if err == nil && (n != chunk || consumed != chunk) {
-			err = io.ErrUnexpectedEOF
-		}
-
-		if err != nil {
-			w.failed = true
-			return total, err
-		}
+	if err := w.deadline(); err != nil {
+		return 0, err
 	}
 
-	return total, nil
+	n, err := fast.ReadFrom(source)
+	if clearErr := w.clearDeadline(); err == nil {
+		err = clearErr
+	}
+
+	w.bytes += n
+
+	if err == nil && source.N != 0 {
+		err = io.ErrUnexpectedEOF
+	}
+
+	if err != nil {
+		w.failed = true
+	}
+
+	return n, err
 }
 
 func (w *racerResponseWriter) Flush() {

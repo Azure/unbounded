@@ -327,23 +327,14 @@ impl LinkNode {
         self.gpu_landing.landing(rail.0, ordinal)
     }
 
-    /// Landing state of each active rail, for metrics.
-    pub fn landing_state(&self) -> Vec<(u16, Vec<(i32, usize)>)> {
-        self.gpu_landing.state()
-    }
-
     /// Count one landing grant on `rail` for GPU `ordinal` that found no
     /// free slot.
     pub fn count_landing_exhausted(&self, rail: RailId, ordinal: i32) {
         self.gpu_landing.count_exhausted(rail.0, ordinal);
     }
 
-    /// Landing exhaustion counts for metrics.
-    pub fn landing_exhausted(&self) -> Vec<((u16, i32), u64)> {
-        self.gpu_landing.exhausted()
-    }
-
     /// Whether GPU landing is configured (GPU decrypt and RDMA both on).
+    #[cfg(test)]
     pub fn gpu_landing_configured(&self) -> bool {
         self.gpu_landing.configured()
     }

@@ -187,7 +187,7 @@ fn reopen_snapshot_reads_old_record_and_appends_without_overwriting_it() {
     segments.validate(id, generation, &extent).unwrap();
     let buffer = drive(
         &reactor,
-        slab.read(
+        slab.read_buf(
             &reactor,
             extent,
             slab.allocate(padded, ()).unwrap(),
@@ -215,7 +215,7 @@ fn reopen_snapshot_reads_old_record_and_appends_without_overwriting_it() {
     );
     let buffer = drive(
         &reactor,
-        slab.read(
+        slab.read_buf(
             &reactor,
             extent,
             slab.allocate(padded, ()).unwrap(),
@@ -244,17 +244,14 @@ fn buffer_pool_keeps_only_zeroed_accounted_storage_and_rejects_undercharging() {
     let mut buffer = slab.allocate(size, charge(size)).unwrap();
     assert_eq!(buffer.len(), size);
     assert!(!buffer.is_empty());
-    let pointer = buffer.bytes().unwrap().as_ptr();
+    let pointer = buffer.as_slice().as_ptr();
     assert_eq!(pointer as usize % alignment.memory(), 0);
-    assert!(buffer.bytes().unwrap().iter().all(|b| *b == 0));
-    buffer.bytes_mut().unwrap().fill(42);
-    let retained = Rc::new(charge(17));
-    let weak = Rc::downgrade(&retained);
-    buffer.retain(retained);
-    assert_eq!(live.get(), size + 17);
+    assert!(buffer.as_slice().iter().all(|b| *b == 0));
+    buffer.as_mut_slice().fill(42);
     drop(buffer);
-    assert!(weak.upgrade().is_none());
-    assert_eq!(live.get(), size);
+    // Idle storage belongs to the pool's idle account; the caller's charge is
+    // released on return.
+    assert_eq!(live.get(), 0);
     assert_eq!(slab.idle_bytes(), size);
 
     // Denied admission must release its charge without consuming the idle buffer.
@@ -262,11 +259,11 @@ fn buffer_pool_keeps_only_zeroed_accounted_storage_and_rejects_undercharging() {
         slab.allocate(size, charge(size - 1)),
         Err(Error::InvalidConfiguration)
     ));
-    assert_eq!(live.get(), size);
+    assert_eq!(live.get(), 0);
     assert_eq!(slab.idle_bytes(), size);
     let reused = slab.allocate(size, charge(size)).unwrap();
-    assert_eq!(reused.bytes().unwrap().as_ptr(), pointer);
-    assert!(reused.bytes().unwrap().iter().all(|b| *b == 0));
+    assert_eq!(reused.as_slice().as_ptr(), pointer);
+    assert!(reused.as_slice().iter().all(|b| *b == 0));
     assert_eq!(live.get(), size);
     assert_eq!(slab.idle_bytes(), 0);
     assert_eq!(slab.reclaim_idle(), 0);
@@ -277,14 +274,14 @@ fn buffer_pool_keeps_only_zeroed_accounted_storage_and_rejects_undercharging() {
     drop(reused);
     drop(overflow);
     assert_eq!(slab.idle_bytes(), size * 2);
-    assert_eq!(live.get(), size * 2);
+    assert_eq!(live.get(), 0);
     let larger = slab.allocate(size * 2, charge(size * 2)).unwrap();
     assert_eq!(larger.len(), size * 2);
-    assert_eq!(live.get(), size * 4);
+    assert_eq!(live.get(), size * 2);
     // Returns within the idle budget are kept until maintenance trims them.
     drop(larger);
     assert_eq!(slab.idle_bytes(), size * 4);
-    assert_eq!(live.get(), size * 4);
+    assert_eq!(live.get(), 0);
     let stats = slab.idle_pool_stats();
     assert_eq!((stats.entries, stats.in_use), (3, 0));
     assert_eq!(slab.reclaim_idle(), size * 4);
@@ -293,7 +290,7 @@ fn buffer_pool_keeps_only_zeroed_accounted_storage_and_rejects_undercharging() {
 
     let outstanding = slab.allocate(size, charge(size)).unwrap();
     drop(slab.allocate(size, charge(size)).unwrap());
-    assert_eq!(live.get(), size * 2);
+    assert_eq!(live.get(), size);
     assert_eq!(slab.idle_bytes(), size);
     drop(slab);
     assert_eq!(live.get(), size);
@@ -391,7 +388,7 @@ fn bound_io_rejects_foreign_tables_and_ranges_appended_after_lease_acquisition()
         let operation = if write {
             slab.write(&reactor, extent, buffer, foreign, &TestScope)
         } else {
-            slab.read(&reactor, extent, buffer, foreign, &TestScope)
+            slab.read_buf(&reactor, extent, buffer, foreign, &TestScope)
         };
         assert!(matches!(
             drive(&reactor, operation),
@@ -411,7 +408,7 @@ fn bound_io_rejects_foreign_tables_and_ranges_appended_after_lease_acquisition()
         let operation = if write {
             slab.write(&reactor, second, buffer, lease, &TestScope)
         } else {
-            slab.read(&reactor, second, buffer, lease, &TestScope)
+            slab.read_buf(&reactor, second, buffer, lease, &TestScope)
         };
         assert!(matches!(
             drive(&reactor, operation),
@@ -437,7 +434,7 @@ fn bound_io_rejects_foreign_tables_and_ranges_appended_after_lease_acquisition()
     );
     let untouched = drive(
         &reactor,
-        slab.read(
+        slab.read_buf(
             &reactor,
             first,
             slab.allocate(size, ()).unwrap(),
@@ -450,7 +447,7 @@ fn bound_io_rejects_foreign_tables_and_ranges_appended_after_lease_acquisition()
     drop(untouched);
     let written = drive(
         &reactor,
-        slab.read(
+        slab.read_buf(
             &reactor,
             second,
             slab.allocate(size, ()).unwrap(),
@@ -539,7 +536,7 @@ fn roundtrip_short_io_and_runtime_errors() {
     assert_eq!(slab.writes_in_flight(), 0);
     drop(buffer);
     let read = || {
-        slab.read(
+        slab.read_buf(
             &reactor,
             extent,
             slab.allocate(extent.length(), ()).unwrap(),
@@ -600,9 +597,6 @@ fn abandoned_write_retains_lease_charges_and_counter_until_completion() {
             .allocate(4096, CountingCharge::new(&used, 4096))
             .unwrap();
         buffer.as_mut_slice().fill(42);
-        let extra = Rc::new(CountingCharge::new(&used, 512));
-        let weak = Rc::downgrade(&extra);
-        buffer.retain(extra);
         sim.inject("write", Fault::HoldCompletion(8)).unwrap();
         let mut op = slab.write(&reactor, extent, buffer, lease, &TestScope);
         assert!(poll(&mut op).is_pending());
@@ -612,8 +606,8 @@ fn abandoned_write_retains_lease_charges_and_counter_until_completion() {
         assert_eq!(slab.writes_in_flight(), 1);
         assert_eq!(slab.idle_bytes(), 0);
         assert_eq!(slab.reclaim_idle(), 0);
-        assert!(weak.upgrade().is_some());
-        assert_eq!(used.get(), 4608);
+        // The kernel completion still owns the staging charge.
+        assert_eq!(used.get(), 4096);
         segments.begin_evict(SegmentId(0)).unwrap();
         assert_eq!(segments.recycle(SegmentId(0)), Err(Error::Busy));
         let mut fence = slab.fence_writes();
@@ -621,8 +615,7 @@ fn abandoned_write_retains_lease_charges_and_counter_until_completion() {
         drive(&reactor, fence).unwrap();
         assert_eq!(slab.writes_in_flight(), 0);
         assert_eq!(reactor.in_flight(), 0);
-        assert!(weak.upgrade().is_none());
-        assert_eq!(used.get(), 4096);
+        assert_eq!(used.get(), 0);
         assert_eq!(slab.idle_bytes(), 4096);
         let reused = slab
             .allocate(4096, CountingCharge::new(&used, 4096))
@@ -671,7 +664,7 @@ fn abandoned_read_and_unpolled_write_release_at_the_correct_fence() {
         .unwrap(),
     );
     sim.inject("read", Fault::HoldCompletion(8)).unwrap();
-    let mut op = slab.read(
+    let mut op = slab.read_buf(
         &reactor,
         extent,
         slab.allocate(4096, ()).unwrap(),
@@ -929,7 +922,7 @@ fn io_uring_roundtrip_and_completion_fence() {
     assert_eq!(poll(&mut fence), Poll::Ready(Ok(())));
     let buffer = drive_real(
         &reactor,
-        slab.read(
+        slab.read_buf(
             &reactor,
             extent,
             slab.allocate(extent.length(), ()).unwrap(),
@@ -1099,7 +1092,7 @@ fn device_placements_route_real_io_and_reject_short_reads() {
             );
             let read = drive_real(
                 &reactor,
-                slab.read(
+                slab.read_buf(
                     &reactor,
                     extent,
                     slab.allocate(half_bytes, ()).unwrap(),
@@ -1138,7 +1131,7 @@ fn device_placements_route_real_io_and_reject_short_reads() {
     }
     // External truncation violates the startup contract but must still fail closed.
     files[1].set_len(segment_bytes).unwrap();
-    let read = slab.read(
+    let read = slab.read_buf(
         &reactor,
         page_alloc::Extent::new(segment_bytes, segment_bytes as usize).unwrap(),
         slab.allocate(segment_bytes as usize, ()).unwrap(),
@@ -1192,7 +1185,7 @@ fn unbound_and_failed_binding_reject_reads_and_writes_before_reactor_admission()
         let (lease, extent) = correct.append(segment_bytes as usize).unwrap();
         let buffer = slab.allocate(extent.length(), ()).unwrap();
         let reactor = Reactor::<TestScope>::new(16, &racer_io::Env::host());
-        let mut read = slab.read(&reactor, extent, buffer, lease, &TestScope);
+        let mut read = slab.read_buf(&reactor, extent, buffer, lease, &TestScope);
         assert!(matches!(
             poll(&mut read),
             Poll::Ready(Err(TestError::Alloc(Error::Unavailable)))
@@ -1287,7 +1280,7 @@ fn partial_table_reclamation_changes_authority_without_erasing_storage() {
     // Existing completion authority still reads bytes after caller index removal.
     let buffer = drive(
         &reactor,
-        slab.read(
+        slab.read_buf(
             &reactor,
             extent,
             slab.allocate(4096, ()).unwrap(),
@@ -1324,7 +1317,7 @@ fn partial_table_reclamation_changes_authority_without_erasing_storage() {
     );
     let buffer = drive(
         &reactor,
-        slab.read(
+        slab.read_buf(
             &reactor,
             replacement_extent,
             slab.allocate(4096, ()).unwrap(),
@@ -1351,7 +1344,7 @@ fn partial_table_reclamation_changes_authority_without_erasing_storage() {
 }
 
 /// Shared body with arbitrary bytes, for exercising vectored validation.
-struct SharedBody(Rc<page_alloc::AlignedBuffer<()>>, std::ops::Range<usize>);
+struct SharedBody(Rc<page_alloc::buf::Buf<()>>, std::ops::Range<usize>);
 
 // SAFETY: the Rc keeps the immutable allocation alive and unmoved; no alias
 // mutates it while the body is owned by a write.
@@ -1407,7 +1400,7 @@ fn vectored_write_roundtrip_validation_and_faults() {
     assert_eq!(slab.writes_in_flight(), 0);
     let read = drive(
         &reactor,
-        slab.read(
+        slab.read_buf(
             &reactor,
             extent,
             slab.allocate(total, ()).unwrap(),

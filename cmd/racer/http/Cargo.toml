@@ -10,12 +10,12 @@ description = "Strict fixed-length HTTP/1.1 over an explicitly driven racer-io r
 test-util = []
 
 [dependencies]
-futures = "0.3"
+futures.workspace = true
 flow-control = { path = "../flow" }
 racer-io = { path = "../io" }
 racer-wire = { path = "../wire" }
-zeroize = "1"
-libc = "0.2"
+zeroize.workspace = true
+libc.workspace = true
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 
 [dev-dependencies]
@@ -23,8 +23,10 @@ rcgen = { version = "0.13", features = ["pem", "ring"] }
 
 [[test]]
 name = "pool"
+path = "tests/pool.rs"
 required-features = ["test-util"]
 
 [[test]]
 name = "tls"
+path = "tests/tls.rs"
 required-features = ["test-util"]

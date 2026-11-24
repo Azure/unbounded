@@ -595,9 +595,6 @@ struct Link {
 /// Subscribe traffic one requester node sent.
 #[derive(Default)]
 struct LinkStats {
-    /// Drop multi-flight Subscribes without a response, as a provider
-    /// predating `Subscription::flights` does.
-    old_provider: bool,
     outstanding: Cell<usize>,
     max_outstanding: Cell<usize>,
     flights: RefCell<Vec<Option<u16>>>,
@@ -641,9 +638,6 @@ impl Link {
                 .borrow_mut()
                 .push(subscription.demand.page_count());
             self.stats.flights.borrow_mut().push(subscription.flights);
-            if self.stats.old_provider && subscription.flights.is_some() {
-                return Err(Error::Io);
-            }
             struct Outstanding<'a>(&'a Cell<usize>);
             impl Drop for Outstanding<'_> {
                 fn drop(&mut self) {
@@ -1296,7 +1290,7 @@ fn later_page_completes_before_head_and_cancellation_keeps_completion_fence() {
 #[test]
 fn production_range_windows_select_from_provider_share_node_work_and_deliver_in_order() {
     let env = racer_io::Env::host();
-    let stats = production_range_windows(&env, false);
+    let stats = production_range_windows(&env);
     assert!(
         stats
             .iter()
@@ -1304,42 +1298,15 @@ fn production_range_windows_select_from_provider_share_node_work_and_deliver_in_
             .any(|flights| flights == Some(crate::read::range_stream::REQUESTED_FLIGHTS))
     );
 }
-#[test]
-fn production_range_windows_fall_back_to_single_flight_for_old_providers() {
-    let env = racer_io::Env::host();
-    let stats = production_range_windows(&env, true);
-    assert!(!stats[0].flights.borrow().is_empty());
-    for stats in &stats {
-        let flights = stats.flights.borrow();
-        if flights.is_empty() {
-            continue;
-        }
-        // The first Subscribe asks for several flights and is dropped; every
-        // later one omits the field, and at most one is outstanding at a time.
-        assert_eq!(
-            flights[0],
-            Some(crate::read::range_stream::REQUESTED_FLIGHTS)
-        );
-        assert!(flights[1..].iter().all(Option::is_none), "{flights:?}");
-        assert!(stats.max_outstanding.get() <= 1);
-    }
-}
 /// Run three range windows on two requester nodes against provider node 2.
 /// The object and windows stay small: node 2's outbound stack is a stub, so
 /// larger windows that overload it and fall back to relayed fetches stall.
 /// Asserts in-order delivery and shared node work; returns each requester's
 /// Subscribe traffic.
-fn production_range_windows(env: &racer_io::Env, old_provider: bool) -> Vec<Rc<LinkStats>> {
+fn production_range_windows(env: &racer_io::Env) -> Vec<Rc<LinkStats>> {
     const PAGES: u64 = 4;
     const WINDOW: usize = 4;
-    let stats: Vec<Rc<LinkStats>> = (0..2)
-        .map(|_| {
-            Rc::new(LinkStats {
-                old_provider,
-                ..Default::default()
-            })
-        })
-        .collect();
+    let stats: Vec<Rc<LinkStats>> = (0..2).map(|_| Rc::new(LinkStats::default())).collect();
     let signers = network(env, 3);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();

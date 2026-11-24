@@ -4,8 +4,6 @@ use super::protocol::PeerResponse;
 use super::protocol::SecurityCodec;
 use super::protocol::SignedRequest;
 use super::protocol::SignedResponse;
-use super::protocol::decode_envelope;
-use super::protocol::encode_envelope;
 use crate::admission::AdmissionPolicy;
 use crate::admission::ResourceClass;
 use crate::error::Error;
@@ -20,7 +18,6 @@ use crate::peer::protocol as p;
 use crate::peer::protocol::Signatures;
 use crate::peer::protocol::SignedHead;
 use crate::peer::protocol::VerifiedHead;
-use crate::peer::protocol::signed_digest;
 use crate::rdma::AuthenticatedGrant;
 use crate::rdma::COMPLETION_HEADER;
 use crate::rdma::GRANT_HEADER;
@@ -154,7 +151,7 @@ fn envelope_digest(auth: &ForwardedHead) -> Result<[u8; 32]> {
 fn attach(head: &mut MessageHead, signed: &SignedHead) -> Result<()> {
     head.headers.push(Header {
         name: HEADER.into(),
-        value: super::protocol::encode_signed(signed)?,
+        value: peer_wire::encode_signed(signed)?,
     });
     Ok(())
 }
@@ -168,7 +165,7 @@ pub(super) fn detach(
         .retain(|h| !h.name.eq_ignore_ascii_case(HEADER));
     value
         .map(|v| {
-            let mut signed = super::protocol::decode_signed(&v)?;
+            let mut signed = peer_wire::decode_signed(&v)?;
             peer_wire::resolve(&mut signed, chains)?;
             Ok(signed)
         })
@@ -176,7 +173,7 @@ pub(super) fn detach(
 }
 fn frame(signed: SignedHead) -> Result<MessageHead> {
     let response = matches!(signed.head.start, StartLine::Response { .. });
-    encode_envelope(
+    peer_wire::encode_envelope(
         &ForwardedHead {
             original: Arc::new(signed),
             hops: vec![],
@@ -184,13 +181,14 @@ fn frame(signed: SignedHead) -> Result<MessageHead> {
         response,
         0,
     )
+    .map_err(Into::into)
 }
 fn unframe(
     head: MessageHead,
     response: bool,
     chains: &dyn peer_wire::Chains,
 ) -> Result<SignedHead> {
-    let (auth, len) = decode_envelope(head, response, chains)?;
+    let (auth, len) = peer_wire::decode_envelope(head, response, chains)?;
     if len != 0 || !auth.hops.is_empty() {
         return Err(Error::InvalidRequest);
     }
@@ -343,9 +341,8 @@ impl Transfers {
         if connection.state().session.as_ref().map(|s| s.peer()) != Some(peer) {
             return Err(Error::Unauthorized);
         }
-        let path = crate::peer::protocol::decode_nodes(
-            crate::peer::protocol::field(&authentication.original.head, "racer-response-path")?
-                .as_bytes(),
+        let path = peer_wire::decode_nodes(
+            peer_wire::field(&authentication.original.head, "racer-response-path")?.as_bytes(),
         )?;
         let receiver_index = path
             .len()
@@ -372,13 +369,11 @@ impl Transfers {
             // Outgoing responses were signed here or verified once by the exchange
             // that returned them; only unverified ingress needs signature checks.
             let signer = if sending {
-                crate::peer::protocol::node_field(&signed.head, "racer-signer")?
+                peer_wire::node_field(&signed.head, "racer-signer")?
             } else {
                 self.signatures.verify_historical(signed)?.node().clone()
             };
-            if signer != path[index]
-                || crate::peer::protocol::receiver(&signed.head)? != path[index - 1]
-            {
+            if signer != path[index] || peer_wire::receiver(&signed.head)? != path[index - 1] {
                 return Err(Error::Unauthorized);
             }
         }
@@ -461,7 +456,7 @@ impl Transfers {
             return Ok((connection, false));
         }
         let digests = envelope_digest(&response.authentication)
-            .and_then(|response| Ok((response, signed_digest(&accept.signed)?)));
+            .and_then(|response| Ok((response, peer_wire::signed_digest(&accept.signed)?)));
         let previous = match digests {
             Ok((response, previous)) => {
                 binding.response = response;
@@ -515,7 +510,7 @@ impl Transfers {
             0,
             vec![extension(COMPLETION_HEADER, sent.header_value())],
         )?;
-        let mut head = encode_envelope(&response.authentication, true, 0)?;
+        let mut head = peer_wire::encode_envelope(&response.authentication, true, 0)?;
         attach(&mut head, &complete)?;
         let connection = self.io.send_head(connection, head, scope).await?.connection;
         links.record_stage(Event::RdmaServeCount, Event::RdmaServeNs, serving);
@@ -549,7 +544,8 @@ impl Transfers {
             ciphertext.bytes().len(),
             vec![],
         )?;
-        let mut head = encode_envelope(&response.authentication, true, ciphertext.bytes().len())?;
+        let mut head =
+            peer_wire::encode_envelope(&response.authentication, true, ciphertext.bytes().len())?;
         attach(&mut head, &finish)?;
         let connection = self.io.send_head(connection, head, scope).await?.connection;
         let written = self
@@ -609,7 +605,7 @@ impl Transfers {
         let Some(links) = &self.links else {
             return Ok(None);
         };
-        let peer = crate::peer::protocol::receiver(
+        let peer = peer_wire::receiver(
             &request
                 .authentication
                 .hops
@@ -803,7 +799,7 @@ impl Transfers {
         {
             return Err(Error::Unauthorized);
         }
-        let peer = crate::peer::protocol::node_field(
+        let peer = peer_wire::node_field(
             &request
                 .authentication
                 .hops
@@ -882,7 +878,7 @@ impl Transfers {
             &peer,
             control,
             &[Phase::Complete, Phase::Finish],
-            &signed_digest(&accept)?,
+            &peer_wire::signed_digest(&accept)?,
             length,
             scope,
         )?;
@@ -949,18 +945,18 @@ impl Transfers {
             // describe exactly this page; the requester verifies the chain
             // against its binding, and the GPU checks the tag.
             let original = &authentication.original.head;
-            if crate::peer::protocol::field(original, "racer-outcome")? != "page" {
+            if peer_wire::field(original, "racer-outcome")? != "page" {
                 return Err(Error::Unauthorized);
             }
-            let request_digest = crate::peer::protocol::decode_binary(
-                crate::peer::protocol::field(original, "racer-request-binding")?.as_bytes(),
+            let request_digest = peer_wire::decode_binary(
+                peer_wire::field(original, "racer-request-binding")?.as_bytes(),
             )?
             .try_into()
             .map_err(|_| Error::InvalidRequest)?;
-            let path = crate::peer::protocol::decode_nodes(
-                crate::peer::protocol::field(original, "racer-response-path")?.as_bytes(),
+            let path = peer_wire::decode_nodes(
+                peer_wire::field(original, "racer-response-path")?.as_bytes(),
             )?;
-            crate::peer::protocol::agrees(
+            peer_wire::agrees(
                 original,
                 &crate::peer::protocol::landed_response_head(
                     &metadata,
@@ -1007,9 +1003,7 @@ impl Transfers {
         // The original envelope is verified by the requester/relay's outstanding
         // binding after this transport returns. No plaintext is published here.
         let response =
-            if crate::peer::protocol::field(&authentication.original.head, "racer-outcome")?
-                == "selected"
-            {
+            if peer_wire::field(&authentication.original.head, "racer-outcome")? == "selected" {
                 PeerResponse::Selected {
                     metadata,
                     ciphertext: page,
@@ -1022,15 +1016,14 @@ impl Transfers {
                 }
             };
         let original = &authentication.original.head;
-        let request_digest = crate::peer::protocol::decode_binary(
-            crate::peer::protocol::field(original, "racer-request-binding")?.as_bytes(),
+        let request_digest = peer_wire::decode_binary(
+            peer_wire::field(original, "racer-request-binding")?.as_bytes(),
         )?
         .try_into()
         .map_err(|_| Error::InvalidRequest)?;
-        let path = crate::peer::protocol::decode_nodes(
-            crate::peer::protocol::field(original, "racer-response-path")?.as_bytes(),
-        )?;
-        crate::peer::protocol::agrees(
+        let path =
+            peer_wire::decode_nodes(peer_wire::field(original, "racer-response-path")?.as_bytes())?;
+        peer_wire::agrees(
             original,
             &crate::peer::protocol::response_head(&response, &request_digest, &path)?,
             false,
@@ -1818,9 +1811,9 @@ impl Transfers {
                         .ok_or(Error::InvalidRequest)?
                         .max(1),
                 )?;
-                let mut head = encode_envelope(&request.authentication, false, 0)?;
+                let mut head = peer_wire::encode_envelope(&request.authentication, false, 0)?;
                 let signatures = self.signatures.clone();
-                let peer = crate::peer::protocol::receiver(
+                let peer = peer_wire::receiver(
                     &request
                         .authentication
                         .hops
@@ -1984,7 +1977,7 @@ impl Transfers {
                 } else {
                     None
                 };
-                let (authentication, length) = decode_envelope(
+                let (authentication, length) = peer_wire::decode_envelope(
                     received.value,
                     true,
                     crate::peer::protocol::chains(&received.connection)?,
@@ -2708,7 +2701,7 @@ mod tests {
                 let serve = async {
                     let b = p::accept(&server.io, b, signers[responder].clone(), &scope).await?;
                     let received = server.io.receive_head(b, &scope).await?;
-                    let (auth, length) = decode_envelope(
+                    let (auth, length) = peer_wire::decode_envelope(
                         received.value,
                         false,
                         crate::peer::protocol::chains(&received.connection)?,
@@ -3214,15 +3207,19 @@ mod tests {
                 p::push_binary(
                     &mut hop,
                     "racer-original",
-                    &signed_digest(&original).unwrap(),
+                    &peer_wire::signed_digest(&original).unwrap(),
                 );
                 p::push_binary(
                     &mut hop,
                     "racer-previous",
-                    &signed_digest(&original).unwrap(),
+                    &peer_wire::signed_digest(&original).unwrap(),
                 );
                 p::push_binary(&mut hop, "racer-request-binding", &[4; 32]);
-                p::push(&mut hop, "racer-response-path", p::nodes(&path).unwrap());
+                p::push(
+                    &mut hop,
+                    "racer-response-path",
+                    peer_wire::nodes(&path).unwrap(),
+                );
                 p::push(&mut hop, "racer-reverse-index", 0);
                 p::push(&mut hop, "racer-receiver", &signers[0].node().0);
                 hops.push(signers[2].sign(hop).unwrap());
@@ -3273,7 +3270,7 @@ mod tests {
                     vec![extension(GRANT_HEADER, pending.header_value())],
                 )
                 .unwrap();
-            let accept_wire = p::encode_signed(&accept).unwrap();
+            let accept_wire = peer_wire::encode_signed(&accept).unwrap();
             if let Some(cooldown) = case.sender_breaker {
                 let links = sender.links.as_ref().unwrap();
                 links.configure_breaker(crate::rdma::breaker::BreakerConfig {
@@ -3328,7 +3325,7 @@ mod tests {
                         },
                         headers: vec![extension("content-length", b"0".to_vec())],
                     };
-                    attach(&mut initial, &p::decode_signed(&accept_wire)?)?;
+                    attach(&mut initial, &peer_wire::decode_signed(&accept_wire)?)?;
                     watch.hold();
                     let sent = receiver.io.send_head(a, initial, &scope).await?;
                     let mut received = receiver.io.receive_head(sent.connection, &scope).await?;
@@ -3336,7 +3333,7 @@ mod tests {
                         &mut received.value,
                         crate::peer::protocol::chains(&received.connection)?,
                     )?;
-                    let (auth, length) = decode_envelope(
+                    let (auth, length) = peer_wire::decode_envelope(
                         received.value,
                         true,
                         crate::peer::protocol::chains(&received.connection)?,
@@ -3360,7 +3357,7 @@ mod tests {
                             received.connection,
                             auth,
                             binding.clone(),
-                            p::decode_signed(&accept_wire)?,
+                            peer_wire::decode_signed(&accept_wire)?,
                             signers[2].node().clone(),
                             control,
                             pending,
@@ -3404,7 +3401,7 @@ mod tests {
                         )
                         .await?;
                     if !sent {
-                        let head = encode_envelope(&response.authentication, true, 144)?;
+                        let head = peer_wire::encode_envelope(&response.authentication, true, 144)?;
                         conn = sender.io.send_head(conn, head, &scope).await?.connection;
                         let PeerResponse::Page { ciphertext, .. } = &response.response else {
                             unreachable!()
@@ -4497,7 +4494,8 @@ mod tests {
             }
         }
         fn copy(control: &SignedHead) -> SignedHead {
-            let mut copy = p::decode_signed(&p::encode_signed(control).unwrap()).unwrap();
+            let mut copy =
+                peer_wire::decode_signed(&peer_wire::encode_signed(control).unwrap()).unwrap();
             peer_wire::resolve(&mut copy, &peer_wire::test_util::AnyChain).unwrap();
             copy
         }

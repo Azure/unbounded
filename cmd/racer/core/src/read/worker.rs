@@ -4,7 +4,7 @@
 //! the [`ReadWindow`]s by id, the metadata [`MetadataCohort`], the serve-side [`ServeDecision`]
 //! with the successor hints it defers to, the prefetch [`OwnerBudget`] and the one [`EffectIds`]
 //! allocator. It routes events between them and emits only external effects as the closed
-//! [`Effect`] enum. Interpreters (production, and the byte-free Model) dispatch on
+//! [`Effect`] enum. Interpreters (the byte-free Model and the core tests) dispatch on
 //! [`Effect::class`] with an exhaustive match and make no decisions.
 //!
 //! Routing inside the core:

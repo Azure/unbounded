@@ -15,12 +15,12 @@
 //! | [`engine`] | Virtual time ([`engine::Nanos`]), event queue with deterministic ties, [`engine::TraceHash`] |
 //! | [`costs`] | The checked-in `costs.toml` cost table and its parser |
 //! | [`resources`] | FIFO cost model: NIC/disk/CPU/crypto servers, origin, per-site RTT matrix |
-//! | [`world`] | Nodes, roles ([`world::SimRole`], [`world::LaneRole`]), the one-thread scheduler, faults |
+//! | [`world`] | Nodes, roles ([`world::SimRole`], [`world::Lane`]), the one-thread scheduler, faults |
 //! | [`invariants`] | Safety/resource/liveness registration and built-ins |
 //! | [`scenario`] | Builder API: nodes, roles, faults, invariants, bounds, fidelity |
 //! | [`model`] | Model fidelity: byte-free interpreter over real `WorkerCore`s on the cost model |
 //! | [`determinism`] | Double-run trace comparison and failure shrinking |
-//! | [`fixture`] | A minimal racer-io node (two lanes, sim disk, timers, mailbox) |
+//! | [`fixture`] | A minimal racer-io node (two lanes, sim disk, timers, SPSC queues) |
 //! | [`scenarios`] | Built-in scenario catalog run by `make racer-dst` |
 //! | [`seeds`] | The seed sets `make racer-dst` runs and their Model coverage check |
 //!
@@ -45,7 +45,7 @@
 //!   disk, sockets and timers are simulated and time and entropy come from the
 //!   world;
 //! - every thread of the production process returned as one role: I/O lanes
-//!   wrap `racer_io::exec::Lane` in [`world::LaneRole`]; other roles
+//!   are [`world::Lane`]s; other roles
 //!   (crypto helpers, RDMA owner, GPU executors, authority shell) implement
 //!   [`world::SimRole`] over their racer-io parts;
 //! - per-node context for former process globals, so crash/restart

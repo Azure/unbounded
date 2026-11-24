@@ -555,7 +555,14 @@ mod circuit {
 
         /// Forget excluded failure records without releasing owned probes.
         pub fn retain(&self, keys: &[K]) {
-            self.states.borrow_mut().retain(|key, _| keys.contains(key));
+            self.retain_by(|key| keys.contains(key));
+        }
+
+        /// Forget failure records that `keep` rejects, without releasing owned
+        /// probes. Callers pass a predicate over borrowed keys, so retaining a
+        /// set of borrowed IDs does not clone or collect them.
+        pub fn retain_by(&self, mut keep: impl FnMut(&K) -> bool) {
+            self.states.borrow_mut().retain(|key, _| keep(key));
         }
 
         /// Count retained failure records, not active probes.

@@ -2,6 +2,17 @@
 members = [".", "io", "alloc", "crypto", "verbs", "gpu", "http", "topology", "flow", "flow-core", "peer-wire", "wire", "authority", "core", "dst"]
 resolver = "3"
 
+[workspace.dependencies]
+futures = "0.3"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# The asm feature gates sha2's aarch64 runtime dispatch. It is set here once so
+# every crate that depends on sha2 selects it; otherwise the software backend
+# is chosen at compile time, even on CPUs with the SHA extensions.
+sha2 = { version = "0.10", features = ["asm"] }
+zeroize = "1"
+
 [package]
 name = "racer"
 version = "0.1.0"
@@ -16,8 +27,6 @@ default = []
 rdma = ["rdma-verbs/native"]
 # Enables the separately loaded CUDA shim (libracer_gpu_cuda.so.1); without a GPU, gpu-read is unavailable.
 cuda = ["racer-gpu/native"]
-# Test-only Go SDK launcher; keeps crate-private fixture assembly out of default builds.
-subscription-interop = []
 # Test support for racer-dst: exposes the whole-application simulation harness.
 dst = [
     "peer-wire/test-util",
@@ -28,11 +37,6 @@ dst = [
     "http1/test-util",
     "topology/test-util",
 ]
-
-[[test]]
-name = "subscription_interop"
-path = "tests/subscription_interop.rs"
-required-features = ["subscription-interop"]
 
 [dependencies]
 peer-wire = { path = "peer-wire" }
@@ -48,23 +52,20 @@ racer-gpu = { path = "gpu" }
 page-alloc = { path = "alloc" }
 racer-io = { path = "io" }
 base64 = "0.22"
-futures = "0.3"
+futures.workspace = true
 getrandom = "0.2"
 io-uring = "0.7"
-libc = "0.2"
+libc.workspace = true
 prost = "0.14.4"
 regex = "1"
 rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-# The asm feature gates sha2's aarch64 runtime dispatch. Enable it in every
-# manifest that depends on sha2; otherwise the software backend is selected at
-# compile time, even on CPUs with the SHA extensions.
-sha2 = { version = "0.10", features = ["asm"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
 x509-parser = { version = "0.16", features = ["verify"] }
-zeroize = "1"
+zeroize.workspace = true
 
 [dev-dependencies]
 topology = { path = "topology", features = ["test-util"] }
@@ -83,9 +84,8 @@ http1 = { path = "http", features = ["test-util"] }
 #
 # A panic in a release build aborts the process: a panicking worker, reactor
 # callback or helper thread leaves shared state that cannot be trusted, so the
-# node restarts instead of limping on. The remaining `catch_unwind` sites only
-# take effect in test builds (Cargo ignores `panic` for test targets) and are
-# removed with the worker group rewrite.
+# node restarts instead of limping on. Cargo ignores this setting for test
+# targets, so tests still unwind.
 [profile.release]
 debug = 1
 lto = "thin"
