@@ -208,7 +208,7 @@ func TestReconcileHostSoftReboot_UsesAPIReader(t *testing.T) {
 	apiReader := fakeStatusClient(machine, hostSoftRebootOperation("op-soft"), outOfBandOperation("op-oob", "test-machine", v1alpha3.OperationHostHardReboot))
 	target := &machineOperationTarget{Client: c, apiReader: apiReader, log: discardLogger()}
 	host := &fakeNodeOperator{bootID: "boot-1"}
-	handler, err := agentdaemon.NewHostSoftRebootHandler(c, target.reader(), target.log, hostSoftRebootTarget{machineName: machine.Name, generation: machine.Generation}, host, &atomic.Bool{})
+	handler, err := agentdaemon.NewHostSoftRebootHandler(c, target.reader(), target.log, hostSoftRebootTarget{machineName: machine.Name, generation: machine.Generation}, host, &atomic.Bool{}, false)
 	require.NoError(t, err)
 
 	result, err := handler.Reconcile(context.Background(), nil, agentdaemon.MachineOperation{Name: "op-soft"})
@@ -218,7 +218,7 @@ func TestReconcileHostSoftReboot_UsesAPIReader(t *testing.T) {
 	assert.Zero(t, host.rebootCalls)
 
 	target.apiReader = nil
-	handler, err = agentdaemon.NewHostSoftRebootHandler(c, target.reader(), target.log, hostSoftRebootTarget{machineName: machine.Name, generation: machine.Generation}, host, &atomic.Bool{})
+	handler, err = agentdaemon.NewHostSoftRebootHandler(c, target.reader(), target.log, hostSoftRebootTarget{machineName: machine.Name, generation: machine.Generation}, host, &atomic.Bool{}, false)
 	require.NoError(t, err)
 	result, err = handler.Reconcile(context.Background(), nil, agentdaemon.MachineOperation{Name: "op-soft"})
 	require.NoError(t, err)

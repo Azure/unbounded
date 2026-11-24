@@ -76,10 +76,15 @@ type HostSoftRebootHandler struct {
 	reference string
 	host      HostRebooter
 	requested *atomic.Bool
+	// machineRefSelectable reports that the API server accepts the
+	// spec.machineRef field selector, as MachineRefSelectable probes it once at
+	// startup. Live MachineOperation lists are then filtered by it.
+	machineRefSelectable bool
 }
 
 // NewHostSoftRebootHandler constructs a handler with a live API reader and an
 // explicit host executor. No system reboot is used as a fallback.
+// machineRefSelectable comes from MachineRefSelectable at startup.
 func NewHostSoftRebootHandler(
 	c client.Client,
 	reader client.Reader,
@@ -87,6 +92,7 @@ func NewHostSoftRebootHandler(
 	target HostSoftRebootTarget,
 	host HostRebooter,
 	requested *atomic.Bool,
+	machineRefSelectable bool,
 ) (*HostSoftRebootHandler, error) {
 	if nilDependency(c) || nilDependency(reader) || log == nil || nilDependency(target) || nilDependency(host) || requested == nil {
 		return nil, errors.New("client, reader, logger, target, host and requested flag are required")
@@ -98,13 +104,14 @@ func NewHostSoftRebootHandler(
 	}
 
 	return &HostSoftRebootHandler{
-		client:    c,
-		reader:    reader,
-		log:       log,
-		target:    target,
-		reference: ref,
-		host:      host,
-		requested: requested,
+		client:               c,
+		reader:               reader,
+		log:                  log,
+		target:               target,
+		reference:            ref,
+		host:                 host,
+		requested:            requested,
+		machineRefSelectable: machineRefSelectable,
 	}, nil
 }
 
@@ -301,16 +308,43 @@ func operationBefore(a, b *v1alpha3.MachineOperation) bool {
 	return a.Name < b.Name
 }
 
-func (h *HostSoftRebootHandler) unfinishedOutOfBandHostOperation(ctx context.Context) (string, error) {
+// machineOperationListOptions returns the options for a live MachineOperation
+// list. When the API server accepts spec.machineRef selection, the field
+// selector is what keeps the traffic to one agent independent of the size of
+// the fleet: the list carries only the operations that name this machine. An
+// older API server or CRD gets an unfiltered list and the agent filters it
+// itself; see MachineRefSelectable.
+func (h *HostSoftRebootHandler) machineOperationListOptions() []client.ListOption {
+	if !h.machineRefSelectable {
+		return nil
+	}
+
+	return []client.ListOption{
+		client.MatchingFieldsSelector{Selector: MachineRefFieldSelector(h.reference)},
+	}
+}
+
+// listMachineOperations lists MachineOperations live through reader, narrowed
+// to this machine when the API server supports spec.machineRef selection.
+func (h *HostSoftRebootHandler) listMachineOperations(ctx context.Context, reader client.Reader) ([]v1alpha3.MachineOperation, error) {
 	var ops v1alpha3.MachineOperationList
-	if err := h.reader.List(ctx, &ops); err != nil {
-		return "", fmt.Errorf("list MachineOperations: %w", err)
+	if err := reader.List(ctx, &ops, h.machineOperationListOptions()...); err != nil {
+		return nil, fmt.Errorf("list MachineOperations: %w", err)
+	}
+
+	return ops.Items, nil
+}
+
+func (h *HostSoftRebootHandler) unfinishedOutOfBandHostOperation(ctx context.Context) (string, error) {
+	ops, err := h.listMachineOperations(ctx, h.reader)
+	if err != nil {
+		return "", err
 	}
 
 	var oldest *v1alpha3.MachineOperation
 
-	for i := range ops.Items {
-		op := &ops.Items[i]
+	for i := range ops {
+		op := &ops[i]
 		if !isOutOfBandHostOperation(op.Spec.OperationKind) {
 			continue
 		}
@@ -389,9 +423,9 @@ func (h *HostSoftRebootHandler) markWaiting(ctx context.Context, name, message s
 // It must only run during startup, not after this process issues a reboot.
 // Errors are returned to the caller, which controls startup retry behavior.
 func (h *HostSoftRebootHandler) PublishStartup(ctx context.Context) error {
-	var ops v1alpha3.MachineOperationList
-	if err := h.client.List(ctx, &ops); err != nil {
-		return fmt.Errorf("list MachineOperations: %w", err)
+	ops, err := h.listMachineOperations(ctx, h.client)
+	if err != nil {
+		return err
 	}
 
 	var (
@@ -399,8 +433,8 @@ func (h *HostSoftRebootHandler) PublishStartup(ctx context.Context) error {
 		errs   []error
 	)
 
-	for i := range ops.Items {
-		op := &ops.Items[i]
+	for i := range ops {
+		op := &ops[i]
 		// Only this machine's own operation is reported: a selector operation
 		// lists the machine as a target, but its status belongs to the
 		// controller that fans it out.

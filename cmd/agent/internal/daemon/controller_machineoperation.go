@@ -49,6 +49,11 @@ type machineOperationTarget struct {
 	// handoff resets the host, which stops and removes the daemon. Nil is
 	// never set.
 	handoff *handoffState
+	// machineRefSelectable reports that the API server accepts the
+	// spec.machineRef field selector, as the startup probe found. The
+	// HostSoftReboot live lists are then narrowed to this machine's
+	// operations.
+	machineRefSelectable bool
 }
 
 // handlers returns the MachineOperation handlers this daemon runs.
