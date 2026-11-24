@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/Azure/unbounded/internal/unbounded"
+	"github.com/Azure/unbounded/internal/systemns"
 )
 
 // Config holds the controller configuration.
@@ -107,7 +107,7 @@ func DefaultLeaderElectionConfig() LeaderElectionConfig {
 		LeaseDuration:     30 * time.Second,
 		RenewDeadline:     15 * time.Second,
 		RetryPeriod:       10 * time.Second,
-		ResourceNamespace: unbounded.SystemNamespace(),
+		ResourceNamespace: systemns.Name(),
 		ResourceName:      "unbounded-net-controller",
 	}
 }

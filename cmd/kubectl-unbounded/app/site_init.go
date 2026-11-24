@@ -26,8 +26,8 @@ import (
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"github.com/Azure/unbounded/internal/kube"
-	"github.com/Azure/unbounded/internal/unbounded"
+	"github.com/Azure/unbounded/internal/bootstraptoken"
+	"github.com/Azure/unbounded/internal/systemns"
 )
 
 //go:embed assets/unbounded-net-site/*.yaml
@@ -274,7 +274,7 @@ func requiredSiteAPIs() ([]schema.GroupVersionKind, error) {
 // proceeds. Permission errors are downgraded to a debug log so a caller that can
 // apply Sites but cannot read Deployments is not blocked or alarmed.
 func (h *siteInitHandler) warnIfOperatorNotReady(ctx context.Context) {
-	namespace := unbounded.SystemNamespace()
+	namespace := systemns.Name()
 
 	deploy, err := h.kubeCli.AppsV1().Deployments(namespace).Get(ctx, "unbounded-operator", metav1.GetOptions{})
 	if err != nil {
@@ -442,20 +442,20 @@ func (h *siteInitHandler) ensureUnboundedSite(ctx context.Context, cfg unbounded
 }
 
 func (h *siteInitHandler) ensureBootstrapToken(ctx context.Context) error {
-	tok, err := kube.GetBootstrapTokenForSite(ctx, h.kubeCli, h.name)
-	if err != nil && !errors.Is(err, kube.ErrBootstrapTokenNotFound) {
+	tok, err := bootstraptoken.ForSite(ctx, h.kubeCli, h.name)
+	if err != nil && !errors.Is(err, bootstraptoken.ErrNotFound) {
 		return fmt.Errorf("getting bootstrap token for %s: %w", h.name, err)
 	}
 
 	if tok == nil {
-		tok, err := kube.NewBootstrapToken()
+		tok, err := bootstraptoken.New()
 		if err != nil {
 			return fmt.Errorf("generating bootstrap token for %s: %w", h.name, err)
 		}
 
 		tok.WithLabel("unbounded-cloud.io/site", h.name)
 
-		if err := kube.ApplyBootstrapToken(ctx, h.kubeCli, fieldManagerID, tok); err != nil {
+		if err := bootstraptoken.Apply(ctx, h.kubeCli, fieldManagerID, tok); err != nil {
 			return fmt.Errorf("applying bootstrap token for %s: %w", h.name, err)
 		}
 	}

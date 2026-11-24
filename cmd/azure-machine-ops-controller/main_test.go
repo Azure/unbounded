@@ -11,7 +11,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	"github.com/Azure/unbounded/internal/unbounded"
+	"github.com/Azure/unbounded/internal/systemns"
 	machineopscontroller "github.com/Azure/unbounded/pkg/machineops/controller"
 )
 
@@ -140,8 +140,8 @@ func TestCapacityFlagsDefaultOff(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, cfg.enableCapacity)
 	require.True(t, cfg.leaderElection)
-	require.Equal(t, unbounded.SystemNamespace(), cfg.providerConfigNamespace)
-	require.Equal(t, unbounded.SystemNamespace(), cfg.credentialSecretNamespace)
+	require.Equal(t, systemns.Name(), cfg.providerConfigNamespace)
+	require.Equal(t, systemns.Name(), cfg.credentialSecretNamespace)
 	require.Empty(t, cfg.allocationConsumerKinds)
 
 	options, err := capacityOptions(cfg)
@@ -158,8 +158,8 @@ func TestCapacityFlagsEnableAllocationController(t *testing.T) {
 	options, err := capacityOptions(cfg)
 	require.NoError(t, err)
 	require.Equal(t, &machineopscontroller.CapacityOptions{
-		CredentialSecretNamespace:  unbounded.SystemNamespace(),
-		ProviderConfigNamespace:    unbounded.SystemNamespace(),
+		CredentialSecretNamespace:  systemns.Name(),
+		ProviderConfigNamespace:    systemns.Name(),
 		EnableAllocationController: true,
 	}, options)
 	require.Empty(t, options.AllocationConsumerKinds, "consumer kinds are empty unless asked for")

@@ -36,7 +36,7 @@ import (
 	"github.com/Azure/unbounded/internal/clusterinfo"
 	"github.com/Azure/unbounded/internal/operator"
 	"github.com/Azure/unbounded/internal/operator/components/gantry"
-	"github.com/Azure/unbounded/internal/unbounded"
+	"github.com/Azure/unbounded/internal/systemns"
 	"github.com/Azure/unbounded/internal/version"
 )
 
@@ -75,8 +75,8 @@ func newCommand(runFn func(context.Context, config) error) *cobra.Command {
 	cmd.Flags().StringVar(&cfg.metricsAddr, "metrics-bind-address", ":8080", "Address for metrics endpoint")
 	cmd.Flags().StringVar(&cfg.probeAddr, "health-probe-bind-address", ":8081", "Address for health probes")
 	cmd.Flags().BoolVar(&cfg.leaderElection, "leader-elect", true, "Enable leader election")
-	cmd.Flags().StringVar(&cfg.leaderElectionNamespace, "leader-elect-namespace", unbounded.SystemNamespace(), "Namespace for the leader election lease")
-	cmd.Flags().StringVar(&cfg.namespace, "namespace", unbounded.SystemNamespace(), "Namespace the operator reconciles components into and migrates legacy state to")
+	cmd.Flags().StringVar(&cfg.leaderElectionNamespace, "leader-elect-namespace", systemns.Name(), "Namespace for the leader election lease")
+	cmd.Flags().StringVar(&cfg.namespace, "namespace", systemns.Name(), "Namespace the operator reconciles components into and migrates legacy state to")
 	cmd.Flags().StringVar(&cfg.imageRegistry, "image-registry", envStringDefault("UNBOUNDED_IMAGE_REGISTRY", "ghcr.io/azure"), "Full image-repository prefix (registry host plus org/namespace) for operator-managed component images (defaults to $UNBOUNDED_IMAGE_REGISTRY or ghcr.io/azure)")
 	cmd.Flags().StringVar(&cfg.apiServerEndpoint, "api-server-endpoint", os.Getenv("UNBOUNDED_API_SERVER_ENDPOINT"), "Kubernetes API server endpoint advertised by machina; overrides auto-discovery from kube-public/cluster-info or the KUBERNETES_SERVICE_HOST FQDN (defaults to $UNBOUNDED_API_SERVER_ENDPOINT)")
 	cmd.Flags().BoolVar(&cfg.reapLegacyResources, "reap-legacy-resources", true, "Translate legacy net-group Sites, migrate state into unbounded-system, and reap the pre-consolidation namespaces (defaults to $UNBOUNDED_REAP_LEGACY_RESOURCES or true)")
@@ -151,7 +151,7 @@ func run(ctx context.Context, cfg config) error {
 
 	namespace := cfg.namespace
 	if namespace == "" {
-		namespace = unbounded.SystemNamespace()
+		namespace = systemns.Name()
 	}
 
 	restConfig := ctrl.GetConfigOrDie()

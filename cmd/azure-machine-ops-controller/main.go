@@ -9,7 +9,7 @@
 //
 // A controller for another provider copies this command and replaces
 // azureProviders. Apart from the provider itself, the only packages this file
-// cannot import from outside this repository are internal/unbounded, for the
+// cannot import from outside this repository are internal/systemns, for the
 // default namespace of the flags, and internal/version, for the version
 // string. The README lists what else in this directory is tied to the
 // repository.
@@ -39,7 +39,7 @@ import (
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/cmd/azure-machine-ops-controller/internal/azurevm"
-	"github.com/Azure/unbounded/internal/unbounded"
+	"github.com/Azure/unbounded/internal/systemns"
 	"github.com/Azure/unbounded/internal/version"
 	"github.com/Azure/unbounded/pkg/machineops"
 	machineopscontroller "github.com/Azure/unbounded/pkg/machineops/controller"
@@ -81,8 +81,8 @@ func newCommand(runController func(context.Context, config) error) *cobra.Comman
 	cmd.Flags().StringVar(&cfg.metricsAddr, "metrics-bind-address", ":8080", "Address for metrics endpoint")
 	cmd.Flags().StringVar(&cfg.probeAddr, "health-probe-bind-address", ":8081", "Address for health probes")
 	cmd.Flags().BoolVar(&cfg.leaderElection, "leader-elect", true, "Enable leader election")
-	cmd.Flags().StringVar(&cfg.leaderElectionNamespace, "leader-elect-namespace", unbounded.SystemNamespace(), "Namespace for the leader election lease")
-	cmd.Flags().StringVar(&cfg.credentialSecretNamespace, "credential-secret-namespace", unbounded.SystemNamespace(), "Namespace containing MachineOperationCredential referenced Secrets")
+	cmd.Flags().StringVar(&cfg.leaderElectionNamespace, "leader-elect-namespace", systemns.Name(), "Namespace for the leader election lease")
+	cmd.Flags().StringVar(&cfg.credentialSecretNamespace, "credential-secret-namespace", systemns.Name(), "Namespace containing MachineOperationCredential referenced Secrets")
 	cmd.Flags().IntVar(&cfg.maxConcurrentReconciles, "max-concurrent-reconciles", 10, "Maximum concurrent MachineOperation reconciles")
 	cmd.Flags().StringVar(&cfg.apiServerEndpoint, "api-server-endpoint", "", "Kubernetes API server endpoint used in host replacement bootstrap config")
 	cmd.Flags().StringVar(&cfg.siteName, "site", "", "Limit this controller to Machines of one Site. Deployments must not have overlapping scopes")
@@ -94,7 +94,7 @@ func newCommand(runController func(context.Context, config) error) *cobra.Comman
 	cmd.Flags().BoolVar(&cfg.enableCapacity, "enable-capacity", false,
 		"Run the MachineClass and MachineAllocation capacity controllers for providers that declare capacity. "+
 			"Requires --leader-elect, the capacity RBAC bindings and the allocation admission policies")
-	cmd.Flags().StringVar(&cfg.providerConfigNamespace, "provider-config-namespace", unbounded.SystemNamespace(),
+	cmd.Flags().StringVar(&cfg.providerConfigNamespace, "provider-config-namespace", systemns.Name(),
 		"Namespace containing MachineClass provider-config and bootstrap files ConfigMaps; used with --enable-capacity")
 	cmd.Flags().StringArrayVar(&cfg.allocationConsumerKinds, "allocation-consumer-kind", nil,
 		"Cluster-scoped consumer kind, as group/version/Kind, whose termination and loss the MachineAllocation controller observes, "+

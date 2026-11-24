@@ -23,7 +23,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/Azure/unbounded/internal/operator/override"
-	"github.com/Azure/unbounded/internal/unbounded"
+	"github.com/Azure/unbounded/internal/systemns"
 )
 
 func overridesValidateCommand() *cobra.Command {
@@ -77,7 +77,7 @@ Examples:
 	cmd.Flags().StringArrayVarP(&files, "filename", "f", nil,
 		"Override document to validate, or - for standard input. Repeatable. "+
 			"Reads the cluster ConfigMap when omitted.")
-	cmd.Flags().StringVar(&namespace, "namespace", unbounded.SystemNamespace(),
+	cmd.Flags().StringVar(&namespace, "namespace", systemns.Name(),
 		"Namespace holding the overrides ConfigMap")
 	cmd.Flags().StringVar(&kubeconfig, "kubeconfig", "", "Path to kubeconfig file")
 

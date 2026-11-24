@@ -33,7 +33,7 @@ import (
 
 	operatormanifests "github.com/Azure/unbounded/deploy/unbounded-operator"
 	"github.com/Azure/unbounded/internal/operator"
-	"github.com/Azure/unbounded/internal/unbounded"
+	"github.com/Azure/unbounded/internal/systemns"
 )
 
 const defaultInstallTimeout = 5 * time.Minute
@@ -101,7 +101,7 @@ Sites are created or updated.`,
 
 func addInstallFlags(cmd *cobra.Command, handler *installHandler) {
 	cmd.Flags().StringVar(&handler.kubeconfigPath, "kubeconfig", "", "Path to kubeconfig file")
-	cmd.Flags().StringVar(&handler.namespace, "namespace", unbounded.SystemNamespace(), "Namespace for unbounded-operator and default components")
+	cmd.Flags().StringVar(&handler.namespace, "namespace", systemns.Name(), "Namespace for unbounded-operator and default components")
 	cmd.Flags().StringVar(&handler.operatorImage, "operator-image", "", "unbounded-operator image name and tag without a registry (e.g. unbounded-operator:v1); the registry comes from --image-registry")
 	cmd.Flags().StringVar(&handler.imageRegistry, "image-registry", "", "Full image-repository prefix (registry host plus org/namespace) all unbounded images are pulled from; defaults to the registry the binary was built with")
 	cmd.Flags().StringVar(&handler.apiServerEndpoint, "api-server-endpoint", "", "Override the Kubernetes API server endpoint advertised to provisioned machines; by default the operator auto-discovers it from kube-public/cluster-info, or the KUBERNETES_SERVICE_HOST FQDN on clusters (e.g. AKS) that do not publish cluster-info")
@@ -122,7 +122,7 @@ func (h *installHandler) execute(ctx context.Context) error {
 	}
 
 	if h.namespace == "" {
-		h.namespace = unbounded.SystemNamespace()
+		h.namespace = systemns.Name()
 	}
 
 	// Refuse to install into a legacy namespace: the operator's migration reaper
@@ -131,7 +131,7 @@ func (h *installHandler) execute(ctx context.Context) error {
 	if operator.IsLegacyNamespace(h.namespace) {
 		return fmt.Errorf(
 			"refusing to install into legacy namespace %q: the operator's migration reaper drains and deletes this namespace; choose a different --namespace (default %q)",
-			h.namespace, unbounded.SystemNamespace(),
+			h.namespace, systemns.Name(),
 		)
 	}
 
@@ -265,14 +265,14 @@ func (h *installHandler) mutateOperatorObject(obj *unstructured.Unstructured) er
 
 	// Retarget the build-time namespace baked into the rendered operator
 	// manifests to the install namespace. The rewrite source MUST be the
-	// build-time literal (DefaultSystemNamespace), not SystemNamespace(): the
+	// build-time literal (systemns.Default), not systemns.Name(): the
 	// latter reflects this process's own POD_NAMESPACE, so when POD_NAMESPACE is
 	// set (an in-cluster installer) or the default namespace is used, the "from"
 	// value would no longer match the baked "unbounded-system" and cluster-scoped
 	// references that only rewriteNamespace can fix (for example the
 	// ClusterRoleBinding subject namespace) would be left pointing at the wrong
 	// namespace, leaving the operator with no RBAC.
-	rewriteNamespace(obj, unbounded.DefaultSystemNamespace, h.namespace)
+	rewriteNamespace(obj, systemns.Default, h.namespace)
 	setNamespace(obj, h.namespace)
 
 	// The api-server-endpoint is delivered to the operator via the

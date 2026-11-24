@@ -9,11 +9,12 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
-	"strings"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+
+	"github.com/Azure/unbounded/internal/bootstraptoken"
 )
 
 // ErrBootstrapTokenNotFound is returned by GetBootstrapToken when no matching
@@ -46,11 +47,10 @@ func GetBootstrapToken(ctx context.Context, kubeCli kubernetes.Interface) (*Boot
 
 	for _, secret := range secrets.Items {
 		if secret.Type == "bootstrap.kubernetes.io/token" {
-			if !strings.HasPrefix(secret.Name, "bootstrap-token-") {
+			tokenID := string(secret.Data["token-id"])
+			if tokenID == "" || secret.Name != bootstraptoken.SecretName(tokenID) {
 				continue
 			}
-
-			tokenID := strings.TrimPrefix(secret.Name, "bootstrap-token-")
 
 			// Extract token secret from secret data
 			tokenSecretBytes, ok := secret.Data["token-secret"]
@@ -90,7 +90,7 @@ func BootstrapTokenManifest(id, token string) string {
 	return fmt.Sprintf(`apiVersion: v1
 kind: Secret
 metadata:
-  name: bootstrap-token-%[1]s
+  name: %[4]s
   namespace: kube-system
   labels:
     unbounded-cloud.io/default-bootstrap-token: "true"
@@ -100,8 +100,8 @@ stringData:
   token-secret: "%[2]s"
   usage-bootstrap-authentication: "true"
   usage-bootstrap-signing: "true"
-  auth-extra-groups: "system:bootstrappers:unbounded-agent-daemons"
-  expiration: "%[3]s"`, id, token, expiresAt)
+  auth-extra-groups: "%[5]s"
+  expiration: "%[3]s"`, id, token, expiresAt, bootstraptoken.SecretName(id), bootstraptoken.Group)
 }
 
 func generateRandomString(length int) (string, error) {

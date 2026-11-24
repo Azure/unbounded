@@ -27,7 +27,7 @@ import (
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/provision"
-	"github.com/Azure/unbounded/internal/unbounded"
+	"github.com/Azure/unbounded/internal/systemns"
 )
 
 const (
@@ -488,10 +488,10 @@ func (r *MachineReconciler) buildSSHConfig(ctx context.Context, machine *unbound
 }
 
 // getSecretValue retrieves a value from a secret in the namespace machina is
-// deployed into (unbounded.SystemNamespace()).
+// deployed into (systemns.Name()).
 func getSecretValue(ctx context.Context, reader client.Reader, ref *unboundedv1alpha3.SecretKeySelector) (string, error) {
 	var secret corev1.Secret
-	if err := reader.Get(ctx, client.ObjectKey{Namespace: unbounded.SystemNamespace(), Name: ref.Name}, &secret); err != nil {
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: systemns.Name(), Name: ref.Name}, &secret); err != nil {
 		return "", fmt.Errorf("get secret %s: %w", ref.Name, err)
 	}
 

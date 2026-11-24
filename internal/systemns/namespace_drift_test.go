@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package unbounded
+package systemns
 
 import (
 	"os"
@@ -24,15 +24,15 @@ type namespaceTemplate struct {
 	renderedFile string
 }
 
-// TestSystemNamespace_MatchesTemplateDefaults is the drift guard between the
-// Go-side default (the systemNamespace const) and the namespace baked into the
-// manifest templates via `{{ default "unbounded-system" .Namespace }}`.
+// TestDefault_MatchesTemplateDefaults is the drift guard between Default and
+// the namespace baked into the manifest templates via
+// `{{ default "unbounded-system" .Namespace }}`.
 //
 // It renders each component's templates with NO Namespace supplied (so the
 // template `default` fallback is exercised) and asserts the resulting Namespace
-// resource name equals systemNamespace. If someone changes the const without
-// updating the templates (or vice versa), this test fails loudly.
-func TestSystemNamespace_MatchesTemplateDefaults(t *testing.T) {
+// resource name equals Default. If someone changes the const without updating
+// the templates (or vice versa), this test fails loudly.
+func TestDefault_MatchesTemplateDefaults(t *testing.T) {
 	root := repoRoot(t)
 
 	templates := []namespaceTemplate{
@@ -60,9 +60,9 @@ func TestSystemNamespace_MatchesTemplateDefaults(t *testing.T) {
 			}
 
 			name := namespaceResourceName(t, raw)
-			if name != systemNamespace {
-				t.Fatalf("%s template default namespace %q does not match systemNamespace %q; keep the const and the manifest template defaults in sync",
-					tc.component, name, systemNamespace)
+			if name != Default {
+				t.Fatalf("%s template default namespace %q does not match Default %q; keep the const and the manifest template defaults in sync",
+					tc.component, name, Default)
 			}
 		})
 	}
@@ -71,7 +71,7 @@ func TestSystemNamespace_MatchesTemplateDefaults(t *testing.T) {
 // Gantry's and unbounded-operator's charts use Helm's release namespace rather
 // than a hardcoded template fallback. The Makefile defaults passed to Helm are
 // therefore their namespace source of truth.
-func TestSystemNamespace_MatchesGantryMakeDefault(t *testing.T) {
+func TestDefault_MatchesGantryMakeDefault(t *testing.T) {
 	root := repoRoot(t)
 
 	raw, err := os.ReadFile(filepath.Join(root, "Makefile"))
@@ -80,12 +80,12 @@ func TestSystemNamespace_MatchesGantryMakeDefault(t *testing.T) {
 	}
 
 	for _, assignment := range []string{
-		"UNBOUNDED_NAMESPACE ?= " + systemNamespace,
+		"UNBOUNDED_NAMESPACE ?= " + Default,
 		"GANTRY_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)",
 		"UNBOUNDED_OPERATOR_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)",
 	} {
 		if !strings.Contains(string(raw), assignment) {
-			t.Fatalf("Makefile is missing %q; keep the Helm render defaults aligned with systemNamespace %q", assignment, systemNamespace)
+			t.Fatalf("Makefile is missing %q; keep the Helm render defaults aligned with Default %q", assignment, Default)
 		}
 	}
 }

@@ -26,7 +26,7 @@ import (
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 	unboundednet "github.com/Azure/unbounded/internal/net/client/unboundednet"
-	"github.com/Azure/unbounded/internal/unbounded"
+	"github.com/Azure/unbounded/internal/systemns"
 )
 
 const (
@@ -86,7 +86,7 @@ func NewServer(clientset kubernetes.Interface, restConfig *rest.Config, namespac
 	}
 
 	if namespace == "" {
-		namespace = unbounded.SystemNamespace()
+		namespace = systemns.Name()
 	}
 
 	mux := http.NewServeMux()

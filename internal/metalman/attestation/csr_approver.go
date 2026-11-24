@@ -23,14 +23,14 @@ import (
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/metalman/indexing"
-	"github.com/Azure/unbounded/internal/unbounded"
+	"github.com/Azure/unbounded/internal/systemns"
 	"github.com/Azure/unbounded/pkg/agent/daemoncred"
 )
 
 // BootstrapUsername returns the CSR requester username of the bootstrap
 // tokens that Attest issues.
 func BootstrapUsername() string {
-	return "system:serviceaccount:" + unbounded.SystemNamespace() + ":" + BootstrapSAName
+	return "system:serviceaccount:" + systemns.Name() + ":" + BootstrapSAName
 }
 
 // CSRApprover approves kubelet client CSRs submitted with a bootstrap token

@@ -21,8 +21,8 @@ import (
 	"sigs.k8s.io/yaml"
 
 	"github.com/Azure/unbounded/api/machina/v1alpha3"
-	"github.com/Azure/unbounded/internal/kube"
-	"github.com/Azure/unbounded/internal/unbounded"
+	"github.com/Azure/unbounded/internal/bootstraptoken"
+	"github.com/Azure/unbounded/internal/systemns"
 )
 
 type machineRegisterHandler struct {
@@ -185,7 +185,7 @@ func (h *machineRegisterHandler) executeAfterValidation(ctx context.Context) err
 	}
 
 	// Resolve the bootstrap token for this site.
-	bootstrapToken, err := kube.GetBootstrapTokenForSite(ctx, h.kubeCli, h.siteName)
+	bootstrapToken, err := bootstraptoken.ForSite(ctx, h.kubeCli, h.siteName)
 	if err != nil {
 		return fmt.Errorf("getting bootstrap token for site %s: %w (run 'kubectl unbounded site init' first)", h.siteName, err)
 	}
@@ -228,7 +228,7 @@ func (h *machineRegisterHandler) executeAfterValidation(ctx context.Context) err
 				Version:    sv.GitVersion,
 				NodeLabels: nodeLabels,
 				BootstrapTokenRef: &v1alpha3.LocalObjectReference{
-					Name: fmt.Sprintf("bootstrap-token-%s", bootstrapToken.ID),
+					Name: bootstraptoken.SecretName(bootstrapToken.ID),
 				},
 			},
 			Agent: h.buildAgentSpec(),
@@ -326,7 +326,7 @@ func (h *machineRegisterHandler) setDefaults() {
 
 	// Default the SSH secret namespace to the machina namespace.
 	if isEmpty(h.namespace) {
-		h.namespace = unbounded.SystemNamespace()
+		h.namespace = systemns.Name()
 	}
 
 	// Default the SSH secret name to "ssh-${site}".
@@ -450,7 +450,7 @@ func machineRegisterCommand() *cobra.Command {
 	cmd.Flags().StringVar(&handler.hostSSHUsername, "ssh-username", "", "SSH username for connecting to the machine")
 	cmd.Flags().StringVar(&handler.hostSSHPrivateKey, "ssh-private-key", "", "Path to SSH private key file (required if no bastion flags are set)")
 	cmd.Flags().StringVar(&handler.sshSecretName, "ssh-secret-name", "", "Name of the Kubernetes secret for SSH credentials (defaults to ssh-$site)")
-	cmd.Flags().StringVar(&handler.namespace, "namespace", unbounded.SystemNamespace(), "Namespace for the SSH secrets and their Machine refs; must match the namespace machina runs in")
+	cmd.Flags().StringVar(&handler.namespace, "namespace", systemns.Name(), "Namespace for the SSH secrets and their Machine refs; must match the namespace machina runs in")
 	cmd.Flags().StringVar(&handler.bastionHost, "bastion-host", "", "Host and optionally port of the bastion (e.g. 5.6.7.8 or 5.6.7.8:2222)")
 	cmd.Flags().StringVar(&handler.bastionSSHSecretName, "bastion-ssh-secret-name", "", "Name of the Kubernetes secret for bastion SSH credentials (defaults to --ssh-secret-name)")
 	cmd.Flags().StringVar(&handler.bastionSSHUsername, "bastion-ssh-username", "", "SSH username for the bastion (defaults to --ssh-username)")

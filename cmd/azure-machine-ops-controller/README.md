@@ -62,9 +62,9 @@ owner can still name it in the deprecated `spec.provider`, with the host in
    `controllerName`. It names the leader-election lease, so two controllers
    that keep the same name in one namespace would exclude each other.
 4. Replace what only exists inside this repository:
-   - `main.go` imports `internal/unbounded` for the default namespace of
+   - `main.go` imports `internal/systemns` for the default namespace of
      three flags and `internal/version` for the version string.
-   - `main_test.go` imports `internal/unbounded` too.
+   - `main_test.go` imports `internal/systemns` too.
    - `envtest_test.go` loads the CRDs from `../../deploy/machina/crd`, a path
      relative to this directory. Point it at your copy of the CRDs.
 5. Take the manifests from `deploy/machine-ops`. They are Go templates that

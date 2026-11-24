@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Azure/unbounded/internal/unbounded"
+	"github.com/Azure/unbounded/internal/systemns"
 )
 
 // TestDefaultLeaderElectionConfig tests DefaultLeaderElectionConfig.
@@ -29,7 +29,7 @@ func TestDefaultLeaderElectionConfig(t *testing.T) {
 		t.Fatalf("unexpected retry period: %v", cfg.RetryPeriod)
 	}
 
-	if cfg.ResourceNamespace != unbounded.SystemNamespace() {
+	if cfg.ResourceNamespace != systemns.Name() {
 		t.Fatalf("unexpected resource namespace: %s", cfg.ResourceNamespace)
 	}
 

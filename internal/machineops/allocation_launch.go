@@ -21,7 +21,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	"github.com/Azure/unbounded/internal/kube"
+	"github.com/Azure/unbounded/internal/bootstraptoken"
 	publicmachineops "github.com/Azure/unbounded/pkg/machineops"
 )
 
@@ -535,13 +535,13 @@ func (r *MachineAllocationReconciler) ensureToken(ctx context.Context, s *alloca
 		return false, fmt.Errorf("get bootstrap token Secret %s/%s: %w", key.Namespace, key.Name, err)
 	}
 
-	token, err := kube.NewBootstrapToken()
+	token, err := bootstraptoken.New()
 	if err != nil {
 		return false, err
 	}
 
 	token.ID = s.names.tokenID
-	token.ExpiresAt = r.now().UTC().Add(kube.DefaultBootstrapTokenTTL)
+	token.ExpiresAt = r.now().UTC().Add(bootstraptoken.DefaultTTL)
 
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -553,7 +553,7 @@ func (r *MachineAllocationReconciler) ensureToken(ctx context.Context, s *alloca
 			},
 		},
 		Type: corev1.SecretTypeBootstrapToken,
-		Data: kube.BootstrapTokenSecretData(token),
+		Data: bootstraptoken.SecretData(token),
 	}
 
 	if err := r.Create(ctx, secret); err != nil {
