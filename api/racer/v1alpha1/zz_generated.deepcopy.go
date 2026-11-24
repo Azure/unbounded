@@ -193,6 +193,11 @@ func (in *ObjectOrigin) DeepCopyInto(out *ObjectOrigin) {
 		*out = new(v1.Duration)
 		**out = **in
 	}
+	if in.MetadataImmutable != nil {
+		in, out := &in.MetadataImmutable, &out.MetadataImmutable
+		*out = new(bool)
+		**out = **in
+	}
 	if in.RequestTimeout != nil {
 		in, out := &in.RequestTimeout, &out.RequestTimeout
 		*out = new(v1.Duration)

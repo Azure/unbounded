@@ -313,6 +313,7 @@ func TestValidateOriginAcceptsValidSpecs(t *testing.T) {
 		"workload-identity": func(o *racerv1.ObjectOrigin) {
 			o.Azure.Credential = &racerv1.AzureCredential{WorkloadIdentity: &racerv1.AzureWorkloadIdentityCredential{ClientID: "c", TenantID: "t"}}
 		},
+		"metadata-immutable": func(o *racerv1.ObjectOrigin) { o.MetadataImmutable = ptr.To(true) },
 		"tuning": func(o *racerv1.ObjectOrigin) {
 			o.MetadataTTL = &metav1.Duration{}
 			o.RequestTimeout = &metav1.Duration{Duration: time.Second}

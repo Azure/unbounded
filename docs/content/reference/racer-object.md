@@ -68,7 +68,11 @@ Objects with a non-identity `Content-Encoding`, such as gzip, are rejected,
 because Racer's metadata cannot carry that header. Store unencoded bytes.
 
 Mutable object names can stay stale for the length of the ClusterCache
-`spec.origin.metadataTTL`. An
+`spec.origin.metadataTTL`. Setting `spec.origin.metadataImmutable` removes that
+revalidation entirely, so use it only for objects that never change: stale
+metadata then fails reads with a version mismatch. Upgrade every publication
+consumer (control seats and dataplanes) before enabling it, because an older
+parser rejects the whole publication. An
 overwritten version may become unavailable mid-read. Request a specific version
 when you need an exact one and the upstream supports versioning.
 
