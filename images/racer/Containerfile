@@ -116,7 +116,6 @@ COPY cmd/racer/gpu/src ./gpu/src
 COPY cmd/racer/gpu/native ./gpu/native
 COPY cmd/racer/http/Cargo.toml ./http/Cargo.toml
 COPY cmd/racer/http/src ./http/src
-COPY cmd/racer/http/tests ./http/tests
 COPY cmd/racer/topology/Cargo.toml ./topology/Cargo.toml
 COPY cmd/racer/topology/src ./topology/src
 COPY cmd/racer/dst/Cargo.toml ./dst/Cargo.toml
@@ -129,7 +128,7 @@ RUN set -eu; \
     features=; \
     if [ "$RACER_NATIVE_RDMA" = true ]; then features=rdma; fi; \
     if [ "$RACER_NATIVE_CUDA" = true ]; then features="${features:+$features,}cuda"; fi; \
-    cargo build --locked --release --bin racer --no-default-features ${features:+--features "$features"}; \
+    cargo build --locked --release --bin racer ${features:+--features "$features"}; \
     if [ "$RACER_NATIVE_RDMA" = true ]; then \
         sh ./build-native.sh verbs/native/verbs.c /out/usr/local/lib/librdma_verbs.so.1; \
     fi; \

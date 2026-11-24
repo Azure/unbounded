@@ -23,8 +23,10 @@ rcgen = { version = "0.13", features = ["pem", "ring"] }
 
 [[test]]
 name = "pool"
+path = "tests/pool.rs"
 required-features = ["test-util"]
 
 [[test]]
 name = "tls"
+path = "tests/tls.rs"
 required-features = ["test-util"]
