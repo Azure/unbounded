@@ -2829,7 +2829,9 @@ fn startup_reauthenticates_retained_identity_and_fails_closed() {
             &config,
             &node,
             &config.limits,
-            &scope(&racer_io::Clock::host(), Duration::from_secs(30)).unwrap(),
+            // Three real TLS handshakes against the fixture; a loaded
+            // machine can spend longer than the old 30s bound on them.
+            &scope(&racer_io::Clock::host(), Duration::from_secs(120)).unwrap(),
             &env.ctx,
         )
     };
