@@ -290,6 +290,14 @@ impl WorkerApplication {
         }
         let mut publication: Option<Operation<'_, ()>> = None;
         let result = std::future::poll_fn(|cx| {
+            // The drain path does not run `poll_services`, so reap this lane's
+            // encode completion here and keep its wake source current.
+            if let Some(encoder) = &self.checkpoint_encoder {
+                encoder.register_driver(cx.waker());
+                if let Err(error) = encoder.poll_budgeted(64) {
+                    return Poll::Ready(Err(error));
+                }
+            }
             if let Some(publish) = publication.as_mut() {
                 if let Poll::Ready(result) = std::pin::Pin::as_mut(publish).poll(cx) {
                     node.checkpoint

@@ -2874,6 +2874,7 @@ fn node_replacement_drains_all_workers_and_restart_converges() {
             node: node.clone(),
             discovered_nics: vec![],
             ctx: env.ctx.clone(),
+            checkpoint_encoder: std::sync::Mutex::new(None),
         });
         let cpu = EffectiveTopology::discover().unwrap().cpus[0].clone();
         let mut group = WorkerGroup::new(
@@ -2991,6 +2992,7 @@ fn two_worker_real_control_key_lease_drain_and_checkpoint_cut() {
         limits,
         discovered_nics: vec![],
         ctx: env.ctx.clone(),
+        checkpoint_encoder: std::sync::Mutex::new(None),
     });
     let cpu = EffectiveTopology::discover().unwrap().cpus[0].clone();
     let plan = AffinityPlan {

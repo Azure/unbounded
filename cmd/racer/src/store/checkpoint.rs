@@ -11,6 +11,7 @@ use super::catalog::RecordLocation;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
+use crate::lifecycle::Service;
 use crate::model::CacheKey;
 use crate::model::ObjectId;
 use crate::model::ObjectVersion;
@@ -21,6 +22,7 @@ use crate::model::VersionMetadata;
 use crate::model::WorkerId;
 use crate::runtime::HashMap;
 use crate::runtime::HashSet;
+use crate::runtime::RequestScope;
 use page_alloc::Alignment;
 use page_alloc::Extent;
 use page_alloc::FreezeGuard;
@@ -31,6 +33,7 @@ use page_alloc::SegmentState;
 use page_alloc::Segments;
 use racer_io::exec::yield_now;
 use racer_io::scoped::fs::prelude::*;
+use racer_io::xthread::offload;
 use racer_wire::control::CacheId;
 use racer_wire::control::ClusterId;
 use racer_wire::control::KeyId;
@@ -38,9 +41,13 @@ use sha2::Digest;
 use sha2::Sha256;
 use std::cell::Cell;
 use std::cell::RefCell;
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::task::Context;
+use std::task::Poll;
+use std::task::Waker;
 
 pub(crate) const CHECKPOINT_NAMES: [&str; 2] = ["checkpoint.0", "checkpoint.1"];
 const SLOTS: racer_io::fs::checkpoint::Slots<HEADER_BYTES> = racer_io::fs::checkpoint::Slots {
@@ -64,6 +71,7 @@ pub struct Checkpointer {
     frozen: RefCell<Option<FreezeGuard>>,
     writer: RefCell<std::rc::Weak<super::StoreWriter>>,
     paused: RefCell<Option<super::WriterPause>>,
+    encoder: RefCell<Option<Rc<EncoderClient>>>,
 }
 
 impl Checkpointer {
@@ -77,11 +85,18 @@ impl Checkpointer {
             frozen: RefCell::new(None),
             writer: RefCell::new(std::rc::Weak::new()),
             paused: RefCell::new(None),
+            encoder: RefCell::new(None),
         }
     }
 
     pub(super) fn bind_writer(&self, writer: &Rc<super::StoreWriter>) {
         *self.writer.borrow_mut() = Rc::downgrade(writer);
+    }
+
+    /// Route validation and encoding to this worker's helper lane. Without a
+    /// binding, publication encodes on the calling lane, as simulation does.
+    pub(crate) fn bind_encoder(&self, encoder: Rc<EncoderClient>) {
+        *self.encoder.borrow_mut() = Some(encoder);
     }
 
     async fn pause_writer(&self) -> Result<Option<super::WriterPause>> {
@@ -313,9 +328,7 @@ impl Checkpointer {
             .borrow()
             .upgrade()
             .map(|writer| writer.metrics.clone());
-        // A real helper thread finishes at a wall time the simulator cannot
-        // schedule, so simulation encodes inline to keep replays deterministic.
-        let offload = !reactor.ctx().is_simulated();
+        let encoder = self.encoder.borrow().clone();
         Ok(Box::pin(async move {
             let image = CheckpointImage {
                 version: CHECKPOINT_VERSION,
@@ -324,12 +337,15 @@ impl Checkpointer {
                 sequence,
                 shards,
             };
-            // Validation and encoding of a large cut is seconds of CPU. Run it
-            // on a helper thread so this reactor keeps serving I/O meanwhile.
-            let encoded = if offload {
-                encode_offloaded(image, budget).await
-            } else {
-                encode_inline(&image, budget)
+            // Validation and encoding of a large cut is seconds of CPU. Hand it
+            // to a helper lane so this lane keeps serving I/O meanwhile. The
+            // simulator has no helper lanes and must stay deterministic, so it
+            // encodes inline.
+            let encoded = match encoder {
+                Some(encoder) if !reactor.ctx().is_simulated() => {
+                    encoder.encode(image, budget, scope.clone()).await?
+                }
+                _ => encode_inline(&image, budget),
             };
             if let Some(metrics) = &metrics {
                 metrics.record(
@@ -364,17 +380,20 @@ impl Checkpointer {
     }
 }
 
-/// Outcome of [`encode_offloaded`], with the CPU wall time it took.
-struct Encoded {
-    result: Result<(Vec<u8>, [u8; DIGEST_BYTES])>,
-    elapsed: std::time::Duration,
+/// Outcome of one validation and encoding pass, with the CPU wall time it took.
+pub(crate) struct Encoded {
+    pub(crate) result: Result<(Vec<u8>, [u8; DIGEST_BYTES])>,
+    pub(crate) elapsed: std::time::Duration,
     /// Name of the thread that encoded, so tests can prove the offload.
     #[cfg(test)]
-    thread: Option<String>,
+    pub(crate) thread: Option<String>,
 }
 
 /// Validate, encode, budget-check, and fingerprint `image`.
-fn encode_checked(image: &CheckpointImage, budget: usize) -> Result<(Vec<u8>, [u8; DIGEST_BYTES])> {
+pub(crate) fn encode_checked(
+    image: &CheckpointImage,
+    budget: usize,
+) -> Result<(Vec<u8>, [u8; DIGEST_BYTES])> {
     let bytes = encode(image)?;
     // Never replace a slot with a cut recovery would reject: the reader caps
     // the file and charges decoded memory against the same budget, so check
@@ -396,37 +415,232 @@ fn encode_inline(image: &CheckpointImage, budget: usize) -> Encoded {
     }
 }
 
-/// Run [`encode_checked`] on a dedicated helper thread and await its result
-/// without blocking the calling reactor. Falls back to encoding inline only
-/// when the OS refuses a new thread.
-async fn encode_offloaded(image: CheckpointImage, budget: usize) -> Encoded {
-    let (sender, receiver) = futures::channel::oneshot::channel();
-    let image = std::sync::Arc::new(image);
-    let shared = image.clone();
-    let spawned = std::thread::Builder::new()
-        .name("racer-checkpoint".into())
-        .spawn(move || {
-            let start = std::time::Instant::now();
-            let result = encode_checked(&shared, budget);
-            // Free the image here, not on the reactor.
-            drop(shared);
-            let _ = sender.send(Encoded {
-                result,
-                elapsed: start.elapsed(),
-                #[cfg(test)]
-                thread: std::thread::current().name().map(Into::into),
-            });
-        });
-    if spawned.is_err() {
-        return encode_inline(&image, budget);
+/// Run one encode, mapping an unwind to the failure a lost helper produced
+/// before this work moved onto the lane. The caller never observes a panic.
+fn encoded_by(run: impl FnOnce() -> Result<(Vec<u8>, [u8; DIGEST_BYTES])>) -> Encoded {
+    let start = std::time::Instant::now();
+    #[cfg(test)]
+    let thread = std::thread::current().name().map(Into::into);
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+        Ok(result) => Encoded {
+            result,
+            elapsed: start.elapsed(),
+            #[cfg(test)]
+            thread,
+        },
+        Err(_) => Encoded {
+            result: Err(Error::Unavailable),
+            elapsed: std::time::Duration::ZERO,
+            #[cfg(test)]
+            thread: None,
+        },
     }
-    drop(image);
-    receiver.await.unwrap_or(Encoded {
-        result: Err(Error::Unavailable),
-        elapsed: std::time::Duration::ZERO,
-        #[cfg(test)]
-        thread: None,
-    })
+}
+
+/// Generation of the single encode pair a node allocates at startup.
+const ENCODE_GENERATION: u64 = 0;
+
+/// Identity of one checkpoint encode accepted by a helper lane.
+#[derive(Copy, Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct EncodeId {
+    worker: WorkerId,
+    generation: u64,
+    sequence: u64,
+}
+impl offload::Identity for EncodeId {
+    type Owner = WorkerId;
+
+    fn owner(self) -> WorkerId {
+        self.worker
+    }
+
+    fn generation(self) -> u64 {
+        self.generation
+    }
+
+    fn sequence(self) -> u64 {
+        self.sequence
+    }
+}
+
+/// One encoded cut awaiting a helper lane. The image is freed on that lane.
+pub(crate) struct EncodeJob {
+    image: CheckpointImage,
+    budget: usize,
+    permit: offload::Permit<EncodeId>,
+}
+impl offload::Reserved<EncodeId> for EncodeJob {
+    fn permit(&self) -> &offload::Permit<EncodeId> {
+        &self.permit
+    }
+}
+
+/// An encoded cut returned to its owning lane. The permit keeps the pair's
+/// joint admission charged until the lane consumes it.
+pub(crate) struct EncodeCompletion {
+    encoded: Encoded,
+    permit: offload::Permit<EncodeId>,
+}
+impl offload::Reserved<EncodeId> for EncodeCompletion {
+    fn permit(&self) -> &offload::Permit<EncodeId> {
+        &self.permit
+    }
+}
+
+pub(crate) type EncodeClientPort = offload::ClientPort<EncodeId, EncodeJob, EncodeCompletion>;
+pub(crate) type EncodeWorkerPort = offload::WorkerPort<EncodeId, EncodeJob, EncodeCompletion>;
+
+/// Allocate the lane-owned producer and helper-owned consumer endpoints.
+/// Only one publication runs at a time, so one accepted job is enough and a
+/// second concurrent submission is refused rather than queued.
+pub(crate) fn pair(worker: WorkerId) -> Result<(EncodeClientPort, EncodeWorkerPort)> {
+    let capacity = NonZeroUsize::new(1).ok_or(Error::Internal)?;
+    offload::try_pair(
+        EncodeId {
+            worker,
+            generation: ENCODE_GENERATION,
+            sequence: 0,
+        },
+        capacity,
+    )
+    .map_err(Into::into)
+}
+
+/// Lane endpoint of the checkpoint encode pair.
+pub(crate) struct EncoderClient {
+    worker: WorkerId,
+    sequence: Cell<u64>,
+    executor: offload::Client<EncodeId, EncodeCompletion, RequestScope>,
+    port: EncodeClientPort,
+}
+impl EncoderClient {
+    pub(crate) fn new(port: EncodeClientPort, worker: WorkerId) -> Self {
+        let capacity = NonZeroUsize::new(port.capacity()).expect("encode pair capacity");
+        Self {
+            worker,
+            sequence: Cell::new(0),
+            executor: offload::Client::new(capacity),
+            port,
+        }
+    }
+
+    /// Submit one cut and await its completion. A rejected submission or a
+    /// lost helper reports the same failure the join error produced before.
+    pub(crate) async fn encode(
+        &self,
+        image: CheckpointImage,
+        budget: usize,
+        scope: RequestScope,
+    ) -> Result<Encoded> {
+        let sequence = self
+            .sequence
+            .get()
+            .checked_add(1)
+            .ok_or(Error::Unavailable)?;
+        self.sequence.set(sequence);
+        let worker = self.worker;
+        let completion = self
+            .executor
+            .execute(
+                &self.port,
+                &scope,
+                std::time::Instant::now(),
+                move |sequence| EncodeId {
+                    worker,
+                    generation: ENCODE_GENERATION,
+                    sequence,
+                },
+                move |permit| EncodeJob {
+                    image,
+                    budget,
+                    permit,
+                },
+                |_| {},
+            )
+            .await?;
+        Ok(completion.encoded)
+    }
+
+    /// Reap completions for the owning lane. The publication future is woken
+    /// when its completion arrives here, not on the helper.
+    pub(crate) fn poll_budgeted(&self, budget: usize) -> Result<()> {
+        self.executor.poll_budgeted(&self.port, budget, |_| {})
+    }
+
+    /// Register the lane woken when a helper publishes a completion.
+    pub(crate) fn register_driver(&self, waker: &Waker) {
+        self.port.register_driver(waker);
+    }
+
+    /// Reject new cuts after the lane stops admitting work.
+    pub(crate) fn close_submissions(&self) {
+        self.port.close_submissions();
+    }
+}
+
+/// Helper-lane endpoint that owns validation and encoding for one lane.
+pub(crate) struct EncoderPort {
+    worker: offload::Worker<EncodeCompletion>,
+    port: EncodeWorkerPort,
+}
+impl EncoderPort {
+    pub(crate) fn new(port: EncodeWorkerPort) -> Self {
+        Self {
+            worker: offload::Worker::default(),
+            port,
+        }
+    }
+
+    /// Process one job, then publish its completion. Free the image here, not
+    /// on the owning lane.
+    fn process(job: EncodeJob) -> EncodeCompletion {
+        let EncodeJob {
+            image,
+            budget,
+            permit,
+        } = job;
+        let encoded = encoded_by(|| encode_checked(&image, budget));
+        drop(image);
+        EncodeCompletion { encoded, permit }
+    }
+
+    fn is_drained(&self) -> bool {
+        self.worker.is_drained()
+    }
+}
+impl Service<RequestScope> for EncoderPort {
+    fn register_driver(&self, waker: &Waker) {
+        self.port.register_driver(waker);
+    }
+
+    fn start<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
+        Box::pin(async move { scope.check() })
+    }
+
+    fn poll_budgeted(&mut self, cx: &mut Context<'_>, budget: usize) -> Result<()> {
+        self.worker
+            .poll(&mut self.port, cx, budget, Self::process)
+            .map_err(Into::into)
+    }
+
+    /// Keep publishing accepted completions until the owning lane closes its
+    /// submissions and no completion remains.
+    fn drain<'a>(&'a mut self, _scope: &'a RequestScope) -> Operation<'a, ()> {
+        Box::pin(std::future::poll_fn(move |cx| {
+            if let Err(error) = self.worker.poll(&mut self.port, cx, 1, Self::process) {
+                return Poll::Ready(Err(error.into()));
+            }
+            if self.is_drained() {
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
+            }
+        }))
+    }
+
+    fn shutdown<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
+        self.drain(scope)
+    }
 }
 
 /// Sequence-independent digest of an encoded checkpoint: SHA-256 over the
@@ -1630,24 +1844,78 @@ mod budget_tests {
         }
     }
 
-    /// Validation and encoding run on a helper thread, not the polling
-    /// reactor, and produce exactly what inline encoding produces.
+    /// Validation and encoding run on the helper lane, not the publishing
+    /// lane, and produce exactly what inline encoding produces. The lane's
+    /// waiter sees the result only after the helper publishes the completion.
     #[test]
     fn offloaded_encode_runs_off_the_reactor_and_matches_inline() {
-        let image = full_image(64, 4);
-        let budget = usize::MAX / 2;
-        let inline = encode_checked(&image, budget).unwrap();
-        let encoded = futures::executor::block_on(encode_offloaded(image, budget));
-        assert_eq!(encoded.thread.as_deref(), Some("racer-checkpoint"));
-        assert_eq!(encoded.result.unwrap(), inline);
-        // Failures on the helper are reported, not lost.
-        let mut bad = full_image(1, 1);
-        bad.version += 1;
-        let encoded = futures::executor::block_on(encode_offloaded(bad, budget));
-        assert_eq!(encoded.result, Err(Error::CorruptRecord));
-        // A cut over budget is refused before any slot write.
-        let encoded = futures::executor::block_on(encode_offloaded(full_image(64, 4), 1));
-        assert_eq!(encoded.result, Err(Error::Overloaded));
+        let (client, port) = pair(WorkerId(0)).unwrap();
+        let encoder = EncoderClient::new(client, WorkerId(0));
+        let mut service = EncoderPort::new(port);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        std::thread::scope(|threads| {
+            let running = stop.clone();
+            let helper = std::thread::Builder::new()
+                .name("racer-checkpoint-test".into())
+                .spawn_scoped(threads, move || {
+                    let waker = racer_io::exec::thread_waker();
+                    let mut cx = std::task::Context::from_waker(&waker);
+                    while !running.load(std::sync::atomic::Ordering::Acquire) {
+                        service.poll_budgeted(&mut cx, 64).unwrap();
+                        if running.load(std::sync::atomic::Ordering::Acquire) {
+                            break;
+                        }
+                        std::thread::park_timeout(std::time::Duration::from_millis(1));
+                    }
+                })
+                .unwrap();
+            let encode = |image, budget| {
+                let scope = RequestScope::host(
+                    crate::model::RequestId([0; 16]),
+                    std::time::Instant::now() + std::time::Duration::from_secs(10),
+                )
+                .unwrap();
+                let mut task = Box::pin(encoder.encode(image, budget, scope));
+                let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+                // The publishing lane cannot observe the cut before the helper
+                // publishes its completion, so the first poll only submits.
+                assert!(task.as_mut().poll(&mut cx).is_pending());
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                loop {
+                    if let std::task::Poll::Ready(result) = task.as_mut().poll(&mut cx) {
+                        return result.unwrap();
+                    }
+                    encoder.poll_budgeted(64).unwrap();
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the helper did not publish the encode"
+                    );
+                    std::thread::yield_now();
+                }
+            };
+            let image = full_image(64, 4);
+            let budget = usize::MAX / 2;
+            let inline = encode_checked(&image, budget).unwrap();
+            let encoded = encode(image, budget);
+            assert_eq!(encoded.thread.as_deref(), Some("racer-checkpoint-test"));
+            assert_eq!(encoded.result.unwrap(), inline);
+            // Failures on the helper are reported, not lost.
+            let mut bad = full_image(1, 1);
+            bad.version += 1;
+            assert_eq!(encode(bad, budget).result, Err(Error::CorruptRecord));
+            // A cut over budget is refused before any slot write.
+            assert_eq!(encode(full_image(64, 4), 1).result, Err(Error::Overloaded));
+            stop.store(true, std::sync::atomic::Ordering::Release);
+            helper.thread().unpark();
+        });
+        // An unwind in the helper reports the failure a lost thread produced,
+        // so the publication caller never observes the panic.
+        let panicked = encoded_by(|| -> Result<(Vec<u8>, [u8; DIGEST_BYTES])> {
+            panic!("checkpoint encode panic")
+        });
+        assert_eq!(panicked.result, Err(Error::Unavailable));
+        assert_eq!(panicked.elapsed, std::time::Duration::ZERO);
+        assert_eq!(panicked.thread, None);
     }
 
     #[test]
