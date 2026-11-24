@@ -12,10 +12,15 @@ FROM ${RUST_IMAGE} AS builder
 ENV RUSTFLAGS="-C force-frame-pointers=yes"
 WORKDIR /src/cmd/racer-object
 
-# Copy only the standalone crate so unrelated repository changes do not
-# invalidate the build cache.
+# Copy only the standalone crate and the wire crate it shares with the
+# dataplane so unrelated repository changes do not invalidate the build cache.
+# racer-wire inherits versions from the racer workspace, so its root manifest
+# comes along; no other workspace member is needed to build it.
 COPY cmd/racer-object/Cargo.toml cmd/racer-object/Cargo.lock cmd/racer-object/build.rs ./
 COPY cmd/racer-object/src ./src
+COPY cmd/racer/Cargo.toml ../racer/Cargo.toml
+COPY cmd/racer/wire/Cargo.toml ../racer/wire/Cargo.toml
+COPY cmd/racer/wire/src ../racer/wire/src
 
 # Version metadata reported by --version, read by src/cli.rs at compile time.
 ARG VERSION=dev
