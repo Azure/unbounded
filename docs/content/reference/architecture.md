@@ -77,7 +77,7 @@ Binary `cmd/kubectl-unbounded`. Provides subcommands:
 
 ### inventory -- Hardware Collector
 
-Four binaries under `cmd/inventory` (packages under `internal/inventory`):
+Four binaries under `cmd/inventory` (private packages under `cmd/inventory/internal`):
 
 | Binary                 | Role |
 |------------------------|------|
