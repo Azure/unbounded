@@ -39,6 +39,14 @@ pub struct HeldSnapshot {
     pub payload_bytes: u64,
     pub segments: u64,
 }
+/// Whole Unix milliseconds, truncated, as the wire freshness domain requires.
+fn unix_millis(now: SystemTime) -> Result<u128> {
+    Ok(now
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| Error::Internal)?
+        .as_millis())
+}
+
 /// One storage shard. The catalog budget is independent of retained page entries;
 /// evicting a catalog item cannot remove a page's attached immutable descriptor.
 pub struct Index {
@@ -1075,10 +1083,7 @@ impl Index {
         else {
             return Ok(None);
         };
-        let now = now
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|_| Error::Internal)?
-            .as_millis();
+        let now = unix_millis(now)?;
         let bound = now
             .checked_add(policy.ttl.as_millis())
             .filter(|millis| *millis <= u128::from(crate::model::MAX_WIRE_INTEGER))
@@ -1092,14 +1097,11 @@ impl Index {
             return Ok(None);
         }
         let now = self.clock.wall_now();
-        // Only an immutable policy publishes an infinite deadline. Once the
-        // definition is mutable again, reject it before the worker observes the
-        // change; the TTL itself is enforced from the observation time by
-        // invalidating pointers when the published policy shrinks.
-        let mutable = self
+        let now_millis = unix_millis(now)?;
+        let policy = self
             .availability
             .metadata_policy(&object.cache)
-            .is_some_and(|policy| !policy.immutable);
+            .filter(|policy| !policy.immutable);
         Ok(self
             .state
             .borrow()
@@ -1107,8 +1109,20 @@ impl Index {
             .get(object)
             .filter(|v| now < v.expires_at.as_system_time())
             .filter(|v| {
-                !mutable
-                    || v.expires_at.to_unix_millis().ok() != Some(crate::model::MAX_WIRE_INTEGER)
+                let Some(policy) = policy else {
+                    return true;
+                };
+                // Only an immutable policy publishes an infinite deadline.
+                if v.expires_at.to_unix_millis().ok() == Some(crate::model::MAX_WIRE_INTEGER) {
+                    return false;
+                }
+                // Reuse less than before is measured from the observation, so a
+                // skipped publication cannot extend an older pointer's life.
+                v.observed_at.to_unix_millis().is_ok_and(|observed| {
+                    now_millis
+                        .checked_sub(u128::from(observed))
+                        .is_some_and(|age| age < policy.ttl.as_millis())
+                })
             })
             .cloned())
     }
@@ -1136,6 +1150,10 @@ impl Index {
                 CurrentVersion {
                     version: metadata.version,
                     expires_at: metadata.expires_at,
+                    observed_at: ExpiresAt::from_unix_millis(
+                        u64::try_from(unix_millis(now)?).map_err(|_| Error::Internal)?,
+                    )
+                    .map_err(|_| Error::Internal)?,
                 },
             );
         }
@@ -1144,20 +1162,6 @@ impl Index {
     /// Drop volatile freshness on clock uncertainty, preserving version descriptors.
     pub fn invalidate_freshness(&self) -> Result<()> {
         self.state_mut().current.clear();
-        Ok(())
-    }
-    /// Drop volatile freshness for caches whose origin policy no longer admits
-    /// their stored pointers, preserving version descriptors.
-    pub(crate) fn invalidate_freshness_for(
-        &self,
-        caches: &HashSet<racer_wire::control::CacheId>,
-    ) -> Result<()> {
-        if caches.is_empty() {
-            return Ok(());
-        }
-        self.state_mut()
-            .current
-            .retain(|object, _| !caches.contains(&object.cache));
         Ok(())
     }
     /// Reclaim standalone catalog entries and any pointers depending on them.
@@ -3104,6 +3108,58 @@ mod tests {
         assert!(
             current.expires_at.as_system_time() <= SystemTime::now() + DEFAULT_ORIGIN_METADATA_TTL
         );
+    }
+
+    #[test]
+    fn mutable_origin_freshness_is_measured_from_the_observation() {
+        use racer_wire::control::AzureContainerUrl;
+        use racer_wire::control::AzureCredential;
+        use racer_wire::control::CacheMode;
+        use racer_wire::control::OriginDefinition;
+        use std::time::Duration;
+
+        let env = racer_io::Env::host();
+        let cache = CacheId(crate::test_support::security::CACHE.into());
+        let availability = crate::test_support::availability(&env);
+        availability.publish_definitions(
+            &env,
+            vec![crate::control::test_cache_definition(
+                cache.clone(),
+                "origin",
+                CacheMode::Cached,
+                Some(OriginDefinition {
+                    metadata_ttl: Duration::from_secs(5),
+                    ..OriginDefinition::azure(
+                        AzureContainerUrl::parse("https://acct.blob.core.windows.net/models")
+                            .unwrap(),
+                        AzureCredential::Anonymous,
+                    )
+                }),
+            )],
+        );
+        let index = Index::new(WorkerId(0), 4, availability.clone(), env.ctx.clock.clone());
+        let m = descriptor("v1", 17);
+        let now = unix_millis(env.ctx.clock.wall_now()).unwrap() as u64;
+        let pointer = |observed_secs_ago: u64| CurrentVersion {
+            version: m.version.clone(),
+            expires_at: ExpiresAt::from_unix_millis(now + 3_600_000).unwrap(),
+            observed_at: ExpiresAt::from_unix_millis(now - observed_secs_ago * 1000).unwrap(),
+        };
+
+        // A pointer published under a longer TTL, which a skipped publication
+        // never rebounded, is stale by age even though its deadline is ahead.
+        index
+            .state
+            .borrow_mut()
+            .current
+            .insert(m.version.object.clone(), pointer(10));
+        assert!(index.current(&m.version.object).unwrap().is_none());
+        index
+            .state
+            .borrow_mut()
+            .current
+            .insert(m.version.object.clone(), pointer(1));
+        assert!(index.current(&m.version.object).unwrap().is_some());
     }
 }
 

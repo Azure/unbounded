@@ -2188,24 +2188,6 @@ impl WorkerApplication {
             .collect();
         self.memory.remove_caches(&removed)?;
         self.store.writer.remove_caches(&removed)?;
-        // A shorter freshness policy must apply to metadata observed under the
-        // longer one, so drop those pointers instead of waiting out their old
-        // deadlines.
-        let revalidate: crate::runtime::HashSet<_> = self
-            .caches
-            .iter()
-            .filter(|old| {
-                snapshot
-                    .caches
-                    .find(&old.id)
-                    .is_some_and(|new| metadata_policy_shrinks(old, new))
-            })
-            .map(|old| old.id.clone())
-            .collect();
-        self.store
-            .writer
-            .index()
-            .invalidate_freshness_for(&revalidate)?;
         // Passthrough caches drop whatever this worker retained for them,
         // including records left from before a restart. Reads observe each
         // publication directly, but this worker may skip intermediate ones
@@ -3113,20 +3095,6 @@ fn prefetch_keeps(
     cache: &racer_wire::control::CacheId,
 ) -> bool {
     snapshot.caches.contains(cache) && snapshot.membership.serves(cache, local)
-}
-
-/// Whether `new` reuses less origin metadata than `old` was observed under.
-fn metadata_policy_shrinks(
-    old: &racer_wire::control::CacheDefinition,
-    new: &racer_wire::control::CacheDefinition,
-) -> bool {
-    let Some(old) = old.origin.as_ref() else {
-        return false;
-    };
-    let Some(new) = new.origin.as_ref() else {
-        return true;
-    };
-    !new.metadata_immutable && (old.metadata_immutable || new.metadata_ttl < old.metadata_ttl)
 }
 
 impl WorkerApplication {
