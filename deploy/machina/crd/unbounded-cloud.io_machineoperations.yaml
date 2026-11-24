@@ -83,15 +83,19 @@ spec:
                 type: object
               machineRef:
                 description: |-
-                  MachineRef is the name of the Machine CR this operation targets.
-                  Either machineRef or machineSelector must be set.
+                  MachineRef is the name of the Machine CR this operation targets. Agents
+                  and provider controllers execute only operations that have machineRef.
+                  Exactly one of machineRef and machineSelector must be set.
                 type: string
               machineSelector:
                 description: |-
-                  MachineSelector selects machines by labels. When set, the
-                  controller creates individual MachineOperation children for
-                  each matched machine. Either machineRef or machineSelector
-                  must be set.
+                  MachineSelector selects Machines by labels for a selector operation.
+                  A controller resolves the selector against Machine labels once and
+                  creates one child MachineOperation with machineRef for each matched
+                  Machine. The children are the per-machine record; this operation's
+                  status carries only counts, in status.summary. Agents and provider
+                  controllers do not resolve the selector. Exactly one of machineRef and
+                  machineSelector must be set.
                 properties:
                   matchExpressions:
                     description: matchExpressions is a list of label selector requirements.
@@ -161,11 +165,94 @@ spec:
                   need a richer type (e.g. runtime.RawExtension for arbitrary
                   JSON, or a typed []OperationParameter struct).
                 type: object
+              rollout:
+                description: |-
+                  Rollout sets how a selector operation is paced. Allowed only with
+                  machineSelector. The whole spec of a selector operation is immutable,
+                  so that every machine gets the same operation.
+                properties:
+                  childRetention:
+                    default: Failed
+                    description: |-
+                      ChildRetention says which child operations are kept once the selector
+                      operation has finished. Failed (the default) keeps the children that
+                      failed, at most 1000 of them, and removes the rest: the ones that
+                      completed, and the held ones a stopped rollout never started. A child
+                      that carries a boot media record is kept as well. The counts in
+                      status.summary remain. All keeps every child, for the per-machine
+                      record of when each finished. Deleting the parent, or its
+                      ttlSecondsAfterFinished, removes its children whatever this says.
+
+                      status.summary is the durable record of a selector operation. A child
+                      may be removed at any time once it has completed, and a child need not
+                      exist for a machine before its turn.
+                    enum:
+                    - Failed
+                    - All
+                    type: string
+                  maxConcurrent:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    default: 1
+                    description: |-
+                      MaxConcurrent is how many matched machines may be operated on at
+                      the same time: a number (at least 1) or a percentage of the matched
+                      machines from "1%" to "100%". Defaults to 1.
+                      The number is bounded so that it fits the 32-bit integer the field
+                      decodes into: a larger stored value would fail every typed read of
+                      the object.
+                    x-kubernetes-int-or-string: true
+                    x-kubernetes-validations:
+                    - message: maxConcurrent must be an integer of at least 1 or a
+                        percentage from 1% to 100%
+                      rule: (type(self) == int && self >= 1 && self <= 2147483647)
+                        || (type(self) == string && self.matches('^([1-9][0-9]?|100)%$'))
+                  maxFailures:
+                    description: |-
+                      MaxFailures is how many failed machines end a rollout whose onFailure
+                      is Continue: once that many have failed, no further machines are
+                      started and the operation fails with reason FailureLimitReached.
+                      Machines already started still finish, so more than this many can
+                      fail. Defaults to 1000, which is also the most allowed: a failed
+                      machine keeps its child operation, and the limit bounds how many a
+                      single operation can leave behind.
+                    format: int32
+                    maximum: 1000
+                    minimum: 1
+                    type: integer
+                  onFailure:
+                    default: Stop
+                    description: |-
+                      OnFailure says what happens after a machine's operation fails.
+                      Stop (the default) starts no further machines. Continue carries on
+                      until maxFailures machines have failed.
+                    enum:
+                    - Stop
+                    - Continue
+                    type: string
+                type: object
+                x-kubernetes-validations:
+                - message: maxFailures is allowed only with onFailure Continue
+                  rule: '!has(self.maxFailures) || (has(self.onFailure) && self.onFailure
+                    == ''Continue'')'
+              suspend:
+                description: |-
+                  Suspend holds a machineRef operation: while it is true, no agent or
+                  provider controller starts the operation, and it does not make another
+                  operation on the same machine wait. It can be set only when the
+                  operation is created, and only cleared afterward. A selector operation
+                  creates the children that may not run yet suspended, and clears the
+                  field to release them at its rollout pace.
+                type: boolean
               ttlSecondsAfterFinished:
                 description: |-
                   TTLSecondsAfterFinished limits the lifetime of a completed or failed
-                  MachineOperation. If set, the agent deletes the MachineOperation
-                  this many seconds after it reaches a terminal phase. If unset, the
+                  MachineOperation. If set, the controller that owns the operation
+                  deletes it this many seconds after it reaches a terminal phase: the
+                  selector fan-out controller for a selector operation, and the provider
+                  controller or metalman for the host operations they execute. It is not
+                  enforced for an operation that an agent executes. If unset, the
                   MachineOperation is kept indefinitely.
                 format: int32
                 minimum: 0
@@ -190,6 +277,19 @@ spec:
                 HostRelease
               rule: '!(self.operationKind in [''HostAllocate'', ''HostRelease''])
                 || !has(self.ttlSecondsAfterFinished)'
+            - message: exactly one of machineRef and machineSelector must be set
+              rule: (has(self.machineRef) && self.machineRef != "") != has(self.machineSelector)
+            - message: machineSelector must have at least one matchLabels or matchExpressions
+                entry
+              rule: '!has(self.machineSelector) || (has(self.machineSelector.matchLabels)
+                && size(self.machineSelector.matchLabels) > 0) || (has(self.machineSelector.matchExpressions)
+                && size(self.machineSelector.matchExpressions) > 0)'
+            - message: rollout is allowed only with machineSelector
+              rule: '!has(self.rollout) || has(self.machineSelector)'
+            - message: suspend is allowed only on a machineRef operation that is not
+                HostAllocate or HostRelease
+              rule: '!has(self.suspend) || !self.suspend || (!has(self.machineSelector)
+                && !(self.operationKind in [''HostAllocate'', ''HostRelease'']))'
           status:
             description: MachineOperationStatus defines the observed state of a MachineOperation.
             properties:
@@ -322,12 +422,60 @@ spec:
                 description: StartedAt is when the agent began executing the operation.
                 format: date-time
                 type: string
+              summary:
+                description: |-
+                  Summary counts the children of a selector operation by state. It is set
+                  once every child exists and is the only per-rollout state kept here, so
+                  the size of this object does not depend on how many machines matched.
+                properties:
+                  active:
+                    description: Active is the number of children released and not
+                      finished.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  complete:
+                    description: Complete is the number of children that completed.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  failed:
+                    description: |-
+                      Failed is the number of children that failed, including children that
+                      were deleted before they finished.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  failedMachines:
+                    description: |-
+                      FailedMachines names up to ten of the machines whose child failed, in
+                      name order. List the children for all of them.
+                    items:
+                      type: string
+                    maxItems: 10
+                    type: array
+                    x-kubernetes-list-type: set
+                  held:
+                    description: Held is the number of children not yet released to
+                      run.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  total:
+                    description: |-
+                      Total is the number of Machines the selector matched, each with one
+                      child operation.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                required:
+                - total
+                type: object
               targets:
                 description: |-
-                  Targets records the per-machine execution state for this operation.
-                  For single-machine operations this contains one entry. For selector
-                  operations, targets are snapshotted when execution begins and remain
-                  authoritative even if selector matches change later.
+                  Targets records the execution state of a machineRef operation's
+                  machine, in one entry. A selector operation has no targets: its
+                  children carry the per-machine state and Summary carries the counts.
                 items:
                   description: MachineOperationTargetStatus records execution state
                     for one target Machine.
@@ -1158,6 +1306,28 @@ spec:
           message: allocation is allowed only for HostAllocate
           rule: '!has(self.status) || !has(self.status.allocation) || (has(self.spec)
             && self.spec.operationKind == ''HostAllocate'')'
+        - fieldPath: .spec.machineSelector
+          message: machineSelector cannot be changed, added or removed after creation
+          rule: (has(oldSelf.spec) && has(oldSelf.spec.machineSelector)) == (has(self.spec)
+            && has(self.spec.machineSelector)) && (!has(oldSelf.spec) || !has(oldSelf.spec.machineSelector)
+            || (has(self.spec) && has(self.spec.machineSelector) && self.spec.machineSelector
+            == oldSelf.spec.machineSelector))
+        - fieldPath: .spec
+          message: spec is immutable for a selector operation
+          rule: '!has(oldSelf.spec) || !has(oldSelf.spec.machineSelector) || (has(self.spec)
+            && self.spec == oldSelf.spec)'
+        - fieldPath: .spec.suspend
+          message: suspend can be set only when the operation is created
+          rule: '!has(self.spec) || !has(self.spec.suspend) || !self.spec.suspend
+            || (has(oldSelf.spec) && has(oldSelf.spec.suspend) && oldSelf.spec.suspend)'
+        - fieldPath: .spec.machineRef
+          message: machineRef cannot be changed
+          rule: '!has(oldSelf.spec) || !has(self.spec) || (has(oldSelf.spec.machineRef)
+            ? oldSelf.spec.machineRef : '''') == (has(self.spec.machineRef) ? self.spec.machineRef
+            : '''')'
+    selectableFields:
+    - jsonPath: .spec.machineRef
+    - jsonPath: .status.phase
     served: true
     storage: true
     subresources:
