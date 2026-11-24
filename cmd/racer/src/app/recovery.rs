@@ -615,64 +615,44 @@ impl WorkerApplication {
         let directory = &self.slab_directory;
         let budget = self.checkpoint_budget;
         let (geometry, snapshot) = (&geometry, &snapshot);
-        self.runtime
-            .reactor
-            .run(
-                startup,
-                None,
-                racer_io::scoped::SubmissionKind::OtherIo,
-                move |io, ctx| {
-                    let (io, ctx) = (io.clone(), ctx.clone());
-                    Box::pin(async move {
-                        let scan = async {
-                            let mut found =
-                                crate::store::checkpoint::candidates(&io, directory, budget, &ctx)
-                                    .await?;
-                            let mut newest = None;
-                            while let Some((slot, image)) =
-                                crate::store::checkpoint::next_candidate(&mut found, &io, &ctx)
-                                    .await
-                            {
-                                newest.get_or_insert((slot, image.sequence));
-                                let fits = node.devices.as_ref().is_none_or(|plan| {
-                                    image.shards.iter().all(|shard| {
-                                        plan.workers.get(shard.worker.0 as usize).is_some_and(
-                                            |worker| {
-                                                shard
-                                                    .index
-                                                    .validate_capacity(
-                                                        worker.page_entries,
-                                                        capacity.1,
-                                                    )
-                                                    .is_ok()
-                                            },
-                                        )
-                                    })
-                                });
-                                if !fits {
-                                    continue;
-                                }
-                                let selected = select(
-                                    std::iter::once(image),
-                                    geometry,
-                                    &node.workers,
-                                    capacity,
-                                    &self.keys,
-                                    &snapshot.caches,
-                                    snapshot.page_size,
-                                );
-                                if selected.is_some() {
-                                    return Ok((newest, selected));
-                                }
-                            }
-                            Ok((newest, None))
-                        };
-                        Ok(scan.await)
-                    }) as racer_io::Operation<'_, Result<_>>
-                },
-                |_| None,
-            )
-            .await?
+        let reactor: &racer_io::scoped::Reactor<crate::runtime::RequestScope> =
+            &self.runtime.reactor;
+        let mut found =
+            crate::store::checkpoint::candidates(reactor, directory, budget, startup).await?;
+        let mut newest = None;
+        while let Some((slot, image)) =
+            crate::store::checkpoint::next_candidate(&mut found, reactor, startup).await
+        {
+            newest.get_or_insert((slot, image.sequence));
+            let fits = node.devices.as_ref().is_none_or(|plan| {
+                image.shards.iter().all(|shard| {
+                    plan.workers
+                        .get(shard.worker.0 as usize)
+                        .is_some_and(|worker| {
+                            shard
+                                .index
+                                .validate_capacity(worker.page_entries, capacity.1)
+                                .is_ok()
+                        })
+                })
+            });
+            if !fits {
+                continue;
+            }
+            let selected = select(
+                std::iter::once(image),
+                geometry,
+                &node.workers,
+                capacity,
+                &self.keys,
+                &snapshot.caches,
+                snapshot.page_size,
+            );
+            if selected.is_some() {
+                return Ok((newest, selected));
+            }
+        }
+        Ok((newest, None))
     }
 }
 

@@ -1,22 +1,23 @@
-//! Secure, descriptor-relative filesystem primitives on the reactor ring:
-//! private directories, bounded reads, durable atomic replacement, and
-//! two-slot checkpoints. Every call is an ordinary ring operation, so it
-//! never blocks the lane and runs unchanged on the simulated driver.
-pub mod checkpoint;
-
+//! Raw-reactor filesystem primitives for control-thread and deterministic
+//! simulation runtimes that do not own a scoped reactor. New worker code uses
+//! [`crate::scoped::fs`]; this module keeps only the primitives those raw
+//! runtimes still call.
 use crate::{
     Error, Reactor, Result,
-    ring::{Descriptor, IoBuffer, OpCtx},
+    ring::{Descriptor, OpCtx},
+    scoped::fs::{
+        AccessError, AccessRequirements, Buffer, ReadBuffer, check_access,
+        operations::{Durability, Replacement, ReplacementError},
+        secure::{check_regular_size, component, path_name},
+    },
 };
 use std::{
     ffi::{CString, OsStr},
     num::NonZeroUsize,
-    ops::Deref,
     os::unix::ffi::OsStrExt,
     path::{Component, Path},
     rc::Rc,
 };
-use zeroize::Zeroize;
 
 /// Reject resolution that escapes the supplied directory descriptor.
 pub const BENEATH: u64 = 0x08;
@@ -32,167 +33,6 @@ pub const PATH_BYTES: usize = crate::ring::ops::PATH_BYTES;
 
 /// Largest file the composed helpers read or write.
 pub const SMALL_FILE_BYTES: usize = 1024 * 1024;
-
-/// Stable I/O storage with a cursor for partial transfers, zeroized on drop.
-pub struct Buffer {
-    data: Vec<u8>,
-
-    start: usize,
-
-    end: usize,
-}
-
-// SAFETY: the private Vec is never resized after allocation, so its heap
-// allocation is stable across moves of the Buffer.
-unsafe impl IoBuffer for Buffer {
-    /// The unconsumed region.
-    fn bytes(&self) -> Result<&[u8]> {
-        Ok(&self.data[self.start..self.end])
-    }
-
-    /// The unconsumed region, mutably.
-    fn bytes_mut(&mut self) -> Result<&mut [u8]> {
-        Ok(&mut self.data[self.start..self.end])
-    }
-}
-
-impl Drop for Buffer {
-    /// Erase the whole allocation.
-    fn drop(&mut self) {
-        self.data.as_mut_slice().zeroize();
-    }
-}
-
-impl Buffer {
-    /// Zeroed storage of `length` bytes (at most `u32::MAX`).
-    pub fn new(length: usize) -> Result<Self> {
-        if length > u32::MAX as usize {
-            return Err(Error::Overloaded);
-        }
-        let mut data = Vec::new();
-        data.try_reserve_exact(length)
-            .map_err(|_| Error::Overloaded)?;
-        data.resize(length, 0);
-        Ok(Self {
-            data,
-            start: 0,
-            end: length,
-        })
-    }
-
-    /// A copy of `bytes`.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let mut buffer = Self::new(bytes.len())?;
-        buffer.data.copy_from_slice(bytes);
-        Ok(buffer)
-    }
-
-    /// Consume `n` positive, in-bounds bytes.
-    pub fn advance(&mut self, n: usize) -> Result<()> {
-        if n == 0 || n > self.remaining() {
-            return Err(Error::Io);
-        }
-        self.start += n;
-        Ok(())
-    }
-
-    /// Unconsumed bytes.
-    pub fn remaining(&self) -> usize {
-        self.end - self.start
-    }
-
-    /// A checked prefix of the unconsumed region.
-    pub fn prefix(&self, n: usize) -> Result<&[u8]> {
-        self.data[self.start..self.end].get(..n).ok_or(Error::Io)
-    }
-
-    /// Reset to `bytes`, which must fit the allocation.
-    fn fill(&mut self, bytes: &[u8]) {
-        self.start = 0;
-        self.end = bytes.len();
-        self.data[..bytes.len()].copy_from_slice(bytes);
-    }
-}
-
-/// Output of a bounded read, zeroized on drop.
-pub struct ReadBuffer {
-    buffer: Buffer,
-}
-
-impl Deref for ReadBuffer {
-    type Target = [u8];
-
-    /// The bytes read.
-    fn deref(&self) -> &[u8] {
-        &self.buffer.data[..self.buffer.end]
-    }
-}
-
-impl std::fmt::Debug for ReadBuffer {
-    /// Show only the length; contents may be secret.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ReadBuffer")
-            .field("len", &self.len())
-            .finish()
-    }
-}
-
-impl AsRef<[u8]> for ReadBuffer {
-    /// The bytes read.
-    fn as_ref(&self) -> &[u8] {
-        self
-    }
-}
-
-/// Required metadata was unavailable, or an access policy failed.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AccessError {
-    /// The stat result omitted a field needed for the decision.
-    MissingMetadata,
-    /// A present field did not satisfy the policy.
-    PermissionDenied,
-}
-
-impl From<AccessError> for Error {
-    /// Both access failures are permission errors.
-    fn from(error: AccessError) -> Self {
-        match error {
-            AccessError::MissingMetadata => Error::Io,
-            AccessError::PermissionDenied => Error::Os(libc::EACCES),
-        }
-    }
-}
-
-/// Ownership, permission, and hard-link constraints.
-#[derive(Clone, Copy, Debug)]
-pub struct AccessRequirements {
-    /// Required numeric owner.
-    pub owner: u32,
-
-    /// Any of these mode bits fails the check.
-    pub forbidden_mode: u16,
-
-    /// Optional exact link count; the field is always required.
-    pub links: Option<u32>,
-}
-
-/// Check completeness, owner, forbidden mode bits, and optional links.
-pub fn check_access(
-    stat: &libc::statx,
-    required: AccessRequirements,
-) -> std::result::Result<(), AccessError> {
-    let mask = libc::STATX_MODE | libc::STATX_UID | libc::STATX_NLINK;
-    if stat.stx_mask & mask != mask {
-        return Err(AccessError::MissingMetadata);
-    }
-    if stat.stx_mode & required.forbidden_mode != 0
-        || stat.stx_uid != required.owner
-        || required.links.is_some_and(|links| stat.stx_nlink != links)
-    {
-        return Err(AccessError::PermissionDenied);
-    }
-    Ok(())
-}
 
 /// Owner-only access for the descriptor's backend: the effective UID on the
 /// host, UID 0 in the simulated OS. Regular files need exactly one link.
@@ -215,86 +55,6 @@ pub fn check_private(
             links: regular.then_some(1),
         },
     )
-}
-
-/// Require a regular file no larger than `limit`.
-pub fn check_regular_size(stat: &libc::statx, limit: u64) -> Result<()> {
-    let mask = libc::STATX_TYPE | libc::STATX_SIZE;
-    if stat.stx_mask & mask != mask
-        || stat.stx_mode as u32 & libc::S_IFMT != libc::S_IFREG
-        || stat.stx_size > limit
-    {
-        return Err(Error::InvalidInput);
-    }
-    Ok(())
-}
-
-/// Validate length and embedded NULs without normalizing.
-pub fn path_name(path: &OsStr, limit: usize) -> Result<CString> {
-    if path.as_bytes().len() > limit.min(PATH_BYTES) || path.as_bytes().contains(&0) {
-        return Err(Error::InvalidInput);
-    }
-    CString::new(path.as_bytes()).map_err(|_| Error::InvalidInput)
-}
-
-/// Validate one normal component (no root, parent, current, or slash).
-pub fn component(name: &OsStr, limit: usize) -> Result<CString> {
-    if !matches!(
-        Path::new(name).components().next(),
-        Some(Component::Normal(_))
-    ) || name.as_bytes().contains(&b'/')
-    {
-        return Err(Error::InvalidInput);
-    }
-    path_name(name, limit)
-}
-
-/// Where a replacement stopped. An accepted rename may execute even if
-/// cancellation wins its completion race; reconcile after fencing.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ReplacementError {
-    /// Validation, writing, or staged-file sync failed before the rename.
-    BeforeRename(Error),
-    /// The rename failed or was canceled; its outcome is uncertain.
-    RenameUncertain(Error),
-    /// The rename completed; only the parent durability fence failed.
-    Published(Error),
-}
-
-impl ReplacementError {
-    /// The underlying failure.
-    pub fn cause(&self) -> Error {
-        match *self {
-            Self::BeforeRename(e) | Self::RenameUncertain(e) | Self::Published(e) => e,
-        }
-    }
-}
-
-/// Fences after writing and after renaming.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Durability {
-    /// Namespace publication only.
-    Publish,
-    /// Sync the stage before the rename, then sync the parent directory.
-    FileAndDirectory,
-}
-
-/// A staged replacement in a pinned, exclusively controlled directory.
-pub struct Replacement {
-    /// Trusted parent directory.
-    pub directory: Rc<Descriptor>,
-
-    /// Fresh, empty, single-link stage.
-    pub staged: Rc<Descriptor>,
-
-    /// Stage name (one component).
-    pub temporary: CString,
-
-    /// Distinct destination name (one component).
-    pub target: CString,
-
-    /// Requested fences.
-    pub durability: Durability,
 }
 
 impl Reactor {
@@ -460,7 +220,7 @@ impl Reactor {
         bytes: &[u8],
         chunk: NonZeroUsize,
         ctx: &OpCtx,
-    ) -> std::result::Result<(), ReplacementError> {
+    ) -> std::result::Result<(), ReplacementError<Error>> {
         use ReplacementError::*;
         let staged = self
             .verify_stage(&replacement, ctx)
@@ -548,7 +308,7 @@ impl Reactor {
         target: &str,
         bytes: &[u8],
         ctx: &OpCtx,
-    ) -> std::result::Result<(), ReplacementError> {
+    ) -> std::result::Result<(), ReplacementError<Error>> {
         use ReplacementError::BeforeRename;
         let target_name = component(target.as_ref(), PATH_BYTES).map_err(BeforeRename)?;
         if bytes.len() > SMALL_FILE_BYTES {

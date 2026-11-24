@@ -4,6 +4,7 @@ use crate::{
     scoped::{
         IoBuffer, Reactor as Core,
         fs::{
+            checkpoint::Slots,
             operations::{Durability, Replacement, ReplacementError},
             prelude::*,
             secure,
@@ -142,10 +143,12 @@ fn poll<T, E>(future: &mut Operation<'_, T, E>) -> Poll<Result<T, E>> {
 }
 
 /// Explicitly drive bounded completion turns until the public operation resolves.
-fn drive<T, E>(reactor: &Reactor, mut future: Operation<'_, T, E>) -> Result<T, E> {
+fn drive<O>(reactor: &Reactor, future: impl std::future::Future<Output = O>) -> O {
+    let mut future = Box::pin(future);
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        if let Poll::Ready(result) = poll(&mut future) {
+        let mut context = Context::from_waker(futures::task::noop_waker_ref());
+        if let Poll::Ready(result) = std::future::Future::poll(future.as_mut(), &mut context) {
             return result;
         }
         assert!(Instant::now() < deadline, "reactor failed to make progress");
@@ -811,4 +814,82 @@ fn real_secure_traversal_magiclinks_hardlinks_cloexec_and_append_normalization()
     let invalid = root.0.join("must-not-exist/../child");
     assert!(drive(&r, r.file_directory(&invalid, true, PATH_BYTES, &request)).is_err());
     assert!(!root.0.join("must-not-exist").exists());
+}
+
+const CHECKPOINT_SLOTS: Slots<8> = Slots {
+    names: ["a.ckpt", "b.ckpt"],
+    minimum_bytes: 8,
+    maximum_bytes: 64,
+};
+
+fn checkpoint_sequence(header: &[u8]) -> Result<u64> {
+    Ok(u64::from_le_bytes(
+        header.try_into().map_err(|_| Error::InvalidInput)?,
+    ))
+}
+
+fn checkpoint_decode(bytes: &[u8], _: usize) -> Result<Vec<u8>> {
+    Ok(bytes[8..].to_vec())
+}
+
+/// Publish both checkpoints on the real ring and decode newest first.
+#[test]
+fn checkpoint_slots_publish_and_decode_newest_first_on_host() {
+    let Some(reactor) = kernel_reactor(16) else {
+        return;
+    };
+    let root = Directory::new();
+    let directory = root.0.join("checkpoint");
+    let request = scope();
+    let chunk = std::num::NonZeroUsize::new(5).unwrap();
+    let mut image = 1u64.to_le_bytes().to_vec();
+    image.extend_from_slice(b"one");
+    let mut found = drive(
+        &reactor,
+        Box::pin(CHECKPOINT_SLOTS.candidates(
+            &reactor,
+            &directory,
+            64,
+            checkpoint_sequence,
+            checkpoint_decode,
+            &request,
+        )),
+    )
+    .unwrap();
+    assert!(drive(&reactor, Box::pin(found.next(&reactor, &request))).is_none());
+    drive(
+        &reactor,
+        Box::pin(CHECKPOINT_SLOTS.publish(&reactor, &directory, 0, &image, chunk, &request)),
+    )
+    .unwrap();
+    let mut next = 2u64.to_le_bytes().to_vec();
+    next.extend_from_slice(b"two");
+    let (slot, sequence) = CHECKPOINT_SLOTS.next_publication(Some((0, 1))).unwrap();
+    assert_eq!((slot, sequence), (1, 2));
+    drive(
+        &reactor,
+        Box::pin(CHECKPOINT_SLOTS.publish(&reactor, &directory, slot, &next, chunk, &request)),
+    )
+    .unwrap();
+    let mut found = drive(
+        &reactor,
+        Box::pin(CHECKPOINT_SLOTS.candidates(
+            &reactor,
+            &directory,
+            64,
+            checkpoint_sequence,
+            checkpoint_decode,
+            &request,
+        )),
+    )
+    .unwrap();
+    assert_eq!(
+        drive(&reactor, Box::pin(found.next(&reactor, &request))),
+        Some((1, b"two".to_vec()))
+    );
+    assert_eq!(
+        drive(&reactor, Box::pin(found.next(&reactor, &request))),
+        Some((0, b"one".to_vec()))
+    );
+    assert!(drive(&reactor, Box::pin(found.next(&reactor, &request))).is_none());
 }

@@ -25,6 +25,7 @@ use std::{
 };
 use zeroize::Zeroize;
 
+pub mod checkpoint;
 pub mod operations;
 
 #[cfg(test)]
@@ -44,17 +45,17 @@ pub mod prelude {
 /// Stable, quota-owning I/O storage with a cursor for partial writes.
 /// The entire allocation is zeroized on drop, including already consumed bytes.
 pub struct Buffer {
-    data: Vec<u8>,
+    pub(crate) data: Vec<u8>,
 
-    start: usize,
+    pub(crate) start: usize,
 
-    end: usize,
+    pub(crate) end: usize,
 }
 
 /// Read output owns its admission charge until drop. Storage is allocated once,
 /// never reallocated with secret bytes, and fully zeroized before release.
 pub struct ReadBuffer {
-    buffer: Buffer,
+    pub(crate) buffer: Buffer,
 }
 
 impl Deref for ReadBuffer {
@@ -71,6 +72,15 @@ impl AsRef<[u8]> for ReadBuffer {
     /// Borrow the completed read without transferring its admission charge.
     fn as_ref(&self) -> &[u8] {
         self
+    }
+}
+
+impl std::fmt::Debug for ReadBuffer {
+    /// Show only the length; contents may be secret.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReadBuffer")
+            .field("len", &self.len())
+            .finish()
     }
 }
 
@@ -126,6 +136,29 @@ impl Buffer {
             start: 0,
             end: length,
         })
+    }
+
+    /// Zeroed storage of `length` bytes (at most `u32::MAX`).
+    pub(crate) fn new(length: usize) -> Result<Self> {
+        if length > u32::MAX as usize {
+            return Err(Error::Overloaded);
+        }
+        Self::allocate(length)
+    }
+
+    /// A copy of `bytes`.
+    #[cfg(test)]
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let mut buffer = Self::new(bytes.len())?;
+        buffer.data.copy_from_slice(bytes);
+        Ok(buffer)
+    }
+
+    /// Reset to `bytes`, which must fit the allocation.
+    pub(crate) fn fill(&mut self, bytes: &[u8]) {
+        self.start = 0;
+        self.end = bytes.len();
+        self.data[..bytes.len()].copy_from_slice(bytes);
     }
 }
 
@@ -481,6 +514,56 @@ impl<F: Future<Output = crate::Result<T>> + Unpin, T> Future for Deferred<F> {
     }
 }
 
+/// Required metadata was unavailable, or an access policy failed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AccessError {
+    /// The stat result omitted a field needed for the decision.
+    MissingMetadata,
+    /// A present field did not satisfy the policy.
+    PermissionDenied,
+}
+
+impl From<AccessError> for Error {
+    /// Both access failures are permission errors.
+    fn from(error: AccessError) -> Self {
+        match error {
+            AccessError::MissingMetadata => Error::Io,
+            AccessError::PermissionDenied => Error::Os(libc::EACCES),
+        }
+    }
+}
+
+/// Ownership, permission, and hard-link constraints.
+#[derive(Clone, Copy, Debug)]
+pub struct AccessRequirements {
+    /// Required numeric owner.
+    pub owner: u32,
+
+    /// Any of these mode bits fails the check.
+    pub forbidden_mode: u16,
+
+    /// Optional exact link count; the field is always required.
+    pub links: Option<u32>,
+}
+
+/// Check completeness, owner, forbidden mode bits, and optional links.
+pub fn check_access(
+    stat: &libc::statx,
+    required: AccessRequirements,
+) -> std::result::Result<(), AccessError> {
+    let mask = libc::STATX_MODE | libc::STATX_UID | libc::STATX_NLINK;
+    if stat.stx_mask & mask != mask {
+        return Err(AccessError::MissingMetadata);
+    }
+    if stat.stx_mode & required.forbidden_mode != 0
+        || stat.stx_uid != required.owner
+        || required.links.is_some_and(|links| stat.stx_nlink != links)
+    {
+        return Err(AccessError::PermissionDenied);
+    }
+    Ok(())
+}
+
 pub mod secure {
     //! Descriptor-relative traversal, metadata primitives, and secure policy helpers.
     //! The primitives accept caller-selected bounds and access requirements. Composed
@@ -492,7 +575,7 @@ pub mod secure {
         path::{Component, Path},
     };
 
-    pub use crate::fs::{AccessError, AccessRequirements, check_access};
+    pub use super::{AccessError, AccessRequirements, check_access};
 
     /// Reject resolution that escapes the supplied directory descriptor.
     pub const BENEATH: u64 = 0x08;
@@ -1390,11 +1473,13 @@ mod test_support {
             .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
     }
 
-    /// Drive explicit completion turns, preserving each operation's error type.
-    pub(super) fn drive<T, E>(reactor: &Reactor, mut future: Operation<'_, T, E>) -> Result<T, E> {
+    /// Drive explicit completion turns for any operation-shaped future.
+    pub(super) fn drive<O>(reactor: &Reactor, future: impl Future<Output = O>) -> O {
+        let mut future = Box::pin(future);
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            if let Poll::Ready(result) = poll(&mut future) {
+            let mut context = Context::from_waker(futures::task::noop_waker_ref());
+            if let Poll::Ready(result) = std::future::Future::poll(future.as_mut(), &mut context) {
                 return result;
             }
             assert!(Instant::now() < deadline, "reactor failed to make progress");

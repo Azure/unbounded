@@ -50,16 +50,14 @@ use std::task::Poll;
 use std::task::Waker;
 
 pub(crate) const CHECKPOINT_NAMES: [&str; 2] = ["checkpoint.0", "checkpoint.1"];
-const SLOTS: racer_io::fs::checkpoint::Slots<HEADER_BYTES> = racer_io::fs::checkpoint::Slots {
-    names: CHECKPOINT_NAMES,
-    minimum_bytes: HEADER_BYTES + CLUSTER_BYTES + 4 + DIGEST_BYTES,
-    maximum_bytes: MAX_CHECKPOINT_BYTES,
-};
+const SLOTS: racer_io::scoped::fs::checkpoint::Slots<HEADER_BYTES> =
+    racer_io::scoped::fs::checkpoint::Slots {
+        names: CHECKPOINT_NAMES,
+        minimum_bytes: HEADER_BYTES + CLUSTER_BYTES + 4 + DIGEST_BYTES,
+        maximum_bytes: MAX_CHECKPOINT_BYTES,
+    };
 
 /// Publication scratch bound per write submission.
-/// One publication's outcome inside its reactor operation.
-type Published = std::result::Result<(), racer_io::fs::ReplacementError>;
-
 const PUBLISH_CHUNK: std::num::NonZeroUsize = std::num::NonZeroUsize::new(16384).unwrap();
 
 pub struct Checkpointer {
@@ -276,8 +274,8 @@ impl Checkpointer {
         shards: Vec<ShardImage>,
     ) -> Operation<'_, ()> {
         let directory = self.directory.clone();
-        let result = block_on_io(env, |reactor, ctx| async move {
-            publish_next(&reactor, &ctx, &directory, cluster, shards).await
+        let result = block_on_io(env, |reactor, scope| async move {
+            publish_next(&reactor, &scope, &directory, cluster, shards).await
         });
         Box::pin(async move { result })
     }
@@ -358,22 +356,11 @@ impl Checkpointer {
             if previous == Some(current) {
                 return Ok(None);
             }
-            reactor
-                .run(
-                    &scope,
-                    None,
-                    racer_io::scoped::SubmissionKind::OtherIo,
-                    move |io, ctx| {
-                        let (io, ctx) = (io.clone(), ctx.clone());
-                        Box::pin(async move {
-                            Ok(SLOTS
-                                .publish(&io, &directory, slot, &bytes, PUBLISH_CHUNK, &ctx)
-                                .await)
-                        }) as racer_io::Operation<'static, _>
-                    },
-                    |_: &racer_io::Operation<'static, Published>| None,
-                )
-                .await?
+            // The encode helper returns bytes only; publication stays a scoped
+            // operation awaited on this lane, so no lane blocks on file I/O.
+            SLOTS
+                .publish(&*reactor, &directory, slot, &bytes, PUBLISH_CHUNK, &scope)
+                .await
                 .map_err(Into::<Error>::into)?;
             Ok(Some(current))
         }))
@@ -806,12 +793,15 @@ impl Recovery {
 /// Callers must discard a rejected image before advancing. An inaccessible storage
 /// directory is fatal; individual checkpoint files are disposable hints. Slab
 /// opening/validation remains independently fatal during Store::open.
-pub(crate) async fn candidates(
-    reactor: &racer_io::Reactor,
+pub(crate) async fn candidates<S>(
+    reactor: &racer_io::scoped::Reactor<S>,
     directory: &Path,
     budget: usize,
-    ctx: &racer_io::OpCtx,
-) -> Result<Candidates> {
+    scope: &S,
+) -> Result<Candidates>
+where
+    S: racer_io::Scope<Error = Error>,
+{
     let mut found = SLOTS
         .candidates(
             reactor,
@@ -821,7 +811,7 @@ pub(crate) async fn candidates(
             |bytes, budget| {
                 decode_with_budget(bytes, budget).map_err(|_| racer_io::Error::InvalidInput)
             },
-            ctx,
+            scope,
         )
         .await
         .map_err(|e| {
@@ -833,12 +823,15 @@ pub(crate) async fn candidates(
 }
 
 /// Decode the newest remaining image, reporting slots skipped on the way.
-pub(crate) async fn next_candidate(
+pub(crate) async fn next_candidate<S>(
     found: &mut Candidates,
-    reactor: &racer_io::Reactor,
-    ctx: &racer_io::OpCtx,
-) -> Option<(usize, CheckpointImage)> {
-    let next = found.next(reactor, ctx).await;
+    reactor: &racer_io::scoped::Reactor<S>,
+    scope: &S,
+) -> Option<(usize, CheckpointImage)>
+where
+    S: racer_io::Scope<Error = Error>,
+{
+    let next = found.next(reactor, scope).await;
     report_skipped(found);
     next
 }
@@ -849,20 +842,24 @@ fn report_skipped(found: &mut Candidates) {
     }
 }
 
-pub(crate) type Candidates = racer_io::fs::checkpoint::Candidates<CheckpointImage, HEADER_BYTES>;
+pub(crate) type Candidates =
+    racer_io::scoped::fs::checkpoint::Candidates<CheckpointImage, HEADER_BYTES, Error>;
 
 /// Publish `shards` as the successor of the newest valid image, into the
 /// opposite slot.
 #[cfg(test)]
-async fn publish_next(
-    reactor: &racer_io::Reactor,
-    ctx: &racer_io::OpCtx,
+async fn publish_next<S>(
+    reactor: &racer_io::scoped::Reactor<S>,
+    scope: &S,
     directory: &Path,
     cluster: ClusterId,
     shards: Vec<ShardImage>,
-) -> Result<()> {
-    let mut found = candidates(reactor, directory, MAX_CHECKPOINT_BYTES, ctx).await?;
-    let newest = next_candidate(&mut found, reactor, ctx)
+) -> Result<()>
+where
+    S: racer_io::Scope<Error = Error>,
+{
+    let mut found = candidates(reactor, directory, MAX_CHECKPOINT_BYTES, scope).await?;
+    let newest = next_candidate(&mut found, reactor, scope)
         .await
         .map(|(slot, image)| (slot, image.sequence));
     drop(found);
@@ -877,29 +874,58 @@ async fn publish_next(
         shards,
     })?;
     SLOTS
-        .publish(reactor, directory, slot, &bytes, PUBLISH_CHUNK, ctx)
+        .publish(reactor, directory, slot, &bytes, PUBLISH_CHUNK, scope)
         .await
         .map_err(|_| Error::Io)
 }
 
-/// Run `make` on a private reactor for the current test environment's driver.
+/// Scope with no cancellation or deadline, for driving private test reactors.
 #[cfg(any(test, feature = "dst"))]
-pub(crate) fn block_on_io<T: 'static, F: std::future::Future<Output = T> + 'static>(
+#[derive(Clone, Copy)]
+struct TestScope;
+
+#[cfg(any(test, feature = "dst"))]
+impl racer_io::Scope for TestScope {
+    type Error = Error;
+
+    fn check(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Run `make` on a private scoped reactor for the current test environment's driver.
+#[cfg(any(test, feature = "dst"))]
+fn block_on_io<T, F>(
     env: &racer_io::Env,
-    make: impl FnOnce(racer_io::Reactor, racer_io::OpCtx) -> F,
-) -> T {
-    let env = env.clone();
-    let ctx = if env.driver.sim_os().is_none() && env.ctx.is_simulated() {
-        racer_io::WorkerCtx::host()
+    make: impl FnOnce(Rc<racer_io::scoped::Reactor<TestScope>>, TestScope) -> F,
+) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    let env = if env.driver.sim_os().is_none() && env.ctx.is_simulated() {
+        racer_io::Env::new(env.driver.clone(), racer_io::WorkerCtx::host())
     } else {
-        env.ctx.clone()
+        env.clone()
     };
-    let reactor =
-        racer_io::Reactor::new(env.driver.clone(), racer_io::ring::Config::new(64), ctx).unwrap();
-    let executor = racer_io::exec::LocalExecutor::new(Some(reactor.wake_handle()));
-    executor
-        .block_on(&reactor, make(reactor.clone(), racer_io::OpCtx::none()))
-        .unwrap()
+    let reactor = Rc::new(racer_io::scoped::Reactor::new(64, &env));
+    reactor.init().unwrap();
+    let future = make(reactor.clone(), TestScope);
+    let mut future = Box::pin(future);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let mut context = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        if let std::task::Poll::Ready(output) =
+            std::future::Future::poll(future.as_mut(), &mut context)
+        {
+            return output;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "test reactor failed to make progress"
+        );
+        reactor.poll_budgeted(64).unwrap();
+        reactor.wait(std::time::Duration::from_millis(1)).unwrap();
+    }
 }
 
 #[cfg(any(test, feature = "dst"))]
@@ -918,10 +944,10 @@ pub(crate) fn read_candidates_with_budget(
     budget: usize,
 ) -> Result<std::vec::IntoIter<(usize, CheckpointImage)>> {
     let directory = directory.to_path_buf();
-    block_on_io(env, move |reactor, ctx| async move {
-        let mut found = candidates(&reactor, &directory, budget, &ctx).await?;
+    block_on_io(env, move |reactor, scope| async move {
+        let mut found = candidates(&reactor, &directory, budget, &scope).await?;
         let mut images = Vec::new();
-        while let Some(image) = next_candidate(&mut found, &reactor, &ctx).await {
+        while let Some(image) = next_candidate(&mut found, &reactor, &scope).await {
             images.push(image);
         }
         Ok(images.into_iter())

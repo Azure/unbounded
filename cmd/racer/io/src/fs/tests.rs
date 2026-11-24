@@ -1,5 +1,5 @@
 //! Filesystem primitives on both drivers.
-use super::{checkpoint::Slots, *};
+use super::*;
 use crate::{
     Driver, Reactor, WorkerCtx,
     ctx::VirtualClock,
@@ -204,102 +204,6 @@ fn replacement_rejects_reused_stages() {
                 &*r.read_child(&dir, "t", 64, false, &ctx).await.unwrap(),
                 b"0123456789"
             );
-        });
-        if let Some(root) = cleanup {
-            let _ = std::fs::remove_dir_all(root);
-        }
-    }
-}
-
-const SLOTS: Slots<8> = Slots {
-    names: ["a.ckpt", "b.ckpt"],
-    minimum_bytes: 8,
-    maximum_bytes: 64,
-};
-
-fn sequence(header: &[u8]) -> Result<u64> {
-    Ok(u64::from_le_bytes(
-        header.try_into().map_err(|_| Error::InvalidInput)?,
-    ))
-}
-
-fn decode(bytes: &[u8], _: usize) -> Result<Vec<u8>> {
-    if bytes[8..].starts_with(b"bad") {
-        return Err(Error::InvalidInput);
-    }
-    Ok(bytes[8..].to_vec())
-}
-
-fn image(sequence: u64, body: &[u8]) -> Vec<u8> {
-    let mut bytes = sequence.to_le_bytes().to_vec();
-    bytes.extend_from_slice(body);
-    bytes
-}
-
-#[test]
-fn checkpoints_alternate_slots_and_decode_newest_first() {
-    for (reactor, root) in backends("checkpoint") {
-        let r = reactor.clone();
-        let cleanup = (!reactor.is_sim()).then(|| root.clone());
-        block_on(&reactor, async move {
-            let ctx = OpCtx::none();
-            let dir = root.join("ckpt");
-            let chunk = NonZeroUsize::new(5).unwrap();
-            let mut none = SLOTS
-                .candidates(&r, &dir, 64, sequence, decode, &ctx)
-                .await
-                .unwrap();
-            assert!(none.next(&r, &ctx).await.is_none());
-            assert_eq!(SLOTS.next_publication(None), Some((0, 1)));
-            SLOTS
-                .publish(&r, &dir, 0, &image(1, b"one"), chunk, &ctx)
-                .await
-                .unwrap();
-            let (slot, next) = SLOTS.next_publication(Some((0, 1))).unwrap();
-            assert_eq!((slot, next), (1, 2));
-            let mark = r.sim_os().map(|os| os.trace().len());
-            SLOTS
-                .publish(&r, &dir, slot, &image(next, b"two"), chunk, &ctx)
-                .await
-                .unwrap();
-            // Publishing into an existing directory issues no fsync at all.
-            if let (Some(os), Some(mark)) = (r.sim_os(), mark) {
-                let trace = os.trace();
-                assert!(trace[mark..].iter().any(|e| e.operation == "submit:rename"));
-                assert!(!trace[mark..].iter().any(|e| e.operation == "submit:fsync"));
-            }
-            let mut found = SLOTS
-                .candidates(&r, &dir, 64, sequence, decode, &ctx)
-                .await
-                .unwrap();
-            // Short reads resume in place inside the single image buffer.
-            if let Some(os) = r.sim_os() {
-                os.inject("read", crate::sim::Fault::Short(1)).unwrap();
-                os.inject("read", crate::sim::Fault::Short(1)).unwrap();
-            }
-            assert_eq!(found.next(&r, &ctx).await, Some((1, b"two".to_vec())));
-            assert_eq!(found.next(&r, &ctx).await, Some((0, b"one".to_vec())));
-            assert!(found.next(&r, &ctx).await.is_none());
-            // A newer slot that fails to decode falls back to the older one.
-            SLOTS
-                .publish(&r, &dir, 0, &image(3, b"bad"), chunk, &ctx)
-                .await
-                .unwrap();
-            let mut fallback = SLOTS
-                .candidates(&r, &dir, 64, sequence, decode, &ctx)
-                .await
-                .unwrap();
-            assert_eq!(fallback.next(&r, &ctx).await, Some((1, b"two".to_vec())));
-            assert_eq!(fallback.skipped, [(0, Error::InvalidInput)]);
-            // Oversized slots are skipped before allocation.
-            let mut tight = SLOTS
-                .candidates(&r, &dir, 9, sequence, decode, &ctx)
-                .await
-                .unwrap();
-            assert!(tight.next(&r, &ctx).await.is_none());
-            assert_eq!(tight.skipped.len(), 2);
-            assert_eq!(SLOTS.next_publication(Some((2, 1))), None);
-            assert_eq!(SLOTS.next_publication(Some((0, u64::MAX))), None);
         });
         if let Some(root) = cleanup {
             let _ = std::fs::remove_dir_all(root);

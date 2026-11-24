@@ -48,7 +48,7 @@ impl<E: Copy> ReplacementError<E> {
 
 /// Explicit fences after writing and after renaming. Stage cleanup/creation
 /// fences, when required, must precede this operation and remain caller-owned.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Durability {
     /// Namespace publication only; no crash durability is promised.
     Publish,

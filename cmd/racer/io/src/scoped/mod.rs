@@ -368,8 +368,9 @@ impl<S: Scope> Reactor<S> {
 
     /// Submit and await one `racer-io` operation under `scope`. A scope
     /// failure takes precedence over the operation's own error, but only after
-    /// the operation is fenced.
-    pub fn run<'a, T: 'static, F>(
+    /// the operation is fenced. Crate-private: callers outside this crate use
+    /// the typed scoped operations instead of constructing raw ring futures.
+    pub(crate) fn run<'a, T: 'static, F>(
         &'a self,
         scope: &'a S,
         capacity: Option<Rc<SubmissionCapacity>>,
@@ -385,7 +386,7 @@ impl<S: Scope> Reactor<S> {
 
     /// [`Self::run`], also retaining `held` until the operation is fenced,
     /// even when the waiting future is dropped first.
-    pub fn run_holding<'a, T: 'static, F>(
+    pub(crate) fn run_holding<'a, T: 'static, F>(
         &'a self,
         scope: &'a S,
         capacity: Option<Rc<SubmissionCapacity>>,
