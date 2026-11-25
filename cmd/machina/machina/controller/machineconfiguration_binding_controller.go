@@ -32,6 +32,8 @@ type MachineConfigurationBindingReconciler struct {
 	Scheme *runtime.Scheme
 }
 
+const noMatchingConfigurationMessage = "No MachineConfiguration has been assigned or matched"
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *MachineConfigurationBindingReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
@@ -75,7 +77,7 @@ func (r *MachineConfigurationBindingReconciler) Reconcile(
 			&machine,
 			metav1.ConditionTrue,
 			"Pending",
-			"No MachineConfiguration has been assigned or matched",
+			noMatchingConfigurationMessage,
 		)
 	}
 
@@ -215,6 +217,15 @@ func (r *MachineConfigurationBindingReconciler) setConfigurationPending(
 	reason string,
 	message string,
 ) error {
+	previous := apimeta.FindStatusCondition(
+		machine.Status.Conditions,
+		unboundedv1alpha3.MachineConditionConfigurationPending,
+	)
+	clearOwnedPendingState := status == metav1.ConditionFalse &&
+		previous != nil && previous.Status == metav1.ConditionTrue &&
+		machine.Status.Phase == unboundedv1alpha3.MachinePhasePending &&
+		machine.Status.Message == previous.Message
+
 	apimeta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
 		Type:               unboundedv1alpha3.MachineConditionConfigurationPending,
 		Status:             status,
@@ -226,6 +237,9 @@ func (r *MachineConfigurationBindingReconciler) setConfigurationPending(
 	if status == metav1.ConditionTrue {
 		machine.Status.Phase = unboundedv1alpha3.MachinePhasePending
 		machine.Status.Message = message
+	} else if clearOwnedPendingState {
+		machine.Status.Phase = ""
+		machine.Status.Message = ""
 	}
 
 	return r.Status().Update(ctx, machine)

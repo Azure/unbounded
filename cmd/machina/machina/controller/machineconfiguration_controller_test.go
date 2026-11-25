@@ -171,6 +171,8 @@ func TestMachineConfigurationBindingReconciler_SetsPendingWhenNoMatch(t *testing
 	)
 	require.NotNil(t, cond)
 	require.Equal(t, metav1.ConditionTrue, cond.Status)
+	require.Equal(t, unboundedv1alpha3.MachinePhasePending, updated.Status.Phase)
+	require.Equal(t, noMatchingConfigurationMessage, updated.Status.Message)
 }
 
 func TestMachineConfigurationBindingReconciler_PinsExplicitLatestVersion(t *testing.T) {
@@ -201,6 +203,73 @@ func TestMachineConfigurationBindingReconciler_PinsExplicitLatestVersion(t *test
 	)
 	require.NotNil(t, cond)
 	require.Equal(t, metav1.ConditionFalse, cond.Status)
+}
+
+func TestMachineConfigurationBindingReconciler_ClearsResolvedConfigurationPendingPhase(t *testing.T) {
+	t.Parallel()
+
+	machine := newTestMachine("machine-a", "10.0.0.1:22", "testuser", defaultKubernetes())
+	machine.Spec.ConfigurationRef = &unboundedv1alpha3.MachineConfigurationRef{Name: "config-a"}
+	machine.Status.Phase = unboundedv1alpha3.MachinePhasePending
+	machine.Status.Message = noMatchingConfigurationMessage
+	apimeta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
+		Type:    unboundedv1alpha3.MachineConditionConfigurationPending,
+		Status:  metav1.ConditionTrue,
+		Reason:  "Pending",
+		Message: noMatchingConfigurationMessage,
+	})
+
+	c := newConfigurationTestClient(t,
+		machine,
+		newTestMachineConfiguration("config-a"),
+		machineConfigurationVersion("config-a", 1),
+	)
+	r := &MachineConfigurationBindingReconciler{Client: c, Scheme: newTestScheme(t)}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKey{Name: "machine-a"}})
+	require.NoError(t, err)
+
+	var updated unboundedv1alpha3.Machine
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "machine-a"}, &updated))
+	require.Empty(t, updated.Status.Phase)
+	require.Empty(t, updated.Status.Message)
+
+	cond := apimeta.FindStatusCondition(
+		updated.Status.Conditions,
+		unboundedv1alpha3.MachineConditionConfigurationPending,
+	)
+	require.NotNil(t, cond)
+	require.Equal(t, metav1.ConditionFalse, cond.Status)
+}
+
+func TestMachineConfigurationBindingReconciler_PreservesUnrelatedPendingPhase(t *testing.T) {
+	t.Parallel()
+
+	machine := newTestMachine("machine-a", "10.0.0.1:22", "testuser", defaultKubernetes())
+	machine.Spec.ConfigurationRef = &unboundedv1alpha3.MachineConfigurationRef{Name: "config-a"}
+	machine.Status.Phase = unboundedv1alpha3.MachinePhasePending
+	machine.Status.Message = "Machine is not reachable"
+	apimeta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
+		Type:    unboundedv1alpha3.MachineConditionConfigurationPending,
+		Status:  metav1.ConditionTrue,
+		Reason:  "Pending",
+		Message: noMatchingConfigurationMessage,
+	})
+
+	c := newConfigurationTestClient(t,
+		machine,
+		newTestMachineConfiguration("config-a"),
+		machineConfigurationVersion("config-a", 1),
+	)
+	r := &MachineConfigurationBindingReconciler{Client: c, Scheme: newTestScheme(t)}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKey{Name: "machine-a"}})
+	require.NoError(t, err)
+
+	var updated unboundedv1alpha3.Machine
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "machine-a"}, &updated))
+	require.Equal(t, unboundedv1alpha3.MachinePhasePending, updated.Status.Phase)
+	require.Equal(t, "Machine is not reachable", updated.Status.Message)
 }
 
 func TestMachineConfigurationBindingReconciler_SelectsByPriorityThenName(t *testing.T) {
