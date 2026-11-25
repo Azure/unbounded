@@ -86,6 +86,7 @@ RestartSteps=10
 LimitNPROC=infinity
 LimitCORE=infinity
 LimitNOFILE=infinity
+LimitMEMLOCK=infinity
 TasksMax=infinity
 OOMScoreAdjust=-999
 
