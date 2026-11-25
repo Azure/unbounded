@@ -217,6 +217,15 @@ func (r *MachineConfigurationBindingReconciler) setConfigurationPending(
 	reason string,
 	message string,
 ) error {
+	previous := apimeta.FindStatusCondition(
+		machine.Status.Conditions,
+		unboundedv1alpha3.MachineConditionConfigurationPending,
+	)
+	clearOwnedPendingState := status == metav1.ConditionFalse &&
+		previous != nil && previous.Status == metav1.ConditionTrue &&
+		machine.Status.Phase == unboundedv1alpha3.MachinePhasePending &&
+		machine.Status.Message == previous.Message
+
 	apimeta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
 		Type:               unboundedv1alpha3.MachineConditionConfigurationPending,
 		Status:             status,
@@ -228,8 +237,7 @@ func (r *MachineConfigurationBindingReconciler) setConfigurationPending(
 	if status == metav1.ConditionTrue {
 		machine.Status.Phase = unboundedv1alpha3.MachinePhasePending
 		machine.Status.Message = message
-	} else if machine.Status.Phase == unboundedv1alpha3.MachinePhasePending &&
-		machine.Status.Message == noMatchingConfigurationMessage {
+	} else if clearOwnedPendingState {
 		machine.Status.Phase = ""
 		machine.Status.Message = ""
 	}

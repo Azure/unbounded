@@ -213,9 +213,10 @@ func TestMachineConfigurationBindingReconciler_ClearsResolvedConfigurationPendin
 	machine.Status.Phase = unboundedv1alpha3.MachinePhasePending
 	machine.Status.Message = noMatchingConfigurationMessage
 	apimeta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
-		Type:   unboundedv1alpha3.MachineConditionConfigurationPending,
-		Status: metav1.ConditionTrue,
-		Reason: "Pending",
+		Type:    unboundedv1alpha3.MachineConditionConfigurationPending,
+		Status:  metav1.ConditionTrue,
+		Reason:  "Pending",
+		Message: noMatchingConfigurationMessage,
 	})
 
 	c := newConfigurationTestClient(t,
@@ -248,6 +249,12 @@ func TestMachineConfigurationBindingReconciler_PreservesUnrelatedPendingPhase(t 
 	machine.Spec.ConfigurationRef = &unboundedv1alpha3.MachineConfigurationRef{Name: "config-a"}
 	machine.Status.Phase = unboundedv1alpha3.MachinePhasePending
 	machine.Status.Message = "Machine is not reachable"
+	apimeta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
+		Type:    unboundedv1alpha3.MachineConditionConfigurationPending,
+		Status:  metav1.ConditionTrue,
+		Reason:  "Pending",
+		Message: noMatchingConfigurationMessage,
+	})
 
 	c := newConfigurationTestClient(t,
 		machine,
