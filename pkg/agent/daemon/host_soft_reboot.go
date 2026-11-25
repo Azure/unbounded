@@ -16,7 +16,6 @@ import (
 
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -30,13 +29,11 @@ const (
 	hostSoftRebootWaitInterval = 10 * time.Second
 )
 
-// HostSoftRebootTarget resolves the identity and selector labels of the local target.
+// HostSoftRebootTarget identifies the local target of MachineOperations.
 // Reference is the machineRef used by operations, not necessarily a Machine CR.
-// MatchSelector receives a compiled selector and the operation kind.
 type HostSoftRebootTarget interface {
 	Reference() string
 	ObservedGeneration(context.Context, client.Reader) (int64, error)
-	MatchSelector(context.Context, client.Reader, v1alpha3.OperationKind, labels.Selector) (bool, error)
 }
 
 // HostRebooter reads host boot evidence and requests a host reboot.
@@ -199,21 +196,11 @@ func operationTargetStatus(status *v1alpha3.MachineOperationStatus, ref string) 
 	return nil
 }
 
-func (h *HostSoftRebootHandler) matches(ctx context.Context, op *v1alpha3.MachineOperation) (bool, error) {
-	if op.Spec.MachineRef != "" {
-		return op.Spec.MachineRef == h.reference, nil
-	}
-
-	if op.Spec.MachineSelector == nil {
-		return false, nil
-	}
-
-	selector, err := metav1.LabelSelectorAsSelector(op.Spec.MachineSelector)
-	if err != nil {
-		return false, nil
-	}
-
-	return h.target.MatchSelector(ctx, h.reader, op.Spec.OperationKind, selector)
+// matches reports whether op names this machine. An operation without a
+// machineRef is never a match, whatever its selector says: a central controller
+// resolves selectors into one machineRef operation per machine.
+func (h *HostSoftRebootHandler) matches(op *v1alpha3.MachineOperation) bool {
+	return op.Spec.MachineRef == h.reference
 }
 
 func (h *HostSoftRebootHandler) start(ctx context.Context, name string, generation int64, bootID string) (bool, error) {
@@ -282,6 +269,10 @@ func (h *HostSoftRebootHandler) finish(ctx context.Context, name string, result 
 			return client.IgnoreNotFound(err)
 		}
 
+		if op.Status.IsTerminal() {
+			return nil
+		}
+
 		now := metav1.Now()
 		SetMachineOperationResult(&op, result, now)
 
@@ -300,8 +291,11 @@ func isOutOfBandHostOperation(kind v1alpha3.OperationKind) bool {
 }
 
 func operationBefore(a, b *v1alpha3.MachineOperation) bool {
-	if !a.CreationTimestamp.Equal(&b.CreationTimestamp) {
-		return a.CreationTimestamp.Before(&b.CreationTimestamp)
+	// An operation that was held for its turn in a rollout joins the queue
+	// when it is released, so it waits for one that started in the meantime.
+	aQueued, bQueued := a.QueueTime(), b.QueueTime()
+	if !aQueued.Equal(&bQueued) {
+		return aQueued.Before(&bQueued)
 	}
 
 	return a.Name < b.Name
@@ -338,7 +332,20 @@ func (h *HostSoftRebootHandler) unfinishedOutOfBandHostOperation(ctx context.Con
 	return oldest.Name, nil
 }
 
-func (h *HostSoftRebootHandler) hostOperationUnfinishedOn(ctx context.Context, op *v1alpha3.MachineOperation) (bool, error) {
+func (h *HostSoftRebootHandler) hostOperationUnfinishedOn(_ context.Context, op *v1alpha3.MachineOperation) (bool, error) {
+	// A selector operation lists this machine as a target long before its
+	// turn comes. Its machineRef operation for this machine is what acts on
+	// the host, so that one holds the reboot and the parent does not.
+	if op.Spec.IsSelectorOperation() {
+		return false, nil
+	}
+
+	// A held operation has not started and may not for a long time: it does
+	// not hold the reboot. Once released it does.
+	if op.IsHeld() {
+		return false, nil
+	}
+
 	target := operationTargetStatus(&op.Status, h.reference)
 	// Cleanup or an unconfirmed media boot can outlast a terminal operation.
 	if target != nil && target.HasOutstandingBootMedia() {
@@ -348,12 +355,12 @@ func (h *HostSoftRebootHandler) hostOperationUnfinishedOn(ctx context.Context, o
 	if op.Status.IsTerminal() {
 		return false, nil
 	}
-	// Resolved targets are authoritative over the original selector.
+	// Resolved targets are authoritative over the spec.
 	if len(op.Status.Targets) > 0 {
 		return target != nil && target.Phase != v1alpha3.OperationPhaseComplete && target.Phase != v1alpha3.OperationPhaseFailed, nil
 	}
 
-	return h.matches(ctx, op)
+	return h.matches(op), nil
 }
 
 func (h *HostSoftRebootHandler) markWaiting(ctx context.Context, name, message string) error {
@@ -394,7 +401,10 @@ func (h *HostSoftRebootHandler) PublishStartup(ctx context.Context) error {
 
 	for i := range ops.Items {
 		op := &ops.Items[i]
-		if op.Spec.OperationKind != v1alpha3.OperationHostSoftReboot {
+		// Only this machine's own operation is reported: a selector operation
+		// lists the machine as a target, but its status belongs to the
+		// controller that fans it out.
+		if op.Spec.OperationKind != v1alpha3.OperationHostSoftReboot || !h.matches(op) {
 			continue
 		}
 
