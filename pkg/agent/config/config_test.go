@@ -608,6 +608,36 @@ func TestImageCredentialProviderValidate(t *testing.T) {
 	}
 }
 
+func TestKubeletConfigDirValidate(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		configDir string
+		wantErr   string
+	}{
+		{name: "unset"},
+		{name: "absolute path", configDir: "/etc/kubernetes/kubelet.conf.d"},
+		{name: "relative path", configDir: "kubelet.conf.d", wantErr: "absolute path"},
+		{name: "unclean path", configDir: "/etc/kubernetes/../kubelet.conf.d", wantErr: "clean absolute path"},
+		{name: "unsafe path", configDir: `/etc/kubernetes/"config.d`, wantErr: "unsafe in a systemd argument"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := (&AgentKubeletConfig{ConfigDir: tt.configDir}).Validate()
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+
+			require.ErrorContains(t, err, tt.wantErr)
+		})
+	}
+}
+
 func TestAgentConfig_DeepCopyNil(t *testing.T) {
 	t.Parallel()
 

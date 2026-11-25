@@ -286,6 +286,7 @@ func resolveKubelet(cfg *config.AgentConfig) (Kubelet, error) {
 
 	return Kubelet{
 		KubeletBinPath:          filepath.Join("/"+BinDir, "kubelet"),
+		ConfigDir:               cfg.Kubelet.ConfigDir,
 		KubeletAuthInfo:         cfg.Kubelet.Auth,
 		KubeconfigData:          slices.Clone(cfg.Kubelet.KubeconfigData),
 		APIServer:               cfg.Kubelet.ApiServer,

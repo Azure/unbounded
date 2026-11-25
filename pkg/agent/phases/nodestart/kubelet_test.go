@@ -31,6 +31,7 @@ func TestConfigureKubeletWritesHostnameOverride(t *testing.T) {
 				BootstrapToken: "token",
 			},
 			ClusterDNS: "10.0.0.10",
+			ConfigDir:  "/etc/kubernetes/kubelet.conf.d",
 		},
 	}
 	require.NoError(t, ConfigureKubelet(goalState).Do(context.Background()))
@@ -42,6 +43,7 @@ func TestConfigureKubeletWritesHostnameOverride(t *testing.T) {
 	))
 	require.NoError(t, err)
 	require.Contains(t, string(data), "--hostname-override=worker-1")
+	require.Contains(t, string(data), "--config-dir=/etc/kubernetes/kubelet.conf.d")
 	require.Contains(t, string(data), "--node-ip=10.0.0.15")
 }
 
@@ -275,6 +277,7 @@ func TestConfigureKubeletOmitsEmptyNodeLabelsAndTaints(t *testing.T) {
 	require.NoError(t, err)
 	require.NotContains(t, string(data), "--node-labels=")
 	require.NotContains(t, string(data), "--register-with-taints=")
+	require.NotContains(t, string(data), "--config-dir=")
 	require.NotContains(t, string(data), "--image-credential-provider-config=")
 	require.NotContains(t, string(data), "--image-credential-provider-bin-dir=")
 }

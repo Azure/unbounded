@@ -56,6 +56,7 @@ func TestConfigureKubeletOnHostUsesAgentOwnedDropIns(t *testing.T) {
 	t.Parallel()
 
 	gs, dir := hostNativeGoalState(t)
+	gs.Kubelet.ConfigDir = "/etc/kubernetes/kubelet.conf.d"
 	task := ConfigureKubeletOnHost(gs, "unbounded-kubelet.service")
 	require.NoError(t, task.Do(context.Background()))
 	require.True(t, task.Changed())
@@ -73,6 +74,9 @@ func TestConfigureKubeletOnHostUsesAgentOwnedDropIns(t *testing.T) {
 	// Same-path files land at their host paths.
 	require.FileExists(t, filepath.Join(dir, "var/lib/kubelet/config.yaml"))
 	require.FileExists(t, filepath.Join(dir, "etc/kubernetes/pki/apiserver-client-ca.crt"))
+	nodeConfig, err := os.ReadFile(filepath.Join(dropIns, "20-node-config.conf"))
+	require.NoError(t, err)
+	require.Contains(t, string(nodeConfig), "--config-dir=/etc/kubernetes/kubelet.conf.d")
 
 	// A second apply of identical content reports no change.
 	again := ConfigureKubeletOnHost(gs, "unbounded-kubelet.service")
