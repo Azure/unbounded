@@ -13,9 +13,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	"github.com/Azure/unbounded/internal/cloudprovider"
 	"github.com/Azure/unbounded/internal/provision"
 )
 
@@ -55,7 +55,7 @@ func ResolveClusterInfo(ctx context.Context, apiServerEndpoint string, k kuberne
 		return nil, fmt.Errorf("kube-dns Service has no ClusterIP")
 	}
 
-	provider, err := cloudprovider.DetectProvider(ctx, k)
+	provider, err := provision.DetectClusterProvider(ctx, k)
 	if err != nil {
 		return nil, fmt.Errorf("detect provider: %w", err)
 	}
@@ -71,8 +71,10 @@ func ResolveClusterInfo(ctx context.Context, apiServerEndpoint string, k kuberne
 		ClusterDNS:   svc.Spec.ClusterIP,
 		KubeVersion:  sv.GitVersion,
 	}
+
 	if provider != nil {
-		info.ProviderLabels = provider.DefaultLabels()
+		log.FromContext(ctx).Info("detected cloud provider", "provider", provider.Name)
+		info.ProviderLabels = provider.NodeLabels
 	}
 
 	return info, nil

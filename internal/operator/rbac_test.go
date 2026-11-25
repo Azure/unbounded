@@ -263,10 +263,12 @@ func loadMachinaRBAC(t *testing.T) (roles []rbacv1.Role, clusterRoles []rbacv1.C
 // for operator-owned ConfigMaps in the install namespace, including the
 // component workload overrides ConfigMap.
 //
-// The machina controller reads exactly one ConfigMap, kube-root-ca.crt in
-// kube-public (cmd/machina/machina/controller/cluster_info.go), through the
-// uncached clientset; that read is served by the cluster-wide configmaps get in
-// its ClusterRole. machina-config reaches the pod as a volume mount, which
+// The machina controller reads ConfigMaps only in kube-public
+// (cmd/machina/machina/controller/cluster_info.go): kube-root-ca.crt, and any
+// that the cluster provider detectors read
+// (internal/provision/cluster_provider.go). It reads them through the uncached
+// clientset; those reads are served by the cluster-wide configmaps get in its
+// ClusterRole. machina-config reaches the pod as a volume mount, which
 // needs no RBAC, and leader election uses Leases. No machina controller watches
 // ConfigMaps and machinaCacheOptions() scopes only Secrets, so no informer is
 // established either.

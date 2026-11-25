@@ -28,7 +28,6 @@ import (
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	netv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 	"github.com/Azure/unbounded/internal/bootstraptoken"
-	"github.com/Azure/unbounded/internal/cloudprovider"
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/config"
 	"github.com/Azure/unbounded/pkg/agent/isolation"
@@ -536,14 +535,14 @@ func (h *manualBootstrapHandler) buildAgentConfig(ctx context.Context) (*provisi
 	// Detect cloud provider for default node labels.
 	var providerLabels map[string]string
 
-	provider, err := cloudprovider.DetectProvider(ctx, h.kubeCli)
+	provider, err := provision.DetectClusterProvider(ctx, h.kubeCli)
 	if err != nil {
 		h.logger.Warn("cloud provider detection failed, continuing without provider labels", "error", err)
 	}
 
 	if provider != nil {
-		h.logger.Info("detected cloud provider", "provider", provider.ID())
-		providerLabels = provider.DefaultLabels()
+		h.logger.Info("detected cloud provider", "provider", provider.Name)
+		providerLabels = provider.NodeLabels
 	}
 
 	// Build a Machine object from CLI flags for the canonical config builder.

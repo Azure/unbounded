@@ -27,7 +27,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	"github.com/Azure/unbounded/internal/cloudprovider"
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/internal/systemns"
 )
@@ -1101,7 +1100,7 @@ func TestProvisionMachine_ProviderLabelsOverride(t *testing.T) {
 		Client: fakeClient,
 		Scheme: s,
 		ClusterInfo: &ClusterInfo{
-			Provider: &cloudprovider.AKSProvider{},
+			Provider: &provision.ClusterProvider{Name: "microsoft-aks", NodeLabels: map[string]string{"kubernetes.azure.com/managed": "false"}},
 		},
 	}
 

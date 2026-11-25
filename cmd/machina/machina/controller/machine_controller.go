@@ -611,7 +611,7 @@ func (r *MachineReconciler) provisionMachine(
 
 	var providerLabels map[string]string
 	if r.ClusterInfo != nil && r.ClusterInfo.Provider != nil {
-		providerLabels = r.ClusterInfo.Provider.DefaultLabels()
+		providerLabels = r.ClusterInfo.Provider.NodeLabels
 	}
 
 	agentConfig := provision.BuildAgentConfig(provision.BuildAgentConfigParams{
