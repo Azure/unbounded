@@ -44,6 +44,12 @@ var (
 		Name:      "wireguard_peers_removed_total",
 		Help:      "Total WireGuard peers removed.",
 	})
+
+	WireGuardDriftRepairs = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: nodeNamespace,
+		Name:      "wireguard_drift_repairs_total",
+		Help:      "Total differences between kernel and desired WireGuard configuration repaired by the periodic check, by interface and reason.",
+	}, []string{"interface", "reason"})
 )
 
 // Route metrics.

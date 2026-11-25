@@ -16,35 +16,25 @@ import (
 	"k8s.io/klog/v2"
 )
 
-// defaultWarningTimeout is how long a warning persists after the last
-// significant counter increment before it is cleared automatically.
-const defaultWarningTimeout = 5 * time.Minute
-
 // defaultRateThreshold is the minimum per-interval counter increment
 // that is considered significant. Increments below this threshold are
-// treated as background noise and will not refresh the warning timer.
+// treated as background noise and do not raise a warning.
 const defaultRateThreshold uint64 = 5
 
 // linkStatsMonitor periodically collects network interface statistics across
 // all network namespaces and detects incrementing error/drop counters.
+//
+// Warnings describe only the increments observed in the most recent interval
+// (current - previous). A counter that stays flat produces no warning, so a
+// warning clears on the first quiet interval after recovery and the cleared
+// state is pushed to the controller with the next status update.
 type linkStatsMonitor struct {
-	interval       time.Duration
-	warningTimeout time.Duration
-	rateThreshold  uint64
-	// nowFunc is used to obtain the current time; overridable in tests.
-	nowFunc func() time.Time
+	interval      time.Duration
+	rateThreshold uint64
 
-	mu          sync.Mutex
-	previous    map[string]linkCounters // key: "netns/ifname"
-	lastWarning map[string]warningEntry // key: "netns/ifname"
-	warnings    []string                // current active warnings
-}
-
-// warningEntry tracks the most recent warning text and the time it was
-// last observed for a given interface.
-type warningEntry struct {
-	message  string
-	lastSeen time.Time
+	mu       sync.Mutex
+	previous map[string]linkCounters // key: "netns/ifname"
+	warnings []string                // warnings from the most recent interval
 }
 
 // linkCounters tracks the error-related counters from stats64.
@@ -84,12 +74,9 @@ type ipNetnsEntry struct {
 // newLinkStatsMonitor creates a monitor that checks link stats at the given interval.
 func newLinkStatsMonitor(interval time.Duration) *linkStatsMonitor {
 	return &linkStatsMonitor{
-		interval:       interval,
-		warningTimeout: defaultWarningTimeout,
-		rateThreshold:  defaultRateThreshold,
-		nowFunc:        time.Now,
-		previous:       make(map[string]linkCounters),
-		lastWarning:    make(map[string]warningEntry),
+		interval:      interval,
+		rateThreshold: defaultRateThreshold,
+		previous:      make(map[string]linkCounters),
 	}
 }
 
@@ -145,12 +132,18 @@ func (m *linkStatsMonitor) collect() {
 		}
 	}
 
+	m.update(current)
+}
+
+// update compares current counters with the previous sample, replaces the
+// active warnings with the increments seen in this interval and makes current
+// the baseline for the next interval.
+func (m *linkStatsMonitor) update(current map[string]linkCounters) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	now := m.nowFunc()
+	var warnings []string
 
-	// Update warning entries for interfaces with significant increments.
 	for key, cur := range current {
 		prev, ok := m.previous[key]
 		if !ok {
@@ -158,30 +151,8 @@ func (m *linkStatsMonitor) collect() {
 		}
 
 		if deltas := detectIncrements(prev, cur, m.rateThreshold); len(deltas) > 0 {
-			m.lastWarning[key] = warningEntry{
-				message:  fmt.Sprintf("interface %s: %s", key, strings.Join(deltas, ", ")),
-				lastSeen: now,
-			}
+			warnings = append(warnings, fmt.Sprintf("interface %s: %s", key, strings.Join(deltas, ", ")))
 		}
-	}
-
-	// Remove entries for interfaces that no longer exist.
-	for key := range m.lastWarning {
-		if _, ok := current[key]; !ok {
-			delete(m.lastWarning, key)
-		}
-	}
-
-	// Build warnings from entries that have not expired.
-	var warnings []string
-
-	for key, entry := range m.lastWarning {
-		if now.Sub(entry.lastSeen) >= m.warningTimeout {
-			delete(m.lastWarning, key)
-			continue
-		}
-
-		warnings = append(warnings, entry.message)
 	}
 
 	sort.Strings(warnings)
@@ -192,6 +163,8 @@ func (m *linkStatsMonitor) collect() {
 		for _, w := range warnings {
 			klog.V(2).Infof("  %s", w)
 		}
+	} else if len(m.warnings) > 0 {
+		klog.V(2).Info("Link stats: error counters are no longer incrementing, clearing warnings")
 	}
 
 	m.previous = current
@@ -212,35 +185,33 @@ func countersFromEntry(e ipLinkEntry) linkCounters {
 }
 
 // detectIncrements compares previous and current counters and returns
-// descriptions of any that increased by at least minDelta.
+// descriptions of any that increased by at least minDelta. A counter that
+// went backwards (for example, because the interface was recreated) is
+// treated as reset and not reported.
 func detectIncrements(prev, cur linkCounters, minDelta uint64) []string {
+	fields := []struct {
+		name      string
+		prev, cur uint64
+	}{
+		{"rx_errors", prev.RxErrors, cur.RxErrors},
+		{"rx_dropped", prev.RxDropped, cur.RxDropped},
+		{"rx_over_errors", prev.RxOverErrors, cur.RxOverErrors},
+		{"tx_errors", prev.TxErrors, cur.TxErrors},
+		{"tx_dropped", prev.TxDropped, cur.TxDropped},
+		{"tx_carrier_errors", prev.TxCarrierErrs, cur.TxCarrierErrs},
+		{"tx_collisions", prev.TxCollisions, cur.TxCollisions},
+	}
+
 	var deltas []string
-	if d := cur.RxErrors - prev.RxErrors; d >= minDelta {
-		deltas = append(deltas, fmt.Sprintf("rx_errors +%d", d))
-	}
 
-	if d := cur.RxDropped - prev.RxDropped; d >= minDelta {
-		deltas = append(deltas, fmt.Sprintf("rx_dropped +%d", d))
-	}
+	for _, f := range fields {
+		if f.cur <= f.prev {
+			continue
+		}
 
-	if d := cur.RxOverErrors - prev.RxOverErrors; d >= minDelta {
-		deltas = append(deltas, fmt.Sprintf("rx_over_errors +%d", d))
-	}
-
-	if d := cur.TxErrors - prev.TxErrors; d >= minDelta {
-		deltas = append(deltas, fmt.Sprintf("tx_errors +%d", d))
-	}
-
-	if d := cur.TxDropped - prev.TxDropped; d >= minDelta {
-		deltas = append(deltas, fmt.Sprintf("tx_dropped +%d", d))
-	}
-
-	if d := cur.TxCarrierErrs - prev.TxCarrierErrs; d >= minDelta {
-		deltas = append(deltas, fmt.Sprintf("tx_carrier_errors +%d", d))
-	}
-
-	if d := cur.TxCollisions - prev.TxCollisions; d >= minDelta {
-		deltas = append(deltas, fmt.Sprintf("tx_collisions +%d", d))
+		if d := f.cur - f.prev; d >= minDelta {
+			deltas = append(deltas, fmt.Sprintf("%s +%d", f.name, d))
+		}
 	}
 
 	return deltas
