@@ -75,7 +75,7 @@ and other non-kind clusters once those NodePort mappings go away
   existing fake clients plus a hook in `ensurePortForwards` (or a
   thin seam) to assert the call is made before any backend
   operation.
-- Run `go test ./hack/cmd/orcadev/...`.
+- Run `go test ./cmd/orca/hack/orcadev/...`.
 
 ### Acceptance Criteria
 
@@ -118,11 +118,11 @@ and divergent install behavior between kind and non-kind clusters.
 
 ### Tests
 
-- Update `internal/orca/manifests` tests so the dev render
+- Update `cmd/orca/internal/manifests` tests so the dev render
   expectations cover ClusterIP output.
 - Verify `setup-orca.sh --no-wait` renders no `nodePort:` entries.
-- Run `go test ./internal/orca/manifests/...` and
-  `go test ./hack/cmd/orcadev/...`.
+- Run `go test ./cmd/orca/internal/manifests/...` and
+  `go test ./cmd/orca/hack/orcadev/...`.
 
 ### Acceptance Criteria
 
@@ -193,7 +193,7 @@ The orcadev package docstring has the same scenario drift.
   - `empty-object`.
   - `etag-change`.
 - Remove `multi-object` and `range-large` from both the README and
-  the orcadev package docstring (`hack/cmd/orcadev/orcadev/orcadev.go`).
+  the orcadev package docstring (`cmd/orca/hack/orcadev/orcadev/orcadev.go`).
   Filing as future work is fine; they are not part of this change.
 - Change default cache examples to use `orca-test` (the default
   azureblob container):
@@ -253,7 +253,7 @@ rollout. The README's existing-cluster path does not mention this.
 
 ### Tests
 
-- Extend `internal/orca/manifests` render coverage for both
+- Extend `cmd/orca/internal/manifests` render coverage for both
   `RequireAntiAffinity=true` and `false`.
 - Manual smoke:
   - kind 3-node path renders `requiredDuringScheduling...`.
@@ -350,9 +350,9 @@ that no cluster consumes.
 
 ## Final Validation Matrix
 
-- `go test ./hack/cmd/orcadev/...`.
-- `go test ./internal/orca/manifests/...`.
-- `go test ./internal/orca/...` (full Orca test surface).
+- `go test ./cmd/orca/hack/orcadev/...`.
+- `go test ./cmd/orca/internal/manifests/...`.
+- `go test ./cmd/orca/internal/...` (full Orca test surface).
 - `golangci-lint run ./...`.
 - `gofumpt -d <changed Go files>`.
 - `bash -n hack/orca/setup-orca.sh hack/orca/kind-up.sh hack/orca/kind-down.sh`.

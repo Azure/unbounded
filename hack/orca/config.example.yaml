@@ -37,7 +37,7 @@
 #     over logging.level in this file.
 #
 # Cross-references:
-#   - internal/orca/config/config.go - canonical schema source.
+#   - cmd/orca/internal/config/config.go - canonical schema source.
 #   - designs/orca/design.md         - architecture and semantics
 #                                      (bounded staleness, atomic
 #                                      commit, stampede protection).
@@ -284,7 +284,7 @@ cluster:
     # CAVEAT: the runtime refuses to start with enabled: true today -
     # the TLS plumbing is not yet implemented and refusing to start
     # prevents a silent security downgrade (see
-    # internal/orca/cluster/cluster.go: newHTTPClient). Leave false
+    # cmd/orca/internal/cluster/cluster.go: newHTTPClient). Leave false
     # for now; production isolation is via Kubernetes NetworkPolicy.
     # Type:    bool.
     # Default: false.

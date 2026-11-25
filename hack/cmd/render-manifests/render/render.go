@@ -3,7 +3,7 @@
 
 // Package render implements the manifest template renderer used by
 // the render-manifests CLI. Exposed as a package so tests in other
-// packages (e.g. internal/orca/manifests) can render the orca
+// packages (e.g. cmd/orca/internal/manifests) can render the orca
 // templates programmatically without shelling out to `go run`.
 package render
 

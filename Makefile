@@ -897,7 +897,7 @@ agent-artifacts-builder-build: ## Build the offline agent artifacts builder (no 
 agent-artifacts-builder: test agent-artifacts-builder-build ## Build the offline agent artifacts builder (implies test)
 
 ORCADEV_BIN=bin/orcadev
-ORCADEV_CMD=./hack/cmd/orcadev
+ORCADEV_CMD=./cmd/orca/hack/orcadev
 
 orcadev: test ## Build the orcadev dev/debug tool (implies test)
 	$(GOBUILD) -o $(ORCADEV_BIN) $(ORCADEV_CMD)/main.go
@@ -1482,10 +1482,10 @@ orca-reset: ## Rebuild orca image, side-load into kind, rolling-restart the depl
 # toolchain can still run integration tests.
 ifdef CI
 orca-inttest: ## Run orca integration tests (Garage + Azurite via testcontainers; requires Docker)
-	$(GOTEST) -tags=integrationtest -race -timeout 15m ./internal/orca/inttest/...
+	$(GOTEST) -tags=integrationtest -race -timeout 15m ./cmd/orca/internal/inttest/...
 else
 orca-inttest: ## Run orca integration tests (Garage + Azurite via testcontainers; requires Docker)
-	$(GOTEST) -tags=integrationtest -race -count=1 -timeout 15m ./internal/orca/inttest/...
+	$(GOTEST) -tags=integrationtest -race -count=1 -timeout 15m ./cmd/orca/internal/inttest/...
 endif
 
 image-net-controller-local: net-frontend resources/cni-plugins-linux-$(HOST_GOARCH)-$(CNI_PLUGINS_VERSION).tgz ## Build the unbounded-net-controller image locally (single-arch)
