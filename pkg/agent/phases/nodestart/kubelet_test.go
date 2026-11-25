@@ -168,6 +168,7 @@ func TestConfigureKubeletWritesConfiguration(t *testing.T) {
 	require.Equal(t, "4h", got["streamingConnectionIdleTimeout"])
 	require.Len(t, got["tlsCipherSuites"], 8)
 	require.Equal(t, true, got["rotateCertificates"])
+	require.Equal(t, true, got["serverTLSBootstrap"])
 
 	authentication := got["authentication"].(map[string]any)
 	require.Equal(t, false, authentication["anonymous"].(map[string]any)["enabled"])

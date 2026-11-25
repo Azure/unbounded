@@ -198,6 +198,7 @@ func defaultKubeletConfiguration() map[string]any {
 		"resolvConf":                     "/etc/resolv.conf",
 		"rotateCertificates":             true,
 		"runtimeRequestTimeout":          "15m",
+		"serverTLSBootstrap":             true,
 		"staticPodPath":                  goalstates.KubeletStaticPodManifestsDir,
 		"streamingConnectionIdleTimeout": "4h",
 		"tlsCipherSuites": []string{
