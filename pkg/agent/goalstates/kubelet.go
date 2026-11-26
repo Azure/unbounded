@@ -11,6 +11,9 @@ type Kubelet struct {
 	// machine container (e.g. /usr/local/bin/kubelet).
 	KubeletBinPath string
 
+	// ConfigDir sets kubelet's --config-dir option.
+	ConfigDir string
+
 	// KubeletAuthInfo holds the authentication configuration for the
 	// kubelet when KubeconfigData is empty.
 	config.KubeletAuthInfo

@@ -278,6 +278,7 @@ func (c *configureKubelet) ensureKubeletDropIns() error {
 			data: map[string]any{
 				"NodeName":                c.goalState.NodeName,
 				"NodeIP":                  spec.NodeIP,
+				"ConfigDir":               spec.ConfigDir,
 				"NodeLabels":              nodeLabels,
 				"RegisterWithTaints":      registerWithTaints,
 				"ImageCredentialProvider": spec.ImageCredentialProvider,

@@ -522,6 +522,7 @@ func TestResolveKubelet_ConfigurationAndImageCredentialProvider(t *testing.T) {
 		},
 		Kubelet: config.AgentKubeletConfig{
 			ApiServer: "https://api.example.com",
+			ConfigDir: "/etc/kubernetes/kubelet.conf.d",
 			Configuration: map[string]any{
 				"logging":              map[string]any{"verbosity": 4},
 				"featureGates":         map[string]bool{"Example": true},
@@ -537,6 +538,7 @@ func TestResolveKubelet_ConfigurationAndImageCredentialProvider(t *testing.T) {
 	k, err := resolveKubelet(cfg)
 	require.NoError(t, err)
 	require.Equal(t, cfg.Kubelet.Configuration, k.Configuration)
+	require.Equal(t, "/etc/kubernetes/kubelet.conf.d", k.ConfigDir)
 	require.Equal(t, "/etc/kubernetes/credential-provider.yaml", k.ImageCredentialProvider.ConfigPath)
 	require.Equal(t, "/usr/local/lib/kubelet-credential-providers", k.ImageCredentialProvider.BinDir)
 }

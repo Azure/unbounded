@@ -557,6 +557,9 @@ type AgentClusterConfig struct {
 // AgentKubeletConfig holds kubelet-specific overrides.
 type AgentKubeletConfig struct {
 	ApiServer string `json:"ApiServer"`
+	// ConfigDir sets kubelet's --config-dir option to load additional
+	// KubeletConfiguration files from a directory.
+	ConfigDir string `json:"ConfigDir,omitempty"`
 	// KubeconfigData is a complete kubeconfig written verbatim for direct
 	// kubelet authentication. It is mutually exclusive with Auth.
 	KubeconfigData []byte `json:"KubeconfigData,omitempty"`
@@ -606,9 +609,22 @@ func (i *ImageCredentialProvider) DeepCopy() *ImageCredentialProvider {
 func (a *AgentKubeletConfig) Validate() error {
 	return errors.Join(
 		validateKubeletConfiguration(a.Configuration),
+		a.validateConfigDir(),
 		a.ImageCredentialProvider.Validate(),
 		a.validateKubeconfigData(),
 	)
+}
+
+func (a *AgentKubeletConfig) validateConfigDir() error {
+	if a.ConfigDir == "" {
+		return nil
+	}
+
+	if err := validateMachinePath(a.ConfigDir); err != nil {
+		return fmt.Errorf("Kubelet.ConfigDir: %w", err)
+	}
+
+	return nil
 }
 
 func (a *AgentKubeletConfig) validateKubeconfigData() error {
