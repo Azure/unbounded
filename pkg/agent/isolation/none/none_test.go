@@ -41,11 +41,18 @@ func TestUnitsAreAgentOwned(t *testing.T) {
 func TestWriteUnitsAtomicAndIdempotent(t *testing.T) {
 	dir := t.TempDir()
 	spec := UnitSpec{BinDir: "/b", KubeletConfigPath: "/c"}
+	containerdUnit := filepath.Join(dir, UnitContainerd)
+	require.NoError(t, os.WriteFile(containerdUnit, []byte("[Service]\nLimitMEMLOCK=65536\n"), 0o644))
 
 	for range 2 {
 		paths, err := WriteUnits(dir, spec)
 		require.NoError(t, err)
 		require.Len(t, paths, 2)
+
+		body, err := os.ReadFile(containerdUnit)
+		require.NoError(t, err)
+		require.Contains(t, string(body), "\nLimitMEMLOCK=infinity\n")
+		require.NotContains(t, string(body), "LimitMEMLOCK=65536")
 	}
 
 	entries, err := os.ReadDir(dir)
