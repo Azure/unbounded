@@ -2200,8 +2200,11 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 		state.mu.Unlock()
 		syncMasqueradeRules(state, nonMasqCIDRs)
 
+		// Desired topology can be unchanged while WireGuard kernel state has
+		// drifted after endpoint roaming or external modification.
+		refreshErrors := []error{repairWireGuardDrift(state)}
+
 		// Heartbeat reconciliations also follow changed native underlay routes.
-		var refreshErrors []error
 
 		for _, tunnelMap := range []*ebpfpkg.TunnelMap{tunnelMap, assignmentMap} {
 			if tunnelMap != nil {
@@ -2212,6 +2215,10 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 		}
 
 		if err := errors.Join(refreshErrors...); err != nil {
+			state.mu.Lock()
+			state.dataplaneDirty = true
+			state.mu.Unlock()
+
 			return err
 		}
 
